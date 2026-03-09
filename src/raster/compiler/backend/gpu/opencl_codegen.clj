@@ -1,0 +1,805 @@
+(ns raster.compiler.backend.gpu.opencl-codegen
+  "S-expression to OpenCL C source emission.
+
+  Converts walked S-expressions into OpenCL C kernel source code.
+  Adapted from cuda_codegen.clj with OpenCL-specific kernel boilerplate:
+  - `__kernel void` instead of `extern \"C\" __global__ void`
+  - `get_global_id(0)` instead of `blockIdx.x * blockDim.x + threadIdx.x`
+  - `__global` address space qualifiers
+  - `barrier(CLK_LOCAL_MEM_FENCE)` instead of `__syncthreads()`
+  - `intel_sub_group_shuffle_down` for Intel GPU subgroup ops
+
+  Expression emission delegates to c_emit.clj shared utilities.
+
+  Usage:
+    (emit-elementwise-kernel \"relu\" :double '(fmax 0.0 x))
+    (emit-reduction-kernel \"sum\" :double '+ 0.0)
+    (kernel-launch-config 100000 :device-id :ze:0)"
+  (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.c-emit :as ce]))
+
+;; ================================================================
+;; OpenCL-specific op map (extends shared op-map)
+;; ================================================================
+
+(def opencl-op-map
+  "Maps Clojure/Java op symbols to OpenCL C equivalents.
+  OpenCL C math functions are identical to C99 — same as CUDA."
+  ce/op-map)
+
+(def opencl-type-map
+  "Maps Raster type keywords to OpenCL C types."
+  {:double "double"
+   :float  "float"
+   :int    "int"
+   :long   "long"})  ;; OpenCL 'long' is 64-bit (unlike CUDA's 'long long')
+
+;; ================================================================
+;; Expression emission (delegates to shared)
+;; ================================================================
+
+(defn emit-expr
+  "Convert an S-expression to an OpenCL C expression string."
+  [expr]
+  (ce/emit-expr expr nil #{} "idx"))
+
+;; ================================================================
+;; OpenCL pragmas
+;; ================================================================
+
+(def ^:private fp64-pragma
+  "Enable double precision (required for OpenCL)."
+  "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+
+(def ^:private subgroup-pragma
+  "Enable Intel subgroup extensions for shuffle ops."
+  "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n")
+
+;; ================================================================
+;; Kernel templates
+;; ================================================================
+
+(defn emit-elementwise-kernel
+  "Generate an OpenCL C element-wise kernel with grid-stride loop.
+
+  kernel-name: string name for the kernel
+  dtype: :double or :float
+  body-expr: S-expression for element transform, using 'x' for input element
+  n-arrays: number of input arrays (default 1)
+
+  Returns an OpenCL C source string."
+  [kernel-name dtype body-expr & {:keys [n-arrays] :or {n-arrays 1}}]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        var-names ["x" "y" "z" "w"]
+        array-params (str/join ", "
+                               (map (fn [i] (str "__global const " ctype "* restrict arr" i))
+                                    (range n-arrays)))
+        reads (str/join "\n"
+                        (map (fn [i]
+                               (str "        " ctype " " (get var-names i (str "v" i))
+                                    " = arr" i "[idx];"))
+                             (range n-arrays)))]
+    (str (when use-fp64? fp64-pragma)
+         "__kernel void " kernel-name "("
+         array-params ", __global " ctype "* restrict out, int n) {\n"
+         "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
+         reads "\n"
+         "        out[idx] = " (emit-expr body-expr) ";\n"
+         "    }\n"
+         "}\n")))
+
+(defn emit-fused-kernel
+  "Generate a fused OpenCL C kernel from a chain of element-wise ops.
+
+  kernel-name: string name
+  dtype: :double or :float
+  ops: seq of {:op op-sym, :result-sym sym, :arg-syms [syms...]}
+
+  Returns OpenCL C source string."
+  [kernel-name dtype ops]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        body-lines (mapv (fn [{:keys [op result-sym arg-syms]}]
+                           (str "        " ctype " "
+                                (emit-expr result-sym)
+                                " = " (emit-expr (cons op arg-syms)) ";"))
+                         ops)]
+    (str (when use-fp64? fp64-pragma)
+         "__kernel void " kernel-name
+         "(__global const double* restrict in, __global double* restrict out, int n) {\n"
+         "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
+         "        " ctype " x = in[idx];\n"
+         (str/join "\n" body-lines) "\n"
+         "        out[idx] = "
+         (emit-expr (:result-sym (last ops))) ";\n"
+         "    }\n"
+         "}\n")))
+
+(defn emit-reduction-kernel
+  "Generate an OpenCL C parallel reduction kernel.
+  Uses local memory tree reduction with Intel subgroup shuffle optimization.
+
+  kernel-name: string name
+  dtype: :double or :float
+  op: '+, '*, 'Math/max, 'Math/min
+  identity-val: identity element for the reduction op
+  workgroup-size: compile-time workgroup size (required for local memory sizing)
+
+  Returns OpenCL C source string."
+  [kernel-name dtype op identity-val & {:keys [workgroup-size] :or {workgroup-size 256}}]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        reduce-op (condp = op
+                    '+ "+"
+                    '* "*"
+                    'Math/max "fmax"
+                    'Math/min "fmin"
+                    "+")
+        is-fn-op (contains? #{'Math/max 'Math/min} op)
+        combine (if is-fn-op
+                  (fn [a b] (str reduce-op "(" a ", " b ")"))
+                  (fn [a b] (str "(" a " " reduce-op " " b ")")))]
+    (str (when use-fp64? fp64-pragma)
+         subgroup-pragma
+         "__kernel void " kernel-name
+         "(__global const " ctype "* restrict input, "
+         "__global " ctype "* restrict output, int n) {\n"
+         "    __local " ctype " sdata[" workgroup-size "];\n"
+         "    int tid = get_local_id(0);\n"
+         "    " ctype " val = " (ce/normalize-identity-val identity-val) ";\n"
+         "    int stride = get_global_size(0);\n"
+         "    int i = get_global_id(0);\n"
+         ;; 4x unrolled grid-stride accumulation
+         "    for (; i + 3 * stride < n; i += 4 * stride) {\n"
+         "        val = " (combine "val" "input[i]") ";\n"
+         "        val = " (combine "val" "input[i + stride]") ";\n"
+         "        val = " (combine "val" "input[i + 2 * stride]") ";\n"
+         "        val = " (combine "val" "input[i + 3 * stride]") ";\n"
+         "    }\n"
+         "    for (; i < n; i += stride) {\n"
+         "        val = " (combine "val" "input[i]") ";\n"
+         "    }\n"
+         "    sdata[tid] = val;\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         ;; Tree reduction in local memory
+         "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
+         "        if (tid < s) {\n"
+         "            sdata[tid] = " (combine "sdata[tid]" "sdata[tid + s]") ";\n"
+         "        }\n"
+         "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    }\n"
+         "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
+         "}\n")))
+
+(defn emit-par-map-kernel
+  "Generate an OpenCL C kernel from a raster.par/map! body expression.
+
+  kernel-name: string name for the kernel
+  dtype: :double or :float
+  body-expr: S-expression for element transform
+  array-params: seq of array symbol names used as inputs
+  scalar-params: seq of scalar symbol names
+
+  Returns OpenCL C source string."
+  [kernel-name dtype body-expr array-params scalar-params]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        arr-params-str (str/join ", "
+                                 (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s)))
+                                      array-params))
+        scalar-params-str (str/join ", "
+                                    (map (fn [s] (str ctype " " (ce/c-symbol s)))
+                                         scalar-params))
+        all-params (str/join ", "
+                             (remove empty?
+                                     [arr-params-str
+                                      (str "__global " ctype "* restrict out")
+                                      scalar-params-str
+                                      "int n"]))]
+    (str (when use-fp64? fp64-pragma)
+         "__kernel void " kernel-name "("
+         all-params ") {\n"
+         "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
+         ;; Array reads
+         (str/join ""
+                   (map-indexed (fn [i s]
+                                  (str "        " ctype " " (ce/c-symbol s)
+                                       "_val = " (ce/c-symbol s) "[idx];\n"))
+                                array-params))
+         "        out[idx] = " (emit-expr body-expr) ";\n"
+         "    }\n"
+         "}\n")))
+
+(defn emit-par-reduce-kernel
+  "Generate an OpenCL C parallel reduction kernel from a raster.par/reduce form.
+
+  kernel-name: string name
+  dtype: :double or :float
+  op: reduction operation (+, *, Math/max, Math/min)
+  identity-val: identity element
+
+  Returns OpenCL C source string."
+  [kernel-name dtype op identity-val & opts]
+  (apply emit-reduction-kernel kernel-name dtype op identity-val opts))
+
+;; ================================================================
+;; XMX Matrix Multiply kernel (Intel Xe Matrix Extensions)
+;; ================================================================
+
+;; ================================================================
+;; Row-softmax kernel (attention score normalization)
+;; ================================================================
+
+(defn emit-row-softmax-kernel
+  "Generate an OpenCL row-wise softmax kernel.
+  Input: [n_rows, row_len] row-major array.
+  Output: [n_rows, row_len] with softmax applied per row.
+
+  Algorithm: 3-pass (max, exp+sum, normalize) with cooperative reduction.
+  One workgroup per row, subgroup cooperative for max and sum.
+
+  kernel-name: string name
+  dtype: :double or :float
+  Options:
+    :workgroup-size — threads per row (default 256)"
+  [kernel-name dtype & {:keys [workgroup-size] :or {workgroup-size 256}}]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        neg-inf (if use-fp64? "-1.0e308" "-1.0e38f")]
+    (str (when use-fp64? fp64-pragma)
+         subgroup-pragma
+         "\n"
+         "// Row-wise softmax: one workgroup per row\n"
+         "__kernel void " kernel-name "(\n"
+         "    __global const " ctype "* restrict input,\n"
+         "    __global " ctype "* restrict output,\n"
+         "    int n_rows, int row_len) {\n"
+         "    __local " ctype " sdata[" workgroup-size "];\n"
+         "    int row = get_group_id(0);\n"
+         "    if (row >= n_rows) return;\n"
+         "    int tid = get_local_id(0);\n"
+         "    int offset = row * row_len;\n"
+         "\n"
+         "    // Pass 1: find row max\n"
+         "    " ctype " max_val = " neg-inf ";\n"
+         "    for (int j = tid; j < row_len; j += " workgroup-size ") {\n"
+         "        max_val = fmax(max_val, input[offset + j]);\n"
+         "    }\n"
+         "    sdata[tid] = max_val;\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    for (int s = " (/ workgroup-size 2) "; s > 0; s >>= 1) {\n"
+         "        if (tid < s) sdata[tid] = fmax(sdata[tid], sdata[tid + s]);\n"
+         "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    }\n"
+         "    " ctype " row_max = sdata[0];\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "\n"
+         "    // Pass 2: exp(x - max) and accumulate sum\n"
+         "    " ctype " sum_val = 0;\n"
+         "    for (int j = tid; j < row_len; j += " workgroup-size ") {\n"
+         "        " ctype " e = exp(input[offset + j] - row_max);\n"
+         "        output[offset + j] = e;\n"
+         "        sum_val += e;\n"
+         "    }\n"
+         "    sdata[tid] = sum_val;\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    for (int s = " (/ workgroup-size 2) "; s > 0; s >>= 1) {\n"
+         "        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+         "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    }\n"
+         "    " ctype " inv_sum = 1 / sdata[0];\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "\n"
+         "    // Pass 3: normalize\n"
+         "    for (int j = tid; j < row_len; j += " workgroup-size ") {\n"
+         "        output[offset + j] *= inv_sum;\n"
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
+;; GroupNorm kernel (channel normalization)
+;; ================================================================
+
+(defn emit-group-norm-kernel
+  "Generate an OpenCL GroupNorm kernel.
+  Input: [n, channels] (flattened from [batch, channels, spatial]).
+  Gamma, Beta: [channels] (affine parameters).
+  num_groups groups, each group has channels/num_groups channels.
+
+  Two-pass: compute group stats, then normalize + scale/shift.
+  One workgroup per (sample, group) pair.
+
+  kernel-name: string name
+  dtype: :double or :float
+  Options:
+    :workgroup-size — threads per group normalization (default 256)
+    :eps           — epsilon for stability (default 1e-5)"
+  [kernel-name dtype & {:keys [workgroup-size eps] :or {workgroup-size 256 eps 1e-5}}]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)
+        eps-str (str eps)]
+    (str (when use-fp64? fp64-pragma)
+         "\n"
+         "// GroupNorm: normalize within groups of channels\n"
+         "// Layout: x[batch, channels], gamma[channels], beta[channels]\n"
+         "__kernel void " kernel-name "(\n"
+         "    __global const " ctype "* restrict input,\n"
+         "    __global const " ctype "* restrict gamma,\n"
+         "    __global const " ctype "* restrict beta,\n"
+         "    __global " ctype "* restrict output,\n"
+         "    int batch_size, int channels, int num_groups) {\n"
+         "    __local " ctype " sdata[" (* 2 workgroup-size) "];\n"  ;; [mean_part | var_part]
+         "    int pair_id = get_group_id(0);\n"  ;; (sample, group) pair
+         "    int sample = pair_id / num_groups;\n"
+         "    int group = pair_id % num_groups;\n"
+         "    if (sample >= batch_size) return;\n"
+         "    int tid = get_local_id(0);\n"
+         "    int group_size = channels / num_groups;\n"
+         "    int ch_start = group * group_size;\n"
+         "    int base = sample * channels;\n"
+         "\n"
+         "    // Pass 1: compute group mean\n"
+         "    " ctype " sum = 0;\n"
+         "    for (int c = tid; c < group_size; c += " workgroup-size ") {\n"
+         "        sum += input[base + ch_start + c];\n"
+         "    }\n"
+         "    sdata[tid] = sum;\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    for (int s = " (/ workgroup-size 2) "; s > 0; s >>= 1) {\n"
+         "        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+         "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    }\n"
+         "    " ctype " mean = sdata[0] / (" ctype ")(group_size);\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "\n"
+         "    // Pass 2: compute group variance\n"
+         "    " ctype " var_sum = 0;\n"
+         "    for (int c = tid; c < group_size; c += " workgroup-size ") {\n"
+         "        " ctype " diff = input[base + ch_start + c] - mean;\n"
+         "        var_sum += diff * diff;\n"
+         "    }\n"
+         "    sdata[tid] = var_sum;\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    for (int s = " (/ workgroup-size 2) "; s > 0; s >>= 1) {\n"
+         "        if (tid < s) sdata[tid] += sdata[tid + s];\n"
+         "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "    }\n"
+         "    " ctype " inv_std = 1 / sqrt(sdata[0] / (" ctype ")(group_size) + " eps-str ");\n"
+         "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+         "\n"
+         "    // Pass 3: normalize + affine\n"
+         "    for (int c = tid; c < group_size; c += " workgroup-size ") {\n"
+         "        int ch = ch_start + c;\n"
+         "        " ctype " x_hat = (input[base + ch] - mean) * inv_std;\n"
+         "        output[base + ch] = gamma[ch] * x_hat + beta[ch];\n"
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
+;; SiLU elementwise kernel (fused activation)
+;; ================================================================
+;; Transpose kernel
+;; ================================================================
+
+(defn emit-transpose-kernel
+  "Generate an OpenCL 2D matrix transpose kernel.
+  Reads from row-major in[i*cols + j], writes to out[j*rows + i].
+  Each work-item handles one element.
+
+  kernel-name: string name
+  dtype: :double or :float (default :float)
+  Returns OpenCL C source string."
+  [kernel-name & {:keys [dtype] :or {dtype :float}}]
+  (let [ctype (get opencl-type-map dtype "float")
+        use-fp64? (= dtype :double)]
+    (str (when use-fp64? fp64-pragma)
+         "__kernel void " kernel-name
+         "(__global const " ctype "* restrict in,"
+         " __global " ctype "* restrict out,"
+         " int rows, int cols) {\n"
+         "    int gid = get_global_id(0);\n"
+         "    int total = rows * cols;\n"
+         "    for (int idx = gid; idx < total; idx += get_global_size(0)) {\n"
+         "        int i = idx / cols;\n"
+         "        int j = idx % cols;\n"
+         "        out[j * rows + i] = in[i * cols + j];\n"
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
+;; Axpy kernel (in-place weight update)
+;; ================================================================
+
+(defn emit-axpy-kernel
+  "Generate an OpenCL axpy kernel: y[i] += alpha * x[i].
+  Used for SGD weight updates on GPU with persistent DeviceBuffers.
+
+  kernel-name: string name
+  dtype: :double or :float (default :float)
+  Returns OpenCL C source string."
+  [kernel-name & {:keys [dtype] :or {dtype :float}}]
+  (let [ctype (get opencl-type-map dtype "float")
+        use-fp64? (= dtype :double)]
+    (str (when use-fp64? fp64-pragma)
+         "__kernel void " kernel-name
+         "(__global " ctype "* restrict y,"
+         " __global const " ctype "* restrict x,"
+         " " ctype " alpha, int n) {\n"
+         "    for (int i = get_global_id(0); i < n; i += get_global_size(0)) {\n"
+         "        y[i] += alpha * x[i];\n"
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
+
+(defn emit-silu-kernel
+  "Generate a fused SiLU kernel: y = x * sigmoid(x) = x / (1 + exp(-x))."
+  [kernel-name dtype]
+  (emit-elementwise-kernel kernel-name dtype '(/ x (+ 1.0 (exp (- x))))))
+
+;; ================================================================
+;; Scatter-reduce kernel (graph attention core)
+;; ================================================================
+
+(defn emit-scatter-reduce-kernel
+  "Generate an OpenCL scatter-reduce kernel for graph attention.
+  out[dst[e]] += f(src_data[src[e]]) for each edge e.
+
+  Two variants:
+    :atomic  — uses atomic_add, works for any edge ordering
+    :sorted  — edges sorted by dst, one workgroup per segment (no atomics)
+
+  For :atomic with FP16, emulates via CAS loop on ushort.
+
+  kernel-name: string name
+  dtype: :double or :float
+  variant: :atomic (default) or :sorted
+  Options:
+    :with-weights? — if true, multiply by weight array: out[dst[e]] += w[e] * src[src[e]*stride+d]
+    :d-model      — feature dimension (inner loop over d)
+    :workgroup-size — for :sorted variant"
+  [kernel-name dtype variant
+   & {:keys [with-weights? d-model workgroup-size]
+      :or {with-weights? true d-model nil workgroup-size 256}}]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)]
+    (case variant
+      :atomic
+      (str (when use-fp64? fp64-pragma)
+           "#pragma OPENCL EXTENSION cl_khr_global_int64_base_atomics : enable\n"
+           "\n"
+           "// Scatter-reduce (atomic): out[dst[e]] += w[e] * data[src[e]*stride+d]\n"
+           "__kernel void " kernel-name "(\n"
+           "    __global const " ctype "* restrict data,\n"    ;; source node features [n_nodes, d_model]
+           "    __global const int* restrict src_edges,\n"     ;; [n_edges]
+           "    __global const int* restrict dst_edges,\n"     ;; [n_edges]
+           (when with-weights?
+             (str "    __global const " ctype "* restrict weights,\n"))
+           "    __global " ctype "* restrict out,\n"           ;; [n_nodes, d_model]
+           "    int n_edges, int stride) {\n"   ;; stride = d_model
+           "    for (int e = get_global_id(0); e < n_edges; e += get_global_size(0)) {\n"
+           "        int src = src_edges[e];\n"
+           "        int dst = dst_edges[e];\n"
+           (if with-weights?
+             (str "        " ctype " w = weights[e];\n"
+                  "        for (int d = 0; d < stride; d++) {\n"
+                  "            " ctype " val = w * data[src * stride + d];\n")
+             (str "        for (int d = 0; d < stride; d++) {\n"
+                  "            " ctype " val = data[src * stride + d];\n"))
+           ;; Atomic add — use native for double/float
+           (if use-fp64?
+             ;; CAS-based atomic add for double
+             (str "            // CAS-based atomic add for double\n"
+                  "            __global volatile long* addr = (__global volatile long*)(out + dst * stride + d);\n"
+                  "            long old_val = *addr;\n"
+                  "            long new_val;\n"
+                  "            do {\n"
+                  "                new_val = as_long(as_double(old_val) + val);\n"
+                  "            } while (atom_cmpxchg(addr, old_val, new_val) != old_val);\n")
+             ;; Native atomic for float (available on Xe2)
+             (str "            atomic_add(out + dst * stride + d, val);\n"))
+           "        }\n"
+           "    }\n"
+           "}\n")
+
+      :sorted
+      ;; Sorted-segment: edges grouped by dst, each workgroup processes one dst node
+      (str (when use-fp64? fp64-pragma)
+           "\n"
+           "// Scatter-reduce (sorted): edges sorted by dst, one workgroup per dst segment\n"
+           "__kernel void " kernel-name "(\n"
+           "    __global const " ctype "* restrict data,\n"
+           "    __global const int* restrict src_edges,\n"
+           "    __global const int* restrict dst_edges,\n"
+           (when with-weights?
+             (str "    __global const " ctype "* restrict weights,\n"))
+           "    __global " ctype "* restrict out,\n"
+           "    __global const int* restrict seg_offsets,\n"   ;; [n_nodes+1] CSR-style
+           "    int n_nodes, int stride) {\n"
+           "    int node = get_group_id(0);\n"
+           "    if (node >= n_nodes) return;\n"
+           "    int seg_start = seg_offsets[node];\n"
+           "    int seg_end = seg_offsets[node + 1];\n"
+           "    int tid = get_local_id(0);\n"
+           "    // Each thread handles a subset of the feature dimensions\n"
+           "    for (int d = tid; d < stride; d += get_local_size(0)) {\n"
+           "        " ctype " acc = 0;\n"
+           "        for (int e = seg_start; e < seg_end; e++) {\n"
+           "            int src = src_edges[e];\n"
+           (if with-weights?
+             (str "            acc += weights[e] * data[src * stride + d];\n")
+             (str "            acc += data[src * stride + d];\n"))
+           "        }\n"
+           "        out[node * stride + d] = acc;\n"
+           "    }\n"
+           "}\n"))))
+
+(defn emit-scatter-reduce-scalar-kernel
+  "Generate scatter-reduce for scalar values (no feature dim loop).
+  out[dst[e]] += value[e]. Used for normalization Z accumulation."
+  [kernel-name dtype]
+  (let [ctype (get opencl-type-map dtype "double")
+        use-fp64? (= dtype :double)]
+    (str (when use-fp64? fp64-pragma)
+         (when use-fp64?
+           "#pragma OPENCL EXTENSION cl_khr_global_int64_base_atomics : enable\n")
+         "\n"
+         "// Scatter-reduce scalar: out[dst[e]] += values[e]\n"
+         "__kernel void " kernel-name "(\n"
+         "    __global const " ctype "* restrict values,\n"
+         "    __global const int* restrict dst_edges,\n"
+         "    __global " ctype "* restrict out,\n"
+         "    int n_edges) {\n"
+         "    for (int e = get_global_id(0); e < n_edges; e += get_global_size(0)) {\n"
+         "        int dst = dst_edges[e];\n"
+         (if use-fp64?
+           (str "        __global volatile long* addr = (__global volatile long*)(out + dst);\n"
+                "        long old_val = *addr;\n"
+                "        long new_val;\n"
+                "        do {\n"
+                "            new_val = as_long(as_double(old_val) + values[e]);\n"
+                "        } while (atom_cmpxchg(addr, old_val, new_val) != old_val);\n")
+           (str "        atomic_add(out + dst, values[e]);\n"))
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
+;; Non-square XMX GEMM kernel (V20-style with full boundary handling)
+;; ================================================================
+
+(defn emit-gemm-nonsquare-kernel
+  "Generate a tiled GEMM kernel using Intel XMX DPAS instructions.
+  Handles arbitrary M, N, K dimensions with full boundary checking.
+  Computes C = A * B (FP16 in, FP32 accumulator, FP16 out).
+
+  Tile per workgroup: 128M × 128N, 16 subgroups (4×4 grid).
+  Each subgroup: 32M × 32N tile (4 M-tiles × 2 N-tiles of 8×16).
+  K-loop: processes 32 K per iteration (2 K-steps of 16).
+  Uses 2D block I/O for hardware OOB clamping on loads.
+
+  kernel-name: string name for the kernel
+  Options:
+    :alpha   - scalar multiplier (default 1.0)
+    :beta    - accumulation factor (default 0.0, C = alpha*A*B + beta*C)
+    :c-dtype - output type, :half or :float (default :half)"
+  [kernel-name & {:keys [alpha beta c-dtype]
+                  :or {alpha 1.0 beta 0.0 c-dtype :half}}]
+  (let [c-type (if (= c-dtype :float) "float" "half")
+        c-size (if (= c-dtype :float) 4 2)
+        store-cast (if (= c-dtype :float) "" "(half)")]
+    (str
+     "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
+     "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
+     "\n"
+     "// Non-square GEMM: C[M×N] = A[M×K] × B[K×N]\n"
+     "// Tile: 128×128 per workgroup, 16 subgroups (4×4), K-unroll ×2\n"
+     "\n"
+     "__attribute__((intel_reqd_sub_group_size(16)))\n"
+     "__kernel void " kernel-name "(\n"
+     "    __global const half* restrict A,\n"
+     "    __global const half* restrict B,\n"
+     "    __global " c-type "* restrict C,\n"
+     "    int M, int N, int K"
+     (when (not= alpha 1.0) ", float alpha")
+     (when (not= beta 0.0) ", float beta")
+     ") {\n"
+     "    int sg_id = get_sub_group_id();\n"
+     "    int sg_lid = get_sub_group_local_id();\n"
+     "    int sg_row = sg_id / 4;\n"
+     "    int sg_col = sg_id % 4;\n"
+     "\n"
+     "    int m_base = get_group_id(1) * 128 + sg_row * 32;\n"
+     "    int n_base0 = get_group_id(0) * 128 + sg_col * 32;\n"
+     "    int n_base1 = n_base0 + 16;\n"
+     "\n"
+     "    // Early exit if entire subgroup tile is OOB\n"
+     "    if (m_base >= M && n_base0 >= N) return;\n"
+     "\n"
+     "    // 8 accumulators: 4 M-tiles × 2 N-tiles\n"
+     "    float8 acc00=0.0f, acc10=0.0f, acc20=0.0f, acc30=0.0f;\n"
+     "    float8 acc01=0.0f, acc11=0.0f, acc21=0.0f, acc31=0.0f;\n"
+     "\n"
+     "    int a_wb = K * 2, a_pb = K * 2;\n"
+     "    int b_wb = N * 2, b_pb = N * 2;\n"
+     "\n"
+     "    // Prefetch first 3 K-steps of A\n"
+     "    for (int p = 0; p < 3 && p * 16 < K; p++) {\n"
+     "        int pk = p * 16;\n"
+     "        for (int m = 0; m < 4; m++)\n"
+     "            intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
+     "                (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
+     "    }\n"
+     "\n"
+     "    // Main K-loop: 32 K elements per iteration (2 K-steps)\n"
+     "    int k = 0;\n"
+     "    for (; k + 31 < K; k += 32) {\n"
+     "        // K-step 1: k\n"
+     "        int pk = k + 48;\n"
+     "        if (pk < K) {\n"
+     "            for (int m = 0; m < 4; m++)\n"
+     "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
+     "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
+     "        }\n"
+     "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
+     "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k)));\n"
+     "        ushort8 a0, a1, a2, a3;\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base), &a0);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+8), &a1);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+16), &a2);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+24), &a3);\n"
+     "        short8 sa0=as_short8(a0), sa1=as_short8(a1), sa2=as_short8(a2), sa3=as_short8(a3);\n"
+     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
+     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
+     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
+     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
+     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
+     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
+     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
+     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
+     "\n"
+     "        // K-step 2: k+16\n"
+     "        int k2 = k + 16;\n"
+     "        pk = k2 + 48;\n"
+     "        if (pk < K) {\n"
+     "            for (int m = 0; m < 4; m++)\n"
+     "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
+     "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
+     "        }\n"
+     "        bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k2)));\n"
+     "        bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k2)));\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base), &a0);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+8), &a1);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+16), &a2);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+24), &a3);\n"
+     "        sa0=as_short8(a0); sa1=as_short8(a1); sa2=as_short8(a2); sa3=as_short8(a3);\n"
+     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
+     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
+     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
+     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
+     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
+     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
+     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
+     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
+     "    }\n"
+     "\n"
+     "    // Remainder K-steps (K not multiple of 32)\n"
+     "    for (; k < K; k += 16) {\n"
+     "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
+     "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
+     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k)));\n"
+     "        ushort8 a0, a1, a2, a3;\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base), &a0);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+8), &a1);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+16), &a2);\n"
+     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+24), &a3);\n"
+     "        short8 sa0=as_short8(a0), sa1=as_short8(a1), sa2=as_short8(a2), sa3=as_short8(a3);\n"
+     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
+     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
+     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
+     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
+     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
+     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
+     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
+     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
+     "    }\n"
+     "\n"
+     "    // Store with full M/N boundary checks\n"
+     "    #pragma unroll\n"
+     "    for (int t = 0; t < 4; t++) {\n"
+     "        float8 a0r = (t==0)?acc00:(t==1)?acc10:(t==2)?acc20:acc30;\n"
+     "        float8 a1r = (t==0)?acc01:(t==1)?acc11:(t==2)?acc21:acc31;\n"
+     "        int row_base = m_base + t * 8;\n"
+     "        #pragma unroll\n"
+     "        for (int i = 0; i < 8; i++) {\n"
+     "            int row = row_base + i;\n"
+     "            if (row < M) {\n"
+     "                float v0, v1;\n"
+     "                switch(i) {\n"
+     "                    case 0: v0=a0r.s0; v1=a1r.s0; break;\n"
+     "                    case 1: v0=a0r.s1; v1=a1r.s1; break;\n"
+     "                    case 2: v0=a0r.s2; v1=a1r.s2; break;\n"
+     "                    case 3: v0=a0r.s3; v1=a1r.s3; break;\n"
+     "                    case 4: v0=a0r.s4; v1=a1r.s4; break;\n"
+     "                    case 5: v0=a0r.s5; v1=a1r.s5; break;\n"
+     "                    case 6: v0=a0r.s6; v1=a1r.s6; break;\n"
+     "                    case 7: v0=a0r.s7; v1=a1r.s7; break;\n"
+     "                }\n"
+     (if (not= beta 0.0)
+       (str
+        "                int col0 = n_base0 + sg_lid;\n"
+        "                int col1 = n_base1 + sg_lid;\n"
+        "                if (col0 < N) {\n"
+        "                    float old = (float)C[row * N + col0];\n"
+        "                    C[row * N + col0] = " store-cast "("
+        (if (not= alpha 1.0) "alpha * " "") "v0 + beta * old);\n"
+        "                }\n"
+        "                if (col1 < N) {\n"
+        "                    float old = (float)C[row * N + col1];\n"
+        "                    C[row * N + col1] = " store-cast "("
+        (if (not= alpha 1.0) "alpha * " "") "v1 + beta * old);\n"
+        "                }\n")
+       (str
+        "                int col0 = n_base0 + sg_lid;\n"
+        "                int col1 = n_base1 + sg_lid;\n"
+        "                if (col0 < N)\n"
+        "                    C[row * N + col0] = " store-cast "("
+        (if (not= alpha 1.0) "alpha * " "") "v0);\n"
+        "                if (col1 < N)\n"
+        "                    C[row * N + col1] = " store-cast "("
+        (if (not= alpha 1.0) "alpha * " "") "v1);\n"))
+     "            }\n"
+     "        }\n"
+     "    }\n"
+     "}\n")))
+
+(defn gemm-launch-config
+  "Compute 2D launch config for GEMM kernel.
+  Returns {:workgroup-size [256 1] :group-count [gc-n gc-m]}
+  where 256 = 16 subgroups × 16 work-items."
+  [m n]
+  (let [gc-m (int (Math/ceil (/ (double m) 128.0)))
+        gc-n (int (Math/ceil (/ (double n) 128.0)))]
+    {:workgroup-size [256 1]
+     :group-count [gc-n gc-m]}))
+
+;; ================================================================
+;; Kernel launch config (Level Zero)
+;; ================================================================
+
+(def ^:private min-ze-elements
+  "Minimum elements before Level Zero kernel is worthwhile."
+  4096)
+
+(defn kernel-launch-config
+  "Compute workgroup/group-count dimensions for n elements on Level Zero.
+  Returns {:workgroup-size int, :group-count int, :local-mem int} or nil if n too small.
+
+  Options:
+    :device-id    — Level Zero device keyword (e.g. :ze:0)
+    :reduction?   — if true, uses larger workgroups and allocates local memory
+    :min-elements — override minimum element threshold"
+  [n & {:keys [device-id reduction? min-elements]
+        :or {reduction? false min-elements min-ze-elements}}]
+  (when (>= n min-elements)
+    (if device-id
+      (try
+        (require 'raster.runtime.hardware)
+        (let [hw-wg ((resolve 'raster.runtime.hardware/optimal-workgroup-size)
+                     device-id n :reduction? reduction?)
+              hw-gc ((resolve 'raster.runtime.hardware/optimal-group-count)
+                     device-id n hw-wg :reduction? reduction?)
+              local-mem (if reduction? (* hw-wg 8) 0)]
+          {:workgroup-size hw-wg :group-count hw-gc :local-mem local-mem})
+        (catch Exception _
+          (let [wg (if reduction? 256 256)
+                gc (int (Math/ceil (/ (double n) (double wg))))]
+            {:workgroup-size wg :group-count gc :local-mem (if reduction? (* wg 8) 0)})))
+      (let [wg (if reduction? 256 256)
+            gc (int (Math/ceil (/ (double n) (double wg))))]
+        {:workgroup-size wg :group-count gc :local-mem (if reduction? (* wg 8) 0)}))))

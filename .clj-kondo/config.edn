@@ -1,0 +1,84 @@
+{:lint-as
+ {raster.core/defn clojure.core/defn
+  raster.vk.gpu/with-gpu-context clojure.core/let}
+
+ :hooks
+ {:analyze-call
+  {raster.core/deftm       hooks.raster-core/deftm
+   raster.core/ftm         hooks.raster-core/ftm
+   raster.core/defvalue    hooks.raster-core/defvalue
+   raster.core/defval      hooks.raster-core/defval
+   raster.core/defabstract hooks.raster-core/defabstract
+   raster.core/defcache    hooks.raster-core/defcache
+   raster.core/ns-raster   hooks.raster-core/ns-raster
+   raster.par/map!         hooks.raster-core/par-map!
+   raster.par/reduce       hooks.raster-core/par-reduce
+   raster.par/scan         hooks.raster-core/par-scan
+   raster.par/scan-exclusive hooks.raster-core/par-scan
+   raster.par/map-void!    hooks.raster-core/par-map-void!
+   raster.par/stencil!     hooks.raster-core/par-stencil!
+   raster.core/reduce!     hooks.raster-core/core-reduce!
+   raster.core/scan!       hooks.raster-core/core-reduce!
+   raster.core/muladd      hooks.raster-core/core-muladd
+   raster.core/stencil!    hooks.raster-core/core-stencil!
+   ;; import-vars in entry-point namespaces
+   raster.dl/import-vars     hooks.raster-core/import-vars
+   raster.ad/import-vars     hooks.raster-core/import-vars
+   raster.sci/import-vars    hooks.raster-core/import-vars
+   raster.abm/import-vars    hooks.raster-core/import-vars
+   raster.ode/import-vars    hooks.raster-core/import-vars
+   raster.gpu/import-vars    hooks.raster-core/import-vars}}
+
+ :config-in-ns
+ {;; Entry-point namespaces use import-vars (intern at runtime) — symbols
+  ;; appear bare in macro calls but are quoted, not resolved
+  raster.sci {:linters {:unresolved-symbol {:level :off}}}
+  raster.ad  {:linters {:unresolved-symbol {:level :off}}}
+  raster.ode {:linters {:unresolved-symbol {:level :off}}}
+  raster.gpu {:linters {:unresolved-symbol {:level :off}}}
+  ;; Type hierarchy namespaces define symbols via deftm from other ns
+  raster.types.number-types {:linters {:unresolved-symbol {:level :off}}}
+  raster.types.algebraic-types {:linters {:unresolved-symbol {:level :off}}}
+  raster.types.promote   {:linters {:unresolved-symbol {:level :off}}}
+  raster.types.traits    {:linters {:unresolved-symbol {:level :off}}}
+  ;; Meander pattern matching — pattern syntax is not valid Clojure binding forms
+  raster.compiler.ir.dialects {:linters {:unresolved-symbol {:level :off}
+                                          :syntax {:level :off}}}
+  ;; Meander rule patterns
+  raster.compiler.passes.scalar.rules {:linters {:unresolved-symbol {:level :off}
+                                                  :unused-private-var {:level :off}}}
+  ;; Pattern matching in simplify (quoted forms as patterns)
+  raster.compiler.passes.scalar.simplify {:linters {:unresolved-symbol {:level :off}}}
+  ;; Conditional Valhalla types
+  raster.types.float16 {:linters {:unresolved-symbol {:level :off}}}
+  ;; GPU ABM uses par macros with nested deftm scoping
+  raster.abm.phases {:linters {:unresolved-symbol {:level :off}}}
+  raster.abm.gpu {:linters {:unresolved-symbol {:level :off}}}
+  ;; Vulkan uses macro-generated bindings
+  raster.vk.mem     {:linters {:unresolved-symbol {:level :off}}}
+  raster.vk.mesh    {:linters {:unresolved-symbol {:level :off}}}
+  raster.vk.stream  {:linters {:unresolved-symbol {:level :off}}}
+  raster.vk.texture {:linters {:unresolved-symbol {:level :off}}}
+  ;; with-mapped-buffer macro introduces bindings kondo can't see
+  asteroids.core {:linters {:unresolved-symbol {:exclude [bb]}}}
+  ;; deftm dispatch params are used for type dispatch, not in bodies
+  asteroids.shapes {:linters {:unused-binding {:level :off}}}}
+
+ :linters
+ {:redefined-var
+  {:level :off}
+
+  ;; deftm is multi-dispatch: each (deftm + [a :- T1 ...]) defines one method,
+  ;; kondo only sees the last defn and reports wrong arity for other overloads
+  :invalid-arity
+  {:level :off}
+
+  :unresolved-namespace
+  {:exclude
+   ;; requiring-resolve patterns — namespaces loaded dynamically
+   [raster.compiler.core.specialize
+    raster.compiler.backend.gpu.par-opencl
+    raster.compiler.backend.jvm.par-simd
+    raster.compiler.passes.parallel.par-redetect
+    raster.compiler.pipeline
+    pattern.types]}}}

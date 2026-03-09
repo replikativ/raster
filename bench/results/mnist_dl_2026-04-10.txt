@@ -1,0 +1,52 @@
+WARNING: Using incubator modules: jdk.incubator.vector
+Registering annotations from typed.ann.clojure...
+Registering annotations from typed.ann.clojure...
+Registering extensions from typed.clj.ext.clojure.core...
+Registering extensions from typed.ext.clojure.spec.alpha...
+Registering extensions from typed.clj.ext.clojure.core.typed...
+Registering extensions from typed.clj.ext.clojure.core.typed.unsafe...
+DEPRECATED SYNTAX (NO_SOURCE_PATH): DEPRECATED: Using integer 0 for object id. Use named variables instead.
+DEPRECATED SYNTAX (NO_SOURCE_PATH): DEPRECATED: Using integer 0 for object id. Use named variables instead.
+DEPRECATED SYNTAX (NO_SOURCE_PATH): DEPRECATED: Using integer 0 for object id. Use named variables instead.
+
+Intel oneMKL ERROR: Parameter 9 was incorrect on entry to cblas_sgemm.
+=== Raster MNIST DL Benchmark (compiled pipeline + reverse-mode AD) ===
+    JDK: 27-internal
+Loading MNIST... done (14.0s)
+
+── MLP 784-128-10 f64 ──
+  Compiling... Registering :var-type-providers from typedclojure_config's...
+done (11.1s)
+  Micro-bench (3000 warmup, 5000 timed)... 153 µs/step
+  Warming up... done
+  Epoch 1  loss=30.9323  acc=10.28%  time=8.2s  (136 µs/step)
+
+── MLP 784-128-10 f32 ──
+  Compiling... done (1.0s)
+  Micro-bench (3000 warmup, 5000 timed)... 79 µs/step
+  Warming up... done
+  Epoch 1  loss=0.2022  acc=96.63%  time=4.6s  (77 µs/step)
+
+── LeNet-5 f64 ──
+  Compiling... done (1.2s)
+  Micro-bench (500 warmup, 2000 timed)... 228 µs/step
+  Warming up... done
+  Epoch 1  loss=31.1707  acc=9.74%  time=13.3s  (222 µs/step)
+
+── LeNet-5 f32 ──
+  Compiling... 
+Intel oneMKL ERROR: Parameter 9 was incorrect on entry to cblas_sgemm.
+
+Intel oneMKL ERROR: Parameter 9 was incorrect on entry to cblas_sgemm.
+done (1.9s)
+  Micro-bench (500 warmup, 2000 timed)... 164 µs/step
+  Warming up... done
+  Epoch 1  loss=0.1317  acc=97.45%  time=8.9s  (148 µs/step)
+
+── Reference: JAX CPU (same machine) ──
+  MLP f64:   86 µs/step
+  MLP f32:   50 µs/step
+  LeNet f64: 370 µs/step
+  LeNet f32: 356 µs/step
+
+Done.

@@ -1,0 +1,11 @@
+=== DP5 Lorenz attractor, t=[0,100], atol=1e-8, rtol=1e-6 ===
+    10000 warmup iterations, 100 measurements
+    JDK: 27-internal
+
+  Clojure (type-hinted)               best:  434  p10:  439  med:  466  p90:  496  mean:  466
+  Raster lazy JIT (deftm)             best: 1022  p10: 1054  med: 1088  p90: 1142  mean: 1093
+  Raster compile-aot                  best:  432  p10:  437  med:  465  p90:  489  mean:  464
+
+  Reference (separate JVM, same hardware):
+    Java DP5:  ~420 us  (dev/DP5Java.java)
+    Julia DP5: ~583 us  (DifferentialEquations.jl)

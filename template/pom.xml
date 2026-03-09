@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <version>template</version>
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>org.replikativ</groupId>
+    <artifactId>raster</artifactId>
+    <packaging>jar</packaging>
+    <name>raster</name>
+    <description>Functional scientific computing for Clojure — typed multiple dispatch, AD, and GPU compilation on the JVM.</description>
+    <licenses>
+        <license>
+            <name>MIT License</name>
+            <url>https://opensource.org/licenses/MIT</url>
+        </license>
+    </licenses>
+    <scm>
+        <connection>scm:git:git@github.com:replikativ/raster.git</connection>
+        <developerConnection>scm:git:git@github.com/replikativ/raster.git</developerConnection>
+        <url>https://github.com/replikativ/raster</url>
+    </scm>
+</project>

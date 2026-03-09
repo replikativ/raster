@@ -1,0 +1,8 @@
+{:remote-repo {:git-url "https://github.com/replikativ/raster"
+               :branch "main"}
+ :quarto {:format {:html {:toc true
+                          :toc-expand 3
+                          :number-depth 1
+                          :toc-depth 4
+                          :theme :cosmo}}}
+ :base-target-path ".clay-temp"}

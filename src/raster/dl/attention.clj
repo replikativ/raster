@@ -1,0 +1,543 @@
+(ns raster.dl.attention
+  "Attention mechanisms for the Raster deep learning framework.
+
+  Provides:
+    scaled-dot-product-attention - standard QKV attention
+    multi-head-attention         - multi-head self-attention with projections
+    graph-attention              - graph attention with scatter-based message passing
+
+  All ops are deftm with rrules for reverse AD.
+  Parametric over element type T (works with both double[] and float[])."
+  (:refer-clojure :exclude [aget aset alength aclone + - * /])
+  (:require [raster.core :refer [deftm ftm]]
+            [raster.arrays :refer [aget aset alength aclone acopy! alloc-like]]
+            [raster.ad.templates :as tmpl]
+            [raster.math :as m]
+            [raster.numeric :as n :refer [+ - * /]]
+            [raster.dl.nn :as nn]
+            [raster.linalg.blas :as blas]))
+
+;; ================================================================
+;; Scaled dot-product attention (single head)
+;; Q:[seq_q, dk], K:[seq_k, dk], V:[seq_k, dv] -> output:[seq_q, dv]
+;; ================================================================
+
+(deftm scaled-dot-product-attn (All [T]
+                                    [Q :- (Array T) K :- (Array T) V :- (Array T)
+                                     seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+                                    :- (Array T)
+                                    (let [scale (/ 1.0 (n/sqrt (double dk)))
+        ;; scores = Q @ K^T / sqrt(dk) -> [seq_q, seq_k]
+                                          scores (alloc-like Q (* seq-q seq-k))
+                                          _ (blas/dgemm-nt! Q K scores seq-q dk seq-k
+                                                            (n/oftype Q 1.0) (n/oftype Q 0.0))
+        ;; Scale scores
+                                          _ (dotimes [i (* seq-q seq-k)]
+                                              (aset scores i (* (aget scores i) scale)))
+        ;; softmax over seq_k dimension for each query
+                                          _ (dotimes [i seq-q]
+                                              (let [offset (* i (int seq-k))
+                                                    max-s (loop [j 0 m (n/neg-inf-val (aget scores 0))]
+                                                            (if (< j seq-k)
+                                                              (recur (inc j) (n/max m (aget scores (+ offset j))))
+                                                              m))
+                                                    sum-exp (loop [j 0 s 0.0]
+                                                              (if (< j seq-k)
+                                                                (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                                                                  (aset scores (+ offset j) e)
+                                                                  (recur (inc j) (+ s e)))
+                                                                s))
+                                                    inv-sum (/ 1.0 sum-exp)]
+                                                (dotimes [j seq-k]
+                                                  (aset scores (+ offset j)
+                                                        (* (aget scores (+ offset j)) inv-sum)))))
+        ;; output = weights @ V -> [seq_q, dv]
+                                          out (nn/matmul scores V seq-q seq-k dv)]
+                                      out)))
+
+;; rrule for scaled-dot-product-attn (pullback operates on double[])
+(tmpl/merge-into-template! 'raster.dl.attention/scaled-dot-product-attn
+                           {:pullback-factory (fn [_result Q K V seq-q seq-k dk dv]
+                                                (fn [d-out]
+                                                  (let [seq-q (long seq-q) seq-k (long seq-k)
+                                                        dk (long dk) dv (long dv)
+                                                        scale (/ 1.0 (n/sqrt (double dk)))
+                               ;; Recompute weights
+                                                        scores (double-array (* seq-q seq-k))
+                                                        weights (double-array (* seq-q seq-k))]
+                           ;; Forward recomputation
+                                                    (dotimes [i seq-q]
+                                                      (dotimes [j seq-k]
+                                                        (let [dot (loop [d 0 acc 0.0]
+                                                                    (if (< d dk)
+                                                                      (recur (inc d) (+ acc (* (aget Q (+ (* i (int dk)) d))
+                                                                                               (aget K (+ (* j (int dk)) d)))))
+                                                                      acc))]
+                                                          (aset scores (+ (* i (int seq-k)) j) (* dot scale)))))
+                                                    (dotimes [i seq-q]
+                                                      (let [offset (* i (int seq-k))
+                                                            max-s (loop [j 0 m n/neg-inf]
+                                                                    (if (< j seq-k) (recur (inc j) (n/max m (aget scores (+ offset j)))) m))
+                                                            sum-exp (loop [j 0 s 0.0]
+                                                                      (if (< j seq-k)
+                                                                        (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                                                                          (aset weights (+ offset j) e)
+                                                                          (recur (inc j) (+ s e))) s))
+                                                            inv-sum (/ 1.0 sum-exp)]
+                                                        (dotimes [j seq-k]
+                                                          (aset weights (+ offset j)
+                                                                (* (aget weights (+ offset j)) inv-sum)))))
+                           ;; d_weights = d_out @ V^T -> [seq_q, seq_k]
+                                                    (let [d-weights (double-array (* seq-q seq-k))
+                                                          _ (blas/dgemm-nt! d-out V d-weights seq-q dv seq-k 1.0 0.0)
+                                 ;; d_V = weights^T @ d_out -> [seq_k, dv]
+                                                          dV (double-array (* seq-k dv))
+                                                          _ (blas/dgemm-tn! weights d-out dV seq-k seq-q dv 1.0 0.0)
+                                 ;; Backprop through softmax
+                                                          d-scores (double-array (* seq-q seq-k))]
+                                                      (dotimes [i seq-q]
+                                                        (let [offset (* i (int seq-k))
+                                     ;; dot(weights[i], d_weights[i])
+                                                              dot-wdw (loop [j 0 acc 0.0]
+                                                                        (if (< j seq-k)
+                                                                          (recur (inc j) (+ acc (* (aget weights (+ offset j))
+                                                                                                   (aget d-weights (+ offset j)))))
+                                                                          acc))]
+                                                          (dotimes [j seq-k]
+                                                            (aset d-scores (+ offset j)
+                                                                  (* scale (aget weights (+ offset j))
+                                                                     (- (aget d-weights (+ offset j)) dot-wdw))))))
+                             ;; dQ = d_scores @ K -> [seq_q, dk]
+                                                      (let [dQ (nn/matmul d-scores K seq-q seq-k dk)
+                                   ;; dK = d_scores^T @ Q -> [seq_k, dk]
+                                                            dK (double-array (* seq-k dk))
+                                                            _ (blas/dgemm-tn! d-scores Q dK seq-k seq-q dk 1.0 0.0)]
+                                                        [dQ dK dV nil nil nil nil])))))})
+
+;; ================================================================
+;; Causal scaled dot-product attention (for autoregressive models)
+;; Same as above but masks future positions (j > i) with -inf before softmax.
+;; ================================================================
+
+(deftm causal-scaled-dot-product-attn (All [T]
+                                           [Q :- (Array T) K :- (Array T) V :- (Array T)
+                                            seq-len :- Long dk :- Long dv :- Long]
+                                           :- (Array T)
+                                           (let [scale (/ 1.0 (n/sqrt (double dk)))
+        ;; scores = Q @ K^T / sqrt(dk) -> [seq_len, seq_len]
+                                                 scores (alloc-like Q (* seq-len seq-len))
+                                                 _ (blas/dgemm-nt! Q K scores seq-len dk seq-len
+                                                                   (n/oftype Q 1.0) (n/oftype Q 0.0))
+        ;; Scale + causal mask: set scores[i,j] = -inf for j > i
+                                                 neg-inf (n/neg-inf-val (aget scores 0))
+                                                 _ (dotimes [i seq-len]
+                                                     (let [offset (* i (int seq-len))]
+                                                       (dotimes [j seq-len]
+                                                         (aset scores (+ offset j)
+                                                               (if (> j i)
+                                                                 neg-inf
+                                                                 (* (aget scores (+ offset j)) scale))))))
+        ;; softmax over seq_len dimension for each query
+                                                 _ (dotimes [i seq-len]
+                                                     (let [offset (* i (int seq-len))
+                                                           max-s (loop [j 0 m neg-inf]
+                                                                   (if (< j seq-len)
+                                                                     (recur (inc j) (n/max m (aget scores (+ offset j))))
+                                                                     m))
+                                                           sum-exp (loop [j 0 s 0.0]
+                                                                     (if (< j seq-len)
+                                                                       (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                                                                         (aset scores (+ offset j) e)
+                                                                         (recur (inc j) (+ s e)))
+                                                                       s))
+                                                           inv-sum (/ 1.0 sum-exp)]
+                                                       (dotimes [j seq-len]
+                                                         (aset scores (+ offset j)
+                                                               (* (aget scores (+ offset j)) inv-sum)))))
+        ;; output = weights @ V -> [seq_len, dv]
+                                                 out (nn/matmul scores V seq-len seq-len dv)]
+                                             out)))
+
+;; ================================================================
+;; Causal multi-head attention (for autoregressive models like GPT-2)
+;; x:[seq_len, d_model], W{q,k,v,o}:[d_model, d_model], b{q,k,v,o}:[d_model]
+;; ================================================================
+
+(deftm causal-multi-head-attention (All [T]
+                                        [x :- (Array T) Wq :- (Array T) bq :- (Array T)
+                                         Wk :- (Array T) bk :- (Array T)
+                                         Wv :- (Array T) bv :- (Array T)
+                                         Wo :- (Array T) bo :- (Array T)
+                                         seq-len :- Long d-model :- Long n-heads :- Long]
+                                        :- (Array T)
+                                        (let [dk (quot d-model n-heads)
+                                              Q (nn/linear x Wq bq seq-len d-model d-model)
+                                              K (nn/linear x Wk bk seq-len d-model d-model)
+                                              V (nn/linear x Wv bv seq-len d-model d-model)
+                                              out (alloc-like x (* seq-len d-model))]
+                                          (dotimes [h n-heads]
+                                            (let [Qh (alloc-like Q (* seq-len dk))
+                                                  Kh (alloc-like K (* seq-len dk))
+                                                  Vh (alloc-like V (* seq-len dk))
+                                                  h-offset (* h (int dk))]
+                                              (dotimes [s seq-len]
+                                                (dotimes [d dk]
+                                                  (let [src-idx (+ (* s (int d-model)) h-offset d)]
+                                                    (aset Qh (+ (* s (int dk)) d) (aget Q src-idx))
+                                                    (aset Kh (+ (* s (int dk)) d) (aget K src-idx))
+                                                    (aset Vh (+ (* s (int dk)) d) (aget V src-idx)))))
+                                              (let [head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len dk dk)]
+                                                (dotimes [s seq-len]
+                                                  (dotimes [d dk]
+                                                    (aset out (+ (* s (int d-model)) h-offset d)
+                                                          (aget head-out (+ (* s (int dk)) d))))))))
+                                          (nn/linear out Wo bo seq-len d-model d-model))))
+
+;; ================================================================
+;; Multi-head self-attention (bidirectional, for BERT-style models)
+;; x:[seq_len, d_model], Wq/Wk/Wv:[d_model, d_model], Wo:[d_model, d_model]
+;; Separate bias parameters bq/bk/bv/bo for BERT-style models.
+;; ================================================================
+
+(deftm multi-head-attention (All [T]
+                                 [x :- (Array T) Wq :- (Array T) bq :- (Array T)
+                                  Wk :- (Array T) bk :- (Array T)
+                                  Wv :- (Array T) bv :- (Array T)
+                                  Wo :- (Array T) bo :- (Array T)
+                                  seq-len :- Long d-model :- Long n-heads :- Long]
+                                 :- (Array T)
+                                 (let [dk (quot d-model n-heads)
+        ;; Project Q, K, V: [seq_len, d_model]
+                                       Q (nn/linear x Wq bq seq-len d-model d-model)
+                                       K (nn/linear x Wk bk seq-len d-model d-model)
+                                       V (nn/linear x Wv bv seq-len d-model d-model)
+        ;; Multi-head: process each head separately and concatenate
+                                       out (alloc-like x (* seq-len d-model))]
+                                   (dotimes [h n-heads]
+                                     (let [;; Extract head h from Q, K, V
+            ;; Q_h: [seq_len, dk]
+                                           Qh (alloc-like Q (* seq-len dk))
+                                           Kh (alloc-like K (* seq-len dk))
+                                           Vh (alloc-like V (* seq-len dk))
+                                           h-offset (* h (int dk))]
+                                       (dotimes [s seq-len]
+                                         (dotimes [d dk]
+                                           (let [src-idx (+ (* s (int d-model)) h-offset d)]
+                                             (aset Qh (+ (* s (int dk)) d)
+                                                   (aget Q src-idx))
+                                             (aset Kh (+ (* s (int dk)) d)
+                                                   (aget K src-idx))
+                                             (aset Vh (+ (* s (int dk)) d)
+                                                   (aget V src-idx)))))
+        ;; Apply attention for this head
+                                       (let [head-out (scaled-dot-product-attn Qh Kh Vh seq-len seq-len dk dk)]
+          ;; Copy head output to appropriate position in concatenated output
+                                         (dotimes [s seq-len]
+                                           (dotimes [d dk]
+                                             (aset out (+ (* s (int d-model)) h-offset d)
+                                                   (aget head-out (+ (* s (int dk)) d))))))))
+    ;; Output projection
+                                   (nn/linear out Wo bo seq-len d-model d-model))))
+
+;; ================================================================
+;; KV-cache: incremental attention for autoregressive generation
+;; These are inference-only (no AD registration).
+;; ================================================================
+
+(deftm causal-attn-with-cache! (All [T]
+                                    [Q-new :- (Array T)     ;; [dk] single query vector
+                                     K-new :- (Array T)     ;; [dk] single key vector
+                                     V-new :- (Array T)     ;; [dv] single value vector
+                                     cache-K :- (Array T)   ;; [max_seq * dk] mutable KV cache
+                                     cache-V :- (Array T)   ;; [max_seq * dv] mutable KV cache
+                                     cache-pos :- Long      ;; current write position (0-indexed)
+                                     dk :- Long dv :- Long]
+                                    :- (Array T)
+  ;; 1. Write K-new, V-new into cache at cache-pos
+                                    (let [k-base (* cache-pos dk)
+                                          v-base (* cache-pos dv)]
+                                      (dotimes [d dk]
+                                        (aset cache-K (+ k-base d) (aget K-new d)))
+                                      (dotimes [d dv]
+                                        (aset cache-V (+ v-base d) (aget V-new d)))
+    ;; 2. Compute scores[j] = dot(Q-new, cache-K[j]) / sqrt(dk) for j in 0..cache-pos
+                                      (let [n-valid (+ cache-pos 1)
+                                            scale (/ 1.0 (n/sqrt (double dk)))
+          ;; Find max score for numerical stability
+                                            max-score (loop [j 0 m (n/neg-inf-val (aget Q-new 0))]
+                                                        (if (< j n-valid)
+                                                          (let [score (loop [d 0 acc 0.0]
+                                                                        (if (< d dk)
+                                                                          (recur (inc d)
+                                                                                 (+ acc (* (aget Q-new d)
+                                                                                           (aget cache-K (+ (* j dk) d)))))
+                                                                          (* acc scale)))]
+                                                            (recur (inc j) (n/max m score)))
+                                                          m))
+          ;; Compute softmax weights and weighted sum simultaneously
+          ;; First pass: exp(score - max) and accumulate sum
+                                            weights (alloc-like Q-new n-valid)
+                                            sum-exp (loop [j 0 s 0.0]
+                                                      (if (< j n-valid)
+                                                        (let [score (loop [d 0 acc 0.0]
+                                                                      (if (< d dk)
+                                                                        (recur (inc d)
+                                                                               (+ acc (* (aget Q-new d)
+                                                                                         (aget cache-K (+ (* j dk) d)))))
+                                                                        (* acc scale)))
+                                                              w (m/exp (- score max-score))]
+                                                          (aset weights j w)
+                                                          (recur (inc j) (+ s w)))
+                                                        s))
+                                            inv-sum (/ 1.0 sum-exp)
+          ;; Output = weighted sum of cache-V rows
+                                            out (alloc-like V-new dv)]
+                                        (dotimes [j n-valid]
+                                          (let [w (* (aget weights j) inv-sum)]
+                                            (dotimes [d dv]
+                                              (aset out d (+ (aget out d) (* w (aget cache-V (+ (* j dv) d))))))))
+                                        out))))
+
+(deftm causal-multi-head-attention-cached! (All [T]
+                                                [x :- (Array T)         ;; [d_model] single token embedding
+                                                 Wq :- (Array T) bq :- (Array T)
+                                                 Wk :- (Array T) bk :- (Array T)
+                                                 Wv :- (Array T) bv :- (Array T)
+                                                 Wo :- (Array T) bo :- (Array T)
+                                                 cache-K :- (Array T)   ;; [n_heads * max_seq * dk] flat
+                                                 cache-V :- (Array T)   ;; [n_heads * max_seq * dk] flat
+                                                 cache-pos :- Long
+                                                 d-model :- Long n-heads :- Long max-seq :- Long]
+                                                :- (Array T)
+                                                (let [dk (quot d-model n-heads)
+        ;; Project single token: x:[d_model] -> Q,K,V:[d_model]
+                                                      Q (nn/linear x Wq bq 1 d-model d-model)
+                                                      K (nn/linear x Wk bk 1 d-model d-model)
+                                                      V (nn/linear x Wv bv 1 d-model d-model)
+        ;; Process each head with its own cache slice
+                                                      concat-out (alloc-like x d-model)
+                                                      head-cache-size (* max-seq dk)]
+                                                  (dotimes [h n-heads]
+                                                    (let [h-offset (* h (int dk))
+                                                          cache-k-offset (* h head-cache-size)
+                                                          cache-v-offset (* h head-cache-size)
+            ;; Extract head h from Q, K, V
+                                                          Qh (alloc-like Q dk)
+                                                          Kh (alloc-like K dk)
+                                                          Vh (alloc-like V dk)]
+                                                      (dotimes [d dk]
+                                                        (aset Qh d (aget Q (+ h-offset d)))
+                                                        (aset Kh d (aget K (+ h-offset d)))
+                                                        (aset Vh d (aget V (+ h-offset d))))
+        ;; Slice into this head's cache region
+        ;; We need to pass the full cache arrays + compute offsets inside
+        ;; Since deftm can't do array slicing, use a per-head cache view
+        ;; by offsetting manually. For now, allocate per-head caches and
+        ;; copy in/out. A more optimized version would use offset arithmetic.
+                                                      (let [head-ck (alloc-like cache-K (* max-seq dk))
+                                                            head-cv (alloc-like cache-V (* max-seq dk))]
+          ;; Copy existing cache for this head
+                                                        (dotimes [i (* cache-pos dk)]
+                                                          (aset head-ck i (aget cache-K (+ cache-k-offset i))))
+                                                        (dotimes [i (* cache-pos dk)]
+                                                          (aset head-cv i (aget cache-V (+ cache-v-offset i))))
+          ;; Run cached attention
+                                                        (let [head-out (causal-attn-with-cache! Qh Kh Vh head-ck head-cv cache-pos dk dk)]
+            ;; Copy updated cache back
+                                                          (let [new-k-base (* cache-pos dk)]
+                                                            (dotimes [d dk]
+                                                              (aset cache-K (+ cache-k-offset new-k-base d)
+                                                                    (aget head-ck (+ new-k-base d)))
+                                                              (aset cache-V (+ cache-v-offset new-k-base d)
+                                                                    (aget head-cv (+ new-k-base d)))))
+            ;; Copy head output to concatenated output
+                                                          (dotimes [d dk]
+                                                            (aset concat-out (+ h-offset d) (aget head-out d)))))))
+    ;; Output projection: concat-out:[d_model] -> out:[d_model]
+                                                  (nn/linear concat-out Wo bo 1 d-model d-model))))
+
+(defn prefill-cache!
+  "Fill KV caches from a full sequence using non-cached forward pass.
+  Returns the output of the last layer for continued generation.
+
+  layers: vector of {:Wq :bq :Wk :bk :Wv :bv :Wo :bo} per layer
+  caches: vector of {:cache-K array, :cache-V array} per layer
+  x: [seq_len, d_model] input embeddings
+  seq-len, d-model, n-heads, max-seq: dimension parameters"
+  [layers caches x seq-len d-model n-heads max-seq]
+  (let [dk (quot d-model n-heads)]
+    ;; For each layer, run non-cached attention and extract K,V into caches
+    (doseq [layer-idx (range (count layers))]
+      (let [{:keys [Wk bk Wv bv]} (nth layers layer-idx)
+            {:keys [cache-K cache-V]} (nth caches layer-idx)
+            ;; Compute K,V projections for full sequence
+            K-full (nn/linear x Wk bk seq-len d-model d-model)
+            V-full (nn/linear x Wv bv seq-len d-model d-model)
+            head-cache-size (* max-seq dk)]
+        ;; Copy K,V into per-head cache slots
+        (dotimes [h n-heads]
+          (let [h-offset (* h (int dk))
+                cache-k-offset (* h head-cache-size)
+                cache-v-offset (* h head-cache-size)]
+            (dotimes [s seq-len]
+              (dotimes [d dk]
+                (let [src-idx (+ (* s (int d-model)) h-offset d)
+                      dst-idx (+ cache-k-offset (* s dk) d)]
+                  (clojure.core/aset cache-K dst-idx (clojure.core/aget K-full src-idx))
+                  (clojure.core/aset cache-V dst-idx (clojure.core/aget V-full src-idx)))))))))))
+
+;; ================================================================
+;; Graph attention (scatter-based message passing)
+;; h:[n_nodes, d_model], W:[d_model, d_model]
+;; src_edges, dst_edges: [n_edges] (long[])
+;; ================================================================
+
+(deftm graph-attention
+  [h :- (Array double)
+   Wq :- (Array double) Wk :- (Array double)
+   Wv :- (Array double) Wo :- (Array double)
+   src-edges :- (Array long) dst-edges :- (Array long)
+   n-nodes :- Long n-edges :- Long d-model :- Long]
+  :- (Array double)
+  (let [;; Project Q, K, V from node features
+        Q (nn/matmul h Wq n-nodes d-model d-model)
+        K (nn/matmul h Wk n-nodes d-model d-model)
+        V (nn/matmul h Wv n-nodes d-model d-model)
+        ;; Compute attention scores at edges
+        ;; score[e] = exp(sum_d Q[dst[e],d] * K[src[e],d] / sqrt(dk))
+        scale (/ 1.0 (n/sqrt (double d-model)))
+        scores (double-array n-edges)
+        _ (dotimes [e n-edges]
+            (let [src (aget src-edges e)
+                  dst (aget dst-edges e)
+                  dot (loop [d 0 acc 0.0]
+                        (if (< d d-model)
+                          (recur (inc d)
+                                 (+ acc (* (aget Q (+ (* dst (int d-model)) d))
+                                           (aget K (+ (* src (int d-model)) d)))))
+                          acc))]
+              (aset scores e (m/exp (n/min 5.0 (n/max -5.0 (* dot scale)))))))
+        ;; Scatter scores to get normalization Z per node
+        Z (double-array n-nodes)
+        _ (dotimes [e n-edges]
+            (let [dst (aget dst-edges e)]
+              (aset Z dst
+                    (+ (aget Z dst) (aget scores e)))))
+        ;; Compute weighted messages and scatter to nodes
+        out (double-array (* n-nodes d-model))
+        _ (dotimes [e n-edges]
+            (let [src (aget src-edges e)
+                  dst (aget dst-edges e)
+                  w (aget scores e)]
+              (dotimes [d d-model]
+                (let [dst-idx (+ (* dst (int d-model)) d)
+                      src-idx (+ (* src (int d-model)) d)]
+                  (aset out dst-idx
+                        (+ (aget out dst-idx)
+                           (* w (aget V src-idx))))))))
+        ;; Normalize: out[node] /= Z[node]
+        _ (dotimes [node n-nodes]
+            (let [z (+ (aget Z node) 1e-6)]
+              (dotimes [d d-model]
+                (let [idx (+ (* node (int d-model)) d)]
+                  (aset out idx (/ (aget out idx) z))))))]
+    ;; Output projection
+    (nn/matmul out Wo n-nodes d-model d-model)))
+
+;; ================================================================
+;; Sinusoidal positional embedding
+;; ================================================================
+
+(deftm sinusoidal-embedding [timesteps :- (Array long)
+                             n :- Long dim :- Long] :- (Array double)
+  (let [out (double-array (* n dim))
+        half-dim (quot dim 2)
+        log-scale (/ (m/log 10000.0) (double (dec half-dim)))]
+    (dotimes [t-idx n]
+      (let [t (double (aget timesteps t-idx))]
+        (dotimes [d half-dim]
+          (let [freq (m/exp (* (- (double d)) log-scale))
+                angle (* t freq)]
+            (aset out (+ (* t-idx (int dim)) d)
+                  (m/sin angle))
+            (aset out (+ (* t-idx (int dim)) half-dim d)
+                  (m/cos angle))))))
+    out))
+
+;; ================================================================
+;; Backward helper for scaled-dot-product attention
+;; ================================================================
+
+(deftm scaled-dot-product-attn-backward
+  [d-out :- (Array double)
+   Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+  :- (Array Object)
+  (let [scale (/ 1.0 (n/sqrt (double dk)))
+        ;; Recompute scores and weights
+        scores (double-array (* seq-q seq-k))
+        weights (double-array (* seq-q seq-k))]
+    (dotimes [i seq-q]
+      (dotimes [j seq-k]
+        (let [dot (loop [d 0 acc 0.0]
+                    (if (< d dk)
+                      (recur (inc d) (+ acc (* (aget Q (+ (* i (int dk)) d))
+                                               (aget K (+ (* j (int dk)) d)))))
+                      acc))]
+          (aset scores (+ (* i (int seq-k)) j) (* dot scale)))))
+    (dotimes [i seq-q]
+      (let [offset (* i (int seq-k))
+            max-s (loop [j 0 m n/neg-inf]
+                    (if (< j seq-k) (recur (inc j) (n/max m (aget scores (+ offset j)))) m))
+            sum-exp (loop [j 0 s 0.0]
+                      (if (< j seq-k)
+                        (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                          (aset weights (+ offset j) e)
+                          (recur (inc j) (+ s e))) s))
+            inv-sum (/ 1.0 sum-exp)]
+        (dotimes [j seq-k]
+          (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
+    ;; d_weights = d_out @ V^T -> [seq_q, seq_k]
+    (let [d-weights (double-array (* seq-q seq-k))
+          _ (blas/dgemm-nt! d-out V d-weights seq-q dv seq-k 1.0 0.0)
+          ;; d_V = weights^T @ d_out -> [seq_k, dv]
+          dV (double-array (* seq-k dv))
+          _ (blas/dgemm-tn! weights d-out dV seq-k seq-q dv 1.0 0.0)
+          ;; Backprop through softmax
+          d-scores (double-array (* seq-q seq-k))]
+      (dotimes [i seq-q]
+        (let [offset (* i (int seq-k))
+              dot-wdw (loop [j 0 acc 0.0]
+                        (if (< j seq-k)
+                          (recur (inc j) (+ acc (* (aget weights (+ offset j))
+                                                   (aget d-weights (+ offset j)))))
+                          acc))]
+          (dotimes [j seq-k]
+            (aset d-scores (+ offset j)
+                  (* scale (aget weights (+ offset j))
+                     (- (aget d-weights (+ offset j)) dot-wdw))))))
+      ;; dQ = d_scores @ K -> [seq_q, dk]
+      (let [dQ (nn/matmul d-scores K seq-q seq-k dk)
+            ;; dK = d_scores^T @ Q -> [seq_k, dk]
+            dK (double-array (* seq-k dk))
+            _ (blas/dgemm-tn! d-scores Q dK seq-k seq-q dk 1.0 0.0)]
+        (object-array [dQ dK dV])))))
+
+;; ================================================================
+;; Template registration for scaled-dot-product attention
+;; ================================================================
+
+(tmpl/merge-into-template! 'raster.dl.attention/scaled-dot-product-attn
+                           {:params '[Q K V seq-q seq-k dk dv] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [Q K V seq-q seq-k dk dv] _result-sym adjoint-sym gensym-fn]
+                                        (let [grads-arr (gensym-fn "attn_grads")
+                                              dQ (gensym-fn "dQ")
+                                              dK (gensym-fn "dK")
+                                              dV (gensym-fn "dV")]
+                                          [(update ctx :bindings into
+                                                   [grads-arr (list 'raster.dl.attention/scaled-dot-product-attn-backward
+                                                                    adjoint-sym Q K V seq-q seq-k dk dv)
+                                                    dQ (list 'clojure.core/aget grads-arr 0)
+                                                    dK (list 'clojure.core/aget grads-arr 1)
+                                                    dV (list 'clojure.core/aget grads-arr 2)])
+                                           [dQ dK dV nil nil nil nil]]))})

@@ -1,0 +1,2717 @@
+(ns raster.ad.reverse
+  "Reverse-mode automatic differentiation via IR transformation.
+
+  Transforms walked S-expressions (from deftm bodies) into augmented
+  code that computes both the primal value and a pullback function.
+  The pullback maps output adjoints to input adjoints.
+
+  Architecture:
+    walked S-expr → normalize → forward pass → reverse pass → [primal, pullback]
+
+  For straight-line code, uses closures-as-tape (Myia insight):
+  the pullback is a closure capturing forward intermediates.
+  No explicit tape allocation needed.
+
+  Usage:
+    (gradient f x)            ;; ∇f(x) : R^n → R
+    (vjp f x)                 ;; [f(x), pullback-fn]
+    (value+gradient f x)      ;; [f(x), ∇f(x)]"
+  (:refer-clojure :exclude [+ - * /])
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [clojure.walk :as walk]
+            [raster.ad.forward :as fwd]
+            [raster.numeric :as numeric]
+            [raster.ad.templates :as tmpl]
+            [raster.compiler.ad.bind-ctx :as bind-ctx]
+            [raster.compiler.ad.flatten :as ad-flatten]
+            [raster.compiler.core.op-descriptor :as op]
+            [raster.compiler.core.inference :as inf]
+            [raster.ad.reverse.normalize :as anf]
+            [raster.compiler.passes.scalar.inline :as inline]))
+
+;; ================================================================
+;; Inline callbacks — breaks inline↔reverse cycle.
+;; inline.clj registers these at load time.
+;; ================================================================
+
+;; ================================================================
+;; Gensym utilities for generated code
+;; ================================================================
+
+(def ^:private ^:dynamic *gensym-counter*
+  "Monotonic counter for AD-generated symbols.
+  nil means uninitialized — callers should use `with-ad-gensym`."
+  nil)
+
+(defn- ad-gensym
+  "Generate a unique symbol for AD-generated code.
+  Optional type-tag stamps :raster.type/tag metadata so downstream
+  passes can read types without re-inference."
+  ([prefix]
+   (symbol (str prefix "__" (swap! *gensym-counter* inc))))
+  ([prefix type-tag]
+   (let [sym (symbol (str prefix "__" (swap! *gensym-counter* inc)))]
+     (if type-tag
+       (vary-meta sym assoc :raster.type/tag type-tag)
+       sym))))
+
+(defmacro ^:private with-ad-gensym
+  "Ensure *gensym-counter* is bound. If already bound (non-nil), inherit it;
+  otherwise bind a fresh counter starting at 0. This allows composed AD passes
+  to share one monotonic counter, avoiding name collisions."
+  [& body]
+  `(if *gensym-counter*
+     (do ~@body)
+     (binding [*gensym-counter* (atom 0)]
+       ~@body)))
+
+;; ================================================================
+;; Nil-safe gradient accumulation
+;; ================================================================
+
+;; Polymorphic array access via raster.arrays — works for any registered
+;; array type (double[], float[], and future types like complex[]).
+;; Uses requiring-resolve to avoid hard load-order dependency.
+(def ^:private ra-aget     (delay @(requiring-resolve 'raster.arrays/aget)))
+(def ^:private ra-aset     (delay @(requiring-resolve 'raster.arrays/aset)))
+(def ^:private ra-alength  (delay @(requiring-resolve 'raster.arrays/alength)))
+(def ^:private ra-aclone   (delay @(requiring-resolve 'raster.arrays/aclone)))
+(def ^:private ra-alloc-like (delay @(requiring-resolve 'raster.arrays/alloc-like)))
+
+(defn grad-acc
+  "Nil-safe gradient accumulation. nil means zero/no gradient.
+  Returns nil only when both inputs are nil.
+  Handles mixed scalar+array: scalar is broadcast-added to array.
+  When both are arrays, uses element-wise addition."
+  [a b]
+  (cond
+    (nil? a) b
+    (nil? b) a
+    ;; scalar + array: broadcast scalar into array element-wise add
+    (and (number? a) (.isArray (class b)))
+    (let [n (long (@ra-alength b))
+          result (@ra-aclone b)]
+      (dotimes [i n]
+        (@ra-aset result i (clojure.core/+ (double a) (double (@ra-aget result i)))))
+      result)
+    (and (number? b) (.isArray (class a)))
+    (let [n (long (@ra-alength a))
+          result (@ra-aclone a)]
+      (dotimes [i n]
+        (@ra-aset result i (clojure.core/+ (double (@ra-aget result i)) (double b))))
+      result)
+    :else (numeric/+ a b)))
+
+(defn aget-grad
+  "Gradient of array element read: y = arr[i].
+  Returns a zero array of same size as arr, with dy at position i.
+  d_arr[i] = dy, d_arr[j] = 0 for j != i."
+  [arr i dy]
+  (let [n (long (@ra-alength arr))
+        g (@ra-alloc-like arr n)]
+    (@ra-aset g (int i) dy)
+    g))
+
+;; ================================================================
+;; Normalization: flatten form for uniform AD processing
+;; ================================================================
+;; After normalization:
+;; - The body is a single symbol
+;; - All if-expressions in binding inits have their branches
+;;   evaluated into separate bindings (both branches always evaluated)
+;; - A branch-flag binding stores the condition result
+;; - The if-binding selects via (if flag then-sym else-sym)
+
+(def ^:private trivial-expr? anf/trivial-expr?)
+
+(defn- anf-normalize-bindings [bindings]
+  (anf/anf-normalize-bindings bindings ad-gensym))
+
+(defn- normalize-for-ad [bindings body-exprs]
+  (anf/normalize-for-ad bindings body-exprs ad-gensym))
+
+;; ================================================================
+;; Core reverse-mode AD transform
+;; ================================================================
+
+(declare vjp)
+
+(defn- auto-make-deftm-rule
+  "Create a transient AD rule for a deftm op that has no explicit template.
+  Returns [{:pullback-factory rule-fn} canonical-op] or nil.
+  Does NOT register in the global template registry — this is a local
+  fallback for runtime AD, not a compile-time directive."
+  [op]
+  (when (qualified-symbol? op)
+    (try
+      (let [v (resolve op)
+            fn-var (or (when (and v (:raster.core/deftm-walked-body (meta v))) v)
+                       (when (and v (.endsWith ^String (name op) "-impl"))
+                         (let [base-name (subs (name op) 0 (clojure.core/- (count (name op)) 5))
+                               base-sym (symbol (namespace op) base-name)]
+                           (when-let [bv (resolve base-sym)]
+                             (when (:raster.core/deftm-walked-body (meta bv)) bv)))))
+            canonical-sym (when fn-var (symbol (str (.ns fn-var)) (str (.sym fn-var))))
+            existing-closure (when canonical-sym (tmpl/get-pullback-factory canonical-sym))]
+        (when fn-var
+          (let [rule-fn (or existing-closure
+                            (fn [_result & args]
+                              (let [[_ pb] (apply vjp fn-var args)]
+                                pb)))]
+            [{:pullback-factory rule-fn} op])))
+      (catch Exception _ nil))))
+
+(def ^:private comparison-op? op/comparison-op?)
+
+(def ^:private numeric-op->qualified
+  "Map from unqualified/core arithmetic and math ops to Dual-compatible qualified symbols.
+  Used in forward pass so Dual numbers flow through for forward-over-reverse."
+  {'+ 'raster.numeric/+, '- 'raster.numeric/-, '* 'raster.numeric/*, '/ 'raster.numeric//,
+   'clojure.core/+ 'raster.numeric/+, 'clojure.core/- 'raster.numeric/-,
+   'clojure.core/* 'raster.numeric/*, 'clojure.core// 'raster.numeric//,
+   'Math/sin 'raster.math/sin, 'Math/cos 'raster.math/cos,
+   'Math/exp 'raster.math/exp, 'Math/log 'raster.math/log,
+   'Math/sqrt 'raster.numeric/sqrt, 'Math/pow 'raster.numeric/pow,
+   'Math/tan 'raster.math/tan, 'Math/abs 'raster.numeric/abs})
+
+(defn- qualify-fwd-expr
+  "Qualify arithmetic ops in a forward-pass expression for Dual compatibility."
+  [expr]
+  (if (seq? expr)
+    (let [head (first expr)
+          qualified-head (get numeric-op->qualified head head)]
+      (cons qualified-head (rest expr)))
+    expr))
+
+(defn- free-syms-excluding
+  "Collect free symbols in an expression, excluding those in bound-set.
+  Does not count seq heads as free (they are operators)."
+  [expr bound-set]
+  (cond
+    (symbol? expr)
+    (if (contains? bound-set expr) #{} #{expr})
+
+    (seq? expr)
+    (reduce into #{} (map #(free-syms-excluding % bound-set) (rest expr)))
+
+    (vector? expr)
+    (reduce into #{} (map #(free-syms-excluding % bound-set) expr))
+
+    :else #{}))
+
+;; Forward declaration for circular dependency: gen-reverse-let <-> gen-reverse-dotimes/par
+(declare ^:private gen-reverse-dotimes)
+(declare ^:private gen-reverse-par-map)
+(declare ^:private gen-reverse-par-reduce)
+
+(defn- gen-reverse-let
+  "Generate reverse-mode AD code for a let* form.
+
+  The form is first normalized (if-branches lifted, body reduced to symbol),
+  then processed in 4 phases:
+  1. Forward pass: process bindings, track activity, record ops
+  2. Reverse pass: walk ops backwards, accumulate adjoints
+  3. Collect parameter adjoints
+  4. Assemble output: [primal, pullback-fn]"
+  [bindings body-exprs active-params]
+  (let [;; === Phase 0: Normalize ===
+        [norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
+
+        ;; === Phase 1: Forward pass ===
+        sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
+        fwd-bindings (atom [])
+        ;; Records: [{:type :call/:if/:alias, ...} ...]
+        records (atom [])
+
+        _ (doseq [[sym init-expr] (partition 2 norm-bindings)]
+            ;; Add forward binding (qualify arithmetic for Dual compatibility)
+            (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
+
+            (let [init-active?
+                  (cond
+                    ;; Literal: never active
+                    (trivial-expr? init-expr)
+                    (if (symbol? init-expr)
+                      (get @sym-activity init-expr false)
+                      false)
+
+                    ;; Function call or special form
+                    (seq? init-expr)
+                    (let [head (first init-expr)]
+                      (cond
+                        ;; Comparison: not active (returns boolean)
+                        (comparison-op? head)
+                        false
+
+                        ;; If expression: active if either branch sym is active
+                        (= 'if head)
+                        (let [[_ _test then else] init-expr]
+                          (boolean
+                           (or (and (symbol? then) (get @sym-activity then false))
+                               (and (symbol? else) (get @sym-activity else false))
+                               ;; Non-symbol branch (number literal): not active by itself
+                               )))
+
+                        ;; Par forms: active if any free variable in body is active
+                        (= 'raster.par/map! head)
+                        (let [[_ _out _idx _bound _cast body] init-expr
+                              free (free-syms-excluding body #{_idx})]
+                          (boolean (some #(get @sym-activity % false) free)))
+
+                        (= 'raster.par/reduce head)
+                        (let [[_ _acc _init _idx _bound body] init-expr
+                              free (free-syms-excluding body #{_idx _acc})]
+                          (boolean (some #(get @sym-activity % false) free)))
+
+                        ;; Loop: active if any init or body references active symbols
+                        (= 'loop head)
+                        (let [[_ bindings-vec & body-forms] init-expr
+                              pairs (partition 2 bindings-vec)
+                              loop-vars (set (map first pairs))
+                              init-exprs (map second pairs)
+                              ;; Check init expressions for active symbols
+                              init-free (reduce into #{} (map #(free-syms-excluding % #{}) init-exprs))
+                              ;; Check body for active symbols (excluding loop vars)
+                              body-free (reduce into #{} (map #(free-syms-excluding % loop-vars) body-forms))]
+                          (boolean (some #(get @sym-activity % false)
+                                         (into init-free body-free))))
+
+                        ;; Normal call: active if any arg is active
+                        :else
+                        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
+                          (boolean
+                           (some #(and (symbol? %) (get @sym-activity % false))
+                                 args)))))
+
+                    :else false)]
+
+              (swap! sym-activity assoc sym init-active?)
+
+              ;; Record for reverse pass
+              (cond
+                ;; Par map: (raster.par/map! out idx bound cast body)
+                (and (seq? init-expr) (= 'raster.par/map! (first init-expr)))
+                (let [active-set (vec (keys (filter val @sym-activity)))
+                      pm-info (assoc (gen-reverse-par-map init-expr active-set) :sym sym)]
+                  ;; Replace the forward binding with tape-augmented forward
+                  (swap! fwd-bindings
+                         (fn [bs]
+                           (let [without-last (vec (drop-last 2 bs))
+                                 tape-sym (:tape-sym pm-info)]
+                             (vec (concat without-last
+                                          [tape-sym (:forward-code pm-info)
+                                           sym nil])))))
+                  (swap! records conj pm-info))
+
+                ;; Par reduce: (raster.par/reduce acc init idx bound body)
+                (and (seq? init-expr) (= 'raster.par/reduce (first init-expr)))
+                (let [active-set (vec (keys (filter val @sym-activity)))
+                      pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)]
+                  ;; Replace the forward binding:
+                  ;; forward-code returns [tape, reduce-result] packed in object-array
+                  ;; We need to extract both the tape and the actual reduce result
+                  (swap! fwd-bindings
+                         (fn [bs]
+                           (let [without-last (vec (drop-last 2 bs))
+                                 tape-sym (:tape-sym pr-info)
+                                 pair-sym (:result-pair-sym pr-info)]
+                             (vec (concat without-last
+                                          [pair-sym (:forward-code pr-info)
+                                           tape-sym (list 'aget pair-sym 0)
+                                           sym (list 'aget pair-sym 1)])))))
+                  (swap! records conj pr-info))
+
+                ;; Dotimes with array mutation: native AD support
+                (and (seq? init-expr) (= 'dotimes (first init-expr)))
+                (let [active-set (vec (keys (filter val @sym-activity)))
+                      dt-info (assoc (gen-reverse-dotimes init-expr active-set) :sym sym)]
+                  ;; Replace the forward binding with tape-augmented forward
+                  (swap! fwd-bindings
+                         (fn [bs]
+                           (let [without-last (vec (drop-last 2 bs))
+                                 tape-sym (:tape-sym dt-info)]
+                             (vec (concat without-last
+                                          [tape-sym (:forward-code dt-info)
+                                           sym nil])))))
+                  (swap! records conj dt-info))
+
+                ;; Regular active bindings
+                init-active?
+                (cond
+                  ;; If expression: conditional adjoint routing
+                  (and (seq? init-expr) (= 'if (first init-expr)))
+                  (let [[_ branch-expr then-expr else-expr] init-expr]
+                    (swap! records conj
+                           {:type :if
+                            :sym sym
+                            :branch branch-expr
+                            :then then-expr
+                            :else else-expr}))
+
+                  ;; Symbol alias: pass-through
+                  (symbol? init-expr)
+                  (swap! records conj
+                         {:type :alias
+                          :sym sym
+                          :source init-expr})
+
+                  ;; Loop: cannot differentiate through raw loop/recur
+                  (and (seq? init-expr) (= 'loop (first init-expr)))
+                  (throw (ex-info
+                          (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
+                               "Use `par/reduce` for differentiable reductions, or wrap "
+                               "the loop in a deftm with an AD template.")
+                          {:sym sym :form-head 'loop}))
+
+                  ;; Function call: use AD rule from unified template registry
+                  (seq? init-expr)
+                  (let [head (first init-expr)
+                        [op args invk?] (if (= '.invk head)
+                                          [(second init-expr) (vec (nnext init-expr)) true]
+                                          [head (vec (rest init-expr)) false])
+                        resolved (or (tmpl/resolve-template op)
+                                     (auto-make-deftm-rule op))
+                        ;; Check for missing AD rule on differentiable operation
+                        has-active-args? (some #(and (symbol? %)
+                                                     (get @sym-activity % false))
+                                               args)]
+                    (when (and (not resolved) has-active-args?)
+                      (throw (ex-info (str "No AD template for `" op
+                                           "` which has active (differentiable) inputs. "
+                                           "Register an AD template or mark inputs as constant.")
+                                      {:op op :args args :sym sym
+                                       :active (filterv #(and (symbol? %)
+                                                              (get @sym-activity % false))
+                                                        args)})))
+                    (when resolved
+                      (let [[_ base-op] resolved
+                            ;; Extract arg types from mangled name (works for both .invk and direct calls)
+                            arg-tags (let [n (name (if invk? op head))
+                                           idx (.indexOf ^String n "_m_")]
+                                       (when (pos? idx)
+                                         (let [tag-str (subs n (clojure.core/+ idx 3))
+                                               ;; Remove -impl suffix if present
+                                               tag-str (if (.endsWith ^String tag-str "-impl")
+                                                         (subs tag-str 0 (clojure.core/- (count tag-str) 5))
+                                                         tag-str)]
+                                           (mapv symbol (.split ^String tag-str "_")))))]
+                        (swap! records conj
+                               {:type :call
+                                :sym sym
+                                :base-op base-op
+                                :args args
+                                :arg-tags arg-tags
+                                :active-args
+                                (set (filter #(and (symbol? %)
+                                                   (get @sym-activity % false))
+                                             args))}))))))))
+
+        ;; === Phase 2: Reverse pass ===
+        dy-sym 'dy__rad
+        adj-env (atom {body-sym [dy-sym]}) ;; seed: d(body) = dy
+        rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
+
+        _ (doseq [record (reverse @records)]
+            (let [{:keys [type sym]} record
+                  ;; Sum all adjoint contributions for this symbol
+                  ;; (dotimes/par-map/par-reduce handle their own adjoints — skip generic summation)
+                  array-type? (contains? #{:dotimes :par-map :par-reduce} type)
+                  adj-contribs (when-not array-type? (get @adj-env sym))
+                  ;; Gradient carries same type as forward variable
+                  adj-sym (when-not array-type?
+                            (ad-gensym (str "d_" (name sym))
+                                       (:raster.type/tag (meta sym))))
+                  adj-expr (cond
+                             (nil? adj-contribs) nil
+                             (= 1 (count adj-contribs)) (first adj-contribs)
+                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                           adj-contribs))
+                  _ (when adj-sym
+                      (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr])))]
+
+              ;; Skip pullback/template propagation when no gradient flows here
+              (when (or array-type? adj-contribs)
+                (case type
+                  ;; Function call: use rrule template or closure pullback
+                  :call
+                  (let [{:keys [base-op args active-args arg-tags]} record
+                        [template _] (tmpl/resolve-template base-op)
+                        ;; Only use template path when actual grad rules exist
+                        ;; (not closure-only entries which lack :grads/:grads-fn)
+                        has-template? (and template
+                                           (or (:grads template) (:grads-fn template)))]
+                    (if has-template?
+                      ;; Template path: use ctx-aware instantiation for flat bindings.
+                      ;; Backward calls are emitted as unmangled qualified symbols
+                      ;; (e.g. raster.nn/dense-backward-dW). Type resolution happens:
+                      ;; - AOT: walker's try-resolve-call mangles based on type-env
+                      ;; - Interpreted: runtime dispatch + parametric specialization
+                      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
+                                                 template args sym adj-sym @rev-ctx)]
+                        (reset! rev-ctx new-ctx)
+                        (doseq [[i grad-sym] (map-indexed vector grad-syms)]
+                          (when (and (some? grad-sym)  ;; nil = no gradient for this arg
+                                     (< i (count args))
+                                     (symbol? (nth args i))
+                                     (contains? active-args (nth args i)))
+                            (swap! adj-env update (nth args i)
+                                   (fnil conj []) grad-sym))))
+                      ;; Closure fallback — nil entries from pullback propagate as nil
+                      (let [pb-sym (ad-gensym "pb")
+                            grads-sym (ad-gensym "grads")]
+                        (swap! rev-ctx #(update % :bindings into
+                                                [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
+                                                                     (list 'quote base-op))
+                                                               sym args)
+                                                 grads-sym (list pb-sym adj-sym)]))
+                        (doseq [[i arg] (map-indexed vector args)]
+                          (when (and (symbol? arg) (contains? active-args arg))
+                            (swap! adj-env update arg
+                                   (fnil conj []) (list 'nth grads-sym i)))))))
+
+                  ;; If: route adjoint conditionally to the taken branch
+                  :if
+                  (let [{:keys [branch then else]} record]
+                    (when (and (symbol? then) (get @sym-activity then false))
+                      (swap! adj-env update then
+                             (fnil conj []) (list 'if branch adj-sym 0.0)))
+                    (when (and else (symbol? else) (get @sym-activity else false))
+                      (swap! adj-env update else
+                             (fnil conj []) (list 'if branch 0.0 adj-sym))))
+
+                  ;; Alias: pass adjoint through
+                  :alias
+                  (let [{:keys [source]} record]
+                    (when (get @sym-activity source false)
+                      (swap! adj-env update source
+                             (fnil conj []) adj-sym)))
+
+                ;; Par map: backward via par/map! for arrays, par/reduce for scalars
+                  :par-map
+                  (let [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms
+                                active-free shadow-allocs backward-maps backward-reduces
+                                tape-sym d-out-sym bound-expr]} record]
+                  ;; 1. Allocate shadow arrays for read arrays
+                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
+                  ;; 2. Bind d_out to the adjoint of the first written array
+                    (when-let [out-arr (first written-arrs)]
+                      (let [d-out-contribs (get @adj-env out-arr)]
+                        (swap! rev-ctx #(update % :bindings into
+                                                [d-out-sym (if (and d-out-contribs (= 1 (count d-out-contribs)))
+                                                             (first d-out-contribs)
+                                                             (or (first d-out-contribs) 0.0))]))))
+                  ;; 3. Emit par/map! for array gradients
+                    (doseq [bwd-map backward-maps]
+                      (swap! rev-ctx #(update % :bindings into bwd-map)))
+                  ;; 4. Emit par/reduce for scalar gradients
+                    (doseq [bwd-reduce backward-reduces]
+                      (swap! rev-ctx #(update % :bindings into bwd-reduce)))
+                  ;; 5. Wire adjoints
+                    (doseq [[arr d-sym] (map vector read-arrs d-read-arr-syms)]
+                      (swap! adj-env update arr (fnil conj []) d-sym))
+                    (doseq [[p d-sym] (map vector active-free d-scalar-syms)]
+                      (swap! adj-env update p (fnil conj []) d-sym)))
+
+                ;; Par reduce: backward via par/map! (adjoint of sum is broadcast)
+                  :par-reduce
+                  (let [{:keys [read-arrs d-read-arr-syms d-scalar-syms
+                                active-free shadow-allocs backward-maps backward-reduces
+                                tape-sym d-acc-sym bound-expr]} record]
+                  ;; 1. Allocate shadow arrays for read arrays
+                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
+                  ;; 2. Bind d_acc to the adjoint of the reduce result
+                    (let [d-acc-contribs (get @adj-env sym)]
+                      (swap! rev-ctx #(update % :bindings into
+                                              [d-acc-sym (if (and d-acc-contribs (= 1 (count d-acc-contribs)))
+                                                           (first d-acc-contribs)
+                                                           (or (first d-acc-contribs) 0.0))])))
+                  ;; 3. Emit par/map! for array gradients
+                    (doseq [bwd-map backward-maps]
+                      (swap! rev-ctx #(update % :bindings into bwd-map)))
+                  ;; 4. Emit par/reduce for scalar gradients
+                    (doseq [bwd-reduce backward-reduces]
+                      (swap! rev-ctx #(update % :bindings into bwd-reduce)))
+                  ;; 5. Wire adjoints
+                    (doseq [[arr d-sym] (map vector read-arrs d-read-arr-syms)]
+                      (swap! adj-env update arr (fnil conj []) d-sym))
+                    (doseq [[p d-sym] (map vector active-free d-scalar-syms)]
+                      (swap! adj-env update p (fnil conj []) d-sym)))
+
+                ;; Dotimes: generate backward loop through tape
+                  :dotimes
+                  (let [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms
+                                active-free shadow-allocs backward-loop tape-sym
+                                d-out-sym n-bwd-sym bound-expr]} record]
+                  ;; 1. Allocate shadow arrays for read arrays
+                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
+                  ;; 2. Bind d_out to the adjoint of the first written array
+                    (when-let [out-arr (first written-arrs)]
+                      (let [d-out-contribs (get @adj-env out-arr)]
+                        (swap! rev-ctx #(update % :bindings into
+                                                [d-out-sym (if (and d-out-contribs (= 1 (count d-out-contribs)))
+                                                             (first d-out-contribs)
+                                                             (or (first d-out-contribs) 0.0))]))))
+                  ;; 3. Bind n_bwd to the bound expression
+                    (swap! rev-ctx #(update % :bindings into [n-bwd-sym bound-expr]))
+                  ;; 4. Run the backward loop
+                    (let [bwd-result-sym (ad-gensym "dt_bwd")]
+                      (swap! rev-ctx #(update % :bindings into [bwd-result-sym backward-loop]))
+                    ;; 5. Distribute results to adj-env
+                    ;; backward-loop returns [d_read_arr_0 ... d_scalar_0 ...]
+                      (doseq [[i arr] (map-indexed vector read-arrs)]
+                        (swap! adj-env update arr
+                               (fnil conj []) (list 'nth bwd-result-sym i)))
+                      (doseq [[i p] (map-indexed vector active-free)]
+                        (swap! adj-env update p
+                               (fnil conj [])
+                               (list 'nth bwd-result-sym (clojure.core/+ (count read-arrs) i)))))))))) ;; close (when (or array-type? adj-contribs) ...)
+
+        ;; === Phase 3: Collect parameter adjoints ===
+        param-adj-syms (atom [])
+
+        _ (doseq [p active-params]
+            (let [contribs (get @adj-env p)
+                  adj-sym (ad-gensym (str "d_" (name p))
+                                     (:raster.type/tag (meta p)))
+                  adj-expr (cond
+                             ;; No contributions → nil (zero/absent gradient).
+                             ;; nil is type-neutral — works for both scalar and array params.
+                             (nil? contribs) 0.0
+                             (= 1 (count contribs)) (first contribs)
+                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                           contribs))]
+              (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
+              (swap! param-adj-syms conj adj-sym)))
+
+        ;; === Phase 4: Assemble ===
+        pullback-body
+        (list 'let* (vec (:bindings @rev-ctx))
+              (vec @param-adj-syms))
+        pullback-fn (list 'fn* [dy-sym] pullback-body)
+
+        result-sym (ad-gensym "result")
+        augmented-bindings (vec (concat @fwd-bindings
+                                        [result-sym body-sym]))]
+    (list 'let* augmented-bindings
+          (vector result-sym pullback-fn))))
+
+;; ================================================================
+;; Loop/recur reverse-mode AD
+;; ================================================================
+
+(defn- parse-loop-form
+  "Parse a loop* form into its components.
+  Returns {:bindings [[sym init] ...], :test, :recur-args, :result-expr}
+  Expects loop body shape: (if test (recur args...) result) or vice versa."
+  [loop-form]
+  (let [[_ raw-bindings & body] loop-form
+        bindings (vec (partition 2 raw-bindings))
+        loop-syms (mapv first bindings)
+        body-expr (if (= 1 (count body)) (first body) (cons 'do body))]
+    ;; Normalize: extract if/recur/result
+    (when-not (and (seq? body-expr) (= 'if (first body-expr)))
+      (throw (ex-info "Loop body must be (if test (recur ...) result)"
+                      {:body body-expr})))
+    (let [[_ test-expr then-expr else-expr] body-expr
+          ;; Extract recur from a branch that may be wrapped in let
+          extract-recur
+          (fn [expr]
+            (cond
+              (and (seq? expr) (= 'recur (first expr)))
+              {:recur-expr expr :recur-bindings []}
+              (and (seq? expr) (#{'let 'let*} (first expr)))
+              (let [inner-bindings (vec (partition 2 (second expr)))
+                    inner-body (drop 2 expr)
+                    last-form (last inner-body)]
+                (when (and (seq? last-form) (= 'recur (first last-form)))
+                  {:recur-expr last-form :recur-bindings inner-bindings}))
+              :else nil))
+          then-recur (extract-recur then-expr)
+          else-recur (extract-recur else-expr)
+          [{:keys [recur-expr recur-bindings]} result-expr recur-in-then?]
+          (cond
+            then-recur [then-recur else-expr true]
+            else-recur [else-recur then-expr false]
+            :else (throw (ex-info "Loop body must have recur in one branch"
+                                  {:then then-expr :else else-expr})))
+          recur-args (vec (rest recur-expr))]
+      {:bindings bindings
+       :loop-syms loop-syms
+       :test-expr test-expr
+       :recur-args recur-args
+       :result-expr result-expr
+       :recur-in-then? recur-in-then?
+       :recur-bindings recur-bindings})))
+
+(defn- loop-var-activity
+  "Determine which loop vars are active.
+  A loop var is active if its init expression OR recur update expression
+  references any active param or another active loop var.
+  Also traces through recur-bindings (let bindings lifted from the recur branch).
+  Uses fixed-point iteration."
+  [bindings recur-args active-params & [recur-bindings]]
+  (let [loop-syms (mapv first bindings)
+        active-set (atom (set active-params))
+        ;; Collect free symbols in an expression
+        free-syms (fn free-syms [expr]
+                    (cond
+                      (symbol? expr) #{expr}
+                      (seq? expr) (reduce into #{} (map free-syms (rest expr)))
+                      :else #{}))
+        ;; Build a dependency map for recur-bindings: {sym -> #{dep-syms}}
+        rb-deps (into {} (map (fn [[sym expr]] [sym (free-syms expr)])
+                              (or recur-bindings [])))
+        ;; Expand a set of symbols through recur-binding dependencies
+        expand-through-rb (fn [syms]
+                            (loop [expanded syms]
+                              (let [new-syms (reduce (fn [acc [rb-sym rb-deps]]
+                                                       (if (contains? acc rb-sym)
+                                                         (into acc rb-deps)
+                                                         acc))
+                                                     expanded rb-deps)]
+                                (if (= new-syms expanded) expanded (recur new-syms)))))
+        changed? (atom true)]
+    ;; Also mark recur-binding symbols as active if their deps are active
+    (doseq [[rb-sym rb-dep-syms] rb-deps]
+      (when (some @active-set rb-dep-syms)
+        (swap! active-set conj rb-sym)))
+    ;; Fixed-point: repeat until no new active vars found
+    (while @changed?
+      (reset! changed? false)
+      (doseq [[sym init] bindings
+              :let [idx (.indexOf loop-syms sym)
+                    update-expr (nth recur-args idx)
+                    init-syms (free-syms init)
+                    update-syms (expand-through-rb (free-syms update-expr))
+                    all-dep-syms (into init-syms update-syms)]]
+        (when (and (not (contains? @active-set sym))
+                   (some @active-set all-dep-syms))
+          (swap! active-set conj sym)
+          (reset! changed? true))))
+    (filterv @active-set loop-syms)))
+
+(declare gen-reverse-loop-with-let)
+(declare gen-reverse-loop*)
+
+(defn- gen-reverse-loop
+  "Generate reverse-mode AD code for a loop* form.
+
+  Strategy (Myia's closures-as-tape):
+  - Forward: run loop, at each iteration compute per-iteration pullback
+    closure via gen-reverse-let, store pullback in ArrayList
+  - Backward: iterate stored pullbacks in reverse, accumulate adjoints
+  - Active loop var adjoints chain across iterations
+  - Free param adjoints accumulate across all iterations"
+  [loop-form active-params]
+  ;; CC2 fix: if any init expressions are non-trivial (compound expressions
+  ;; that reference active params), lift them into let bindings and delegate
+  ;; to gen-reverse-loop-with-let so adjoints propagate through the init.
+  ;; E.g. (loop [a (* x 2.0) ...] ...) → (let* [a_init (* x 2.0)] (loop [a a_init ...] ...))
+  ;; Only lift inits that reference active params — (long 0) etc. stay in place.
+  (let [raw-bindings (vec (partition 2 (second loop-form)))
+        active-set (set active-params)
+        references-active? (fn refs? [expr]
+                             (cond
+                               (symbol? expr) (contains? active-set expr)
+                               (seq? expr) (some refs? (rest expr))
+                               :else false))
+        active-nontrivial (filterv (fn [[_ init]]
+                                     (and (seq? init) (references-active? init)))
+                                   raw-bindings)]
+    (if (seq active-nontrivial)
+      (let [lifted (mapv (fn [[sym init]]
+                           (let [init-sym (ad-gensym (str "init_" (name sym)))]
+                             {:sym sym :init init :init-sym init-sym}))
+                         active-nontrivial)
+            lifted-set (set (map :sym lifted))
+            let-bindings (vec (mapcat (fn [{:keys [init-sym init]}]
+                                        [init-sym init])
+                                      lifted))
+            new-loop-bindings (vec (mapcat (fn [[sym init]]
+                                             (if (contains? lifted-set sym)
+                                               (let [entry (first (filter #(= sym (:sym %)) lifted))]
+                                                 [sym (:init-sym entry)])
+                                               [sym init]))
+                                           raw-bindings))
+            new-loop-form (list* 'loop new-loop-bindings (drop 2 loop-form))]
+        (gen-reverse-loop-with-let let-bindings new-loop-form active-params))
+      (gen-reverse-loop* loop-form active-params))))
+
+(defn- gen-reverse-loop*
+  "Core reverse-mode loop transform (all init expressions are trivial)."
+  [loop-form active-params]
+  (let [{:keys [bindings loop-syms test-expr recur-args
+                result-expr recur-in-then? recur-bindings]} (parse-loop-form loop-form)
+        recur-bindings (or recur-bindings [])
+
+        ;; Determine active loop vars (include recur-binding dependencies)
+        active-loop-vars (loop-var-activity bindings recur-args active-params recur-bindings)
+
+        ;; All active symbols: active params + active loop vars
+        all-active (vec (distinct (concat active-params active-loop-vars)))
+
+        ;; Determine which loop var is the result
+        ;; (result-expr should be a loop var symbol)
+        result-var (when (symbol? result-expr) result-expr)
+
+        ;; === Per active-loop-var transform data ===
+        ;; For each active loop var, gen-reverse-let transforms its update expr.
+        ;; iter-active: only active loop vars + active params (gradients returned for these).
+        ;; All loop vars are passed to gen-reverse-let as active-params so expressions
+        ;; in recur-bindings (e.g. aget W i) can reference loop counters like i.
+        ;; Non-active loop vars get nil gradients which are harmlessly discarded.
+        iter-active (vec (distinct (concat active-loop-vars active-params)))
+
+        per-var-data
+        (mapv (fn [lv]
+                (let [idx (.indexOf loop-syms lv)
+                      update-expr (nth recur-args idx)
+                      nv-sym (ad-gensym (str "nv_" (name lv)))
+                      vpb-sym (ad-gensym (str "vpb_" (name lv)))
+                      val-sym (ad-gensym (str "val_" (name lv)))
+                      pb-sym (ad-gensym (str "pb_" (name lv)))
+                      ;; Include recur-branch let bindings so the AD transform
+                      ;; differentiates through aget/math inside the loop body.
+                      all-bindings (vec (concat (mapcat identity recur-bindings)
+                                                [nv-sym update-expr]))]
+                  {:lv lv
+                   :idx idx
+                   :nv-sym nv-sym
+                   :vpb-sym vpb-sym
+                   :val-sym val-sym
+                   :pb-sym pb-sym
+                   :transform (gen-reverse-let
+                               all-bindings
+                               [nv-sym]
+                               iter-active)}))
+              active-loop-vars)
+
+        n-alv (count active-loop-vars)
+
+        ;; Gensyms for generated code
+        pullbacks-sym (ad-gensym "pbs")
+        loop-result-sym (ad-gensym "loop_r")
+        n-sym (ad-gensym "n")
+        j-sym (ad-gensym "j")
+
+        ;; === Forward loop body ===
+        ;; At each iteration, for each active loop var:
+        ;; 1. Evaluate its transform → [new_value, pullback]
+        ;; 2. Store pullback(s)
+        ;; 3. Recur with new values
+        fwd-loop-body
+        (let [transform-bindings
+              (vec (mapcat
+                    (fn [{:keys [vpb-sym val-sym pb-sym transform]}]
+                      [vpb-sym transform
+                       val-sym (list 'nth vpb-sym 0)
+                       pb-sym (list 'nth vpb-sym 1)])
+                    per-var-data))
+
+              store-expr
+              (if (= 1 n-alv)
+                ;; Single var: store pullback directly
+                (list '.add pullbacks-sym (:pb-sym (first per-var-data)))
+                ;; Multi var: store vector of pullbacks
+                (list '.add pullbacks-sym
+                      (cons 'vector (mapv :pb-sym per-var-data))))
+
+              idx->val (into {} (map (fn [{:keys [idx val-sym]}] [idx val-sym])
+                                     per-var-data))
+              new-recur-args (mapv (fn [i arg] (get idx->val i arg))
+                                   (range) recur-args)
+
+              body (list 'let* transform-bindings
+                         (list 'do store-expr (cons 'recur new-recur-args)))
+              ;; For compound result expressions, return all loop vars + result
+              ;; so the pullback can differentiate through the result expression.
+              terminal-expr (if result-var
+                              result-expr
+                              (cons 'vector (concat loop-syms [result-expr])))]
+          (if recur-in-then?
+            (list 'if test-expr body terminal-expr)
+            (list 'if test-expr terminal-expr body)))
+
+        loop-init-bindings (vec (mapcat (fn [[sym init]] [sym init]) bindings))
+
+        ;; The forward loop body. pullbacks-sym (ArrayList) is bound at the
+        ;; OUTER scope so both forward and backward code can reference it
+        ;; without shadowing — the inline alpha-rename sees one binding.
+        forward-loop-form
+        (cons 'loop (cons loop-init-bindings (list fwd-loop-body)))
+
+        ;; === Backward loop ===
+        ;; Maintains per-loop-var adjoints (d_lv_i) and per-param adjoints (d_p_k).
+        ;; Each iteration (in reverse):
+        ;;   For each active loop var i: grads_i = pb_i(d_lv_i)
+        ;;   Cross-accumulate: new_d_lv_j = sum_i grads_i[j]
+        ;;   Param accumulate: d_p_k += sum_i grads_i[N+k]
+        d-lv-syms (mapv (fn [lv] (ad-gensym (str "d_" (name lv)))) active-loop-vars)
+        d-param-syms (mapv (fn [p] (ad-gensym (str "d_" (name p)))) active-params)
+
+        backward-body
+        (if (= 1 n-alv)
+          ;; === Single active var: optimized path (no cross-accumulation) ===
+          (let [d-lv-sym (first d-lv-syms)
+                iter-pb-sym (ad-gensym "ipb")
+                grads-sym (ad-gensym "grads")
+                grads-bindings [iter-pb-sym (list '.get pullbacks-sym j-sym)
+                                grads-sym (list iter-pb-sym d-lv-sym)]
+                new-d-lv (list 'nth grads-sym 0)
+                new-d-params (mapv (fn [i p-sym]
+                                     (list 'raster.ad.reverse/grad-acc p-sym
+                                           (list 'nth grads-sym
+                                                 (clojure.core/+ 1 i))))
+                                   (range) d-param-syms)
+                backward-recur (cons 'recur
+                                     (cons (list 'clojure.core/- j-sym 1)
+                                           (cons new-d-lv new-d-params)))]
+            (list 'let* (vec grads-bindings) backward-recur))
+
+          ;; === Multi active vars: cross-accumulate ===
+          (let [pbs-vec-sym (ad-gensym "pbs_v")
+                ;; Per-var: extract pullback, call with that var's adjoint
+                per-var-grads
+                (mapv (fn [i lv]
+                        (let [ipb-sym (ad-gensym (str "ipb_" (name lv)))
+                              ig-sym (ad-gensym (str "ig_" (name lv)))]
+                          {:ipb-sym ipb-sym
+                           :ig-sym ig-sym
+                           :bindings [ipb-sym (list 'nth pbs-vec-sym i)
+                                      ig-sym (list ipb-sym (nth d-lv-syms i))]}))
+                      (range) active-loop-vars)
+
+                ;; Cross-accumulate: new_d_lv_j = sum_i grads_i[j]
+                new-d-lv-exprs
+                (mapv (fn [j]
+                        (reduce (fn [acc pvg]
+                                  (list 'raster.ad.reverse/grad-acc acc
+                                        (list 'nth (:ig-sym pvg) j)))
+                                (list 'nth (:ig-sym (first per-var-grads)) j)
+                                (rest per-var-grads)))
+                      (range n-alv))
+
+                ;; Param accumulate: d_p_k += sum_i grads_i[N+k]
+                new-d-param-exprs
+                (mapv (fn [k d-p-sym]
+                        (let [grad-idx (clojure.core/+ n-alv k)]
+                          (reduce (fn [acc pvg]
+                                    (list 'raster.ad.reverse/grad-acc acc
+                                          (list 'nth (:ig-sym pvg) grad-idx)))
+                                  (list 'raster.ad.reverse/grad-acc d-p-sym
+                                        (list 'nth (:ig-sym (first per-var-grads))
+                                              grad-idx))
+                                  (rest per-var-grads))))
+                      (range) d-param-syms)
+
+                all-bindings (vec (concat
+                                   [pbs-vec-sym (list '.get pullbacks-sym j-sym)]
+                                   (mapcat :bindings per-var-grads)))
+
+                recur-args (cons (list 'clojure.core/- j-sym 1)
+                                 (concat new-d-lv-exprs new-d-param-exprs))]
+            (list 'let* all-bindings (cons 'recur recur-args))))
+
+        ;; === Compound result expression differentiation ===
+        ;; When result-expr is not a simple loop var, the forward loop returns
+        ;; [lv0 lv1 ... result-value]. The pullback must:
+        ;; 1. Bind final loop var values from the forward return vector
+        ;; 2. Differentiate result-expr (with final loop vars substituted)
+        ;; 3. Use the resulting adjoints to seed the backward loop
+        n-loop-syms (count loop-syms)
+
+        result-seed
+        (when-not result-var
+          (let [;; Gensyms for the final loop var values (accessible in pullback)
+                final-lv-syms (mapv (fn [lv] (ad-gensym (str "final_" (name lv))))
+                                    loop-syms)
+                ;; Substitute loop-var names in result-expr with final-lv gensyms
+                lv-subst (zipmap loop-syms final-lv-syms)
+                subst-result (walk/postwalk-replace lv-subst result-expr)
+                ;; Differentiate the substituted result-expr w.r.t. iter-active
+                ;; (active loop vars + active params), using final-lv names
+                subst-iter-active (mapv #(get lv-subst % %) iter-active)
+                res-sym (ad-gensym "res")
+                res-bindings [res-sym subst-result]
+                res-transform (gen-reverse-let res-bindings [res-sym] subst-iter-active)
+                ;; At pullback time: call the result pullback with dy__rad
+                rvpb-sym (ad-gensym "rvpb")
+                rpb-sym (ad-gensym "rpb")
+                rg-sym (ad-gensym "rgrads")
+                ;; Per-symbol seed gensyms for the backward loop init
+                lv-seed-syms (mapv (fn [lv] (ad-gensym (str "seed_" (name lv))))
+                                   active-loop-vars)
+                param-seed-syms (mapv (fn [p] (ad-gensym (str "seed_" (name p))))
+                                      active-params)]
+            {:final-lv-syms final-lv-syms
+             :pullback-bindings
+             (vec (concat
+                   ;; Bind final loop var values from the forward return vector
+                   (mapcat (fn [i s] [s (list 'nth loop-result-sym i)])
+                           (range) final-lv-syms)
+                   ;; Differentiate result expr and call pullback
+                   [rvpb-sym res-transform
+                    rpb-sym (list 'nth rvpb-sym 1)
+                    rg-sym (list rpb-sym 'dy__rad)]
+                   ;; Extract per-symbol seeds
+                   (mapcat (fn [i s] [s (list 'nth rg-sym i)])
+                           (range) lv-seed-syms)
+                   (mapcat (fn [i s] [s (list 'nth rg-sym (clojure.core/+ n-alv i))])
+                           (range) param-seed-syms)))
+             :lv-seed-syms lv-seed-syms
+             :param-seed-syms param-seed-syms}))
+
+        ;; Backward loop init: seed adjoints with dy or computed seeds.
+        backward-init
+        (vec (concat
+              [j-sym (list 'clojure.core/- n-sym 1)]
+              (if result-var
+                ;; Simple result: seed the matching loop var with dy, others nil
+                (mapcat (fn [lv d-sym]
+                          [d-sym (if (= lv result-var) 'dy__rad nil)])
+                        active-loop-vars d-lv-syms)
+                ;; Compound result: use pre-computed seed symbols
+                (mapcat (fn [d-sym seed-sym] [d-sym seed-sym])
+                        d-lv-syms (:lv-seed-syms result-seed)))
+              (if result-var
+                (mapcat (fn [s] [s nil]) d-param-syms)
+                (mapcat (fn [d-sym seed-sym] [d-sym seed-sym])
+                        d-param-syms (:param-seed-syms result-seed)))))
+
+        backward-test (list 'clojure.core/>= j-sym 0)
+
+        ;; Backward loop returns all adjoints: [d_lv_0..N-1 d_p_0..M-1]
+        backward-return (vec (concat d-lv-syms d-param-syms))
+
+        backward-loop (list 'loop backward-init
+                            (list 'if backward-test
+                                  backward-body
+                                  backward-return))
+
+        ;; === Init-expr adjoint flow ===
+        ;; After backward loop, residual d_lv values flow through init exprs
+        ;; back to params. E.g. (loop [a x ...] ...) means d_x += d_a_residual.
+        bw-sym (ad-gensym "bw")
+
+        final-param-exprs
+        (mapv (fn [k p]
+                (let [base-dp (list 'nth bw-sym (clojure.core/+ n-alv k))
+                      ;; Contributions from active loop var inits that reference this param
+                      init-contribs
+                      (keep-indexed
+                       (fn [i lv]
+                         (let [bind-idx (.indexOf loop-syms lv)
+                               [_ init-expr] (nth bindings bind-idx)]
+                           (when (and (symbol? init-expr) (= init-expr p))
+                             (list 'nth bw-sym i))))
+                       active-loop-vars)]
+                  (if (empty? init-contribs)
+                    base-dp
+                    (reduce (fn [acc c] (list 'raster.ad.reverse/grad-acc acc c))
+                            base-dp
+                            init-contribs))))
+              (range) active-params)
+
+        ;; The pullback function.
+        ;; For compound result expressions, the seed-computing bindings go
+        ;; in the pullback's let*, before the backward loop.
+        pullback-bindings
+        (vec (concat
+              (when result-seed (:pullback-bindings result-seed))
+              [n-sym (list '.size pullbacks-sym)
+               bw-sym backward-loop]))
+
+        pullback-code
+        (list 'fn* ['dy__rad]
+              (list 'let* pullback-bindings
+                    (vec final-param-exprs)))
+
+        ;; Final assembly: pbs is bound once at the outer scope, shared by
+        ;; both forward (which .add's to it) and backward (which .get/.size's it).
+        ;; No shadowing, no destructuring — alpha-rename sees one binding.
+        ;; For compound result expressions, the forward loop returns a vector
+        ;; [lv0 lv1 ... result-value]; extract the result as the last element.
+        result-value-expr (if result-var
+                            loop-result-sym
+                            (list 'nth loop-result-sym n-loop-syms))]
+    (list 'let* [pullbacks-sym (list 'java.util.ArrayList.)
+                 loop-result-sym forward-loop-form]
+          (vector result-value-expr pullback-code))))
+
+(defn- gen-reverse-loop-with-let
+  "Handle (let* [bindings...] (loop ...)) by wrapping the let bindings
+  around the loop and composing pullbacks.
+  The let bindings compute values used by the loop, and the loop
+  pullback returns adjoints for those values, which then chain
+  backward through the let bindings."
+  [let-bindings loop-form active-params]
+  (let [;; ANF-normalize the let bindings
+        anf-bindings (anf-normalize-bindings let-bindings)
+        ;; Track which let-bound symbols are active
+        sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
+        fwd-bindings (atom [])
+        records (atom [])
+
+        _ (doseq [[sym init-expr] (partition 2 anf-bindings)]
+            (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
+            (let [init-active?
+                  (cond
+                    (trivial-expr? init-expr)
+                    (if (symbol? init-expr)
+                      (get @sym-activity init-expr false)
+                      false)
+                    (seq? init-expr)
+                    (let [head (first init-expr)]
+                      (cond
+                        (comparison-op? head) false
+                        :else
+                        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
+                          (boolean
+                           (some #(and (symbol? %) (get @sym-activity % false))
+                                 args)))))
+                    :else false)]
+              (swap! sym-activity assoc sym init-active?)
+              (when init-active?
+                (cond
+                  (symbol? init-expr)
+                  (swap! records conj {:type :alias :sym sym :source init-expr})
+                  (seq? init-expr)
+                  (let [head (first init-expr)
+                        [op args] (if (= '.invk head)
+                                    [(second init-expr) (vec (nnext init-expr))]
+                                    [head (vec (rest init-expr))])
+                        resolved (or (tmpl/resolve-template op)
+                                     (auto-make-deftm-rule op))]
+                    (when resolved
+                      (let [[_ base-op] resolved]
+                        (swap! records conj
+                               {:type :call :sym sym :base-op base-op
+                                :args args
+                                :active-args (set (filter #(and (symbol? %)
+                                                                (get @sym-activity % false))
+                                                          args))}))))))))
+
+        ;; All symbols that are active after let bindings
+        ;; These are available to the loop
+        let-active-syms (filterv #(get @sym-activity % false)
+                                 (map first (partition 2 anf-bindings)))
+
+        ;; Extended active params for the loop: original params + active let bindings
+        loop-active (vec (distinct (concat active-params let-active-syms)))
+
+        ;; Transform the loop with extended active params
+        loop-transform (gen-reverse-loop loop-form loop-active)
+        ;; loop-transform returns [loop-result, pullback-fn]
+        ;; where pullback returns adjoints for loop-active
+
+        ;; Now we need to chain: loop pullback gives us adjoints for
+        ;; let-bound symbols; we reverse through let bindings to get
+        ;; adjoints for the original active-params
+
+        ;; Generate reverse pass for let bindings
+        dy-sym 'dy__rad
+        loop-vpb-sym (ad-gensym "lvpb")
+        loop-val-sym (ad-gensym "lval")
+        loop-pb-sym (ad-gensym "lpb")
+        loop-grads-sym (ad-gensym "lgrads")
+
+        ;; After calling loop pullback, we have adjoints for loop-active
+        ;; Map them to adj-env for reverse pass through let bindings
+        adj-env (atom {})
+        _ (doseq [[i sym] (map-indexed vector loop-active)]
+            (swap! adj-env assoc sym [(list 'nth loop-grads-sym i)]))
+
+        rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
+        _ (doseq [record (reverse @records)]
+            (let [{:keys [type sym]} record
+                  adj-contribs (get @adj-env sym)
+                  adj-sym (ad-gensym (str "d_" (name sym))
+                                     (:raster.type/tag (meta sym)))
+                  adj-expr (cond
+                             (nil? adj-contribs) nil
+                             (= 1 (count adj-contribs)) (first adj-contribs)
+                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                           adj-contribs))]
+              (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
+              (when adj-contribs
+                (case type
+                  :call
+                  (let [{:keys [base-op args active-args]} record
+                        [template _] (tmpl/resolve-template base-op)
+                        has-template? (and template
+                                           (or (:grads template) (:grads-fn template)))]
+                    (if has-template?
+                      ;; Template path: use ctx-aware instantiation for flat bindings
+                      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
+                                                 template args sym adj-sym @rev-ctx)]
+                        (reset! rev-ctx new-ctx)
+                        (doseq [[i grad-sym] (map-indexed vector grad-syms)]
+                          (when (and (some? grad-sym)  ;; nil = no gradient for this arg
+                                     (< i (count args))
+                                     (symbol? (nth args i))
+                                     (contains? active-args (nth args i)))
+                            (swap! adj-env update (nth args i)
+                                   (fnil conj []) grad-sym))))
+                      ;; Closure fallback
+                      (let [pb-r (ad-gensym "pb")
+                            gr-r (ad-gensym "grads")]
+                        (swap! rev-ctx #(update % :bindings into
+                                                [pb-r (list* (list 'raster.ad.templates/get-pullback-factory
+                                                                   (list 'quote base-op))
+                                                             sym args)
+                                                 gr-r (list pb-r adj-sym)]))
+                        (doseq [[i arg] (map-indexed vector args)]
+                          (when (and (symbol? arg) (contains? active-args arg))
+                            (swap! adj-env update arg
+                                   (fnil conj []) (list 'nth gr-r i)))))))
+                  :alias
+                  (let [{:keys [source]} record]
+                    (when (get @sym-activity source false)
+                      (swap! adj-env update source (fnil conj []) adj-sym)))
+                  nil))))
+
+        ;; Collect param adjoints
+        param-adj-syms (atom [])
+        _ (doseq [p active-params
+                  :let [contribs (get @adj-env p)
+                        adj-sym (ad-gensym (str "d_" (name p))
+                                           (:raster.type/tag (meta p)))
+                        adj-expr (cond
+                                   (nil? contribs) 0.0
+                                   (= 1 (count contribs)) (first contribs)
+                                   :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                                 contribs))]]
+            (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
+            (swap! param-adj-syms conj adj-sym))]
+
+    ;; Assemble: let bindings (forward) + loop + pullback composition
+    (list 'let* (vec (concat @fwd-bindings
+                             [loop-vpb-sym loop-transform
+                              loop-val-sym (list 'nth loop-vpb-sym 0)
+                              loop-pb-sym (list 'nth loop-vpb-sym 1)]))
+          (vector loop-val-sym
+                  (list 'fn* [dy-sym]
+                        (list 'let* (vec (concat
+                                          [loop-grads-sym (list loop-pb-sym dy-sym)]
+                                          (:bindings @rev-ctx)))
+                              (vec @param-adj-syms)))))))
+
+;; ================================================================
+;; Dotimes reverse-mode AD (array mutation patterns)
+;; ================================================================
+
+(defn- parse-dotimes-form
+  "Parse a dotimes form into its components.
+  Returns {:counter-sym, :bound-expr, :body}."
+  [form]
+  (let [[_ [counter-sym bound-expr] & body] form]
+    {:counter-sym counter-sym
+     :bound-expr bound-expr
+     :body (if (= 1 (count body)) (first body) (cons 'do body))}))
+
+(defn- analyze-dotimes-body
+  "Analyze a dotimes body for aset/aget operations.
+  Returns {:scalar-bindings [[sym init] ...], :asets [...], :agets [...],
+           :free-syms #{...}}."
+  [body counter-sym]
+  (let [;; Extract let* bindings if present
+        [bindings body-result]
+        (if (and (seq? body) (#{'let 'let*} (first body)))
+          [(partition 2 (second body)) (last (drop 2 body))]
+          [[] body])
+
+        asets (atom [])
+        agets (atom [])
+        scalar-bindings (atom [])
+
+        _ (doseq [[sym init] bindings]
+            (cond
+              ;; aget: record and keep as binding
+              (and (seq? init)
+                   (op/aget-op?
+                    (first init)))
+              (do (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
+                  (swap! scalar-bindings conj [sym init]))
+
+              ;; aset: record but don't keep as scalar binding
+              (and (seq? init)
+                   (op/aset-op?
+                    (first init)))
+              (swap! asets conj {:arr (nth init 1) :idx (nth init 2) :val (nth init 3)})
+
+              ;; Normal binding: keep
+              :else
+              (swap! scalar-bindings conj [sym init])))
+
+        ;; Check if body-result itself is an aset
+        _ (when (and (seq? body-result)
+                     (op/aset-op?
+                      (first body-result)))
+            (swap! asets conj {:arr (nth body-result 1)
+                               :idx (nth body-result 2)
+                               :val (nth body-result 3)}))
+
+        ;; Collect free symbols (referenced but not bound in body)
+        bound-syms (set (cons counter-sym (map first @scalar-bindings)))
+        collect-free (fn collect-free [expr]
+                       (cond
+                         (symbol? expr)
+                         (when-not (contains? bound-syms expr) #{expr})
+
+                         (seq? expr)
+                         (reduce into #{} (map collect-free (rest expr)))
+
+                         :else #{}))]
+    {:scalar-bindings @scalar-bindings
+     :asets @asets
+     :agets @agets
+     :body-result body-result
+     :free-syms (reduce into #{}
+                        (concat
+                         (map (fn [[_ init]] (collect-free init)) @scalar-bindings)
+                         (map (fn [{:keys [val]}] (collect-free val)) @asets)))}))
+
+(defn- gen-reverse-dotimes
+  "Generate reverse-mode AD code for a dotimes form with array mutation.
+
+  Strategy (closures-as-tape):
+  - Forward: run dotimes, at each iteration build pullback closure via
+    gen-reverse-let on the scalar computation, store in ArrayList tape.
+    Also perform the aset operations normally.
+  - Backward: iterate tape in reverse. For each iteration:
+    - Read d_out[i] from shadow output array
+    - Call pullback with d_out[i] → gradients for inputs
+    - Write input gradients to shadow arrays (for aget'd arrays)
+    - Accumulate scalar param gradients
+
+  The result is [nil, pullback-fn] where pullback takes a map of
+  {arr-sym → d_arr} and returns adjoints for active-params.
+
+  For use within gen-reverse-let: the dotimes record stores enough info
+  to generate the backward pass inline."
+  [dotimes-form active-params]
+  (let [{:keys [counter-sym bound-expr body]} (parse-dotimes-form dotimes-form)
+        {:keys [scalar-bindings asets agets free-syms]} (analyze-dotimes-body body counter-sym)
+
+        ;; Determine which arrays are written and read
+        written-arrs (vec (distinct (map :arr asets)))
+        read-arrs (vec (distinct (map :arr agets)))
+
+        ;; Active free symbols (scalars, not arrays, not counter)
+        active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+
+        ;; For each iteration, the scalar computation produces the value(s)
+        ;; that get aset'd. We transform these via gen-reverse-let.
+        ;; The "iter-active" set includes aget-result symbols + active free params
+        aget-syms (mapv :sym agets)
+        iter-active (vec (distinct (concat aget-syms active-free)))
+
+        ;; For each aset, get the value being written
+        ;; Build the scalar computation to differentiate:
+        ;; The bindings are the scalar-bindings (minus aget bindings),
+        ;; and the "result" is the value being written.
+        pure-scalar-bindings (vec (mapcat identity
+                                          (remove (fn [[sym _]]
+                                                    (contains? (set aget-syms) sym))
+                                                  scalar-bindings)))
+
+        ;; If we have asets, use the first aset's val as the differentiation target
+        ;; (multi-aset dotimes would need extension)
+        aset-info (first asets)
+        val-sym (when aset-info (:val aset-info))
+
+        ;; Gensyms
+        tape-sym (ad-gensym "tape")
+        vpb-sym (ad-gensym "vpb")
+        val-result-sym (ad-gensym "val")
+        pb-sym (ad-gensym "pb")
+        j-sym (ad-gensym "j")
+        n-bwd-sym (ad-gensym "n_bwd")
+
+        ;; Per-iteration scalar transform
+        ;; We need val-sym to be the "result" of the scalar computation
+        scalar-transform
+        (when (and val-sym (seq iter-active))
+          (if (seq pure-scalar-bindings)
+            (gen-reverse-let
+             (vec (concat pure-scalar-bindings [val-result-sym val-sym]))
+             [val-result-sym]
+             iter-active)
+            ;; val-sym is directly an active symbol (e.g., just aget result)
+            (gen-reverse-let
+             [val-result-sym val-sym]
+             [val-result-sym]
+             iter-active)))
+
+        ;; === Forward code ===
+        ;; (let [tape (ArrayList.)]
+        ;;   (dotimes [i n]
+        ;;     (let [xi (aget x i)    ;; original aget bindings
+        ;;           vpb (transform)   ;; [val, pullback]
+        ;;           val (nth vpb 0)
+        ;;           pb  (nth vpb 1)]
+        ;;       (.add tape pb)
+        ;;       (aset out i val)))
+        ;;   tape)
+        fwd-dotimes-body
+        (when scalar-transform
+          (let [aget-bindings (vec (mapcat (fn [{:keys [sym arr idx]}]
+                                             [sym (list 'aget arr idx)])
+                                           agets))
+                transform-bindings [vpb-sym scalar-transform
+                                    val-result-sym (list 'nth vpb-sym 0)
+                                    pb-sym (list 'nth vpb-sym 1)]
+                store-and-aset [(ad-gensym "_store") (list '.add tape-sym pb-sym)
+                                (ad-gensym "_aset") (list 'aset (:arr aset-info)
+                                                          (:idx aset-info)
+                                                          val-result-sym)]
+                all-bindings (vec (concat aget-bindings transform-bindings store-and-aset))]
+            (list 'let* all-bindings nil)))
+
+        forward-code
+        (when fwd-dotimes-body
+          (list 'let* [tape-sym (list 'java.util.ArrayList.)]
+                (list 'do
+                      (list 'dotimes [counter-sym bound-expr] fwd-dotimes-body)
+                      tape-sym)))
+
+        ;; === Backward code ===
+        ;; For each read array: shadow array d_arr
+        ;; For each scalar param: accumulator in loop
+        d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
+        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
+
+        ;; Backward loop body:
+        ;; (loop [j (- n 1) d_w_acc 0.0 ...]
+        ;;   (if (>= j 0)
+        ;;     (let [pb (.get tape j)
+        ;;           d_val (aget d_out j)
+        ;;           grads (pb d_val)]
+        ;;       (aset d_x j (nth grads 0))    ;; for aget-sourced symbols
+        ;;       (recur (- j 1) (+ d_w_acc (nth grads 1)) ...))
+        ;;     [d_x d_w_acc ...]))
+
+        ;; Map iter-active index to what it corresponds to
+        ;; iter-active = [aget-syms... active-free...]
+        ;; grads[0..len(aget-syms)-1] → aget input gradients
+        ;; grads[len(aget-syms)..] → scalar param gradients
+
+        ;; Backward loop: reads d_out, calls pullbacks, accumulates
+        d-out-sym (ad-gensym "d_out")  ;; placeholder, filled by caller
+        iter-pb-sym (ad-gensym "iter_pb")
+        d-val-sym (ad-gensym "d_val")
+        grads-iter-sym (ad-gensym "grads_iter")
+
+        bwd-body-bindings
+        (vec (concat
+              [iter-pb-sym (list '.get tape-sym j-sym)
+               d-val-sym (list 'aget d-out-sym j-sym)
+               grads-iter-sym (list iter-pb-sym d-val-sym)]
+              ;; aset into shadow arrays for aget'd inputs
+              (mapcat (fn [i aget-info d-arr-sym]
+                        (let [scatter-sym (ad-gensym "_scatter")]
+                          [scatter-sym
+                           (list 'aset d-arr-sym j-sym
+                                 (list 'nth grads-iter-sym i))]))
+                      (range) agets d-read-arr-syms)))
+
+        n-agets (count agets)
+        bwd-recur-args
+        (cons (list 'clojure.core/- j-sym 1)
+              (map-indexed (fn [i d-s]
+                             (list 'raster.ad.reverse/grad-acc
+                                   d-s
+                                   (list 'nth grads-iter-sym (clojure.core/+ n-agets i))))
+                           d-scalar-syms))
+
+        bwd-loop-body (list 'let* bwd-body-bindings (cons 'recur bwd-recur-args))
+
+        bwd-loop-init
+        (vec (concat
+              [j-sym (list 'clojure.core/- n-bwd-sym 1)]
+              (mapcat (fn [s] [s nil]) d-scalar-syms)))
+
+        bwd-return (vec (concat d-read-arr-syms d-scalar-syms))
+
+        backward-loop
+        (list 'loop bwd-loop-init
+              (list 'if (list 'clojure.core/>= j-sym 0)
+                    bwd-loop-body
+                    bwd-return))
+
+        ;; Shadow array allocations
+        shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
+                                     [d-arr-sym (list 'raster.arrays/zeros-like arr-sym
+                                                      (list 'clojure.core/alength arr-sym))])
+                                   d-read-arr-syms read-arrs))]
+
+    ;; Return: tape + metadata for the backward pass
+    ;; The backward will be assembled by the caller (gen-reverse-let)
+    ;; when it processes the :dotimes record in reverse
+    {:type :dotimes
+     :forward-code forward-code
+     :tape-sym tape-sym
+     :d-out-sym d-out-sym
+     :n-bwd-sym n-bwd-sym
+     :written-arrs written-arrs
+     :read-arrs read-arrs
+     :d-read-arr-syms d-read-arr-syms
+     :d-scalar-syms d-scalar-syms
+     :active-free active-free
+     :shadow-allocs shadow-allocs
+     :backward-loop backward-loop
+     :bound-expr bound-expr}))
+
+;; ================================================================
+;; Par map reverse-mode AD (preserves parallel structure)
+;; ================================================================
+
+(defn- analyze-par-map-body
+  "Analyze a par/map! body for aget references and free scalars.
+  Returns {:agets [{:arr sym :idx idx-sym} ...], :free-scalars [sym ...],
+           :scalar-bindings [[sym init] ...], :body-result expr}."
+  [body-expr idx-sym]
+  (let [agets (atom [])
+        scalar-bindings (atom [])
+        ;; Extract let* bindings if present
+        [bindings body-result]
+        (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
+          [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
+          [[] body-expr])]
+    ;; Scan bindings for aget patterns
+    (doseq [[sym init] bindings]
+      (if (and (seq? init)
+               (op/aget-op? (first init)))
+        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
+        (swap! scalar-bindings conj [sym init])))
+    (let [aget-syms (set (map :sym @agets))
+          bound-syms (set (cons idx-sym (concat (map first @scalar-bindings) aget-syms)))
+          free-syms (free-syms-excluding body-result bound-syms)
+          ;; Also collect free syms from scalar binding inits
+          all-free (reduce into free-syms
+                           (map (fn [[_ init]]
+                                  (free-syms-excluding init bound-syms))
+                                @scalar-bindings))]
+      {:agets @agets
+       :scalar-bindings @scalar-bindings
+       :body-result body-result
+       ;; Remove arrays that are aget'd (they're inputs, not scalars)
+       :free-syms (disj all-free idx-sym)})))
+
+(defn- gen-reverse-par-map
+  "Generate reverse-mode AD code for a raster.par/map! form.
+
+  Forward form: (raster.par/map! out idx bound cast body-expr)
+
+  Strategy (closures-as-tape, same as dotimes):
+  - Forward: run the par/map! as-is, also store per-element pullback
+    via a sequential dotimes into an object-array tape (pullbacks are closures).
+  - Backward: for array inputs, emit par/map! applying pullback[i] * d_out[i]
+    for scalar inputs, emit par/reduce summing pullback contributions.
+
+  Returns a record map for gen-reverse-let to use."
+  [par-map-form active-params]
+  (let [[_ out-sym idx-sym bound-expr cast-fn body-expr] par-map-form
+        {:keys [agets scalar-bindings body-result free-syms]}
+        (analyze-par-map-body body-expr idx-sym)
+
+        ;; Determine which arrays are written and read
+        written-arrs [out-sym]
+        read-arrs (vec (distinct (map :arr agets)))
+
+        ;; Active free symbols (scalars, not arrays, not counter)
+        active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+
+        ;; For each iteration, differentiate the scalar body
+        aget-syms (mapv :sym agets)
+        iter-active (vec (distinct (concat aget-syms active-free)))
+
+        ;; Scalar bindings minus aget bindings
+        pure-scalar-bindings (vec (mapcat identity
+                                          (remove (fn [[sym _]]
+                                                    (contains? (set aget-syms) sym))
+                                                  scalar-bindings)))
+
+        ;; Gensyms
+        tape-sym (ad-gensym "par_tape")
+        vpb-sym (ad-gensym "vpb")
+        val-result-sym (ad-gensym "val")
+        pb-sym (ad-gensym "pb")
+
+        ;; Per-iteration scalar transform (gen-reverse-let on the scalar body)
+        scalar-transform
+        (when (seq iter-active)
+          (let [binds (if (seq pure-scalar-bindings)
+                        (vec (concat pure-scalar-bindings [val-result-sym body-result]))
+                        [val-result-sym body-result])]
+            (gen-reverse-let binds [val-result-sym] iter-active)))
+
+        ;; === Forward code ===
+        ;; Run original par/map! AND build tape of pullbacks
+        fwd-dotimes-body
+        (when scalar-transform
+          (let [aget-bindings (vec (mapcat (fn [{:keys [sym arr idx]}]
+                                             [sym (list 'aget arr idx)])
+                                           agets))
+                transform-bindings [vpb-sym scalar-transform
+                                    val-result-sym (list 'nth vpb-sym 0)
+                                    pb-sym (list 'nth vpb-sym 1)]
+                store-and-aset [(ad-gensym "_store") (list 'aset tape-sym idx-sym pb-sym)
+                                (ad-gensym "_aset") (list 'aset out-sym idx-sym
+                                                          (if cast-fn
+                                                            (list cast-fn val-result-sym)
+                                                            val-result-sym))]
+                all-bindings (vec (concat aget-bindings transform-bindings store-and-aset))]
+            (list 'let* all-bindings nil)))
+
+        forward-code
+        (when fwd-dotimes-body
+          (list 'let* [tape-sym (list 'object-array bound-expr)]
+                (list 'do
+                      (list 'dotimes [idx-sym bound-expr] fwd-dotimes-body)
+                      tape-sym)))
+
+        ;; === Backward code ===
+        ;; For array inputs: par/map! that applies pullback[i] to d_out[i]
+        ;; For scalar inputs: par/reduce that accumulates scalar gradients
+        d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
+        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
+        d-out-sym (ad-gensym "d_out")
+        bwd-idx-sym (ad-gensym "bi")
+        iter-pb-sym (ad-gensym "iter_pb")
+        grads-iter-sym (ad-gensym "grads_iter")
+        d-val-sym (ad-gensym "d_val")
+
+        n-agets (count agets)
+
+        ;; Shadow array allocations
+        shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
+                                     [d-arr-sym (list 'raster.arrays/zeros-like arr-sym
+                                                      (list 'clojure.core/alength arr-sym))])
+                                   d-read-arr-syms read-arrs))
+
+        ;; Backward par/map! for each read array:
+        ;; (raster.par/map! d_arr bwd_i bound nil
+        ;;   (let* [pb (aget tape bwd_i) dv (aget d_out bwd_i) grads (pb dv)]
+        ;;     (nth grads aget-index)))
+        backward-maps
+        (vec (map-indexed
+              (fn [aget-idx [d-arr-sym _arr-sym]]
+                (let [bwd-body (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
+                                            d-val-sym (list 'aget d-out-sym bwd-idx-sym)
+                                            grads-iter-sym (list iter-pb-sym d-val-sym)]
+                                     (list 'nth grads-iter-sym aget-idx))]
+                  [d-arr-sym (list 'raster.par/map! d-arr-sym bwd-idx-sym bound-expr nil bwd-body)]))
+              (map vector d-read-arr-syms read-arrs)))
+
+        ;; Backward par/reduce for each scalar param:
+        ;; (raster.par/reduce d_s_acc 0.0 bwd_i bound
+        ;;   (let* [pb (aget tape bwd_i) dv (aget d_out bwd_i) grads (pb dv)]
+        ;;     (raster.numeric/+ d_s_acc (nth grads scalar-index))))
+        d-s-acc-sym (ad-gensym "d_s_acc")
+        backward-reduces
+        (vec (map-indexed
+              (fn [scalar-idx d-scalar-sym]
+                (let [grad-idx (clojure.core/+ n-agets scalar-idx)
+                      bwd-body (list 'let* [iter-pb-sym (list 'aget tape-sym bwd-idx-sym)
+                                            d-val-sym (list 'aget d-out-sym bwd-idx-sym)
+                                            grads-iter-sym (list iter-pb-sym d-val-sym)]
+                                     (list 'raster.numeric/+ d-s-acc-sym
+                                           (list 'nth grads-iter-sym grad-idx)))]
+                  [d-scalar-sym (with-meta
+                                  (list 'raster.par/reduce d-s-acc-sym 0.0 bwd-idx-sym bound-expr bwd-body)
+                                  {:tag 'double})]))
+              d-scalar-syms))]
+
+    {:type :par-map
+     :forward-code forward-code
+     :tape-sym tape-sym
+     :d-out-sym d-out-sym
+     :written-arrs written-arrs
+     :read-arrs read-arrs
+     :d-read-arr-syms d-read-arr-syms
+     :d-scalar-syms d-scalar-syms
+     :active-free active-free
+     :shadow-allocs shadow-allocs
+     :backward-maps backward-maps
+     :backward-reduces backward-reduces
+     :bound-expr bound-expr}))
+
+;; ================================================================
+;; Par reduce reverse-mode AD (preserves parallel structure)
+;; ================================================================
+
+(defn- analyze-par-reduce-body
+  "Analyze a par/reduce body for aget references and free scalars.
+  Similar to analyze-par-map-body but for reduce body context."
+  [body-expr idx-sym acc-sym]
+  (let [agets (atom [])
+        scalar-bindings (atom [])
+        [bindings body-result]
+        (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
+          [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
+          [[] body-expr])]
+    (doseq [[sym init] bindings]
+      (if (and (seq? init)
+               (op/aget-op? (first init)))
+        (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
+        (swap! scalar-bindings conj [sym init])))
+    (let [aget-syms (set (map :sym @agets))
+          bound-syms (set (list* idx-sym acc-sym (concat (map first @scalar-bindings) aget-syms)))
+          free-syms (free-syms-excluding body-result bound-syms)
+          all-free (reduce into free-syms
+                           (map (fn [[_ init]]
+                                  (free-syms-excluding init bound-syms))
+                                @scalar-bindings))]
+      {:agets @agets
+       :scalar-bindings @scalar-bindings
+       :body-result body-result
+       :free-syms (disj all-free idx-sym acc-sym)})))
+
+(defn- gen-reverse-par-reduce
+  "Generate reverse-mode AD code for a raster.par/reduce form.
+
+  Forward form: (raster.par/reduce acc init idx bound body-expr)
+
+  Strategy (closures-as-tape):
+  - Forward: run the reduce as-is (sequential), also store per-element
+    pullback closures in an object-array tape.
+  - Backward: for array inputs, emit par/map! applying pullback[i] * d_acc
+    for scalar inputs, emit par/reduce summing pullback contributions.
+
+  For simple reductions (acc + f(x[i])):
+  d_x[i] = d_acc * df/d(x[i]) → par/map!
+
+  Returns a record map for gen-reverse-let to use."
+  [par-reduce-form active-params]
+  (let [[_ acc-sym init-expr idx-sym bound-expr body-expr] par-reduce-form
+        {:keys [agets scalar-bindings body-result free-syms]}
+        (analyze-par-reduce-body body-expr idx-sym acc-sym)
+
+        ;; Read arrays (via aget in body)
+        read-arrs (vec (distinct (map :arr agets)))
+
+        ;; Active free symbols
+        active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+
+        ;; For each iteration, differentiate the body w.r.t. its inputs
+        ;; The body of a reduce uses acc + some per-element function
+        ;; We differentiate the body w.r.t. aget results and free scalars
+        aget-syms (mapv :sym agets)
+        ;; Include acc-sym as an active input (its adjoint chains through iterations)
+        iter-active (vec (distinct (concat [acc-sym] aget-syms active-free)))
+
+        ;; Scalar bindings minus aget bindings
+        pure-scalar-bindings (vec (mapcat identity
+                                          (remove (fn [[sym _]]
+                                                    (contains? (set aget-syms) sym))
+                                                  scalar-bindings)))
+
+        ;; Gensyms
+        tape-sym (ad-gensym "red_tape")
+        vpb-sym (ad-gensym "vpb")
+        val-result-sym (ad-gensym "val")
+        pb-sym (ad-gensym "pb")
+        fwd-idx-sym (ad-gensym "fi")
+
+        ;; Per-iteration scalar transform
+        scalar-transform
+        (when (seq iter-active)
+          (let [binds (if (seq pure-scalar-bindings)
+                        (vec (concat pure-scalar-bindings [val-result-sym body-result]))
+                        [val-result-sym body-result])]
+            (gen-reverse-let binds [val-result-sym] iter-active)))
+
+        ;; === Forward code ===
+        ;; Run the reduce sequentially, storing pullbacks in tape
+        fwd-loop-body
+        (when scalar-transform
+          (let [aget-bindings (vec (mapcat (fn [{:keys [sym arr idx]}]
+                                             [sym (list 'aget arr idx)])
+                                           agets))
+                transform-bindings [vpb-sym scalar-transform
+                                    val-result-sym (list 'nth vpb-sym 0)
+                                    pb-sym (list 'nth vpb-sym 1)]
+                store-binding [(ad-gensym "_store") (list 'aset tape-sym fwd-idx-sym pb-sym)]
+                all-bindings (vec (concat aget-bindings transform-bindings store-binding))]
+            (list 'let* all-bindings val-result-sym)))
+
+        ;; Forward code packs [tape, reduce-result] in an object-array pair.
+        ;; The caller (gen-reverse-let) unpacks tape and result from the pair.
+        reduce-result-sym (ad-gensym "red_val")
+        result-pair-sym (ad-gensym "red_pair")
+
+        forward-code
+        (when fwd-loop-body
+          (let [pair-arr-sym (ad-gensym "pair")]
+            (list 'let* [tape-sym (list 'object-array bound-expr)
+                         reduce-result-sym
+                         (list 'loop [fwd-idx-sym 0 acc-sym init-expr]
+                               (list 'if (list 'clojure.core/< fwd-idx-sym bound-expr)
+                                     (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
+                                     acc-sym))
+                         pair-arr-sym (list 'object-array 2)
+                         (ad-gensym "_s0") (list 'aset pair-arr-sym 0 tape-sym)
+                         (ad-gensym "_s1") (list 'aset pair-arr-sym 1 reduce-result-sym)]
+                  pair-arr-sym)))
+
+        ;; === Backward code ===
+        d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
+        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
+        d-acc-sym (ad-gensym "d_acc")
+        bwd-idx-sym (ad-gensym "bi")
+        iter-pb-sym (ad-gensym "iter_pb")
+        grads-iter-sym (ad-gensym "grads_iter")
+
+        n-agets (count agets)
+        ;; acc-sym is iter-active[0], so its grad is at index 0
+        ;; aget-syms are iter-active[1..n-agets], so their grads are at indices 1..n-agets
+        ;; active-free are iter-active[n-agets+1..], so grads at n-agets+1..
+
+        ;; Shadow array allocations
+        shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
+                                     [d-arr-sym (list 'raster.arrays/zeros-like arr-sym
+                                                      (list 'clojure.core/alength arr-sym))])
+                                   d-read-arr-syms read-arrs))
+
+        ;; For reduce backward: d_acc flows backward through iterations.
+        ;; At each iteration i: pullback[i] maps d_acc_out to [d_acc_in, d_aget_0, ..., d_scalar_0, ...]
+        ;; Since iterations are chained, we need reverse sequential traversal for d_acc.
+        ;; BUT for the aget arrays and scalars, each iteration's contribution is independent.
+
+        ;; The adjoint of a reduce is: for each i from n-1 to 0:
+        ;;   d_in_i = pullback_i(d_acc)[aget_index]
+        ;;   d_acc = pullback_i(d_acc)[0]  (chain rule through accumulator)
+        ;;
+        ;; Since d_acc chains, the array gradients depend on the chained d_acc.
+        ;; For a simple sum reduction (acc + x[i]):
+        ;;   pullback[i](d_acc) = [d_acc, d_acc]  (both partials are 1)
+        ;;   So d_x[i] = d_acc for all i (broadcast)
+        ;;
+        ;; In general, we need a sequential backward loop (like dotimes).
+        ;; BUT we can still emit par/map! for the independent parts IF
+        ;; the accumulator adjoint is constant (doesn't change across iterations).
+        ;;
+        ;; For most reductions (sum, weighted sum), d_acc is constant.
+        ;; For now, use a sequential backward loop (same approach as dotimes)
+        ;; but output the gradient arrays as par forms after the loop.
+
+        ;; Sequential backward loop: iterate from n-1 to 0
+        j-sym (ad-gensym "j")
+        d-val-sym (ad-gensym "d_val")
+        d-acc-chain-sym (ad-gensym "d_acc_chain")
+
+        bwd-body-bindings
+        (vec (concat
+              [iter-pb-sym (list 'aget tape-sym j-sym)
+               grads-iter-sym (list iter-pb-sym d-acc-chain-sym)]
+              ;; aset into shadow arrays for aget'd inputs
+              ;; acc is iter-active[0], aget-syms are [1..n-agets]
+              (mapcat (fn [i _aget-info d-arr-sym]
+                        (let [scatter-sym (ad-gensym "_scatter")]
+                          [scatter-sym
+                           (list 'aset d-arr-sym j-sym
+                                 (list 'nth grads-iter-sym (clojure.core/+ 1 i)))]))
+                      (range) agets d-read-arr-syms)))
+
+        ;; Recur: update j, chain d_acc through, accumulate scalar grads
+        bwd-recur-args
+        (cons (list 'clojure.core/- j-sym 1)
+              (cons ;; d_acc chains through iteration: pullback[i](d_acc)[0]
+               (list 'nth grads-iter-sym 0)
+               (map-indexed (fn [i d-s]
+                              (list 'raster.ad.reverse/grad-acc
+                                    d-s
+                                    (list 'nth grads-iter-sym
+                                          (clojure.core/+ 1 n-agets i))))
+                            d-scalar-syms)))
+
+        n-bwd-sym (ad-gensym "n_bwd")
+
+        bwd-loop-body (list 'let* bwd-body-bindings (cons 'recur bwd-recur-args))
+
+        bwd-loop-init
+        (vec (concat
+              [j-sym (list 'clojure.core/- n-bwd-sym 1)
+               d-acc-chain-sym d-acc-sym]
+              (mapcat (fn [s] [s nil]) d-scalar-syms)))
+
+        bwd-return (vec (concat d-read-arr-syms d-scalar-syms))
+
+        backward-loop
+        (list 'let* [n-bwd-sym bound-expr]
+              (list 'loop bwd-loop-init
+                    (list 'if (list 'clojure.core/>= j-sym 0)
+                          bwd-loop-body
+                          bwd-return)))
+
+        ;; For par-reduce, the backward uses a sequential loop (due to acc chaining),
+        ;; so we represent it as backward-maps (shadow arrays) from the loop result.
+        ;; The backward-reduces accumulate the scalar gradients.
+        bwd-result-sym (ad-gensym "red_bwd")]
+
+    {:type :par-reduce
+     :forward-code forward-code
+     :tape-sym tape-sym
+     :d-acc-sym d-acc-sym
+     :written-arrs []
+     :read-arrs read-arrs
+     :d-read-arr-syms d-read-arr-syms
+     :d-scalar-syms d-scalar-syms
+     :active-free active-free
+     :shadow-allocs shadow-allocs
+     ;; For par-reduce backward, we use a single backward loop
+     ;; and distribute results via nth (like dotimes).
+     ;; backward-maps: first entry runs the loop, subsequent entries extract.
+     :backward-maps
+     (vec (concat
+           [[bwd-result-sym backward-loop]]
+           (map-indexed (fn [i d-arr-sym]
+                          [d-arr-sym (list 'nth bwd-result-sym i)])
+                        d-read-arr-syms)))
+     :backward-reduces
+     (vec (map-indexed
+           (fn [i d-scalar-sym]
+             [d-scalar-sym (list 'nth bwd-result-sym (clojure.core/+ (count read-arrs) i))])
+           d-scalar-syms))
+     :bound-expr bound-expr
+     :reduce-result-sym reduce-result-sym
+     :result-pair-sym result-pair-sym}))
+
+;; ================================================================
+;; Top-level transform
+;; ================================================================
+
+(defn- extract-let-parts
+  "Extract bindings and body from a walked form.
+  Handles bare let* and nested forms."
+  [form]
+  (cond
+    (and (seq? form) (symbol? (first form))
+         (#{'let 'let*} (first form)))
+    [(second form) (nnext form)]
+
+    :else
+    [[] [form]]))
+
+(defn transform-body
+  "Transform a single walked body expression for reverse-mode AD.
+  Returns an S-expression that evaluates to [primal, pullback-fn].
+
+  active-params: ordered sequence of parameter symbols that need gradients.
+  form: the walked S-expression body.
+
+  The pullback-fn takes a scalar dy and returns a vector of
+  adjoints [d_param1 d_param2 ...] in the same order as active-params."
+  [form active-params]
+  (with-ad-gensym
+    (let [[bindings body-exprs] (extract-let-parts form)
+          ;; Check if the let body is a loop
+          body-expr-1 (when (= 1 (count body-exprs)) (first body-exprs))
+          body-is-loop? (and body-expr-1 (seq? body-expr-1)
+                             (#{'loop 'loop*} (first body-expr-1)))]
+      (cond
+        ;; let* with loop body: wrap let bindings around the loop
+        ;; and pass to gen-reverse-loop-with-let
+        (and (seq bindings) body-is-loop?)
+        (gen-reverse-loop-with-let bindings body-expr-1 (vec active-params))
+
+        ;; Has let bindings, non-loop body — use the full transform
+        (seq bindings)
+        (gen-reverse-let bindings body-exprs (vec active-params))
+
+        ;; No let — single expression
+        :else
+        (let [body-expr (first body-exprs)]
+          (cond
+            ;; Literal — zero gradient
+            (or (number? body-expr) (nil? body-expr))
+            (vector body-expr
+                    (list 'fn* ['dy__rad]
+                          (vec (repeat (count active-params) 0.0))))
+
+            ;; Symbol — gradient is 1 for that param, 0 for others
+            (symbol? body-expr)
+            (vector body-expr
+                    (list 'fn* ['dy__rad]
+                          (vec (map (fn [p] (if (= p body-expr) 'dy__rad 0.0))
+                                    active-params))))
+
+            ;; If form — route through gen-reverse-let (normalization handles it)
+            (and (seq? body-expr) (= 'if (first body-expr)))
+            (gen-reverse-let [] [body-expr] (vec active-params))
+
+            ;; Loop form
+            (and (seq? body-expr) (#{'loop 'loop*} (first body-expr)))
+            (gen-reverse-loop body-expr (vec active-params))
+
+            ;; Dotimes form — wrap in a let binding for gen-reverse-let to handle
+            (and (seq? body-expr) (= 'dotimes (first body-expr)))
+            (let [result-sym (ad-gensym "dt")]
+              (gen-reverse-let [result-sym body-expr] [result-sym]
+                               (vec active-params)))
+
+            ;; Single function call — wrap in a binding
+            (seq? body-expr)
+            (let [result-sym (ad-gensym "r")]
+              (gen-reverse-let [result-sym body-expr] [result-sym]
+                               (vec active-params)))
+
+            :else
+            (throw (ex-info "Cannot differentiate form" {:form body-expr}))))))))
+
+;; ================================================================
+;; Public API
+;; ================================================================
+
+(defn- resolve-deftm-var
+  "Resolve a deftm dispatch var to its backing mangled var with walked body.
+  Checks (in order):
+  1. Direct metadata on f-var (mangled method vars, value+grad/grad results)
+  2. Deref'd value metadata (for vars pointing to value+grad/grad IFn objects)
+  3. Dispatch table lookup (for generic dispatch vars → mangled method vars)"
+  [f-var]
+  (cond
+    ;; Direct metadata (mangled vars, IFn with metadata)
+    (:raster.core/deftm-walked-body (meta f-var))
+    f-var
+
+    ;; Deref'd value: var pointing to a value+grad/grad result
+    (and (instance? clojure.lang.Var f-var)
+         (let [val-meta (try (meta @f-var) (catch Exception _ nil))]
+           (:raster.core/deftm-walked-body val-meta)))
+    @f-var
+
+    ;; Dispatch table: generic var → mangled method
+    :else
+    (let [resolved (when-let [dt (:raster.core/dispatch-table (meta f-var))]
+                     (let [all-methods (mapcat identity (vals @dt))
+                           ns-obj (:ns (meta f-var))
+                           fn-name (:name (meta f-var))]
+                       (if (= 1 (count all-methods))
+                         ;; Single method: unambiguous
+                         (let [method (first all-methods)
+                               mangled-name (symbol (str fn-name "_m_"
+                                                         (clojure.string/join "_" (:tags method))))]
+                           (ns-resolve ns-obj mangled-name))
+                         ;; Multiple methods: cannot auto-resolve for AD
+                         (throw (ex-info (str "Ambiguous dispatch for value+grad on `" fn-name
+                                              "`: " (count all-methods) " overloads. "
+                                              "Use the mangled var directly, e.g. #'"
+                                              (ns-name ns-obj) "/" fn-name "_m_<tags>")
+                                         {:var f-var
+                                          :overloads (mapv :tags all-methods)})))))]
+      (or resolved f-var))))
+
+(def ^:private vjp-cache (atom {}))
+
+(defn- get-vjp-fn
+  "Get or compile the AD-transformed function for a deftm var.
+  Cached by [var-identity walked-body] to avoid recompiling on every call."
+  [resolved]
+  (let [m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "vjp requires a deftm var"
+                                   {:var resolved})))
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        (throw (ex-info "No walked body on var" {:var resolved})))
+        cache-key [resolved walked-body]
+        cached (get @vjp-cache cache-key)]
+    (or cached
+        (let [active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+              transformed (transform-body (first walked-body) active-params)
+              fn-form (list 'fn (vec active-params) transformed)
+              compiled-fn (eval fn-form)]
+          (swap! vjp-cache assoc cache-key compiled-fn)
+          compiled-fn))))
+
+(defn vjp
+  "Value-and-pullback for a deftm function.
+  f-var: a deftm var (dispatch or mangled).
+  args: the arguments to evaluate at.
+
+  Returns [f(args...), pullback-fn] where pullback-fn: dy -> [dx1 dx2 ...]."
+  [f-var & args]
+  (let [resolved (resolve-deftm-var f-var)
+        compiled-fn (get-vjp-fn resolved)]
+    (apply compiled-fn args)))
+
+;; ================================================================
+;; S-expression level API (for testing without deftm)
+;; ================================================================
+
+(defn grad-expr
+  "Transform a quoted S-expression for reverse-mode AD.
+  Returns the transformed S-expression that evaluates to
+  [primal, pullback-fn]."
+  [form active-params]
+  (transform-body form (vec active-params)))
+
+(defn numerical-gradient
+  "Compute gradient by finite differences (for testing).
+  f: a Clojure function of doubles.
+  args: vector of double arguments.
+  Returns vector of partial derivatives."
+  [f args & {:keys [eps] :or {eps 1e-7}}]
+  (let [n (count args)
+        f0 (apply f args)]
+    (vec (for [i (range n)]
+           (let [args+ (update args i clojure.core/+ eps)
+                 f+ (apply f args+)]
+             (clojure.core// (clojure.core/- f+ f0) eps))))))
+
+;; ================================================================
+;; Compositional AD: Reified pullbacks for reverse-over-reverse
+;; ================================================================
+;;
+;; Key idea: instead of emitting pullback as (fn* [dy] ...) closure,
+;; emit it as a flat let* form with captured forward values as explicit
+;; parameters. This makes the pullback itself differentiable by AD.
+;;
+;; Output structure:
+;;   {:primal-form   (let* [...fwd...] body-sym)
+;;    :pullback-form (let* [...rev...] [d_p1 d_p2 ...])
+;;    :pullback-params [dy captured1 captured2 ...]
+;;    :active-params [p1 p2 ...]
+;;    :captured-syms [c1 c2 ...]}
+
+(defn- collect-free-syms
+  "Collect unqualified, non-namespaced free symbols from an S-expression."
+  [e]
+  (cond (and (symbol? e) (not (namespace e))) #{e}
+        (seq? e)    (apply clojure.set/union #{} (map collect-free-syms e))
+        (vector? e) (apply clojure.set/union #{} (map collect-free-syms e))
+        :else       #{}))
+
+(defn- collect-bound-syms
+  "Collect symbols bound in a let* bindings vector."
+  [bindings-vec]
+  (set (take-nth 2 bindings-vec)))
+
+(defn- reify-pullback
+  "Transform a walked body into a reified pullback suitable for composition.
+
+  Instead of the standard [primal, (fn* [dy] ...)] output, returns a map:
+    {:primal-form     S-expr that computes the primal value
+     :pullback-form   S-expr that computes gradients (a let* form)
+     :pullback-params [dy-sym captured1 captured2 ...]
+     :active-params   [p1 p2 ...] (original function params)
+     :captured-syms   [c1 c2 ...] (forward values needed by pullback)
+     :fwd-bindings    [...] (forward pass bindings vector)}
+
+  The pullback-form can be transformed by AD for reverse-over-reverse."
+  [form active-params]
+  (with-ad-gensym
+    (let [[bindings body-exprs] (extract-let-parts form)
+          [norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
+
+          ;; === Phase 1: Forward pass (same as gen-reverse-let) ===
+          sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
+          fwd-bindings (atom [])
+          records (atom [])
+
+          _ (doseq [[sym init-expr] (partition 2 norm-bindings)]
+              (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
+              (let [init-active?
+                    (cond
+                      (trivial-expr? init-expr)
+                      (if (symbol? init-expr)
+                        (get @sym-activity init-expr false)
+                        false)
+
+                      (seq? init-expr)
+                      (let [head (first init-expr)]
+                        (cond
+                          (comparison-op? head) false
+
+                          (= 'if head)
+                          (let [[_ _test then else] init-expr]
+                            (boolean
+                             (or (and (symbol? then) (get @sym-activity then false))
+                                 (and (symbol? else) (get @sym-activity else false)))))
+
+                          :else
+                          (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
+                            (boolean
+                             (some #(and (symbol? %) (get @sym-activity % false))
+                                   args)))))
+
+                      :else false)]
+
+                (swap! sym-activity assoc sym init-active?)
+
+                (when init-active?
+                  (cond
+                    (and (seq? init-expr) (= 'if (first init-expr)))
+                    (let [[_ branch-expr then-expr else-expr] init-expr]
+                      (swap! records conj
+                             {:type :if :sym sym
+                              :branch branch-expr :then then-expr :else else-expr}))
+
+                    (symbol? init-expr)
+                    (swap! records conj {:type :alias :sym sym :source init-expr})
+
+                    (seq? init-expr)
+                    (let [head (first init-expr)
+                          [op args] (if (= '.invk head)
+                                      [(second init-expr) (vec (nnext init-expr))]
+                                      [head (vec (rest init-expr))])
+                          resolved (or (tmpl/resolve-template op)
+                                       (auto-make-deftm-rule op))]
+                      (when resolved
+                        (let [[_ base-op] resolved]
+                          (swap! records conj
+                                 {:type :call :sym sym
+                                  :base-op base-op
+                                  :args args
+                                  :active-args
+                                  (set (filter #(and (symbol? %)
+                                                     (get @sym-activity % false))
+                                               args))}))))))))
+
+          ;; === Phase 2: Reverse pass (same as gen-reverse-let) ===
+          dy-sym 'dy__rad
+          adj-env (atom {body-sym [dy-sym]})
+          rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
+
+          _ (doseq [record (reverse @records)]
+              (let [{:keys [type sym]} record
+                    adj-contribs (get @adj-env sym)
+                    adj-sym (ad-gensym (str "d_" (name sym))
+                                       (:raster.type/tag (meta sym)))
+                    adj-expr (cond
+                               (nil? adj-contribs) nil
+                               (= 1 (count adj-contribs)) (first adj-contribs)
+                               :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                             adj-contribs))
+                    _ (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))]
+
+                (when adj-contribs
+                  (case type
+                    :call
+                    (let [{:keys [base-op args active-args]} record
+                          [template _] (tmpl/resolve-template base-op)
+                          has-template? (and template
+                                             (or (:grads template) (:grads-fn template)))]
+                      (if has-template?
+                        (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
+                                                   template args sym adj-sym @rev-ctx)]
+                          (reset! rev-ctx new-ctx)
+                          (doseq [[i grad-sym] (map-indexed vector grad-syms)]
+                            (when (and (< i (count args))
+                                       (symbol? (nth args i))
+                                       (contains? active-args (nth args i)))
+                              (swap! adj-env update (nth args i)
+                                     (fnil conj []) grad-sym))))
+                        (let [pb-sym (ad-gensym "pb")
+                              grads-sym (ad-gensym "grads")]
+                          (swap! rev-ctx #(update % :bindings into
+                                                  [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
+                                                                       (list 'quote base-op))
+                                                                 sym args)
+                                                   grads-sym (list pb-sym adj-sym)]))
+                          (doseq [[i arg] (map-indexed vector args)]
+                            (when (and (symbol? arg) (contains? active-args arg))
+                              (swap! adj-env update arg
+                                     (fnil conj []) (list 'nth grads-sym i)))))))
+
+                    :if
+                    (let [{:keys [branch then else]} record]
+                      (when (and (symbol? then) (get @sym-activity then false))
+                        (swap! adj-env update then
+                               (fnil conj []) (list 'if branch adj-sym nil)))
+                      (when (and else (symbol? else) (get @sym-activity else false))
+                        (swap! adj-env update else
+                               (fnil conj []) (list 'if branch nil adj-sym))))
+
+                    :alias
+                    (let [{:keys [source]} record]
+                      (when (get @sym-activity source false)
+                        (swap! adj-env update source
+                               (fnil conj []) adj-sym)))))))
+
+          ;; === Phase 3: Collect parameter adjoints ===
+          param-adj-syms (atom [])
+
+          _ (doseq [p active-params]
+              (let [contribs (get @adj-env p)
+                    adj-sym (ad-gensym (str "d_" (name p))
+                                       (:raster.type/tag (meta p)))
+                    adj-expr (cond
+                               (nil? contribs) 0.0
+                               (= 1 (count contribs)) (first contribs)
+                               :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
+                                             contribs))]
+                (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
+                (swap! param-adj-syms conj adj-sym)))
+
+          ;; === Phase 4: Reify pullback ===
+          rev-bindings (vec (:bindings @rev-ctx))
+          pullback-body (list 'let* rev-bindings (vec @param-adj-syms))
+
+          ;; Determine captured variables:
+          ;; Free symbols in the reverse bindings that are NOT:
+          ;; - defined within the reverse bindings themselves
+          ;; - the dy symbol
+          ;; - the active params (these flow separately)
+          rev-bound (collect-bound-syms rev-bindings)
+          rev-free  (collect-free-syms rev-bindings)
+          fwd-bound (collect-bound-syms (vec @fwd-bindings))
+          ;; Captured = free in reverse bindings ∩ bound in forward bindings
+          captured  (clojure.set/intersection rev-free fwd-bound)
+          ;; Maintain deterministic order: use forward binding order
+          captured-ordered (filterv captured (take-nth 2 @fwd-bindings))
+
+          ;; Pullback params: [dy, captured1, captured2, ...]
+          pullback-params (vec (cons dy-sym captured-ordered))
+
+          ;; Standard output for backward compatibility
+          result-sym (ad-gensym "result")
+          augmented-bindings (vec (concat @fwd-bindings [result-sym body-sym]))]
+
+      {:primal-form     (list 'let* augmented-bindings result-sym)
+       :pullback-form   pullback-body
+       :pullback-params pullback-params
+       :active-params   (vec active-params)
+       :captured-syms   captured-ordered
+       :fwd-bindings    (vec @fwd-bindings)
+       :result-sym      result-sym
+       :body-sym        body-sym
+       ;; Standard [primal, pullback] for backward compat
+       :standard-form
+       (list 'let* augmented-bindings
+             (vector result-sym
+                     (list 'fn* [dy-sym] pullback-body)))})))
+
+(defn- transform-pullback
+  "Apply AD to a reified pullback form, producing second-order derivatives.
+
+  Takes a reified pullback (from reify-pullback) and differentiates the
+  pullback function itself. This enables reverse-over-reverse (RoR) AD.
+
+  diff-params: which pullback params to differentiate w.r.t.
+               Typically the original function params (subset of captured-syms).
+               The dy param is always active (it's the 'input' to the pullback).
+
+  Returns a new reified pullback map for the second-order computation."
+  [reified-pb diff-params]
+  (let [{:keys [pullback-form pullback-params]} reified-pb
+        ;; The pullback form is a let* — extract bindings and body
+        [_ bindings-vec & body-exprs] pullback-form
+        ;; diff-params should be a subset of pullback-params
+        active (set diff-params)
+        active-ordered (filterv active pullback-params)]
+    (with-ad-gensym
+      (let [;; Treat the pullback-form as a function body with pullback-params
+            ;; Build a let* wrapping for the transform
+            transformed (gen-reverse-let bindings-vec body-exprs active-ordered)]
+        {:second-order-form transformed
+         :second-order-params active-ordered
+         :original reified-pb}))))
+
+(defn- vjp-compositional
+  "Value-and-pullback with reified pullback for composition.
+
+  Like vjp, but returns a map with both the standard [value, pullback-fn]
+  and the reified pullback form for optional second-order differentiation.
+
+  Returns {:value     f(args)
+           :pullback  (fn [dy] -> [d_p1 d_p2 ...])
+           :reified   reified-pullback-map}"
+  [f-var & args]
+  (let [resolved (resolve-deftm-var f-var)
+        m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "vjp-compositional requires a deftm var"
+                                   {:var f-var})))
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        (throw (ex-info "No walked body" {:var f-var})))
+        active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+        reified (reify-pullback (first walked-body) active-params)
+        param-bindings (vec (mapcat vector active-params args))
+        ;; Eval the standard form for the actual computation
+        [value pullback] (eval (list 'let* param-bindings (:standard-form reified)))]
+    {:value value
+     :pullback pullback
+     :reified reified}))
+
+(defn compile-hvp-fn
+  "Compile a Hessian-vector product function for a scalar deftm var.
+
+  Returns (fn [args-vec v-vec] -> Hv) where Hv is the Hessian-vector product.
+  Uses reverse-over-reverse: differentiates the pullback itself.
+
+  The compiled function computes: H*v = d/dx [v^T * grad(f)(x)]
+  where H is the Hessian of f at x.
+
+  This is the key primitive for:
+  - Newton's method (solve H*d = -g for direction d)
+  - Conjugate gradient on the Hessian
+  - Trust region methods"
+  [f-var]
+  ;; Bind a shared counter for all AD passes (reify-pullback + transform-body)
+  (binding [*gensym-counter* (atom 0)]
+    (let [resolved (resolve-deftm-var f-var)
+          m (meta resolved)
+          params (or (:raster.core/deftm-params m)
+                     (throw (ex-info "compile-hvp-fn requires a deftm var" {:var f-var})))
+          walked-body (or (:raster.core/deftm-walked-body m)
+                          (throw (ex-info "No walked body" {:var f-var})))
+          active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+          n (count active-params)
+
+        ;; Phase 1: Reify the pullback
+          reified (reify-pullback (first walked-body) active-params)
+          {:keys [pullback-form pullback-params captured-syms
+                  fwd-bindings result-sym body-sym]} reified
+
+        ;; Phase 2: Differentiate the pullback w.r.t. captured params
+        ;; The pullback computes g(dy, captured...) = [d_p1 ... d_pN]
+        ;; We want d/d(captured) of v^T * g(1.0, captured...)
+        ;; = d/d(captured) of sum_i v_i * d_p_i
+        ;;
+        ;; This is the same as running the pullback's own reverse AD
+        ;; with adjoint seed = v (one per output component).
+        ;;
+        ;; But the pullback outputs a VECTOR [d_p1 ... d_pN], so we need
+        ;; to form the dot product v^T * [d_p1 ... d_pN] first, THEN
+        ;; differentiate that scalar w.r.t. the original params.
+        ;;
+        ;; Strategy: Build a form that computes v^T * grad(f)(x),
+        ;; then differentiate THAT w.r.t. x using standard AD.
+
+        ;; Build the "v-dot-grad" form:
+        ;; (let* [...fwd... dy__rad 1.0 ...rev...
+        ;;        vdg (+ (* v0 d_p1) (* v1 d_p2) ...)]
+        ;;   vdg)
+          v-syms (mapv #(symbol (str "v__" (name %))) active-params)
+          [_ rev-bindings-vec rev-body] pullback-form
+        ;; rev-body is the [d_p1 d_p2 ...] vector
+          grad-syms (vec rev-body)
+
+        ;; Build dot product: v^T * grad
+          dot-terms (mapv (fn [vi gi] (list 'raster.numeric/* vi gi))
+                          v-syms grad-syms)
+          dot-expr (if (= 1 (count dot-terms))
+                     (first dot-terms)
+                     (reduce (fn [a b] (list 'raster.numeric/+ a b))
+                             dot-terms))
+          dot-sym (symbol "vdg__hvp")
+
+        ;; Combined form: fwd + dy=1.0 + rev + dot product
+          combined-bindings (vec (concat fwd-bindings
+                                         [result-sym body-sym]
+                                         ['dy__rad 1.0]
+                                         rev-bindings-vec
+                                         [dot-sym dot-expr]))
+          combined-form (list 'let* combined-bindings dot-sym)
+
+        ;; Phase 3: Differentiate the combined form w.r.t. active-params
+        ;; This gives us d(v^T * grad(f))/d(x) = H*v
+        ;; Counter is shared — reify-pullback already consumed some,
+        ;; transform-body continues from there, no collisions.
+          hvp-transformed (transform-body combined-form active-params)
+
+        ;; Phase 4: Build the compiled function
+        ;; Parameters: [x1 x2 ... v1 v2 ...]
+          all-params (vec (concat active-params v-syms))
+          compiled-fn (eval (list 'fn all-params hvp-transformed))]
+
+    ;; Return a function that takes [args-vec v-vec] -> [value Hv-vec]
+      (fn [args-vec v-vec]
+        (let [all-args (vec (concat args-vec v-vec))
+              [_vdg_value pullback] (apply compiled-fn all-args)
+            ;; pullback(1.0) gives us [d/dx1, d/dx2, ..., d/dv1, d/dv2, ...]
+            ;; We only want the first n entries (derivatives w.r.t. x, not v)
+              all-grads (pullback 1.0)]
+          (vec (take n all-grads)))))))
+
+(defn compile-hessian-fn
+  "Compile a full Hessian matrix function for a scalar deftm var.
+
+  Returns (fn [args-vec] -> [[H11 H12...] [H21 H22...] ...])
+  Computes Hessian by n Hessian-vector products with standard basis vectors.
+
+  For large n, prefer compile-hvp-fn (O(n) vs O(n^2) cost)."
+  [f-var]
+  (let [resolved (resolve-deftm-var f-var)
+        params (:raster.core/deftm-params (meta resolved))
+        n (count params)
+        hvp-fn (compile-hvp-fn f-var)]
+    (fn [args-vec]
+      (vec (for [i (range n)]
+             (let [e-i (vec (concat (repeat i 0.0) [1.0] (repeat (clojure.core/- n i 1) 0.0)))]
+               (hvp-fn args-vec e-i)))))))
+
+;; ================================================================
+;; Composable AD operators: grad, value+grad
+;; ================================================================
+;;
+;; These return objects that work in two modes:
+;; 1. Runtime: call directly as IFn (evaluates AD-transformed code)
+;; 2. Compiled: carries ::deftm-walked-body metadata so the compiler
+;;    pipeline can inline the AD-transformed body at call sites.
+;;
+;; This makes AD composable with normal deftm code:
+;;   (deftm train-step [W x y lr] :- Double
+;;     (let [[loss d_W _ _] ((value+grad my-loss) W x y)]
+;;       (axpy! W W (- lr) d_W)
+;;       loss))
+;;
+;; When compiled via compile-aot, the pipeline inlines the
+;; AD-transformed body, giving full visibility for optimization.
+
+(defn- undevirtualize
+  "Replace .invk calls with their generic dispatch equivalents using :raster.op/original metadata.
+  (.invk mangled-impl a b) → (raster.numeric/+ a b)
+  This allows Dual numbers to propagate through the walked body."
+  [form]
+  (cond
+    (and (seq? form) (= '.invk (first form)))
+    (let [op-sym (or (:raster.op/original (meta form)) (:op (meta form)))]
+      (if op-sym
+        (apply list op-sym (map undevirtualize (drop 2 form)))
+        ;; No :op metadata — keep as-is (e.g., fn-param .invk calls)
+        (apply list (map undevirtualize form))))
+
+    (seq? form)
+    (with-meta (apply list (map undevirtualize form)) (meta form))
+
+    (vector? form)
+    (mapv undevirtualize form)
+
+    :else form))
+
+(defn- strip-primitive-casts
+  "Remove (double x), (float x) etc. casts that would fail on Dual numbers.
+  Dual dispatch handles type propagation instead."
+  [form]
+  (cond
+    (and (seq? form) (= 2 (count form))
+         (contains? #{'double 'float 'long 'int
+                      'clojure.core/double 'clojure.core/float
+                      'clojure.core/long 'clojure.core/int} (first form)))
+    (strip-primitive-casts (second form))
+
+    (seq? form)
+    (with-meta (apply list (map strip-primitive-casts form)) (meta form))
+
+    (vector? form)
+    (mapv strip-primitive-casts form)
+
+    :else form))
+
+(defn- hoist-nested-lets
+  "Hoist let expressions out of call arguments into a wrapping let*.
+  Transforms: (f (let [a e1] a) (let [b e2] b)) → (let* [a e1 b e2] (f a b))
+  Recursively processes sub-expressions. Required for AD which expects flat ANF."
+  [form]
+  (cond
+    (not (seq? form)) form
+
+    ;; Already a let/let* — hoist in bindings and body
+    (and (seq? form) (contains? #{'let 'let*} (first form)))
+    (let [[let-sym bindings & body] form
+          hoisted-bindings (mapv (fn [[sym expr]] [sym (hoist-nested-lets expr)])
+                                 (partition 2 bindings))
+          hoisted-body (map hoist-nested-lets body)]
+      (apply list let-sym (vec (mapcat identity hoisted-bindings)) hoisted-body))
+
+    ;; Scope-introducing forms — recurse but don't hoist across scope boundaries
+    (and (seq? form) (contains? #{'if 'loop 'loop* 'fn* 'do 'when 'recur 'dotimes} (first form)))
+    (with-meta (apply list (first form) (map hoist-nested-lets (rest form))) (meta form))
+
+    ;; Function call — check for let expressions in arguments
+    (seq? form)
+    (let [f (first form)
+          args (rest form)
+          hoisted-args (map hoist-nested-lets args)
+          ;; Collect let bindings from args and replace with their body
+          collected (reduce
+                     (fn [{:keys [bindings clean-args]} arg]
+                       (if (and (seq? arg) (contains? #{'let 'let*} (first arg)))
+                         (let [[_ inner-bindings & inner-body] arg]
+                           {:bindings (into bindings (vec inner-bindings))
+                            :clean-args (conj clean-args (last inner-body))})
+                         {:bindings bindings
+                          :clean-args (conj clean-args arg)}))
+                     {:bindings [] :clean-args []}
+                     hoisted-args)]
+      (if (seq (:bindings collected))
+        (list 'let* (vec (:bindings collected))
+              (apply list f (:clean-args collected)))
+        (apply list f hoisted-args)))
+
+    :else form))
+
+(defn- build-grad-walked-body
+  "Build the AD-transformed walked body for a deftm var.
+  Returns {:walked-body [form], :params [sym ...], :source-ns ns}
+  where form is a flat let* returning [primal grad1 ... gradN].
+  Returns nil if AD transform fails."
+  [f-var]
+  (let [resolved (resolve-deftm-var f-var)
+        m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "grad requires a deftm var" {:var f-var})))
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        (throw (ex-info "No walked body on var" {:var f-var})))
+        active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        source-ns (or (:ns m) *ns*)
+        ;; Infer dtype from parameter tags for correct AD seed type
+        dtype (if (some #{'floats 'float} tags) :float :double)
+        ;; Lower: inline compound deftm ops into primitives before AD
+        lowered (binding [inline/*ad-transform-body-fn* transform-body]
+                  (inline/lower-to-ad-primitives (first walked-body)))
+        ;; Hoist nested lets out of call args into flat ANF for AD
+        hoisted (hoist-nested-lets lowered)
+        ad-form (transform-body hoisted active-params)
+        flat (binding [ad-flatten/*flatten-dtype* dtype]
+               (ad-flatten/flatten-for-gradient ad-form))]
+    (when flat
+      {:walked-body [(:form flat)]
+       :params active-params
+       :tags tags
+       :source-ns source-ns
+       :result-sym (:result-sym flat)
+       :param-adj-syms (:param-adj-syms flat)})))
+
+(defn- make-runtime-value+grad-fn
+  "Build a runtime IFn from the AD-transformed walked body."
+  [walked-body params]
+  (eval (list 'fn (vec params) (first walked-body))))
+
+(defn ^clojure.lang.IFn value+grad
+  "Composable value+gradient operator.
+
+  (value+grad f) returns a function that computes [value, grad1, ..., gradN].
+  Works in two modes:
+  - Runtime: callable directly as (fn [args...] -> [value grads...])
+  - Compiled: carries deftm metadata so the pipeline can inline the
+    AD-transformed body when called inside a compiled deftm.
+
+  Options:
+    :mode  - :reverse (default), :forward, or :auto
+
+  Usage:
+    ;; Runtime
+    ((value+grad #'my-loss) 3.0 4.0)  ;; => [25.0 6.0 8.0]
+
+    ;; Inside compiled deftm
+    (deftm train-step [W x y lr] :- Double
+      (let [[loss d_W _ _] ((value+grad #'my-loss) W x y)]
+        (axpy! W W (- lr) d_W)
+        loss))"
+  ([f-var] (value+grad f-var :mode :reverse))
+  ([f-var & {:keys [mode] :or {mode :reverse}}]
+   (case mode
+     :reverse
+     (let [{:keys [walked-body params tags source-ns]}
+           (build-grad-walked-body f-var)
+           runtime-fn (make-runtime-value+grad-fn walked-body params)
+           ;; Qualify symbols in walked body for inlining from other namespaces
+           inline-ns inf/qualify-body-symbols
+           param-set (set params)
+           qualified-wb (mapv #(inline-ns % source-ns param-set) walked-body)]
+       ;; Return an IFn that also carries deftm metadata for the compiler
+       (let [result-fn (fn [& args] (apply runtime-fn args))]
+         (with-meta result-fn
+           {::value+grad true
+            :raster.core/deftm-walked-body qualified-wb
+            :raster.core/deftm-params params
+            :raster.core/deftm-tags tags})))
+
+     :forward
+     ;; Forward-mode gradient via Dual numbers on the walked body.
+     ;; Un-devirtualize .invk → generic dispatch so Dual numbers propagate.
+     (let [resolved (resolve-deftm-var f-var)
+           m (meta resolved)
+           params (or (:raster.core/deftm-params m)
+                      (throw (ex-info "grad requires a deftm var" {:var f-var})))
+           walked-body (or (:raster.core/deftm-walked-body m)
+                           (throw (ex-info "No walked body on var" {:var f-var})))
+           tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+           ;; Build a generic-dispatch version of the walked body
+           generic-body (undevirtualize (first walked-body))
+           ;; Strip primitive casts — Dual numbers aren't primitives
+           clean-body (strip-primitive-casts generic-body)
+           active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+           generic-fn (eval (list 'fn active-params clean-body))
+           n (count params)
+           make-dual fwd/->Dual
+           dual-class (Class/forName "raster.ad.forward.Dual")
+           get-v (fn [d] (.get (.getField dual-class "v") d))
+           get-partials (fn [d] (.get (.getField dual-class "partials") d))]
+       (fn [& args]
+         (let [arg-vec (vec args)
+               value (apply generic-fn arg-vec)
+               grads (double-array n)]
+           ;; One forward pass per parameter, seeding with Dual(val, 1.0)
+           (dotimes [i n]
+             (let [dual-args (into []
+                                   (map-indexed
+                                    (fn [j a]
+                                      (if (== j i)
+                                        (make-dual (double a) (double-array [1.0]))
+                                        (make-dual (double a) (double-array [0.0]))))
+                                    arg-vec))
+                   result (apply generic-fn dual-args)
+                   deriv (if (.isInstance dual-class result)
+                           (clojure.core/aget ^doubles (get-partials result) 0)
+                           0.0)]
+               (clojure.core/aset grads i deriv)))
+           (vec (cons (if (.isInstance dual-class value) (get-v value) value)
+                      (seq grads))))))
+
+     :auto
+     ;; Griewank heuristic: forward when n_inputs ≤ n_outputs, reverse otherwise.
+     ;; For scalar-output functions (the common case), reverse is better for n > 1.
+     ;; For n = 1, forward avoids tape overhead.
+     (let [resolved (resolve-deftm-var f-var)
+           n-params (count (or (:raster.core/deftm-params (meta resolved)) []))
+           selected (if (<= n-params 1) :forward :reverse)]
+       (value+grad f-var :mode selected)))))
+
+(defn grad
+  "Composable gradient operator.
+
+  (grad f) returns a function that computes [grad1, ..., gradN].
+  Like value+grad but drops the primal value.
+
+  Options:
+    :mode  - :reverse (default), :forward, or :auto
+
+  Usage:
+    ((grad #'my-loss) 3.0 4.0)  ;; => [6.0 8.0]"
+  ([f-var] (grad f-var :mode :reverse))
+  ([f-var & {:keys [mode] :or {mode :reverse}}]
+   (let [vg-fn (value+grad f-var :mode mode)
+         vg-meta (meta vg-fn)]
+     ;; Build a grad-specific walked body that drops the primal
+     (if-let [wb (:raster.core/deftm-walked-body vg-meta)]
+       (let [params (:raster.core/deftm-params vg-meta)
+             tags (:raster.core/deftm-tags vg-meta)
+             ;; Rewrite walked body: [primal g1 g2 ...] → [g1 g2 ...]
+             grad-wb (mapv (fn [form]
+                             (if (and (seq? form) (#{'let 'let*} (first form)))
+                               (let [[let-sym bindings & body-exprs] form
+                                     last-body (last body-exprs)]
+                                 (if (vector? last-body)
+                                   (list* let-sym bindings
+                                          (concat (butlast body-exprs)
+                                                  [(vec (rest last-body))]))
+                                   form))
+                               form))
+                           wb)
+             runtime-fn (make-runtime-value+grad-fn grad-wb params)]
+         (with-meta
+           (fn [& args] (apply runtime-fn args))
+           {::grad true
+            :raster.core/deftm-walked-body grad-wb
+            :raster.core/deftm-params params
+            :raster.core/deftm-tags tags}))
+       ;; Fallback: no walked body (forward mode)
+       (fn [& args]
+         (vec (rest (apply vg-fn args))))))))

@@ -1,0 +1,148 @@
+version: 2.1
+
+commands:
+  install-clojure:
+    description: "Install Clojure CLI tools"
+    steps:
+      - run:
+          name: Install Clojure CLI 1.12.0.1488
+          command: |
+            if ! command -v clojure &> /dev/null; then
+              curl -L -O https://download.clojure.org/install/linux-install-1.12.0.1488.sh
+              chmod +x linux-install-1.12.0.1488.sh
+              sudo ./linux-install-1.12.0.1488.sh
+              rm linux-install-1.12.0.1488.sh
+            fi
+
+executors:
+  clojure-java24:
+    docker:
+      - image: cimg/openjdk:24.0
+    working_directory: ~/repo
+    resource_class: large
+    environment:
+      JAVA_TOOL_OPTIONS: "-Xmx3200m"
+
+jobs:
+  setup:
+    executor: clojure-java24
+    steps:
+      - checkout
+      - install-clojure
+      - run:
+          name: Install OpenBLAS
+          command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev
+      - restore_cache:
+          keys:
+            - v2-dependencies-{{ checksum "deps.edn" }}
+            - v2-dependencies-
+      - run:
+          name: Download dependencies
+          command: clojure -P -M:dev:test:build
+      - save_cache:
+          paths:
+            - ~/.m2
+            - ~/.gitlibs
+          key: v2-dependencies-{{ checksum "deps.edn" }}
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - repo
+
+  build:
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Build JAR
+          command: clojure -T:build jar
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - repo/target
+
+  test:
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Install OpenBLAS
+          command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev
+      - run:
+          name: Run tests
+          command: clojure -X:test
+
+  deploy:
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Deploy to Clojars
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ]; then
+              clojure -T:build deploy
+            else
+              echo "Skipping deploy - not on main branch"
+            fi
+
+  release:
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Install GitHub CLI
+          command: |
+            curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg
+            echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" | sudo tee /etc/apt/sources.list.d/github-cli.list > /dev/null
+            sudo apt update
+            sudo apt install gh -y
+      - run:
+          name: Create GitHub release
+          command: |
+            if [ "${CIRCLE_BRANCH}" = "main" ] && [ -n "${GITHUB_TOKEN}" ]; then
+              JAR_FILE=$(ls target/raster-*.jar | head -1)
+              VERSION=$(basename "$JAR_FILE" | sed 's/raster-//' | sed 's/.jar//')
+
+              echo "Creating release for version ${VERSION}"
+              gh release create "v${VERSION}" \
+                --title "Release ${VERSION}" \
+                --notes "Raster ${VERSION}" \
+                "$JAR_FILE" || echo "Release may already exist"
+            else
+              echo "Skipping release - not on main branch or no GITHUB_TOKEN"
+            fi
+
+workflows:
+  version: 2
+  build-test-and-deploy:
+    jobs:
+      - setup
+      - build:
+          requires:
+            - setup
+      - test:
+          requires:
+            - build
+      - deploy:
+          context:
+            - clojars-deploy
+          filters:
+            branches:
+              only: main
+          requires:
+            - test
+      - release:
+          context:
+            - github-token
+          filters:
+            branches:
+              only: main
+          requires:
+            - deploy
