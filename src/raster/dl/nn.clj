@@ -1299,21 +1299,20 @@
                                                          (recur (inc c) acc))
                                                        (/ acc group-size)))
                                                inv-std (/ 1.0 (n/sqrt (+ var eps)))
-                                               sums (loop [c 0 sum1 0.0 sum2 0.0]
-                                                      (if (< c cpg)
-                                                        (let [ch (+ (* g (int cpg)) c)
-                                                              [sum1 sum2] (loop [sp 0 is1 sum1 is2 sum2]
-                                                                            (if (< sp spatial)
-                                                                              (let [idx (+ (* b (int (* channels spatial)))
-                                                                                           (* ch (int spatial)) sp)
-                                                                                    x-hat (* (- (aget x idx) mean) inv-std)
-                                                                                    dg (* (aget dy idx) (aget gamma ch))]
-                                                                                (recur (inc sp) (+ is1 (* dg x-hat)) (+ is2 dg)))
-                                                                              [is1 is2]))]
-                                                          (recur (inc c) sum1 sum2))
-                                                        [sum1 sum2]))
-                                               s1 (nth sums 0)
-                                               s2 (nth sums 1)
+                                               ;; Accumulate into double-array to avoid vector return
+                                               ;; (nth on vector loses type tags after inlining)
+                                               sums-buf (double-array 2)
+                                               _ (dotimes [c cpg]
+                                                   (let [ch (+ (* g (int cpg)) c)]
+                                                     (dotimes [sp spatial]
+                                                       (let [idx (+ (* b (int (* channels spatial)))
+                                                                    (* ch (int spatial)) sp)
+                                                             x-hat (* (- (aget x idx) mean) inv-std)
+                                                             dg (* (aget dy idx) (aget gamma ch))]
+                                                         (aset sums-buf 0 (+ (aget sums-buf 0) (* dg x-hat)))
+                                                         (aset sums-buf 1 (+ (aget sums-buf 1) dg))))))
+                                               s1 (aget sums-buf 0)
+                                               s2 (aget sums-buf 1)
                                                n-inv (/ 1.0 group-size)]
                                            (dotimes [c cpg]
                                              (let [ch (+ (* g (int cpg)) c)]
