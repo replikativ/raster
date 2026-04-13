@@ -218,10 +218,10 @@
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         tags (types/extract-tags params annotations)
         explicit-ret-tag (when ret-type (types/annotation->tag ret-type nil))
-        ;; Infer return type via TC when no explicit annotation.
-        ;; TC is authoritative — avoids void/Object mismatch between
-        ;; (Fn [...]) caller and deftm callee.
-        tc-ret-tag (when (and (not explicit-ret-tag) (seq annotations))
+        ;; Infer return type via TC when no explicit annotation and TC is eager.
+        ;; When tc-eager? is false (default), the walker uses structural inference
+        ;; and TC runs later at compile-aot/specialize time.
+        tc-ret-tag (when (and tc-eager? (not explicit-ret-tag) (seq annotations))
                      (try
                        (:ret-tag (inf/tc-analyze-deftm-body
                                   (or fn-label '<infer>) params annotations body))
@@ -591,7 +591,7 @@
                       (str "deftm requires a parameter vector, got: " (pr-str (first rest-args))))
         ;; Shared preparation: parse, validate, walk
             prep (prepare-typed-body param-vec (rest rest-args)
-                                     {:fn-label (str "deftm " fn-name) :tc-eager? true})
+                                     {:fn-label (str "deftm " fn-name)})
             {:keys [params annotations tags ret-type ret-tag body
                     hinted-params walked-body walked-body-typed has-fn-params?
                     generate-typed? typed-iface-name prim-hinted-params]} prep
@@ -777,7 +777,7 @@
             [nil body-args]))
         ;; Shared preparation: parse, validate, walk (TC eager for ftm)
         prep (prepare-typed-body param-vec body-args
-                                 {:fn-label "ftm" :tc-eager? true})
+                                 {:fn-label "ftm"})
         {:keys [params annotations tags ret-type ret-tag body
                 walked-body prim-hinted-params typed-iface-name]} prep
         ;; ftm-specific: interface types for reify (primitives stay, others → Object)

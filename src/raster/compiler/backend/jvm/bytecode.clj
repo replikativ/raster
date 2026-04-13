@@ -64,6 +64,7 @@
 (def ^:private V-cd (ClassDesc/ofDescriptor "V"))
 (def ^:private no-cd (into-array ClassDesc []))
 (def ^:private F-cd (ClassDesc/ofDescriptor "F"))
+(def ^:private Z-cd (ClassDesc/ofDescriptor "Z"))
 (def ^:private fltarr-cd (ClassDesc/ofDescriptor "[F"))
 (def ^:private lngarr-cd (ClassDesc/ofDescriptor "[J"))
 (def ^:private intarr-cd (ClassDesc/ofDescriptor "[I"))
@@ -85,7 +86,7 @@
 
 (defn- primitive?
   "True if this stack type is a JVM primitive (not :ref, :void, or :diverge)."
-  [t] (case t (:double :float :int :long) true false))
+  [t] (case t (:double :float :int :long :bool) true false))
 
 (defn- diverge?
   "True if this form never completes normally (throw, recur).
@@ -189,8 +190,8 @@
         (.equals c Long/TYPE) :long
         (.equals c Integer/TYPE) :int
         (.equals c Float/TYPE) :float
-        ;; boolean, byte, short, char are all int at JVM bytecode level
-        (.equals c Boolean/TYPE) :int
+        (.equals c Boolean/TYPE) :bool
+        ;; byte, short, char are all int at JVM bytecode level
         (.equals c Byte/TYPE) :int
         (.equals c Short/TYPE) :int
         (.equals c Character/TYPE) :int
@@ -203,8 +204,8 @@
   [form locals]
   (cond
     (nil? form) :ref
-    (true? form) :int
-    (false? form) :int
+    (true? form) :bool
+    (false? form) :bool
     (float? form) :double
     (integer? form) :int
     (symbol? form) (or (when-let [{:keys [type]} (get locals form)] type)
@@ -359,7 +360,11 @@
     :long   (do (.checkcast code number-cd)
                 (.invokevirtual code number-cd "longValue" (MethodTypeDesc/of J-cd no-cd)))
     :int    (do (.checkcast code number-cd)
-                (.invokevirtual code number-cd "intValue" (MethodTypeDesc/of I-cd no-cd)))))
+                (.invokevirtual code number-cd "intValue" (MethodTypeDesc/of I-cd no-cd)))
+    :bool   (let [bool-cd (ClassDesc/ofDescriptor "Ljava/lang/Boolean;")]
+              (.checkcast code bool-cd)
+              (.invokevirtual code bool-cd "booleanValue"
+                              (MethodTypeDesc/of (ClassDesc/ofDescriptor "Z") no-cd)))))
 
 (defn- emit-box-to-ref
   "Box a primitive stack value to Object. Returns :ref."
@@ -373,6 +378,10 @@
                 :ref)
     :int    (do (.invokestatic code int-box-cd "valueOf"
                                (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                :ref)
+    :bool   (do (.invokestatic code (ClassDesc/ofDescriptor "Ljava/lang/Boolean;") "valueOf"
+                               (MethodTypeDesc/of (ClassDesc/ofDescriptor "Ljava/lang/Boolean;")
+                                                  (into-array ClassDesc [(ClassDesc/ofDescriptor "Z")])))
                 :ref)
     :long   (do (.invokestatic code long-box-cd "valueOf"
                                (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
@@ -390,16 +399,20 @@
                       (.invokevirtual code number-cd "doubleValue" (MethodTypeDesc/of D-cd no-cd))
                       :double)
     [:int :double]  (do (.i2d code) :double)
+    [:bool :double] (do (.i2d code) :double)
     [:long :double] (do (.l2d code) :double)
     [:float :double] (do (.f2d code) :double)
     [:double :int]  (do (.d2i code) :int)
     [:long :int]    (do (.l2i code) :int)
     [:float :int]   (do (.f2i code) :int)
+    [:bool :int]    :int  ;; same JVM representation
     [:int :long]    (do (.i2l code) :long)
+    [:bool :long]   (do (.i2l code) :long)
     [:double :long] (do (.d2l code) :long)
     [:float :long]  (do (.f2l code) :long)
     [:double :float] (do (.d2f code) :float)
     [:int :float]   (do (.i2f code) :float)
+    [:bool :float]  (do (.i2f code) :float)
     [:long :float]  (do (.l2f code) :float)
     [:ref :float]   (do (.checkcast code number-cd)
                         (.invokevirtual code number-cd "floatValue" (MethodTypeDesc/of F-cd no-cd))
@@ -423,6 +436,12 @@
                       (.invokevirtual code number-cd "intValue" (MethodTypeDesc/of I-cd no-cd))
                       (.labelBinding code end-label)
                       :int)
+    [:ref :bool]    (let [bool-cd (ClassDesc/ofDescriptor "Ljava/lang/Boolean;")]
+                      (.checkcast code bool-cd)
+                      (.invokevirtual code bool-cd "booleanValue"
+                                      (MethodTypeDesc/of (ClassDesc/ofDescriptor "Z") no-cd))
+                      :bool)
+    [:int :bool]    :bool  ;; same JVM representation
     [:ref :long]    (do (.checkcast code number-cd)
                         (.invokevirtual code number-cd "longValue" (MethodTypeDesc/of J-cd no-cd))
                         :long)
@@ -430,6 +449,7 @@
     [:double :ref]  (do (emit-box-to-ref code :double) :ref)
     [:float :ref]   (do (emit-box-to-ref code :float) :ref)
     [:int :ref]     (do (emit-box-to-ref code :int) :ref)
+    [:bool :ref]    (do (emit-box-to-ref code :bool) :ref)
     [:long :ref]    (do (emit-box-to-ref code :long) :ref)
     ;; already the right type
     to-type))
@@ -758,7 +778,7 @@
                                                             (let [fname (str sym)
                                                                   ftype (case (:type info)
                                                                           :double D-cd :long J-cd
-                                                                          :int I-cd :float F-cd obj-cd)
+                                                                          :int I-cd :float F-cd :bool Z-cd obj-cd)
                                                                   st (:type info)
                                                                   slot (let [s @next-slot]
                                                                          (swap! next-slot + (if (two-slot? st) 2 1))
@@ -781,7 +801,7 @@
                                                               (case st
                                                                 :double (.dstore code slot)
                                                                 :long   (.lstore code slot)
-                                                                :int    (.istore code slot)
+                                                                (:int :bool) (.istore code slot)
                                                                 :float  (.fstore code slot)
                                                                 (.astore code slot))
                                                               (assoc locs sym {:slot slot :type st
@@ -1037,7 +1057,7 @@
                                                                 (let [fname (str sym)
                                                                       ftype (case (:type info)
                                                                               :double D-cd :long J-cd
-                                                                              :int I-cd :float F-cd obj-cd)
+                                                                              :int I-cd :float F-cd :bool Z-cd obj-cd)
                                                                       st (:type info)
                                                                       slot (let [s @next-slot]
                                                                              (swap! next-slot + (if (two-slot? st) 2 1))
@@ -1055,7 +1075,7 @@
                                                                   (case st
                                                                     :double (.dstore code slot)
                                                                     :long   (.lstore code slot)
-                                                                    :int    (.istore code slot)
+                                                                    (:int :bool) (.istore code slot)
                                                                     :float  (.fstore code slot)
                                                                     (.astore code slot))
                                                                   (assoc locs sym {:slot slot :type st :hint (:hint info)})))
@@ -1122,7 +1142,7 @@
                                                                 (let [fname (str sym)
                                                                       ftype (case (:type info)
                                                                               :double D-cd :long J-cd
-                                                                              :int I-cd :float F-cd obj-cd)
+                                                                              :int I-cd :float F-cd :bool Z-cd obj-cd)
                                                                       st (:type info)
                                                                       slot (let [s @next-slot]
                                                                              (swap! next-slot + (if (two-slot? st) 2 1))
@@ -1140,7 +1160,7 @@
                                                                   (case st
                                                                     :double (.dstore code slot)
                                                                     :long   (.lstore code slot)
-                                                                    :int    (.istore code slot)
+                                                                    (:int :bool) (.istore code slot)
                                                                     :float  (.fstore code slot)
                                                                     (.astore code slot))
                                                                   (assoc locs sym {:slot slot :type st :hint (:hint info)})))
@@ -1173,7 +1193,7 @@
                                                          (case ret-st
                                                            :double  (.dreturn code)
                                                            :long    (.lreturn code)
-                                                           :int     (.ireturn code)
+                                                           (:int :bool) (.ireturn code)
                                                            :float   (.freturn code)
                                                            :void    (.return_ code)
                                                            (.areturn code)))))))))))))
@@ -1202,7 +1222,7 @@
       (.ifnull code null-label)
       (.ldc code (int 0)) (.goto_ code end-label)
       (.labelBinding code null-label) (.ldc code (int 1))
-      (.labelBinding code end-label) :int)
+      (.labelBinding code end-label) :bool)
 
     "some?"
     (let [t (emit-form code (first args) locals ctx)
@@ -1212,7 +1232,7 @@
       (.ifnull code null-label)
       (.ldc code (int 1)) (.goto_ code end-label)
       (.labelBinding code null-label) (.ldc code (int 0))
-      (.labelBinding code end-label) :int)
+      (.labelBinding code end-label) :bool)
 
     "identical?"
     (let [t1 (emit-form code (first args) locals ctx)]
@@ -1224,7 +1244,7 @@
         (.if_acmpeq code eq-label)
         (.ldc code (int 0)) (.goto_ code end-label)
         (.labelBinding code eq-label) (.ldc code (int 1))
-        (.labelBinding code end-label) :int))
+        (.labelBinding code end-label) :bool))
 
     "instance?"
     (let [[cls-form val-form] args
@@ -1235,25 +1255,25 @@
           t (emit-form code val-form locals ctx)]
       (when (primitive? t) (emit-box-to-ref code t))
       (.instanceOf code (class-desc-of cls))
-      :int)
+      :bool)
 
     "boolean?"
     (let [t (emit-form code (first args) locals ctx)]
       (when (primitive? t) (emit-box-to-ref code t))
       (.instanceOf code (ClassDesc/ofDescriptor "Ljava/lang/Boolean;"))
-      :int)
+      :bool)
 
     "number?"
     (let [t (emit-form code (first args) locals ctx)]
       (when (primitive? t) (emit-box-to-ref code t))
       (.instanceOf code number-cd)
-      :int)
+      :bool)
 
     "string?"
     (let [t (emit-form code (first args) locals ctx)]
       (when (primitive? t) (emit-box-to-ref code t))
       (.instanceOf code (ClassDesc/ofDescriptor "Ljava/lang/String;"))
-      :int)
+      :bool)
 
     ;; ---- Boolean logic ----
     "not"
@@ -1261,7 +1281,7 @@
           false-label (.newLabel code)
           end-label   (.newLabel code)]
       (case t
-        :int  (.ifeq code false-label)
+        (:int :bool)  (.ifeq code false-label)
         :ref  (let [not-null (.newLabel code)]
                 (.dup code)
                 (.ifnonnull code not-null)
@@ -1279,11 +1299,11 @@
         :double (do (.ldc code 0.0) (.dcmpl code) (.ifeq code false-label))
         :float  (do (.ldc code (float 0.0)) (.fcmpl code) (.ifeq code false-label))
         :long   (do (.ldc code (long 0)) (.lcmp code) (.ifeq code false-label)))
-      (when (#{:int :double :float :long} t)
+      (when (#{:int :bool :double :float :long} t)
         (.ldc code (int 0)) (.goto_ code end-label)
         (.labelBinding code false-label) (.ldc code (int 1))
         (.labelBinding code end-label))
-      :int)
+      :bool)
 
     ;; ---- Numeric coercions ----
     "byte"  (let [t (emit-form code (first args) locals ctx)]
@@ -1299,6 +1319,7 @@
                     true-label (.newLabel code)
                     end-label  (.newLabel code)]
                 (case t
+                  :bool :bool  ;; already a boolean, no-op
                   :int  (do (.ifne code true-label)
                             (.ldc code (int 0)) (.goto_ code end-label)
                             (.labelBinding code true-label) (.ldc code (int 1))
@@ -1331,7 +1352,7 @@
                               (.ldc code (int 0)) (.goto_ code end-label)
                               (.labelBinding code true-label) (.ldc code (int 1))
                               (.labelBinding code end-label)))
-                :int)
+                :bool)
 
     ;; ---- Array constructors ----
     "long-array"    (cond
@@ -1433,24 +1454,24 @@
         :int    (do (.ifeq code zero-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code zero-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :long   (do (.ldc code (long 0)) (.lcmp code) (.ifeq code zero-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code zero-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :double (do (.ldc code 0.0) (.dcmpl code) (.ifeq code zero-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code zero-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :float  (do (.ldc code (float 0.0)) (.fcmpl code) (.ifeq code zero-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code zero-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         ;; ref → unbox and compare
         (do (emit-unbox-double code) (.ldc code 0.0) (.dcmpl code) (.ifeq code zero-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code zero-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)))
+            (.labelBinding code end-label) :bool)))
 
     ;; ---- pos? / neg? ----
     "pos?"
@@ -1461,23 +1482,23 @@
         :int    (do (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :long   (do (.ldc code (long 0)) (.lcmp code) (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :float  (do (.ldc code (float 0.0)) (.fcmpg code) (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :double (do (.ldc code 0.0) (.dcmpg code) (.ifgt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         (do (emit-unbox-double code) (.ldc code 0.0) (.dcmpg code) (.ifgt code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)))
+            (.labelBinding code end-label) :bool)))
 
     "neg?"
     (let [t (emit-form code (first args) locals ctx)
@@ -1487,23 +1508,23 @@
         :int    (do (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :long   (do (.ldc code (long 0)) (.lcmp code) (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :float  (do (.ldc code (float 0.0)) (.fcmpg code) (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         :double (do (.ldc code 0.0) (.dcmpg code) (.iflt code true-label)
                     (.ldc code (int 0)) (.goto_ code end-label)
                     (.labelBinding code true-label) (.ldc code (int 1))
-                    (.labelBinding code end-label) :int)
+                    (.labelBinding code end-label) :bool)
         (do (emit-unbox-double code) (.ldc code 0.0) (.dcmpg code) (.iflt code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)))
+            (.labelBinding code end-label) :bool)))
 
     ;; ---- even? / odd? ----
     "even?"
@@ -1515,13 +1536,13 @@
             (.ifeq code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)
+            (.labelBinding code end-label) :bool)
         (do (when (not= t :int) (emit-coerce code t :int))
             (.ldc code (int 1)) (.iand code)
             (.ifeq code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)))
+            (.labelBinding code end-label) :bool)))
 
     "odd?"
     (let [t (emit-form code (first args) locals ctx)
@@ -1532,13 +1553,13 @@
             (.ifne code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)
+            (.labelBinding code end-label) :bool)
         (do (when (not= t :int) (emit-coerce code t :int))
             (.ldc code (int 1)) (.iand code)
             (.ifne code true-label)
             (.ldc code (int 0)) (.goto_ code end-label)
             (.labelBinding code true-label) (.ldc code (int 1))
-            (.labelBinding code end-label) :int)))
+            (.labelBinding code end-label) :bool)))
 
     ;; Not handled here
     nil))
@@ -1553,8 +1574,8 @@
     ;; Division: float×float→float, everything else→double
     (if (and (= t1 :float) (= t2 :float)) :float :double)
     (case t1
-      :int    (case t2 :int :int, :long :long, :float :float, :double)
-      :long   (case t2 (:int :long) :long, :double)
+      (:int :bool) (case t2 (:int :bool) :int, :long :long, :float :float, :double)
+      :long   (case t2 (:int :bool :long) :long, :double)
       :float  (case t2 :float :float, :double)
       :double :double
       ;; :ref — unbox, treat as double
@@ -1564,7 +1585,7 @@
   "Emit a single arithmetic instruction for the given type and op string."
   [code op type]
   (case type
-    :int    (case op "+" (.iadd code) "-" (.isub code) "*" (.imul code) "/" (.idiv code))
+    (:int :bool) (case op "+" (.iadd code) "-" (.isub code) "*" (.imul code) "/" (.idiv code))
     :long   (case op "+" (.ladd code) "-" (.lsub code) "*" (.lmul code) "/" (.ldiv code))
     :float  (case op "+" (.fadd code) "-" (.fsub code) "*" (.fmul code) "/" (.fdiv code))
     :double (case op "+" (.dadd code) "-" (.dsub code) "*" (.dmul code) "/" (.ddiv code))))
@@ -1579,7 +1600,7 @@
     (and (= op "-") (= 1 (count args)))
     (let [t (emit-form code (first args) locals ctx)]
       (case t
-        :int    (do (.ineg code) :int)
+        (:int :bool) (do (.ineg code) :int)
         :long   (do (.lneg code) :long)
         :float  (do (.fneg code) :float)
         :double (do (.dneg code) :double)
@@ -1606,7 +1627,7 @@
           ;; For :ref, coerce to double eagerly
           t1 (if (= t1 :ref) (do (emit-coerce code t1 :double) :double) t1)
           ;; For division with integer first arg, coerce to double
-          t1 (if (and division? (#{:int :long} t1))
+          t1 (if (and division? (#{:int :bool :long} t1))
                (do (emit-coerce code t1 :double) :double)
                t1)]
       (loop [remaining (rest args) cur t1]
@@ -1634,7 +1655,7 @@
                 ;; Reload t2
                 (case target
                   :double (.dload code tmp) :long (.lload code tmp)
-                  :float (.fload code tmp) :int (.iload code tmp))))
+                  :float (.fload code tmp) (:int :bool) (.iload code tmp))))
             (emit-arith-op code op target)
             (recur (rest remaining) target)))))))
 
@@ -1732,8 +1753,8 @@
    int → int, long → long, float → float, else → double."
   [code op args locals ctx]
   (let [t1 (emit-form code (first args) locals ctx)
-        target (case t1 :int :int :long :long :float :float :double)
-        ret-cd (case target :int I-cd :long (ClassDesc/ofDescriptor "J")
+        target (case t1 (:int :bool) :int :long :long :float :float :double)
+        ret-cd (case target (:int :bool) I-cd :long (ClassDesc/ofDescriptor "J")
                      :float (ClassDesc/ofDescriptor "F") D-cd)
         mm-mt (MethodTypeDesc/of ret-cd (into-array ClassDesc [ret-cd ret-cd]))]
     (when (not= t1 target) (emit-coerce code t1 target))
@@ -2273,6 +2294,7 @@
                         (.equals target-cd J-cd) :long
                         (.equals target-cd I-cd) :int
                         (.equals target-cd F-cd) :float
+                        (.equals target-cd Z-cd) :bool
                         :else :ref)]
         (if (and (= t :ref) (= target-st :ref) (not (.equals target-cd obj-cd)))
           (.checkcast code target-cd)
@@ -2472,6 +2494,7 @@
                                   (.equals ^ClassDesc pd J-cd) :long
                                   (.equals ^ClassDesc pd I-cd) :int
                                   (.equals ^ClassDesc pd F-cd) :float
+                                  (.equals ^ClassDesc pd Z-cd) :bool
                                   :else :ref)]
               (if (and (= t :ref) (= target-st :ref) (not (.equals ^ClassDesc pd obj-cd)))
                 (.checkcast code pd)
@@ -2484,6 +2507,7 @@
                   (.equals ^ClassDesc ret-cd J-cd) :long
                   (.equals ^ClassDesc ret-cd I-cd) :int
                   (.equals ^ClassDesc ret-cd F-cd) :float
+                  (.equals ^ClassDesc ret-cd Z-cd) :bool
                   (.equals ^ClassDesc ret-cd (ClassDesc/ofDescriptor "V")) :void
                   :else :ref)))
 
@@ -2507,6 +2531,7 @@
                                   (.equals ^ClassDesc pd J-cd) :long
                                   (.equals ^ClassDesc pd I-cd) :int
                                   (.equals ^ClassDesc pd F-cd) :float
+                                  (.equals ^ClassDesc pd Z-cd) :bool
                                   :else :ref)]
               (cond
             ;; Box primitives to Object when method expects Object
@@ -2525,6 +2550,7 @@
                 (.equals ^ClassDesc ret-cd-actual J-cd) :long
                 (.equals ^ClassDesc ret-cd-actual I-cd) :int
                 (.equals ^ClassDesc ret-cd-actual F-cd) :float
+                (.equals ^ClassDesc ret-cd-actual Z-cd) :bool
                 (.equals ^ClassDesc ret-cd-actual V-cd) :void
                 :else :ref))
 
@@ -2833,7 +2859,7 @@
                           (case t
                             :double (.dstore code slot)
                             :long   (.lstore code slot)
-                            :int    (.istore code slot)
+                            (:int :bool) (.istore code slot)
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
@@ -2891,14 +2917,14 @@
                   (let [;; t2 on top, t1 below. Store t2, coerce t1, reload+coerce t2
                         tmp (let [s @(:next-slot ctx)]
                               (case t2
-                                :int    (do (.istore code s) (swap! (:next-slot ctx) inc) s)
+                                (:int :bool) (do (.istore code s) (swap! (:next-slot ctx) inc) s)
                                 :float  (do (.fstore code s) (swap! (:next-slot ctx) inc) s)
                                 :long   (do (.lstore code s) (swap! (:next-slot ctx) + 2) s)
                                 :double (do (.dstore code s) (swap! (:next-slot ctx) + 2) s)
                                 ;; :ref — store as Object, will coerce to double on reload
                                 (do (.astore code s) (swap! (:next-slot ctx) inc) s)))]
                     (when (not= t1 :double) (emit-coerce code t1 :double))
-                    (case t2 :int (do (.iload code tmp) (.i2d code))
+                    (case t2 (:int :bool) (do (.iload code tmp) (.i2d code))
                           :long (do (.lload code tmp) (.l2d code))
                           :float (do (.fload code tmp) (.f2d code))
                           :double (.dload code tmp)
@@ -2915,7 +2941,7 @@
                     (emit-form code pred locals (dissoc ctx :void-context)))]
     (when-not branch-folded?
       (case pred-type
-        :int    (.ifeq code else-label)
+        (:int :bool) (.ifeq code else-label)
       ;; Clojure truthiness: null and Boolean.FALSE are falsy, everything else truthy
         :ref    (let [not-null-label (.newLabel code)]
                   (.dup code)
@@ -3364,7 +3390,7 @@
     (do (case type
           :double (.dload code slot)
           :long   (.lload code slot)
-          :int    (.iload code slot)
+          (:int :bool) (.iload code slot)
           :float  (.fload code slot)
           (.aload code slot))
         type)
@@ -3466,7 +3492,7 @@
                          (case t
                            :double (.dstore code slot)
                            :long   (.lstore code slot)
-                           :int    (.istore code slot)
+                           (:int :bool) (.istore code slot)
                            :float  (.fstore code slot)
                            (.astore code slot))
                          (assoc locs sym {:slot slot :type t})))
@@ -3515,7 +3541,7 @@
           (case type
             :double (.dstore code slot)
             :long   (.lstore code slot)
-            :int    (.istore code slot)
+            (:int :bool) (.istore code slot)
             :float  (.fstore code slot)
             (.astore code slot)))
         (.goto_ code loop-label)
@@ -3708,7 +3734,7 @@
         (case type
           :double (.dload code slot)
           :long   (.lload code slot)
-          :int    (.iload code slot)
+          (:int :bool) (.iload code slot)
           :float  (.fload code slot)
           (.aload code slot))))
     (.invokespecial code (:class-desc anon-info) "<init>"
@@ -3803,7 +3829,7 @@
         (case type
           :double (.dload code slot)
           :long   (.lload code slot)
-          :int    (.iload code slot)
+          (:int :bool) (.iload code slot)
           :float  (.fload code slot)
           (.aload code slot))))
     (.invokespecial code (:class-desc reify-info) "<init>"
@@ -3853,8 +3879,8 @@
     (cond
       ;; --- Atoms ---
       (nil? form)     (do (.aconst_null code) :ref)
-      (true? form)    (do (.ldc code (int 1)) :int)
-      (false? form)   (do (.ldc code (int 0)) :int)
+      (true? form)    (do (.ldc code (int 1)) :bool)
+      (false? form)   (do (.ldc code (int 0)) :bool)
       (integer? form) (if (and (instance? Long form)
                                (or (> (long form) Integer/MAX_VALUE)
                                    (< (long form) Integer/MIN_VALUE)))
@@ -4096,7 +4122,7 @@
     (double Double) {:class Double/TYPE :class-desc D-cd :stack-type :double}
     (long Long)     {:class Long/TYPE :class-desc J-cd :stack-type :long}
     (int Integer)   {:class Integer/TYPE :class-desc I-cd :stack-type :int}
-    boolean         {:class Boolean/TYPE :class-desc (ClassDesc/ofDescriptor "Z") :stack-type :int}
+    boolean         {:class Boolean/TYPE :class-desc (ClassDesc/ofDescriptor "Z") :stack-type :bool}
     (float Float)   {:class Float/TYPE :class-desc F-cd :stack-type :float}
     (void Void)     {:class Void/TYPE :class-desc V-cd :stack-type :void}
     ;; Array types — use typed descriptors ([D, [J, etc.) for precise
@@ -4139,7 +4165,7 @@
     float    {:class-desc F-cd :stack-type :float}
     long     {:class-desc J-cd :stack-type :long}
     int      {:class-desc I-cd :stack-type :int}
-    boolean  {:class-desc (ClassDesc/ofDescriptor "Z") :stack-type :int}
+    boolean  {:class-desc (ClassDesc/ofDescriptor "Z") :stack-type :bool}
     objects  {:class-desc objarr-cd :stack-type :ref}
     doubles  {:class-desc dblarr-cd :stack-type :ref}
     floats   {:class-desc fltarr-cd :stack-type :ref}
@@ -4347,9 +4373,9 @@
                                                        :long   (do (when (not= ret-type :long)
                                                                      (emit-coerce code ret-type :long))
                                                                    (.lreturn code))
-                                                       :int    (do (when (not= ret-type :int)
-                                                                     (emit-coerce code ret-type :int))
-                                                                   (.ireturn code))
+                                                       (:int :bool) (do (when (not= ret-type return-stack-type)
+                                                                          (emit-coerce code ret-type return-stack-type))
+                                                                        (.ireturn code))
                                                        :float  (do (when (not= ret-type :float)
                                                                      (emit-coerce code ret-type :float))
                                                                    (.freturn code))
@@ -4360,8 +4386,7 @@
                                                                                     (MethodTypeDesc/of dbl-box-cd (into-array ClassDesc [D-cd])))
                                                              :float  (.invokestatic code flt-box-cd "valueOf"
                                                                                     (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
-                                                             :int    (.invokestatic code int-box-cd "valueOf"
-                                                                                    (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                                                             (:int :bool) (emit-box-to-ref code ret-type)
                                                              :long   (.invokestatic code long-box-cd "valueOf"
                                                                                     (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
                                                              :void   (.aconst_null code))
@@ -4428,7 +4453,7 @@
                                                        (.checkcast code ret-cd))
                                                      (case target-st
                                                        :double (.dreturn code) :long (.lreturn code)
-                                                       :int (.ireturn code) :float (.freturn code)
+                                                       (:int :bool) (.ireturn code) :float (.freturn code)
                                                        :void (.return_ code)
                                                        :ref (.areturn code)))
                                                    (when (= ret-type :void)
