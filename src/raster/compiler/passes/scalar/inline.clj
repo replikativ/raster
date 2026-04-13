@@ -11,7 +11,9 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]
-            [raster.compiler.passes.scalar.cse :as cse]))
+            [raster.compiler.passes.scalar.cse :as cse]
+            [raster.core :as rcore]
+            [raster.compiler.core.dispatch :as dispatch]))
 
 (def ^:private call-head util/call-head)
 (def ^:private call-args util/call-args)
@@ -68,7 +70,7 @@
         val-metadata (when (instance? clojure.lang.Var v)
                        (try (meta @v) (catch Exception _ nil)))
         walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        ((requiring-resolve 'raster.core/ensure-walked-body!) v)
+                        (rcore/ensure-walked-body! v)
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -135,21 +137,19 @@
               (try-resolve-walked-body v)
               (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
                 (let [all-methods (mapcat identity (vals @dispatch-table))
-                      has-parametric? (when-let [pr (requiring-resolve
-                                                     'raster.compiler.core.dispatch/parametric-registry)]
-                                        (contains? @@pr (symbol (namespace base-sym) (name base-sym))))
+                      has-parametric? (contains? @dispatch/parametric-registry
+                                                 (symbol (namespace base-sym) (name base-sym)))
                       ;; Type-safe overload selection with parametric specialization.
                       ;; Single-method fallback only when function is NOT parametric
                       ;; (i.e., the one method IS the only possible overload).
                       match (or (when (seq arg-tags)
                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
-                                      (when-let [try-ps (requiring-resolve
-                                                         'raster.compiler.core.inference/try-parametric-specialize!)]
-                                        (when (try-ps (symbol (namespace base-sym) (name base-sym)) arg-tags)
+                                      (when (inf/try-parametric-specialize!
+                                              (symbol (namespace base-sym) (name base-sym)) arg-tags)
                                           (let [new-methods (mapcat identity
                                                                     (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods)))))))
+                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
                                 ;; Single method fallback: safe when no other overloads exist
                                 ;; AND function is not parametric. Parametric functions
                                 ;; may need a different specialization that hasn't been
@@ -518,7 +518,7 @@
                                       params)]
                        (list 'nth vg-sym 1))]
         (binding [*ns* src-ns]
-          (eval (list (requiring-resolve 'raster.core/deftm)
+          (eval (list #'rcore/deftm
                       deriv-sym annotated-params :- 'Double body)))
         (recur (inc k) deriv-sym)))))
 
@@ -699,18 +699,16 @@
                         (:raster.core/deftm val-meta) @v
                         :else (when-let [dt (:raster.core/dispatch-table (meta v))]
                                 (let [all-methods (mapcat val @dt)
-                                      has-parametric? (when-let [pr (requiring-resolve
-                                                                     'raster.compiler.core.dispatch/parametric-registry)]
-                                                        (contains? @@pr (symbol (namespace var-sym) (name var-sym))))
+                                      has-parametric? (contains? @dispatch/parametric-registry
+                                                                 (symbol (namespace var-sym) (name var-sym)))
                                 ;; Type-safe overload selection + parametric specialization
                                       method (or (when (seq arg-tags)
                                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
-                                                       (when-let [try-ps (requiring-resolve
-                                                                          'raster.compiler.core.inference/try-parametric-specialize!)]
-                                                         (when (try-ps (symbol (namespace var-sym) (name var-sym)) arg-tags)
+                                                       (when (inf/try-parametric-specialize!
+                                                               (symbol (namespace var-sym) (name var-sym)) arg-tags)
                                                            (let [new-methods (mapcat val @dt)]
                                                              (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                            new-methods)))))))
+                                                                            new-methods))))))
                                            ;; Non-parametric single method: safe (no other overloads possible)
                                                  (when (and (= 1 (count all-methods)) (not has-parametric?))
                                                    (first all-methods)))
@@ -722,7 +720,7 @@
                                     (try (ns-resolve ns-obj mangled) (catch Exception _ nil))))))]
          (when resolved
            (let [m (meta resolved)
-                 walked-body ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
+                 walked-body (rcore/ensure-walked-body! resolved)
                  params (:raster.core/deftm-params m)]
              (when (and walked-body params)
                {:walked-body walked-body :params params :var resolved}))))))))
@@ -1412,13 +1410,12 @@
                                                (= (vec arg-tags) (vec (:tags e))))
                                              entries))
                               ;; No exact match — try parametric specialization for (All [T]) functions
-                              (when-let [try-ps (requiring-resolve
-                                                 'raster.compiler.core.inference/try-parametric-specialize!)]
-                                (when (try-ps (symbol (namespace (first expr)) (name (first expr))) arg-tags)
+                              (when (inf/try-parametric-specialize!
+                                      (symbol (namespace (first expr)) (name (first expr))) arg-tags)
                                   (let [new-entries (get @dt-atom (count args))]
                                     (first (filter (fn [e]
                                                      (= (vec arg-tags) (vec (:tags e))))
-                                                   new-entries)))))))]
+                                                   new-entries))))))]
               (when match
                 (let [mn (str (types/mangle (symbol (name (first expr))) (:tags match)))
                       ms (symbol (str (:mangled-ns match)) mn)

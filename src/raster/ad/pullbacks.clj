@@ -16,7 +16,8 @@
   (:require [raster.numeric :as n :refer [+ - * /]]
             [raster.math :as math]
             [raster.sci.special]
-            [raster.ad.templates :as tmpl]))
+            [raster.ad.templates :as tmpl]
+            [raster.linalg.core :as la]))
 
 ;; ================================================================
 ;; Arithmetic pullbacks
@@ -251,7 +252,7 @@
 ;; solve: Ax = b => db = A^{-T} dy, dA = -db x^T
 (tmpl/merge-into-template! 'raster.linalg.core/solve
                            {:pullback-factory (fn [result A b n]
-                                                (let [solve-fn (requiring-resolve 'raster.linalg.core/solve)]
+                                                (let [solve-fn la/solve]
                                                   (fn [dy]
                                                     (let [x result
                                                           At (double-array (* n n))
@@ -268,7 +269,7 @@
 ;; det: d/dA det(A) = det(A) * (A^{-1})^T
 (tmpl/merge-into-template! 'raster.linalg.core/array-det
                            {:pullback-factory (fn [result A n]
-                                                (let [inv-fn (requiring-resolve 'raster.linalg.core/array-inv)]
+                                                (let [inv-fn la/array-inv]
                                                   (fn [dy]
                                                     (let [Ainv (inv-fn A n)
                                                           dA (double-array (* n n))]

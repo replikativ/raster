@@ -58,7 +58,8 @@
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.form :as form]
-            [raster.compiler.core.method-entry :as me]))
+            [raster.compiler.core.method-entry :as me]
+            [raster.core :as rcore]))
 
 (defn- check-purity! [walked-body active-params warning-meta]
   (purity/validate-for-ad! walked-body active-params warning-meta))
@@ -152,7 +153,7 @@
         ;; Fallback: use pre-walked body from definition time or lazy walk
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
-        (raster.core/ensure-walked-body! resolved)
+        (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body or raw body" {:var f-var})))))
 
 (defn- get-params [f-var & [dtype]]
@@ -989,7 +990,7 @@
         m (meta resolved)
         walked (or (:raster.core/deftm-walked-body-typed m)
                    (:raster.core/deftm-walked-body m)
-                   (raster.core/ensure-walked-body! resolved))]
+                   (rcore/ensure-walked-body! resolved))]
     (when-not walked
       (println "No walked body found for" f-var))
     (println (str "\n=== Type Analysis: " (:name m) " ===\n"))

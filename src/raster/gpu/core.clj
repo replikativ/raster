@@ -27,7 +27,8 @@
   (:refer-clojure :exclude [])
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
-            [raster.compiler.core.inference :as inf]))
+            [raster.compiler.core.inference :as inf]
+            [raster.core :as rcore]))
 
 ;; ================================================================
 ;; Backend dispatch
@@ -87,7 +88,7 @@
   [v]
   (let [resolved (or (resolve-deftm-var v) v)]
     (or (:raster.core/deftm-walked-body (meta resolved))
-        ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
+        (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body" {:var v})))))
 
 ;; ================================================================
