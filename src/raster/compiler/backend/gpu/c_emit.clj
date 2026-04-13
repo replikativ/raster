@@ -1290,7 +1290,8 @@
                               impl-v    (try (ns-resolve fn-ns mangled)
                                              (catch Exception _ nil))]
                           (when impl-v
-                            (when-let [walked-body (get (meta impl-v) :raster.core/deftm-walked-body)]
+                            (when-let [walked-body (or (get (meta impl-v) :raster.core/deftm-walked-body)
+                                                       ((requiring-resolve 'raster.core/ensure-walked-body!) impl-v))]
                               (let [params (get (meta impl-v) :raster.core/deftm-params)]
                                 (when (= (count params) (count args))
                                   (let [subst      (zipmap params (vec args))

@@ -390,7 +390,8 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "Not a deftm var" {:var v})))
         tags (:raster.core/deftm-tags m)
-        walked-body (:raster.core/deftm-walked-body m)
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        ((requiring-resolve 'raster.core/ensure-walked-body!) v))
         return-tag (:raster.core/return-tag m)
         _ (when-not walked-body
             (throw (ex-info "No walked body on deftm var" {:var v})))

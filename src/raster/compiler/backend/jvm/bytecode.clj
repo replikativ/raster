@@ -2400,7 +2400,7 @@
       (emit-deftm-invokestatic code bc-info args locals ctx)
         ;; 2. Fallback static-call lowering when bytecode metadata is absent
       (let [si (resolve-static-call
-                (:raster.core/deftm-walked-body m) (:raster.core/deftm-params m)
+                ((requiring-resolve 'raster.core/ensure-walked-body!) v) (:raster.core/deftm-params m)
                 (:raster.core/deftm-tags m) (:raster.core/return-tag m))]
         (if si
           (let [{:keys [class method method-type deftm-call-args java-param-types]} si
@@ -2481,7 +2481,7 @@
     ;; Skip ^:no-inline deftms (BLAS, etc.) — call via IFn fallback
         (and (symbol? head)
              (when-let [v (ns-resolve (or (:source-ns ctx) *ns*) head)]
-               (and (:raster.core/deftm-walked-body (meta v))
+               (and (:raster.core/deftm (meta v))
                     (not (no-inline-deftm? v)))))
         (emit-deftm-call code head head-name args locals ctx)
 
@@ -4075,7 +4075,7 @@
 
 (defn- scan-deftm-refs
   "Walk forms to find all referenced deftm vars.
-  Returns a set of vars that have ::deftm-walked-body metadata.
+  Returns a set of vars that have ::deftm metadata.
   Handles both direct calls (ns/fn args...) and .invk forms
   (.invk ^IFace ns/fn-impl args...)."
   [forms source-ns]
@@ -4093,14 +4093,14 @@
                               base-sym (symbol (namespace impl-sym) base-name)]
                           (when-let [v (try (ns-resolve source-ns base-sym) (catch Exception _ nil))]
                             (when (and (var? v)
-                                       (:raster.core/deftm-walked-body (meta v))
+                                       (:raster.core/deftm (meta v))
                                        (not (no-inline-deftm? v)))
                               (swap! refs conj v)))))
                       (doseq [f (drop 2 form)] (scan f)))
                     ;; Normal call
                     (do (when-let [v (try (ns-resolve source-ns h) (catch Exception _ nil))]
                           (when (and (var? v)
-                                     (:raster.core/deftm-walked-body (meta v))
+                                     (:raster.core/deftm (meta v))
                                      (not (no-inline-deftm? v)))
                             (swap! refs conj v)))
                         (doseq [f (rest form)] (scan f)))))
@@ -4255,7 +4255,7 @@
                                 ;; Qualify symbols in the walked body using the deftm's source ns
                                     param-set (set (map #(if (symbol? %) % (symbol (name %))) deftm-params))
                                     qualified-wb (mapv #(inf/qualify-body-symbols % deftm-ns param-set)
-                                                       (:raster.core/deftm-walked-body m))]
+                                                       ((requiring-resolve 'raster.core/ensure-walked-body!) v))]
                                 {:method-name (clojure.lang.Compiler/munge (str (:name m)))
                                  :method-type mt
                                  :params deftm-params
@@ -4522,7 +4522,7 @@
     (when (contains? *compiling-deftms* var-sym)
       (throw (ex-info (str "Cycle detected compiling deftm: " var-sym)
                       {:var var-sym})))
-    (let [walked-body (:raster.core/deftm-walked-body m)
+    (let [walked-body ((requiring-resolve 'raster.core/ensure-walked-body!) deftm-var)
           params      (:raster.core/deftm-params m)
           tags        (:raster.core/deftm-tags m)
           return-tag  (:raster.core/return-tag m)

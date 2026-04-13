@@ -61,7 +61,8 @@
    Returns a buffer-semantics map or nil."
   [v]
   (let [m (meta v)
-        walked-body (:raster.core/deftm-walked-body m)
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        ((requiring-resolve 'raster.core/ensure-walked-body!) v))
         params (:raster.core/deftm-params m)]
     (when (and walked-body params (= 1 (count walked-body)))
       (let [body (first walked-body)]
@@ -183,7 +184,7 @@
          cached
          (let [result (try
                         (when-let [v (resolve op-sym)]
-                          (when (and (var? v) (:raster.core/deftm-walked-body (meta v)))
+                          (when (and (var? v) (:raster.core/deftm (meta v)))
                             (when-let [bs (detect-auto-buffer-semantics v)]
                               [bs op-sym])))
                         (catch Exception _ nil))]

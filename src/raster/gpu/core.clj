@@ -69,9 +69,9 @@
 
 (defn resolve-deftm-var
   "Resolve a deftm var through dispatch table to the mangled backing var.
-   Returns the var that carries :raster.core/deftm-walked-body metadata."
+   Returns the var that carries :raster.core/deftm metadata."
   [v]
-  (if (:raster.core/deftm-walked-body (meta v))
+  (if (:raster.core/deftm (meta v))
     v
     (when-let [dt (:raster.core/dispatch-table (meta v))]
       (let [entries (vals @dt)
@@ -87,6 +87,7 @@
   [v]
   (let [resolved (or (resolve-deftm-var v) v)]
     (or (:raster.core/deftm-walked-body (meta resolved))
+        ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
         (throw (ex-info "Var has no deftm walked body" {:var v})))))
 
 ;; ================================================================

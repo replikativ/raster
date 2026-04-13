@@ -146,12 +146,12 @@
   (when (qualified-symbol? op)
     (try
       (let [v (resolve op)
-            fn-var (or (when (and v (:raster.core/deftm-walked-body (meta v))) v)
+            fn-var (or (when (and v (:raster.core/deftm (meta v))) v)
                        (when (and v (.endsWith ^String (name op) "-impl"))
                          (let [base-name (subs (name op) 0 (clojure.core/- (count (name op)) 5))
                                base-sym (symbol (namespace op) base-name)]
                            (when-let [bv (resolve base-sym)]
-                             (when (:raster.core/deftm-walked-body (meta bv)) bv)))))
+                             (when (:raster.core/deftm (meta bv)) bv)))))
             canonical-sym (when fn-var (symbol (str (.ns fn-var)) (str (.sym fn-var))))
             existing-closure (when canonical-sym (tmpl/get-pullback-factory canonical-sym))]
         (when fn-var
@@ -1974,13 +1974,13 @@
   [f-var]
   (cond
     ;; Direct metadata (mangled vars, IFn with metadata)
-    (:raster.core/deftm-walked-body (meta f-var))
+    (:raster.core/deftm (meta f-var))
     f-var
 
     ;; Deref'd value: var pointing to a value+grad/grad result
     (and (instance? clojure.lang.Var f-var)
          (let [val-meta (try (meta @f-var) (catch Exception _ nil))]
-           (:raster.core/deftm-walked-body val-meta)))
+           (:raster.core/deftm val-meta)))
     @f-var
 
     ;; Dispatch table: generic var → mangled method
@@ -2014,7 +2014,7 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "vjp requires a deftm var"
                                    {:var resolved})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                         (throw (ex-info "No walked body on var" {:var resolved})))
         cache-key [resolved walked-body]
         cached (get @vjp-cache cache-key)]
@@ -2325,7 +2325,7 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "vjp-compositional requires a deftm var"
                                    {:var f-var})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                         (throw (ex-info "No walked body" {:var f-var})))
         active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         reified (reify-pullback (first walked-body) active-params)
@@ -2356,7 +2356,7 @@
           m (meta resolved)
           params (or (:raster.core/deftm-params m)
                      (throw (ex-info "compile-hvp-fn requires a deftm var" {:var f-var})))
-          walked-body (or (:raster.core/deftm-walked-body m)
+          walked-body (or ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                           (throw (ex-info "No walked body" {:var f-var})))
           active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
           n (count active-params)
@@ -2555,7 +2555,7 @@
         m (meta resolved)
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
         active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
@@ -2619,6 +2619,7 @@
        (let [result-fn (fn [& args] (apply runtime-fn args))]
          (with-meta result-fn
            {::value+grad true
+            :raster.core/deftm true
             :raster.core/deftm-walked-body qualified-wb
             :raster.core/deftm-params params
             :raster.core/deftm-tags tags})))
@@ -2630,7 +2631,7 @@
            m (meta resolved)
            params (or (:raster.core/deftm-params m)
                       (throw (ex-info "grad requires a deftm var" {:var f-var})))
-           walked-body (or (:raster.core/deftm-walked-body m)
+           walked-body (or ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                            (throw (ex-info "No walked body on var" {:var f-var})))
            tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
            ;; Build a generic-dispatch version of the walked body
@@ -2709,6 +2710,7 @@
          (with-meta
            (fn [& args] (apply runtime-fn args))
            {::grad true
+            :raster.core/deftm true
             :raster.core/deftm-walked-body grad-wb
             :raster.core/deftm-params params
             :raster.core/deftm-tags tags}))

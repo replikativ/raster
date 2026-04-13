@@ -68,7 +68,7 @@
         val-metadata (when (instance? clojure.lang.Var v)
                        (try (meta @v) (catch Exception _ nil)))
         walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        (:raster.core/deftm-walked-body metadata)
+                        ((requiring-resolve 'raster.core/ensure-walked-body!) v)
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -685,8 +685,8 @@
                          (try
                            (let [v (ns-resolve ns-obj var-sym)]
                              (when (and v (var? v)
-                                        (or (:raster.core/deftm-walked-body (meta v))
-                                            (:raster.core/deftm-walked-body (try (meta @v) (catch Exception _ nil)))
+                                        (or (:raster.core/deftm (meta v))
+                                            (:raster.core/deftm (try (meta @v) (catch Exception _ nil)))
                                             (:raster.core/dispatch-table (meta v))))
                                v))
                            (catch Exception _ nil)))
@@ -695,8 +695,8 @@
        (let [;; Try direct metadata, deref'd value metadata, then dispatch table
              val-meta (when (var? v) (try (meta @v) (catch Exception _ nil)))
              resolved (cond
-                        (:raster.core/deftm-walked-body (meta v)) v
-                        (:raster.core/deftm-walked-body val-meta) @v
+                        (:raster.core/deftm (meta v)) v
+                        (:raster.core/deftm val-meta) @v
                         :else (when-let [dt (:raster.core/dispatch-table (meta v))]
                                 (let [all-methods (mapcat val @dt)
                                       has-parametric? (when-let [pr (requiring-resolve
@@ -722,7 +722,7 @@
                                     (try (ns-resolve ns-obj mangled) (catch Exception _ nil))))))]
          (when resolved
            (let [m (meta resolved)
-                 walked-body (:raster.core/deftm-walked-body m)
+                 walked-body ((requiring-resolve 'raster.core/ensure-walked-body!) resolved)
                  params (:raster.core/deftm-params m)]
              (when (and walked-body params)
                {:walked-body walked-body :params params :var resolved}))))))))
