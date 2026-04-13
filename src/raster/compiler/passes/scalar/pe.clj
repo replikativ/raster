@@ -17,7 +17,8 @@
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.normalize :as normalize]
-            [raster.compiler.passes.scalar.simplify :as simp]))
+            [raster.compiler.passes.scalar.simplify :as simp]
+            [raster.core :as rcore]))
 
 ;; ================================================================
 ;; Value analysis
@@ -390,7 +391,8 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "Not a deftm var" {:var v})))
         tags (:raster.core/deftm-tags m)
-        walked-body (:raster.core/deftm-walked-body m)
+        walked-body (or (:raster.core/deftm-walked-body m)
+                        (rcore/ensure-walked-body! v))
         return-tag (:raster.core/return-tag m)
         _ (when-not walked-body
             (throw (ex-info "No walked body on deftm var" {:var v})))

@@ -28,7 +28,9 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.ad.reverse.normalize :as anf]
-            [raster.compiler.passes.scalar.inline :as inline]))
+            [raster.compiler.passes.scalar.inline :as inline]
+            [raster.core :as rcore]
+            [raster.arrays :as arrays]))
 
 ;; ================================================================
 ;; Inline callbacks — breaks inline↔reverse cycle.
@@ -72,12 +74,6 @@
 
 ;; Polymorphic array access via raster.arrays — works for any registered
 ;; array type (double[], float[], and future types like complex[]).
-;; Uses requiring-resolve to avoid hard load-order dependency.
-(def ^:private ra-aget     (delay @(requiring-resolve 'raster.arrays/aget)))
-(def ^:private ra-aset     (delay @(requiring-resolve 'raster.arrays/aset)))
-(def ^:private ra-alength  (delay @(requiring-resolve 'raster.arrays/alength)))
-(def ^:private ra-aclone   (delay @(requiring-resolve 'raster.arrays/aclone)))
-(def ^:private ra-alloc-like (delay @(requiring-resolve 'raster.arrays/alloc-like)))
 
 (defn grad-acc
   "Nil-safe gradient accumulation. nil means zero/no gradient.
@@ -90,16 +86,16 @@
     (nil? b) a
     ;; scalar + array: broadcast scalar into array element-wise add
     (and (number? a) (.isArray (class b)))
-    (let [n (long (@ra-alength b))
-          result (@ra-aclone b)]
+    (let [n (long (arrays/alength b))
+          result (arrays/aclone b)]
       (dotimes [i n]
-        (@ra-aset result i (clojure.core/+ (double a) (double (@ra-aget result i)))))
+        (arrays/aset result i (clojure.core/+ (double a) (double (arrays/aget result i)))))
       result)
     (and (number? b) (.isArray (class a)))
-    (let [n (long (@ra-alength a))
-          result (@ra-aclone a)]
+    (let [n (long (arrays/alength a))
+          result (arrays/aclone a)]
       (dotimes [i n]
-        (@ra-aset result i (clojure.core/+ (double (@ra-aget result i)) (double b))))
+        (arrays/aset result i (clojure.core/+ (double (arrays/aget result i)) (double b))))
       result)
     :else (numeric/+ a b)))
 
@@ -108,9 +104,9 @@
   Returns a zero array of same size as arr, with dy at position i.
   d_arr[i] = dy, d_arr[j] = 0 for j != i."
   [arr i dy]
-  (let [n (long (@ra-alength arr))
-        g (@ra-alloc-like arr n)]
-    (@ra-aset g (int i) dy)
+  (let [n (long (arrays/alength arr))
+        g (arrays/alloc-like arr n)]
+    (arrays/aset g (int i) dy)
     g))
 
 ;; ================================================================
@@ -146,12 +142,12 @@
   (when (qualified-symbol? op)
     (try
       (let [v (resolve op)
-            fn-var (or (when (and v (:raster.core/deftm-walked-body (meta v))) v)
+            fn-var (or (when (and v (:raster.core/deftm (meta v))) v)
                        (when (and v (.endsWith ^String (name op) "-impl"))
                          (let [base-name (subs (name op) 0 (clojure.core/- (count (name op)) 5))
                                base-sym (symbol (namespace op) base-name)]
                            (when-let [bv (resolve base-sym)]
-                             (when (:raster.core/deftm-walked-body (meta bv)) bv)))))
+                             (when (:raster.core/deftm (meta bv)) bv)))))
             canonical-sym (when fn-var (symbol (str (.ns fn-var)) (str (.sym fn-var))))
             existing-closure (when canonical-sym (tmpl/get-pullback-factory canonical-sym))]
         (when fn-var
@@ -1974,13 +1970,13 @@
   [f-var]
   (cond
     ;; Direct metadata (mangled vars, IFn with metadata)
-    (:raster.core/deftm-walked-body (meta f-var))
+    (:raster.core/deftm (meta f-var))
     f-var
 
     ;; Deref'd value: var pointing to a value+grad/grad result
     (and (instance? clojure.lang.Var f-var)
          (let [val-meta (try (meta @f-var) (catch Exception _ nil))]
-           (:raster.core/deftm-walked-body val-meta)))
+           (:raster.core/deftm val-meta)))
     @f-var
 
     ;; Dispatch table: generic var → mangled method
@@ -2014,7 +2010,7 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "vjp requires a deftm var"
                                    {:var resolved})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var resolved})))
         cache-key [resolved walked-body]
         cached (get @vjp-cache cache-key)]
@@ -2325,7 +2321,7 @@
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "vjp-compositional requires a deftm var"
                                    {:var f-var})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body" {:var f-var})))
         active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         reified (reify-pullback (first walked-body) active-params)
@@ -2356,7 +2352,7 @@
           m (meta resolved)
           params (or (:raster.core/deftm-params m)
                      (throw (ex-info "compile-hvp-fn requires a deftm var" {:var f-var})))
-          walked-body (or (:raster.core/deftm-walked-body m)
+          walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body" {:var f-var})))
           active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
           n (count active-params)
@@ -2555,7 +2551,7 @@
         m (meta resolved)
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
-        walked-body (or (:raster.core/deftm-walked-body m)
+        walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
         active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
@@ -2619,6 +2615,7 @@
        (let [result-fn (fn [& args] (apply runtime-fn args))]
          (with-meta result-fn
            {::value+grad true
+            :raster.core/deftm true
             :raster.core/deftm-walked-body qualified-wb
             :raster.core/deftm-params params
             :raster.core/deftm-tags tags})))
@@ -2630,7 +2627,7 @@
            m (meta resolved)
            params (or (:raster.core/deftm-params m)
                       (throw (ex-info "grad requires a deftm var" {:var f-var})))
-           walked-body (or (:raster.core/deftm-walked-body m)
+           walked-body (or (rcore/ensure-walked-body! resolved)
                            (throw (ex-info "No walked body on var" {:var f-var})))
            tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
            ;; Build a generic-dispatch version of the walked body
@@ -2709,6 +2706,7 @@
          (with-meta
            (fn [& args] (apply runtime-fn args))
            {::grad true
+            :raster.core/deftm true
             :raster.core/deftm-walked-body grad-wb
             :raster.core/deftm-params params
             :raster.core/deftm-tags tags}))

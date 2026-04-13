@@ -89,7 +89,8 @@
           mangled (symbol (str "test-broadcast-add_m_"
                                (clojure.string/join "_" (:tags method))))
           backing-var (ns-resolve 'raster.par-test mangled)
-          walked (:raster.core/deftm-walked-body (meta backing-var))]
+          walked (or (:raster.core/deftm-walked-body (meta backing-var))
+                     (raster.core/ensure-walked-body! backing-var))]
       ;; The walked body should contain a raster.par/pmap form (pure IR)
       (is (some #(and (seq? %) (= 'raster.par/pmap (first %)))
                 (tree-seq seq? seq (first walked)))
@@ -107,7 +108,8 @@
           mangled (symbol (str "test-reduce-sum_m_"
                                (clojure.string/join "_" (:tags method))))
           backing-var (ns-resolve 'raster.par-test mangled)
-          walked (:raster.core/deftm-walked-body (meta backing-var))]
+          walked (or (:raster.core/deftm-walked-body (meta backing-var))
+                     (raster.core/ensure-walked-body! backing-var))]
       ;; The walked body should contain a raster.par/reduce form
       (is (some #(and (seq? %) (= 'raster.par/reduce (first %)))
                 (tree-seq seq? seq (first walked)))

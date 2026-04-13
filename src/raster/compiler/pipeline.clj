@@ -58,7 +58,8 @@
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.form :as form]
-            [raster.compiler.core.method-entry :as me]))
+            [raster.compiler.core.method-entry :as me]
+            [raster.core :as rcore]))
 
 (defn- check-purity! [walked-body active-params warning-meta]
   (purity/validate-for-ad! walked-body active-params warning-meta))
@@ -74,7 +75,7 @@
   Without dtype, picks the single overload or errors if ambiguous."
   ([f-var] (resolve-deftm-var f-var nil))
   ([f-var dtype]
-   (if (:raster.core/deftm-walked-body (meta f-var))
+   (if (:raster.core/deftm (meta f-var))
      f-var
      ;; Look up the dispatch table
      (when-let [dt (:raster.core/dispatch-table (meta f-var))]
@@ -149,9 +150,10 @@
                                          "- falling back to pre-walked body:" (.getMessage t)))
                               nil))]
             walked))
-        ;; Fallback: use pre-walked body from definition time
+        ;; Fallback: use pre-walked body from definition time or lazy walk
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
+        (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body or raw body" {:var f-var})))))
 
 (defn- get-params [f-var & [dtype]]
@@ -987,7 +989,8 @@
   (let [resolved (or (when dtype (resolve-deftm-var f-var dtype)) f-var)
         m (meta resolved)
         walked (or (:raster.core/deftm-walked-body-typed m)
-                   (:raster.core/deftm-walked-body m))]
+                   (:raster.core/deftm-walked-body m)
+                   (rcore/ensure-walked-body! resolved))]
     (when-not walked
       (println "No walked body found for" f-var))
     (println (str "\n=== Type Analysis: " (:name m) " ===\n"))

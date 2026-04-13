@@ -206,10 +206,11 @@
      :validate?     — warn on unresolvable annotations (default true)
      :fn-label      — label for validation warnings (e.g. \"deftm foo\")
      :tc-eager?     — run TC before walking (ftm=true, deftm=false)
+     :defer-walk?   — skip walking for typed functions (Julia model)
      :simplify?     — apply simplifier to walked body"
   [param-vec ret-args opts]
-  (let [{:keys [validate? fn-label tc-eager? simplify?]
-         :or {validate? true tc-eager? false simplify? *simplify?*}} opts
+  (let [{:keys [validate? fn-label tc-eager? defer-walk? simplify?]
+         :or {validate? true tc-eager? false defer-walk? false simplify? *simplify?*}} opts
         ;; Parse return type and body from ret-args
         [ret-type body] (if (= :- (first ret-args))
                           [(second ret-args) (nnext ret-args)]
@@ -218,10 +219,14 @@
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         tags (types/extract-tags params annotations)
         explicit-ret-tag (when ret-type (types/annotation->tag ret-type nil))
-        ;; Infer return type via TC when no explicit annotation.
-        ;; TC is authoritative — avoids void/Object mismatch between
-        ;; (Fn [...]) caller and deftm callee.
-        tc-ret-tag (when (and (not explicit-ret-tag) (seq annotations))
+        ;; Determine generate-typed? early (needed for defer-walk? decision)
+        generate-typed? (types/has-primitive-annotations? annotations ret-type)
+        ;; Julia model: skip walking for typed deftm — walk happens at JIT time
+        skip-walk? (and defer-walk? generate-typed?)
+        ;; Infer return type via TC when no explicit annotation and TC is eager.
+        ;; When tc-eager? is false (default), the walker uses structural inference
+        ;; and TC runs later at compile-aot/specialize time.
+        tc-ret-tag (when (and tc-eager? (not explicit-ret-tag) (seq annotations))
                      (try
                        (:ret-tag (inf/tc-analyze-deftm-body
                                   (or fn-label '<infer>) params annotations body))
@@ -246,19 +251,19 @@
                             (:binding-tags (inf/tc-analyze-deftm-body
                                             (or fn-label '<ftm>) params annotations body))
                             (catch Throwable _ nil)))
-        ;; Walk body with plain type-env (IFn path)
+        ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
-        walked-body (let [wb (map #(walker/walk-body % walk-opts) body)]
-                      (if simplify? (map simplify/simplify wb) wb))
+        walked-body (when-not skip-walk?
+                      (let [wb (map #(walker/walk-body % walk-opts) body)]
+                        (if simplify? (map simplify/simplify wb) wb)))
         ;; Conditional second walk with fn-info (typed .invk path)
         has-fn-params? (some :fn-info (vals full-type-env))
-        walked-body-typed (when has-fn-params?
+        walked-body-typed (when (and (not skip-walk?) has-fn-params?)
                             (let [full-walk-opts (assoc walk-opts :type-env full-type-env)
                                   wb (map #(walker/walk-body % full-walk-opts) body)]
                               (if simplify? (map simplify/simplify wb) wb)))
         ;; Typed interface info
-        generate-typed? (types/has-primitive-annotations? annotations ret-type)
         typed-iface-info (when generate-typed?
                            (let [prim-tags (mapv #(types/annotation->tag %1 %2) annotations params)]
                              (types/ensure-fn-interface! prim-tags)))
@@ -296,12 +301,25 @@
   silently falling back to the deftype impl."
   false)
 
+(defn- jit-walk-with-tc
+  "Walk body with TC binding tags for JIT compilation.
+  Julia model: type inference + devirtualization happens at first invocation,
+  not at definition time. This gives TC-quality code in the JIT path."
+  [source-body params tags annotations source-ns]
+  (let [type-env (build-walker-type-env params annotations)
+        tc-binding-tags (try
+                          (:binding-tags (inf/tc-analyze-deftm-body
+                                          '<jit> params annotations source-body))
+                          (catch Throwable _ nil))
+        walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+    (mapv #(walker/walk-body % walk-opts) source-body)))
+
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
-  Uses the definition-time walked body directly. TC runs at AOT time
-  (compile-aot), not at lazy JIT time — JIT must be fast.
-  Returns the compiled impl on success. On failure, throws unless
-  *jit-silent-fallback?* is true."
+  Julia model: re-walks from source body with TC at JIT time for
+  TC-quality devirtualization. Falls back to pre-walked body if
+  TC re-walk fails. Returns the compiled impl on success."
   [impl-var mangled-sym params tags return-tag walked-body source-ns typed-iface-name
    & {:keys [annotations source-body]}]
   (try
@@ -311,12 +329,19 @@
                (clojure.lang.DynamicClassLoader.
                 (.getContextClassLoader (Thread/currentThread))))]
       (binding [me/*compilation-classloader* (or me/*compilation-classloader* cl)]
-        (let [class-name (str "raster.compiled.DT_"
+        (let [;; Re-walk from source body with TC for better devirtualization
+              effective-body (if (and source-body annotations)
+                               (try (jit-walk-with-tc (vec source-body) params tags
+                                                      annotations source-ns)
+                                    (catch Throwable _
+                                      walked-body))
+                               walked-body)
+              class-name (str "raster.compiled.DT_"
                               (.replace (str mangled-sym) "." "_")
-                              "_" (bit-and (hash walked-body) 0x7FFFFFFF)
+                              "_" (bit-and (hash effective-body) 0x7FFFFFFF)
                               "_" (mod (System/nanoTime) 1000000))
               impl (bytecode/compile-typed-impl! class-name params tags return-tag
-                                                 walked-body source-ns typed-iface-name
+                                                 effective-body source-ns typed-iface-name
                                                  (str (ns-name source-ns)) (str mangled-sym))]
           (when impl
             (let [old-impl (.getRawRoot ^clojure.lang.Var impl-var)]
@@ -398,6 +423,31 @@
   [key]
   (get @walked-body-registry key))
 
+(clojure.core/defn ^:no-doc ensure-walked-body!
+  "Lazily walk a deftm var's source body with TC. Returns walked body.
+  Julia model: walking is deferred to first use. If the var already has
+  a walked body, returns it immediately. Otherwise walks from source body
+  with TC binding tags and caches the result on the var metadata.
+  Thread-safe via double-checked locking per var."
+  [v]
+  (or (seq (::deftm-walked-body (meta v)))
+      (locking v
+        (or (seq (::deftm-walked-body (meta v)))
+            (when-let [src (::deftm-source-body (meta v))]
+              (let [m (meta v)
+                    walked (try (jit-walk-with-tc (vec src)
+                                                  (::deftm-params m)
+                                                  (::deftm-tags m)
+                                                  (::deftm-annotations m)
+                                                  (try (the-ns (::deftm-source-ns m))
+                                                       (catch Exception _ *ns*)))
+                                (catch Throwable _
+                                  ;; Fallback: walk without TC
+                                  (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
+                                    (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
+                (alter-meta! v assoc ::deftm-walked-body (vec walked))
+                (vec walked)))))))
+
 ;; ================================================================
 ;; Public API: defn — Clojure defn with walked body for compiler inlining
 ;; ================================================================
@@ -457,6 +507,7 @@
           `(do ~defn-form
                (let [reg# (walked-body-for ~reg-key)]
                  (alter-meta! (var ~name) assoc
+                              ::deftm true
                               ::deftm-walked-body (:walked-body reg#)
                               ::deftm-raw-body (:source-body reg#)
                               ::deftm-source-ns '~(symbol (str *ns*))
@@ -589,9 +640,10 @@
       (let [param-vec (first rest-args)
             _ (assert (vector? param-vec)
                       (str "deftm requires a parameter vector, got: " (pr-str (first rest-args))))
-        ;; Shared preparation: parse, validate, walk
+        ;; Shared preparation: parse, validate, walk (deferred for typed deftm)
             prep (prepare-typed-body param-vec (rest rest-args)
-                                     {:fn-label (str "deftm " fn-name) :tc-eager? true})
+                                     {:fn-label (str "deftm " fn-name)
+                                      :defer-walk? true})
             {:keys [params annotations tags ret-type ret-tag body
                     hinted-params walked-body walked-body-typed has-fn-params?
                     generate-typed? typed-iface-name prim-hinted-params]} prep
@@ -618,7 +670,7 @@
     ;; which would hit Clojure's 64KB method limit for functions with
     ;; many expanded par forms (e.g. vern7-step! with 10 broadcast stages).
         (swap! walked-body-registry assoc (str mangled)
-               {:walked-body (vec walked-body)
+               {:walked-body (when walked-body (vec walked-body))
                 :walked-body-typed (when walked-body-typed (vec walked-body-typed))
                 :source-body (vec body)})
         `(do
@@ -656,6 +708,7 @@
        ;; hit Clojure's 64KB method limit for functions with many par forms.
            (let [reg# (walked-body-for ~(str mangled))]
              (alter-meta! (var ~mangled) assoc
+                          ::deftm true
                           ::deftm-params '~params
                           ::deftm-tags '~tags
                           ::deftm-annotations '~(vec annotations)
@@ -730,7 +783,9 @@
                                                      iv# (:mangled-sym spec#)
                                                      (:params spec#) (:tags spec#) (:return-tag spec#)
                                                      (:walked-body spec#) (the-ns (:source-ns-name spec#))
-                                                     (:typed-iface-name spec#))
+                                                     (:typed-iface-name spec#)
+                                                     :annotations (:annotations spec#)
+                                                     :source-body (:source-body spec#))
                                                     (alter-meta! iv# dissoc ::jit-spec)))))
                                         ;; Route through -impl (after JIT: compiled class with IFn)
                                             (apply (deref (var ~mangled-impl-var)) ~'args))
@@ -777,7 +832,7 @@
             [nil body-args]))
         ;; Shared preparation: parse, validate, walk (TC eager for ftm)
         prep (prepare-typed-body param-vec body-args
-                                 {:fn-label "ftm" :tc-eager? true})
+                                 {:fn-label "ftm"})
         {:keys [params annotations tags ret-type ret-tag body
                 walked-body prim-hinted-params typed-iface-name]} prep
         ;; ftm-specific: interface types for reify (primitives stay, others → Object)
@@ -801,7 +856,8 @@
           (~'invoke [~this-sym ~@invoke-params]
             (let ~invoke-let-bindings
               ~@(or walker-source-body body))))
-        merge {::deftm-walked-body '~(vec walked-body)
+        merge {::deftm true
+               ::deftm-walked-body '~(vec walked-body)
                 ;; Source body for AD: walker's pre-walk source (uses raster.numeric
                 ;; dispatch which handles Dual) when ftm is inside a walked deftm body.
                 ;; Falls back to the raw body when ftm is used standalone.

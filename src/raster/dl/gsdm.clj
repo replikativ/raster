@@ -36,7 +36,8 @@
             [raster.dl.diffusion :as diff]
             [raster.dl.loss :as loss]
             [raster.dl.array-ops :as array-ops]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.core.walker :as walker]))
 
 (declare weights-map->args weight-param-order)
 
@@ -1263,7 +1264,7 @@
   (let [body (gen-gsdm-loss-body n-layers emb-dim n-heads n-spaces)
         flat-env (build-walker-env n-layers)
         type-env (reduce-kv (fn [m s t] (assoc m s {:tag t})) {} flat-env)]
-    ((requiring-resolve 'raster.compiler.core.walker/walk-body)
+    (walker/walk-body
      body {:type-env type-env})))
 
 (defn compile-gsdm-train-fn

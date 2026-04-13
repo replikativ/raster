@@ -149,7 +149,7 @@
   "True if f is a var with deftm metadata (can use value+grad)."
   [f]
   (and (var? f)
-       (or (:raster.core/deftm-walked-body (meta f))
+       (or (:raster.core/deftm (meta f))
            (:raster.core/dispatch-table (meta f)))))
 
 (defn- make-derivative-fn

@@ -622,7 +622,7 @@
               ;; Promotion failed — accept the abstract fallback if it exists
               (when exact {:entry exact})))))))
 
-(defn- try-parametric-specialize!
+(defn try-parametric-specialize!
   "When a concrete dispatch entry is not found but a parametric template exists,
   trigger specialization and return the new entry. This is the Julia model:
   specialize on first use at compile time, not just at runtime."

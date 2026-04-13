@@ -13,7 +13,7 @@
        (raster.numeric/+ x 2))
      ;=> Sym((+ x 2))"
   (:refer-clojure :exclude [+ - * / abs < <= > >= ==])
-  (:require [raster.core :refer [deftm defvalue defval defabstract]]
+  (:require [raster.core :as rcore :refer [deftm defvalue defval defabstract]]
             [raster.numeric]
             [raster.math]
             [raster.types.promote :as promote]))
@@ -409,7 +409,7 @@
   [f-var sym-bindings]
   (let [meta-map (meta f-var)
         ;; Resolve to the mangled var with walked body
-        resolved (or (when (:raster.core/deftm-walked-body meta-map) f-var)
+        resolved (or (when (:raster.core/deftm meta-map) f-var)
                      (when-let [dt (:raster.core/dispatch-table meta-map)]
                        (let [entries (vals @dt)
                              method (first (first entries))
@@ -420,7 +420,8 @@
         _ (when-not resolved
             (throw (ex-info "Var has no deftm walked body" {:var f-var})))
         resolved-meta (meta resolved)
-        walked-body (:raster.core/deftm-walked-body resolved-meta)
+        walked-body (or (:raster.core/deftm-walked-body resolved-meta)
+                        (rcore/ensure-walked-body! resolved))
         params (:raster.core/deftm-params resolved-meta)
         ;; Build env from param→sym-binding mapping
         env (reduce (fn [e p]
