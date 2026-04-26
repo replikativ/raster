@@ -196,10 +196,12 @@
           loss (nth out 0)
           grads (rest out)]
       (is (Double/isFinite loss))
-      (is (= (count flat) (count grads))
-          "One gradient per leaf")
+      ;; The grad vector has one slot per ORIGINAL flat-arg (all leaves +
+      ;; all non-pytree args). Non-doubles slots get nil (non-differentiable).
+      (is (>= (count grads) (count flat))
+          "At least one gradient per leaf, plus nils for non-diff scalar args")
       (is (every? (fn [g]
-                    (or (nil? g)        ;; Frozen leaves get nil grads
+                    (or (nil? g)        ;; Frozen leaves / Long params get nil
                         (and (instance? (Class/forName "[D") g)
                              (every? #(Double/isFinite %) g))))
                   grads)

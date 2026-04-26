@@ -600,13 +600,23 @@
         param-adj-syms (atom [])
 
         _ (doseq [p active-params]
-            (let [contribs (get @adj-env p)
-                  adj-sym (ad-gensym (str "d_" (name p))
-                                     (:raster.type/tag (meta p)))
+            (let [tag (:raster.type/tag (meta p))
+                  contribs (get @adj-env p)
+                  adj-sym (ad-gensym (str "d_" (name p)) tag)
+                  ;; No contributions → zero of the SAME shape/type as the
+                  ;; param. For arrays, a scalar 0.0 would crash downstream
+                  ;; array primitives if it ever gets read as an adjoint.
+                  ;; (Yes, in the per-iteration AD this is rarely consumed,
+                  ;; but the result-pullback's compound branch consumes
+                  ;; param adjoints by index for backward-loop seeding —
+                  ;; see gen-reverse-loop's result-seed machinery.)
+                  no-contrib-default
+                  (case tag
+                    doubles (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
+                    floats  (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
+                    0.0)
                   adj-expr (cond
-                             ;; No contributions → nil (zero/absent gradient).
-                             ;; nil is type-neutral — works for both scalar and array params.
-                             (nil? contribs) 0.0
+                             (nil? contribs) no-contrib-default
                              (= 1 (count contribs)) (first contribs)
                              :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
                                            contribs))]
@@ -962,7 +972,23 @@
                 ;; (active loop vars + active params), using final-lv names
                 subst-iter-active (mapv #(get lv-subst % %) iter-active)
                 res-sym (ad-gensym "res")
-                res-bindings [res-sym subst-result]
+                ;; Lift any nested let* bindings out of subst-result so AD can
+                ;; process each binding as a separate record. If we leave the
+                ;; let* opaque, gen-reverse-let's Phase 1 doesn't know how to
+                ;; record it (the call dispatch falls through with no template
+                ;; for `let*`), Phase 2 has no records, no contributions flow,
+                ;; and Phase 3 fires every param adjoint with the no-contribs
+                ;; default — the gradient w.r.t. the loop's final value never
+                ;; gets computed. Recurse through nested lets to handle deeply
+                ;; nested cases produced by inlining.
+                [lifted-bindings final-result]
+                (loop [expr subst-result acc []]
+                  (if (and (seq? expr) (#{'let 'let*} (first expr)))
+                    (let [[_ binds & body] expr
+                          last-body (last body)]
+                      (recur last-body (into acc binds)))
+                    [acc expr]))
+                res-bindings (vec (concat lifted-bindings [res-sym final-result]))
                 res-transform (gen-reverse-let res-bindings [res-sym] subst-iter-active)
                 ;; At pullback time: call the result pullback with dy__rad
                 rvpb-sym (ad-gensym "rvpb")
