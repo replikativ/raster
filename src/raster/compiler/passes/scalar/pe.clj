@@ -65,9 +65,33 @@
             init-count
             (+ init-count (reduce + 0 (map #(count-uses sym %) (nnext form))))))
 
-        ;; fn — sym might be shadowed by params
+        ;; fn/fn* — count uses in body; sym may be shadowed by params per arity.
+        ;; Returning 0 here is unsound: it lets PE drop bindings whose only
+        ;; uses are inside a closure (e.g. AD per-step pullbacks captured from
+        ;; the forward loop). DCE's free-syms-flat already counts these correctly.
         (#{'fn 'fn*} head)
-        0 ;; Conservative: don't inline into closures
+        (let [tail (rest form)
+              ;; Skip optional name in (fn name ...) form
+              tail (if (and (symbol? (first tail)) (not (vector? (first tail))))
+                     (rest tail)
+                     tail)
+              count-arity
+              (fn [arity-body]
+                (let [params (first arity-body)
+                      body (rest arity-body)]
+                  (if (and (vector? params)
+                           (some #(= sym %) (filter symbol? params)))
+                    0 ;; shadowed by this arity's params
+                    (reduce + 0 (map #(count-uses sym %) body)))))]
+          (cond
+            ;; Single arity: (fn [params] body...)
+            (vector? (first tail))
+            (count-arity tail)
+            ;; Multi-arity: (fn ([params] body) ([params] body))
+            :else
+            (reduce + 0 (map count-arity
+                             (filter #(and (seq? %) (vector? (first %)))
+                                     tail)))))
 
         ;; General form
         :else
@@ -238,9 +262,31 @@
             1 (first kept)
             (cons 'do kept)))
 
-        ;; fn/fn* — don't PE inside (different scope)
+        ;; fn/fn* — recurse into body to substitute env for non-shadowed syms.
+        ;; Without this, when PE inlines a binding [h x] (drops h, env[h] = x),
+        ;; references to h inside fn* bodies (captured forward state in AD
+        ;; pullbacks) become unresolved at bytecode emit.
         (and (symbol? head) (#{'fn 'fn*} head))
-        form
+        (let [tail (rest form)
+              ;; (fn name? [params] body...) — strip optional name
+              [name? rest-tail] (if (and (symbol? (first tail))
+                                         (not (vector? (first tail))))
+                                  [(first tail) (rest tail)]
+                                  [nil tail])]
+          (cond
+            ;; Single arity: (fn name? [params] body...)
+            (vector? (first rest-tail))
+            (let [params (first rest-tail)
+                  body (rest rest-tail)
+                  shadowed (set (filter symbol? params))
+                  body-env (if (seq shadowed) (apply dissoc const-env shadowed) const-env)
+                  pe-body (map #(pe-pass % body-env) body)
+                  r (apply list head (concat (when name? [name?])
+                                             [params]
+                                             pe-body))]
+              (if-let [m (meta form)] (with-meta r m) r))
+            ;; Multi-arity or unrecognized — leave alone
+            :else form))
 
         ;; ftm — leave alone
         (= head 'ftm)
