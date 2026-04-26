@@ -55,17 +55,17 @@
 (def y (double-array [1.0 0.0 -1.0]))
 (def shape-args [1 2 4 3])  ; batch d-in d-hid d-out
 
-(defn pytree-w [] {:W1 W1 :b1 b1 :W2 W2 :b2 b2})
+(defn tree-w [] {:W1 W1 :b1 b1 :W2 W2 :b2 b2})
 
 (deftest forward-equivalence-lazy-jit
-  (let [a (apply mlp-loss-A (pytree-w) x y shape-args)
+  (let [a (apply mlp-loss-A (tree-w) x y shape-args)
         b (apply mlp-loss-B W1 b1 W2 b2 x y shape-args)]
     (is (= a b) "lazy JIT: defmodel and flat deftm produce identical loss")))
 
 (deftest forward-equivalence-compile-aot
   (let [fast-A (rp/compile-aot #'mlp-loss-A)
         fast-B (pipeline/compile-aot #'mlp-loss-B)
-        a (apply fast-A (pytree-w) x y shape-args)
+        a (apply fast-A (tree-w) x y shape-args)
         b (apply fast-B W1 b1 W2 b2 x y shape-args)]
     (is (= a b) "compile-aot: defmodel and flat deftm produce identical loss")))
 
@@ -84,10 +84,10 @@
       (is (= (vec (nth out-A 3)) (vec (nth out-B 2))) "b1 grad — A idx 3, B idx 2")
       (is (= (vec (nth out-A 4)) (vec (nth out-B 4))) "b2 grad"))))
 
-(deftest gradient-equivalence-via-pytree-api
-  (testing "rp/value+grad returns structured grad pytrees matching raw deftm"
-    (let [vg-pytree (rp/value+grad #'mlp-loss-A)
-          [loss-A grad-w-A] (apply vg-pytree (pytree-w) x y shape-args)
+(deftest gradient-equivalence-via-tree-api
+  (testing "rp/value+grad returns structured grad trees matching raw deftm"
+    (let [vg-tree (rp/value+grad #'mlp-loss-A)
+          [loss-A grad-w-A] (apply vg-tree (tree-w) x y shape-args)
           vg-B (ad/value+grad #'mlp-loss-B)
           out-B (apply vg-B W1 b1 W2 b2 x y shape-args)]
       (is (= loss-A (first out-B)) "loss matches raw deftm")

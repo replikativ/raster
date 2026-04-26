@@ -12,7 +12,7 @@
       (gpt2-embeddings → layer-norm → linear → cross-entropy-loss)
     in a defmodel body. Same primitives work outside this composition. The
     issue is in raster's AD/compile-aot pipeline interaction with parametric
-    deftms in loss bodies, not in the pytree machinery — GSDM trains via
+    deftms in loss bodies, not in the tree machinery — GSDM trains via
     compile-train-step at the same scale (1735 µs/step at 2-layer 8-dim).
 
   This file demonstrates the WORKING forward path. The inline-block emitter
@@ -46,7 +46,7 @@
           :proj-w (Param (Array double))  :proj-b (Param (Array double))}))
 
 (defn weights-spec
-  "Full GPT-2 weights pytree spec for n-layer transformer.
+  "Full GPT-2 weights tree spec for n-layer transformer.
 
   :unembed-b is a Frozen zero bias used as the unembedding-projection bias
   (GPT-2 ties wte as the unembedding weight and has no real bias). Carrying it
@@ -63,11 +63,11 @@
            :layers    (list 'HVec (vec (repeat n-layer bs)))})))
 
 ;; ----------------------------------------------------------------------
-;; Convert raster.dl.gpt2/load-model output to pytree shape
+;; Convert raster.dl.gpt2/load-model output to tree shape
 ;; ----------------------------------------------------------------------
 
-(defn model->pytree
-  "Convert a raster.dl.gpt2 model map (from load-model) into the pytree shape
+(defn model->tree
+  "Convert a raster.dl.gpt2 model map (from load-model) into the tree shape
   expected by the gpt2-loss defmodel. Arrays in the result share storage with
   the model — mutations during training affect the original model."
   [model]
@@ -78,7 +78,7 @@
      :layers (mapv layers (range n-layer))}))
 
 (defn random-init-weights
-  "Allocate a fresh random GPT-2 weights pytree (Gaussian init, scaled by
+  "Allocate a fresh random GPT-2 weights tree (Gaussian init, scaled by
   1/sqrt(d-model)). For training-from-scratch demos and tests."
   [{:keys [n-layer d-model n-head vocab-size max-position]}]
   (let [rng (java.util.Random. 42)
@@ -187,7 +187,7 @@
 
 (defn make-gpt2-loss
   "Eval a defmodel form for the given config and return its var. The var has
-  structured-arg surface (takes a weights pytree); compile-aot and value+grad
+  structured-arg surface (takes a weights tree); compile-aot and value+grad
   pick up the same surface via params metadata."
   [{:keys [n-layer d-model] :as _config}]
   (let [w-spec (weights-spec n-layer)

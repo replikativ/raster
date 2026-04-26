@@ -40,7 +40,7 @@
     (raster.dl.loss/mse-loss pred y (clojure.core/* batch d))))
 
 ;; ---------------------------------------------------------------------------
-;; Train step — uses flat-view (compile-time grad-pytree view) + walk!
+;; Train step — uses flat-view (compile-time grad-tree view) + walk!
 ;; (compile-time per-leaf adam-step!).  No body-gen, no eval, no helper.
 ;; ---------------------------------------------------------------------------
 (rp/defmodel small-train
@@ -85,7 +85,7 @@
 ;; scan-vec demo — chain a stack of layers with no manual unrolling.
 ;; ---------------------------------------------------------------------------
 
-;; Per-block step: takes (acc-pytree, layer-pytree, batch, d).
+;; Per-block step: takes (acc-tree, layer-tree, batch, d).
 (rp/defmodel mlp-block
   [h :- (Array double)
    layer :- (Params (HMap :mandatory {:W (Param (Array double))
@@ -107,7 +107,7 @@
     (raster.dl.loss/mse-loss h-final y (clojure.core/* batch d))))
 
 ;; ---------------------------------------------------------------------------
-;; Fold: `deftm` (not defmodel!) detects Params and routes through the pytree
+;; Fold: `deftm` (not defmodel!) detects Params and routes through the tree
 ;; pipeline. User writes deftm; the macro forwards.
 ;; ---------------------------------------------------------------------------
 (core/deftm linear-via-deftm

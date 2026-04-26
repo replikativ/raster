@@ -74,13 +74,13 @@
 ;; ----------------------------------------------------------------------
 
 (defn- compile-flatten-wrapper
-  "Build a *fixed-arity* wrapper around inner-fn that splices each pytree arg
+  "Build a *fixed-arity* wrapper around inner-fn that splices each tree arg
   into per-leaf positional args via the callee's treedef. Generated via eval
   once per defmodel / compile-aot call — eliminates the per-call rest-args
   seq, transient loop, spec walk, and apply that the older runtime adapter
   performed.
 
-  Validates that no two leaves of the same pytree share JVM identity (naked
+  Validates that no two leaves of the same tree share JVM identity (naked
   weight tying) — throws a clear error if they do."
   [inner-fn original-args treedefs]
   (let [user-syms (mapv (fn [arg] (gensym (str (name arg) "_"))) original-args)
@@ -118,7 +118,7 @@
 
 (defmacro defmodel
   "Define a deftm-style typed function whose params can include HMap/HVec
-  pytrees. Body uses (:k m) / (get m :k) / (nth v i) for access; the macro
+  trees. Body uses (:k m) / (get m :k) / (nth v i) for access; the macro
   pre-flattens the body so the underlying compiled function takes flat
   positional args. The user-facing var accepts the structured args and
   flattens at call time.
@@ -165,7 +165,7 @@
 ;; ----------------------------------------------------------------------
 
 (defn compile-aot
-  "Compile a defmodel var. If the var has pytree treedefs, compile the
+  "Compile a defmodel var. If the var has tree treedefs, compile the
   underlying flat deftm via pipeline/compile-aot and wrap with a flatten-shim
   matching the original structured args. Otherwise pass through."
   [model-var & opts]
@@ -189,7 +189,7 @@
 
 (defn leaves-by-kind
   "Return a flat map of {path-key -> leaf-value} for leaves matching `kind`.
-  spec is the pytree type spec; value is a runtime pytree.
+  spec is the tree type spec; value is a runtime tree.
   kind ∈ {:param :frozen :plain}."
   [kind spec value]
   (let [descs (pf/flatten-spec spec)
@@ -206,9 +206,9 @@
   (leaves-by-kind :param spec value))
 
 (defn unflatten-by-kind
-  "Inverse of `leaves-by-kind`: given a spec, the original full pytree, and a
+  "Inverse of `leaves-by-kind`: given a spec, the original full tree, and a
   flat map of {path-key -> updated-leaf-value} for one kind, return a new
-  pytree with those leaves replaced. Other-kind leaves pass through."
+  tree with those leaves replaced. Other-kind leaves pass through."
   [kind spec original-value updated-flat]
   (let [descs (pf/flatten-spec spec)
         vals  (pf/flatten-value spec original-value)
@@ -222,11 +222,11 @@
 (defn value+grad
   "Like raster.ad.reverse/value+grad but works on a defmodel var.
   Returns a function that takes the same structured args as the model and
-  produces [value grad-arg-1 grad-arg-2 ...] where pytree args yield grad
-  pytrees of the same shape as the input pytree (one entry per leaf,
+  produces [value grad-arg-1 grad-arg-2 ...] where tree args yield grad
+  trees of the same shape as the input tree (one entry per leaf,
   including Frozen leaves whose grads are typically zero arrays).
 
-  For non-pytree args, the grad is the raw flat output from value+grad."
+  For non-tree args, the grad is the raw flat output from value+grad."
   [model-var]
   (let [m            (meta model-var)
         flat-var     (or (::flat-var m) (throw (ex-info "Not a defmodel var" {:var model-var})))
@@ -247,7 +247,7 @@
             flat-out (apply vg flat)
             value    (first flat-out)
             flat-grads (rest flat-out)]
-        ;; Walk arg list in lockstep with flat-grads, restructuring pytree grads
+        ;; Walk arg list in lockstep with flat-grads, restructuring tree grads
         (loop [args original-args
                flat-grads flat-grads
                out  (transient [value])]
@@ -262,7 +262,7 @@
             (persistent! out)))))))
 
 (defn strip-leaf-wrappers
-  "Walk a pytree spec and remove Param/Frozen wrappers from every leaf,
+  "Walk a tree spec and remove Param/Frozen wrappers from every leaf,
   preserving HMap/HVec structure. Used to derive m/v specs from a weights
   spec — optimizer-state arrays don't carry trainability semantics."
   [spec]
@@ -288,9 +288,9 @@
       :else (double-array n))))
 
 (defn init-adam-state
-  "Allocate parallel m and v pytrees matching the structure of `weights`.
+  "Allocate parallel m and v trees matching the structure of `weights`.
   At every leaf position (regardless of Param/Frozen), allocate a zero array
-  of the same dtype and length. Returns {:m <m-pytree> :v <v-pytree>}.
+  of the same dtype and length. Returns {:m <m-tree> :v <v-tree>}.
 
   Frozen-leaf entries are wasted (the train step never reads them) but the
   shape parallelism keeps pre-flatten and the canonical leaf order trivial."
@@ -324,9 +324,9 @@
   and applies an Adam step in-place on the corresponding (:path w) array."
   [loss-flat-var loss-args weights-arg leaves loss-treedef]
   (let [;; loss-args is the loss var's original arg list, e.g. '[w values ...]
-        ;; weights-arg is the symbol of the pytree-typed arg, usually 'w
-        ;; The flat call to value+grad expects: pytree leaves first (canonical
-        ;; order), then non-pytree args in declared order.
+        ;; weights-arg is the symbol of the tree-typed arg, usually 'w
+        ;; The flat call to value+grad expects: tree leaves first (canonical
+        ;; order), then non-tree args in declared order.
         flat-call-args (concat
                          (map (fn [{:keys [path]}] (access-expr weights-arg path)) leaves)
                          (filter (fn [a] (not= a weights-arg)) loss-args))
@@ -383,7 +383,7 @@
   "Build a fused training-step compiled function from a defmodel loss var.
 
   Returns {:train-fn   compiled IFn taking (weights, m, v, ...data..., max-grad-norm, lr, beta1, beta2, eps, adam-t)
-           :init-state (fn [weights] -> {:m <m-pytree> :v <v-pytree>})
+           :init-state (fn [weights] -> {:m <m-tree> :v <v-tree>})
            :var        the underlying defmodel var (for inspection)}.
 
   The synthesized body is evaluated as a defmodel inside raster.params, so the
@@ -397,13 +397,13 @@
         original-args (::original-args m-meta)
         arg-anns      (::arg-annotations m-meta)
         flat-var      (::flat-var m-meta)
-        ;; Assume the FIRST pytree arg is the weights — common case.
+        ;; Assume the FIRST tree arg is the weights — common case.
         [w-arg w-td]  (first treedefs)
         spec          (:spec w-td)
         leaves        (:leaves w-td)
         m-spec        (strip-leaf-wrappers spec)
-        ;; Build the train-step's arg vector: [w m v ...non-pytree-args... +hyperparams]
-        non-pytree    (vec (keep (fn [[a ann]] (when (not (pf/pytree-arg? ann)) [a ann]))
+        ;; Build the train-step's arg vector: [w m v ...non-tree-args... +hyperparams]
+        non-tree    (vec (keep (fn [[a ann]] (when (not (pf/tree-arg? ann)) [a ann]))
                                  (map vector original-args arg-anns)))
         train-name    (symbol (str (.sym loss-var) "--train-step"))
         body          (gen-train-step-body flat-var original-args w-arg leaves w-td)
@@ -411,7 +411,7 @@
                              [w-arg :- spec]
                              ['m :- m-spec]
                              ['v :- m-spec]
-                             (mapcat (fn [[a ann]] [a :- ann]) non-pytree)
+                             (mapcat (fn [[a ann]] [a :- ann]) non-tree)
                              ['max-grad-norm :- 'Double
                               'lr            :- 'Double
                               'beta1         :- 'Double
@@ -431,8 +431,8 @@
      :spec       spec}))
 
 (defn model-treedef
-  "Look up the treedef for a defmodel var's first pytree arg.
-  If multiple pytree args, returns the first; for arg-name access use
+  "Look up the treedef for a defmodel var's first tree arg.
+  If multiple tree args, returns the first; for arg-name access use
   (-> (meta v) ::treedefs (get arg-name))."
   [model-var]
   (let [tds (-> model-var meta ::treedefs)]

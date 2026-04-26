@@ -1,8 +1,8 @@
 (ns raster.compiler.core.params-flatten
-  "Source-level pre-flatten for HMap / HVec parameter pytrees.
+  "Source-level pre-flatten for HMap / HVec parameter trees.
 
   Rewrites a deftm body so every (:k m) / (get m :k) / (nth v i) on a typed
-  pytree arg becomes a reference to a flat positional symbol. The walker, TC,
+  tree arg becomes a reference to a flat positional symbol. The walker, TC,
   bytecode emission, and lazy JIT path see no HMap — they see a flat-arg deftm.
   The wrapper kind (Param / Frozen) is tracked per leaf in the treedef so AD
   and the optimizer can dispatch at runtime."
@@ -22,12 +22,12 @@
 (defn hvec-spec? [s]
   (and (sequential? s) (= 'HVec (first s))))
 
-(defn pytree-spec? [s]
+(defn tree-spec? [s]
   (or (hmap-spec? s) (hvec-spec? s)))
 
 (defn params-marker?
   "True iff annotation is the (Params <inner>) marker at the deftm-arg level.
-  Params is the EXPLICIT signal that an arg is a structured pytree to be
+  Params is the EXPLICIT signal that an arg is a structured tree to be
   flattened at compile time. Inside the marker, the structure uses ordinary
   HMap/HVec/Param/Frozen forms."
   [annotation]
@@ -58,19 +58,19 @@
   (let [v (second hvec-spec)]
     (if (vector? v) v [])))
 
-(defn validate-pytree-spec!
-  "Validate that a pytree spec uses only the closed, fully-specified constructs
+(defn validate-tree-spec!
+  "Validate that a tree spec uses only the closed, fully-specified constructs
   the Params machinery can flatten. Throws clojure.lang.ExceptionInfo with a
   pointed message on:
 
    - (HMap :optional {...})            — optional keys break canonical leaf order
    - (HMap :complete? false)           — open maps mean unknown leaves at compile time
-   - (HMap :absent-keys ...)           — semantics ambiguous for closed pytree
+   - (HMap :absent-keys ...)           — semantics ambiguous for closed tree
    - (HMap <unknown-opt> ...)          — typo-guard for unsupported HMap options
    - (HVec X) where X is not a vector  — HVec must list its element types
    - (HVec [T...] <extras>)            — HVec doesn't take extra options
 
-  Recurses into every nested HMap/HVec. Leaves are unchecked (any non-pytree
+  Recurses into every nested HMap/HVec. Leaves are unchecked (any non-tree
   type passes through). Returns the spec on success."
   [spec]
   (letfn [(walk [s]
@@ -128,7 +128,7 @@
                   (walk child)))
 
               :else
-              ;; Leaf type — pytree machinery doesn't inspect it further.
+              ;; Leaf type — tree machinery doesn't inspect it further.
               nil))]
     (walk spec)
     spec))
@@ -156,7 +156,7 @@
   order. Each entry: {:path [k|i ...] :type T :kind :param|:frozen|:plain}.
 
   HMap keys are sorted to give a stable order. HVec entries are in vector index
-  order. Sub-pytrees recurse; non-pytree types are leaves."
+  order. Sub-trees recurse; non-tree types are leaves."
   [spec]
   (letfn [(walk [s path]
             (cond
@@ -192,7 +192,7 @@
 (def ^:private nth-syms #{'nth 'clojure.core/nth})
 
 (defn extract-access-step
-  "Recognize a single-step pytree access. Returns [target-form step] or nil.
+  "Recognize a single-step tree access. Returns [target-form step] or nil.
   Supports (:k m), (get m :k), (nth v i-literal) with qualified or unqualified
   get/nth. Step is a keyword or integer."
   [form]
@@ -211,10 +211,10 @@
         [(second form) (nth form 2)]))))
 
 (defn leaf-spec? [spec]
-  (and (some? spec) (not (pytree-spec? spec))))
+  (and (some? spec) (not (tree-spec? spec))))
 
 (defn path->flat-idx
-  "Given a pytree spec and a leaf path, return the canonical flat-index of
+  "Given a tree spec and a leaf path, return the canonical flat-index of
   that path in the spec's leaves (in sorted-key/ascending-index order).
   Returns nil if path doesn't correspond to a leaf."
   [spec path]
@@ -299,7 +299,7 @@
   The :spec value is unquoted and unwrapped from any (Params ...) marker
   so callers can pass either the inner HMap/HVec directly or wrap with Params.
 
-  Validates that the resolved spec is a well-formed pytree spec (HMap or HVec)
+  Validates that the resolved spec is a well-formed tree spec (HMap or HVec)
   — catches typos and malformed specs at macro time rather than producing
   silent garbage at runtime."
   [form]
@@ -332,13 +332,13 @@
                      (throw (ex-info "flat-view :spec-of var has no :raster.params/treedefs metadata"
                                      {:var v}))))
                :else (throw (ex-info "flat-view requires :spec-of or :spec option" {:form form})))]
-    (when-not (pytree-spec? spec)
+    (when-not (tree-spec? spec)
       (throw (ex-info (str "flat-view :spec must be an HMap or HVec form (or wrapped "
                            "in Params). Got: " (pr-str spec))
                       {:form form :spec spec})))
-    (validate-pytree-spec! spec)
+    (validate-tree-spec! spec)
     (when (zero? (count (flatten-spec spec)))
-      (throw (ex-info "flat-view :spec has no leaves — empty pytree?"
+      (throw (ex-info "flat-view :spec has no leaves — empty tree?"
                       {:form form :spec spec})))
     {:source source :spec spec :starting-at starting-at}))
 
@@ -359,14 +359,14 @@
           path))
 
 ;; ----------------------------------------------------------------------
-;; Cross-deftm pytree call splicing
+;; Cross-deftm tree call splicing
 ;;
 ;; When the body contains a call to a deftm whose params include
-;; (Params ...), splice the pytree leaves at the call site instead of
+;; (Params ...), splice the tree leaves at the call site instead of
 ;; passing a structured value. Replaces the call with one to the callee's
 ;; flat-var. Eliminates runtime Map reconstruction at deftm-to-deftm
 ;; boundaries — the structured wrapper is only used at the outer program
-;; boundary (calls from non-pytree user code).
+;; boundary (calls from non-tree user code).
 ;; ----------------------------------------------------------------------
 
 (defn- safe-to-duplicate?
@@ -387,14 +387,14 @@
         false))))
 
 (defn splice-cross-deftm-call
-  "If form is a call to a deftm with Params-typed args, splice the pytree
+  "If form is a call to a deftm with Params-typed args, splice the tree
   leaves at the call site to call the flat-var directly. Returns the
   rewritten form, or nil if no splicing applies.
 
-  If a pytree arg is not safe to duplicate (e.g. a side-effecting expression
+  If a tree arg is not safe to duplicate (e.g. a side-effecting expression
   or non-trivial computation), it is lifted into a temp let-binding so the
   evaluation happens exactly once — preserving the contract of the original
-  flatten-on-call wrapper, which evaluates each pytree arg once and reads
+  flatten-on-call wrapper, which evaluates each tree arg once and reads
   multiple keys from the result."
   [form _env]
   (when (and (seq? form) (symbol? (first form)))
@@ -409,21 +409,21 @@
                  original-args
                  (seq treedefs)
                  (= (count args) (count original-args)))
-        (let [;; First pass: lift unsafe pytree args to temp bindings.
+        (let [;; First pass: lift unsafe tree args to temp bindings.
               tmp-binds (volatile! [])
               normalized-args
               (mapv (fn [arg-form callee-arg-name]
                       (if (and (get treedefs callee-arg-name)
                                (not (safe-to-duplicate? arg-form)))
-                        (let [g (gensym (str "__pytree_arg__"
+                        (let [g (gensym (str "__tree_arg__"
                                              (name callee-arg-name) "__"))]
                           (vswap! tmp-binds into [g arg-form])
                           g)
                         arg-form))
                     args
                     original-args)
-              ;; Second pass: splice each pytree arg into per-leaf path-access
-              ;; expressions, leaving non-pytree args untouched.
+              ;; Second pass: splice each tree arg into per-leaf path-access
+              ;; expressions, leaving non-tree args untouched.
               spliced-args
               (vec
                 (mapcat
@@ -452,7 +452,7 @@
   '#{walk! raster.tree/walk!})
 
 (defn walk-form?
-  "True iff form is a (raster.tree/walk! kind f [pytree-args] & extras) call."
+  "True iff form is a (raster.tree/walk! kind f [tree-args] & extras) call."
   [form]
   (and (seq? form) (>= (count form) 4) (contains? walk-syms (first form))))
 
@@ -489,28 +489,28 @@
             (set (map count-typed-params (:arglists m)))))))))
 
 (defn- expand-walk-form
-  "Expand (tree/walk! kind f [pytree-args...] extras...) using compile-time
-  spec info from the FIRST pytree-arg. Emits a `do` form with one f call per
+  "Expand (tree/walk! kind f [tree-args...] extras...) using compile-time
+  spec info from the FIRST tree-arg. Emits a `do` form with one f call per
   matching leaf.
 
-  Arity-checks `f` against the call shape (one arg per pytree-arg + extras)
+  Arity-checks `f` against the call shape (one arg per tree-arg + extras)
   when arity info is available. Catches user errors at macro time rather than
   surfacing as opaque IFn invoke failures at runtime."
   [form env]
-  (let [[_ kind f-form pytree-args-vec & extras] form]
-    (when-not (vector? pytree-args-vec)
-      (throw (ex-info "tree/walk!: pytree-args must be a vector"
-                      {:got pytree-args-vec})))
-    (let [first-arg (first pytree-args-vec)
+  (let [[_ kind f-form tree-args-vec & extras] form]
+    (when-not (vector? tree-args-vec)
+      (throw (ex-info "tree/walk!: tree-args must be a vector"
+                      {:got tree-args-vec})))
+    (let [first-arg (first tree-args-vec)
           first-resolved (resolve-path first-arg env)
           spec (or (:spec first-resolved)
-                   (throw (ex-info (str "tree/walk!: first pytree-arg `"
+                   (throw (ex-info (str "tree/walk!: first tree-arg `"
                                         (pr-str first-arg)
-                                        "` must resolve to a known pytree spec")
+                                        "` must resolve to a known tree spec")
                                    {:arg first-arg :env-keys (keys env)})))
           leaves (flatten-spec spec)
           matching (filter #(or (= kind :any) (= (:kind %) kind)) leaves)
-          expected-arity (+ (count pytree-args-vec) (count extras))
+          expected-arity (+ (count tree-args-vec) (count extras))
           arities (callee-arities f-form)]
       (when (and arities (not (contains? arities expected-arity)))
         (throw (ex-info
@@ -520,8 +520,8 @@
                         (str "in " (sort arities)))
                       ", but walk! emits per-leaf calls with arity "
                       expected-arity " ("
-                      (count pytree-args-vec) " pytree arg"
-                      (when (not= 1 (count pytree-args-vec)) "s")
+                      (count tree-args-vec) " tree arg"
+                      (when (not= 1 (count tree-args-vec)) "s")
                       " + " (count extras) " extra"
                       (when (not= 1 (count extras)) "s")
                       "). Make sure f's signature matches "
@@ -529,7 +529,7 @@
                  {:f f-form
                   :expected expected-arity
                   :callee-arities arities
-                  :pytree-args (count pytree-args-vec)
+                  :tree-args (count tree-args-vec)
                   :extras (count extras)})))
       (when (empty? matching)
         (binding [*out* *err*]
@@ -546,7 +546,7 @@
                       (apply list f-form
                              (concat (mapv (fn [arg-form]
                                              (access-expr-for-path arg-form path))
-                                           pytree-args-vec)
+                                           tree-args-vec)
                                      extras)))
                     matching)]
         (cons ::splice-statements calls)))))
@@ -610,7 +610,7 @@
         xs-resolved (resolve-path xs-form env)
         spec (or (:spec xs-resolved)
                  (throw (ex-info (str "scan-vec: xs `" (pr-str xs-form)
-                                      "` must resolve to a known pytree spec")
+                                      "` must resolve to a known tree spec")
                                  {:xs xs-form :env-keys (keys env)})))
         _ (when-not (hvec-spec? spec)
             (throw (ex-info "scan-vec: xs must be an HVec sub-tree"
@@ -618,7 +618,7 @@
         elems (hvec-elems spec)
         n (count elems)
         ;; Try to resolve f as a Params-typed defmodel. If its second positional
-        ;; arg (the element) is a pytree, splice each iteration directly to the
+        ;; arg (the element) is a tree, splice each iteration directly to the
         ;; callee's --flat var rather than reconstructing the structured elt.
         f-var (when (symbol? f-form)
                 (try (resolve f-form) (catch Exception _ nil)))
@@ -673,11 +673,11 @@
   resolves to a typed path:
    - Leaf path: the binding value becomes the flat-arg reference (alias kept).
    - Sub-tree path: the binding is DROPPED entirely. The original expression
-     would dangle (the pytree-arg has been removed from the deftm signature),
+     would dangle (the tree-arg has been removed from the deftm signature),
      and emitting [name nil] confuses downstream passes that capture the
      binding into helper-method args. The binding name is recorded in env so
      subsequent leaf accesses resolve through it. If a sub-tree alias is used
-     as a value (e.g. passed to a function), assert-no-dangling-pytree-refs!
+     as a value (e.g. passed to a function), assert-no-dangling-tree-refs!
      catches it post-walk."
   [bindings env walk-fn record-leaf!]
   (loop [pairs (partition 2 bindings)
@@ -716,7 +716,7 @@
             (recur (rest pairs) (conj out bsym walked-val) new-e))
 
           ;; Sub-tree path: drop the binding; track in env only
-          (and resolved (pytree-spec? (:spec resolved)))
+          (and resolved (tree-spec? (:spec resolved)))
           (recur (rest pairs) out (assoc e bsym resolved))
 
           :else
@@ -725,7 +725,7 @@
       [out e])))
 
 (defn rewrite-body
-  "Rewrite body: replace static pytree access with flat-arg references.
+  "Rewrite body: replace static tree access with flat-arg references.
 
   Returns {:body body' :leaves [{:root :path :spec :sym} ...]} where leaves
   describes every flat arg referenced by the rewritten body, in first-seen
@@ -758,9 +758,9 @@
                   (scan-vec-form? form)
                   (walk (expand-scan-vec form env) env)
 
-                  ;; Cross-deftm pytree splicing: if the call target is a deftm
+                  ;; Cross-deftm tree splicing: if the call target is a deftm
                   ;; whose original signature had Params args, replace the call
-                  ;; with a direct call to its flat-var, with each pytree arg
+                  ;; with a direct call to its flat-var, with each tree arg
                   ;; expanded into its leaves at the call site.
                   spliced
                   (walk spliced env)
@@ -820,7 +820,7 @@
 ;; ----------------------------------------------------------------------
 
 (defn flatten-value
-  "Walk a runtime pytree value matching spec, returning a vector of leaves
+  "Walk a runtime tree value matching spec, returning a vector of leaves
   in canonical order (same as flatten-spec)."
   [spec value]
   (letfn [(walk [s v]
@@ -836,12 +836,12 @@
     (walk spec value)))
 
 (defn assert-no-identity-collisions!
-  "Walk a runtime pytree value matching spec; throw if two leaves share JVM
-  identity (the same object placed at two pytree positions, a.k.a. naked weight
+  "Walk a runtime tree value matching spec; throw if two leaves share JVM
+  identity (the same object placed at two tree positions, a.k.a. naked weight
   tying). Naked tying causes incorrect gradients: each position gets its own
   gradient buffer, so contributions from different paths don't accumulate.
 
-  Resolution: use a single canonical pytree position for the shared parameter
+  Resolution: use a single canonical tree position for the shared parameter
   and reference it from multiple places in the model body, or wrap with `Tied`
   (Phase 2 — not yet implemented).
 
@@ -874,19 +874,19 @@
       (walk spec value [])
       (when-let [[a b] @result]
         (throw (ex-info
-                 (str "Pytree leaves at " (pr-str a) " and " (pr-str b)
+                 (str "Tree leaves at " (pr-str a) " and " (pr-str b)
                       " share JVM identity (same object at two positions). "
                       "Naked weight sharing causes incorrect gradients — each "
                       "position gets its own gradient buffer; contributions "
                       "from different paths don't accumulate. Use one "
-                      "canonical pytree position and reference it from "
+                      "canonical tree position and reference it from "
                       "multiple places in the model body, or wrap with `Tied` "
                       "(not yet implemented).")
                  {:path-a a :path-b b}))))))
 
 (defn unflatten-value
   "Given spec and a flat vector of leaves in canonical order, reconstruct the
-  pytree value. Inverse of flatten-value."
+  tree value. Inverse of flatten-value."
   [spec leaves]
   (letfn [(walk [s i]
             (cond
@@ -919,10 +919,10 @@
        (filter (fn [[ld _]] (= kind (:kind ld))))
        (mapv second)))
 
-(defn pytree-shape
+(defn tree-shape
   "A small structural fingerprint of a runtime value: the spec walked to leaves,
   with each leaf replaced by [:leaf <class>] for its runtime class. Useful as a
-  cache key when validating that a runtime call's pytree matches a treedef."
+  cache key when validating that a runtime call's tree matches a treedef."
   [spec value]
   (let [leaves (flatten-value spec value)]
     (mapv (fn [v] [:leaf (some-> v class .getName)]) leaves)))
@@ -931,12 +931,12 @@
 ;; Top-level: prepare deftm args
 ;; ----------------------------------------------------------------------
 
-(defn pytree-arg?
+(defn tree-arg?
   "True iff annotation is the (Params ...) marker — the explicit signal that
-  this deftm-arg is a structured pytree to be flattened at compile time.
+  this deftm-arg is a structured tree to be flattened at compile time.
 
   HMap/HVec annotations alone do NOT trigger flattening — they remain as
-  regular runtime types. Wrap them in (Params ...) to opt into the pytree
+  regular runtime types. Wrap them in (Params ...) to opt into the tree
   pipeline. This makes the contract syntactically explicit: looking at an
   annotation tells you whether the arg gets flattened."
   [annotation]
@@ -951,21 +951,21 @@
      form)
     @acc))
 
-(defn- assert-no-dangling-pytree-refs!
-  "Pytree args are removed from the deftm signature by the pre-flatten pass.
-  Any reference to a pytree-arg symbol (or a sub-tree alias bound only to a
+(defn- assert-no-dangling-tree-refs!
+  "Tree args are removed from the deftm signature by the pre-flatten pass.
+  Any reference to a tree-arg symbol (or a sub-tree alias bound only to a
   path) that survives the rewrite indicates the user used the value
   non-statically — e.g. passed it to a function or stored it. We can't compile
   that under B1; surface a clear error rather than producing dangling code."
-  [rewritten-body pytree-arg-syms]
+  [rewritten-body tree-arg-syms]
   (let [present (collect-symbols rewritten-body)
-        leaks   (filter present pytree-arg-syms)]
+        leaks   (filter present tree-arg-syms)]
     (when (seq leaks)
       (throw (ex-info
-              (str "Pytree-typed deftm arg(s) " (vec leaks)
+              (str "Tree-typed deftm arg(s) " (vec leaks)
                    " referenced as a value in the body. The pre-flatten pass "
                    "only handles static leaf access via (:k m) / (get m :k) / "
-                   "(nth v i). Passing a pytree (or sub-tree) as a value to "
+                   "(nth v i). Passing a tree (or sub-tree) as a value to "
                    "another function is not supported in this version.")
               {:leaked-symbols (vec leaks)})))))
 
@@ -973,34 +973,34 @@
   "Pre-flatten a deftm signature. params and annotations come from
   parse-typed-params; body is the deftm body.
 
-  For each pytree-typed param, all leaves become flat positional args
-  (canonical sorted order). Non-pytree params pass through unchanged.
+  For each tree-typed param, all leaves become flat positional args
+  (canonical sorted order). Non-tree params pass through unchanged.
 
   Returns {:params new-params, :annotations new-anns, :body new-body,
            :treedefs {root-sym {:spec ... :leaves [{:path :sym :kind :type}]}}}"
   [params annotations body]
-  (let [;; Pytree args are tagged with (Params <inner>). Use the inner spec
+  (let [;; Tree args are tagged with (Params <inner>). Use the inner spec
         ;; for flattening; the Params wrapper is just the trigger.
-        param-inner (fn [ann] (when (pytree-arg? ann) (unwrap-params ann)))
-        ;; Reject malformed pytree specs at the deftm boundary so the user
+        param-inner (fn [ann] (when (tree-arg? ann) (unwrap-params ann)))
+        ;; Reject malformed tree specs at the deftm boundary so the user
         ;; sees a clear error here instead of silent leaf misordering or a
         ;; cryptic downstream failure.
         _ (doseq [[p ann] (map vector params annotations)
-                  :when (pytree-arg? ann)]
-            (try (validate-pytree-spec! (unwrap-params ann))
+                  :when (tree-arg? ann)]
+            (try (validate-tree-spec! (unwrap-params ann))
                  (catch clojure.lang.ExceptionInfo e
                    (throw (ex-info (str "Invalid Params spec for arg `" p "`: "
                                         (.getMessage e))
                                    (assoc (ex-data e) :param p)
                                    e)))))
-        ;; Build initial env: each pytree param becomes a path root with the
+        ;; Build initial env: each tree param becomes a path root with the
         ;; INNER (unwrapped) structural spec.
         init-env (into {}
                        (keep (fn [[p ann]]
                                (when-let [inner (param-inner ann)]
                                  [p {:root p :path [] :spec inner}]))
                              (map vector params annotations)))
-        ;; For each pytree arg, generate canonical flat leaves up-front so
+        ;; For each tree arg, generate canonical flat leaves up-front so
         ;; ordering is stable independent of body access order
         canonical-leaves
         (into {}
@@ -1010,15 +1010,15 @@
                                    (assoc leaf :sym (path->sym p path)))
                                  (flatten-spec inner))]))
                     (map vector params annotations)))
-        pytree-arg-syms (vec (keep (fn [[p ann]] (when (pytree-arg? ann) p))
+        tree-arg-syms (vec (keep (fn [[p ann]] (when (tree-arg? ann) p))
                                    (map vector params annotations)))
         ;; Rewrite the body
         {body' :body} (rewrite-body body init-env)
-        _ (assert-no-dangling-pytree-refs! body' pytree-arg-syms)
+        _ (assert-no-dangling-tree-refs! body' tree-arg-syms)
         ;; Build new param + annotation vectors
         [new-params new-anns]
         (reduce (fn [[ps as] [p ann]]
-                  (if (pytree-arg? ann)
+                  (if (tree-arg? ann)
                     (let [leaves (canonical-leaves p)]
                       [(into ps (map :sym) leaves)
                        (into as (map (fn [{:keys [type kind]}]

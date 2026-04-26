@@ -197,7 +197,7 @@
           grads (rest out)]
       (is (Double/isFinite loss))
       ;; The grad vector has one slot per ORIGINAL flat-arg (all leaves +
-      ;; all non-pytree args). Non-doubles slots get nil (non-differentiable).
+      ;; all non-tree args). Non-doubles slots get nil (non-differentiable).
       (is (>= (count grads) (count flat))
           "At least one gradient per leaf, plus nils for non-diff scalar args")
       (is (every? (fn [g]

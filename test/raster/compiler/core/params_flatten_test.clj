@@ -13,50 +13,50 @@
     (is (= '{:a Long}
            (pf/hmap-mandatory '(HMap :mandatory {:a Long} :complete? true))))))
 
-(deftest validate-pytree-spec-accepts-supported-shapes
+(deftest validate-tree-spec-accepts-supported-shapes
   (testing "Shorthand and explicit forms with closed semantics are accepted"
-    (is (= '(HMap {:a Long}) (pf/validate-pytree-spec! '(HMap {:a Long}))))
+    (is (= '(HMap {:a Long}) (pf/validate-tree-spec! '(HMap {:a Long}))))
     (is (= '(HMap :mandatory {:a Long})
-           (pf/validate-pytree-spec! '(HMap :mandatory {:a Long}))))
+           (pf/validate-tree-spec! '(HMap :mandatory {:a Long}))))
     (is (= '(HMap :mandatory {:a Long} :complete? true)
-           (pf/validate-pytree-spec! '(HMap :mandatory {:a Long} :complete? true))))
+           (pf/validate-tree-spec! '(HMap :mandatory {:a Long} :complete? true))))
     (is (= '(HVec [Long Double])
-           (pf/validate-pytree-spec! '(HVec [Long Double])))))
+           (pf/validate-tree-spec! '(HVec [Long Double])))))
   (testing "Recurses into nested HMap/HVec children"
     (is (= '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W Long})])})
-           (pf/validate-pytree-spec!
+           (pf/validate-tree-spec!
              '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W Long})])}))))))
 
-(deftest validate-pytree-spec-rejects-optional-keys
+(deftest validate-tree-spec-rejects-optional-keys
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":optional"
-        (pf/validate-pytree-spec!
+        (pf/validate-tree-spec!
           '(HMap :mandatory {:a Long} :optional {:b Long})))))
 
-(deftest validate-pytree-spec-rejects-complete-false
+(deftest validate-tree-spec-rejects-complete-false
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":complete\? true"
-        (pf/validate-pytree-spec!
+        (pf/validate-tree-spec!
           '(HMap :mandatory {:a Long} :complete? false)))))
 
-(deftest validate-pytree-spec-rejects-absent-keys
+(deftest validate-tree-spec-rejects-absent-keys
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":absent-keys"
-        (pf/validate-pytree-spec!
+        (pf/validate-tree-spec!
           '(HMap :mandatory {:a Long} :absent-keys #{:b})))))
 
-(deftest validate-pytree-spec-rejects-unknown-options
+(deftest validate-tree-spec-rejects-unknown-options
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported options"
-        (pf/validate-pytree-spec!
+        (pf/validate-tree-spec!
           '(HMap :mandatory {:a Long} :weird-opt 42)))))
 
-(deftest validate-pytree-spec-rejects-malformed-hvec
+(deftest validate-tree-spec-rejects-malformed-hvec
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"HVec"
-        (pf/validate-pytree-spec! '(HVec))))
+        (pf/validate-tree-spec! '(HVec))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"HVec"
-        (pf/validate-pytree-spec! '(HVec [Long] :something-else)))))
+        (pf/validate-tree-spec! '(HVec [Long] :something-else)))))
 
-(deftest validate-pytree-spec-rejects-nested-bad-shape
+(deftest validate-tree-spec-rejects-nested-bad-shape
   (testing "Nested HMap with :optional fails — recursion catches it"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #":optional"
-          (pf/validate-pytree-spec!
+          (pf/validate-tree-spec!
             '(HMap :mandatory {:layers (HVec [(HMap :optional {:W Long})])}))))))
 
 (deftest prepare-deftm-rejects-bad-spec
@@ -118,7 +118,7 @@
 
 (deftest assert-no-identity-collisions-skips-primitives
   (testing "Boxed numbers/booleans aren't treated as identity-shared"
-    ;; Two pytree positions with the same long literal could be cached and
+    ;; Two tree positions with the same long literal could be cached and
     ;; share identity (Long.valueOf), but they don't represent shared mutable
     ;; state, so identity collision must be ignored for primitives.
     (let [spec '(HMap :mandatory {:a Long :b Long})
@@ -203,7 +203,7 @@
                    (Array double)]
                  '(let [h (linear x (:W1 w) (:b1 w))]
                     (linear h (:W2 w) (:b2 w))))]
-    (testing "Pytree arg expanded to flat positional args in canonical order"
+    (testing "Tree arg expanded to flat positional args in canonical order"
       (is (= '[w__W1 w__W2 w__b1 w__b2 x] (:params result))))
     (testing "Flat annotations preserve Param wrapper, x untouched"
       (is (= '[(Param (Array double)) (Param (Array double))
@@ -222,7 +222,7 @@
                (:spec td)))
         (is (= '[w__W1 w__W2 w__b1 w__b2] (mapv :sym (:leaves td))))))))
 
-(deftest prepare-deftm-non-pytree-args-untouched
+(deftest prepare-deftm-non-tree-args-untouched
   (let [result (pf/prepare-deftm
                  '[a b]
                  '[(Array double) Long]
@@ -280,7 +280,7 @@
     (is (= [2.0] (vec (first frozen))))))
 
 (deftest let-binding-with-subtree-value-dropped
-  (testing "Sub-tree alias bindings are dropped from the let — no dangling pytree-arg refs"
+  (testing "Sub-tree alias bindings are dropped from the let — no dangling tree-arg refs"
     (let [{:keys [body]}
           (pf/rewrite-body
             '(let [layer (nth (:layers w) 0)
@@ -297,8 +297,8 @@
         (is (= '(use w__layers__0__Wq) (nth bindings 1))
             "the leaf access through the (now-absent) alias still resolves via env")))))
 
-(deftest pytree-arg-as-value-errors
-  (testing "Passing the pytree arg as a value (e.g. (some-fn w)) is rejected"
+(deftest tree-arg-as-value-errors
+  (testing "Passing the tree arg as a value (e.g. (some-fn w)) is rejected"
     (is (thrown-with-msg?
           clojure.lang.ExceptionInfo #"referenced as a value"
           (pf/prepare-deftm
@@ -442,7 +442,7 @@
            (ns-unmap *ns* (symbol (str s "--flat")))))))
 
 (deftest walk-arity-mismatch-errors-at-macro-time
-  (testing "If f's known arity doesn't match (pytree-args + extras), error clearly"
+  (testing "If f's known arity doesn't match (tree-args + extras), error clearly"
     (with-fake-callees ['ariy-step!]
       (fn []
         ;; Define a fake callee with original-args of length 4 (acc-style 4-arg)
@@ -602,16 +602,16 @@
              (into {} (map (fn [l] [(first (:path l)) (:kind l)])) leaves))))))
 
 ;; ----------------------------------------------------------------------
-;; Cross-deftm pytree call splicing
+;; Cross-deftm tree call splicing
 ;;
 ;; When a defmodel-typed callee is invoked from another defmodel body, the
 ;; pre-flatten walker should rewrite the call to invoke the callee's --flat
-;; var directly, splicing each pytree arg into its leaves at the call site.
+;; var directly, splicing each tree arg into its leaves at the call site.
 ;; This eliminates runtime Map reconstruction at deftm-to-deftm boundaries.
 ;; ----------------------------------------------------------------------
 
-(deftest splice-cross-deftm-call-rewrites-pytree-arg
-  (testing "Splice rewrites (callee pytree-arg ...) to (callee--flat leaf1 leaf2 ...)"
+(deftest splice-cross-deftm-call-rewrites-tree-arg
+  (testing "Splice rewrites (callee tree-arg ...) to (callee--flat leaf1 leaf2 ...)"
     (with-fake-callees ['inner-block]
       (fn []
         (fake-callee-var!
@@ -630,10 +630,10 @@
                        '(:b (:l w))
                        'x 'batch 'd)
                  spliced)
-              "Pytree arg is spliced into per-leaf path-access expressions"))))))
+              "Tree arg is spliced into per-leaf path-access expressions"))))))
 
-(deftest splice-cross-deftm-call-passes-through-non-pytree-args
-  (testing "Non-pytree args pass through untouched, in order"
+(deftest splice-cross-deftm-call-passes-through-non-tree-args
+  (testing "Non-tree args pass through untouched, in order"
     (with-fake-callees ['mixed-callee]
       (fn []
         (fake-callee-var!
@@ -691,14 +691,14 @@
                 '(composite-block (:l w) x batch d))
               ns-name (str (.name *ns*))]
           (is (= '[w__l__W w__l__b x batch d] params)
-              "Outer pytree arg gets flattened into positional args")
+              "Outer tree arg gets flattened into positional args")
           (is (= (list (symbol ns-name "composite-block--flat")
                        'w__l__W 'w__l__b 'x 'batch 'd)
                  body)
               "Body calls the callee's --flat var with leaves spliced and resolved to outer flat-args"))))))
 
-(deftest splice-lifts-unsafe-pytree-arg-to-let-binding
-  (testing "Side-effecting / non-trivial pytree arg is lifted to a temp binding so it evaluates once"
+(deftest splice-lifts-unsafe-tree-arg-to-let-binding
+  (testing "Side-effecting / non-trivial tree arg is lifted to a temp binding so it evaluates once"
     (with-fake-callees ['side-effect-callee]
       (fn []
         (fake-callee-var!
@@ -728,7 +728,7 @@
                 "Splice references the temp symbol in each leaf access")))))))
 
 (deftest cross-deftm-splice-with-let-aliased-subtree
-  (testing "Splicing works when the pytree arg is a let-aliased sub-tree"
+  (testing "Splicing works when the tree arg is a let-aliased sub-tree"
     (with-fake-callees ['alias-block]
       (fn []
         (fake-callee-var!

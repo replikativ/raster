@@ -572,7 +572,7 @@
         ;; The All form wraps the entire signature + body
         parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))
         ;; Detect a (Params ...) annotation in the param vector — that signals
-        ;; this deftm uses the pytree pipeline (compile-time flattening +
+        ;; this deftm uses the tree pipeline (compile-time flattening +
         ;; structured-arg wrapper). Forward to raster.params/defmodel which
         ;; owns that machinery. The user namespace must require raster.params
         ;; for the resolution to succeed.

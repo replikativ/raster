@@ -22,7 +22,7 @@
   - `flat-view` — declare a binding is a flat view (compile-time tag, no runtime
     cost). Used by the pre-flatten pass to resolve subsequent path access on the
     binding to flat-index lookups.
-  - `walk!` — in-place per-leaf operation across K parallel structured pytrees.
+  - `walk!` — in-place per-leaf operation across K parallel structured trees.
     Compile-time unrolled to one named-deftm call per leaf.
   - `scan-vec` — sequential fold over a known-length HVec sub-tree. Compile-time
     unrolled to a let-chain.
@@ -60,7 +60,7 @@
 ;; ----------------------------------------------------------------------
 
 (defmacro flat-view
-  "Declare that `flat-vec-form` is a flat-view of a known pytree spec.
+  "Declare that `flat-vec-form` is a flat-view of a known tree spec.
 
   Inside a defmodel body, the pre-flatten pass recognizes this and records
   the binding in its env so subsequent `(:k binding)` / `(nth binding i)`
@@ -71,7 +71,7 @@
   flat vector unchanged.
 
   Options:
-    :spec-of var          -- the var whose first pytree arg's spec is the source
+    :spec-of var          -- the var whose first tree arg's spec is the source
     :spec spec-form       -- explicit spec literal (alternative to :spec-of)
     :starting-at idx      -- skip the first idx entries (default 0).
                              For value+grad output, use :starting-at 1.
@@ -86,30 +86,30 @@
   flat-vec-form)
 
 (defmacro walk!
-  "In-place per-leaf application of f across K parallel structured pytrees,
+  "In-place per-leaf application of f across K parallel structured trees,
   filtered by leaf kind. Compile-time unrolled via the pre-flatten pass.
 
   f is a NAMED deftm var. Per leaf path P matching kind, emits
-    (f pytree-args[0]@P pytree-args[1]@P ... pytree-args[K-1]@P extras...)
+    (f tree-args[0]@P tree-args[1]@P ... tree-args[K-1]@P extras...)
 
   Outside a defmodel body, falls back to a runtime walk via
-  `flatten`/spec lookup of the first pytree-arg.
+  `flatten`/spec lookup of the first tree-arg.
 
   Args:
     kind         -- :param, :frozen, :plain, or :any
     f            -- a deftm function (passed as a var, e.g. #'adam-step!,
                     or as a bare symbol resolvable in scope)
-    pytree-args  -- vector of K pytree expressions, each of compatible shape
+    tree-args  -- vector of K tree expressions, each of compatible shape
                     (the first determines structure)
     extras       -- additional positional args passed to every f call
 
   Example:
     (tree/walk! :param adam-leaf-step! [w grads m v] lr beta1 beta2 eps t)"
-  [kind f pytree-args & extras]
-  ;; Runtime fallback: walk via the FIRST pytree-arg's spec at runtime.
+  [kind f tree-args & extras]
+  ;; Runtime fallback: walk via the FIRST tree-arg's spec at runtime.
   ;; Slow but correct. The pre-flatten pass replaces this with a compile-time
   ;; unrolled per-leaf call sequence when the spec is statically known.
-  (let [first-pt (first pytree-args)
+  (let [first-pt (first tree-args)
         spec-sym (gensym "spec__")
         leaf-descs-sym (gensym "leaves__")
         ld-sym (gensym "ld__")]
@@ -124,7 +124,7 @@
                         `(reduce (fn [v# step#]
                                    (if (keyword? step#) (get v# step#) (nth v# step#)))
                                  ~pt path#))
-                      pytree-args)
+                      tree-args)
             ~@extras))))))
 
 (defmacro scan-vec

@@ -28,7 +28,7 @@
 (def x (double-array [10.0 20.0]))
 (def expected [50.1 110.2 170.3])
 
-(deftest defmodel-attaches-pytree-metadata
+(deftest defmodel-attaches-tree-metadata
   (let [m (meta #'linear-model)]
     (is (contains? m :raster.params/treedefs))
     (is (contains? m :raster.params/flat-var))
@@ -45,8 +45,8 @@
         y    (fast {:W W :b b} x 3 2)]
     (is (= expected (vec y)))))
 
-(deftest compile-aot-pass-through-on-non-pytree-var
-  (testing "compile-aot delegates to pipeline/compile-aot for non-pytree deftms"
+(deftest compile-aot-pass-through-on-non-tree-var
+  (testing "compile-aot delegates to pipeline/compile-aot for non-tree deftms"
     ;; Just verify the path doesn't blow up — defining a regular deftm is
     ;; outside this ns's responsibility, but compile-aot should pass through.
     (let [v (resolve 'raster.params-test/linear-model--flat)]

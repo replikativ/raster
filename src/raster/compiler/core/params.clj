@@ -1,5 +1,5 @@
 (ns raster.compiler.core.params
-  "Per-leaf semantics for parameter pytrees.
+  "Per-leaf semantics for parameter trees.
 
   `(Param T)` marks a tunable leaf — gradient target, optimizer-updated.
   `(Frozen T)` marks a leaf that participates structurally but receives no gradient.
