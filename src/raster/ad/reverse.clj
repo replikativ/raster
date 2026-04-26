@@ -471,15 +471,24 @@
                             (swap! adj-env update arg
                                    (fnil conj []) (list 'nth grads-sym i)))))))
 
-                  ;; If: route adjoint conditionally to the taken branch
+                  ;; If: route adjoint conditionally to the taken branch.
+                  ;; The inactive branch needs a zero of the SAME shape as
+                  ;; adj-sym — for array adjoints, a scalar 0.0 would crash
+                  ;; downstream array-add-backward etc. with a type mismatch.
                   :if
-                  (let [{:keys [branch then else]} record]
+                  (let [{:keys [branch then else]} record
+                        zero-of-shape
+                        (case (:raster.type/tag (meta sym))
+                          doubles (list 'double-array (list 'raster.arrays/alength adj-sym))
+                          floats  (list 'float-array  (list 'raster.arrays/alength adj-sym))
+                          ;; Scalar fallback (also covers nil tag)
+                          0.0)]
                     (when (and (symbol? then) (get @sym-activity then false))
                       (swap! adj-env update then
-                             (fnil conj []) (list 'if branch adj-sym 0.0)))
+                             (fnil conj []) (list 'if branch adj-sym zero-of-shape)))
                     (when (and else (symbol? else) (get @sym-activity else false))
                       (swap! adj-env update else
-                             (fnil conj []) (list 'if branch 0.0 adj-sym))))
+                             (fnil conj []) (list 'if branch zero-of-shape adj-sym))))
 
                   ;; Alias: pass adjoint through
                   :alias
@@ -2699,8 +2708,15 @@
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
-        all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        all-params (vec (map-indexed
+                          (fn [i p]
+                            (let [tag (nth tags i nil)
+                                  base (if (symbol? p) p (symbol (name p)))]
+                              (if tag
+                                (with-meta base {:raster.type/tag tag})
+                                (with-meta base nil))))
+                          params))
         ;; Only differentiable-tag params seed activity analysis. Non-diff
         ;; params (Long/longs scalars, indices, etc.) are constants for AD —
         ;; expressions involving only them stay inactive and don't need AD
