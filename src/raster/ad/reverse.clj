@@ -133,6 +133,11 @@
 
 (declare vjp)
 
+(def ^:private differentiable-tag?
+  "Param tags that carry gradient. Floating-point arrays and scalars only —
+  Long/long, longs (indices), Boolean, Object, etc. are never differentiated."
+  #{'doubles 'floats 'double 'float})
+
 (defn- auto-make-deftm-rule
   "Create a transient AD rule for a deftm op that has no explicit template.
   Returns [{:pullback-factory rule-fn} canonical-op] or nil.
@@ -1206,16 +1211,49 @@
      :bound-expr bound-expr
      :body (if (= 1 (count body)) (first body) (cons 'do body))}))
 
+(defn- contains-nested-loop?
+  "True iff form contains a nested dotimes/loop/loop* (excluding the surface
+  let* bindings whose inits we already visit). Used to detect patterns that
+  the simple analyzer can't handle."
+  [form]
+  (cond
+    (and (seq? form) (#{'dotimes 'loop 'loop*} (first form))) true
+    (and (seq? form) (= 'let* (first form)))
+    (or (some contains-nested-loop? (map second (partition 2 (second form))))
+        (some contains-nested-loop? (drop 2 form)))
+    (seq? form) (some contains-nested-loop? form)
+    :else false))
+
 (defn- analyze-dotimes-body
   "Analyze a dotimes body for aset/aget operations.
   Returns {:scalar-bindings [[sym init] ...], :asets [...], :agets [...],
-           :free-syms #{...}}."
+           :free-syms #{...}}.
+
+  Limited shape: handles a flat let* (or no let) whose body-result is the
+  final aset. Does NOT recurse into nested dotimes/loops — those would
+  reference the outer counter via complex index expressions that this
+  template can't safely back-prop through. If a nested loop is detected,
+  throws with a pointer to register an explicit AD template."
   [body counter-sym]
   (let [;; Extract let* bindings if present
         [bindings body-result]
         (if (and (seq? body) (#{'let 'let*} (first body)))
           [(partition 2 (second body)) (last (drop 2 body))]
           [[] body])
+
+        ;; Detect unsupported shapes EARLY — silently producing wrong code
+        ;; was the d_out__N bug. Surface a clear error instead.
+        _ (when (or (some (fn [[_ init]] (contains-nested-loop? init)) bindings)
+                    (contains-nested-loop? body-result))
+            (throw (ex-info
+                    (str "AD reverse-mode dotimes analyzer can't handle nested "
+                         "dotimes/loop forms inside the body. The simple flat-loop "
+                         "template doesn't apply. Register an explicit AD pullback "
+                         "template for the enclosing op via "
+                         "raster.ad.templates/merge-into-template!, OR refactor the "
+                         "function to use templated primitives (raster.par/map!, "
+                         "scaled-dot-product-attn, etc.) that have AD support.")
+                    {:counter counter-sym :body body})))
 
         asets (atom [])
         agets (atom [])
@@ -1373,30 +1411,28 @@
                       tape-sym)))
 
         ;; === Backward code ===
-        ;; For each read array: shadow array d_arr
-        ;; For each scalar param: accumulator in loop
-        d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
-        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
-
-        ;; Backward loop body:
-        ;; (loop [j (- n 1) d_w_acc 0.0 ...]
-        ;;   (if (>= j 0)
-        ;;     (let [pb (.get tape j)
-        ;;           d_val (aget d_out j)
-        ;;           grads (pb d_val)]
-        ;;       (aset d_x j (nth grads 0))    ;; for aget-sourced symbols
-        ;;       (recur (- j 1) (+ d_w_acc (nth grads 1)) ...))
-        ;;     [d_x d_w_acc ...]))
-
-        ;; Map iter-active index to what it corresponds to
-        ;; iter-active = [aget-syms... active-free...]
-        ;; grads[0..len(aget-syms)-1] → aget input gradients
-        ;; grads[len(aget-syms)..] → scalar param gradients
+        ;; For each read array: shadow array d_arr — tag matches source array's
+        ;; element type (inherits :raster.type/tag if present; defaults to doubles).
+        d-read-arr-syms (mapv (fn [arr]
+                                (ad-gensym (str "d_" (name arr))
+                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                              read-arrs)
+        d-scalar-syms (mapv (fn [p]
+                              (ad-gensym (str "d_" (name p) "_acc")
+                                         (or (:raster.type/tag (meta p)) 'double)))
+                            active-free)
 
         ;; Backward loop: reads d_out, calls pullbacks, accumulates
-        d-out-sym (ad-gensym "d_out")  ;; placeholder, filled by caller
+        ;; d-out-sym is the gradient of the output array — bound by gen-reverse-let
+        ;; from adj-env contributions. Tag inherits from the output array type
+        ;; (defaults to doubles, the dominant case for raster training).
+        out-array-tag (or (some-> written-arrs first meta :raster.type/tag) 'doubles)
+        out-elem-tag (case out-array-tag
+                       doubles 'double, floats 'float, longs 'long, ints 'int,
+                       'double)
+        d-out-sym (ad-gensym "d_out" out-array-tag)
         iter-pb-sym (ad-gensym "iter_pb")
-        d-val-sym (ad-gensym "d_val")
+        d-val-sym (ad-gensym "d_val" out-elem-tag)
         grads-iter-sym (ad-gensym "grads_iter")
 
         bwd-body-bindings
@@ -1571,13 +1607,24 @@
         ;; === Backward code ===
         ;; For array inputs: par/map! that applies pullback[i] to d_out[i]
         ;; For scalar inputs: par/reduce that accumulates scalar gradients
-        d-read-arr-syms (mapv (fn [arr] (ad-gensym (str "d_" (name arr)))) read-arrs)
-        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
-        d-out-sym (ad-gensym "d_out")
+        ;; Type-tag the gradient symbols so downstream type inference is complete.
+        d-read-arr-syms (mapv (fn [arr]
+                                (ad-gensym (str "d_" (name arr))
+                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                              read-arrs)
+        d-scalar-syms (mapv (fn [p]
+                              (ad-gensym (str "d_" (name p) "_acc")
+                                         (or (:raster.type/tag (meta p)) 'double)))
+                            active-free)
+        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        out-elem-tag (case out-array-tag
+                       doubles 'double, floats 'float, longs 'long, ints 'int,
+                       'double)
+        d-out-sym (ad-gensym "d_out" out-array-tag)
         bwd-idx-sym (ad-gensym "bi")
         iter-pb-sym (ad-gensym "iter_pb")
         grads-iter-sym (ad-gensym "grads_iter")
-        d-val-sym (ad-gensym "d_val")
+        d-val-sym (ad-gensym "d_val" out-elem-tag)
 
         n-agets (count agets)
 
@@ -2004,7 +2051,12 @@
 
 (defn- get-vjp-fn
   "Get or compile the AD-transformed function for a deftm var.
-  Cached by [var-identity walked-body] to avoid recompiling on every call."
+  Cached by [var-identity walked-body] to avoid recompiling on every call.
+
+  Filters active params by tag (same rule as build-grad-walked-body): only
+  doubles/floats are seeded as active. The pullback's output vector still has
+  one slot per ORIGINAL param (with nil for non-differentiable slots) so
+  positional consumers don't shift."
   [resolved]
   (let [m (meta resolved)
         params (or (:raster.core/deftm-params m)
@@ -2015,9 +2067,44 @@
         cache-key [resolved walked-body]
         cached (get @vjp-cache cache-key)]
     (or cached
-        (let [active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
-              transformed (transform-body (first walked-body) active-params)
-              fn-form (list 'fn (vec active-params) transformed)
+        (let [all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+              tags (or (:raster.core/deftm-tags m)
+                       (vec (repeat (count params) 'double)))
+              diff-active-params (vec (keep-indexed
+                                        (fn [i p]
+                                          (when (differentiable-tag? (nth tags i nil)) p))
+                                        all-params))
+              transformed (transform-body (first walked-body) diff-active-params)
+              ;; transformed is (let* bindings [primal pullback-fn])
+              ;; The pullback returns gradients for diff-active-params only;
+              ;; wrap it so it returns gradients aligned with all-params (nil
+              ;; in non-differentiable slots).
+              pullback-sym (gensym "pb_")
+              dy-sym       (gensym "dy_")
+              raw-grads-sym (gensym "raw_grads_")
+              diff->idx (zipmap diff-active-params (range))
+              padded-grads-form
+              (mapv (fn [p]
+                      (if-let [j (diff->idx p)]
+                        (list 'clojure.core/nth raw-grads-sym j)
+                        nil))
+                    all-params)
+              ;; Build (fn [args] (let [tx <transformed> primal (nth tx 0)
+              ;;                        pb (nth tx 1)]
+              ;;                    [primal (fn [dy] [<padded grads>])]))
+              tx-sym (gensym "tx_")
+              primal-sym (gensym "primal_")
+              fn-form
+              (list 'fn (vec all-params)
+                    (list 'let* [tx-sym transformed
+                                 primal-sym (list 'clojure.core/nth tx-sym 0)
+                                 pullback-sym (list 'clojure.core/nth tx-sym 1)]
+                          (list 'clojure.core/vector
+                                primal-sym
+                                (list 'fn [dy-sym]
+                                      (list 'let* [raw-grads-sym
+                                                   (list pullback-sym dy-sym)]
+                                            padded-grads-form)))))
               compiled-fn (eval fn-form)]
           (swap! vjp-cache assoc cache-key compiled-fn)
           compiled-fn))))
@@ -2541,6 +2628,65 @@
 
     :else form))
 
+(defn- lift-loop-to-tail
+  "Restructure (let* [pre... loop-sym (loop ...) post...] body) so the loop
+  becomes the let's tail expression — the canonical shape gen-reverse-loop-with-let
+  expects. Inlines the post-bindings + body into the loop's result branch.
+
+  When called on something that isn't a let* with a loop in binding position,
+  returns the form unchanged. Handles only the FIRST loop binding found —
+  recurse from the caller if multiple loops in series need lifting.
+
+  Loop body shape required: (if test (recur ...) result-expr) or
+                            (if test result-expr (recur ...))."
+  [form]
+  (if-not (and (seq? form) (#{'let 'let*} (first form)))
+    form
+    (let [[let-sym bindings & body-exprs] form
+          pairs (partition 2 bindings)
+          loop-binding? (fn [[_ init]]
+                          (and (seq? init) (#{'loop 'loop*} (first init))))
+          [pre-pairs post] (split-with (complement loop-binding?) pairs)
+          [loop-pair & post-pairs] post]
+      (if-not loop-pair
+        form
+        (let [[loop-sym loop-form] loop-pair
+              [_ loop-bindings & loop-body] loop-form
+              loop-body-expr (if (= 1 (count loop-body))
+                               (first loop-body)
+                               (cons 'do loop-body))]
+          (if-not (and (seq? loop-body-expr) (= 'if (first loop-body-expr)))
+            form    ;; Non-canonical loop body — leave alone
+            (let [[_ test-expr then-expr else-expr] loop-body-expr
+                  recur? (fn [e]
+                           (and (seq? e) (= 'recur (first e))))
+                  letted-recur? (fn [e]
+                                  (and (seq? e) (#{'let 'let*} (first e))
+                                       (recur? (last e))))
+                  has-recur? (fn [e] (or (recur? e) (letted-recur? e)))
+                  [recur-branch result-branch recur-in-then?]
+                  (cond (has-recur? then-expr) [then-expr else-expr true]
+                        (has-recur? else-expr) [else-expr then-expr false]
+                        :else                  [nil nil nil])]
+              (if-not recur-branch
+                form    ;; Couldn't identify the recur branch
+                (let [;; The loop's "value" gets bound to loop-sym, then
+                      ;; post-pairs and body run with that binding visible.
+                      cont-bindings (vec (concat
+                                           [loop-sym result-branch]
+                                           (mapcat identity post-pairs)))
+                      cont (apply list 'let* cont-bindings body-exprs)
+                      new-loop-body (if recur-in-then?
+                                      (list 'if test-expr recur-branch cont)
+                                      (list 'if test-expr cont recur-branch))
+                      new-loop-form (apply list 'loop loop-bindings [new-loop-body])]
+                  (if (seq pre-pairs)
+                    (apply list let-sym
+                           (vec (mapcat identity pre-pairs))
+                           [new-loop-form])
+                    new-loop-form))))))))))
+
+
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
   Returns {:walked-body [form], :params [sym ...], :source-ns ns}
@@ -2553,8 +2699,17 @@
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
-        active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+        all-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        ;; Only differentiable-tag params seed activity analysis. Non-diff
+        ;; params (Long/longs scalars, indices, etc.) are constants for AD —
+        ;; expressions involving only them stay inactive and don't need AD
+        ;; rules. Their grad slots are still emitted in the output vector
+        ;; (via all-params) so positional consumers don't shift.
+        diff-active-params (vec (keep-indexed
+                                  (fn [i p]
+                                    (when (differentiable-tag? (nth tags i nil)) p))
+                                  all-params))
         source-ns (or (:ns m) *ns*)
         ;; Infer dtype from parameter tags for correct AD seed type
         dtype (if (some #{'floats 'float} tags) :float :double)
@@ -2563,21 +2718,49 @@
                   (inline/lower-to-ad-primitives (first walked-body)))
         ;; Hoist nested lets out of call args into flat ANF for AD
         hoisted (hoist-nested-lets lowered)
-        ad-form (transform-body hoisted active-params)
+        ;; If a loop ended up bound to a let-var (common after inlining a
+        ;; deftm whose body's tail is a loop), lift it back to tail position
+        ;; so gen-reverse-loop-with-let can handle it.
+        loop-lifted (lift-loop-to-tail hoisted)
+        ad-form (transform-body loop-lifted diff-active-params)
         flat (binding [ad-flatten/*flatten-dtype* dtype]
-               (ad-flatten/flatten-for-gradient ad-form))]
+               (ad-flatten/flatten-for-gradient ad-form))
+        ;; Pad the gradient output vector so positional consumers see one slot
+        ;; per ORIGINAL param (loss + N grads), with nil where the param was
+        ;; non-differentiable. flat's inner form is (let* bindings [primal d1
+        ;; d2 ... dN_diff]); we rewrite it to [primal slot1 ... slotN_all].
+        padded-form
+        (when flat
+          (let [diff->idx (zipmap diff-active-params (range))
+                grad-slots (mapv (fn [p]
+                                   (if-let [j (diff->idx p)]
+                                     (nth (:param-adj-syms flat) j)
+                                     nil))
+                                 all-params)
+                output-vec (vec (cons (:result-sym flat) grad-slots))
+                [op bindings _] (:form flat)]
+            (list op bindings output-vec)))]
     (when flat
-      {:walked-body [(:form flat)]
-       :params active-params
+      {:walked-body [padded-form]
+       :params all-params
        :tags tags
        :source-ns source-ns
        :result-sym (:result-sym flat)
        :param-adj-syms (:param-adj-syms flat)})))
 
 (defn- make-runtime-value+grad-fn
-  "Build a runtime IFn from the AD-transformed walked body."
+  "Build a runtime IFn from the AD-transformed walked body.
+  Uses (& args) + indexed unpack so deftms with >20 params (Clojure's fn
+  positional-arg limit) still work. The unpacking lets are trivially
+  eliminated by the JVM JIT for the common ≤20-param case."
   [walked-body params]
-  (eval (list 'fn (vec params) (first walked-body))))
+  (if (<= (count params) 20)
+    (eval (list 'fn (vec params) (first walked-body)))
+    (let [args-sym (gensym "args__")
+          unpack (vec (mapcat (fn [p i] [p `(nth ~args-sym ~i)])
+                              params (range)))]
+      (eval (list 'fn ['& args-sym]
+                  (list 'let unpack (first walked-body)))))))
 
 (defn ^clojure.lang.IFn value+grad
   "Composable value+gradient operator.

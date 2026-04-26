@@ -15,6 +15,7 @@
             [raster.math :as m]
             [raster.numeric :as n :refer [+ - * /]]
             [raster.dl.nn :as nn]
+            [raster.dl.array-ops :as ops]
             [raster.linalg.blas :as blas]))
 
 ;; ================================================================
@@ -158,40 +159,139 @@
                                                  out (nn/matmul scores V seq-len seq-len dv)]
                                              out)))
 
+;; rrule for causal-scaled-dot-product-attn — same shape as the non-causal
+;; rule above but with the causal mask applied during the scores recomputation
+;; AND clamped on d-scores so future-position gradients are zeroed.
+(tmpl/merge-into-template! 'raster.dl.attention/causal-scaled-dot-product-attn
+                           {:pullback-factory
+                            (fn [_result Q K V seq-len dk dv]
+                              (fn [d-out]
+                                (let [seq-len (long seq-len) dk (long dk) dv (long dv)
+                                      scale (/ 1.0 (n/sqrt (double dk)))
+                                      neg-inf-c Double/NEGATIVE_INFINITY
+                                      scores  (double-array (* seq-len seq-len))
+                                      weights (double-array (* seq-len seq-len))]
+                                  ;; Forward recomputation with causal mask
+                                  (dotimes [i seq-len]
+                                    (dotimes [j seq-len]
+                                      (let [dot (loop [d 0 acc 0.0]
+                                                  (if (< d dk)
+                                                    (recur (inc d)
+                                                           (+ acc (* (aget Q (+ (* i (int dk)) d))
+                                                                     (aget K (+ (* j (int dk)) d)))))
+                                                    acc))]
+                                        (aset scores (+ (* i (int seq-len)) j)
+                                              (if (> j i) neg-inf-c (* dot scale))))))
+                                  (dotimes [i seq-len]
+                                    (let [offset (* i (int seq-len))
+                                          max-s (loop [j 0 m neg-inf-c]
+                                                  (if (< j seq-len)
+                                                    (recur (inc j)
+                                                           (n/max m (aget scores (+ offset j))))
+                                                    m))
+                                          sum-exp (loop [j 0 s 0.0]
+                                                    (if (< j seq-len)
+                                                      (let [s-ij (aget scores (+ offset j))
+                                                            e (if (= s-ij neg-inf-c)
+                                                                0.0
+                                                                (m/exp (- s-ij max-s)))]
+                                                        (aset weights (+ offset j) e)
+                                                        (recur (inc j) (+ s e)))
+                                                      s))
+                                          inv-sum (if (zero? sum-exp) 0.0 (/ 1.0 sum-exp))]
+                                      (dotimes [j seq-len]
+                                        (aset weights (+ offset j)
+                                              (* (aget weights (+ offset j)) inv-sum)))))
+                                  ;; d_weights = d_out @ V^T -> [seq_len, seq_len]
+                                  (let [d-weights (double-array (* seq-len seq-len))
+                                        _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len 1.0 0.0)
+                                        ;; d_V = weights^T @ d_out -> [seq_len, dv]
+                                        dV (double-array (* seq-len dv))
+                                        _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv 1.0 0.0)
+                                        ;; Backprop through softmax (with causal mask: future positions zero)
+                                        d-scores (double-array (* seq-len seq-len))]
+                                    (dotimes [i seq-len]
+                                      (let [offset (* i (int seq-len))
+                                            dot-wdw (loop [j 0 acc 0.0]
+                                                      (if (< j seq-len)
+                                                        (recur (inc j)
+                                                               (+ acc (* (aget weights (+ offset j))
+                                                                         (aget d-weights (+ offset j)))))
+                                                        acc))]
+                                        (dotimes [j seq-len]
+                                          (aset d-scores (+ offset j)
+                                                (if (> j i)
+                                                  0.0
+                                                  (* scale (aget weights (+ offset j))
+                                                     (- (aget d-weights (+ offset j)) dot-wdw)))))))
+                                    ;; dQ = d_scores @ K -> [seq_len, dk]
+                                    (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
+                                          dK (double-array (* seq-len dk))
+                                          _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk 1.0 0.0)]
+                                      [dQ dK dV nil nil nil])))))})
+
+;; ================================================================
+;; Causal single-head attention (AD-friendly: no head-split shuffles).
+;; Composes only deftms with registered AD pullbacks so value+grad inlines
+;; cleanly. For training-from-scratch demonstrations of GPT-2-style models;
+;; the multi-head version below uses dotimes/aset shuffles that don't
+;; differentiate without an explicit pullback on the whole block.
+;; ================================================================
+
+(deftm causal-single-head-attention (All [T]
+                                         [x  :- (Array T)
+                                          Wq :- (Array T) bq :- (Array T)
+                                          Wk :- (Array T) bk :- (Array T)
+                                          Wv :- (Array T) bv :- (Array T)
+                                          Wo :- (Array T) bo :- (Array T)
+                                          seq-len :- Long d-model :- Long]
+                                         :- (Array T)
+                                         (let [Q   (nn/linear x Wq bq seq-len d-model d-model)
+                                               K   (nn/linear x Wk bk seq-len d-model d-model)
+                                               V   (nn/linear x Wv bv seq-len d-model d-model)
+                                               attn-out (causal-scaled-dot-product-attn
+                                                          Q K V seq-len d-model d-model)]
+                                           (nn/linear attn-out Wo bo seq-len d-model d-model))))
+
 ;; ================================================================
 ;; Causal multi-head attention (for autoregressive models like GPT-2)
 ;; x:[seq_len, d_model], W{q,k,v,o}:[d_model, d_model], b{q,k,v,o}:[d_model]
 ;; ================================================================
 
-(deftm causal-multi-head-attention (All [T]
-                                        [x :- (Array T) Wq :- (Array T) bq :- (Array T)
-                                         Wk :- (Array T) bk :- (Array T)
-                                         Wv :- (Array T) bv :- (Array T)
-                                         Wo :- (Array T) bo :- (Array T)
-                                         seq-len :- Long d-model :- Long n-heads :- Long]
-                                        :- (Array T)
-                                        (let [dk (quot d-model n-heads)
-                                              Q (nn/linear x Wq bq seq-len d-model d-model)
-                                              K (nn/linear x Wk bk seq-len d-model d-model)
-                                              V (nn/linear x Wv bv seq-len d-model d-model)
-                                              out (alloc-like x (* seq-len d-model))]
-                                          (dotimes [h n-heads]
-                                            (let [Qh (alloc-like Q (* seq-len dk))
-                                                  Kh (alloc-like K (* seq-len dk))
-                                                  Vh (alloc-like V (* seq-len dk))
-                                                  h-offset (* h (int dk))]
-                                              (dotimes [s seq-len]
-                                                (dotimes [d dk]
-                                                  (let [src-idx (+ (* s (int d-model)) h-offset d)]
-                                                    (aset Qh (+ (* s (int dk)) d) (aget Q src-idx))
-                                                    (aset Kh (+ (* s (int dk)) d) (aget K src-idx))
-                                                    (aset Vh (+ (* s (int dk)) d) (aget V src-idx)))))
-                                              (let [head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len dk dk)]
-                                                (dotimes [s seq-len]
-                                                  (dotimes [d dk]
-                                                    (aset out (+ (* s (int d-model)) h-offset d)
-                                                          (aget head-out (+ (* s (int dk)) d))))))))
-                                          (nn/linear out Wo bo seq-len d-model d-model))))
+(deftm causal-multi-head-attention
+  "Causal multi-head self-attention. Composed via slice-strided-2d /
+  scatter-strided-2d over a loop fold so each step is a templated AD primitive
+  — no nested-dotimes shuffles for AD to walk through. The output projection
+  lives in the loop's result branch so AD sees the canonical
+  (let* bindings (loop … result)) shape that gen-reverse-loop-with-let handles."
+  [x :- (Array double) Wq :- (Array double) bq :- (Array double)
+   Wk :- (Array double) bk :- (Array double)
+   Wv :- (Array double) bv :- (Array double)
+   Wo :- (Array double) bo :- (Array double)
+   seq-len :- Long d-model :- Long n-heads :- Long]
+  :- (Array double)
+  (let [dk (quot d-model n-heads)
+        n  (* seq-len d-model)
+        Q  (nn/linear x Wq bq seq-len d-model d-model)
+        K  (nn/linear x Wk bk seq-len d-model d-model)
+        V  (nn/linear x Wv bv seq-len d-model d-model)]
+    ;; Fold over heads: at each step, slice the head's QKV slabs out of
+    ;; the full projections, run causal single-head attention, scatter
+    ;; the result into a [seq_len × d_model] zeros-padded slab, and add
+    ;; into the running accumulator. The result branch projects the
+    ;; concatenated heads through Wo/bo.
+    (loop [h 0 acc (double-array n)]
+      (if (< h n-heads)
+        (let [col-off (* h (int dk))
+              Qh (ops/slice-strided-2d Q seq-len d-model col-off dk)
+              Kh (ops/slice-strided-2d K seq-len d-model col-off dk)
+              Vh (ops/slice-strided-2d V seq-len d-model col-off dk)
+              head-out (causal-scaled-dot-product-attn
+                         Qh Kh Vh seq-len dk dk)
+              out-h (ops/scatter-strided-2d
+                      head-out seq-len d-model col-off dk)]
+          (recur (inc h) (ops/array-add acc out-h n)))
+        (nn/linear acc Wo bo seq-len d-model d-model)))))
 
 ;; ================================================================
 ;; Multi-head self-attention (bidirectional, for BERT-style models)

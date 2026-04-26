@@ -146,10 +146,10 @@
                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
                                       (when (inf/try-parametric-specialize!
-                                              (symbol (namespace base-sym) (name base-sym)) arg-tags)
-                                          (let [new-methods (mapcat identity
-                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
+                                             (symbol (namespace base-sym) (name base-sym)) arg-tags)
+                                        (let [new-methods (mapcat identity
+                                                                  (vals @(:raster.core/dispatch-table (meta v))))]
+                                          (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
                                 ;; Single method fallback: safe when no other overloads exist
                                 ;; AND function is not parametric. Parametric functions
                                 ;; may need a different specialization that hasn't been
@@ -705,10 +705,10 @@
                                       method (or (when (seq arg-tags)
                                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                                        (when (inf/try-parametric-specialize!
-                                                               (symbol (namespace var-sym) (name var-sym)) arg-tags)
-                                                           (let [new-methods (mapcat val @dt)]
-                                                             (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                            new-methods))))))
+                                                              (symbol (namespace var-sym) (name var-sym)) arg-tags)
+                                                         (let [new-methods (mapcat val @dt)]
+                                                           (first (filter #(= (vec arg-tags) (vec (:tags %)))
+                                                                          new-methods))))))
                                            ;; Non-parametric single method: safe (no other overloads possible)
                                                  (when (and (= 1 (count all-methods)) (not has-parametric?))
                                                    (first all-methods)))
@@ -1333,10 +1333,23 @@
                                  (let [[lifted cleaned] (anf-lift init)]
                                    (concat lifted [[sym cleaned]])))
                                renamed-pairs)
-          ;; ANF-lift the body (with renaming applied)
-          body-expr (subst-syms @rename-map (last inner-body))
+          ;; CRITICAL: a binding-form with MULTIPLE body-exprs has earlier
+          ;; statements that are side effects (Clojure semantics: do-style
+          ;; eval, drop result of all but last). When we lift into expression
+          ;; position, we must preserve those effects as lifted bindings —
+          ;; previously they were silently dropped via (last inner-body),
+          ;; which lost all asets/mutations from inlined deftm bodies.
+          inner-body-vec (vec inner-body)
+          effect-exprs (mapv #(subst-syms @rename-map %) (butlast inner-body-vec))
+          effect-lifted (mapv (fn [eff]
+                                [(with-meta (gensym "_eff_")
+                                   {:raster.effect/effectful true})
+                                 eff])
+                              effect-exprs)
+          ;; ANF-lift the final body expression (with renaming applied)
+          body-expr (subst-syms @rename-map (last inner-body-vec))
           [body-lifted body-cleaned] (anf-lift body-expr)]
-      [(vec (concat lifted-inner body-lifted)) body-cleaned])
+      [(vec (concat lifted-inner effect-lifted body-lifted)) body-cleaned])
 
     ;; Non-liftable forms — do NOT recurse (would lift bindings
     ;; past scope boundaries or conditional branches)
@@ -1411,11 +1424,11 @@
                                              entries))
                               ;; No exact match — try parametric specialization for (All [T]) functions
                               (when (inf/try-parametric-specialize!
-                                      (symbol (namespace (first expr)) (name (first expr))) arg-tags)
-                                  (let [new-entries (get @dt-atom (count args))]
-                                    (first (filter (fn [e]
-                                                     (= (vec arg-tags) (vec (:tags e))))
-                                                   new-entries))))))]
+                                     (symbol (namespace (first expr)) (name (first expr))) arg-tags)
+                                (let [new-entries (get @dt-atom (count args))]
+                                  (first (filter (fn [e]
+                                                   (= (vec arg-tags) (vec (:tags e))))
+                                                 new-entries))))))]
               (when match
                 (let [mn (str (types/mangle (symbol (name (first expr))) (:tags match)))
                       ms (symbol (str (:mangled-ns match)) mn)

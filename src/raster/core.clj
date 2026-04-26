@@ -570,8 +570,22 @@
                                 [nil args])
         ;; Detect parametric: (deftm name (All [T] [params...] :- Ret body))
         ;; The All form wraps the entire signature + body
-        parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))]
-    (if parametric?
+        parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))
+        ;; Detect a (Params ...) annotation in the param vector — that signals
+        ;; this deftm uses the pytree pipeline (compile-time flattening +
+        ;; structured-arg wrapper). Forward to raster.params/defmodel which
+        ;; owns that machinery. The user namespace must require raster.params
+        ;; for the resolution to succeed.
+        params-arg? (and (not parametric?)
+                         (vector? (first rest-args))
+                         (some (fn [item]
+                                 (and (sequential? item)
+                                      (= 'Params (first item))))
+                               (first rest-args)))]
+    (cond
+      params-arg?
+      `(raster.params/defmodel ~fn-name ~@(if docstring (cons docstring rest-args) rest-args))
+      parametric?
       ;; === Parametric deftm: register template + generate concrete double ===
       (do
         ;; Guard: body forms outside (All [T] ...) are silently dropped.
@@ -636,6 +650,7 @@
              (deftm ~fn-name ~concrete-params
                ~@(when concrete-ret [:- concrete-ret])
                ~@concrete-body))))
+      :else
       ;; === Normal deftm ===
       (let [param-vec (first rest-args)
             _ (assert (vector? param-vec)

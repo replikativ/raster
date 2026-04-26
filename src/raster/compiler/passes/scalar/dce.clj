@@ -124,12 +124,26 @@
   "Remove dead bindings from a flat let* form.
    Effectful bindings are preserved only when their side effects are
    externally visible: either they mutate a live buffer, or they have
-   no identifiable mutation targets (opaque effects like IO)."
+   no identifiable mutation targets (opaque effects like IO).
+
+   Seeds `live` with body free-syms PLUS all free symbols anywhere in the
+   let* that aren't bound by it (function parameters and outer-scope refs).
+   Without this, a binding that mutates a function parameter could be
+   incorrectly DCE'd because backward iteration processes the mutation
+   before the parameter becomes live via later bindings — but mutations of
+   parameters are externally observable and must always be preserved."
   [let-form & {:keys [root-pred] :or {root-pred (constantly false)}}]
   (let [[let-sym bindings-vec & body-exprs] let-form
         pairs (vec (partition 2 bindings-vec))
         n (count pairs)
-        live (atom (apply clojure.set/union #{} (map free-syms body-exprs)))
+        bound-syms (set (map first pairs))
+        body-free (apply clojure.set/union #{} (map free-syms body-exprs))
+        binding-free (apply clojure.set/union #{}
+                            (map #(free-syms (second %)) pairs))
+        let-free (clojure.set/difference
+                   (clojure.set/union body-free binding-free)
+                   bound-syms)
+        live (atom (clojure.set/union body-free let-free))
         _ (doseq [[sym expr] pairs]
             (when (or (root-pred sym)
                       ;; Only seed opaque effects (no identifiable mutation targets).
