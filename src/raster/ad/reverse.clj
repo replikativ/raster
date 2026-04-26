@@ -1947,6 +1947,8 @@
     :else
     [[] [form]]))
 
+(declare ^:private lift-loop-to-tail)
+
 (defn transform-body
   "Transform a single walked body expression for reverse-mode AD.
   Returns an S-expression that evaluates to [primal, pullback-fn].
@@ -1958,7 +1960,11 @@
   adjoints [d_param1 d_param2 ...] in the same order as active-params."
   [form active-params]
   (with-ad-gensym
-    (let [[bindings body-exprs] (extract-let-parts form)
+    (let [;; If a loop ended up bound to a let-var (common after inlining a
+          ;; deftm whose body's tail is a loop), lift it to tail position so
+          ;; gen-reverse-loop-with-let can handle it.
+          form (lift-loop-to-tail form)
+          [bindings body-exprs] (extract-let-parts form)
           ;; Check if the let body is a loop
           body-expr-1 (when (= 1 (count body-exprs)) (first body-exprs))
           body-is-loop? (and body-expr-1 (seq? body-expr-1)
@@ -2734,11 +2740,9 @@
                   (inline/lower-to-ad-primitives (first walked-body)))
         ;; Hoist nested lets out of call args into flat ANF for AD
         hoisted (hoist-nested-lets lowered)
-        ;; If a loop ended up bound to a let-var (common after inlining a
-        ;; deftm whose body's tail is a loop), lift it back to tail position
-        ;; so gen-reverse-loop-with-let can handle it.
-        loop-lifted (lift-loop-to-tail hoisted)
-        ad-form (transform-body loop-lifted diff-active-params)
+        ;; transform-body itself will lift any binding-position loop into
+        ;; tail position via lift-loop-to-tail.
+        ad-form (transform-body hoisted diff-active-params)
         flat (binding [ad-flatten/*flatten-dtype* dtype]
                (ad-flatten/flatten-for-gradient ad-form))
         ;; Pad the gradient output vector so positional consumers see one slot

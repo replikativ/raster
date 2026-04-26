@@ -721,9 +721,11 @@
          (when resolved
            (let [m (meta resolved)
                  walked-body (rcore/ensure-walked-body! resolved)
-                 params (:raster.core/deftm-params m)]
+                 params (:raster.core/deftm-params m)
+                 tags   (:raster.core/deftm-tags m)]
              (when (and walked-body params)
-               {:walked-body walked-body :params params :var resolved}))))))))
+               {:walked-body walked-body :params params :tags tags
+                :var resolved}))))))))
 
 (def ^:dynamic *expand-for-ad-trace* false)
 (def ^:dynamic *param-env* nil)
@@ -806,7 +808,7 @@
                      (when (every? some? tags) tags)))
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
-      (let [{:keys [walked-body params]} deftm-info
+      (let [{:keys [walked-body params tags]} deftm-info
             transform-body (or *ad-transform-body-fn*
                                (throw (ex-info "*ad-transform-body-fn* not bound — pipeline must bind it for AD inlining" {})))
             body-form (first walked-body)
@@ -815,7 +817,18 @@
             ;; Template-backed ops (matmul, mse-loss, etc.) stay symbolic
             ;; so the AD transform can use their templates.
             body-form (expand-for-ad body-form 10)
-            active-params (mapv #(if (symbol? %) % (symbol (name %))) params)
+            all-params (mapv #(if (symbol? %) % (symbol (name %))) params)
+            ;; Only floating-point arrays/scalars are differentiable. Long/longs
+            ;; are constants for AD — passing them as active forces AD to look
+            ;; for rules on integer ops like (quot d-model n-heads), which
+            ;; don't exist (and shouldn't, since the result is non-diff).
+            ;; Same rule as raster.ad.reverse/build-grad-walked-body.
+            differentiable-tag? '#{doubles floats double float}
+            tags-vec (or tags (vec (repeat (count all-params) 'double)))
+            active-params (vec (keep-indexed
+                                 (fn [i p]
+                                   (when (differentiable-tag? (nth tags-vec i nil)) p))
+                                 all-params))
             ad-form (transform-body body-form active-params)
             ;; Canonicalize and flatten
             canonical (flatten/canonicalize-ad-form ad-form)]
@@ -855,7 +868,17 @@
                                              (map first pairs)
                                              renamed-pairs))
                     loss-sym (get final-subst result-sym result-sym)
-                    grad-syms (mapv #(get final-subst % %) param-adj-syms)
+                    diff-grad-syms (mapv #(get final-subst % %) param-adj-syms)
+                    ;; Map each ORIGINAL param to a grad sym (or nil for
+                    ;; non-differentiable params filtered out at AD seed time).
+                    ;; Positional consumers see one slot per original param.
+                    diff-set (set active-params)
+                    diff->idx (zipmap active-params (range))
+                    grad-syms (mapv (fn [p]
+                                      (if (contains? diff-set p)
+                                        (nth diff-grad-syms (diff->idx p))
+                                        nil))
+                                    all-params)
                     ;; Tag gradient syms with expected types from param tags.
                     ;; Array params (doubles, floats, longs) have array gradients.
                     ;; This ensures downstream type inference knows the gradient types
@@ -866,7 +889,7 @@
                                    (:raster.core/deftm-tags (meta (resolve var-sym)))
                                    (vec (repeat (count grad-syms) 'double)))
                     grad-syms (mapv (fn [gs tag]
-                                      (if (and tag (not= tag 'double) (not= tag 'long))
+                                      (if (and gs tag (not= tag 'double) (not= tag 'long))
                                         (with-meta gs {:tag tag})
                                         gs))
                                     grad-syms param-tags)

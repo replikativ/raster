@@ -4697,9 +4697,11 @@
   (branch folding, int loops, checkcast elimination)."
   [class-name params tags return-tag walked-body source-ns typed-iface-name
    & [fallback-ns fallback-name]]
-  (when (> (count params) 20)
-    (throw (ex-info "BC compilation: function has more than 20 parameters (IFn limit)"
-                    {:count (count params) :class class-name})))
+  ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
+  ;; method limit is 255. For >20 typed params we still emit compute_static
+  ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
+  ;; are skipped (existing guard) and the applyTo path uses a reflective
+  ;; fallback into compute_static (emitted below).
   (let [;; Par-extraction splitting: extract par/map! and par/reduce forms into
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
@@ -4965,20 +4967,56 @@
                                                                       (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
                                                        (= crd "V") (.aconst_null code)
                                                        :else nil))
-                                                   (.areturn code)))))
-                      ;; applyTo for varargs
+                                                   (.areturn code))))))
+                      ;; applyTo for varargs.
+                      ;; For ≤20 params: AFn.applyToHelper unpacks the seq and
+                      ;; routes to one of the IFn.invoke(Object…) overloads.
+                      ;; For >20 params: AFn.applyToHelper caps at 20, so we
+                      ;; emit a custom body that builds an Object[N] from the
+                      ;; seq and invokes compute_static reflectively.
                             (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
                                   iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
-                                  apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))]
+                                  reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
+                                  obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
+                                  apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
+                                  reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
+                                  small? (<= (count param-cds) 20)
+                                  load-int (fn [code n]
+                                             (cond (<= -128 n 127) (.bipush code (int n))
+                                                   (<= -32768 n 32767) (.sipush code (int n))
+                                                   :else (.ldc code (int n))))]
                               (.withMethodBody cb "applyTo"
                                                (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd]))
                                                (int 0x0001)
                                                (reify java.util.function.Consumer
                                                  (accept [_ code]
-                                                   (.aload code 0)
-                                                   (.aload code 1)
-                                                   (.invokestatic code afn-cd "applyToHelper" apply-mt)
-                                                   (.areturn code)))))))))
+                                                   (if small?
+                                                     (do (.aload code 0)
+                                                         (.aload code 1)
+                                                         (.invokestatic code afn-cd "applyToHelper" apply-mt)
+                                                         (.areturn code))
+                                                     (let [n (count param-cds)]
+                                                       (load-int code n)
+                                                       (.anewarray code obj-cd)
+                                                       (.astore code 2)
+                                                       (.aload code 1)
+                                                       (.astore code 3)
+                                                       (dotimes [i n]
+                                                         (.aload code 2)
+                                                         (load-int code i)
+                                                         (.aload code 3)
+                                                         (.invokeinterface code iseq-cd "first"
+                                                                           (MethodTypeDesc/of obj-cd no-cd))
+                                                         (.aastore code)
+                                                         (.aload code 3)
+                                                         (.invokeinterface code iseq-cd "next"
+                                                                           (MethodTypeDesc/of iseq-cd no-cd))
+                                                         (.astore code 3))
+                                                       (.ldc code class-name)
+                                                       (.ldc code "compute_static")
+                                                       (.aload code 2)
+                                                       (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
+                                                       (.areturn code))))))))))
         loader (compilation-loader)
         wrapper-class (.defineClass loader wrapper-name bytes nil)]
     (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
