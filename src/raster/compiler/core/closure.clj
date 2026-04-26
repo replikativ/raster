@@ -264,6 +264,11 @@
                              (when (contains? safe-syms-set p)
                                (infer-alloc-tag p))
                              (:tag (meta p))
+                             ;; AD stamps grad syms with :raster.type/tag (e.g. 'doubles).
+                             ;; Without reading it, helper params get 'Object, and the
+                             ;; aget/aset fallback checkcasts to Object[] — fails at
+                             ;; runtime when the captured array is double[].
+                             (:raster.type/tag (meta p))
                              (get @type-env p)
                              'Object))
          ;; Build type env from params + hoisted buffers + preceding bindings

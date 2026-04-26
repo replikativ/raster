@@ -827,7 +827,13 @@
             tags-vec (or tags (vec (repeat (count all-params) 'double)))
             active-params (vec (keep-indexed
                                  (fn [i p]
-                                   (when (differentiable-tag? (nth tags-vec i nil)) p))
+                                   (let [tag (nth tags-vec i nil)]
+                                     (when (differentiable-tag? tag)
+                                       ;; Stamp :raster.type/tag so AD can read it
+                                       ;; in gen-reverse-let Phase 3 → adj-sym carries
+                                       ;; the tag → closure helpers get typed params
+                                       ;; instead of falling back to Object.
+                                       (with-meta p {:raster.type/tag tag}))))
                                  all-params))
             ad-form (transform-body body-form active-params)
             ;; Canonicalize and flatten
