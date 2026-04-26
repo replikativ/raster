@@ -1815,7 +1815,9 @@
                     (when (symbol? arr) (:hint (get locals arr))))
         arr-verified? (when (symbol? arr) (:verified (get locals arr)))
         arr-type (emit-form code arr locals ctx)]
-    ;; Checkcast array — skip when type verified by method descriptor
+    ;; Checkcast array — skip when type verified by method descriptor.
+    ;; Unknown arr-tag defaults to Object[] so aastore has a typed array
+    ;; reference (otherwise verifier rejects: 'Object' isn't an array type).
     (when (and (= arr-type :ref) (not arr-verified?))
       (let [arr-cls (case arr-tag
                       objects (Class/forName "[Ljava.lang.Object;")
@@ -1825,8 +1827,9 @@
                       ints    (Class/forName "[I")
                       bytes   (Class/forName "[B")
                       shorts  (Class/forName "[S")
-                      nil)]
-        (when arr-cls (.checkcast code (class-desc-of arr-cls)))))
+                      ;; Unknown arr-tag: assume Object[] for aastore
+                      (Class/forName "[Ljava.lang.Object;"))]
+        (.checkcast code (class-desc-of arr-cls))))
     (let [t (emit-form code idx locals ctx)]
       (when (not= t :int) (emit-coerce code t :int)))
     ;; In void context (non-last statement), emit plain store (1 instr).
