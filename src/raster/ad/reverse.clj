@@ -504,13 +504,23 @@
                                 tape-sym d-out-sym bound-expr]} record]
                   ;; 1. Allocate shadow arrays for read arrays
                     (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_out to the adjoint of the first written array
+                  ;; 2. Bind d_out to the adjoint of the first written array.
+                  ;; If no contributions, the adjoint is a zero of the SAME shape
+                  ;; as the forward result — for arrays that's a zero array (a
+                  ;; scalar 0.0 here would crash downstream array-add-backward
+                  ;; et al. with a Double/Long type mismatch).
                     (when-let [out-arr (first written-arrs)]
-                      (let [d-out-contribs (get @adj-env out-arr)]
+                      (let [d-out-contribs (get @adj-env out-arr)
+                            zero-of-shape (case (:raster.type/tag (meta out-arr))
+                                            doubles (list 'double-array (list 'raster.arrays/alength out-arr))
+                                            floats  (list 'float-array  (list 'raster.arrays/alength out-arr))
+                                            0.0)]
                         (swap! rev-ctx #(update % :bindings into
-                                                [d-out-sym (if (and d-out-contribs (= 1 (count d-out-contribs)))
+                                                [d-out-sym (cond
+                                                             (and d-out-contribs (= 1 (count d-out-contribs)))
                                                              (first d-out-contribs)
-                                                             (or (first d-out-contribs) 0.0))]))))
+                                                             d-out-contribs (first d-out-contribs)
+                                                             :else zero-of-shape)]))))
                   ;; 3. Emit par/map! for array gradients
                     (doseq [bwd-map backward-maps]
                       (swap! rev-ctx #(update % :bindings into bwd-map)))
@@ -530,7 +540,8 @@
                                 tape-sym d-acc-sym bound-expr]} record]
                   ;; 1. Allocate shadow arrays for read arrays
                     (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_acc to the adjoint of the reduce result
+                  ;; 2. Bind d_acc to the adjoint of the reduce result. par/reduce
+                  ;; returns a SCALAR — 0.0 default is correct for the empty case.
                     (let [d-acc-contribs (get @adj-env sym)]
                       (swap! rev-ctx #(update % :bindings into
                                               [d-acc-sym (if (and d-acc-contribs (= 1 (count d-acc-contribs)))
@@ -555,13 +566,21 @@
                                 d-out-sym n-bwd-sym bound-expr]} record]
                   ;; 1. Allocate shadow arrays for read arrays
                     (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_out to the adjoint of the first written array
+                  ;; 2. Bind d_out to the adjoint of the first written array.
+                  ;; Same shape rule as the par-map case above — array adjoints
+                  ;; need a typed zero array, not a scalar 0.0.
                     (when-let [out-arr (first written-arrs)]
-                      (let [d-out-contribs (get @adj-env out-arr)]
+                      (let [d-out-contribs (get @adj-env out-arr)
+                            zero-of-shape (case (:raster.type/tag (meta out-arr))
+                                            doubles (list 'double-array (list 'raster.arrays/alength out-arr))
+                                            floats  (list 'float-array  (list 'raster.arrays/alength out-arr))
+                                            0.0)]
                         (swap! rev-ctx #(update % :bindings into
-                                                [d-out-sym (if (and d-out-contribs (= 1 (count d-out-contribs)))
+                                                [d-out-sym (cond
+                                                             (and d-out-contribs (= 1 (count d-out-contribs)))
                                                              (first d-out-contribs)
-                                                             (or (first d-out-contribs) 0.0))]))))
+                                                             d-out-contribs (first d-out-contribs)
+                                                             :else zero-of-shape)]))))
                   ;; 3. Bind n_bwd to the bound expression
                     (swap! rev-ctx #(update % :bindings into [n-bwd-sym bound-expr]))
                   ;; 4. Run the backward loop
