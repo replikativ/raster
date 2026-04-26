@@ -2863,10 +2863,14 @@
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
-                          (assoc locs sym {:slot slot :type t :hint tag
-                                           ;; Mark as verified if we just checkcast'd it
-                                           ;; — skips redundant checkcasts on aget/aset
-                                           :verified (boolean (and tag (not= tag 'Object)))})
+                          (let [new-locs (assoc locs sym {:slot slot :type t :hint tag
+                                                          :verified (boolean (and tag (not= tag 'Object)))})]
+                            (when (and (System/getProperty "raster.debug.locals")
+                                       (or (.startsWith (str sym) "K_")
+                                           (.startsWith (str sym) "V_")
+                                           (.startsWith (str sym) "Q_")))
+                              (println (str "  [bind] " sym " → slot " slot " type " t)))
+                            new-locs)
                           locs)))
                     locals pairs)]
     (emit-body code body new-locals ctx)))
@@ -3386,6 +3390,15 @@
 (defn- emit-symbol
   "Emit bytecode for a symbol: local variable load, var deref, constant fold, or static field."
   [code form locals ctx]
+  (when (and (System/getProperty "raster.debug.locals")
+             (symbol? form)
+             (or (.startsWith (str form) "K_")
+                 (.startsWith (str form) "V_")
+                 (.startsWith (str form) "Q_")))
+    (println (str "  [lookup] " form " → " (if (contains? locals form) "FOUND" "MISSING")
+                  " (locals has " (count locals) " entries)"))
+    (when-not (contains? locals form)
+      (println "  [lookup-fail] all locals: " (sort (map str (keys locals))))))
   (if-let [{:keys [slot type]} (get locals form)]
     (do (case type
           :double (.dload code slot)

@@ -152,11 +152,31 @@
          dim-env (or (hoist/build-dim-env form params-set) {})
          [_ bindings-vec & body-exprs] form
          pairs (vec (map vec (partition 2 bindings-vec)))
+         _ (when (System/getProperty "raster.debug.hoist")
+             (let [pred #(or (.startsWith (str %) "K_")
+                             (.startsWith (str %) "V_")
+                             (.startsWith (str %) "Q_"))
+                   tagged-syms (filter pred (map first pairs))]
+               (println "  [hoist-input] " (count pairs) "pairs total, K/V/Q-pattern:" (vec tagged-syms))))
          dtype (:dtype opts)
          rewritten-pairs (hoist/rewrite-alloc-exprs pairs dim-env params-set dtype)
+         _ (when (System/getProperty "raster.debug.hoist")
+             (let [pred #(or (.startsWith (str %) "K_")
+                             (.startsWith (str %) "V_")
+                             (.startsWith (str %) "Q_"))
+                   tagged-syms (filter pred (map first rewritten-pairs))]
+               (println "  [post-rewrite-alloc] " (count rewritten-pairs) "pairs total, K/V/Q-pattern:" (vec tagged-syms))))
          safe-pairs (vec (filter #(hoist/hoist-safe-pair? params-set %) rewritten-pairs))
          safe-syms-set (set (map first safe-pairs))
          inner-pairs (vec (remove (fn [[sym _]] (contains? safe-syms-set sym)) rewritten-pairs))
+         _ (when (System/getProperty "raster.debug.hoist")
+             (let [pred #(or (.startsWith (str %) "K_")
+                             (.startsWith (str %) "V_")
+                             (.startsWith (str %) "Q_"))
+                   inner-tagged (filter pred (map first inner-pairs))
+                   safe-tagged (filter pred (map first safe-pairs))]
+               (println "  [hoist-split] inner-pairs K/V/Q:" (vec inner-tagged))
+               (println "  [hoist-split] safe-pairs K/V/Q:" (vec safe-tagged))))
          safe-buf-syms (mapv first safe-pairs)
          alloc-body (vec (map second safe-pairs))
          ;; In bytecode path, hoisted bufs are direct params — no rebind needed.
@@ -351,6 +371,20 @@
                                   (apply list head (vec new-binds) (map #(tag-walk % new-env) body)))
                                 form))]
                         (tag-walk compute-form @type-env))
+         _debug-dump (when (System/getProperty "raster.debug.compute-form")
+                       (let [src (pr-str compute-form)]
+                         (spit "/tmp/compute-form.txt" src)
+                         (println "  [compute-form] dumped, len=" (count src))
+                         (when-let [[head binds & _body] (when (seq? compute-form) compute-form)]
+                           (when (#{'let 'let*} head)
+                             (let [pairs (partition 2 binds)
+                                   syms (mapv first pairs)]
+                               (println "  [compute-form] binding count:" (count syms))
+                               (doseq [sym syms
+                                       :when (or (.startsWith (str sym) "K_")
+                                                 (.startsWith (str sym) "V_")
+                                                 (.startsWith (str sym) "Q_"))]
+                                 (println "  [compute-form] has binding:" sym)))))))
          ;; Compile via bytecode — static methods + IFn wrapper class
          compile-hoisted! hoisted/compile-hoisted-class!
          class-name (str "raster.compiled.CF_" (System/nanoTime))
