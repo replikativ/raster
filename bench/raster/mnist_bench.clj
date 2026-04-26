@@ -1,6 +1,10 @@
 (ns raster.mnist-bench
   "MNIST training benchmark: MLP and LeNet-5, f64 and f32.
 
+  Each train step is one rp/compile-train-step call: defmodel wraps the
+  loss with a structured weight tree, value+grad + grad-clip + Adam are
+  fused into a single bytecoded kernel.
+
   Run with Valhalla JDK:
     source valhalla-env.sh
     OPENBLAS_NUM_THREADS=1 clojure -J--enable-preview \\
@@ -9,14 +13,11 @@
       -J--add-modules=jdk.incubator.vector \\
       -J-XX:ReservedCodeCacheSize=512m -J-Xmx8g \\
       -M:bench:valhalla -m raster.mnist-bench"
-  (:require [raster.core :refer [deftm]]
-            [raster.nn :as nn]
+  (:require [raster.nn :as nn]
             [raster.dl.nn :as dl]
             [raster.dl.lenet :as lenet]
-            [raster.dl.optim :as optim]
             [raster.arrays :as arrays]
-            [raster.ad.reverse :as rev]
-            [raster.compiler.pipeline :as pipeline])
+            [raster.params :as rp])
   (:import [java.io DataInputStream]
            [java.util Random]
            [java.util.zip GZIPInputStream]))
@@ -54,78 +55,46 @@
       (dotimes [i n] (aset arr i (Byte/toUnsignedInt (.readByte dis)))) arr)))
 
 ;; ================================================================
-;; MLP train steps (f64 and f32)
+;; MLP loss models (one per dtype — defmodel surface is monomorphic)
 ;; ================================================================
 
-(deftm mlp-train-step
-  [W1 :- (Array double), b1 :- (Array double),
-   W2 :- (Array double), b2 :- (Array double),
-   x :- (Array double), y :- (Array double),
-   lr :- Double] :- Double
-  (let [vg ((rev/value+grad (var nn/loss-fn)) W1 b1 W2 b2 x y)
-        loss (nth vg 0)]
-    (optim/sgd-step! W1 (nth vg 1) (arrays/alength W1) lr)
-    (optim/sgd-step! b1 (nth vg 2) (arrays/alength b1) lr)
-    (optim/sgd-step! W2 (nth vg 3) (arrays/alength W2) lr)
-    (optim/sgd-step! b2 (nth vg 4) (arrays/alength b2) lr)
-    loss))
+(rp/defmodel mlp-loss-f64
+  [w :- (Params (HMap :mandatory {:W1 (Param (Array double)) :b1 (Param (Array double))
+                                  :W2 (Param (Array double)) :b2 (Param (Array double))}))
+   x :- (Array double) y :- (Array double)] :- Double
+  (nn/loss-fn (:W1 w) (:b1 w) (:W2 w) (:b2 w) x y))
 
-(deftm mlp-train-step
-  [W1 :- (Array float), b1 :- (Array float),
-   W2 :- (Array float), b2 :- (Array float),
-   x :- (Array float), y :- (Array float),
-   lr :- Double] :- Float
-  (let [vg ((rev/value+grad (var nn/loss-fn)) W1 b1 W2 b2 x y)
-        loss (nth vg 0)]
-    (optim/sgd-step! W1 (nth vg 1) (arrays/alength W1) lr)
-    (optim/sgd-step! b1 (nth vg 2) (arrays/alength b1) lr)
-    (optim/sgd-step! W2 (nth vg 3) (arrays/alength W2) lr)
-    (optim/sgd-step! b2 (nth vg 4) (arrays/alength b2) lr)
-    loss))
+(rp/defmodel mlp-loss-f32
+  [w :- (Params (HMap :mandatory {:W1 (Param (Array float)) :b1 (Param (Array float))
+                                  :W2 (Param (Array float)) :b2 (Param (Array float))}))
+   x :- (Array float) y :- (Array float)] :- Float
+  (nn/loss-fn (:W1 w) (:b1 w) (:W2 w) (:b2 w) x y))
 
 ;; ================================================================
-;; LeNet train steps (f64 and f32)
+;; LeNet loss models (one per dtype)
 ;; ================================================================
 
-(deftm lenet-train-step
-  [conv1-W :- (Array double) conv1-b :- (Array double)
-   conv2-W :- (Array double) conv2-b :- (Array double)
-   fc1-W :- (Array double) fc1-b :- (Array double)
-   fc2-W :- (Array double) fc2-b :- (Array double)
-   x :- (Array double) y :- (Array double)
-   lr :- Double] :- Double
-  (let [vg ((rev/value+grad (var lenet/lenet-loss-fn))
-            conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b x y)
-        loss (nth vg 0)]
-    (optim/sgd-step! conv1-W (nth vg 1) (arrays/alength conv1-W) lr)
-    (optim/sgd-step! conv1-b (nth vg 2) (arrays/alength conv1-b) lr)
-    (optim/sgd-step! conv2-W (nth vg 3) (arrays/alength conv2-W) lr)
-    (optim/sgd-step! conv2-b (nth vg 4) (arrays/alength conv2-b) lr)
-    (optim/sgd-step! fc1-W   (nth vg 5) (arrays/alength fc1-W)   lr)
-    (optim/sgd-step! fc1-b   (nth vg 6) (arrays/alength fc1-b)   lr)
-    (optim/sgd-step! fc2-W   (nth vg 7) (arrays/alength fc2-W)   lr)
-    (optim/sgd-step! fc2-b   (nth vg 8) (arrays/alength fc2-b)   lr)
-    loss))
+(rp/defmodel lenet-loss-f64
+  [w :- (Params (HMap :mandatory
+                      {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
+                       :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
+                       :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
+                       :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))}))
+   x :- (Array double) y :- (Array double)] :- Double
+  (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
+                       (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
+                       x y))
 
-(deftm lenet-train-step
-  [conv1-W :- (Array float) conv1-b :- (Array float)
-   conv2-W :- (Array float) conv2-b :- (Array float)
-   fc1-W :- (Array float) fc1-b :- (Array float)
-   fc2-W :- (Array float) fc2-b :- (Array float)
-   x :- (Array float) y :- (Array float)
-   lr :- Double] :- Float
-  (let [vg ((rev/value+grad (var lenet/lenet-loss-fn))
-            conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b x y)
-        loss (nth vg 0)]
-    (optim/sgd-step! conv1-W (nth vg 1) (arrays/alength conv1-W) lr)
-    (optim/sgd-step! conv1-b (nth vg 2) (arrays/alength conv1-b) lr)
-    (optim/sgd-step! conv2-W (nth vg 3) (arrays/alength conv2-W) lr)
-    (optim/sgd-step! conv2-b (nth vg 4) (arrays/alength conv2-b) lr)
-    (optim/sgd-step! fc1-W   (nth vg 5) (arrays/alength fc1-W)   lr)
-    (optim/sgd-step! fc1-b   (nth vg 6) (arrays/alength fc1-b)   lr)
-    (optim/sgd-step! fc2-W   (nth vg 7) (arrays/alength fc2-W)   lr)
-    (optim/sgd-step! fc2-b   (nth vg 8) (arrays/alength fc2-b)   lr)
-    loss))
+(rp/defmodel lenet-loss-f32
+  [w :- (Params (HMap :mandatory
+                      {:conv1-W (Param (Array float)) :conv1-b (Param (Array float))
+                       :conv2-W (Param (Array float)) :conv2-b (Param (Array float))
+                       :fc1-W   (Param (Array float)) :fc1-b   (Param (Array float))
+                       :fc2-W   (Param (Array float)) :fc2-b   (Param (Array float))}))
+   x :- (Array float) y :- (Array float)] :- Float
+  (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
+                       (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
+                       x y))
 
 ;; ================================================================
 ;; Model initialization
@@ -173,10 +142,11 @@
 ;; Evaluation
 ;; ================================================================
 
-(defn- mlp-evaluate [W1 b1 W2 b2 images ^ints labels dtype]
-  (let [n (alength labels)
+(defn- mlp-evaluate [w images ^ints labels dtype]
+  (let [{:keys [W1 b1 W2 b2]} w
+        n (alength labels)
         float? (= dtype :float)
-        fwd (fn [W1 b1 W2 b2 x] (nn/dense W2 (nn/relu (nn/dense W1 x b1)) b2))]
+        fwd (fn [x] (nn/dense W2 (nn/relu (nn/dense W1 x b1)) b2))]
     (* 100.0 (/ (double (loop [i 0 c 0]
                            (if (< i n)
                              (let [img (nth images i)
@@ -186,25 +156,25 @@
                                                f (float-array (clojure.core/alength img))]
                                            (dotimes [j (clojure.core/alength img)] (aset f j (float (aget img j)))) f)
                                          img)
-                                   pred (arrays/argmax (fwd W1 b1 W2 b2 img))]
+                                   pred (arrays/argmax (fwd img))]
                                (recur (inc i) (if (== pred (aget labels i)) (inc c) c)))
                              c)))
                (double n)))))
 
-(defn- lenet-evaluate [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-                       images ^ints labels dtype]
-  (let [n (alength labels)
+(defn- lenet-evaluate [w images ^ints labels dtype]
+  (let [{:keys [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b]} w
+        n (alength labels)
         float? (= dtype :float)
-        fwd (fn [c1w c1b c2w c2b f1w f1b f2w f2b x]
-              (let [c1 (dl/conv2d x c1w c1b 1 1 28 28 6 5 5 1 1 0 0)
+        fwd (fn [x]
+              (let [c1 (dl/conv2d x conv1-W conv1-b 1 1 28 28 6 5 5 1 1 0 0)
                     r1 (nn/relu c1)
                     p1 (dl/maxpool2d r1 1 6 24 24 2 2)
-                    c2 (dl/conv2d p1 c2w c2b 1 6 12 12 16 5 5 1 1 0 0)
+                    c2 (dl/conv2d p1 conv2-W conv2-b 1 6 12 12 16 5 5 1 1 0 0)
                     r2 (nn/relu c2)
                     p2 (dl/maxpool2d r2 1 16 8 8 2 2)
-                    f1 (nn/dense f1w p2 f1b)
+                    f1 (nn/dense fc1-W p2 fc1-b)
                     a1 (nn/relu f1)]
-                (nn/dense f2w a1 f2b)))]
+                (nn/dense fc2-W a1 fc2-b)))]
     (* 100.0 (/ (double (loop [i 0 c 0]
                            (if (< i n)
                              (let [img (nth images i)
@@ -213,8 +183,7 @@
                                                f (float-array (clojure.core/alength img))]
                                            (dotimes [j (clojure.core/alength img)] (aset f j (float (aget img j)))) f)
                                          img)
-                                   pred (arrays/argmax (fwd conv1-W conv1-b conv2-W conv2-b
-                                                            fc1-W fc1-b fc2-W fc2-b img))]
+                                   pred (arrays/argmax (fwd img))]
                                (recur (inc i) (if (== pred (aget labels i)) (inc c) c)))
                              c)))
                (double n)))))
@@ -238,86 +207,102 @@
 ;; Run benchmarks
 ;; ================================================================
 
+;; Adam hyperparameters (defaults match raster.params/compile-train-step)
+(def ^:private adam-lr 0.01)
+(def ^:private adam-beta1 0.9)
+(def ^:private adam-beta2 0.999)
+(def ^:private adam-eps 1e-8)
+(def ^:private adam-clip 1.0)
+
 (defn- run-mlp-bench [dtype train-imgs train-lbls test-imgs test-lbls-int]
-  (let [dtype-str (if (= dtype :float) "f32" "f64")
-        n (count train-imgs)]
+  (let [dtype-str  (if (= dtype :float) "f32" "f64")
+        model-var  (if (= dtype :float) #'mlp-loss-f32 #'mlp-loss-f64)
+        n (count train-imgs)
+        t-counter (atom 0)]
     (println (format "\n── MLP 784-128-10 %s ──" dtype-str))
-    (print "  Compiling... ") (flush)
+    (print "  Compiling fused train step... ") (flush)
     (let [tc (System/currentTimeMillis)
-          f (pipeline/compile-aot #'mlp-train-step
-              :dtype (if (= dtype :float) :float :double))
+          {:keys [train-fn init-state]} (rp/compile-train-step model-var)
           _ (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
-          {:keys [W1 b1 W2 b2]} (init-mlp 128 (Random. 42) dtype)
-          lr 0.01]
+          w (init-mlp 128 (Random. 42) dtype)
+          {:keys [m v]} (init-state w)
+          step! (fn [^doubles x ^doubles y]
+                  (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
+                            (swap! t-counter inc)))]
       ;; Micro-benchmark: median µs/step
       (let [n-warmup (Integer/parseInt (System/getProperty "raster.bench.warmup" "3000"))
             n-timed  (Integer/parseInt (System/getProperty "raster.bench.timed" "5000"))]
         (printf "  Micro-bench (%d warmup, %d timed)... " n-warmup n-timed) (flush)
-        (let [us (micro-bench #(f W1 b1 W2 b2 (nth train-imgs (rand-int n)) (nth train-lbls (rand-int n)) lr)
+        (let [us (micro-bench #(step! (nth train-imgs (rand-int n))
+                                      (nth train-lbls (rand-int n)))
                               n-warmup n-timed)]
           (println (format "%.0f µs/step" us))))
       ;; Full epoch (skip with -Draster.bench.skip-epoch=true)
       (when-not (= "true" (System/getProperty "raster.bench.skip-epoch"))
-        (let [{:keys [W1 b1 W2 b2]} (init-mlp 128 (Random. 42) dtype)]
+        (let [w (init-mlp 128 (Random. 42) dtype)
+              {:keys [m v]} (init-state w)
+              step! (fn [^doubles x ^doubles y]
+                      (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
+                                (swap! t-counter inc)))]
           (print "  Warming up... ") (flush)
-          (dotimes [i 1000] (f W1 b1 W2 b2 (nth train-imgs (mod i n)) (nth train-lbls (mod i n)) lr))
+          (dotimes [i 1000] (step! (nth train-imgs (mod i n)) (nth train-lbls (mod i n))))
           (println "done")
           (let [idx (shuffle (range n))
                 t0 (System/currentTimeMillis)
                 total (reduce (fn [acc i]
-                                (+ acc (double (f W1 b1 W2 b2 (nth train-imgs i) (nth train-lbls i) lr))))
+                                (+ acc (double (step! (nth train-imgs i) (nth train-lbls i)))))
                               0.0 idx)
                 dt (/ (- (System/currentTimeMillis) t0) 1000.0)
-                acc (mlp-evaluate W1 b1 W2 b2 test-imgs test-lbls-int dtype)]
+                acc (mlp-evaluate w test-imgs test-lbls-int dtype)]
             (println (format "  Epoch 1  loss=%.4f  acc=%.2f%%  time=%.1fs  (%.0f µs/step)"
                        (/ total n) acc dt (* 1e6 (/ dt n))))))))))
 
 (defn- run-lenet-bench [dtype train-imgs train-lbls test-imgs test-lbls-int]
   (let [dtype-str (if (= dtype :float) "f32" "f64")
-        n (count train-imgs)]
+        model-var (if (= dtype :float) #'lenet-loss-f32 #'lenet-loss-f64)
+        n (count train-imgs)
+        t-counter (atom 0)]
     (println (format "\n── LeNet-5 %s ──" dtype-str))
-    (print "  Compiling... ") (flush)
+    (print "  Compiling fused train step... ") (flush)
     (let [tc (System/currentTimeMillis)
-          f (try
-              (pipeline/compile-aot #'lenet-train-step
-                :dtype (if (= dtype :float) :float :double))
-              (catch Throwable e
-                (println (format "failed: %s" (.getMessage e)))
-                nil))
-          _ (when f (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0))))
-          f (or f lenet-train-step)
-          {:keys [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b]}
-          (init-lenet (Random. 42) dtype)
-          lr 0.01]
-      ;; Micro-benchmark
-      (let [n-warmup (Integer/parseInt (System/getProperty "raster.bench.lenet.warmup" "500"))
-            n-timed  (Integer/parseInt (System/getProperty "raster.bench.lenet.timed" "2000"))]
-        (printf "  Micro-bench (%d warmup, %d timed)... " n-warmup n-timed) (flush)
-        (let [us (micro-bench #(f conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-                                  (nth train-imgs (rand-int n)) (nth train-lbls (rand-int n)) lr)
-                              n-warmup n-timed)]
-          (println (format "%.0f µs/step" us))))
-      ;; Full epoch (skip with -Draster.bench.skip-epoch=true)
-      (when-not (= "true" (System/getProperty "raster.bench.skip-epoch"))
-        (let [{:keys [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b]}
-              (init-lenet (Random. 42) dtype)]
-          (print "  Warming up... ") (flush)
-          (dotimes [i 200]
-            (f conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-               (nth train-imgs (mod i n)) (nth train-lbls (mod i n)) lr))
-          (println "done")
-          (let [idx (shuffle (range n))
-                t0 (System/currentTimeMillis)
-                total (reduce (fn [acc i]
-                                (+ acc (double (f conv1-W conv1-b conv2-W conv2-b
-                                                 fc1-W fc1-b fc2-W fc2-b
-                                                 (nth train-imgs i) (nth train-lbls i) lr))))
-                              0.0 idx)
-                dt (/ (- (System/currentTimeMillis) t0) 1000.0)
-                acc (lenet-evaluate conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-                                   test-imgs test-lbls-int dtype)]
-            (println (format "  Epoch 1  loss=%.4f  acc=%.2f%%  time=%.1fs  (%.0f µs/step)"
-                       (/ total n) acc dt (* 1e6 (/ dt n))))))))))
+          compiled (try (rp/compile-train-step model-var)
+                        (catch Throwable e
+                          (println (format "failed: %s" (.getMessage e))) nil))]
+      (when compiled
+        (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
+        (let [{:keys [train-fn init-state]} compiled
+              w (init-lenet (Random. 42) dtype)
+              {:keys [m v]} (init-state w)
+              step! (fn [^doubles x ^doubles y]
+                      (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
+                                (swap! t-counter inc)))]
+          ;; Micro-benchmark
+          (let [n-warmup (Integer/parseInt (System/getProperty "raster.bench.lenet.warmup" "500"))
+                n-timed  (Integer/parseInt (System/getProperty "raster.bench.lenet.timed" "2000"))]
+            (printf "  Micro-bench (%d warmup, %d timed)... " n-warmup n-timed) (flush)
+            (let [us (micro-bench #(step! (nth train-imgs (rand-int n))
+                                          (nth train-lbls (rand-int n)))
+                                  n-warmup n-timed)]
+              (println (format "%.0f µs/step" us))))
+          ;; Full epoch (skip with -Draster.bench.skip-epoch=true)
+          (when-not (= "true" (System/getProperty "raster.bench.skip-epoch"))
+            (let [w (init-lenet (Random. 42) dtype)
+                  {:keys [m v]} (init-state w)
+                  step! (fn [^doubles x ^doubles y]
+                          (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
+                                    (swap! t-counter inc)))]
+              (print "  Warming up... ") (flush)
+              (dotimes [i 200] (step! (nth train-imgs (mod i n)) (nth train-lbls (mod i n))))
+              (println "done")
+              (let [idx (shuffle (range n))
+                    t0 (System/currentTimeMillis)
+                    total (reduce (fn [acc i]
+                                    (+ acc (double (step! (nth train-imgs i) (nth train-lbls i)))))
+                                  0.0 idx)
+                    dt (/ (- (System/currentTimeMillis) t0) 1000.0)
+                    acc (lenet-evaluate w test-imgs test-lbls-int dtype)]
+                (println (format "  Epoch 1  loss=%.4f  acc=%.2f%%  time=%.1fs  (%.0f µs/step)"
+                           (/ total n) acc dt (* 1e6 (/ dt n))))))))))))
 
 (defn -main [& args]
   (println "=== Raster MNIST DL Benchmark (compiled pipeline + reverse-mode AD) ===")
