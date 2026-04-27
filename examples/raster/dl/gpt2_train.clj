@@ -186,15 +186,15 @@
 ;; ----------------------------------------------------------------------
 
 (defn make-gpt2-loss
-  "Eval a defmodel form for the given config and return its var. The var has
-  structured-arg surface (takes a weights tree); compile-aot and value+grad
-  pick up the same surface via params metadata."
+  "Eval a deftm form for the given config and return its var. The var has
+  structured-arg surface (takes a weights tree via the HMap arg type);
+  compile-aot and value+grad pick up the same surface via tree metadata."
   [{:keys [n-layer d-model] :as _config}]
   (let [w-spec (weights-spec n-layer)
         body   (gpt2-loss-body n-layer d-model)
         sym    (symbol (str "gpt2-loss-" n-layer "L-" d-model "d"))
-        form   `(raster.params/defmodel ~sym
-                  [~'w           :- (~'Params ~w-spec)
+        form   `(raster.core/deftm ~sym
+                  [~'w           :- ~w-spec
                    ~'token-ids   :- (~'Array ~'long)
                    ~'targets     :- (~'Array ~'long)
                    ~'seq-len     :- ~'Long

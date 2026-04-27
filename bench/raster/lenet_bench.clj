@@ -1,13 +1,14 @@
 (ns raster.lenet-bench
   "LeNet-5 MNIST training benchmark — single-sample SGD, f64.
 
-  Uses raster.params/compile-train-step with :optimizer :sgd. A defmodel
-  wraps the loss with a structured weight tree; compile-train-step fuses
-  value+grad + grad-clip + the per-leaf SGD update into one bytecoded
-  train kernel.
+  Uses raster.params/compile-train-step with :optimizer :sgd. A deftm with
+  HMap-typed weight args expands at compile time into a flat-arg deftm;
+  compile-train-step fuses value+grad + grad-clip + the per-leaf SGD
+  update into one bytecoded train kernel.
 
   Run: clojure -J--add-modules=jdk.incubator.vector -M:bench -m raster.lenet-bench"
-  (:require [raster.nn :as nn]
+  (:require [raster.core :as core]
+            [raster.nn :as nn]
             [raster.dl.nn :as dl]
             [raster.dl.lenet :as lenet]
             [raster.arrays :as arrays]
@@ -19,12 +20,12 @@
 ;; Loss model — structured weights, fused train step via compile-train-step
 ;; ================================================================
 
-(rp/defmodel lenet-loss
-  [w :- (Params (HMap :mandatory
-                      {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
-                       :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
-                       :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
-                       :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))}))
+(core/deftm lenet-loss
+  [w :- (HMap :mandatory
+              {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
+               :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
+               :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
+               :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))})
    x :- (Array double) y :- (Array double)] :- Double
   (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
                        (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)

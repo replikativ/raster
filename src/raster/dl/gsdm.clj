@@ -1014,17 +1014,17 @@
        ~'loss)))
 
 (defn make-gsdm-loss
-  "Eval an rp/defmodel for the given config and return its var.
-  The var has structured-arg surface (takes a weights tree); compile-aot,
-  value+grad, and compile-train-step pick up the same surface via the
-  params metadata."
+  "Eval a deftm for the given config and return its var. The var has
+  structured-arg surface (takes a weights tree via the HMap arg type);
+  compile-aot, value+grad, and compile-train-step pick up the same
+  surface via tree metadata."
   [{:keys [n-layers emb-dim n-heads n-spaces]
     :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1}}]
   (let [w-spec (weights-spec n-layers)
         body (gsdm-loss-body n-layers emb-dim n-heads n-spaces)
         sym  (symbol (str "gsdm-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s"))
-        form `(raster.params/defmodel ~sym
-                [~'w :- (~'Params ~w-spec)
+        form `(raster.core/deftm ~sym
+                [~'w :- ~w-spec
                  ~'values :- (~'Array ~'double)
                  ~'spaces :- (~'Array ~'long)
                  ~'target :- (~'Array ~'double)

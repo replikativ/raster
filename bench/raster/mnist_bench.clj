@@ -1,10 +1,11 @@
 (ns raster.mnist-bench
   "MNIST training benchmark: MLP and LeNet-5, f64 and f32 — single-sample SGD.
 
-  Each train step is one rp/compile-train-step call: defmodel wraps the
-  loss with a structured weight tree, value+grad + grad-clip + the per-leaf
-  SGD update are fused into a single bytecoded kernel. Per-dtype defmodels
-  exist because the defmodel surface is monomorphic.
+  Each train step is one rp/compile-train-step call: deftm with HMap-typed
+  weight args expands into a flat-arg deftm at compile time, value+grad +
+  grad-clip + the per-leaf SGD update are fused into a single bytecoded
+  kernel. Per-dtype losses exist because the deftm dispatch surface is
+  monomorphic.
 
   Run with Valhalla JDK:
     source valhalla-env.sh
@@ -14,7 +15,8 @@
       -J--add-modules=jdk.incubator.vector \\
       -J-XX:ReservedCodeCacheSize=512m -J-Xmx8g \\
       -M:bench:valhalla -m raster.mnist-bench"
-  (:require [raster.nn :as nn]
+  (:require [raster.core :as core]
+            [raster.nn :as nn]
             [raster.dl.nn :as dl]
             [raster.dl.lenet :as lenet]
             [raster.arrays :as arrays]
@@ -23,18 +25,18 @@
   (:import [java.util Random]))
 
 ;; ================================================================
-;; MLP loss models (one per dtype — defmodel surface is monomorphic)
+;; MLP loss models (one per dtype — deftm surface is monomorphic)
 ;; ================================================================
 
-(rp/defmodel mlp-loss-f64
-  [w :- (Params (HMap :mandatory {:W1 (Param (Array double)) :b1 (Param (Array double))
-                                  :W2 (Param (Array double)) :b2 (Param (Array double))}))
+(core/deftm mlp-loss-f64
+  [w :- (HMap :mandatory {:W1 (Param (Array double)) :b1 (Param (Array double))
+                          :W2 (Param (Array double)) :b2 (Param (Array double))})
    x :- (Array double) y :- (Array double)] :- Double
   (nn/loss-fn (:W1 w) (:b1 w) (:W2 w) (:b2 w) x y))
 
-(rp/defmodel mlp-loss-f32
-  [w :- (Params (HMap :mandatory {:W1 (Param (Array float)) :b1 (Param (Array float))
-                                  :W2 (Param (Array float)) :b2 (Param (Array float))}))
+(core/deftm mlp-loss-f32
+  [w :- (HMap :mandatory {:W1 (Param (Array float)) :b1 (Param (Array float))
+                          :W2 (Param (Array float)) :b2 (Param (Array float))})
    x :- (Array float) y :- (Array float)] :- Float
   (nn/loss-fn (:W1 w) (:b1 w) (:W2 w) (:b2 w) x y))
 
@@ -42,23 +44,23 @@
 ;; LeNet loss models (one per dtype)
 ;; ================================================================
 
-(rp/defmodel lenet-loss-f64
-  [w :- (Params (HMap :mandatory
-                      {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
-                       :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
-                       :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
-                       :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))}))
+(core/deftm lenet-loss-f64
+  [w :- (HMap :mandatory
+              {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
+               :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
+               :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
+               :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))})
    x :- (Array double) y :- (Array double)] :- Double
   (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
                        (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
                        x y))
 
-(rp/defmodel lenet-loss-f32
-  [w :- (Params (HMap :mandatory
-                      {:conv1-W (Param (Array float)) :conv1-b (Param (Array float))
-                       :conv2-W (Param (Array float)) :conv2-b (Param (Array float))
-                       :fc1-W   (Param (Array float)) :fc1-b   (Param (Array float))
-                       :fc2-W   (Param (Array float)) :fc2-b   (Param (Array float))}))
+(core/deftm lenet-loss-f32
+  [w :- (HMap :mandatory
+              {:conv1-W (Param (Array float)) :conv1-b (Param (Array float))
+               :conv2-W (Param (Array float)) :conv2-b (Param (Array float))
+               :fc1-W   (Param (Array float)) :fc1-b   (Param (Array float))
+               :fc2-W   (Param (Array float)) :fc2-b   (Param (Array float))})
    x :- (Array float) y :- (Array float)] :- Float
   (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
                        (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
