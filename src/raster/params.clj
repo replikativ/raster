@@ -338,11 +338,28 @@
         vg-call `((raster.ad.reverse/value+grad (var ~(symbol (str (.ns loss-flat-var))
                                                               (str (.sym loss-flat-var)))))
                   ~@flat-call-args)
-        ;; Per-Param destructure: d_<idx> = (nth vg-out (inc idx))
+        ;; Per-Param destructure: d_<idx> = (nth vg-out (inc idx)).
+        ;; Stamp each d__i with the proper array tag (doubles/floats) from
+        ;; the leaf type so the walker can resolve clip-grad-norm! and
+        ;; sgd-step!/adam-step! to the correct float vs double specialization
+        ;; instead of defaulting to the doubles overload (which would inline
+        ;; a Double-init reduce! into the train-step and crash with [F→[D
+        ;; in the SegRed SIMD codegen for f32 paths).
         param-leaf-pairs (keep-indexed (fn [i l] (when (= :param (:kind l)) [i l]))
                                        leaves)
+        leaf->arr-tag (fn [l]
+                        (let [t (:type l)]
+                          (cond
+                            (and (sequential? t) (= 'Array (first t)) (= 'float (second t))) 'floats
+                            (and (sequential? t) (= 'Array (first t)) (= 'double (second t))) 'doubles
+                            (and (sequential? t) (= 'Array (first t)) (= 'long (second t))) 'longs
+                            (and (sequential? t) (= 'Array (first t)) (= 'int (second t))) 'ints
+                            :else nil)))
         d-syms (into {} (map (fn [[i l]]
-                               [(:path l) (symbol (str "d__" i))])
+                               (let [tag (leaf->arr-tag l)
+                                     base (symbol (str "d__" i))]
+                                 [(:path l)
+                                  (if tag (with-meta base {:tag tag}) base)]))
                              param-leaf-pairs))
         ;; Bind every effect to a non-underscore name (effect-clip-i, effect-step-i)
         ;; so compile-aot's DCE doesn't eliminate them. Side effects surface as
@@ -441,11 +458,16 @@
          ;; sees two same-name dispatch entries with different arities).
          train-name    (symbol (str (.sym loss-var) "--train-step-" (name optimizer)))
          body          (gen-train-step-body flat-var original-args w-arg leaves w-td optimizer)
+         ;; CRITICAL: spec/m-spec are bare HMaps. Wrap with Params so prepare-deftm
+         ;; recognizes the args as tree-typed and pre-flattens (:k w) accesses
+         ;; into flat positional symbols. Without the wrapper, pre-flatten silently
+         ;; no-ops and the train-step body's runtime keyword extractions become
+         ;; megamorphic IFn.invoke dispatches downstream (~3x slowdown).
          param-vec     (vec (concat
-                              [w-arg :- spec]
+                              [w-arg :- (list 'Params spec)]
                               (when (= optimizer :adam)
-                                ['m :- m-spec
-                                 'v :- m-spec])
+                                ['m :- (list 'Params m-spec)
+                                 'v :- (list 'Params m-spec)])
                               (mapcat (fn [[a ann]] [a :- ann]) non-tree)
                               ['max-grad-norm :- 'Double
                                'lr            :- 'Double]

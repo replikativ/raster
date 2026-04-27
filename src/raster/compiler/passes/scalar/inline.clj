@@ -133,12 +133,18 @@
        (when-not dispatch-no-inline?
          (when-let [v (try (resolve base-sym) (catch Exception _ nil))]
            (when-not (:no-inline (meta v))
-             (or
-              (try-resolve-walked-body v)
+             (let [parametric-sym (symbol (namespace base-sym) (name base-sym))
+                   has-parametric? (contains? @dispatch/parametric-registry parametric-sym)]
+               (or
+                ;; For parametric (All [T]) functions, skip the var's parametric
+                ;; template body — its literals are still T-generic. Force the
+                ;; dispatch-table path so try-parametric-specialize! generates
+                ;; (or finds) a concrete entry whose body has the literal-cast-fn
+                ;; applied (e.g. `0.0` → `(float 0.0)` for T=float).
+                (when-not has-parametric?
+                  (try-resolve-walked-body v))
               (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
                 (let [all-methods (mapcat identity (vals @dispatch-table))
-                      has-parametric? (contains? @dispatch/parametric-registry
-                                                 (symbol (namespace base-sym) (name base-sym)))
                       ;; Type-safe overload selection with parametric specialization.
                       ;; Single-method fallback only when function is NOT parametric
                       ;; (i.e., the one method IS the only possible overload).
@@ -146,7 +152,7 @@
                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
                                       (when (inf/try-parametric-specialize!
-                                             (symbol (namespace base-sym) (name base-sym)) arg-tags)
+                                             parametric-sym arg-tags)
                                         (let [new-methods (mapcat identity
                                                                   (vals @(:raster.core/dispatch-table (meta v))))]
                                           (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
@@ -164,7 +170,7 @@
                                                                  (:tags match))))
                           backing-var (try (resolve backing-sym) (catch Exception _ nil))]
                       (when backing-var
-                        (try-resolve-walked-body backing-var))))))))))))))
+                        (try-resolve-walked-body backing-var)))))))))))))))
 
 (def ^:private alloc-sym->array-tag op/alloc-sym->array-tag)
 

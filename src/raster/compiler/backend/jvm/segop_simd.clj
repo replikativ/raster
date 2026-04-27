@@ -655,6 +655,11 @@
         elem-type (or (:dtype segred)
                       (throw (ex-info "SegRed missing :dtype — type metadata lost in pipeline"
                                       {:acc acc :init init})))
+        _ (when (System/getProperty "raster.debug.segred-dtype")
+            (binding [*out* *err*]
+              (println "[segred] dtype=" elem-type
+                       " acc=" acc " init=" init
+                       " inputs=" (vec (:inputs segred)))))
         {:keys [species-expr from-array broadcast] cf :cast-fn} (get simd-type-info elem-type)]
     (when (and acc init idx bound lambda)
       ;; Unwrap let* in lambda

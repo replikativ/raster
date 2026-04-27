@@ -443,17 +443,14 @@
                (doseq [p params]
                  (when (= 'Object (:tag (meta p)))
                    (println (format "WARN: %s param '%s' typed as Object (may box)" name p))))))
-         ;; Validate: warn about Object-typed helper params that should be arrays
-         _ (doseq [{:keys [name params]} all-fn-specs]
-             (let [obj-params (filterv #(= 'Object (:tag (meta %))) params)
-                   ;; Only warn for non-compute methods (helpers with free vars)
-                   ;; Compute params are typed by param-env
-                   warn? (and (not= name 'compute) (seq obj-params))]
-               (when warn?
-                 (binding [*out* *err*]
-                   (println (format "WARNING: helper '%s' has %d Object-typed params: %s"
-                                    name (count obj-params)
-                                    (mapv str obj-params)))))))
+         ;; Validate: warn about Object-typed helper params that should be arrays.
+         ;; Becomes a hard error when raster.strict.types=true is set, so silent
+         ;; type-loss regressions surface at compile time instead of as runtime
+         ;; ClassCastException or megamorphic dispatch overhead.
+         _ ((requiring-resolve 'raster.compiler.passes.scalar.validate-types/report-violations!)
+            :closure/hoist
+            ((requiring-resolve 'raster.compiler.passes.scalar.validate-types/helper-object-params)
+             all-fn-specs))
          ;; Typed interface for zero-boxing invocation
          fn-param-tags (mapv tag-for-param fn-params)
          iface-info (types/ensure-fn-interface! fn-param-tags)
