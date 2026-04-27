@@ -213,8 +213,22 @@
                                                                                (= hname "aclone")))
                                                             ;; Source is the second arg (or third for .invk)
                                                             (if (= '.invk head) (nth alloc-expr 2) (second alloc-expr)))))
+                                           ;; Only `(*-array n val)` carries a fill value as the 3rd
+                                           ;; element. Other 3-element allocations like
+                                           ;; `(zeros-like ref n)` have length-not-value as the 3rd
+                                           ;; element — treating that as a fill value emits
+                                           ;; `Arrays.fill(buf, <length>)` and then JVM overload
+                                           ;; resolution picks `Arrays.fill(short[], short)`,
+                                           ;; producing a `[D → [S` runtime cast.
+                                           array-ctor? (fn [head]
+                                                         (when (symbol? head)
+                                                           (let [n (name head)]
+                                                             (and (.endsWith n "-array")
+                                                                  (or (nil? (namespace head))
+                                                                      (= "clojure.core" (namespace head)))))))
                                            fill-val (when (and (not aclone-src)
-                                                               (seq? alloc-expr) (= 3 (count alloc-expr)))
+                                                               (seq? alloc-expr) (= 3 (count alloc-expr))
+                                                               (array-ctor? (first alloc-expr)))
                                                       (nth alloc-expr 2))
                                            default-fill (case arr-tag
                                                           doubles 0.0
