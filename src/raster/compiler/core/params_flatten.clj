@@ -34,7 +34,9 @@
   (and (sequential? annotation) (= 'Params (first annotation))))
 
 (defn unwrap-params
-  "Unwrap (Params <inner>) → <inner>. Other annotations pass through."
+  "Unwrap (Params <inner>) → <inner>. Other annotations pass through.
+  Bare HMap/HVec annotations are already in the canonical inner form, so
+  they pass through unchanged — Params is just a back-compat trigger."
   [annotation]
   (if (params-marker? annotation)
     (second annotation)
@@ -932,15 +934,18 @@
 ;; ----------------------------------------------------------------------
 
 (defn tree-arg?
-  "True iff annotation is the (Params ...) marker — the explicit signal that
-  this deftm-arg is a structured tree to be flattened at compile time.
+  "True iff annotation describes a structured tree to be flattened at compile
+  time. Recognized forms:
+    (HMap :mandatory {...})  /  (HMap {...})
+    (HVec [T0 T1 ...])
+    (Params <inner>)         — back-compat alias; <inner> must be HMap/HVec
 
-  HMap/HVec annotations alone do NOT trigger flattening — they remain as
-  regular runtime types. Wrap them in (Params ...) to opt into the tree
-  pipeline. This makes the contract syntactically explicit: looking at an
-  annotation tells you whether the arg gets flattened."
+  Other annotations (Array, primitives, value classes) pass through as
+  ordinary typed deftm args."
   [annotation]
-  (params-marker? annotation))
+  (or (params-marker? annotation)
+      (hmap-spec? annotation)
+      (hvec-spec? annotation)))
 
 (defn- collect-symbols
   "Return the set of all symbols that appear anywhere in form."

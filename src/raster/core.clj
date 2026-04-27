@@ -571,16 +571,21 @@
         ;; Detect parametric: (deftm name (All [T] [params...] :- Ret body))
         ;; The All form wraps the entire signature + body
         parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))
-        ;; Detect a (Params ...) annotation in the param vector — that signals
-        ;; this deftm uses the tree pipeline (compile-time flattening +
-        ;; structured-arg wrapper). Forward to raster.params/defmodel which
-        ;; owns that machinery. The user namespace must require raster.params
-        ;; for the resolution to succeed.
+        ;; Detect tree-typed annotations in the param vector — these signal
+        ;; that this deftm uses the tree pipeline (compile-time flattening +
+        ;; structured-arg wrapper). Recognized forms:
+        ;;   (HMap ...)       — bare HMap annotation
+        ;;   (HVec [...])     — bare HVec annotation
+        ;;   (Params <inner>) — back-compat alias; <inner> must be HMap/HVec
+        ;; Forward to raster.params/defmodel which owns that machinery. The
+        ;; user namespace must require raster.params for the resolution to
+        ;; succeed (lazy via requiring-resolve at expansion time below).
+        tree-head? #{'Params 'HMap 'HVec}
         params-arg? (and (not parametric?)
                          (vector? (first rest-args))
                          (some (fn [item]
                                  (and (sequential? item)
-                                      (= 'Params (first item))))
+                                      (tree-head? (first item))))
                                (first rest-args)))]
     (cond
       params-arg?

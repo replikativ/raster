@@ -458,16 +458,14 @@
          ;; sees two same-name dispatch entries with different arities).
          train-name    (symbol (str (.sym loss-var) "--train-step-" (name optimizer)))
          body          (gen-train-step-body flat-var original-args w-arg leaves w-td optimizer)
-         ;; CRITICAL: spec/m-spec are bare HMaps. Wrap with Params so prepare-deftm
-         ;; recognizes the args as tree-typed and pre-flattens (:k w) accesses
-         ;; into flat positional symbols. Without the wrapper, pre-flatten silently
-         ;; no-ops and the train-step body's runtime keyword extractions become
-         ;; megamorphic IFn.invoke dispatches downstream (~3x slowdown).
+         ;; HMap/HVec arg types are recognized directly by prepare-deftm — no
+         ;; Params wrapper needed. The (:k w) accesses pre-flatten into flat
+         ;; positional symbols at compile time.
          param-vec     (vec (concat
-                              [w-arg :- (list 'Params spec)]
+                              [w-arg :- spec]
                               (when (= optimizer :adam)
-                                ['m :- (list 'Params m-spec)
-                                 'v :- (list 'Params m-spec)])
+                                ['m :- m-spec
+                                 'v :- m-spec])
                               (mapcat (fn [[a ann]] [a :- ann]) non-tree)
                               ['max-grad-norm :- 'Double
                                'lr            :- 'Double]
