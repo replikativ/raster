@@ -1041,22 +1041,23 @@
                    "another function is not supported in this version.")
               {:leaked-symbols (vec leaks)})))))
 
-(defn prepare-deftm
-  "Pre-flatten a deftm signature. params and annotations come from
-  parse-typed-params; body is the deftm body.
+(defn prepare-deftm-shape
+  "Cheap, body-independent half of prepare-deftm. Walks the spec only
+  (no body rewrite) to compute:
 
-  For each tree-typed param, all leaves become flat positional args
-  (canonical sorted order). Non-tree params pass through unchanged.
+    :params      flat positional param symbols (canonical leaf order)
+    :annotations flat positional annotations matching :params
+    :treedefs    {root-sym {:spec ... :leaves [{:path :sym :kind :type}]}}
+    :env         {root-sym {:root ... :path [] :spec ...}} for use by
+                 prepare-deftm-body to rewrite (:k root) accesses
+    :tree-arg-syms vector of tree-typed root symbols (for dangling-ref check)
 
-  Returns {:params new-params, :annotations new-anns, :body new-body,
-           :treedefs {root-sym {:spec ... :leaves [{:path :sym :kind :type}]}}}"
-  [params annotations body]
-  (let [;; Tree args are tagged with (Params <inner>). Use the inner spec
-        ;; for flattening; the Params wrapper is just the trigger.
-        param-inner (fn [ann] (when (tree-arg? ann) (unwrap-params ann)))
-        ;; Reject malformed tree specs at the deftm boundary so the user
-        ;; sees a clear error here instead of silent leaf misordering or a
-        ;; cryptic downstream failure.
+  Validates spec well-formedness. Body work (rewrite-body) is split out
+  into prepare-deftm-body so the deftm macro can defer it to lazy JIT
+  time while still emitting the --flat deftm with the right arity at
+  macro time."
+  [params annotations]
+  (let [param-inner (fn [ann] (when (tree-arg? ann) (unwrap-params ann)))
         _ (doseq [[p ann] (map vector params annotations)
                   :when (tree-arg? ann)]
             (try (validate-tree-spec! (unwrap-params ann))
@@ -1065,15 +1066,11 @@
                                         (.getMessage e))
                                    (assoc (ex-data e) :param p)
                                    e)))))
-        ;; Build initial env: each tree param becomes a path root with the
-        ;; INNER (unwrapped) structural spec.
         init-env (into {}
                        (keep (fn [[p ann]]
                                (when-let [inner (param-inner ann)]
                                  [p {:root p :path [] :spec inner}]))
                              (map vector params annotations)))
-        ;; For each tree arg, generate canonical flat leaves up-front so
-        ;; ordering is stable independent of body access order
         canonical-leaves
         (into {}
               (keep (fn [[p ann]]
@@ -1083,18 +1080,13 @@
                                  (flatten-spec inner))]))
                     (map vector params annotations)))
         tree-arg-syms (vec (keep (fn [[p ann]] (when (tree-arg? ann) p))
-                                   (map vector params annotations)))
-        ;; Rewrite the body
-        {body' :body} (rewrite-body body init-env)
-        _ (assert-no-dangling-tree-refs! body' tree-arg-syms)
-        ;; Build new param + annotation vectors
+                                 (map vector params annotations)))
         [new-params new-anns]
         (reduce (fn [[ps as] [p ann]]
                   (if (tree-arg? ann)
                     (let [leaves (canonical-leaves p)]
                       [(into ps (map :sym) leaves)
                        (into as (map (fn [{:keys [type kind]}]
-                                       ;; Keep wrapper kind for consumers downstream
                                        (case kind
                                          :param  (list 'Param type)
                                          :frozen (list 'Frozen type)
@@ -1108,7 +1100,37 @@
                                (when-let [inner (param-inner ann)]
                                  [p {:spec inner :leaves (canonical-leaves p)}]))
                              (map vector params annotations)))]
-    {:params      new-params
-     :annotations new-anns
-     :body        body'
+    {:params        new-params
+     :annotations   new-anns
+     :treedefs      treedefs
+     :env           init-env
+     :tree-arg-syms tree-arg-syms}))
+
+(defn prepare-deftm-body
+  "Body half of prepare-deftm. Given env (from prepare-deftm-shape) and
+  the original deftm body, run the (:k root) → root__k rewrite and return
+  the rewritten body. Throws if any tree-arg root symbol leaks through
+  the rewrite (i.e. used as a value rather than a path).
+
+  Pure function — safe to call at macro time, lazy JIT time, or any time
+  in between. The defmodel macro defers this to lazy JIT so the walker
+  pre-flatten happens alongside the type walker, not at source-read time."
+  [body env tree-arg-syms]
+  (let [{body' :body} (rewrite-body body env)]
+    (assert-no-dangling-tree-refs! body' tree-arg-syms)
+    body'))
+
+(defn prepare-deftm
+  "Convenience: prepare-deftm-shape + prepare-deftm-body in one call.
+  Kept for callers that don't need to defer body rewriting.
+
+  Returns {:params new-params, :annotations new-anns, :body new-body,
+           :treedefs {root-sym {:spec ... :leaves [{:path :sym :kind :type}]}}}"
+  [params annotations body]
+  (let [{:keys [params annotations treedefs env tree-arg-syms]}
+        (prepare-deftm-shape params annotations)
+        new-body (prepare-deftm-body body env tree-arg-syms)]
+    {:params      params
+     :annotations annotations
+     :body        new-body
      :treedefs    treedefs}))
