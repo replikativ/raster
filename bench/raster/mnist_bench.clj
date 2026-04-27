@@ -1,9 +1,10 @@
 (ns raster.mnist-bench
-  "MNIST training benchmark: MLP and LeNet-5, f64 and f32.
+  "MNIST training benchmark: MLP and LeNet-5, f64 and f32 — single-sample SGD.
 
   Each train step is one rp/compile-train-step call: defmodel wraps the
-  loss with a structured weight tree, value+grad + grad-clip + Adam are
-  fused into a single bytecoded kernel.
+  loss with a structured weight tree, value+grad + grad-clip + the per-leaf
+  SGD update are fused into a single bytecoded kernel. Per-dtype defmodels
+  exist because the defmodel surface is monomorphic.
 
   Run with Valhalla JDK:
     source valhalla-env.sh
@@ -17,42 +18,9 @@
             [raster.dl.nn :as dl]
             [raster.dl.lenet :as lenet]
             [raster.arrays :as arrays]
-            [raster.params :as rp])
-  (:import [java.io DataInputStream]
-           [java.util Random]
-           [java.util.zip GZIPInputStream]))
-
-;; ================================================================
-;; IDX file parsing
-;; ================================================================
-
-(defn- parse-idx-images [^String path dtype]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [_ (.readInt dis) n (.readInt dis) _ (.readInt dis) _ (.readInt dis)]
-      (mapv (fn [_]
-              (if (= dtype :float)
-                (let [arr (float-array 784)]
-                  (dotimes [j 784] (aset arr j (float (/ (double (Byte/toUnsignedInt (.readByte dis))) 255.0))))
-                  arr)
-                (let [arr (double-array 784)]
-                  (dotimes [j 784] (aset arr j (/ (double (Byte/toUnsignedInt (.readByte dis))) 255.0)))
-                  arr)))
-            (range n)))))
-
-(defn- parse-idx-labels [^String path dtype]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [_ (.readInt dis) n (.readInt dis)]
-      (mapv (fn [_]
-              (let [lbl (Byte/toUnsignedInt (.readByte dis))]
-                (if (= dtype :float)
-                  (let [arr (float-array 10)] (aset arr lbl (float 1.0)) arr)
-                  (let [arr (double-array 10)] (aset arr lbl 1.0) arr))))
-            (range n)))))
-
-(defn- parse-idx-labels-int [^String path]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [_ (.readInt dis) n (.readInt dis) arr (int-array n)]
-      (dotimes [i n] (aset arr i (Byte/toUnsignedInt (.readByte dis)))) arr)))
+            [raster.params :as rp]
+            [raster.mnist-data :as data])
+  (:import [java.util Random]))
 
 ;; ================================================================
 ;; MLP loss models (one per dtype — defmodel surface is monomorphic)
@@ -95,48 +63,6 @@
   (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
                        (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
                        x y))
-
-;; ================================================================
-;; Model initialization
-;; ================================================================
-
-(defn- init-mlp [^long hidden ^Random rng dtype]
-  (if (= dtype :float)
-    (let [l1 (Math/sqrt (/ 6.0 (+ 784.0 hidden)))
-          l2 (Math/sqrt (/ 6.0 (+ (double hidden) 10.0)))
-          W1 (float-array (* 784 hidden))
-          W2 (float-array (* hidden 10))]
-      (dotimes [i (* 784 hidden)] (aset W1 i (float (- (* (.nextDouble rng) 2.0 l1) l1))))
-      (dotimes [i (* hidden 10)] (aset W2 i (float (- (* (.nextDouble rng) 2.0 l2) l2))))
-      {:W1 W1 :b1 (float-array hidden) :W2 W2 :b2 (float-array 10)})
-    {:W1 (nn/xavier-init! rng 784 hidden (double-array (* 784 hidden)))
-     :b1 (double-array hidden)
-     :W2 (nn/xavier-init! rng hidden 10 (double-array (* hidden 10)))
-     :b2 (double-array 10)}))
-
-(defn- init-lenet [^Random rng dtype]
-  (if (= dtype :float)
-    (let [kaiming (fn [^long fan-in ^long n]
-                    (let [s (Math/sqrt (/ 2.0 (double fan-in)))
-                          a (float-array n)]
-                      (dotimes [i n] (aset a i (float (* (.nextGaussian rng) s))))
-                      a))]
-      {:conv1-W (kaiming 25 (* 6 1 5 5))
-       :conv1-b (float-array 6)
-       :conv2-W (kaiming 150 (* 16 6 5 5))
-       :conv2-b (float-array 16)
-       :fc1-W   (kaiming 256 (* 120 256))
-       :fc1-b   (float-array 120)
-       :fc2-W   (kaiming 120 (* 10 120))
-       :fc2-b   (float-array 10)})
-    {:conv1-W (nn/kaiming-init! rng (* 1 5 5) (double-array (* 6 1 5 5)))
-     :conv1-b (double-array 6)
-     :conv2-W (nn/kaiming-init! rng (* 6 5 5) (double-array (* 16 6 5 5)))
-     :conv2-b (double-array 16)
-     :fc1-W   (nn/kaiming-init! rng 256 (double-array (* 120 256)))
-     :fc1-b   (double-array 120)
-     :fc2-W   (nn/kaiming-init! rng 120 (double-array (* 10 120)))
-     :fc2-b   (double-array 10)}))
 
 ;; ================================================================
 ;; Evaluation
@@ -207,28 +133,20 @@
 ;; Run benchmarks
 ;; ================================================================
 
-;; Adam hyperparameters (defaults match raster.params/compile-train-step)
-(def ^:private adam-lr 0.01)
-(def ^:private adam-beta1 0.9)
-(def ^:private adam-beta2 0.999)
-(def ^:private adam-eps 1e-8)
-(def ^:private adam-clip 1.0)
+(def ^:private sgd-lr 0.01)
+(def ^:private sgd-clip 1.0)
 
 (defn- run-mlp-bench [dtype train-imgs train-lbls test-imgs test-lbls-int]
   (let [dtype-str  (if (= dtype :float) "f32" "f64")
         model-var  (if (= dtype :float) #'mlp-loss-f32 #'mlp-loss-f64)
-        n (count train-imgs)
-        t-counter (atom 0)]
+        n (count train-imgs)]
     (println (format "\n── MLP 784-128-10 %s ──" dtype-str))
-    (print "  Compiling fused train step... ") (flush)
+    (print "  Compiling fused train step (SGD)... ") (flush)
     (let [tc (System/currentTimeMillis)
-          {:keys [train-fn init-state]} (rp/compile-train-step model-var)
+          {:keys [train-fn]} (rp/compile-train-step model-var {:optimizer :sgd})
           _ (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
-          w (init-mlp 128 (Random. 42) dtype)
-          {:keys [m v]} (init-state w)
-          step! (fn [^doubles x ^doubles y]
-                  (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
-                            (swap! t-counter inc)))]
+          w (data/init-mlp 128 (Random. 42) dtype)
+          step! (fn [x y] (train-fn w x y sgd-clip sgd-lr))]
       ;; Micro-benchmark: median µs/step
       (let [n-warmup (Integer/parseInt (System/getProperty "raster.bench.warmup" "3000"))
             n-timed  (Integer/parseInt (System/getProperty "raster.bench.timed" "5000"))]
@@ -239,11 +157,8 @@
           (println (format "%.0f µs/step" us))))
       ;; Full epoch (skip with -Draster.bench.skip-epoch=true)
       (when-not (= "true" (System/getProperty "raster.bench.skip-epoch"))
-        (let [w (init-mlp 128 (Random. 42) dtype)
-              {:keys [m v]} (init-state w)
-              step! (fn [^doubles x ^doubles y]
-                      (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
-                                (swap! t-counter inc)))]
+        (let [w (data/init-mlp 128 (Random. 42) dtype)
+              step! (fn [x y] (train-fn w x y sgd-clip sgd-lr))]
           (print "  Warming up... ") (flush)
           (dotimes [i 1000] (step! (nth train-imgs (mod i n)) (nth train-lbls (mod i n))))
           (println "done")
@@ -260,22 +175,18 @@
 (defn- run-lenet-bench [dtype train-imgs train-lbls test-imgs test-lbls-int]
   (let [dtype-str (if (= dtype :float) "f32" "f64")
         model-var (if (= dtype :float) #'lenet-loss-f32 #'lenet-loss-f64)
-        n (count train-imgs)
-        t-counter (atom 0)]
+        n (count train-imgs)]
     (println (format "\n── LeNet-5 %s ──" dtype-str))
-    (print "  Compiling fused train step... ") (flush)
+    (print "  Compiling fused train step (SGD)... ") (flush)
     (let [tc (System/currentTimeMillis)
-          compiled (try (rp/compile-train-step model-var)
+          compiled (try (rp/compile-train-step model-var {:optimizer :sgd})
                         (catch Throwable e
                           (println (format "failed: %s" (.getMessage e))) nil))]
       (when compiled
         (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
-        (let [{:keys [train-fn init-state]} compiled
-              w (init-lenet (Random. 42) dtype)
-              {:keys [m v]} (init-state w)
-              step! (fn [^doubles x ^doubles y]
-                      (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
-                                (swap! t-counter inc)))]
+        (let [{:keys [train-fn]} compiled
+              w (data/init-lenet (Random. 42) dtype)
+              step! (fn [x y] (train-fn w x y sgd-clip sgd-lr))]
           ;; Micro-benchmark
           (let [n-warmup (Integer/parseInt (System/getProperty "raster.bench.lenet.warmup" "500"))
                 n-timed  (Integer/parseInt (System/getProperty "raster.bench.lenet.timed" "2000"))]
@@ -286,11 +197,8 @@
               (println (format "%.0f µs/step" us))))
           ;; Full epoch (skip with -Draster.bench.skip-epoch=true)
           (when-not (= "true" (System/getProperty "raster.bench.skip-epoch"))
-            (let [w (init-lenet (Random. 42) dtype)
-                  {:keys [m v]} (init-state w)
-                  step! (fn [^doubles x ^doubles y]
-                          (train-fn w m v x y adam-clip adam-lr adam-beta1 adam-beta2 adam-eps
-                                    (swap! t-counter inc)))]
+            (let [w (data/init-lenet (Random. 42) dtype)
+                  step! (fn [x y] (train-fn w x y sgd-clip sgd-lr))]
               (print "  Warming up... ") (flush)
               (dotimes [i 200] (step! (nth train-imgs (mod i n)) (nth train-lbls (mod i n))))
               (println "done")
@@ -310,22 +218,19 @@
 
   (print "Loading MNIST... ") (flush)
   (let [t0 (System/currentTimeMillis)
-        train-imgs-f64 (parse-idx-images "data/mnist/train-images-idx3-ubyte.gz" :double)
-        train-lbls-f64 (parse-idx-labels "data/mnist/train-labels-idx1-ubyte.gz" :double)
-        train-imgs-f32 (parse-idx-images "data/mnist/train-images-idx3-ubyte.gz" :float)
-        train-lbls-f32 (parse-idx-labels "data/mnist/train-labels-idx1-ubyte.gz" :float)
-        ;; Test images always f64 (eval converts if needed)
-        test-imgs (parse-idx-images "data/mnist/t10k-images-idx3-ubyte.gz" :double)
-        test-lbls-int (parse-idx-labels-int "data/mnist/t10k-labels-idx1-ubyte.gz")]
+        f64 (data/load-mnist :double)
+        f32 (data/load-mnist :float)
+        test-imgs     (:test-imgs f64)
+        test-lbls-int (:test-lbls-int f64)]
     (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) t0) 1000.0)))
 
     ;; MLP benchmarks
-    (run-mlp-bench :double train-imgs-f64 train-lbls-f64 test-imgs test-lbls-int)
-    (run-mlp-bench :float  train-imgs-f32 train-lbls-f32 test-imgs test-lbls-int)
+    (run-mlp-bench :double (:train-imgs f64) (:train-lbls f64) test-imgs test-lbls-int)
+    (run-mlp-bench :float  (:train-imgs f32) (:train-lbls f32) test-imgs test-lbls-int)
 
     ;; LeNet benchmarks
-    (run-lenet-bench :double train-imgs-f64 train-lbls-f64 test-imgs test-lbls-int)
-    (run-lenet-bench :float  train-imgs-f32 train-lbls-f32 test-imgs test-lbls-int)
+    (run-lenet-bench :double (:train-imgs f64) (:train-lbls f64) test-imgs test-lbls-int)
+    (run-lenet-bench :float  (:train-imgs f32) (:train-lbls f32) test-imgs test-lbls-int)
 
     (println "\n── Reference: JAX CPU (same machine) ──")
     (println "  MLP f64:   86 µs/step")
