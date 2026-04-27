@@ -320,9 +320,14 @@
 
 (defn- gen-train-step-body
   "Synthesize the train-step body S-expression. The body computes the loss
-  via (value+grad #'loss-flat-var), then for each Param leaf clips the grad
-  and applies an Adam step in-place on the corresponding (:path w) array."
-  [loss-flat-var loss-args weights-arg leaves loss-treedef]
+  via (value+grad #'loss-flat-var), clips each Param leaf's gradient, then
+  applies the per-Param optimizer step in-place on (:path w).
+
+  optimizer ∈ {:adam :sgd}:
+    :adam — uses raster.dl.optim/adam-step! and references m, v, lr, beta1,
+            beta2, eps, adam-t in the surrounding scope.
+    :sgd  — uses raster.dl.optim/sgd-step! and references only lr."
+  [loss-flat-var loss-args weights-arg leaves _loss-treedef optimizer]
   (let [;; loss-args is the loss var's original arg list, e.g. '[w values ...]
         ;; weights-arg is the symbol of the tree-typed arg, usually 'w
         ;; The flat call to value+grad expects: tree leaves first (canonical
@@ -339,10 +344,9 @@
         d-syms (into {} (map (fn [[i l]]
                                [(:path l) (symbol (str "d__" i))])
                              param-leaf-pairs))
-        ;; Bind every effect to a non-underscore name (effect-clip-i, effect-adam-i)
-        ;; so compile-aot's DCE doesn't eliminate them. The existing
-        ;; compile-gsdm-train-fn produces the same shape — side effects
-        ;; surface as `effect_NNNNN` bindings in the compiled form.
+        ;; Bind every effect to a non-underscore name (effect-clip-i, effect-step-i)
+        ;; so compile-aot's DCE doesn't eliminate them. Side effects surface as
+        ;; `effect_NNNNN` bindings in the compiled form.
         grad-bindings
         (vec (mapcat (fn [[i l]]
                        [(d-syms (:path l)) `(clojure.core/nth ~'__vg-out ~(inc i))])
@@ -355,23 +359,35 @@
                           `(raster.dl.optim/clip-grad-norm!
                              ~d (raster.arrays/alength ~w-acc) ~'max-grad-norm)]))
                      param-leaf-pairs))
-        adam-bindings
-        (vec (mapcat (fn [[i l]]
-                       (let [d (d-syms (:path l))
-                             w-acc (access-expr weights-arg (:path l))
-                             m-acc (access-expr 'm (:path l))
-                             v-acc (access-expr 'v (:path l))]
-                         [(symbol (str "effect-adam-" i))
-                          `(raster.dl.optim/adam-step!
-                             ~w-acc ~d ~m-acc ~v-acc
-                             (raster.arrays/alength ~w-acc)
-                             ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t)]))
-                     param-leaf-pairs))]
+        opt-bindings
+        (case optimizer
+          :adam
+          (vec (mapcat (fn [[i l]]
+                         (let [d (d-syms (:path l))
+                               w-acc (access-expr weights-arg (:path l))
+                               m-acc (access-expr 'm (:path l))
+                               v-acc (access-expr 'v (:path l))]
+                           [(symbol (str "effect-step-" i))
+                            `(raster.dl.optim/adam-step!
+                               ~w-acc ~d ~m-acc ~v-acc
+                               (raster.arrays/alength ~w-acc)
+                               ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t)]))
+                       param-leaf-pairs))
+          :sgd
+          (vec (mapcat (fn [[i l]]
+                         (let [d (d-syms (:path l))
+                               w-acc (access-expr weights-arg (:path l))]
+                           [(symbol (str "effect-step-" i))
+                            `(raster.dl.optim/sgd-step!
+                               ~w-acc ~d (raster.arrays/alength ~w-acc) ~'lr)]))
+                       param-leaf-pairs))
+          (throw (ex-info "Unknown optimizer (expected :adam or :sgd)"
+                          {:optimizer optimizer})))]
     `(~'let [~'__vg-out ~vg-call
              ~'loss (clojure.core/nth ~'__vg-out 0)
              ~@grad-bindings]
         ~@(map second (partition 2 clip-bindings))
-        ~@(map second (partition 2 adam-bindings))
+        ~@(map second (partition 2 opt-bindings))
         ~'loss)))
 
 (defn- ensure-train-step-deps! []
@@ -382,53 +398,76 @@
 (defn compile-train-step
   "Build a fused training-step compiled function from a defmodel loss var.
 
-  Returns {:train-fn   compiled IFn taking (weights, m, v, ...data..., max-grad-norm, lr, beta1, beta2, eps, adam-t)
-           :init-state (fn [weights] -> {:m <m-tree> :v <v-tree>})
-           :var        the underlying defmodel var (for inspection)}.
+  Options:
+    :optimizer  — :adam (default) or :sgd
+
+  Adam returns:
+    {:train-fn   IFn (weights, m, v, ...data..., max-grad-norm, lr, beta1, beta2, eps, adam-t)
+     :init-state (fn [weights] -> {:m <m-tree> :v <v-tree>})
+     :var        underlying defmodel var
+     :spec       weights tree spec}
+
+  SGD returns:
+    {:train-fn   IFn (weights, ...data..., max-grad-norm, lr)
+     :init-state (fn [_] nil)        ;; SGD has no per-Param state
+     :var        underlying defmodel var
+     :spec       weights tree spec}
 
   The synthesized body is evaluated as a defmodel inside raster.params, so the
   pre-flatten pass converts all (:k w) / (:k m) / (:k v) accesses to flat args
-  and compile-aot fuses value+grad with the per-leaf Adam updates."
-  [loss-var]
-  (ensure-train-step-deps!)
-  (let [m-meta        (meta loss-var)
-        treedefs      (or (::treedefs m-meta)
-                          (throw (ex-info "Not a defmodel var" {:var loss-var})))
-        original-args (::original-args m-meta)
-        arg-anns      (::arg-annotations m-meta)
-        flat-var      (::flat-var m-meta)
-        ;; Assume the FIRST tree arg is the weights — common case.
-        [w-arg w-td]  (first treedefs)
-        spec          (:spec w-td)
-        leaves        (:leaves w-td)
-        m-spec        (strip-leaf-wrappers spec)
-        ;; Build the train-step's arg vector: [w m v ...non-tree-args... +hyperparams]
-        non-tree    (vec (keep (fn [[a ann]] (when (not (pf/tree-arg? ann)) [a ann]))
-                                 (map vector original-args arg-anns)))
-        train-name    (symbol (str (.sym loss-var) "--train-step"))
-        body          (gen-train-step-body flat-var original-args w-arg leaves w-td)
-        param-vec     (vec (concat
-                             [w-arg :- spec]
-                             ['m :- m-spec]
-                             ['v :- m-spec]
-                             (mapcat (fn [[a ann]] [a :- ann]) non-tree)
-                             ['max-grad-norm :- 'Double
-                              'lr            :- 'Double
-                              'beta1         :- 'Double
-                              'beta2         :- 'Double
-                              'eps           :- 'Double
-                              'adam-t        :- 'Long]))
-        form          `(raster.params/defmodel ~train-name ~param-vec :- ~'Double
-                         ~body)
-        target-ns     (.ns ^clojure.lang.Var loss-var)
-        train-var     (binding [*ns* target-ns]
-                        (eval form)
-                        (find-var (symbol (str (.name target-ns)) (str train-name))))
-        train-fn      (compile-aot train-var)]
-    {:train-fn   train-fn
-     :init-state (fn [weights] (init-adam-state spec weights))
-     :var        train-var
-     :spec       spec}))
+  and compile-aot fuses value+grad with the per-leaf optimizer updates."
+  ([loss-var] (compile-train-step loss-var {}))
+  ([loss-var {:keys [optimizer] :or {optimizer :adam}}]
+   (ensure-train-step-deps!)
+   (when-not (#{:adam :sgd} optimizer)
+     (throw (ex-info "Unknown optimizer (expected :adam or :sgd)"
+                     {:optimizer optimizer})))
+   (let [m-meta        (meta loss-var)
+         treedefs      (or (::treedefs m-meta)
+                           (throw (ex-info "Not a defmodel var" {:var loss-var})))
+         original-args (::original-args m-meta)
+         arg-anns      (::arg-annotations m-meta)
+         flat-var      (::flat-var m-meta)
+         ;; Assume the FIRST tree arg is the weights — common case.
+         [w-arg w-td]  (first treedefs)
+         spec          (:spec w-td)
+         leaves        (:leaves w-td)
+         m-spec        (strip-leaf-wrappers spec)
+         ;; Build the train-step's arg vector: [w (m v)? ...non-tree-args... +hyperparams]
+         non-tree      (vec (keep (fn [[a ann]] (when (not (pf/tree-arg? ann)) [a ann]))
+                                  (map vector original-args arg-anns)))
+         ;; Optimizer in the name disambiguates overloads when the same loss
+         ;; var is compiled under both :adam and :sgd (compile-aot otherwise
+         ;; sees two same-name dispatch entries with different arities).
+         train-name    (symbol (str (.sym loss-var) "--train-step-" (name optimizer)))
+         body          (gen-train-step-body flat-var original-args w-arg leaves w-td optimizer)
+         param-vec     (vec (concat
+                              [w-arg :- spec]
+                              (when (= optimizer :adam)
+                                ['m :- m-spec
+                                 'v :- m-spec])
+                              (mapcat (fn [[a ann]] [a :- ann]) non-tree)
+                              ['max-grad-norm :- 'Double
+                               'lr            :- 'Double]
+                              (when (= optimizer :adam)
+                                ['beta1  :- 'Double
+                                 'beta2  :- 'Double
+                                 'eps    :- 'Double
+                                 'adam-t :- 'Long])))
+         form          `(raster.params/defmodel ~train-name ~param-vec :- ~'Double
+                          ~body)
+         target-ns     (.ns ^clojure.lang.Var loss-var)
+         train-var     (binding [*ns* target-ns]
+                         (eval form)
+                         (find-var (symbol (str (.name target-ns)) (str train-name))))
+         train-fn      (compile-aot train-var)]
+     {:train-fn   train-fn
+      :init-state (case optimizer
+                    :adam (fn [weights] (init-adam-state spec weights))
+                    :sgd  (fn [_] nil))
+      :var        train-var
+      :spec       spec
+      :optimizer  optimizer})))
 
 (defn model-treedef
   "Look up the treedef for a defmodel var's first tree arg.
