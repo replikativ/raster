@@ -80,16 +80,20 @@
   seq, transient loop, spec walk, and apply that the older runtime adapter
   performed.
 
-  Validates that no two leaves of the same tree share JVM identity (naked
-  weight tying) — throws a clear error if they do."
+  Validates that:
+    - the runtime tree shape matches the spec (HVec lengths, HMap keys);
+    - no two leaves of the same tree share JVM identity (naked weight tying)."
   [inner-fn original-args treedefs]
   (let [user-syms (mapv (fn [arg] (gensym (str (name arg) "_"))) original-args)
         validations
         (vec (for [[arg sym] (map vector original-args user-syms)
                    :when (get treedefs arg)]
                (let [td (get treedefs arg)]
-                 `(raster.compiler.core.params-flatten/assert-no-identity-collisions!
-                    '~(:spec td) ~sym))))
+                 `(do
+                    (raster.compiler.core.params-flatten/assert-tree-shape!
+                      '~(:spec td) ~sym)
+                    (raster.compiler.core.params-flatten/assert-no-identity-collisions!
+                      '~(:spec td) ~sym)))))
         flat-args (vec (mapcat (fn [arg sym]
                                  (if-let [td (get treedefs arg)]
                                    (mapv (fn [{:keys [path]}]

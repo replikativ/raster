@@ -886,6 +886,73 @@
                       "(not yet implemented).")
                  {:path-a a :path-b b}))))))
 
+(defn assert-tree-shape!
+  "Walk a runtime tree value matching spec; throw if the runtime shape doesn't
+  match the spec — wrong HVec length, missing HMap keys, or extra HMap keys.
+
+  Without this check, the wrapper silently extracts only the leaves the spec
+  declares and ignores or fails on extras, so a wrong-shape tree at runtime
+  produces wrong values (extras dropped) or cryptic IndexOutOfBoundsException
+  (missing leaves) deep inside the compiled kernel.
+
+  Primitives are exempt — JVM identity is not meaningful and they don't
+  carry shape."
+  [spec value]
+  (letfn [(walk [s v path]
+            (cond
+              (hmap-spec? s)
+              (let [keys-spec (set (keys (hmap-mandatory s)))
+                    keys-val  (when (map? v) (set (keys v)))
+                    missing   (clojure.set/difference keys-spec (or keys-val #{}))
+                    extra     (clojure.set/difference (or keys-val #{}) keys-spec)]
+                (when-not (map? v)
+                  (throw (ex-info
+                           (str "Tree shape mismatch at " (pr-str path)
+                                ": spec declares an HMap but runtime value is "
+                                (pr-str (class v)))
+                           {:path path :spec s :value v :expected :map})))
+                (when (seq missing)
+                  (throw (ex-info
+                           (str "Tree shape mismatch at " (pr-str path)
+                                ": missing HMap keys " (pr-str missing))
+                           {:path path :spec s :missing-keys missing})))
+                (when (seq extra)
+                  (throw (ex-info
+                           (str "Tree shape mismatch at " (pr-str path)
+                                ": runtime tree has extra HMap keys "
+                                (pr-str extra) " not declared in the spec. "
+                                "If you want these to flow through, declare "
+                                "them in the model spec.")
+                           {:path path :spec s :extra-keys extra})))
+                (doseq [[k sub-spec] (hmap-mandatory s)]
+                  (walk sub-spec (get v k) (conj path k))))
+
+              (hvec-spec? s)
+              (let [elems (hvec-elems s)
+                    spec-n (count elems)
+                    val-n  (when (sequential? v) (count v))]
+                (when-not (sequential? v)
+                  (throw (ex-info
+                           (str "Tree shape mismatch at " (pr-str path)
+                                ": spec declares an HVec but runtime value is "
+                                (pr-str (class v)))
+                           {:path path :spec s :value v :expected :sequential})))
+                (when (not= spec-n val-n)
+                  (throw (ex-info
+                           (str "Tree shape mismatch at " (pr-str path)
+                                ": spec declares HVec of length " spec-n
+                                " but runtime value has length " val-n ". "
+                                "Variable-length HVec is not supported — the "
+                                "compiled kernel is monomorphic in shape.")
+                           {:path path :spec s
+                            :expected-length spec-n :actual-length val-n})))
+                (doseq [[i sub-spec] (map-indexed vector elems)]
+                  (walk sub-spec (nth v i) (conj path i))))
+
+              ;; leaf: nothing to check structurally
+              :else nil))]
+    (walk spec value [])))
+
 (defn unflatten-value
   "Given spec and a flat vector of leaves in canonical order, reconstruct the
   tree value. Inverse of flatten-value."

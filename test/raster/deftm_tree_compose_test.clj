@@ -98,3 +98,47 @@
           eager-result    (two-block-net tree x d)]
       (is (= (vec compiled-result) (vec eager-result))
           "compile-aot output should match eager structured-call output"))))
+
+;; --------------------------------------------------------------------------
+;; Shape-mismatch validation (regression for silent-extra-leaf bug)
+;; --------------------------------------------------------------------------
+(deftest wrapper-rejects-extra-hvec-elements
+  (testing "passing a 3-layer tree to a 2-layer-spec model errors clearly"
+    (let [d 4
+          x  (double-array [1.0 2.0 3.0 4.0])
+          extra-tree {:layers [{:W (double-array [0.5 0.5 0.5 0.5])
+                                :b (double-array [0.1 0.2 0.3 0.4])}
+                               {:W (double-array [2.0 2.0 2.0 2.0])
+                                :b (double-array [0.0 0.0 0.0 0.0])}
+                               ;; spec has 2 layers; this third one is extra
+                               {:W (double-array [3.0 3.0 3.0 3.0])
+                                :b (double-array [0.0 0.0 0.0 0.0])}]}]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"Tree shape mismatch.*HVec of length 2 but runtime value has length 3"
+                            (two-block-net extra-tree x d))))))
+
+(deftest wrapper-rejects-extra-hmap-keys
+  (testing "passing a tree with extra HMap keys errors clearly"
+    (let [d 4
+          x  (double-array [1.0 2.0 3.0 4.0])
+          extra-key-tree {:layers [{:W (double-array [0.5 0.5 0.5 0.5])
+                                    :b (double-array [0.1 0.2 0.3 0.4])
+                                    :unexpected (double-array [9.0])}
+                                   {:W (double-array [2.0 2.0 2.0 2.0])
+                                    :b (double-array [0.0 0.0 0.0 0.0])}]}]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"extra HMap keys.*:unexpected"
+                            (two-block-net extra-key-tree x d))))))
+
+(deftest wrapper-rejects-missing-hmap-keys
+  (testing "passing a tree with missing HMap keys errors clearly"
+    (let [d 4
+          x  (double-array [1.0 2.0 3.0 4.0])
+          missing-key-tree {:layers [{:W (double-array [0.5 0.5 0.5 0.5])
+                                      ;; missing :b
+                                      }
+                                     {:W (double-array [2.0 2.0 2.0 2.0])
+                                      :b (double-array [0.0 0.0 0.0 0.0])}]}]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"missing HMap keys"
+                            (two-block-net missing-key-tree x d))))))
