@@ -4478,6 +4478,15 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
+        _ (when-let [dir (System/getProperty "raster.debug.dump-class-dir")]
+            (let [safe-name (clojure.string/replace class-name "." "_")
+                  path (str dir "/" safe-name ".class")]
+              (java.nio.file.Files/write
+                (java.nio.file.Paths/get path (into-array String []))
+                bytes
+                (into-array java.nio.file.OpenOption []))
+              (binding [*out* *err*]
+                (println "[dump-class]" class-name "->" path))))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class cls
