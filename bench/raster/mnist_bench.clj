@@ -224,13 +224,15 @@
         test-lbls-int (:test-lbls-int f64)]
     (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) t0) 1000.0)))
 
-    ;; MLP benchmarks
-    (run-mlp-bench :double (:train-imgs f64) (:train-lbls f64) test-imgs test-lbls-int)
-    (run-mlp-bench :float  (:train-imgs f32) (:train-lbls f32) test-imgs test-lbls-int)
-
-    ;; LeNet benchmarks
-    (run-lenet-bench :double (:train-imgs f64) (:train-lbls f64) test-imgs test-lbls-int)
-    (run-lenet-bench :float  (:train-imgs f32) (:train-lbls f32) test-imgs test-lbls-int)
+    ;; Wrap each kernel so one failure doesn't gate the rest of the suite.
+    (doseq [[label runner dtype train-imgs train-lbls]
+            [["MLP f64"   run-mlp-bench   :double (:train-imgs f64) (:train-lbls f64)]
+             ["MLP f32"   run-mlp-bench   :float  (:train-imgs f32) (:train-lbls f32)]
+             ["LeNet f64" run-lenet-bench :double (:train-imgs f64) (:train-lbls f64)]
+             ["LeNet f32" run-lenet-bench :float  (:train-imgs f32) (:train-lbls f32)]]]
+      (try (runner dtype train-imgs train-lbls test-imgs test-lbls-int)
+           (catch Throwable e
+             (println (format "\n[%s] FAILED: %s" label (.getMessage e))))))
 
     (println "\n── Reference: JAX CPU (same machine) ──")
     (println "  MLP f64:   86 µs/step")
