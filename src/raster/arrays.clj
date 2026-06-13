@@ -29,7 +29,10 @@
   (clojure.core/aget ^ints arr (int i)))
 (deftm aget [arr :- (Array float), i :- Long] :- Float
   (clojure.core/aget ^floats arr (int i)))
-;; Object[] fallback (also covers byte[], short[], char[], boolean[])
+;; byte[] — signed element; int8/uint8 callers interpret signedness
+(deftm aget [arr :- (Array byte), i :- Long] :- Byte
+  (clojure.core/aget ^bytes arr (int i)))
+;; Object[] fallback (also covers short[], char[], boolean[])
 (deftm aget [arr :- Object, i :- Long]
   (clojure.core/aget ^objects arr (int i)))
 
@@ -51,6 +54,11 @@
 ;; Narrowing: double → float (Julia-style automatic conversion)
 (deftm aset [arr :- (Array float), i :- Long, v :- Double]
   (clojure.core/aset ^floats arr (int i) (float v)))
+;; byte[] — store from Byte or (commonly) a computed Long, truncated to byte
+(deftm aset [arr :- (Array byte), i :- Long, v :- Byte]
+  (clojure.core/aset ^bytes arr (int i) (byte v)))
+(deftm aset [arr :- (Array byte), i :- Long, v :- Long]
+  (clojure.core/aset ^bytes arr (int i) (byte v)))
 ;; Object[] fallback — call RT.aset directly because clojure.core/aset
 ;; with ^objects emits AASTORE (void) causing stack underflow in deftype methods
 (deftm aset [arr :- Object, i :- Long, v :- Object]
@@ -71,6 +79,8 @@
   (long (clojure.core/alength ^ints arr)))
 (deftm alength [arr :- (Array float)] :- Long
   (long (clojure.core/alength ^floats arr)))
+(deftm alength [arr :- (Array byte)] :- Long
+  (long (clojure.core/alength ^bytes arr)))
 ;; Object[] fallback
 (deftm alength [arr :- Object] :- Long
   (long (clojure.core/alength ^objects arr)))

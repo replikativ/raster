@@ -147,13 +147,45 @@
         (recur (inc i) u2))
       upd)))
 
+;; Cache-blocked / race-free local join: each point pulls candidates from its
+;; neighbors-of-neighbors and updates ONLY ITS OWN heap. When run per block, a
+;; thread writes only its block's heaps (owned, contiguous -> cache-local, no
+;; write races); neighbor-list reads of other blocks are benign stale reads
+;; (Hogwild-tolerant). This is the parallelizable form of EVoC's block-owned apply.
+(deftm local-join-owned!
+  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   bstart :- Long bend :- Long dim :- Long k :- Long] :- Long
+  (loop [p bstart upd 0]
+    (if (< p bend)
+      (let [pb (* p k)
+            u2 (loop [j 0 u upd]
+                 (if (< j k)
+                   (let [a (long (aget ind (+ pb j)))]
+                     (if (< a 0)
+                       (recur (inc j) u)
+                       (let [ab (* a k)
+                             u3 (loop [l 0 uu u]
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ ab l)))]
+                                      (if (or (< b 0) (== b p))
+                                        (recur (inc l) uu)
+                                        (let [dd (cos-dist data p b dim)
+                                              r (flagged-heap-push! dist ind flags pb k dd b 1)]
+                                          (recur (inc l) (+ uu r)))))
+                                    uu))]
+                         (recur (inc j) u3))))
+                   u))]
+        (recur (inc p) u2))
+      upd)))
+
 (defn parallel-local-join!
-  "CPU-multicore local-join via futures over point-blocks (Hogwild)."
+  "CPU-multicore local-join via futures over point-blocks. Race-free writes
+   (each thread owns its block's heaps); cache-local."
   [data dist ind flags n dim k n-threads]
   (let [n (long n) n-threads (long n-threads)
         bs (long (Math/ceil (/ (double n) n-threads)))]
     (->> (range n-threads)
-         (mapv (fn [t] (future (local-join-block! data dist ind flags
+         (mapv (fn [t] (future (local-join-owned! data dist ind flags
                                                   (long (* t bs)) (long (min n (* (inc (long t)) bs)))
                                                   (long dim) (long k)))))
          (mapv deref)
@@ -213,9 +245,8 @@
     ;; refine
     (loop [it 0]
       (when (clojure.core/< it n-iters)
-        (let [upd (if (clojure.core/> n-threads 1)
-                    (parallel-local-join! X dist ind flags n dim k n-threads)
-                    (local-join! X dist ind flags n dim k))]
+        ;; owned/cache-local local-join (n-threads=1 => single block, serial)
+        (let [upd (parallel-local-join! X dist ind flags n dim k n-threads)]
           (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
             (recur (clojure.core/inc it))))))
     (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
