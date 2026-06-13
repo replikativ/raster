@@ -253,18 +253,31 @@
       (finalize! dist ind n k out-idx out-dst)
       {:idx out-idx :dst out-dst})))
 
+;; nn-descent stores -cos (on L2-normalized rows). Convert to -log2(cos) so the
+;; approximate path matches the brute path and feeds UMAP's fuzzy-set a proper
+;; [0,∞) distance (self=0). cos = -stored; order is preserved (monotone in cos).
+(deftm neg-cos->log2! [d :- (Array double) m :- Long] :- (Array double)
+  (dotimes [i m]
+    (let [cos (- 0.0 (aget d i))]
+      (aset d i (if (> cos 0.0) (- 0.0 (rm/log2 cos)) 1.0e308))))
+  d)
+
 (defn cosine-knn
   "Cosine kNN that auto-selects exact brute-force (small n) vs approximate
    NN-descent (large n). Returns {:idx :dst} (dst = -log2 cos, self first),
    matching knn_graph's float path. X is L2-normalized in place either way."
   [^doubles X n dim k & {:keys [threshold] :or {threshold 4096}}]
   (let [n (long n) dim (long dim) k (long k)]
+    ;; cos-dist (and knn-brute-cosine!) both assume L2-normalized rows, so
+    ;; normalize once up front — covers BOTH paths (norms vary in real data).
+    (knn/l2-normalize! X n dim)
     (if (clojure.core/< n threshold)
-      (let [_ (knn/l2-normalize! X n dim)
-            oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
+      (let [oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
         (knn/knn-brute-cosine! X n dim k oi od)
         {:idx oi :dst od})
-      (nn-descent X n dim k))))
+      (let [r (nn-descent X n dim k)]
+        (neg-cos->log2! (:dst r) (clojure.core/* n k))
+        r))))
 
 ;; ====================================================================
 ;; int8 / uint8 NN-descent — quantized large-data path (EVoC dtype paths).

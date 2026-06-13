@@ -19,7 +19,9 @@
          :exec-fn cognitect.test-runner.api/test}
   :dev {:extra-paths ["test" "dev" "notebooks" "examples"]
         :extra-deps {org.scicloj/kindly {:mvn/version "4-beta23"}
-                     org.scicloj/clay {:mvn/version "2.0.13"}}
+                     org.scicloj/clay {:mvn/version "2.0.13"}
+                     org.scicloj/tableplot {:mvn/version "1-beta17"}
+                     scicloj/tablecloth {:mvn/version "8.021"}}
         :jvm-opts ["-Dclojure.server.repl={:port,5555,:accept,clojure.core.server/repl}"
                    "--enable-native-access=ALL-UNNAMED"
                    "--add-modules=jdk.incubator.vector"]}
@@ -27,7 +29,9 @@
          :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
                       criterium/criterium {:mvn/version "0.4.6"}
                       org.scicloj/kindly {:mvn/version "4-beta23"}
-                      org.scicloj/clay {:mvn/version "2.0.13"}}
+                      org.scicloj/clay {:mvn/version "2.0.13"}
+                      org.scicloj/tableplot {:mvn/version "1-beta17"}
+                      scicloj/tablecloth {:mvn/version "8.021"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"]
          :main-opts ["-m" "nrepl.cmdline" "--port" "7899"]}
@@ -35,7 +39,9 @@
           :extra-deps {nrepl/nrepl {:mvn/version "1.3.0"}
                        cider/cider-nrepl {:mvn/version "0.50.2"}
                        org.scicloj/kindly {:mvn/version "4-beta23"}
-                       org.scicloj/clay {:mvn/version "2.0.13"}}
+                       org.scicloj/clay {:mvn/version "2.0.13"}
+                       org.scicloj/tableplot {:mvn/version "1-beta17"}
+                       scicloj/tablecloth {:mvn/version "8.021"}}
           :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                      "--add-modules=jdk.incubator.vector"]
           :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
