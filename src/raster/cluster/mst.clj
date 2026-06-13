@@ -129,6 +129,20 @@
     (gather-edges! from to w ord m sf st sd)
     {:from sf :to st :w sd}))
 
+;; Size-thresholded MST: dense O(n²) Prim wins below ~5k (tight loop, low
+;; constants); KD-tree Boruvka O(n log n) wins above. Picks the faster path so
+;; clustering is optimal across scales. (boruvka required lazily to avoid a cycle.)
+(def ^:const boruvka-threshold 5000)
+(declare mutual-reachability-mst)
+
+(defn mst
+  "Mutual-reachability MST, auto-selecting dense Prim (small n) vs KD-tree
+   Boruvka (large n). Returns {:from :to :w :core}."
+  [^doubles emb n dim min-samples]
+  (if (clojure.core/< (long n) boruvka-threshold)
+    (mutual-reachability-mst emb n dim min-samples)
+    ((requiring-resolve 'raster.cluster.boruvka/boruvka-mst) emb n dim min-samples)))
+
 ;; Thin orchestrator: kNN -> core distances -> dense Prim MST.
 ;; Returns {:from int[] :to int[] :w double[]} (n-1 edges, weights in rdist units).
 (defn mutual-reachability-mst
