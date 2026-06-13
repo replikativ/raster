@@ -79,3 +79,45 @@
                               (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
                     (double (* n k)))]
       (is (> recall 0.9) (str "recall " recall " should exceed 0.9")))))
+
+(defn- byte-blobs
+  "n quantized byte points in `dim` dims, drawn from `nc` Gaussian blobs.
+  Each cluster center is a random byte vector; points jitter around it."
+  [n dim nc seed]
+  (let [r (java.util.Random. seed)
+        centers (vec (for [_ (range nc)]
+                       (let [c (byte-array dim)]
+                         (dotimes [d dim] (aset c d (byte (- (.nextInt r 256) 128)))) c)))
+        X (byte-array (* n dim))]
+    (dotimes [i n]
+      (let [^bytes c (nth centers (mod i nc))]
+        (dotimes [d dim]
+          (let [v (+ (aget c d) (* 8 (.nextGaussian r)))]
+            (aset X (+ (* i dim) d)
+                  (byte (max -128 (min 127 (Math/round v)))))))))
+    X))
+
+(deftest nndescent-bytes-recall-vs-brute
+  (testing "Quantized byte NN-descent (int8 + uint8) achieves high recall vs brute-force"
+    (let [n 300 dim 32 k 12
+          ;; pure-Clojure brute (calls byte-dist from Clojure — no deftm inlining)
+          brute (fn [^bytes data mode]
+                  (let [oi (int-array (* n k))]
+                    (dotimes [i n]
+                      (let [ds (sort-by second
+                                 (map (fn [j] [j (raster.spatial.nndescent/byte-dist data i j dim mode)])
+                                      (range n)))]
+                        (dotimes [t k] (aset oi (+ (* i k) t) (int (first (nth ds t)))))))
+                    oi))
+          rec (fn [ni bi]
+                (/ (reduce + (for [i (range n)]
+                     (count (clojure.set/intersection
+                              (set (for [t (range k)] (aget ni (+ (* i k) t))))
+                              (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
+                   (double (* n k))))]
+      (doseq [mode [0 1]]                       ;; 0 = int8 (signed inner), 1 = uint8 (bit-Jaccard)
+        (let [X (byte-blobs n dim 6 (+ 2 mode))
+              bi (brute X mode)
+              ni (:idx (raster.spatial.nndescent/nn-descent-bytes X n dim k mode))
+              r (rec ni bi)]
+          (is (> r 0.85) (str "mode " mode " recall " r " should exceed 0.85")))))))

@@ -11,10 +11,10 @@
   rows (distance = -dot = fast_cosine), matching knn_graph's float path.
 
   All numeric work deftm; reuses rptree + tau-rand-int! + raster.math/log2."
-  (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == mod])
+  (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == mod bit-and bit-or])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
-            [raster.numeric :refer [+ - * / < > <= >= == mod]]
+            [raster.numeric :refer [+ - * / < > <= >= == mod bit-and bit-or]]
             [raster.math :as rm]
             [raster.umap :as u]
             [raster.umap.knn :as knn]
@@ -265,3 +265,108 @@
         (knn/knn-brute-cosine! X n dim k oi od)
         {:idx oi :dst od})
       (nn-descent X n dim k))))
+
+;; ====================================================================
+;; int8 / uint8 NN-descent — quantized large-data path (EVoC dtype paths).
+;; int8 and uint8 are both byte[] in the JVM (can't dispatch by type), so one
+;; byte NN-descent selects the distance via `mode`: 0 = int8 (signed quantized
+;; inner product, -Σx·y), 1 = uint8 (bit-Jaccard, -popcount(x&y)/popcount(x|y)).
+;; Reuses the flagged-heap; random init + owned local-join (RP-trees are float-
+;; specific in EVoC; random init + descent converges for the quantized paths).
+;; ====================================================================
+
+(deftm byte-dist [data :- (Array byte) a :- Long b :- Long dim :- Long mode :- Long] :- Double
+  (let [ab (* a dim) bb (* b dim)]
+    (if (== mode 0)
+      ;; int8: negative signed inner product
+      (loop [i 0 s 0]
+        (if (< i dim)
+          (recur (inc i) (+ s (* (long (aget data (+ ab i))) (long (aget data (+ bb i))))))
+          (- 0.0 (double s))))
+      ;; uint8: negative bit-Jaccard (popcount over unsigned bytes)
+      (loop [i 0 r 0 dn 0]
+        (if (< i dim)
+          (let [x (bit-and (long (aget data (+ ab i))) 255)
+                y (bit-and (long (aget data (+ bb i))) 255)]
+            (recur (inc i)
+                   (+ r (Long/bitCount (bit-and x y)))
+                   (+ dn (Long/bitCount (bit-or x y)))))
+          (if (> dn 0) (- 0.0 (/ (double r) (double dn))) 0.0))))))
+
+(deftm init-random-bytes!
+  [data :- (Array byte) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   rng-state :- (Array long) n :- Long dim :- Long k :- Long mode :- Long] :- (Array double)
+  (dotimes [i n]
+    (flagged-heap-push! dist ind flags (* i k) k (byte-dist data i i dim mode) i 1)
+    (dotimes [t k]
+      (let [j (mod (u/tau-rand-int! rng-state 0) n)]
+        (when (not (== j i))
+          (flagged-heap-push! dist ind flags (* i k) k (byte-dist data i j dim mode) j 1)))))
+  dist)
+
+(deftm local-join-bytes!
+  [data :- (Array byte) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   n :- Long dim :- Long k :- Long mode :- Long] :- Long
+  (loop [p 0 upd 0]
+    (if (< p n)
+      (let [pb (* p k)
+            u2 (loop [j 0 u upd]
+                 (if (< j k)
+                   (let [a (long (aget ind (+ pb j)))]
+                     (if (< a 0)
+                       (recur (inc j) u)
+                       (let [ab (* a k)
+                             u3 (loop [l 0 uu u]
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ ab l)))]
+                                      (if (or (< b 0) (== b p))
+                                        (recur (inc l) uu)
+                                        (let [dd (byte-dist data p b dim mode)
+                                              r (flagged-heap-push! dist ind flags pb k dd b 1)]
+                                          (recur (inc l) (+ uu r)))))
+                                    uu))]
+                         (recur (inc j) u3))))
+                   u))]
+        (recur (inc p) u2))
+      upd)))
+
+;; sort each point's k entries ascending by stored distance; emit idx + dist.
+(deftm finalize-bytes!
+  [dist :- (Array double) ind :- (Array int) n :- Long k :- Long
+   out-idx :- (Array int) out-dst :- (Array double)] :- (Array int)
+  (dotimes [i n]
+    (let [ib (* i k)]
+      (loop [a 1]
+        (when (< a k)
+          (let [dv (aget dist (+ ib a)) iv (aget ind (+ ib a))]
+            (loop [b (- a 1)]
+              (if (and (>= b 0) (> (aget dist (+ ib b)) dv))
+                (do (aset dist (+ ib (+ b 1)) (aget dist (+ ib b)))
+                    (aset ind (+ ib (+ b 1)) (aget ind (+ ib b)))
+                    (recur (- b 1)))
+                (do (aset dist (+ ib (+ b 1)) dv) (aset ind (+ ib (+ b 1)) (int iv))))))
+          (recur (inc a))))
+      (dotimes [t k]
+        (aset out-idx (+ ib t) (aget ind (+ ib t)))
+        (aset out-dst (+ ib t) (aget dist (+ ib t))))))
+  out-idx)
+
+(defn nn-descent-bytes
+  "Approximate kNN of quantized byte data (n*dim). mode 0=int8 (signed inner
+   product), 1=uint8 (bit-Jaccard). Random init + owned local-join descent.
+   Returns {:idx :dst} (dst = the stored metric, smaller=nearer, self first)."
+  [^bytes X n dim k mode & {:keys [n-iters seed] :or {n-iters 15 seed 42}}]
+  (let [n (long n) dim (long dim) k (long k) mode (long mode)
+        dist (double-array (clojure.core/* n k)) ind (int-array (clojure.core/* n k))
+        flags (int-array (clojure.core/* n k))
+        _ (java.util.Arrays/fill dist Double/MAX_VALUE) _ (java.util.Arrays/fill ind (int -1))
+        rng (long-array [(long seed) (long (clojure.core/+ seed 7919)) (long (clojure.core/+ seed 104729))])]
+    (init-random-bytes! X dist ind flags rng n dim k mode)
+    (loop [it 0]
+      (when (clojure.core/< it n-iters)
+        (let [upd (local-join-bytes! X dist ind flags n dim k mode)]
+          (when (clojure.core/> upd (quot (clojure.core/* n k) 50))
+            (recur (clojure.core/inc it))))))
+    (let [oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
+      (finalize-bytes! dist ind n k oi od)
+      {:idx oi :dst od})))
