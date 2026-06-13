@@ -3,7 +3,8 @@
             [raster.linalg.sparse :refer [->CSRMatrix ->COOMatrix
                                           csr-from-dense csr-to-dense
                                           spmv spmv-t spmm csr-scale csr-diag
-                                          csr-eye csr-transpose coo-to-csr]]))
+                                          csr-eye csr-transpose coo-to-csr
+                                          csr-add csr-hadamard]]))
 
 (def ^:const EPS 1e-6)
 
@@ -171,3 +172,53 @@
       (is (approx= 0.0 (aget dense 1)))
       (is (approx= 0.0 (aget dense 2)))
       (is (approx= 4.0 (aget dense 3))))))
+
+;; ================================================================
+;; csr-add  (alpha*A + beta*B, union of patterns)
+;; ================================================================
+
+(deftest csr-add-test
+  (let [A (csr-from-dense (double-array [1.0 0.0 2.0  0.0 3.0 0.0  4.0 0.0 0.0]) 3 3)
+        B (csr-from-dense (double-array [5.0 0.0 0.0  0.0 6.0 7.0  4.0 0.0 1.0]) 3 3)]
+    (testing "A + B"
+      (let [d (csr-to-dense (csr-add A 1.0 B 1.0))]
+        (is (= (vec d) (mapv double [6 0 2  0 9 7  8 0 1])))))
+    (testing "A - B (overlapping entries cancel, including an exact zero)"
+      (let [d (csr-to-dense (csr-add A 1.0 B -1.0))]
+        (is (= (vec d) (mapv double [-4 0 2  0 -3 -7  0 0 -1])))))
+    (testing "scaled combination 2A + 0.5B"
+      (let [d (csr-to-dense (csr-add A 2.0 B 0.5))]
+        (is (approx= (aget d 0) 4.5))    ; 2*1 + 0.5*5
+        (is (approx= (aget d 4) 9.0))    ; 2*3 + 0.5*6
+        (is (approx= (aget d 5) 3.5))))))  ; 0 + 0.5*7
+
+;; ================================================================
+;; csr-hadamard  (elementwise product, intersection of patterns)
+;; ================================================================
+
+(deftest csr-hadamard-test
+  (let [A (csr-from-dense (double-array [1.0 0.0 2.0  0.0 3.0 0.0  4.0 0.0 0.0]) 3 3)
+        B (csr-from-dense (double-array [5.0 0.0 0.0  0.0 6.0 7.0  4.0 0.0 1.0]) 3 3)]
+    (testing "A ∘ B keeps only shared nonzeros"
+      (let [d (csr-to-dense (csr-hadamard A B))]
+        (is (= (vec d) (mapv double [5 0 0  0 18 0  16 0 0])))))))
+
+;; ================================================================
+;; t-conorm symmetrization: W = A + Aᵀ - A∘Aᵀ is symmetric, entries in (0,1]
+;; ================================================================
+
+(deftest csr-tconorm-test
+  (testing "fuzzy-set union of an asymmetric membership matrix is symmetric"
+    (let [A (csr-from-dense (double-array [0.0 0.8 0.0  0.0 0.0 0.5  0.3 0.0 0.0]) 3 3)
+          AT (csr-transpose A)
+          prod (csr-hadamard A AT)
+          W (csr-add (csr-add A 1.0 AT 1.0) 1.0 prod -1.0)
+          d (csr-to-dense W)]
+      ;; symmetric
+      (is (approx= (aget d 1) (aget d 3)))
+      (is (approx= (aget d 5) (aget d 7)))
+      (is (approx= (aget d 2) (aget d 6)))
+      ;; (0,1): only A[0,1]=0.8 present (A[1,0]=0) -> 0.8
+      (is (approx= (aget d 1) 0.8))
+      ;; all present entries in (0,1]
+      (is (every? (fn [x] (and (>= x 0.0) (<= x 1.0))) (vec d))))))

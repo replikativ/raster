@@ -10,7 +10,8 @@
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == abs]]
-            [raster.math :as rm]))
+            [raster.math :as rm]
+            [raster.linalg.sparse :as sp]))
 
 ;; SMOOTH_K_TOLERANCE=1e-5, MIN_K_DIST_SCALE=1e-3, local_connectivity=1, bandwidth=1.
 ;; dst: euclidean knn distances double[n*k] (sorted asc, self at col 0).
@@ -78,33 +79,73 @@
           (aset vals (+ ib j) v)))))
   vals)
 
-;; --- symmetrization (graph bookkeeping; plain Clojure) ---
-;; Combine directed memberships into the symmetric fuzzy graph
-;;   W[i,j] = A[i,j] + A[j,i] - A[i,j]*A[j,i]
-;; Returns {:head int[] :tail int[] :weights double[]} over all nonzero (i,j).
+;; --- symmetrization via raster.linalg.sparse (reuse the CSR substrate) ---
+;; The directed memberships form a sparse matrix A (A[i, knn_idx[i,j]] = val);
+;; the symmetric fuzzy graph is the t-conorm W = A + Aᵀ - A∘Aᵀ, built from
+;; coo-to-csr + csr-transpose + csr-add + csr-hadamard. Same CSR type that
+;; spmv / spectral-Lanczos / EVoC's neighbor graph consume — no bespoke sparse code.
+
+;; Fill COO triplets from the knn membership layout, dropping self-edges and
+;; zero memberships (umap's eliminate_zeros). Output arrays are sized n*k (the
+;; max); returns the actual nnz written so coo-to-csr reads only the prefix.
+(deftm fill-membership-coo!
+  [idx :- (Array int) vals :- (Array double) n :- Long k :- Long
+   rowidx :- (Array int) colidx :- (Array int) values :- (Array double)] :- Long
+  (loop [i 0 w 0]
+    (if (< i n)
+      (recur (inc i)
+             (loop [j 0 w2 w]
+               (if (< j k)
+                 (let [p (+ (* i k) j)
+                       c (aget idx p)
+                       v (aget vals p)]
+                   (if (and (not (== (long c) -1)) (> v 0.0))
+                     (do (aset rowidx w2 (int i))
+                         (aset colidx w2 c)
+                         (aset values w2 v)
+                         (recur (inc j) (inc w2)))
+                     (recur (inc j) w2)))
+                 w2)))
+      w)))
+
+;; Expand a symmetric CSR's (rowptr,colidx,values) into directed edge arrays.
+(deftm graph->edges!
+  [rowptr :- (Array int) colidx :- (Array int) values :- (Array double) n :- Long
+   head :- (Array int) tail :- (Array int) ws :- (Array double)] :- (Array int)
+  (dotimes [i n]
+    (loop [p (long (aget rowptr i))]
+      (when (< p (long (aget rowptr (+ i 1))))
+        (aset head p (int i))
+        (aset tail p (aget colidx p))
+        (aset ws p (aget values p))
+        (recur (+ p 1)))))
+  head)
+
+(defn fuzzy-graph
+  "Symmetric fuzzy simplicial set as a CSRMatrix: W = A + Aᵀ - A∘Aᵀ, where
+  A[i, knn_idx[i,j]] = membership val. Thin glue around the deftm COO fill +
+  raster.linalg.sparse CSR ops."
+  [^ints idx ^doubles vals n k]
+  (let [n (long n) k (long k)
+        cap (clojure.core/* n k)
+        rowidx (int-array cap) colidx (int-array cap) values (double-array cap)
+        nnz (fill-membership-coo! idx vals n k rowidx colidx values)
+        coo (sp/->COOMatrix rowidx colidx values n n nnz)
+        a    (sp/coo-to-csr coo)
+        at   (sp/csr-transpose a)
+        prod (sp/csr-hadamard a at)
+        summ (sp/csr-add a 1.0 at 1.0)]
+    (sp/csr-add summ 1.0 prod -1.0)))
+
+(defn graph->edges
+  "Expand a symmetric CSRMatrix into directed edge arrays for the layout."
+  [W]
+  (let [nnz (long (.-nnz W))
+        head (int-array nnz) tail (int-array nnz) ws (double-array nnz)]
+    (graph->edges! (.-rowptr W) (.-colidx W) (.-values W) (long (.-nrows W)) head tail ws)
+    {:head head :tail tail :weights ws}))
+
 (defn symmetrize
-  [^ints idx ^doubles vals ^long n ^long k]
-  (let [a (java.util.HashMap.)]                       ; (i*n+j) -> A[i,j]
-    (dotimes [i n]
-      (dotimes [j k]
-        (let [c (clojure.core/aget idx (clojure.core/+ (clojure.core/* i k) j))
-              v (clojure.core/aget vals (clojure.core/+ (clojure.core/* i k) j))]
-          (when (clojure.core/and (clojure.core/not= c -1) (clojure.core/> v 0.0))
-            (.put a (clojure.core/+ (clojure.core/* (long i) n) (long c)) v)))))
-    (let [seen (java.util.HashSet.)
-          heads (java.util.ArrayList.) tails (java.util.ArrayList.) ws (java.util.ArrayList.)]
-      (doseq [e (.entrySet a)]
-        (let [key (long (.getKey e))
-              i (quot key n) j (rem key n)
-              kk (clojure.core/+ (clojure.core/* j n) i)]
-          (when (clojure.core/not (.contains seen key))
-            (.add seen key) (.add seen kk)
-            (let [aij (double (.getValue e))
-                  aji (double (or (.get a kk) 0.0))
-                  w (clojure.core/- (clojure.core/+ aij aji) (clojure.core/* aij aji))]
-              (when (clojure.core/> w 0.0)
-                ;; emit both directions (undirected edge -> 2 COO entries, as umap does)
-                (.add heads (int i)) (.add tails (int j)) (.add ws w)
-                (.add heads (int j)) (.add tails (int i)) (.add ws w))))))
-      {:head (int-array heads) :tail (int-array tails)
-       :weights (double-array ws)})))
+  "Convenience: fuzzy graph -> directed edge arrays {:head :tail :weights}."
+  [idx vals n k]
+  (graph->edges (fuzzy-graph idx vals n k)))
