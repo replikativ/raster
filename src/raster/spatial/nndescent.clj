@@ -1,0 +1,236 @@
+(ns raster.spatial.nndescent
+  "Approximate kNN via nearest-neighbor descent — ports EVoC's float NN-descent
+  (the large-n, high-dim graph-kNN path where KD-trees fail). RP-tree forest init
+  + random init seed a per-point max-heap kNN graph; iterative local join
+  (neighbor-of-neighbor) refines it; deheap-sort + -log2(cos) gives the result.
+
+  Faithful-in-result: same algorithm (RP-tree init + local join), validated by
+  recall vs brute-force (NN-descent is approximate; EVoC's own output is
+  non-deterministic). EVoC's blocking/working-set details are cache micro-opts
+  that don't change recall, so they're omitted. Cosine metric on L2-normalized
+  rows (distance = -dot = fast_cosine), matching knn_graph's float path.
+
+  All numeric work deftm; reuses rptree + tau-rand-int! + raster.math/log2."
+  (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == mod])
+  (:require [raster.core :refer [deftm]]
+            [raster.arrays :refer [aget aset alength]]
+            [raster.numeric :refer [+ - * / < > <= >= == mod]]
+            [raster.math :as rm]
+            [raster.umap :as u]
+            [raster.umap.knn :as knn]
+            [raster.spatial.rptree :as rp]))
+
+;; distance = -dot (fast_cosine on L2-normalized rows; smaller = nearer)
+(deftm cos-dist [data :- (Array double) a :- Long b :- Long dim :- Long] :- Double
+  (let [ab (* a dim) bb (* b dim)]
+    (loop [d 0 acc 0.0]
+      (if (< d dim)
+        (recur (inc d) (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))
+        (- 0.0 acc)))))
+
+;; Bounded max-heap push with dedup + "new" flag, on point's sub-array [base,base+k).
+;; Root = worst (max) distance. Returns 1 if inserted, 0 otherwise.
+(deftm flagged-heap-push!
+  [dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   base :- Long size :- Long p :- Double nn :- Long flag :- Long] :- Long
+  (if (>= p (aget dist base))
+    0
+    (let [dup (loop [t 0] (if (< t size)
+                            (if (== (aget ind (+ base t)) nn) 1 (recur (inc t)))
+                            0))]
+      (if (== dup 1)
+        0
+        (let [fin (loop [i 0]
+                    (let [ic1 (+ (* 2 i) 1) ic2 (+ ic1 1)]
+                      (if (>= ic1 size)
+                        i
+                        (let [isw (if (>= ic2 size)
+                                    (if (> (aget dist (+ base ic1)) p) ic1 -1)
+                                    (if (>= (aget dist (+ base ic1)) (aget dist (+ base ic2)))
+                                      (if (< p (aget dist (+ base ic1))) ic1 -1)
+                                      (if (< p (aget dist (+ base ic2))) ic2 -1)))]
+                          (if (== isw -1)
+                            i
+                            (do (aset dist (+ base i) (aget dist (+ base isw)))
+                                (aset ind (+ base i) (aget ind (+ base isw)))
+                                (aset flags (+ base i) (aget flags (+ base isw)))
+                                (recur isw)))))))]
+          (aset dist (+ base fin) p) (aset ind (+ base fin) (int nn)) (aset flags (+ base fin) (int flag))
+          1)))))
+
+;; seed: self (dist=-1 -> cos 1) + k random neighbors per point
+(deftm init-random!
+  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   rng-state :- (Array long) n :- Long dim :- Long k :- Long] :- (Array double)
+  (dotimes [i n]
+    (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i i dim) i 1)
+    (dotimes [t k]
+      (let [j (mod (u/tau-rand-int! rng-state 0) n)]
+        (when (not (== j i))
+          (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i j dim) j 1)))))
+  dist)
+
+;; seed from RP-tree leaves: all-pairs within each leaf
+(deftm init-leaves!
+  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   idx :- (Array int) leaf-start :- (Array int) leaf-end :- (Array int)
+   n-leaves :- Long dim :- Long k :- Long] :- (Array double)
+  (dotimes [lf n-leaves]
+    (let [s (long (aget leaf-start lf)) e (long (aget leaf-end lf))]
+      (loop [p s]
+        (when (< p e)
+          (loop [q (+ p 1)]
+            (when (< q e)
+              (let [a (long (aget idx p)) b (long (aget idx q))
+                    dd (cos-dist data a b dim)]
+                (flagged-heap-push! dist ind flags (* a k) k dd b 1)
+                (flagged-heap-push! dist ind flags (* b k) k dd a 1))
+              (recur (inc q))))
+          (recur (inc p))))))
+  dist)
+
+;; one refinement iteration: local join over each point's neighbor list (push
+;; both directions makes the graph symmetric -> reverse neighbors propagate).
+(deftm local-join!
+  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   n :- Long dim :- Long k :- Long] :- Long
+  (loop [i 0 upd 0]
+    (if (< i n)
+      (let [ib (* i k)
+            u2 (loop [j 0 u upd]
+                 (if (< j k)
+                   (let [a (long (aget ind (+ ib j)))]
+                     (if (< a 0)
+                       (recur (inc j) u)
+                       (let [u3 (loop [l (+ j 1) uu u]
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ ib l)))]
+                                      (if (< b 0)
+                                        (recur (inc l) uu)
+                                        (let [dd (cos-dist data a b dim)
+                                              r1 (flagged-heap-push! dist ind flags (* a k) k dd b 1)
+                                              r2 (flagged-heap-push! dist ind flags (* b k) k dd a 1)]
+                                          (recur (inc l) (+ (+ uu r1) r2)))))
+                                    uu))]
+                         (recur (inc j) u3))))
+                   u))]
+        (recur (inc i) u2))
+      upd)))
+
+;; local join over a block of points [bstart,bend) — for CPU-multicore via
+;; Clojure futures (raster par = SIMD/GPU, not CPU-thread; these irregular heap
+;; loops need thread-level parallelism). Concurrent heap pushes across blocks are
+;; Hogwild races, as EVoC's parallel mode accepts.
+(deftm local-join-block!
+  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+   bstart :- Long bend :- Long dim :- Long k :- Long] :- Long
+  (loop [i bstart upd 0]
+    (if (< i bend)
+      (let [ib (* i k)
+            u2 (loop [j 0 u upd]
+                 (if (< j k)
+                   (let [a (long (aget ind (+ ib j)))]
+                     (if (< a 0)
+                       (recur (inc j) u)
+                       (let [u3 (loop [l (+ j 1) uu u]
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ ib l)))]
+                                      (if (< b 0)
+                                        (recur (inc l) uu)
+                                        (let [dd (cos-dist data a b dim)
+                                              r1 (flagged-heap-push! dist ind flags (* a k) k dd b 1)
+                                              r2 (flagged-heap-push! dist ind flags (* b k) k dd a 1)]
+                                          (recur (inc l) (+ (+ uu r1) r2)))))
+                                    uu))]
+                         (recur (inc j) u3))))
+                   u))]
+        (recur (inc i) u2))
+      upd)))
+
+(defn parallel-local-join!
+  "CPU-multicore local-join via futures over point-blocks (Hogwild)."
+  [data dist ind flags n dim k n-threads]
+  (let [n (long n) n-threads (long n-threads)
+        bs (long (Math/ceil (/ (double n) n-threads)))]
+    (->> (range n-threads)
+         (mapv (fn [t] (future (local-join-block! data dist ind flags
+                                                  (long (* t bs)) (long (min n (* (inc (long t)) bs)))
+                                                  (long dim) (long k)))))
+         (mapv deref)
+         (reduce clojure.core/+))))
+
+;; sort each point's k entries ascending by distance; emit idx + -log2(cos).
+(deftm finalize!
+  [dist :- (Array double) ind :- (Array int) n :- Long k :- Long
+   out-idx :- (Array int) out-dst :- (Array double)] :- (Array int)
+  (dotimes [i n]
+    (let [ib (* i k)]
+      (loop [a 1]
+        (when (< a k)
+          (let [dv (aget dist (+ ib a)) iv (aget ind (+ ib a))]
+            (loop [b (- a 1)]
+              (if (and (>= b 0) (> (aget dist (+ ib b)) dv))
+                (do (aset dist (+ ib (+ b 1)) (aget dist (+ ib b)))
+                    (aset ind (+ ib (+ b 1)) (aget ind (+ ib b)))
+                    (recur (- b 1)))
+                (do (aset dist (+ ib (+ b 1)) dv) (aset ind (+ ib (+ b 1)) (int iv))))))
+          (recur (inc a))))
+      (dotimes [t k]
+        (aset out-idx (+ ib t) (aget ind (+ ib t)))
+        (let [cosv (- 0.0 (aget dist (+ ib t)))]
+          (aset out-dst (+ ib t) (if (> cosv 0.0) (- 0.0 (rm/log2 cosv)) 0.0))))))
+  out-idx)
+
+;; --- orchestrator ---
+(defn nn-descent
+  "Approximate cosine kNN of X (flat n*dim, will be L2-normalized in place).
+   n-trees RP-trees + random init, then n-iters local-join refinement.
+   Returns {:idx int[n*k] :dst double[n*k] (-log2 cos, self first)}."
+  [^doubles X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads]
+                         :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1}}]
+  (let [n (long n) dim (long dim) k (long k)
+        _ (knn/l2-normalize! X n dim)
+        dist (double-array (clojure.core/* n k))
+        ind (int-array (clojure.core/* n k))
+        flags (int-array (clojure.core/* n k))
+        _ (java.util.Arrays/fill dist Double/MAX_VALUE)
+        _ (java.util.Arrays/fill ind (int -1))
+        rng (long-array [(long seed) (long (clojure.core/+ seed 7919)) (long (clojure.core/+ seed 104729))])
+        ;; RP-tree forest init (parallel over trees when n-threads>1; each tree
+        ;; has its own idx/hp/stk + rng, init-leaves pushes to the shared heap Hogwild)
+        build-tree! (fn [tree-i]
+                      (let [idx (int-array n) hp (double-array dim)
+                            stk (int-array (clojure.core/* 4 n)) ls (int-array n) le (int-array n)
+                            rng-t (long-array [(long (clojure.core/+ seed (clojure.core/* tree-i 1000003)))
+                                               (long (clojure.core/+ seed (clojure.core/* tree-i 1000033) 7919))
+                                               (long (clojure.core/+ seed (clojure.core/* tree-i 1000037) 104729))])
+                            nl (rp/build-rptree-leaves! X n dim leaf-size idx rng-t hp stk ls le)]
+                        (init-leaves! X dist ind flags idx ls le (long nl) dim k)))]
+    (if (clojure.core/> n-threads 1)
+      (->> (range n-trees) (mapv (fn [ti] (future (build-tree! ti)))) (mapv deref))
+      (dotimes [ti n-trees] (build-tree! ti)))
+    (init-random! X dist ind flags rng n dim k)
+    ;; refine
+    (loop [it 0]
+      (when (clojure.core/< it n-iters)
+        (let [upd (if (clojure.core/> n-threads 1)
+                    (parallel-local-join! X dist ind flags n dim k n-threads)
+                    (local-join! X dist ind flags n dim k))]
+          (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
+            (recur (clojure.core/inc it))))))
+    (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
+      (finalize! dist ind n k out-idx out-dst)
+      {:idx out-idx :dst out-dst})))
+
+(defn cosine-knn
+  "Cosine kNN that auto-selects exact brute-force (small n) vs approximate
+   NN-descent (large n). Returns {:idx :dst} (dst = -log2 cos, self first),
+   matching knn_graph's float path. X is L2-normalized in place either way."
+  [^doubles X n dim k & {:keys [threshold] :or {threshold 4096}}]
+  (let [n (long n) dim (long dim) k (long k)]
+    (if (clojure.core/< n threshold)
+      (let [_ (knn/l2-normalize! X n dim)
+            oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
+        (knn/knn-brute-cosine! X n dim k oi od)
+        {:idx oi :dst od})
+      (nn-descent X n dim k))))

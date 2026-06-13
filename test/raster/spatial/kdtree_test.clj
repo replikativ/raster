@@ -3,6 +3,8 @@
   valid minimum spanning tree (total weight == dense Prim)."
   (:require [clojure.test :refer [deftest testing is]]
             [raster.spatial.kdtree :as kd]
+            [raster.spatial.rptree]
+            [raster.spatial.nndescent]
             [raster.umap.knn :as knn]
             [raster.cluster.mst :as mst]
             [raster.cluster.boruvka :as bor]))
@@ -39,3 +41,41 @@
           tot (fn [m] (reduce + 0.0 (map #(aget ^doubles (:w m) %) (range (alength ^doubles (:w m))))))]
       (is (= (clojure.core/dec n) (alength ^doubles (:w b))) "n-1 edges")
       (is (< (Math/abs (- (tot p) (tot b))) 1e-6) "same total weight as Prim"))))
+
+;; ================================================================
+;; RP-tree forest + NN-descent (approximate kNN)
+;; ================================================================
+
+(deftest rptree-leaves-cover-all-points
+  (testing "RP-tree leaf ranges partition every point exactly once"
+    (let [n 400 dim 5 leaf 30
+          X (let [r (java.util.Random. 1) a (double-array (* n dim))]
+              (dotimes [i (* n dim)] (aset a i (.nextGaussian r))) a)
+          idx (int-array n) hp (double-array dim) stk (int-array (* 4 n))
+          ls (int-array n) le (int-array n)
+          rng (long-array [1 2 3])
+          nl (raster.spatial.rptree/build-rptree-leaves! X n dim leaf idx rng hp stk ls le)
+          seen (boolean-array n)
+          total (reduce + (for [lf (range nl)]
+                            (do (doseq [p (range (aget ls lf) (aget le lf))]
+                                  (aset seen (aget idx p) true))
+                                (- (aget le lf) (aget ls lf)))))]
+      (is (= n total) "leaf ranges cover all n points")
+      (is (every? identity (seq seen)) "every point appears in a leaf"))))
+
+(deftest nndescent-recall-vs-brute
+  (testing "NN-descent achieves high recall vs exact brute-force cosine kNN"
+    (let [n 1500 dim 8 k 12
+          X (let [r (java.util.Random. 3) a (double-array (* n dim))]
+              (dotimes [i (* n dim)] (aset a i (.nextGaussian r))) a)
+          Xn (double-array (seq X))
+          _ (raster.umap.knn/l2-normalize! Xn n dim)
+          bi (int-array (* n k)) bd (double-array (* n k))
+          _ (raster.umap.knn/knn-brute-cosine! Xn n dim k bi bd)
+          ni (:idx (raster.spatial.nndescent/nn-descent (double-array (seq X)) n dim k))
+          recall (/ (reduce + (for [i (range n)]
+                     (count (clojure.set/intersection
+                              (set (for [t (range k)] (aget ni (+ (* i k) t))))
+                              (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
+                    (double (* n k)))]
+      (is (> recall 0.9) (str "recall " recall " should exceed 0.9")))))
