@@ -154,8 +154,43 @@
 (defonce soa-registry (atom {}))
 (defonce soa-reverse-registry (atom {}))
 
+(defn meta-type-annotation
+  "Read a metadata-form type annotation — `^{:- T}` or TypedClojure's
+  `^{:typed.clojure/type T}` — from the metadata of x. Used both for a param
+  symbol (param type) and for the whole arg vector (return type, mirroring
+  Clojure's own `^long [x]` return-hint convention). Returns the annotation
+  form (a symbol or list like (Array double)) or nil."
+  [x]
+  (let [m (meta x)]
+    (or (:- m) (:typed.clojure/type m))))
+
+(defn param-type-meta
+  "Extract a metadata-form type annotation from a param symbol:
+  `^{:- T} x` or TypedClojure's `^{:typed.clojure/type T} x`.
+  Returns the annotation form or nil. This is the Rich-Hickey-suggested
+  metadata syntax, an alternative to the inline `x :- T` token form."
+  [param]
+  (when (symbol? param)
+    (meta-type-annotation param)))
+
+(defn strip-type-meta
+  "Remove metadata-form type-annotation keys from a param symbol so they don't
+  leak into generated binding/hint forms downstream. Leaves :tag and any other
+  metadata intact."
+  [param]
+  (if (and (symbol? param) (meta param))
+    (vary-meta param dissoc :- :typed.clojure/type)
+    param))
+
 (defn parse-typed-params
-  "Parse a parameter vector with :- Type annotations.
+  "Parse a parameter vector with :- Type annotations. Two equivalent forms:
+
+     [x :- Long]          ;; inline token form
+     [^{:- Long} x]       ;; metadata form (also ^{:typed.clojure/type Long})
+
+   Inline takes precedence when both are present on the same param. The
+   metadata form's annotation flows through the identical annotation->tag
+   machinery, so (Array T), (Fn [...] R), (Param T), etc. all work there too.
    Returns {:params [names...] :annotations [type-or-nil...]}"
   [param-vec]
   (let [items (vec param-vec)]
@@ -168,11 +203,11 @@
           (if (and (< (+ idx 2) (count items))
                    (= :- (nth items (inc idx))))
             (recur (+ idx 3)
-                   (conj params item)
+                   (conj params (strip-type-meta item))
                    (conj anns (nth items (+ idx 2))))
             (recur (inc idx)
-                   (conj params item)
-                   (conj anns nil))))))))
+                   (conj params (strip-type-meta item))
+                   (conj anns (param-type-meta item)))))))))
 
 (declare annotation->fn-info)
 

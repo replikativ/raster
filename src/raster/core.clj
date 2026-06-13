@@ -212,9 +212,11 @@
   (let [{:keys [validate? fn-label tc-eager? defer-walk? simplify?]
          :or {validate? true tc-eager? false defer-walk? false simplify? *simplify?*}} opts
         ;; Parse return type and body from ret-args
+        ;; Return type: inline `:- Ret` after the arg vector, else metadata
+        ;; `^{:- Ret}` on the arg vector itself (mirrors Clojure's ^long [x]).
         [ret-type body] (if (= :- (first ret-args))
                           [(second ret-args) (nnext ret-args)]
-                          [nil ret-args])
+                          [(types/meta-type-annotation param-vec) ret-args])
         ;; Parse typed params
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         tags (types/extract-tags params annotations)
@@ -542,12 +544,24 @@
     (deftm foo [x :- Long] :- Long (* x x))
     (deftm foo [x :- String] (count x))
 
+  Annotations may equivalently be given as metadata (the Rich-Hickey /
+  TypedClojure style). A param type goes on the param symbol; the return
+  type goes on the arg vector, before it (mirroring Clojure's ^long [x]):
+
+    (deftm foo ^{:- Long} [x :- Long] (* x x))           ; return via metadata
+    (deftm foo [^{:- Long} x] :- Long (* x x))           ; param via metadata
+    (deftm foo [^{:typed.clojure/type Long} x] ...)       ; TC's fully-qualified key
+
+  Inline and metadata forms may be freely mixed; inline wins if both are
+  present on the same position. The metadata annotation flows through the
+  identical machinery, so (Array T), (Fn [..] R), (Param T) etc. all work.
+
   Type inference is automatic:
   - Record field types inferred via typedclojure (use :field keyword access)
   - Let bindings auto-hinted (no manual ^doubles needed)
   - Calls to other deftm functions devirtualized at compile time
 
-  Also supports legacy ^Tag metadata on parameters."
+  Also supports legacy ^Tag (:tag) metadata on parameters."
   {:arglists '([name [params...] :- RetType & body]
                [name docstring [params...] & body])}
   [fn-name & args]
@@ -588,7 +602,7 @@
               after-params (rest all-rest)
               [ret-type body] (if (= :- (first after-params))
                                 [(second after-params) (nnext after-params)]
-                                [nil after-params])
+                                [(types/meta-type-annotation param-vec) after-params])
               {:keys [params annotations]} (types/parse-typed-params param-vec)
             ;; Build annotation forms preserving type variables
               ann-forms (mapv (fn [ann] (or ann 'Object)) annotations)
