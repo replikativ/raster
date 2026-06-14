@@ -19,9 +19,11 @@
 (def ^:private get-walked-body @#'pipeline/get-walked-body)
 
 (defn- dispatch-counts
-  "Walk all walked-body forms of a deftm var and total {:devirtualized :dispatched}."
-  [v]
-  (let [wb (get-walked-body v nil)
+  "Walk all walked-body forms of a deftm var and total {:devirtualized :dispatched}.
+  Parametric kernels (All [T]) are instantiated per element type; pass an explicit
+  dtype to pick one overload (devirtualization is dtype-independent)."
+  [v dtype]
+  (let [wb (get-walked-body v dtype)
         forms (if (vector? wb) wb [wb])]
     (reduce (fn [acc f]
               (merge-with + acc (select-keys (inspect/analyze-devirtualization f)
@@ -33,12 +35,13 @@
   (testing "hot deftm kernels devirtualize 100% on the lazy-JIT walk path"
     ;; These must be exactly 0 — any runtime-dispatched numeric op in these tight
     ;; loops is a type-transport regression (e.g. TC not run in the source ns).
-    (doseq [v [#'umap/optimize-layout!
-               #'graph/smooth-knn-dist!     ; inline (if ...) result now typed
-               #'graph/membership-strengths!
-               #'nnd/cos-dist
-               #'nnd/local-join!]]
-      (let [{:keys [devirtualized dispatched]} (dispatch-counts v)]
+    ;; [var dtype] — dtype disambiguates parametric (All [T]) overloads.
+    (doseq [[v dtype] [[#'umap/optimize-layout! :double]  ; parametric over emb
+                       [#'graph/smooth-knn-dist! nil]     ; inline (if ...) result now typed
+                       [#'graph/membership-strengths! nil]
+                       [#'nnd/cos-dist :double]           ; parametric (f32+f64)
+                       [#'nnd/local-join! nil]]]
+      (let [{:keys [devirtualized dispatched]} (dispatch-counts v dtype)]
         (is (zero? dispatched)
             (str v " has " dispatched " undevirtualized dispatch op(s) ("
                  devirtualized " devirtualized) — type-transport regression on the "

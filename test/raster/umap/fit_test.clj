@@ -24,7 +24,7 @@
 
 (defn- nn-label-agreement
   "Fraction of points whose nearest 2D-embedding neighbor shares its label."
-  [^doubles emb ^ints y n]
+  [^floats emb ^ints y n]
   (/ (double
        (reduce + (for [i (range n)]
                    (let [xi (* 2 i)
@@ -46,6 +46,6 @@
           [X y] (blobs n dim nc 7)
           {:keys [emb] :as res} (fit/fit X n dim :k 15 :seed 42)
           agree (nn-label-agreement emb y n)]
-      (is (= (* n 2) (count emb)) "embedding is n*2 doubles")
+      (is (= (* n 2) (count emb)) "embedding is n*2 floats")
       (is (= :spectral (:init res)) "small n uses spectral init")
       (is (> agree 0.95) (str "2D NN-label agreement " agree " should exceed 0.95")))))

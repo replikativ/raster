@@ -68,13 +68,13 @@
 ;;   states  long[n_vertices*3] per-vertex RNG state (mutated)
 ;; ----------------------------------------------------------------------
 (deftm optimize-layout!
-  [emb :- (Array double) head :- (Array int) tail :- (Array int)
+  (All [T] [emb :- (Array T) head :- (Array int) tail :- (Array int)
    eps :- (Array double) epn :- (Array double)
    eons :- (Array double) eonsn :- (Array double)
    states :- (Array long)
    a :- Double b :- Double gamma :- Double init-alpha :- Double
    n-vertices :- Long dim :- Long n-epochs :- Long]
-  :- (Array double)
+  :- (Array T)
   (let [n-edges (alength eps)
         bm1 (- b 1.0)]
     (dotimes [ep n-epochs]
@@ -130,4 +130,4 @@
                             g (if (> gcn 0.0) (uclip (* gcn (- cd od))) 0.0)]
                         (aset emb (+ jb d) (+ cd (* g alpha)))))))
                 (aset eonsn i (+ (aget eonsn i) (* (double n-neg) (aget epn i))))))))))
-    emb))
+    emb)))

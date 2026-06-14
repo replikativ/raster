@@ -51,39 +51,48 @@
 ;; ---- init / RNG seeding (data setup — plain Clojure, clojure.core arrays) ----
 
 (defn- random-init
-  "Uniform [-10,10] init, umap.umap_ init='random'."
-  ^doubles [n dim seed]
+  "Uniform [-10,10] init as float32, umap.umap_ init='random' (rng.uniform.astype(f32))."
+  ^floats [n dim seed]
   (let [r (java.util.Random. (long seed))
-        e (double-array (clojure.core/* (long n) (long dim)))]
+        e (float-array (clojure.core/* (long n) (long dim)))]
     (dotimes [i (clojure.core/alength e)]
-      (clojure.core/aset-double e i (clojure.core/- (clojure.core/* 20.0 (.nextDouble r)) 10.0)))
+      (clojure.core/aset e i (float (clojure.core/- (clojure.core/* 20.0 (.nextDouble r)) 10.0))))
     e))
 
-(defn- add-noise!
-  "Add N(0,1e-4) jitter, as umap does after spectral init."
-  ^doubles [^doubles e seed]
-  (let [r (java.util.Random. (clojure.core/+ (long seed) 1))]
-    (dotimes [i (clojure.core/alength e)]
-      (clojure.core/aset-double e i (clojure.core/+ (clojure.core/aget e i)
-                                                    (clojure.core/* 1.0e-4 (.nextGaussian r)))))
-    e))
+(defn- ->float-init!
+  "Cast a f64 spectral init (after scale + N(0,1e-4) jitter, computed in f64 like
+  umap) down to a float32 embedding — umap casts the embedding to f32 at the end."
+  ^floats [^doubles e seed]
+  (let [r (java.util.Random. (clojure.core/+ (long seed) 1))
+        n (clojure.core/alength e)
+        f (float-array n)]
+    (dotimes [i n]
+      (clojure.core/aset f i (float (clojure.core/+ (clojure.core/aget e i)
+                                                    (clojure.core/* 1.0e-4 (.nextGaussian r))))))
+    f))
 
 (defn- init-states
-  "Per-vertex LFSR113 state long[n*3]. Low bits forced high enough (≥0x1000) to
-  avoid the degenerate seed region of the three Tausworthe generators."
-  ^longs [n seed]
+  "Per-vertex Tausworthe state long[n*3], mirroring umap's
+  rng_state_per_sample[j] = rng_state + embedding[j,0].view(int64): a base triple
+  drawn from seed, plus the int64 bit pattern of each vertex's first coordinate."
+  ^longs [^floats emb dim n seed]
   (let [r (java.util.Random. (long seed))
+        b0 (.nextLong r) b1 (.nextLong r) b2 (.nextLong r)
         st (long-array (clojure.core/* (long n) 3))]
-    (dotimes [v (clojure.core/alength st)]
-      (clojure.core/aset st v (clojure.core/bit-or
-                                (clojure.core/bit-and (.nextLong r) 0xFFFFFFFF) 0x1000)))
+    (dotimes [v (long n)]
+      (let [bits (Double/doubleToLongBits
+                   (double (clojure.core/aget emb (clojure.core/* v (long dim)))))
+            base (clojure.core/* v 3)]
+        (clojure.core/aset st (clojure.core/+ base 0) (clojure.core/unchecked-add b0 bits))
+        (clojure.core/aset st (clojure.core/+ base 1) (clojure.core/unchecked-add b1 bits))
+        (clojure.core/aset st (clojure.core/+ base 2) (clojure.core/unchecked-add b2 bits))))
     st))
 
 (defn fit
   "Fit a UMAP embedding of X (flat row-major double[n*dim]).
   Options: :k (neighbors, 15) :out-dim (2) :n-epochs (auto 500/200)
            :neg-rate (5.0) :gamma (1.0) :init (:auto|:spectral|:random) :seed (42).
-  Returns {:emb double[n*out-dim] :n n :dim out-dim :n-edges ...}.
+  Returns {:emb float[n*out-dim] :n n :dim out-dim :n-edges ...} (f32, like umap).
 
   The deftm kernels run via lazy-JIT (fully devirtualized). For repeated/large
   workloads, compile-aot any kernel externally — no need to bake it in here."
@@ -103,11 +112,11 @@
         {:keys [head tail weights]} (graph/symmetrize idx vals n k)
         n-edges (long (alength weights))
         mode (if (= init :auto) (if (clojure.core/> n 8000) :random :spectral) init)
-        ;; 4. low-dim init
+        ;; 4. low-dim init (float32 embedding, mirroring umap's f32 dtype)
         emb (case mode
               :spectral (let [{e :emb} (spectral/spectral-init head tail weights n out-dim)]
                           (spectral/scale-embedding! e 10.0)
-                          (add-noise! e seed))
+                          (->float-init! e seed))
               :random (random-init n out-dim seed))
         ;; 5. epochs-per-sample + per-vertex RNG state, then the SGD solve
         eps (double-array n-edges)
@@ -115,7 +124,7 @@
         epn (double-array n-edges)
         _ (epochs-per-neg! eps epn n-edges (double neg-rate))
         eons (aclone eps) eonsn (aclone epn)
-        states (init-states n seed)]
+        states (init-states emb out-dim n seed)]
     (u/optimize-layout! emb head tail eps epn eons eonsn states
                         A B (double gamma) 1.0 n out-dim ne)
     {:emb emb :n n :dim out-dim :n-edges n-edges :init mode}))
