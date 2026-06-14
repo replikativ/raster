@@ -16,17 +16,22 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == mod bit-and bit-or]]
             [raster.math :as rm]
+            [raster.par :as par]
             [raster.umap :as u]
             [raster.umap.knn :as knn]
             [raster.spatial.rptree :as rp]))
 
 ;; distance = -dot (fast_cosine on L2-normalized rows; smaller = nearer)
-(deftm cos-dist [data :- (Array double) a :- Long b :- Long dim :- Long] :- Double
-  (let [ab (* a dim) bb (* b dim)]
-    (loop [d 0 acc 0.0]
-      (if (< d dim)
-        (recur (inc d) (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))
-        (- 0.0 acc)))))
+(deftm cos-dist
+  "Negative cosine between rows a and b of a flat n*dim array (= -dot on
+   L2-normalized rows). Parametric over element type so it serves both the f64
+   default and umap's f32 path; written as par/reduce so the dot vectorizes once
+   the backend handles affine-offset loads. (Accumulates in f64 even for f32 data
+   — more precise than umap's f32 rdist, irrelevant to kNN ordering/recall.)"
+  (All [T] [data :- (Array T) a :- Long b :- Long dim :- Long] :- Double
+    (let [ab (* a dim) bb (* b dim)]
+      (- 0.0 (par/reduce acc 0.0 d dim
+                         (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))))))
 
 ;; Bounded max-heap push with dedup + "new" flag, on point's sub-array [base,base+k).
 ;; Root = worst (max) distance. Returns 1 if inserted, 0 otherwise.
