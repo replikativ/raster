@@ -87,8 +87,8 @@
 
   The deftm kernels run via lazy-JIT (fully devirtualized). For repeated/large
   workloads, compile-aot any kernel externally — no need to bake it in here."
-  [^doubles X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed]
-                       :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42}}]
+  [X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed]
+              :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42}}]
   (let [n (long n) dim (long dim) k (long k) out-dim (long out-dim)
         ne (long (or n-epochs (if (clojure.core/> n 10000) 200 500)))
         nk (clojure.core/* n k)

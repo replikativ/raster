@@ -223,8 +223,9 @@
   "Approximate cosine kNN of X (flat n*dim, will be L2-normalized in place).
    n-trees RP-trees + random init, then n-iters local-join refinement.
    Returns {:idx int[n*k] :dst double[n*k] (-log2 cos, self first)}."
-  [^doubles X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads]
-                         :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1}}]
+  ;; X may be double[] or float[] — the kernels are parametric (All [T]).
+  [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads]
+               :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1}}]
   (let [n (long n) dim (long dim) k (long k)
         _ (knn/l2-normalize! X n dim)
         dist (double-array (clojure.core/* n k))
@@ -271,7 +272,7 @@
   "Cosine kNN that auto-selects exact brute-force (small n) vs approximate
    NN-descent (large n). Returns {:idx :dst} (dst = -log2 cos, self first),
    matching knn_graph's float path. X is L2-normalized in place either way."
-  [^doubles X n dim k & {:keys [threshold] :or {threshold 4096}}]
+  [X n dim k & {:keys [threshold] :or {threshold 4096}}]
   (let [n (long n) dim (long dim) k (long k)]
     ;; cos-dist (and knn-brute-cosine!) both assume L2-normalized rows, so
     ;; normalize once up front — covers BOTH paths (norms vary in real data).
