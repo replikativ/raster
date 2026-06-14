@@ -22,7 +22,8 @@
             [raster.umap.knn :as knn]
             [raster.umap.graph :as graph]
             [raster.umap.spectral :as spectral]
-            [raster.spatial.nndescent :as nnd]))
+            [raster.spatial.nndescent :as nnd]
+            [raster.compiler.pipeline :as pipeline]))
 
 ;; a,b curve params for spread=1.0, min_dist=0.1 (umap.umap_.find_ab_params).
 (def A 1.5769434603113077)
@@ -79,13 +80,24 @@
                                 (clojure.core/bit-and (.nextLong r) 0xFFFFFFFF) 0x1000)))
     st))
 
+;; SGD solver: once type transport is fixed, lazy-JIT is fully devirtualized and
+;; nearly matches compiled (compile-aot adds only SIMD/inlining, marginal for a
+;; dim=2 kernel: ~28s vs ~36s on a real MNIST-10k graph). So lazy is the default —
+;; a single fit is faster lazy (no ~6s compile latency). :compile? true compiles
+;; the SGD once per process (worth it for repeated fits / large n where the
+;; per-sample speedup amortizes). On REPL redef of the kernel the delay is stale.
+(defonce ^:private compiled-sgd (delay (pipeline/compile-aot #'u/optimize-layout!)))
+
 (defn fit
   "Fit a UMAP embedding of X (flat row-major double[n*dim]).
   Options: :k (neighbors, 15) :out-dim (2) :n-epochs (auto 500/200)
-           :neg-rate (5.0) :gamma (1.0) :init (:auto|:spectral|:random) :seed (42).
+           :neg-rate (5.0) :gamma (1.0) :init (:auto|:spectral|:random) :seed (42)
+           :compile? (false) — compile-aot the SGD solver (one-time ~6s, then a
+                               modest per-sample speedup; best for repeated/large fits).
   Returns {:emb double[n*out-dim] :n n :dim out-dim :n-edges ...}."
-  [^doubles X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed]
-                       :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42}}]
+  [^doubles X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed compile?]
+                       :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42
+                            compile? false}}]
   (let [n (long n) dim (long dim) k (long k) out-dim (long out-dim)
         ne (long (or n-epochs (if (clojure.core/> n 10000) 200 500)))
         nk (clojure.core/* n k)
@@ -113,6 +125,9 @@
         _ (epochs-per-neg! eps epn n-edges (double neg-rate))
         eons (aclone eps) eonsn (aclone epn)
         states (init-states n seed)]
-    (u/optimize-layout! emb head tail eps epn eons eonsn states
-                        A B (double gamma) 1.0 n out-dim ne)
+    (if compile?
+      (@compiled-sgd emb head tail eps epn eons eonsn states
+                     A B (double gamma) 1.0 n out-dim ne)
+      (u/optimize-layout! emb head tail eps epn eons eonsn states
+                          A B (double gamma) 1.0 n out-dim ne))
     {:emb emb :n n :dim out-dim :n-edges n-edges :init mode}))
