@@ -119,7 +119,7 @@
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
                           (try
-                            (:binding-tags (inf/tc-analyze-deftm-body '<compile> params annotations body))
+                            (:binding-tags (inf/tc-analyze-deftm-body '<compile> params annotations body source-ns))
                             (catch Throwable e
                               (binding [*out* *err*]
                                 (println (str "WARNING: TC analysis failed at compile time: " (.getMessage e))))

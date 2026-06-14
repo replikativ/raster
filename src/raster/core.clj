@@ -231,7 +231,7 @@
         tc-ret-tag (when (and tc-eager? (not explicit-ret-tag) (seq annotations))
                      (try
                        (:ret-tag (inf/tc-analyze-deftm-body
-                                  (or fn-label '<infer>) params annotations body))
+                                  (or fn-label '<infer>) params annotations body *ns*))
                        (catch Throwable _ nil)))
         ret-tag (or explicit-ret-tag tc-ret-tag)
         ;; Validate
@@ -251,7 +251,7 @@
         tc-binding-tags (when tc-eager?
                           (try
                             (:binding-tags (inf/tc-analyze-deftm-body
-                                            (or fn-label '<ftm>) params annotations body))
+                                            (or fn-label '<ftm>) params annotations body *ns*))
                             (catch Throwable _ nil)))
         ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
@@ -311,7 +311,7 @@
   (let [type-env (build-walker-type-env params annotations)
         tc-binding-tags (try
                           (:binding-tags (inf/tc-analyze-deftm-body
-                                          '<jit> params annotations source-body))
+                                          '<jit> params annotations source-body source-ns))
                           (catch Throwable _ nil))
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
@@ -1436,7 +1436,7 @@
         ;; same as prepare-typed-body does for normal deftm
         tc-binding-tags (try
                           (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
-                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec)))
+                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec source-ns)))
                           (catch Throwable e
                             (println (str "WARNING: TC analysis failed during parametric specialization of `"
                                           fn-name "`: " (.getMessage e)))

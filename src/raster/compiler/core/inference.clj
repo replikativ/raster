@@ -211,8 +211,14 @@
     :stability-warning — warning if return type is unstable (Union)
     :binding-tags      — {sym → dispatch-tag} for all let bindings
 
-  This gives the walker complete type information from a single TC pass."
-  [fn-name params annotations body]
+  This gives the walker complete type information from a single TC pass.
+
+  source-ns (optional): the namespace the body was written in. TC's analyzer
+  resolves bare/refer'd vars (e.g. `pow` from raster.numeric) against *ns*, so at
+  re-walk time (compile-aot / lazy JIT, which run in a different ns than the
+  definition) *ns* must be bound to the source ns or every refer'd op fails to
+  resolve — yielding a TCError return and discarding ALL inferred binding types."
+  [fn-name params annotations body & [source-ns]]
   (try
     ;; Skip TC analysis for fully-untyped methods (all Object/Any params).
     ;; These are polymorphic fallbacks where TC can't add value — every operation
@@ -227,7 +233,12 @@
                                    params annotations))
             body-expr (if (= 1 (count body)) (first body) (cons 'do body))
             wrapped (list 'clojure.core.typed/fn fn-params body-expr)
-            result (try (check-fn wrapped {:checked-ast true
+            ;; Resolve refer'd ops against the body's own namespace.
+            result (binding [*ns* (if source-ns
+                                    (if (instance? clojure.lang.Namespace source-ns)
+                                      source-ns (the-ns source-ns))
+                                    *ns*)]
+                     (try (check-fn wrapped {:checked-ast true
                                            :check-config {:check-form-eval :never}})
                         (catch Throwable e1
                           ;; Fallback: retry without checked-ast if TC's internal
@@ -236,7 +247,7 @@
                                (catch Throwable e2
                                  (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
                                                (.getMessage e1) " → retry: " (.getMessage e2)))
-                                 nil))))]
+                                 nil)))))]
         (when result
           (when (and (seq (:type-errors result))
                      (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
