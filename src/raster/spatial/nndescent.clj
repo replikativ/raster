@@ -65,7 +65,7 @@
 
 ;; seed: self (dist=-1 -> cos 1) + k random neighbors per point
 (deftm init-random!
-  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+  (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
    rng-state :- (Array long) n :- Long dim :- Long k :- Long] :- (Array double)
   (dotimes [i n]
     (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i i dim) i 1)
@@ -73,11 +73,11 @@
       (let [j (mod (u/tau-rand-int! rng-state 0) n)]
         (when (not (== j i))
           (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i j dim) j 1)))))
-  dist)
+  dist))
 
 ;; seed from RP-tree leaves: all-pairs within each leaf
 (deftm init-leaves!
-  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+  (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
    idx :- (Array int) leaf-start :- (Array int) leaf-end :- (Array int)
    n-leaves :- Long dim :- Long k :- Long] :- (Array double)
   (dotimes [lf n-leaves]
@@ -92,7 +92,7 @@
                 (flagged-heap-push! dist ind flags (* b k) k dd a 1))
               (recur (inc q))))
           (recur (inc p))))))
-  dist)
+  dist))
 
 ;; one refinement iteration: local join over each point's neighbor list (push
 ;; both directions makes the graph symmetric -> reverse neighbors propagate).
@@ -158,7 +158,7 @@
 ;; write races); neighbor-list reads of other blocks are benign stale reads
 ;; (Hogwild-tolerant). This is the parallelizable form of EVoC's block-owned apply.
 (deftm local-join-owned!
-  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+  (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
    bstart :- Long bend :- Long dim :- Long k :- Long] :- Long
   (loop [p bstart upd 0]
     (if (< p bend)
@@ -181,7 +181,7 @@
                          (recur (inc j) u3))))
                    u))]
         (recur (inc p) u2))
-      upd)))
+      upd))))
 
 (defn parallel-local-join!
   "CPU-multicore local-join via futures over point-blocks. Race-free writes

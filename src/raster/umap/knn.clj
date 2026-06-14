@@ -18,7 +18,7 @@
 ;;   out-idx : int[n*k]    neighbor indices (ascending distance, self first)
 ;;   out-dst : double[n*k] euclidean distances
 (deftm knn-brute!
-  [X :- (Array double) n :- Long dim :- Long k :- Long
+  (All [T] [X :- (Array T) n :- Long dim :- Long k :- Long
    out-idx :- (Array int) out-dst :- (Array double)]
   :- (Array double)
   (dotimes [i n]
@@ -49,13 +49,13 @@
       ;; convert the k kept squared distances to euclidean
       (dotimes [t k]
         (aset out-dst (+ ib t) (sqrt (aget out-dst (+ ib t)))))))
-  out-dst)
+  out-dst))
 
 ;; --- cosine kNN for EVoC (L2-normalize, distance = -log2(cosine_similarity)) ---
 
 ;; L2-normalize each row in place (rows of zero norm are left unchanged, as EVoC).
 (deftm l2-normalize!
-  [X :- (Array double) n :- Long dim :- Long] :- (Array double)
+  (All [T] [X :- (Array T) n :- Long dim :- Long] :- (Array T)
   (dotimes [i n]
     (let [ib (* i dim)
           nrm (loop [d 0 s 0.0]
@@ -63,12 +63,12 @@
           r (sqrt nrm)
           inv (/ 1.0 (if (== r 0.0) 1.0 r))]
       (dotimes [d dim] (aset X (+ ib d) (* (aget X (+ ib d)) inv)))))
-  X)
+  X))
 
 ;; Exact cosine kNN on L2-normalized rows. Distance = -log2(cos), matching EVoC's
 ;; knn_graph float path (self first at distance 0). Keeps the k smallest distances.
 (deftm knn-brute-cosine!
-  [Xn :- (Array double) n :- Long dim :- Long k :- Long
+  (All [T] [Xn :- (Array T) n :- Long dim :- Long k :- Long
    out-idx :- (Array int) out-dst :- (Array double)]
   :- (Array double)
   (dotimes [i n]
@@ -89,4 +89,4 @@
                     (recur (- p 1)))
                 (do (aset out-dst (+ ib p) dist)
                     (aset out-idx (+ ib p) (int j))))))))))
-  out-dst)
+  out-dst))

@@ -18,7 +18,7 @@
 ;; rng-state is a long[3] (mutated); hp is a dim-length work buffer; stk holds
 ;; (start,end) frames (2 ints each).
 (deftm build-rptree-leaves!
-  [data :- (Array double) n :- Long dim :- Long leaf-size :- Long
+  (All [T] [data :- (Array T) n :- Long dim :- Long leaf-size :- Long
    idx :- (Array int) rng-state :- (Array long) hp :- (Array double) stk :- (Array int)
    leaf-start :- (Array int) leaf-end :- (Array int)] :- Long
   (dotimes [i n] (aset idx i (int i)))
@@ -38,7 +38,7 @@
                 ;; hyperplane = normalize(data[left] - data[right])
                 _ (let [nrm (loop [d 0 s 0.0]
                               (if (< d dim)
-                                (let [v (- (aget data (+ (* left dim) d)) (aget data (+ (* right dim) d)))]
+                                (let [v (double (- (aget data (+ (* left dim) d)) (aget data (+ (* right dim) d))))]
                                   (aset hp d v) (recur (inc d) (+ s (* v v))))
                                 s))
                         r (sqrt nrm)
@@ -64,4 +64,4 @@
             (aset stk base (int start)) (aset stk (+ base 1) (int split2))
             (aset stk (* sp 2) (int split2)) (aset stk (+ (* sp 2) 1) (int end))
             (recur (+ sp1 2) nl))))
-      nl)))
+      nl))))
