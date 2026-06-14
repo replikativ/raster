@@ -412,6 +412,29 @@
             (if-let [t (walked-tag (last result))]
               (vary-meta result assoc :raster.type/tag t)
               result)
+            ;; case — result type is the (agreeing) type of all clause results
+            ;; (every 2nd clause element) plus the optional trailing default.
+            (= 'case head)
+            (let [clauses (drop 2 result)
+                  pairs?  (even? (count clauses))
+                  results (concat (map second (partition 2 (if pairs? clauses (butlast clauses))))
+                                  (when-not pairs? [(last clauses)]))
+                  tags    (map walked-tag results)]
+              (if (and (seq tags) (every? some? tags) (apply = tags))
+                (vary-meta result assoc :raster.type/tag (first tags))
+                result))
+            ;; try — result type is the (agreeing) type of the body's last form and
+            ;; each catch's last form (finally never yields the value).
+            (= 'try head)
+            (let [parts   (rest result)
+                  cf?     (fn [f] (and (seq? f) (contains? #{'catch 'finally} (first f))))
+                  body    (take-while (complement cf?) parts)
+                  catches (filter #(and (seq? %) (= 'catch (first %))) parts)
+                  vforms  (concat (when (seq body) [(last body)]) (map last catches))
+                  tags    (map walked-tag vforms)]
+              (if (and (seq tags) (every? some? tags) (apply = tags))
+                (vary-meta result assoc :raster.type/tag (first tags))
+                result))
             :else result))
         result))))
 
