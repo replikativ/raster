@@ -370,7 +370,17 @@
       (if (and (seq? result)
                (not (:raster.type/tag (meta result)))
                (instance? clojure.lang.IObj result))
-        (let [head (first result)]
+        (let [head (first result)
+              type-env (:type-env ctx)
+              ;; Tag of an already-walked sub-form (bottom-up: inner forms are
+              ;; walked+stamped before their parent).
+              walked-tag (fn [w]
+                           (cond
+                             (seq? w)    (or (:raster.type/tag (meta w))
+                                             (inf/infer-rewritten-tag w nil type-env))
+                             (symbol? w) (or (:raster.type/tag (meta w))
+                                             (inf/type-env-tag type-env w))
+                             :else       (inf/literal-tag w)))]
           (cond
             ;; .invk — read ret-tag from impl-sym metadata
             (and (= '.invk head) (symbol? (second result)))
@@ -380,6 +390,28 @@
             ;; Primitive cast — (double x), (float x), etc.
             (contains? types/primitive-info head)
             (vary-meta result assoc :raster.type/tag head)
+            ;; if — result type is the (agreeing) type of its value branches.
+            ;; A recur branch carries no value, so the result is the OTHER branch;
+            ;; this also types loop bodies of the form (if test (recur ...) acc).
+            ;; Only stamp when the type is unambiguous (both value branches agree)
+            ;; so a genuine union stays untyped (and thus dispatched — correct).
+            (and (= 'if head) (>= (count result) 3))
+            (let [recur? (fn [x] (and (seq? x) (= 'recur (first x))))
+                  then (nth result 2)
+                  els  (when (> (count result) 3) (nth result 3))
+                  tt   (when-not (recur? then) (walked-tag then))
+                  et   (when (and els (not (recur? els))) (walked-tag els))
+                  rtag (cond
+                         (and tt et (= tt et))      tt
+                         (and tt els (recur? els))  tt
+                         (and et (recur? then))     et
+                         :else nil)]              ; one-arm/ambiguous → leave untyped
+              (if rtag (vary-meta result assoc :raster.type/tag rtag) result))
+            ;; let*/loop*/do — result type is the last body form's type.
+            (contains? '#{let* loop* do} head)
+            (if-let [t (walked-tag (last result))]
+              (vary-meta result assoc :raster.type/tag t)
+              result)
             :else result))
         result))))
 
