@@ -90,12 +90,15 @@
                   k (long (aget tail i))
                   jb (* j dim)
                   kb (* k dim)
-                  d2 (loop [d 0 acc 0.0]
-                       (if (< d dim)
-                         (recur (inc d)
-                                (let [df (- (aget emb (+ jb d)) (aget emb (+ kb d)))]
-                                  (+ acc (* df df))))
-                         acc))
+                  ;; d2 accumulates in double (numba rdist is f64); also gives pow
+                  ;; a double arg when emb is float[] (no pow(float,double) overload).
+                  d2 (double
+                       (loop [d 0 acc 0.0]
+                         (if (< d dim)
+                           (recur (inc d)
+                                  (let [df (- (aget emb (+ jb d)) (aget emb (+ kb d)))]
+                                    (+ acc (* df df))))
+                           acc)))
                   gc (if (> d2 0.0)
                        (/ (* (* (* -2.0 a) b) (pow d2 bm1))
                           (+ (* a (pow d2 b)) 1.0))
@@ -114,12 +117,13 @@
                 (dotimes [p n-neg]
                   (let [kk (mod (tau-rand-int! states (* j 3)) n-vertices)
                         kb2 (* kk dim)
-                        d2n (loop [d 0 acc 0.0]
-                              (if (< d dim)
-                                (recur (inc d)
-                                       (let [df (- (aget emb (+ jb d)) (aget emb (+ kb2 d)))]
-                                         (+ acc (* df df))))
-                                acc))
+                        d2n (double
+                              (loop [d 0 acc 0.0]
+                                (if (< d dim)
+                                  (recur (inc d)
+                                         (let [df (- (aget emb (+ jb d)) (aget emb (+ kb2 d)))]
+                                           (+ acc (* df df))))
+                                  acc)))
                         gcn (if (> d2n 0.0)
                               (/ (* (* 2.0 gamma) b)
                                  (* (+ 0.001 d2n) (+ (* a (pow d2n b)) 1.0)))

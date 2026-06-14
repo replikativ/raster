@@ -50,38 +50,44 @@
 
 ;; ---- init / RNG seeding (data setup — plain Clojure, clojure.core arrays) ----
 
+;; NOTE on dtype: umap stores the embedding as float32. In raster a float[]
+;; embedding makes optimize-layout! mix float (emb) with double scalars (a,b,gc,
+;; alpha) in its inner loop; TC can't devirtualize those mixed-type ops, leaving
+;; ~2 runtime-dispatched ops that — at millions of edge updates — make the SGD
+;; ~168x slower (measured) than the fully-devirtualized f64 path. UMAP's SGD is
+;; chaotic, so f32-vs-f64 is irrelevant to quality. We therefore use a f64
+;; embedding for the SGD (kNN still runs f32, where it is bit-exact to numba).
+;; optimize-layout! stays parametric (All [T]) so the f32 path remains available
+;; and validated bit-exact vs numba in dev/umap_port/validate_f32.clj.
 (defn- random-init
-  "Uniform [-10,10] init as float32, umap.umap_ init='random' (rng.uniform.astype(f32))."
-  ^floats [n dim seed]
+  "Uniform [-10,10] init, umap.umap_ init='random' (rng.uniform), as f64."
+  ^doubles [n dim seed]
   (let [r (java.util.Random. (long seed))
-        e (float-array (clojure.core/* (long n) (long dim)))]
+        e (double-array (clojure.core/* (long n) (long dim)))]
     (dotimes [i (clojure.core/alength e)]
-      (clojure.core/aset e i (float (clojure.core/- (clojure.core/* 20.0 (.nextDouble r)) 10.0))))
+      (clojure.core/aset-double e i (clojure.core/- (clojure.core/* 20.0 (.nextDouble r)) 10.0)))
     e))
 
-(defn- ->float-init!
-  "Cast a f64 spectral init (after scale + N(0,1e-4) jitter, computed in f64 like
-  umap) down to a float32 embedding — umap casts the embedding to f32 at the end."
-  ^floats [^doubles e seed]
-  (let [r (java.util.Random. (clojure.core/+ (long seed) 1))
-        n (clojure.core/alength e)
-        f (float-array n)]
-    (dotimes [i n]
-      (clojure.core/aset f i (float (clojure.core/+ (clojure.core/aget e i)
-                                                    (clojure.core/* 1.0e-4 (.nextGaussian r))))))
-    f))
+(defn- add-noise!
+  "Add N(0,1e-4) jitter, as umap does after spectral init (f64)."
+  ^doubles [^doubles e seed]
+  (let [r (java.util.Random. (clojure.core/+ (long seed) 1))]
+    (dotimes [i (clojure.core/alength e)]
+      (clojure.core/aset-double e i (clojure.core/+ (clojure.core/aget e i)
+                                                    (clojure.core/* 1.0e-4 (.nextGaussian r)))))
+    e))
 
 (defn- init-states
   "Per-vertex Tausworthe state long[n*3], mirroring umap's
   rng_state_per_sample[j] = rng_state + embedding[j,0].view(int64): a base triple
   drawn from seed, plus the int64 bit pattern of each vertex's first coordinate."
-  ^longs [^floats emb dim n seed]
+  ^longs [^doubles emb dim n seed]
   (let [r (java.util.Random. (long seed))
         b0 (.nextLong r) b1 (.nextLong r) b2 (.nextLong r)
         st (long-array (clojure.core/* (long n) 3))]
     (dotimes [v (long n)]
       (let [bits (Double/doubleToLongBits
-                   (double (clojure.core/aget emb (clojure.core/* v (long dim)))))
+                   (clojure.core/aget emb (clojure.core/* v (long dim))))
             base (clojure.core/* v 3)]
         (clojure.core/aset st (clojure.core/+ base 0) (clojure.core/unchecked-add b0 bits))
         (clojure.core/aset st (clojure.core/+ base 1) (clojure.core/unchecked-add b1 bits))
@@ -92,7 +98,7 @@
   "Fit a UMAP embedding of X (flat row-major double[n*dim]).
   Options: :k (neighbors, 15) :out-dim (2) :n-epochs (auto 500/200)
            :neg-rate (5.0) :gamma (1.0) :init (:auto|:spectral|:random) :seed (42).
-  Returns {:emb float[n*out-dim] :n n :dim out-dim :n-edges ...} (f32, like umap).
+  Returns {:emb double[n*out-dim] :n n :dim out-dim :n-edges ...}.
 
   The deftm kernels run via lazy-JIT (fully devirtualized). For repeated/large
   workloads, compile-aot any kernel externally — no need to bake it in here."
@@ -112,11 +118,12 @@
         {:keys [head tail weights]} (graph/symmetrize idx vals n k)
         n-edges (long (alength weights))
         mode (if (= init :auto) (if (clojure.core/> n 8000) :random :spectral) init)
-        ;; 4. low-dim init (float32 embedding, mirroring umap's f32 dtype)
+        ;; 4. low-dim init — f64 embedding (see dtype NOTE above: f32 emb makes the
+        ;;    SGD ~168x slower via mixed-precision dispatch; quality is identical).
         emb (case mode
               :spectral (let [{e :emb} (spectral/spectral-init head tail weights n out-dim)]
                           (spectral/scale-embedding! e 10.0)
-                          (->float-init! e seed))
+                          (add-noise! e seed))
               :random (random-init n out-dim seed))
         ;; 5. epochs-per-sample + per-vertex RNG state, then the SGD solve
         eps (double-array n-edges)

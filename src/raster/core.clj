@@ -54,6 +54,7 @@
             [raster.compiler.backend.jvm.valhalla :as valhalla]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.typed-dispatch :as typed-dispatch]
             [raster.runtime.callsites :as callsites]))
 
@@ -317,6 +318,37 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) source-body)))
 
+(def ^:dynamic *jit-simd?*
+  "Opt-in: vectorize par/map and par/reduce in the lazy-JIT bytecode upgrade via
+  the JDK Vector API (par-simd/simd-pass), the same codegen compile-aot uses.
+
+  Default FALSE. The emitted vector bytecode is correct and identical to
+  compile-aot's, but when a small kernel (e.g. a dim~50 cos-dist) is invoked
+  through the deftm `.invk` interface inside a hot loop, C2's escape analysis
+  fails to scalarize the per-call DoubleVector temporaries — they heap-allocate
+  every call, and at millions of calls that is a large net regression (measured
+  ~12x on UMAP kNN) despite the loop body being 'vectorized'. compile-aot does
+  not hit this because it inlines the kernel into its caller so EA can see the
+  whole region. Until lazy-JIT SIMD is made reliably scalarizable across the
+  .invk boundary, SIMD out of the box lives in compile-aot; bind this to true to
+  opt a lazy-JIT kernel into SIMD when you know it pays (large bounds, or the
+  kernel is the whole hot method). simd-pass keeps a scalar tail + falls back to
+  a scalar loop, so results stay correct (reductions reorder FP adds like BLAS)."
+  false)
+
+(defn- simd-expand-jit-body
+  "Replace par forms in a lazy-JIT walked body with SIMD code when *jit-simd?*.
+  Per-form: vectorize via simd-pass, else leave the par form for bytecode's
+  scalar expansion. Never throws — a failed form keeps its scalar shape."
+  [walked-body source-ns]
+  (if-not *jit-simd?*
+    walked-body
+    (binding [*ns* (or source-ns *ns*)]
+      (mapv (fn [form]
+              (try (:form (par-simd/simd-pass form))
+                   (catch Throwable _ form)))
+            walked-body))))
+
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
   Julia model: re-walks from source body with TC at JIT time for
@@ -338,6 +370,8 @@
                                     (catch Throwable _
                                       walked-body))
                                walked-body)
+              ;; Vectorize par/map + par/reduce out of the box (scalar fallback inside).
+              effective-body (simd-expand-jit-body effective-body source-ns)
               class-name (str "raster.compiled.DT_"
                               (.replace (str mangled-sym) "." "_")
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
