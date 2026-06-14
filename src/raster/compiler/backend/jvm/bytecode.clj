@@ -837,6 +837,11 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
+        _ (when-let [dir (System/getProperty "raster.dumpdir")]
+            (try (java.nio.file.Files/write
+                  (.toPath (java.io.File. dir (str (clojure.string/replace class-name "." "_") ".class")))
+                  bytes (make-array java.nio.file.OpenOption 0))
+                 (catch Throwable _ nil)))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class-desc class-desc
@@ -3067,11 +3072,15 @@
             ;; Only used for the var-reference path; local path keeps Object return.
             ret-tag-meta (:raster.type/ret-tag (meta obj))
             ^Class prim-ret-class (case ret-tag-meta
-                                    (double Double) Double/TYPE
-                                    (long Long)     Long/TYPE
-                                    (int Integer)   Integer/TYPE
-                                    (float Float)   Float/TYPE
-                                    (void Void)     Void/TYPE
+                                    (double Double)   Double/TYPE
+                                    (long Long)       Long/TYPE
+                                    (int Integer)     Integer/TYPE
+                                    (float Float)     Float/TYPE
+                                    ;; Comparison/boolean ops: bind compute_prim's
+                                    ;; primitive boolean return (zero-boxing) instead
+                                    ;; of falling back to the boxed invk → Object path.
+                                    (boolean Boolean) Boolean/TYPE
+                                    (void Void)       Void/TYPE
                                     nil)
             is-var? (and (namespace obj) (not (get locals obj)))]
         (if is-var?
@@ -3479,24 +3488,74 @@
                                 (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
               :ref))))))
 
+(defn- widen-loop-type
+  "Slot type for a loop var = LUB(init type, recur-value type), promoting only in
+  the value-preserving numeric direction (never narrowing). This matters because
+  e.g. (loop [d 0] ... (recur (inc d) ...)) has an int init but a long recur value
+  (Clojure's 0 is a Long; the walker widens uses to long). Without unification the
+  var is stored as int and every iteration round-trips i2l…l2i, which defeats C2's
+  counted-loop recognition and blocks SuperWord auto-vectorization. Unifying to
+  long yields a clean long counted loop. Returns init-t when no safe widening
+  applies."
+  [init-t recur-t]
+  (let [num? #{:int :long :float :double}
+        rank {:int 0 :long 1 :float 2 :double 3}]
+    (cond
+      (or (nil? recur-t) (= init-t recur-t)) init-t
+      (not (and (num? init-t) (num? recur-t))) init-t
+      ;; long and float can't represent each other exactly → promote to double
+      (or (= init-t :double) (= recur-t :double)) :double
+      (or (and (= init-t :long) (= recur-t :float))
+          (and (= init-t :float) (= recur-t :long))) :double
+      (> (rank recur-t) (rank init-t)) recur-t
+      :else init-t)))
+
+(defn- loop-recur-arg-types
+  "Infer, for each of the n loop vars, the widest stack type its recur values
+  produce — without emitting. Scans only recur forms that target THIS loop
+  (skips nested loop*/fn* which retarget recur). Used to widen loop-var slots."
+  [body n locals]
+  (let [acc (atom (vec (repeat n nil)))
+        rank {:int 0 :long 1 :float 2 :double 3}
+        widest (fn [a b] (cond (nil? a) b (nil? b) a
+                               (>= (get rank a -1) (get rank b -1)) a :else b))]
+    (letfn [(scan [form]
+              (cond
+                (and (seq? form) (= 'recur (first form)))
+                (doseq [[i a] (map-indexed vector (rest form))]
+                  (when (< i n)
+                    (swap! acc update i widest (infer-arg-stack-type a locals))))
+                (and (seq? form) (symbol? (first form))
+                     (contains? #{"loop*" "fn*"} (name (first form)))) nil
+                (seq? form) (run! scan (rest form))
+                (vector? form) (run! scan form)
+                :else nil))]
+      (run! scan body))
+    @acc))
+
 (defn- emit-loop*
   "Emit bytecode for (loop* [bindings] body...)."
   [code args locals ctx]
   (let [[bindings & body] args
-        pairs (partition 2 bindings)
+        pairs (vec (partition 2 bindings))
         loop-label (.newLabel code)
+        ;; Type each loop var as LUB(init, recur values) so a long-recurring
+        ;; counter isn't pinned to int (which blocks vectorization).
+        recur-types (loop-recur-arg-types body (count pairs) locals)
         loop-locals (reduce
-                     (fn [locs [sym init]]
+                     (fn [locs [[sym init] rt]]
                        (let [t (emit-form code init locs (dissoc ctx :void-context))
-                             slot (alloc-slot! ctx t)]
-                         (case t
-                           :double (.dstore code slot)
-                           :long   (.lstore code slot)
-                           (:int :bool) (.istore code slot)
-                           :float  (.fstore code slot)
-                           (.astore code slot))
-                         (assoc locs sym {:slot slot :type t})))
-                     locals pairs)
+                             slot-t (widen-loop-type t rt)]
+                         (when (not= t slot-t) (emit-coerce code t slot-t))
+                         (let [slot (alloc-slot! ctx slot-t)]
+                           (case slot-t
+                             :double (.dstore code slot)
+                             :long   (.lstore code slot)
+                             (:int :bool) (.istore code slot)
+                             :float  (.fstore code slot)
+                             (.astore code slot))
+                           (assoc locs sym {:slot slot :type slot-t}))))
+                     locals (map vector pairs recur-types))
         loop-var-syms (mapv first pairs)]
     (.labelBinding code loop-label)
     (let [ctx (assoc ctx :loop-label loop-label
@@ -4462,6 +4521,11 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
+        _ (when-let [dir (System/getProperty "raster.dumpdir")]
+            (try (java.nio.file.Files/write
+                  (.toPath (java.io.File. dir (str (clojure.string/replace class-name "." "_") ".class")))
+                  bytes (make-array java.nio.file.OpenOption 0))
+                 (catch Throwable _ nil)))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class cls
