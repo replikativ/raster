@@ -553,19 +553,40 @@
             (and (= b idx-sym) (integer? a)) (long a)
             :else nil))))))
 
-;; --- Strict-less-than (loop bound: i < n maps to range [0,n)) ---
+;; --- Relational comparisons (:comparison facet) ---
 
-(def less-than-ops
-  "Strict less-than comparisons. A loop guarded by (< i n) iterates [0,n),
-   which is the only bound shape loop-lift rewrites to a [0,bound) SOAC.
-   Listed per surface variant (bare / clojure.core / raster.numeric), matching
-   the convention of the other classification sets in this namespace."
-  #{'< 'clojure.core/< 'raster.numeric/<})
+(defn register-comparison!
+  "Register the relational kind of a binary comparison operator as the
+   :comparison facet: {:kind :lt|:le|:gt|:ge|:eq|:ne}. Like register-algebra!,
+   this lives in the unified registry — one entry per op, extensible by other
+   namespaces — rather than a bespoke set.
+
+   (This is distinct from comparison-op?, which is the broader AD notion of a
+   non-differentiable boolean op, including unary predicates like zero?/pos?.)"
+  [op-sym kind]
+  (register-op-descriptor! op-sym {:comparison {:kind kind}}))
+
+(defn comparison-kind
+  "The relational :kind of op-sym (:lt/:le/:gt/:ge/:eq/:ne), or nil."
+  [op-sym]
+  (:kind (:comparison (get-op-descriptor op-sym))))
 
 (defn less-than-op?
-  "True if sym is a strict less-than comparison."
-  [sym]
-  (contains? less-than-ops sym))
+  "True iff op-sym is a strict less-than. A loop guarded by (< i n) iterates
+   the contiguous range [0,n), the only bound shape loop-lift currently rewrites
+   to a [0,bound) SOAC. Other relational kinds are recognized by the registry
+   but loop-lift conservatively bails on them (e.g. <= would need a [0,n+1)
+   bound); adding them later is a matcher change, not a new classification set."
+  [op-sym]
+  (= :lt (comparison-kind op-sym)))
+
+;; Register relational kinds for every surface variant
+;; (bare / clojure.core / raster.numeric).
+(doseq [[base kind] {'<  :lt  '<=  :le  '>  :gt  '>=  :ge  '==  :eq  'not=  :ne}
+        v    [base
+              (symbol "clojure.core" (name base))
+              (symbol "raster.numeric" (name base))]]
+  (register-comparison! v kind))
 
 ;; --- Algebraic properties (:algebra facet; loop-lift reduction eligibility) ---
 
