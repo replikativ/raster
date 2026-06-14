@@ -18,6 +18,7 @@
     - All aget calls must use the loop variable as index
     - Reduce/scan loops must have the expected single index/accumulator shape"
   (:require [clojure.walk]
+            [raster.ad.purity :as purity]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
@@ -132,26 +133,91 @@
      :cast cast-fn
      :body value-expr}))
 
+(defn- contains-sym?
+  "True if `sym` occurs anywhere in `form` (as a value, not just head)."
+  [form sym]
+  (cond
+    (= form sym)   true
+    (seq? form)    (boolean (some #(contains-sym? % sym) form))
+    (vector? form) (boolean (some #(contains-sym? % sym) form))
+    :else          false))
+
+(defn- reduction-update-ok?
+  "The update body must be (⊕ acc e) / (⊕ e acc) where ⊕ is a registered
+   commutative monoid (associative AND commutative — descriptor/commutative-
+   monoid-op?) and the non-acc operand e is acc-free. This is the soundness gate
+   that prevents lifting a non-associative/non-commutative recurrence (e.g.
+   (- acc e)) or a serially-dependent body into a reordered multi-accumulator
+   SIMD reduce."
+  [full-body acc-sym]
+  (let [op   (descriptor/semantic-op full-body)
+        args (vec (descriptor/call-args full-body))]
+    (and op
+         (= 2 (count args))
+         (descriptor/commutative-monoid-op? op)
+         (let [[a b] args]
+           (or (and (patterns/acc-ref? a acc-sym) (not (contains-sym? b acc-sym)))
+               (and (patterns/acc-ref? b acc-sym) (not (contains-sym? a acc-sym))))))))
+
+(defn- pure-op?
+  "True only if `op` is *proven* pure by the beichte effect classifier
+   (raster.ad.purity), applied to the SEMANTIC operator. This queries the
+   shared effect registry — no ad-hoc symbol whitelist in this pass — so it is
+   namespace-precise (resolves the actual var / honors the !-convention) and
+   complete-by-construction (every raster.numeric/raster.math public is
+   registered pure; new ops are picked up automatically). :impure and :unknown
+   both fail closed → conservative bail. nil op (unrecognized call shape) fails."
+  [op]
+  (and op (= :pure (purity/pure-op? op))))
+
+(defn- pure-elem?
+  "True if expr is a pure function of the index and loop-invariants. Each call's
+   purity is decided by beichte on the op RECOVERED from .invk metadata via
+   descriptor/semantic-op — never by pure-sexp? on the .invk form itself (which
+   blanket-trusts .invk and would hide an impure devirtualized op). Unknown or
+   impure ops bail, so a reordered/parallel reduction never changes behavior."
+  [expr]
+  (cond
+    (seq? expr)    (and (pure-op? (descriptor/semantic-op expr))
+                        (every? pure-elem? (descriptor/call-args expr)))
+    (vector? expr) (every? pure-elem? expr)
+    :else          true))
+
 (defn- loop-reduce-pattern?
   "Check if a form matches the loop->reduce pattern.
-  Returns {:acc sym :init expr :idx sym :bound expr :body expr} or nil."
+  Returns {:acc sym :init expr :idx sym :bound expr :body expr} or nil.
+
+  A loop/recur reduction is lifted to a (reordered, multi-accumulator) SIMD
+  par/reduce ONLY when every precondition below is *proven*; otherwise it is
+  left as a scalar loop. The gates are conservative (bail when unsure), so a
+  false negative costs only a missed optimization — never a wrong result."
   [form]
   (when (seq? form)
     (cond
       (= 'loop (first form))
       (when-let [{:keys [acc-sym acc-init index-sym then-branch else-expr update-expr bound-expr]} (patterns/match-reduce-loop form)]
-        (let [full-body (if (and (seq? then-branch)
-                                 (contains? #{'let 'let*} (first then-branch)))
-                          then-branch
-                          update-expr)
-              ewise? (body-element-wise? full-body index-sym nil)]
-          (when ewise?
-            {:acc acc-sym
-             :init acc-init
-             :idx index-sym
-             :bound bound-expr
-             :body full-body
-             :post-fn (when (not= else-expr acc-sym) else-expr)})))
+        (when (and
+               ;; (1) no dropped effects: the consequent is a DIRECT recur, not a
+               ;;     do/let that could carry side effects or hidden acc-deps.
+               (seq? then-branch) (= 'recur (first then-branch))
+               ;; (2) bound is loop-invariant — must not reference index or acc.
+               (not (contains-sym? bound-expr index-sym))
+               (not (contains-sym? bound-expr acc-sym))
+               ;; (3) shape: update is (⊕ acc e), ⊕ reassoc-tolerant, e acc-free.
+               (reduction-update-ok? update-expr acc-sym)
+               ;; (4) e is pure, so reordering the reduction is observationally safe.
+               (pure-elem? update-expr)
+               ;; (5) all array reads are at the index; no aset; no cross-index reads.
+               (body-element-wise? update-expr index-sym nil)
+               ;; (6) the exit value depends only on acc + invariants, never the
+               ;;     index (which would otherwise escape its loop scope).
+               (not (contains-sym? else-expr index-sym)))
+          {:acc acc-sym
+           :init acc-init
+           :idx index-sym
+           :bound bound-expr
+           :body update-expr
+           :post-fn (when (not= else-expr acc-sym) else-expr)}))
 
       (contains? #{'let 'let*} (first form))
       (let [[_ bindings-vec & body-exprs] form]
@@ -320,6 +386,33 @@
   [expr]
   {:expr expr :stats (empty-stats)})
 
+(declare lift-parallel-forms)
+
+(defn- lift-expr
+  "Try to lift a single expression that may contain walker-devirtualized .invk
+  ops. The pattern matchers are metadata-aware (they recover op identity from
+  :raster.op/original via descriptor/semantic-op), so matching runs DIRECTLY on
+  the original form — no rewriting. If it classifies as a liftable loop, emit the
+  par form whose body is the ORIGINAL .invk subforms, preserving the typed
+  invokedynamic dispatch the backend relies on. Otherwise return orig unchanged,
+  recursing into nested let/loop.
+
+  This is why we never globally denorm: rewriting .invk → bare ops would both
+  de-devirtualize surrounding calls (backend type miscompiles, e.g. [D as [S)
+  and drop the invokedynamic path for lifted bodies (boxed IFn dispatch)."
+  [orig]
+  (let [k (classify-loop-form orig)]
+    (cond
+      (contains? #{:nested-map :map :scan :reduce} k)
+      (rewrite-binding-expr orig)
+
+      (let-form? orig)
+      (let [inner (lift-parallel-forms orig)]
+        {:expr (:form inner) :stats (:stats inner)})
+
+      :else
+      {:expr orig :stats (empty-stats)})))
+
 (defn lift-parallel-forms
   "Scan a flat let* form for loop patterns that can be lifted into raster.par nodes.
 
@@ -332,24 +425,24 @@
   Returns {:form new-form :stats {:maps-detected N :reduces-detected N :scans-detected N}}"
   [let-form]
   (if-not (let-form? let-form)
-    {:form let-form :stats (empty-stats)}
+    ;; Not a let* — still try to lift a bare loop in expression/body position
+    ;; (e.g. a deftm whose whole body is a reduction loop).
+    (let [{new-expr :expr new-stats :stats} (lift-expr let-form)]
+      {:form new-expr :stats new-stats})
     (let [[let-sym bindings-vec & body-exprs] let-form
           pairs (vec (partition 2 bindings-vec))
           {:keys [pairs stats]}
           (reduce (fn [{:keys [pairs stats]} [sym expr]]
-                    (let [{new-expr :expr new-stats :stats} (rewrite-binding-expr expr)]
+                    (let [{new-expr :expr new-stats :stats} (lift-expr expr)]
                       {:pairs (conj pairs [sym new-expr])
                        :stats (add-stats stats new-stats)}))
                   {:pairs [] :stats (empty-stats)}
                   pairs)
           {:keys [body stats]}
           (reduce (fn [{:keys [body stats]} expr]
-                    (if (let-form? expr)
-                      (let [inner (lift-parallel-forms expr)]
-                        {:body (conj body (:form inner))
-                         :stats (add-stats stats (:stats inner))})
-                      {:body (conj body expr)
-                       :stats stats}))
+                    (let [{new-expr :expr new-stats :stats} (lift-expr expr)]
+                      {:body (conj body new-expr)
+                       :stats (add-stats stats new-stats)}))
                   {:body [] :stats stats}
                   body-exprs)]
       {:form (list* let-sym (vec (mapcat identity pairs)) body)

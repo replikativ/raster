@@ -260,3 +260,36 @@
       (let [result (bc-fixed-point-test-fn g 1.0 9.0 1e-12 100)]
         (is (< (Math/abs (- result 3.0)) 1e-10)
             (str "BC-compiled sqrt(9) should be 3.0, got " result))))))
+
+;; ================================================================
+;; Loop-lift recovery — differential correctness (Option A)
+;; A hand-written loop/recur reduction must (a) lift to a SIMD par/reduce and
+;; (b) produce the same result as the scalar reference, within FP reassociation
+;; tolerance (the multi-accumulator SIMD reduce reorders the additions).
+;; ================================================================
+
+(deftm handloop-dot
+  [a :- (Array double), b :- (Array double), n :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (raster.numeric/< i n)
+      (recur (raster.numeric/+ i 1)
+             (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget a i)
+                                                     (raster.arrays/aget b i))))
+      acc)))
+
+(deftest handloop-reduce-differential-test
+  (testing "hand-loop dot lifts to SIMD par/reduce and matches scalar within FP tol"
+    (let [expl (with-out-str (pipeline/explain-pipeline (var handloop-dot)))]
+      (is (re-find #"raster.par/reduce" expl) "hand loop should lift to par/reduce")
+      (is (re-find #"simd-reduces 1" expl) "lifted reduce should vectorize"))
+    (let [f (pipeline/compile-aot (var handloop-dot))
+          rng (java.util.Random. 42)
+          n 1000
+          a (double-array (repeatedly n #(.nextGaussian rng)))
+          b (double-array (repeatedly n #(.nextGaussian rng)))
+          a2 (doubles a) b2 (doubles b)
+          expected (loop [i 0 acc 0.0]
+                     (if (< i n) (recur (inc i) (+ acc (* (aget a2 i) (aget b2 i)))) acc))
+          got (double (f a b n))]
+      (is (< (Math/abs (- got (double expected))) 1e-9)
+          (str "lifted=" got " scalar=" expected)))))

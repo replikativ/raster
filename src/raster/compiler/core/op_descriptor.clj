@@ -511,6 +511,110 @@
   [sym]
   (contains? increment-ops sym))
 
+(defn semantic-op
+  "The semantic operator of a call form. For a walker-devirtualized
+   (.invk impl args...) form, returns the original op from :raster.op/original
+   metadata (the sanctioned way to recover meaning — never parse mangled names).
+   Otherwise returns (first form). nil if form is not a call/seq."
+  [form]
+  (when (seq? form)
+    (if (= '.invk (first form))
+      (:raster.op/original (meta form))
+      (first form))))
+
+(defn call-args
+  "The semantic arguments of a call form, skipping the impl receiver for
+   devirtualized (.invk impl args...) forms. Returns a seq (possibly empty)."
+  [form]
+  (when (seq? form)
+    (if (= '.invk (first form)) (nnext form) (rest form))))
+
+(defn affine-step
+  "If `expr` is an affine step of the induction variable `idx-sym` — i.e.
+   (inc idx), (unchecked-inc idx), or (+ idx c) / (+ c idx) with a constant
+   integer c — return the constant stride as a long. Otherwise nil.
+   Works on both bare ops and walker-devirtualized (.invk impl ...) forms via
+   semantic-op/call-args, so no form rewriting is needed for matching."
+  [expr idx-sym]
+  (when (seq? expr)
+    (let [op   (semantic-op expr)
+          args (vec (call-args expr))]
+      (cond
+        (and (increment-op? op)
+             (= 1 (count args))
+             (= idx-sym (first args)))
+        1
+
+        (and (addition-op? op)
+             (= 2 (count args)))
+        (let [[a b] args]
+          (cond
+            (and (= a idx-sym) (integer? b)) (long b)
+            (and (= b idx-sym) (integer? a)) (long a)
+            :else nil))))))
+
+;; --- Strict-less-than (loop bound: i < n maps to range [0,n)) ---
+
+(def less-than-ops
+  "Strict less-than comparisons. A loop guarded by (< i n) iterates [0,n),
+   which is the only bound shape loop-lift rewrites to a [0,bound) SOAC.
+   Listed per surface variant (bare / clojure.core / raster.numeric), matching
+   the convention of the other classification sets in this namespace."
+  #{'< 'clojure.core/< 'raster.numeric/<})
+
+(defn less-than-op?
+  "True if sym is a strict less-than comparison."
+  [sym]
+  (contains? less-than-ops sym))
+
+;; --- Algebraic properties (:algebra facet; loop-lift reduction eligibility) ---
+
+(defn register-algebra!
+  "Register the algebraic properties of a binary operator as the :algebra facet:
+     {:associative? bool :commutative? bool :identity expr}
+   Merged into the unified op-descriptor registry, so adding a new reducible op
+   is a single entry — no central set to edit, and other namespaces can declare
+   their own ops the same way."
+  [op-sym algebra]
+  (register-op-descriptor! op-sym {:algebra algebra}))
+
+(defn algebra-facet
+  "The :algebra facet for op-sym, or nil. Looks up the exact (qualified) symbol;
+   loop-lift queries with descriptor/semantic-op, which yields clean op symbols."
+  [op-sym]
+  (:algebra (get-op-descriptor op-sym)))
+
+(defn commutative-monoid-op?
+  "True iff op-sym is a registered commutative monoid — ASSOCIATIVE *and*
+   COMMUTATIVE. This is the precise precondition for lowering a loop/recur
+   reduction into a reordered, multi-accumulator SIMD reduce: that reduce both
+   regroups (needs associativity) and interleaves operands across lanes (needs
+   commutativity). - and / qualify as neither (acc-e = init-Σe is a sum in
+   disguise; acc/e a product) and are correctly absent → they bail to a scalar
+   loop. Unregistered ops also bail (conservative; never a miscompile).
+
+   Note on floats: +/* are associative only in exact arithmetic; lifting accepts
+   the last-ULP reorder, the same global trade par/reduce! already makes (min,
+   max, and the integer bitwise monoids are exact)."
+  [op-sym]
+  (let [a (algebra-facet op-sym)]
+    (boolean (and a (:associative? a) (:commutative? a)))))
+
+;; The numeric commutative monoids and the integer bitwise monoids, registered
+;; for every surface variant (bare / clojure.core / raster.numeric).
+(doseq [[base algebra]
+        {'+       {:associative? true :commutative? true :identity 0}
+         '*       {:associative? true :commutative? true :identity 1}
+         'min     {:associative? true :commutative? true :identity nil}
+         'max     {:associative? true :commutative? true :identity nil}
+         'bit-and {:associative? true :commutative? true :identity -1}
+         'bit-or  {:associative? true :commutative? true :identity 0}
+         'bit-xor {:associative? true :commutative? true :identity 0}}
+        v    [base
+              (symbol "clojure.core" (name base))
+              (symbol "raster.numeric" (name base))]]
+  (register-algebra! v algebra))
+
 ;; --- Devirtualization detection ---
 
 (defn undevirtualized-call?
