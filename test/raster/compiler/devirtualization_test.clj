@@ -34,6 +34,7 @@
     ;; These must be exactly 0 — any runtime-dispatched numeric op in these tight
     ;; loops is a type-transport regression (e.g. TC not run in the source ns).
     (doseq [v [#'umap/optimize-layout!
+               #'graph/smooth-knn-dist!     ; inline (if ...) result now typed
                #'graph/membership-strengths!
                #'nnd/cos-dist
                #'nnd/local-join!]]
@@ -43,13 +44,7 @@
                  devirtualized " devirtualized) — type-transport regression on the "
                  "lazy-JIT path; check that TC binding types reach the walker"))))))
 
-(deftest known-residual-dispatch
-  (testing "kernels with a known, tracked residual dispatch do not regress further"
-    ;; smooth-knn-dist! has 1 dispatched op: (+ s (if ...)) — the inline (if ...)
-    ;; subexpression is not a let-binding so it carries no TC binding-tag, and the
-    ;; structural fallback doesn't type if/let/do results. Tracked as the broader
-    ;; inline-subexpression typing gap. The bound catches any *new* regression.
-    (let [{:keys [dispatched]} (dispatch-counts #'graph/smooth-knn-dist!)]
-      (is (<= dispatched 1)
-          (str "smooth-knn-dist! dispatched=" dispatched " (expected <=1); a new "
-               "type-transport regression appeared")))))
+;; NOTE: analyze-devirtualization currently only detects un-devirtualized
+;; raster.numeric/raster.math ops, NOT un-devirtualized user-deftm calls (e.g.
+;; byte-dist inside local-join-bytes!, which still runs via runtime dispatch).
+;; Extending it to flag user-deftm dispatch is tracked follow-up work.
