@@ -196,7 +196,10 @@
          (mapv deref)
          (reduce clojure.core/+))))
 
-;; sort each point's k entries ascending by distance; emit idx + -log2(cos).
+;; sort each point's k entries ascending by stored distance (-cos), then emit the
+;; raw -cos values (unfilled heap slots stay Double/MAX_VALUE). cosine-knn applies
+;; neg-cos->log2! once to convert to -log2(cos) (1e308 for far/unfilled) — matching
+;; the brute path. (Converting here too would double-convert and destroy the graph.)
 (deftm finalize!
   [dist :- (Array double) ind :- (Array int) n :- Long k :- Long
    out-idx :- (Array int) out-dst :- (Array double)] :- (Array int)
@@ -214,15 +217,15 @@
           (recur (inc a))))
       (dotimes [t k]
         (aset out-idx (+ ib t) (aget ind (+ ib t)))
-        (let [cosv (- 0.0 (aget dist (+ ib t)))]
-          (aset out-dst (+ ib t) (if (> cosv 0.0) (- 0.0 (rm/log2 cosv)) 0.0))))))
+        (aset out-dst (+ ib t) (aget dist (+ ib t))))))
   out-idx)
 
 ;; --- orchestrator ---
 (defn nn-descent
   "Approximate cosine kNN of X (flat n*dim, will be L2-normalized in place).
    n-trees RP-trees + random init, then n-iters local-join refinement.
-   Returns {:idx int[n*k] :dst double[n*k] (-log2 cos, self first)}."
+   Returns {:idx int[n*k] :dst double[n*k] (raw -cos, self first)}; cosine-knn
+   applies neg-cos->log2! to convert to -log2(cos)."
   ;; X may be double[] or float[] — the kernels are parametric (All [T]).
   [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads]
                :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1}}]
