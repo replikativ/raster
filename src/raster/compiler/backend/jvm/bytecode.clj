@@ -1743,6 +1743,11 @@
               "==" (.ifeq code true-label) "not=" (.ifne code true-label))))))
     ;; Return Boolean.FALSE/TRUE (not int 0/1) so Clojure truthiness works.
     ;; int 0 is truthy in Clojure, which breaks (and (> j 0) ...) short-circuit.
+    ;; NOTE: keeping this boxed avoids a latent stack-map bug in emit-if-handler's
+    ;; branch-merge (the skip-box? prediction goes inconsistent when comparison
+    ;; branches are :bool in value position) — see option B follow-up. Branch
+    ;; contexts (if/loop/when tests) never reach here: they branch-fold instead
+    ;; (incl. devirtualized .invk comparisons, comparison-pred-parts below).
     (.getstatic code (ClassDesc/of "java.lang" "Boolean") "FALSE"
                 (ClassDesc/of "java.lang" "Boolean"))
     (.goto_ code end-label)
@@ -2876,6 +2881,37 @@
                     locals pairs)]
     (emit-body code body new-locals ctx)))
 
+(defn- comparison-pred-parts
+  "Return [op-name arg1 arg2] when `pred` is a 2-arg comparison the if-handler can
+   branch-fold to IF_ICMPxx — whether written bare/qualified (`(< a b)`,
+   `(raster.numeric/< a b)`) or devirtualized by the walker to `.invk`
+   (`(.invk raster.numeric/_lt__m_long_long-impl a b)`). Folding the .invk form is
+   essential for hot loops: otherwise every loop/`if` test compiles to an
+   invokedynamic call into the comparison impl (which boxes through
+   Boolean.TRUE/FALSE) instead of a single IF_ICMPxx — and C2's counted-loop
+   recognition needs the IF_ICMPxx at the back-edge."
+  [pred]
+  (when (and (seq? pred) (symbol? (first pred)))
+    (let [h (first pred)]
+      (cond
+        (and (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h))
+             (= 2 (count (rest pred))))
+        [(name h) (nth pred 1) (nth pred 2)]
+
+        ;; devirtualized, pre-macroexpand: (.invk impl a b)
+        (and (= '.invk h) (= 3 (count (rest pred))) (symbol? (second pred)))
+        (when-let [op (util/impl->op (second pred))]
+          (when (contains? #{"<" "<=" ">" ">=" "==" "not="} (name op))
+            [(name op) (nth pred 2) (nth pred 3)]))
+
+        ;; devirtualized, post-macroexpand dot-form: (. impl invk a b)
+        ;; (macroexpand-all-preserving rewrites (.invk impl a b) to this)
+        (and (= '. h) (= 4 (count (rest pred)))
+             (= 'invk (nth pred 2)) (symbol? (nth pred 1)))
+        (when-let [op (util/impl->op (nth pred 1))]
+          (when (contains? #{"<" "<=" ">" ">=" "==" "not="} (name op))
+            [(name op) (nth pred 3) (nth pred 4)]))))))
+
 (defn- emit-if-handler
   "Emit bytecode for (if pred then else).
   Handles branch folding for int/long/double comparisons, Clojure truthiness
@@ -2887,16 +2923,15 @@
         ;; Branch folding: if pred is (< a b), emit IF_ICMPGE directly
         ;; instead of materializing boolean. Critical for C2 counted loop
         ;; recognition which requires IF_ICMPxx at the loop back-edge.
+        cmp-parts (comparison-pred-parts pred)
         branch-folded?
-        (when (and (seq? pred) (symbol? (first pred)))
-          (let [pn (name (first pred))]
-            (when (and (contains? #{"<" "<=" ">" ">=" "==" "not="} pn)
-                       (= 2 (count (rest pred))))
-              (let [a1 (nth pred 1) a2 (nth pred 2)
-                    val-ctx (dissoc ctx :void-context)
-                    t1 (emit-form code a1 locals val-ctx)
-                    t2 (emit-form code a2 locals val-ctx)]
-                (cond
+        (when cmp-parts
+          (let [pn (nth cmp-parts 0)
+                a1 (nth cmp-parts 1) a2 (nth cmp-parts 2)
+                val-ctx (dissoc ctx :void-context)
+                t1 (emit-form code a1 locals val-ctx)
+                t2 (emit-form code a2 locals val-ctx)]
+            (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
                   (and (= t1 :int) (= t2 :int))
                   (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
@@ -2939,7 +2974,7 @@
                     (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
                           ">" (.ifle code else-label) ">=" (.iflt code else-label)
                           "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                    true))))))
+                    true))))
         ;; Predicate must always produce a value (to branch on),
         ;; so strip :void-context from ctx.
         pred-type (when-not branch-folded?
