@@ -72,6 +72,7 @@
 (def ^:private int-box-cd  (ClassDesc/ofDescriptor "Ljava/lang/Integer;"))
 (def ^:private long-box-cd (ClassDesc/ofDescriptor "Ljava/lang/Long;"))
 (def ^:private dbl-box-cd  (ClassDesc/ofDescriptor "Ljava/lang/Double;"))
+(def ^:private bool-box-cd (ClassDesc/ofDescriptor "Ljava/lang/Boolean;"))
 (def ^:private ifn-cd (ClassDesc/ofDescriptor "Lclojure/lang/IFn;"))
 (def ^:private var-cd (ClassDesc/ofDescriptor "Lclojure/lang/Var;"))
 (def ^:private rt-cd  (ClassDesc/ofDescriptor "Lclojure/lang/RT;"))
@@ -231,8 +232,8 @@
           (if (every? #(= :float (infer-arg-stack-type % locals)) args)
             :float
             :double))
-        ;; Comparison ops produce :ref (Boolean.TRUE/FALSE from emit-comparison)
-        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :ref
+        ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
+        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
         ;; Only returns a primitive type when BOTH branches are known
         ;; to produce the same primitive. Conservative: returns nil when
@@ -828,6 +829,8 @@
                                                                               (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
                                                        :int    (.invokestatic code int-box-cd "valueOf"
                                                                               (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                                                       :bool   (.invokestatic code bool-box-cd "valueOf"
+                                                                              (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [Z-cd])))
                                                        :long   (.invokestatic code long-box-cd "valueOf"
                                                                               (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
                                                        :void   (.aconst_null code)
@@ -1106,6 +1109,8 @@
                                                                                    (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
                                                            :int     (.invokestatic code int-box-cd "valueOf"
                                                                                    (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                                                           :bool    (.invokestatic code bool-box-cd "valueOf"
+                                                                                   (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [Z-cd])))
                                                            :long    (.invokestatic code long-box-cd "valueOf"
                                                                                    (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
                                                            :void    (.aconst_null code)
@@ -1741,21 +1746,18 @@
               "<"  (.iflt code true-label) "<=" (.ifle code true-label)
               ">"  (.ifgt code true-label) ">=" (.ifge code true-label)
               "==" (.ifeq code true-label) "not=" (.ifne code true-label))))))
-    ;; Return Boolean.FALSE/TRUE (not int 0/1) so Clojure truthiness works.
-    ;; int 0 is truthy in Clojure, which breaks (and (> j 0) ...) short-circuit.
-    ;; NOTE: keeping this boxed avoids a latent stack-map bug in emit-if-handler's
-    ;; branch-merge (the skip-box? prediction goes inconsistent when comparison
-    ;; branches are :bool in value position) — see option B follow-up. Branch
-    ;; contexts (if/loop/when tests) never reach here: they branch-fold instead
-    ;; (incl. devirtualized .invk comparisons, comparison-pred-parts below).
-    (.getstatic code (ClassDesc/of "java.lang" "Boolean") "FALSE"
-                (ClassDesc/of "java.lang" "Boolean"))
+    ;; Produce primitive int 0/1 (:bool), NOT a boxed Boolean — matching the
+    ;; type-predicate emitters above and Clojure's own intrinsic comparison
+    ;; codegen. Consumers branch on :bool directly (if/when/loop → ifeq, 0=false)
+    ;; or box at an Object boundary via emit-coerce [:bool :ref] (Boolean.valueOf,
+    ;; 0→Boolean.FALSE preserves truthiness). Eager Boolean.TRUE/FALSE boxing made
+    ;; every comparison impl a 22-byte box→unbox round-trip C2 won't inline.
+    (.ldc code (int 0))
     (.goto_ code end-label)
     (.labelBinding code true-label)
-    (.getstatic code (ClassDesc/of "java.lang" "Boolean") "TRUE"
-                (ClassDesc/of "java.lang" "Boolean"))
+    (.ldc code (int 1))
     (.labelBinding code end-label)
-    :ref))
+    :bool))
 
 (defn- emit-minmax
   "Emit min/max bytecode. Variadic: (min a b c) → Math.min(Math.min(a, b), c).
@@ -2108,7 +2110,7 @@
     (let [t    (emit-form code (first args) locals ctx)
           inc? (contains? #{"inc" "unchecked-inc" "unchecked-inc-int"} head-name)]
       (case t
-        :int    (do (.ldc code (int 1))  (if inc? (.iadd code) (.isub code)) :int)
+        (:int :bool) (do (.ldc code (int 1))  (if inc? (.iadd code) (.isub code)) :int)
         :long   (do (.ldc code (long 1)) (if inc? (.ladd code) (.lsub code)) :long)
         :double (do (.ldc code 1.0)      (if inc? (.dadd code) (.dsub code)) :double)
         :float  (do (.ldc code (float 1.0)) (if inc? (.fadd code) (.fsub code)) :float)
@@ -2918,6 +2920,13 @@
   for refs, and type merging between branches (boxing only when needed)."
   [code args locals ctx]
   (let [[pred then else] args
+        ;; Distinguish a PRESENT else expression from a falsy else VALUE: `else`
+        ;; can legitimately be the literal `false` or `nil` (e.g. and/or fusion
+        ;; emits `(if cmp then false)`), so `(if else …)` truthiness would wrongly
+        ;; treat those as "no else branch" and push null instead of emitting them
+        ;; — a latent bug that surfaced as a stack-map mismatch once comparison
+        ;; then-branches became primitive :bool. Key off the arg count instead.
+        has-else? (>= (count args) 3)
         else-label (.newLabel code)
         end-label  (.newLabel code)
         ;; Branch folding: if pred is (< a b), emit IF_ICMPGE directly
@@ -3003,7 +3012,7 @@
         ;; Then branch diverges (throw/recur) — never falls through.
         ;; No goto needed. Else branch is the only value-producing path.
         (do (.labelBinding code else-label)
-            (let [else-type (if else
+            (let [else-type (if has-else?
                               (emit-form code else locals ctx)
                               (do (.aconst_null code) :ref))]
               (when (primitive? else-type)
@@ -3019,7 +3028,7 @@
         ;; (Integer(0) is truthy, but int 0 with ifeq is correctly falsy).
         :else
         (let [else-type-pred (cond
-                               (nil? else) :ref
+                               (not has-else?) :ref
                                (symbol? else) (:type (get locals else))
                                :else (infer-arg-stack-type else locals))
               skip-box? (and (primitive? then-type)
@@ -3032,7 +3041,7 @@
             (emit-box-to-ref code then-type))
           (.goto_ code end-label)
           (.labelBinding code else-label)
-          (let [else-type (if else
+          (let [else-type (if has-else?
                             (emit-form code else locals ctx)
                             (do (.aconst_null code) :ref))]
             (cond
