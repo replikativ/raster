@@ -210,25 +210,42 @@
 ;; Pass functions — each takes (form, opts) → form or {:form :stats}
 ;; ================================================================
 
+(defn- effect-bindings-for
+  "Bind each effect statement to a fresh effectful throwaway, preserving order.
+   (effect1) (effect2) → [_eff1 (effect1) _eff2 (effect2)]"
+  [effects]
+  (vec (mapcat (fn [eff]
+                 [(with-meta (gensym "_eff_") {:raster.effect/effectful true}) eff])
+               effects)))
+
 (defn- normalize-let-body
-  "Convert multi-body let/let* to single-body let* with effect bindings.
+  "Normalize a body to a single-result let* form, lifting statement effects into
+   effectful bindings (so order/effects survive DCE and the let*-only dialects).
    (let [a 1] (effect1) (effect2) result)
    → (let* [a 1 _eff1 (effect1) _eff2 (effect2)] result)
-   Only applies when there are multiple body expressions."
+   (do (effect1) result)        → (let* [_eff1 (effect1)] result)
+   A multi-statement `do` is the shape a multi-form deftm body walks to (e.g.
+   `(dotimes ...) ret`); without this it reaches the :fixpointed dialect as a bare
+   `do` and fails the let* check (compile-aot of any multi-form kernel)."
   [form]
-  (if-not (form/binding-form? form)
-    form
-    (let [[head bindings & body-exprs] form]
+  (cond
+    ;; (do e1 ... ret) — multi-statement do → let* with effect bindings
+    (and (seq? form) (= 'do (first form)))
+    (let [body-exprs (rest form)]
+      (cond
+        (empty? body-exprs) form
+        (= 1 (count body-exprs)) (recur (first body-exprs))   ; (do x) → normalize x
+        :else (list 'let* (effect-bindings-for (butlast body-exprs)) (last body-exprs))))
+
+    (not (form/binding-form? form)) form
+
+    :else
+    (let [[_head bindings & body-exprs] form]
       (if (<= (count body-exprs) 1)
         form ;; Already single-body — leave as-is
         ;; Multi body — lift effects into bindings
-        (let [effects (butlast body-exprs)
-              result (last body-exprs)
-              effect-bindings (vec (mapcat (fn [eff]
-                                             [(with-meta (gensym "_eff_") {:raster.effect/effectful true})
-                                              eff])
-                                           effects))]
-          (list 'let* (vec (concat bindings effect-bindings)) result))))))
+        (list 'let* (vec (concat bindings (effect-bindings-for (butlast body-exprs))))
+              (last body-exprs))))))
 
 (defn- tag-expr-types
   "Recursively attach :tag metadata to expressions whose type is inferrable.
@@ -318,6 +335,20 @@
     (vector? form) (some has-undevirtualized-calls? form)
     :else false))
 
+(defn- ensure-let*-result
+  "Normalize a form to a let* so the flat-let* dialects accept it. A multi-form
+   deftm body walks to a bare `do`, and a single-expression body (a `loop`, `if`,
+   call, …) is also valid IR — but PE collapses the empty `(let* [] …)` wrapper
+   pass-lower adds (pe.clj returns the bare body when all bindings are eliminated),
+   leaving a non-let* top form that fails validation. Re-wrap here (post-PE, so it
+   survives): `do` → effect-binding let*; any other non-binding form → bind the
+   result to a gensym. The final emission (compile!) likewise wraps non-let* forms."
+  [form]
+  (let [norm (normalize-let-body form)]
+    (if (form/binding-form? norm)
+      norm
+      (let [g (gensym "_ret_")] (list 'let* [g norm] g)))))
+
 (defn- pass-fixpoint
   "Fixpoint pass: expand → normalize → rewalk → PE+CSE until stable.
 
@@ -339,7 +370,7 @@
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        {:form current :stats total-stats}
+        {:form (ensure-let*-result current) :stats total-stats}
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
                          (inline/expand-for-backends current 3 (:param-env opts)))
@@ -359,7 +390,7 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            {:form current :stats (assoc total-stats :fixpoint-iterations iter)}
+            {:form (ensure-let*-result current) :stats (assoc total-stats :fixpoint-iterations iter)}
             (recur rewalked (inc iter)
                    (assoc total-stats :fixpoint-iterations (inc iter)))))))))
 
