@@ -274,8 +274,15 @@
 (defn cosine-knn
   "Cosine kNN that auto-selects exact brute-force (small n) vs approximate
    NN-descent (large n). Returns {:idx :dst} (dst = -log2 cos, self first),
-   matching knn_graph's float path. X is L2-normalized in place either way."
-  [X n dim k & {:keys [threshold] :or {threshold 4096}}]
+   matching knn_graph's float path. X is L2-normalized in place either way.
+
+   :n-threads parallelizes the NN-descent path (per-tree RP-forest build + block-
+   owned local-join, Hogwild-tolerant — like pynndescent's parallel mode, which is
+   also non-deterministic). Defaults to all cores; the per-op scalar cos-dist dot
+   is at the JVM floor, so multicore is the lever that matches numba (~2.8x @8c)."
+  [X n dim k & {:keys [threshold n-threads]
+                :or {threshold 4096
+                     n-threads (.availableProcessors (Runtime/getRuntime))}}]
   (let [n (long n) dim (long dim) k (long k)]
     ;; cos-dist (and knn-brute-cosine!) both assume L2-normalized rows, so
     ;; normalize once up front — covers BOTH paths (norms vary in real data).
@@ -284,7 +291,7 @@
       (let [oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
         (knn/knn-brute-cosine! X n dim k oi od)
         {:idx oi :dst od})
-      (let [r (nn-descent X n dim k)]
+      (let [r (nn-descent X n dim k :n-threads n-threads)]
         (neg-cos->log2! (:dst r) (clojure.core/* n k))
         r))))
 
