@@ -29,6 +29,7 @@
 (def ^:private simd-unary-ops descriptor/simd-unary-ops)
 (def ^:private simd-lanewise-unary-ops descriptor/simd-lanewise-unary-ops)
 (def ^:private simd-binary-ops descriptor/simd-binary-ops)
+(def ^:private simd-lanewise-binary-ops descriptor/simd-lanewise-binary-ops)
 (def ^:private simd-ternary-ops descriptor/simd-ternary-ops)
 
 (def ^:private simd-compare-ops
@@ -242,6 +243,7 @@
             (contains? simd-unary-ops math-sym) [1 math-sym]
             (contains? simd-lanewise-unary-ops math-sym) [1 math-sym]
             (contains? simd-binary-ops math-sym) [2 math-sym]
+            (contains? simd-lanewise-binary-ops math-sym) [2 math-sym]
             (contains? simd-ternary-ops math-sym) [3 math-sym]))
         ;; raster.numeric/* → try both clojure.core/* and bare *
         (= ns-str "raster.numeric")
@@ -252,6 +254,7 @@
             (contains? simd-unary-ops core-sym) [1 core-sym]
             (contains? simd-binary-ops bare-sym) [2 bare-sym]
             (contains? simd-binary-ops core-sym) [2 core-sym]
+            (contains? simd-lanewise-binary-ops bare-sym) [2 bare-sym]
             (contains? simd-ternary-ops bare-sym) [3 bare-sym]
             (contains? simd-ternary-ops core-sym) [3 core-sym]))
         :else nil))))
@@ -279,6 +282,10 @@
     (simd-able? (second expr) idx-sym)
     (and (seq? expr) (= 3 (count expr))
          (contains? simd-binary-ops (first expr)))
+    (and (simd-able? (nth expr 1) idx-sym)
+         (simd-able? (nth expr 2) idx-sym))
+    (and (seq? expr) (= 3 (count expr))
+         (contains? simd-lanewise-binary-ops (first expr)))
     (and (simd-able? (nth expr 1) idx-sym)
          (simd-able? (nth expr 2) idx-sym))
     (and (seq? expr) (= 4 (count expr))
@@ -450,6 +457,11 @@
       (and (seq? expr) (= 3 (count expr)) (contains? simd-binary-ops (first expr)))
       (list (simd-binary-ops (first expr)) (recur-fn (nth expr 1)) (recur-fn (nth expr 2)))
 
+      ;; binary lanewise (pow via SVML POW): base.lanewise(OP, argVec)
+      (and (seq? expr) (= 3 (count expr)) (contains? simd-lanewise-binary-ops (first expr)))
+      (list '.lanewise (recur-fn (nth expr 1)) (simd-lanewise-binary-ops (first expr))
+            (recur-fn (nth expr 2)))
+
       (and (seq? expr) (= 4 (count expr)) (contains? simd-ternary-ops (first expr)))
       (list (simd-ternary-ops (first expr))
             (recur-fn (nth expr 1)) (recur-fn (nth expr 2)) (recur-fn (nth expr 3)))
@@ -504,9 +516,13 @@
                 (list (simd-unary-ops op-sym) (recur-fn (first args)))
                 (contains? simd-lanewise-unary-ops op-sym)
                 (list '.lanewise (recur-fn (first args)) (simd-lanewise-unary-ops op-sym)))
-            2 (when (contains? simd-binary-ops op-sym)
+            2 (cond
+                (contains? simd-binary-ops op-sym)
                 (list (simd-binary-ops op-sym)
-                      (recur-fn (first args)) (recur-fn (second args))))
+                      (recur-fn (first args)) (recur-fn (second args)))
+                (contains? simd-lanewise-binary-ops op-sym)
+                (list '.lanewise (recur-fn (first args))
+                      (simd-lanewise-binary-ops op-sym) (recur-fn (second args))))
             3 (when (contains? simd-ternary-ops op-sym)
                 (list (simd-ternary-ops op-sym)
                       (recur-fn (first args))

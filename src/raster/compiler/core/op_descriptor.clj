@@ -398,13 +398,24 @@
   "Ternary ops (fma)."
   {'Math/fma '.fma})
 
+(def simd-lanewise-binary-ops
+  "Binary ops using lanewise VectorOperators — base.lanewise(OP, argVec).
+   POW is lowered through Intel SVML (x64) / SLEEF (ARM) by the JVM, giving a
+   fully vectorized accurate pow. Both raster.numeric/pow and fast-pow map here:
+   in vector code SVML POW is both accurate and fast, so the scalar fast-pow
+   polynomial isn't needed."
+  {'Math/pow  'jdk.incubator.vector.VectorOperators/POW
+   'pow       'jdk.incubator.vector.VectorOperators/POW
+   'fast-pow  'jdk.incubator.vector.VectorOperators/POW})
+
 (defn simd-capable?
   "True if sym has a SIMD equivalent."
   [sym]
   (or (contains? simd-unary-ops sym)
       (contains? simd-lanewise-unary-ops sym)
       (contains? simd-binary-ops sym)
-      (contains? simd-ternary-ops sym)))
+      (contains? simd-ternary-ops sym)
+      (contains? simd-lanewise-binary-ops sym)))
 
 ;; --- Array access ---
 
