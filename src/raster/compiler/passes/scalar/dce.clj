@@ -37,6 +37,17 @@
         #{buf-arg}
         (extract-mutation-targets buf-arg)))
 
+    ;; Array writes (aset / clojure.core/aset / raster.arrays/aset!) mutate their
+    ;; FIRST arg (the array). Without this, a `_`-bound array-fill loop whose value
+    ;; is unused is wrongly eliminated as dead — leaving the array unwritten.
+    (and (seq? expr)
+         (symbol? (first expr))
+         (>= (count expr) 2)
+         (descriptor/aset-op? (first expr)))
+    (if (symbol? (second expr))
+      #{(second expr)}
+      (extract-mutation-targets (second expr)))
+
     (and (seq? expr)
          (symbol? (first expr))
          (>= (count expr) 2)
