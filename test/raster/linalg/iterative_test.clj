@@ -1,6 +1,7 @@
 (ns raster.linalg.iterative-test
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.linalg.iterative :refer [cg gmres bicgstab pcg jacobi-precond lanczos]]
+            [raster.linalg.iterative :refer [cg gmres bicgstab pcg jacobi-precond lanczos
+                                             lanczos-tridiag]]
             [raster.core :refer [ftm]]))
 
 (def ^:const TOL 1e-3)
@@ -439,3 +440,17 @@
           evals (aget ^objects res 0)]
       (is (approx= 3.41421 (aget ^doubles evals 0) 1e-3))
       (is (approx= 2.0     (aget ^doubles evals 1) 1e-3)))))
+
+(deftest lanczos-early-termination-test
+  (testing "lanczos-tridiag stops well before maxiter once the k wanted Ritz pairs
+            converge (Ritz-residual check), instead of always running maxiter steps"
+    (let [dn 60
+          mv (ftm [x :- (Array double) y :- (Array double)] :- (Array double)
+                  (dotimes [i dn] (aset y i (* (+ (double i) 1.0) (aget x i))))
+                  y)
+          maxit 300
+          alpha (double-array maxit) beta (double-array maxit)
+          V (double-array (* maxit dn)) w (double-array dn)
+          am (long (lanczos-tridiag mv alpha beta V w dn maxit 1e-6 3))]
+      (is (> am 3) "must build at least k+1 vectors")
+      (is (< am 100) (str "should converge early, took " am " of " maxit " steps")))))

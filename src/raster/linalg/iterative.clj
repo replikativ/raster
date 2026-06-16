@@ -370,6 +370,37 @@
 
 ;; --- Lanczos helpers (split for JVM 64KB method limit + JIT friendliness) ---
 
+;; Convergence test for the k largest-|theta| Ritz pairs of a tridiagonal whose
+;; eigenpairs are (evals[i], row i of evecs). For a symmetric Lanczos basis the
+;; residual of Ritz pair i as an eigenpair of the full operator is exactly
+;; beta_{m+1} * |s_i[last]| (no need to form the Ritz vector). Converged when every
+;; wanted pair's residual is below tol * |theta|_max. This is the ARPACK criterion
+;; and lets the iteration stop as soon as the wanted end of the spectrum resolves.
+(deftm ritz-converged?
+  [evals :- (Array double) evecs :- (Array double) m :- Long
+   bnext :- Double k :- Long tol :- Double] :- Boolean
+  (let [tmax   (loop [i 0 mx 0.0]
+                 (if (< i m) (recur (inc i) (Math/max mx (n/abs (aget evals i)))) mx))
+        thresh (* tol (Math/max 1.0e-30 tmax))
+        kk     (int (Math/min (long k) m))
+        used   (int-array m)]
+    (loop [picked 0]
+      (if (>= picked kk)
+        true
+        ;; pick the unused index with the largest |theta|
+        (let [bi (loop [i 0 best -1 bestv -1.0]
+                   (if (< i m)
+                     (if (and (zero? (aget used i)) (> (n/abs (aget evals i)) bestv))
+                       (recur (inc i) i (n/abs (aget evals i)))
+                       (recur (inc i) best bestv))
+                     best))]
+          (if (< bi 0)
+            true
+            (let [resid (* bnext (n/abs (aget evecs (+ (* bi m) (- m 1)))))]
+              (if (>= resid thresh)
+                false
+                (do (aset used bi 1) (recur (inc picked)))))))))))
+
 (deftm lanczos-tridiag
   "Lanczos iteration with full reorthogonalization.
   Builds tridiagonal matrix (alpha, beta-arr) and orthonormal basis V.
@@ -377,7 +408,7 @@
   (All [T] [matvec-fn :- (Fn [(Array T) (Array T)] (Array T))
             alpha :- (Array double) beta-arr :- (Array double)
             V :- (Array double) w :- (Array T)
-            n :- Long m :- Long tol :- Double] :- Long
+            n :- Long m :- Long tol :- Double k :- Long] :- Long
        (let [;; Initialize v1 = random unit vector
              _ (let [v0 (double-array n)]
                  (dotimes [i n]
@@ -425,8 +456,26 @@
                                 (aset w i (- (aget w i)
                                              (* coeff (aget V (+ vp-off i))))))))
               ;; beta[j+1] = ||w||
-                   bnext  (vec-norm2 w n)]
+                   bnext  (vec-norm2 w n)
+              ;; Ritz convergence check (periodic, after a 2k warmup): build the
+              ;; current (j+1)x(j+1) tridiagonal, eigh it, and test the k wanted
+              ;; pairs. Cheap when convergence is early; lets us stop well short of m.
+                   msize  (int (+ j 1))
+                   converged
+                   (if (and (>= msize (* 2 k)) (< msize m)
+                            (zero? (rem msize 8)))
+                     (let [Tm (double-array (* msize msize))
+                           _  (dotimes [i msize]
+                                (aset Tm (+ (* i msize) i) (aget alpha i))
+                                (when (< i (- msize 1))
+                                  (let [b (aget beta-arr (+ i 1))]
+                                    (aset Tm (+ (* i msize) (+ i 1)) b)
+                                    (aset Tm (+ (* (+ i 1) msize) i) b))))
+                           res (eigen/eigh Tm msize)]
+                       (ritz-converged? (aget res 0) (aget res 1) msize bnext k tol))
+                     false)]
                (if (or (< bnext (* tol (n/abs aj)))
+                       converged
                        (>= (+ j 1) m))
                  (long (+ j 1))
                  (let [vj1-off (int (* (+ j 1) n))
@@ -550,7 +599,7 @@
                           beta-arr (double-array m)
                           V        (double-array (* m n))
                           w        (double-array n)
-                          actual-m (lanczos-tridiag matvec-fn alpha beta-arr V w n m tol)
+                          actual-m (lanczos-tridiag matvec-fn alpha beta-arr V w n m tol k)
                           am       (int (long actual-m))
                           d        (double-array am)
                           e        (double-array am)

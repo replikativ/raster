@@ -20,6 +20,10 @@
 (defn median ^double [xs] (let [s (vec (sort xs)) c (count s)] (nth s (quot c 2))))
 
 ;; [tag n data-dim umap-ms]  (umap-ms from spectral_bench.py output)
+;; Latest with Lanczos early-termination (median ms, single machine):
+;;   swiss_1000 30/25 0.86x  swiss_2000 88/84 0.96x  swiss_5000 378/380 1.01x
+;;   mnist_1000 19/42 2.21x  mnist_2000 64/85 1.32x  mnist_5000 80/77 0.97x
+;; (before early-termination mnist_5000 was 880ms = 0.09x — fixed-256-iter Lanczos)
 (def CASES [["swiss_1000" 1000 3  25.35] ["swiss_2000" 2000 3  84.44] ["swiss_5000" 5000 3  379.83]
             ["mnist_1000" 1000 50 42.40] ["mnist_2000" 2000 50 84.90] ["mnist_5000" 5000 50 77.48]])
 (def G "/tmp/umap_gold")
