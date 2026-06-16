@@ -803,6 +803,29 @@
           (contains? types/primitive-info head)
           head
 
+           ;; if/when expression — result type = numeric unification of the
+           ;; branch types (widen mismatched numeric branches to the larger).
+           ;; MUST precede the symbol-head clause below, which would otherwise
+           ;; match 'if (a symbol) and short-circuit to nil. Without this, a
+           ;; local bound to (if …) is untyped → downstream mixed-precision
+           ;; arithmetic on it (double gc × float diff) falls to the boxing
+           ;; variadic dispatch (~96x Valhalla / ~888x GraalVM in float kernels).
+          (= 'if head)
+          (let [branch-tag (fn [b] (or (infer-rewritten-tag b nil type-env)
+                                       (literal-tag b)
+                                       (when (symbol? b) (type-env-tag type-env b))))
+                then-tag (branch-tag (nth rewritten-form 2 nil))
+                else-tag (when (>= (count rewritten-form) 4)
+                           (branch-tag (nth rewritten-form 3)))
+                rank '{int 1 long 2 float 3 double 4}]
+            (cond
+              (nil? else-tag) then-tag
+              (nil? then-tag) else-tag
+              (= then-tag else-tag) then-tag
+              (and (rank then-tag) (rank else-tag))
+              (if (>= (rank then-tag) (rank else-tag)) then-tag else-tag)
+              :else (or (promote-tag then-tag else-tag) then-tag else-tag)))
+
            ;; Devirtualized call
           (and (symbol? head) (not= '.invk head))
           (when-let [v (resolve head)]
@@ -1181,6 +1204,12 @@
    (when-let [t (when (and (seq? init) (contains? alloc-sym->array-tag (first init)))
                   (get alloc-sym->array-tag (first init)))]
      (trace-inferred sym t :array-alloc))
+   ;; if/when result — type from the (walked) branches (see infer-rewritten-tag).
+   ;; A local bound to (if …) is otherwise untyped, forcing downstream
+   ;; mixed-precision arithmetic onto the boxing variadic path.
+   (when-let [t (when (and (seq? rewritten-init) (= 'if (first rewritten-init)))
+                  (infer-rewritten-tag rewritten-init init type-env))]
+     (trace-inferred sym t :if))
    ;; Fn-info return type — TC doesn't know walker fn-info
    (when-let [t (when (and (seq? init) (symbol? (first init)))
                   (when-let [info (type-env-fn-info type-env (first init))]

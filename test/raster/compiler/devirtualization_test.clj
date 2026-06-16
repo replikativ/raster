@@ -36,7 +36,10 @@
     ;; These must be exactly 0 — any runtime-dispatched numeric op in these tight
     ;; loops is a type-transport regression (e.g. TC not run in the source ns).
     ;; [var dtype] — dtype disambiguates parametric (All [T]) overloads.
-    (doseq [[v dtype] [[#'umap/optimize-layout! :double]  ; parametric over emb
+    (doseq [[v dtype] [[#'umap/optimize-layout-chunk! :double] ; parametric over emb
+                       [#'umap/optimize-layout-chunk! :float]  ; f32: mixed double×float
+                                                               ; via if-bound gc must
+                                                               ; devirt (was 888x boxing)
                        [#'graph/smooth-knn-dist! nil]     ; inline (if ...) result now typed
                        [#'graph/membership-strengths! nil]
                        [#'nnd/cos-dist :double]           ; parametric (f32+f64)
