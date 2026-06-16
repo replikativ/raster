@@ -172,6 +172,14 @@
            (= 'raster.par/stencil! resolved)))
     :par-stencil
 
+    (and (seq? form)
+         (let [head (first form)
+               resolved (if (and (symbol? head) (namespace head))
+                          (resolve-aliased-symbol head (:source-ns ctx))
+                          head)]
+           (= 'raster.par/gather resolved)))
+    :par-gather
+
     ;; Pure par/map — first-class IR form (NOT a typed macro)
     (and (seq? form)
          (let [head (first form)
@@ -737,6 +745,32 @@
                             out-tag (assoc :tag out-tag :raster.type/tag out-tag)
                             elem-type (assoc :raster.type/elem-type elem-type)))
         result))))
+
+;; ================================================================
+;; Branch: par/gather (first-class IR — preserved for the SIMD vgather pass,
+;; not macroexpanded to a scalar loop)
+;; ================================================================
+
+(defmethod walk-form :par-gather [form ctx]
+  ;; (raster.par/gather out src index n [stride]) — keep symbolic; the SIMD
+  ;; pass emits a hardware vgather (DoubleVector.fromArray index-map form),
+  ;; else expand-par-gather! lowers it to a scalar loop.
+  (let [args       (vec (rest form))
+        out-sym    (first args)
+        out-tag    (ctx-get-tag ctx out-sym)
+        hinted-out (if (and out-tag (types/array-tag? out-tag))
+                     (stamp-type-meta out-sym out-tag)
+                     out-sym)
+        elem-type  (case out-tag
+                     floats :float doubles :double longs :long ints :int
+                     nil)
+        result     (list* 'raster.par/gather hinted-out
+                          (mapv #(walk % ctx) (rest args)))]
+    (if (or out-tag elem-type)
+      (with-meta result (cond-> {}
+                          out-tag (assoc :tag out-tag :raster.type/tag out-tag)
+                          elem-type (assoc :raster.type/elem-type elem-type)))
+      result)))
 
 ;; ================================================================
 ;; Branch: pure par/map (first-class IR, not typed macro)

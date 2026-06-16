@@ -657,6 +657,45 @@
                   simd-loop)))))))
 
 ;; ================================================================
+;; par/gather → SIMD hardware vgather
+;; ================================================================
+
+(defn compile-par-gather
+  "Compile (raster.par/gather out src index n) to a SIMD vgather loop:
+     out[j..j+L) = src[index[j..j+L)]
+   via DoubleVector.fromArray(species, src, 0, index, j) (hardware vgather),
+   stored contiguously into out, with a scalar tail. Flat (non-strided) form
+   only; returns SIMD S-expr or nil. elem-type ∈ {:double :float}."
+  [out src index n elem-type]
+  (let [{:keys [species-expr from-array]} (get simd-type-info elem-type)
+        vec-tag     (case elem-type :double 'jdk.incubator.vector.DoubleVector
+                          :float 'jdk.incubator.vector.FloatVector)
+        species-sym (vary-meta (gensym "sp__") assoc :tag 'jdk.incubator.vector.VectorSpecies)
+        lanes-sym   (vary-meta (gensym "lanes__") assoc :tag 'long)
+        n-sym       (vary-meta (gensym "n__") assoc :tag 'long)
+        j-sym       (vary-meta (gensym "j__") assoc :tag 'long)
+        gv-sym      (vary-meta (gensym "gv__") assoc :tag vec-tag)]
+    (when species-expr
+      (list 'let* [species-sym species-expr
+                   lanes-sym (list '.length species-sym)
+                   n-sym (list 'int n)]
+            (list 'loop* [j-sym '(int 0)]
+                  (list 'if (list '<= (list '+ j-sym lanes-sym) n-sym)
+                        ;; vgather: src[index[j..j+L)] → contiguous out[j..j+L)
+                        (list 'let* [gv-sym (list from-array species-sym src 0 index j-sym)]
+                              (list '.intoArray gv-sym out j-sym)
+                              (list 'recur (list '+ j-sym lanes-sym)))
+                        ;; scalar tail
+                        (list 'loop* [j-sym j-sym]
+                              (list 'if (list '< j-sym n-sym)
+                                    (list 'do
+                                          (list 'clojure.core/aset out j-sym
+                                                (list 'clojure.core/aget src
+                                                      (list 'clojure.core/aget index j-sym)))
+                                          (list 'recur (list 'inc j-sym)))
+                                    out))))))))
+
+;; ================================================================
 ;; SegRed → SIMD (multi-accumulator)
 ;; ================================================================
 

@@ -17,8 +17,9 @@
 (defn- par-mutation-form?
   "True if expr is a par form that mutates an output buffer.
    par/map!, par/scan, par/scan-exclusive, par/stencil!, par/map-void!,
-   par/scatter!, par/butterfly!, par/rng-fill!, par/collect!, par/active-ids!
-   all write to an output buffer. par/reduce and par/map (pure) are not mutations."
+   par/scatter!, par/gather, par/butterfly!, par/rng-fill!, par/collect!,
+   par/active-ids! all write to an output buffer (arg 0). par/reduce and
+   par/map (pure) are not mutations."
   [expr]
   (and (par/par-form? expr)
        (not (par/par-reduce-form? expr))

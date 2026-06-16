@@ -223,6 +223,33 @@
                                     (clojure.core/aget ~src src-pos#)))))))
       ~output)))
 
+(defmacro gather
+  "Parallel gather: out[i] = src[index[i]]. The SIMD backend emits a hardware
+  vector gather (DoubleVector.fromArray with an index map); otherwise expands
+  to a sequential loop.
+
+  Form: (raster.par/gather out src index n)
+  Semantics: for i in 0..n: output[i] = src[index[i]]
+
+  Strided form: (raster.par/gather out src index n stride)
+  Semantics: for i in 0..n, d in 0..stride: out[i*stride+d] = src[index[i]*stride+d]"
+  ([output src index n]
+   `(let [n# (int ~n)]
+      (dotimes [i# n#]
+        (clojure.core/aset ~output i#
+                           (clojure.core/aget ~src (clojure.core/aget ~index i#))))
+      ~output))
+  ([output src index n stride]
+   `(let [n# (int ~n)
+          stride# (int ~stride)]
+      (dotimes [i# n#]
+        (let [sbase# (* (clojure.core/aget ~index i#) stride#)
+              obase# (* i# stride#)]
+          (dotimes [d# stride#]
+            (clojure.core/aset ~output (+ obase# d#)
+                               (clojure.core/aget ~src (+ sbase# d#))))))
+      ~output)))
+
 ;; ================================================================
 ;; Reduce-by-key macro (runtime fallback)
 ;; ================================================================

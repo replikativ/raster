@@ -460,6 +460,20 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-stencil! form)))
 
+              ;; raster.par/gather → hardware vgather (flat 4-arg form only)
+              (par/par-gather-form? form)
+              (let [args (vec (rest form))]
+                (if (= 4 (count args))
+                  (let [[out src index n] args
+                        elem-type (or (out-sym->elem-type out) :double)]
+                    (if-let [simd-form (segop-simd/compile-par-gather out src index n elem-type)]
+                      (do (swap! stats update :simd-gathers (fnil inc 0))
+                          simd-form)
+                      (do (swap! stats update :fallback inc)
+                          (par/expand-par-gather! form))))
+                  (do (swap! stats update :fallback inc)
+                      (par/expand-par-gather! form))))
+
               ;; let/let* — check for fusable consecutive maps
               (and (seq? form) (contains? #{'let 'let*} (first form)))
               (let [[let-sym bindings & body] form
