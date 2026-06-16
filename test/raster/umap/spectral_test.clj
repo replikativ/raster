@@ -99,6 +99,48 @@
     (dotimes [d dim] (aset c d (/ (aget c d) (double (- hi lo)))))
     c))
 
+(defn- ring-clusters-on-circle
+  "K disconnected ring-clusters of `per` vertices each, whose data-space centroids
+  lie on a circle (cluster k at angle 2πk/K). Returns [head tail weights X data-dim]."
+  [k-clusters per]
+  (let [dd 2 n (* k-clusters per)
+        x (double-array (* n dd))
+        h (java.util.ArrayList.) t (java.util.ArrayList.) w (java.util.ArrayList.)]
+    (dotimes [k k-clusters]
+      (let [cx (* 10.0 (Math/cos (* 2 Math/PI (/ k (double k-clusters)))))
+            cy (* 10.0 (Math/sin (* 2 Math/PI (/ k (double k-clusters)))))]
+        (dotimes [i per]
+          (let [v (+ (* k per) i)]
+            (aset x (* v dd) (+ cx (* 0.3 (Math/cos (* 13.0 i)))))
+            (aset x (+ (* v dd) 1) (+ cy (* 0.3 (Math/sin (* 7.0 i)))))
+            (let [j (+ (* k per) (mod (inc i) per))]
+              (.add h v) (.add t j) (.add w 1.0)
+              (.add h j) (.add t v) (.add w 1.0))))))
+    [(int-array h) (int-array t) (double-array w) x dd]))
+
+(deftest tier-c-data-centroid-topology-test
+  (testing "with many components (c > 2*dim), data-centroid meta-placement recovers
+            the component topology: clusters whose centroids are circular neighbours
+            map to neighbouring embedding centers"
+    (let [k-clusters 6 per 30 n (* k-clusters per)
+          [h t w x dd] (ring-clusters-on-circle k-clusters per)
+          emb (sp/spectral-init h t w n 2 x dd)         ; 7-arg: Tier C enabled
+          center (fn [k] (centroid emb (* k per) (* (inc k) per)))
+          centers (mapv center (range k-clusters))
+          dist (fn [a b] (let [ca (centers a) cb (centers b)]
+                           (Math/sqrt (+ (Math/pow (- (aget ca 0) (aget cb 0)) 2)
+                                         (Math/pow (- (aget ca 1) (aget cb 1)) 2)))))]
+      (is (= (alength emb) (* n 2)))
+      (is (not (some #(Double/isNaN %) (seq emb))) "no NaN")
+      ;; each cluster's nearest other center must be one of its ring neighbours
+      (doseq [k (range k-clusters)]
+        (let [others (remove #{k} (range k-clusters))
+              nearest (apply min-key #(dist k %) others)
+              ring-nbrs #{(mod (dec k) k-clusters) (mod (inc k) k-clusters)}]
+          (is (contains? ring-nbrs nearest)
+              (str "cluster " k " nearest center is " nearest
+                   ", expected a ring neighbour " ring-nbrs)))))))
+
 (deftest multi-component-separation-test
   (testing "two disconnected components are placed at distinct meta-centers,
             spread well apart relative to each component's internal radius"
@@ -114,6 +156,8 @@
                             (Math/sqrt (+ (Math/pow (- (aget emb (* i 2)) (aget ca 0)) 2)
                                           (Math/pow (- (aget emb (+ (* i 2) 1)) (aget ca 1)) 2)))))]
       (is (= (alength emb) (* n 2)))
-      (is (> dist (* 2.0 rad))
-          (str "component centers (dist " dist ") should be well separated vs radius " rad))
+      ;; umap sizes each component radius to data_range = half the center gap, so
+      ;; components touch but don't overlap: radius <= ~half the center distance.
+      (is (<= rad (* 0.55 dist))
+          (str "component radius " rad " should stay within ~half the center gap " dist))
       (is (not (some #(Double/isNaN %) (seq emb))) "no NaN in embedding"))))

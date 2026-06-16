@@ -11,10 +11,11 @@
       drop the trivial one (eigenvalue ~2, the all-ones-ish vector), and keep dim.
 
   All array number-crunching is deftm; `spectral-init` is a thin orchestrator."
-  (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == abs max])
+  (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == abs max min])
   (:require [raster.core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength]]
-            [raster.numeric :refer [+ - * / < > <= >= == abs max sqrt]]
+            [raster.numeric :refer [+ - * / < > <= >= == abs max min sqrt]]
+            [raster.math :as m]
             [raster.linalg.eigen :as eigen]
             [raster.linalg.iterative :as it]))
 
@@ -209,11 +210,10 @@
 ;; Multi-component layout — per-component spectral + ±eye meta-placement
 ;; ---------------------------------------------------------------------------
 
-;; Meta-embedding of c components into dim-space. Walks the coordinate axes with
+;; ±eye meta-embedding of c components into dim-space (umap's `else` branch, used
+;; when c <= 2*dim or no data is available). Walks the coordinate axes with
 ;; alternating sign and growing radius: components 0..dim-1 -> +e_axis, the next
-;; dim -> -e_axis, then +2e_axis, etc. For c <= 2*dim this is exactly umap's
-;; ±eye placement; beyond that it keeps producing distinct, separated centers.
-;; (Tier C would instead place centers at data-space centroids.)
+;; dim -> -e_axis, etc. For c <= 2*dim this is exactly umap's ±eye placement.
 (deftm meta-embedding!
   [meta :- (Array double) c :- Long dim :- Long] :- (Array double)
   (dotimes [t (* c dim)] (aset meta t 0.0))
@@ -228,6 +228,94 @@
           (recur (+ i 1) axis2 sign rad)))))
   meta)
 
+;; --- Tier C: data-centroid component layout (umap component_layout) ---
+
+;; Mean of each component's data points (X is n*data-dim row-major, any float type).
+(deftm component-centroids!
+  (All [T]
+   [X :- (Array T) label :- (Array int) centroid :- (Array double)
+    counts :- (Array double) n :- Long data-dim :- Long c :- Long]
+   :- (Array double)
+   (dotimes [t (* c data-dim)] (aset centroid t 0.0))
+   (dotimes [i c] (aset counts i 0.0))
+   (dotimes [i n]
+     (let [lab (long (aget label i))]
+       (aset counts lab (+ (aget counts lab) 1.0))
+       (dotimes [d data-dim]
+         (let [k (+ (* lab data-dim) d)]
+           (aset centroid k (+ (aget centroid k) (double (aget X (+ (* i data-dim) d)))))))))
+   (dotimes [lab c]
+     (let [cnt (max 1.0 (aget counts lab))]
+       (dotimes [d data-dim]
+         (let [k (+ (* lab data-dim) d)]
+           (aset centroid k (/ (aget centroid k) cnt))))))
+   centroid))
+
+;; Gaussian affinity exp(-||c_i - c_j||^2) between component centroids (c*c dense).
+(deftm centroid-affinity!
+  [centroid :- (Array double) affinity :- (Array double) c :- Long data-dim :- Long]
+  :- (Array double)
+  (dotimes [i c]
+    (aset affinity (+ (* i c) i) 1.0)
+    (dotimes [j c]
+      (when (< j i)
+        (let [d2 (loop [d 0 s 0.0]
+                   (if (< d data-dim)
+                     (let [diff (- (aget centroid (+ (* i data-dim) d))
+                                   (aget centroid (+ (* j data-dim) d)))]
+                       (recur (inc d) (+ s (* diff diff))))
+                     s))
+              a (m/exp (- 0.0 d2))]
+          (aset affinity (+ (* i c) j) a)
+          (aset affinity (+ (* j c) i) a)))))
+  affinity)
+
+;; Spectral embedding of the c*c dense affinity into dim dims (= meta centers).
+;; Normalized Laplacian of the affinity (a complete, hence connected, graph), eigh,
+;; eigenvectors 1..dim, scaled so max|coord| = 1 (umap component_layout tail).
+(deftm affinity-meta-embedding!
+  [affinity :- (Array double) meta :- (Array double) c :- Long dim :- Long]
+  :- (Array double)
+  (let [isd (double-array c)
+        _   (dotimes [i c]
+              (let [s (loop [j 0 acc 0.0]
+                        (if (< j c) (recur (inc j) (+ acc (aget affinity (+ (* i c) j)))) acc))]
+                (aset isd i (if (> s 0.0) (/ 1.0 (sqrt s)) 0.0))))
+        L   (double-array (* c c))
+        _   (dotimes [i c]
+              (dotimes [j c]
+                (let [v (* (aget affinity (+ (* i c) j)) (* (aget isd i) (aget isd j)))]
+                  (aset L (+ (* i c) j) (- (if (== i j) 1.0 0.0) v)))))
+        res (eigen/eigh L c)
+        _   (extract-eigvecs! (aget res 1) meta c dim)
+        nd  (* c dim)
+        mx  (loop [t 0 mm 0.0] (if (< t nd) (recur (inc t) (max mm (abs (aget meta t)))) mm))
+        s   (/ 1.0 (max 1.0e-12 mx))]
+    (dotimes [t nd] (aset meta t (* (aget meta t) s)))
+    meta))
+
+;; Half the distance from component ci's meta-center to its nearest other center
+;; (umap's data_range — sizes each component to fit the gap to its neighbour).
+(deftm meta-data-ranges!
+  [meta :- (Array double) ranges :- (Array double) c :- Long dim :- Long]
+  :- (Array double)
+  (dotimes [i c]
+    (let [mn (loop [j 0 m 1.0e30]
+               (if (< j c)
+                 (if (== j i)
+                   (recur (inc j) m)
+                   (let [d2 (loop [d 0 s 0.0]
+                              (if (< d dim)
+                                (let [diff (- (aget meta (+ (* i dim) d)) (aget meta (+ (* j dim) d)))]
+                                  (recur (inc d) (+ s (* diff diff))))
+                                s))]
+                     (recur (inc j) (min m (sqrt d2)))))
+                 m))]
+      (aset ranges i (/ (if (>= mn 1.0e30) 1.0 mn) 2.0))))
+  ranges)
+
+;; --- placement kernels (use meta-centers directly; per-component data-range scale) ---
+
 ;; Scale a (per-component) embedding in place so max|coord| = 1.
 (deftm normalize-unit! [emb :- (Array double) n :- Long dim :- Long] :- (Array double)
   (let [nd (* n dim)
@@ -236,32 +324,31 @@
     (dotimes [i nd] (aset emb i (* (aget emb i) s)))
     emb))
 
-;; Write a component's (normalized) sub-embedding into the global embedding at its
-;; global vertex ids, translated to the component's meta-center * spacing.
+;; Write a component's unit-normalized sub-embedding into the global embedding at
+;; its global vertex ids: sub * data-range + meta-center.
 (deftm scatter-component!
   [sub :- (Array double) emb :- (Array double) verts :- (Array int)
-   meta :- (Array double) ci :- Long sz :- Long dim :- Long spacing :- Double]
+   meta :- (Array double) ci :- Long sz :- Long dim :- Long data-range :- Double]
   :- (Array double)
   (dotimes [l sz]
     (let [g (long (aget verts l))]
       (dotimes [d dim]
         (aset emb (+ (* g dim) d)
-              (+ (aget sub (+ (* l dim) d))
-                 (* spacing (aget meta (+ (* ci dim) d))))))))
+              (+ (* data-range (aget sub (+ (* l dim) d)))
+                 (aget meta (+ (* ci dim) d)))))))
   emb)
 
-;; Place a too-small component (size <= dim+1, no meaningful spectral structure):
-;; all its vertices sit at the meta-center * spacing plus a tiny deterministic
-;; spread so coincident points don't collapse the layout.
+;; Place a too-small component (no meaningful spectral structure): all its vertices
+;; sit at the meta-center plus a small deterministic spread scaled by data-range.
 (deftm place-small!
   [emb :- (Array double) verts :- (Array int) meta :- (Array double)
-   ci :- Long sz :- Long dim :- Long spacing :- Double] :- (Array double)
+   ci :- Long sz :- Long dim :- Long data-range :- Double] :- (Array double)
   (dotimes [l sz]
     (let [g (long (aget verts l))]
       (dotimes [d dim]
         (aset emb (+ (* g dim) d)
-              (+ (* spacing (aget meta (+ (* ci dim) d)))
-                 (* 0.001 (+ (double l) (* 0.13 (double d)))))))))
+              (+ (aget meta (+ (* ci dim) d))
+                 (* data-range (* 0.5 (- (/ (+ (double l) (* 0.37 (double d))) (double sz)) 0.5))))))))
   emb)
 
 ;; --- collection glue (dynamic per-component grouping; deftm can't express this) ---
@@ -298,42 +385,63 @@
         (clojure.core/aset w k (double (.get sw k))))
       [h t w])))
 
+(defn- data-component-centers!
+  "Tier C: meta-centers from data-space component centroids (umap component_layout).
+  Fills `meta` (c*dim) via the spectral embedding of the centroid affinity matrix."
+  [X ^ints label ^doubles meta n c dim data-dim]
+  (let [n (long n) c (long c) dim (long dim) data-dim (long data-dim)
+        centroid (double-array (clojure.core/* c data-dim))
+        counts   (double-array c)
+        _ (component-centroids! X label centroid counts n data-dim c)
+        affinity (double-array (clojure.core/* c c))
+        _ (centroid-affinity! centroid affinity c data-dim)]
+    (affinity-meta-embedding! affinity meta c dim)
+    meta))
+
 (defn- multi-component-layout
-  "Embed each connected component spectrally, normalize to unit radius, and place
-  components at ±eye meta-centers so they don't overlap."
-  [^ints head ^ints tail ^doubles weights ^ints label n c dim]
+  "Embed each connected component spectrally and place it at its meta-center, scaled
+  to its data-range (half the gap to the nearest neighbouring component). Meta-centers
+  come from data centroids (Tier C) when c > 2*dim and X is available, else ±eye."
+  [^ints head ^ints tail ^doubles weights ^ints label X n c dim data-dim]
   (let [n (long n) c (long c) dim (long dim)
         ne (alength weights)
         emb (double-array (clojure.core/* n dim))
         meta (double-array (clojure.core/* c dim))
-        _ (meta-embedding! meta c dim)
-        spacing 3.0
+        _ (if (and X (clojure.core/> c (clojure.core/* 2 dim)))
+            (data-component-centers! X label meta n c dim data-dim)
+            (meta-embedding! meta c dim))
+        ranges (double-array c)
+        _ (meta-data-ranges! meta ranges c dim)
         comp-verts (component-vertices label n c)
         g2l (int-array n)]
     (dotimes [ci c]
       (let [verts ^ints (nth comp-verts ci)
-            sz (alength verts)]
+            sz (alength verts)
+            dr (clojure.core/aget ranges ci)]
         (dotimes [l sz] (clojure.core/aset g2l (clojure.core/aget verts l) (int l)))
-        (if (clojure.core/<= sz (clojure.core/inc dim))
-          (place-small! emb verts meta ci sz dim spacing)
+        (if (clojure.core/< sz (clojure.core/* 2 dim))
+          (place-small! emb verts meta ci sz dim dr)
           (let [[sh st sw] (induced-subgraph head tail weights label ci g2l ne)
                 sub (connected-spectral sh st sw sz dim)]
             (normalize-unit! sub sz dim)
-            (scatter-component! sub emb verts meta ci sz dim spacing)))))
+            (scatter-component! sub emb verts meta ci sz dim dr)))))
     emb))
 
 (defn spectral-init
   "Spectral embedding of a symmetric weighted graph (edge list head/tail/weights).
   Returns the n*dim row-major embedding. Single connected component -> direct
-  spectral solve; multiple components -> per-component spectral + meta-placement."
-  [^ints head ^ints tail ^doubles weights n dim]
-  (let [n (long n) dim (long dim)
-        ne (alength weights)
-        parent (int-array n)
-        _ (connected-components! head tail parent n ne)
-        label (int-array n)
-        remap (int-array n)
-        c (long (densify-labels! parent label remap n))]
-    (if (clojure.core/== c 1)
-      (connected-spectral head tail weights n dim)
-      (multi-component-layout head tail weights label n c dim))))
+  spectral solve; multiple components -> per-component spectral + meta-placement.
+  Pass `X` (data, n*data-dim) to enable data-centroid meta-placement (Tier C) for
+  highly-fragmented graphs (c > 2*dim); without it, ±eye placement is used."
+  ([head tail weights n dim] (spectral-init head tail weights n dim nil 0))
+  ([^ints head ^ints tail ^doubles weights n dim X data-dim]
+   (let [n (long n) dim (long dim)
+         ne (alength weights)
+         parent (int-array n)
+         _ (connected-components! head tail parent n ne)
+         label (int-array n)
+         remap (int-array n)
+         c (long (densify-labels! parent label remap n))]
+     (if (clojure.core/== c 1)
+       (connected-spectral head tail weights n dim)
+       (multi-component-layout head tail weights label X n c dim data-dim)))))
