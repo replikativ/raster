@@ -321,8 +321,12 @@
   ;; :metric 0 = cosine (L2-normalize + RP-tree init), 1 = euclidean (no normalize,
   ;; random init only — angular RP-trees don't fit euclidean geometry).
   [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads max-candidates metric]
-               :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1 max-candidates 30 metric 0}}]
+               :or {leaf-size 30 seed 42 n-threads 1 max-candidates 30 metric 0}}]
   (let [n (long n) dim (long dim) k (long k) metric (long metric)
+        ;; scale forest size + iterations with n (pynndescent heuristics) — a fixed
+        ;; small forest gives terrible recall at large n (garbage graph).
+        n-trees (long (or n-trees (min 32 (+ 5 (long (Math/round (/ (Math/sqrt (double n)) 20.0)))))))
+        n-iters (long (or n-iters (max 12 (long (Math/round (/ (Math/log (double n)) (Math/log 2.0)))))))
         _ (when (clojure.core/zero? metric) (knn/l2-normalize! X n dim))
         dist (double-array (clojure.core/* n k))
         ind (int-array (clojure.core/* n k))
