@@ -21,7 +21,7 @@
                             bit-shift-left bit-shift-right unsigned-bit-shift-right])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
-            [raster.numeric :refer [+ - * / < > <= >= == pow mod
+            [raster.numeric :refer [+ - * / < > <= >= == pow fast-pow mod
                                     bit-and bit-or bit-xor
                                     bit-shift-left bit-shift-right
                                     unsigned-bit-shift-right]]))
@@ -99,9 +99,12 @@
                                   (let [df (- (aget emb (+ jb d)) (aget emb (+ kb d)))]
                                     (+ acc (* df df))))
                            acc)))
+                  ;; fast-pow: ~2.25x faster than Math/pow, ~1e-5 rel err — the
+                  ;; gradient is clipped to [-4,4] so the approximation is lost
+                  ;; in the noise. d2 > 0 guaranteed by the guard.
                   gc (if (> d2 0.0)
-                       (/ (* (* (* -2.0 a) b) (pow d2 bm1))
-                          (+ (* a (pow d2 b)) 1.0))
+                       (/ (* (* (* -2.0 a) b) (fast-pow d2 bm1))
+                          (+ (* a (fast-pow d2 b)) 1.0))
                        0.0)]
               ;; attractive update (move both endpoints)
               (dotimes [d dim]
@@ -126,7 +129,7 @@
                                   acc)))
                         gcn (if (> d2n 0.0)
                               (/ (* (* 2.0 gamma) b)
-                                 (* (+ 0.001 d2n) (+ (* a (pow d2n b)) 1.0)))
+                                 (* (+ 0.001 d2n) (+ (* a (fast-pow d2n b)) 1.0)))
                               0.0)]
                     (dotimes [d dim]
                       (let [cd (aget emb (+ jb d))
