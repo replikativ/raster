@@ -97,7 +97,7 @@
 ;; one refinement iteration: local join over each point's neighbor list (push
 ;; both directions makes the graph symmetric -> reverse neighbors propagate).
 (deftm local-join!
-  [data :- (Array double) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+  (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
    n :- Long dim :- Long k :- Long] :- Long
   (loop [i 0 upd 0]
     (if (< i n)
@@ -120,7 +120,7 @@
                          (recur (inc j) u3))))
                    u))]
         (recur (inc i) u2))
-      upd)))
+      upd))))
 
 ;; local join over a block of points [bstart,bend) — for CPU-multicore via
 ;; Clojure futures (raster par = SIMD/GPU, not CPU-thread; these irregular heap
@@ -196,6 +196,83 @@
          (mapv deref)
          (reduce clojure.core/+))))
 
+;; Reverse adjacency for one round: rev[a*rmax + c] lists up to rmax points that
+;; have `a` as a forward neighbour (capped — like pynndescent's max_candidates).
+;; rcnt[a] = how many were stored.
+(deftm build-reverse!
+  [ind :- (Array int) rev :- (Array int) rcnt :- (Array int)
+   n :- Long k :- Long rmax :- Long] :- (Array int)
+  (dotimes [i n] (aset rcnt i (int 0)))
+  (dotimes [i n]
+    (dotimes [j k]
+      (let [a (long (aget ind (+ (* i k) j)))]
+        (when (>= a 0)
+          (let [c (long (aget rcnt a))]
+            (when (< c rmax)
+              (aset rev (+ (* a rmax) c) (int i))
+              (aset rcnt a (int (+ c 1)))))))))
+  rev)
+
+;; Reverse-augmented owned local-join. For point p, explore 2-hop candidates via
+;; BOTH forward neighbours (forward(p) -> forward(a)) AND reverse neighbours
+;; (q points at p -> push q, and explore forward(q)). Writes only p's heap
+;; (race-free, cache-local). This is the full NN-descent neighbourhood join.
+(deftm local-join-owned-rev!
+  (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
+            rev :- (Array int) rcnt :- (Array int)
+            bstart :- Long bend :- Long dim :- Long k :- Long rmax :- Long] :- Long
+  (loop [p bstart upd 0]
+    (if (< p bend)
+      (let [pb (* p k)
+            ;; (1) forward first-hop a, explore forward(a)
+            u1 (loop [j 0 u upd]
+                 (if (< j k)
+                   (let [a (long (aget ind (+ pb j)))]
+                     (if (< a 0)
+                       (recur (inc j) u)
+                       (let [ab (* a k)
+                             uu (loop [l 0 v u]
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ ab l)))]
+                                      (if (or (< b 0) (== b p))
+                                        (recur (inc l) v)
+                                        (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k (cos-dist data p b dim) b 1)))))
+                                    v))]
+                         (recur (inc j) uu))))
+                   u))
+            ;; (2) reverse first-hop q: push q, then explore forward(q)
+            rc (long (aget rcnt p))
+            u2 (loop [j 0 u u1]
+                 (if (< j rc)
+                   (let [q (long (aget rev (+ (* p rmax) j)))]
+                     (if (or (< q 0) (== q p))
+                       (recur (inc j) u)
+                       (let [u' (+ u (flagged-heap-push! dist ind flags pb k (cos-dist data p q dim) q 1))
+                             qb (* q k)
+                             uu (loop [l 0 v u']
+                                  (if (< l k)
+                                    (let [b (long (aget ind (+ qb l)))]
+                                      (if (or (< b 0) (== b p))
+                                        (recur (inc l) v)
+                                        (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k (cos-dist data p b dim) b 1)))))
+                                    v))]
+                         (recur (inc j) uu))))
+                   u))]
+        (recur (inc p) u2))
+      upd))))
+
+(defn parallel-local-join-rev!
+  "Reverse-augmented owned local-join across point-blocks (futures). Race-free."
+  [data dist ind flags rev rcnt n dim k rmax n-threads]
+  (let [n (long n) n-threads (long (max 1 (long n-threads)))
+        bs (long (Math/ceil (/ (double n) n-threads)))]
+    (->> (range n-threads)
+         (mapv (fn [t] (future (local-join-owned-rev! data dist ind flags rev rcnt
+                                                      (long (* t bs)) (long (min n (* (inc (long t)) bs)))
+                                                      (long dim) (long k) (long rmax)))))
+         (mapv deref)
+         (reduce clojure.core/+))))
+
 ;; sort each point's k entries ascending by stored distance (-cos), then emit the
 ;; raw -cos values (unfilled heap slots stay Double/MAX_VALUE). cosine-knn applies
 ;; neg-cos->log2! once to convert to -log2(cos) (1e308 for far/unfilled) — matching
@@ -251,16 +328,26 @@
       (->> (range n-trees) (mapv (fn [ti] (future (build-tree! ti)))) (mapv deref))
       (dotimes [ti n-trees] (build-tree! ti)))
     (init-random! X dist ind flags rng n dim k)
-    ;; refine
+    ;; refine — reverse-augmented owned local-join (rev capped at rmax candidates)
+    (let [rmax (long (clojure.core/* 2 k))
+          rev (int-array (clojure.core/* n rmax))
+          rcnt (int-array n)
+          ;; warm the parametric kernel for X's dtype on an empty range BEFORE the
+          ;; futures fan out — concurrent first-call specialization races to null.
+          _ (local-join-owned-rev! X dist ind flags rev rcnt 0 0 dim k rmax)]
     (loop [it 0]
       (when (clojure.core/< it n-iters)
-        ;; owned/cache-local local-join (n-threads=1 => single block, serial)
-        (let [upd (parallel-local-join! X dist ind flags n dim k n-threads)]
+        ;; Build the reverse adjacency for this round, then do a reverse-augmented
+        ;; owned local-join: each point explores 2-hop neighbours via BOTH its
+        ;; forward neighbours and the points that point AT it (reverse). This is the
+        ;; core NN-descent recall mechanism; forward-only plateaus ~0.78 recall.
+        (build-reverse! ind rev rcnt n k rmax)
+        (let [upd (parallel-local-join-rev! X dist ind flags rev rcnt n dim k rmax n-threads)]
           (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
             (recur (clojure.core/inc it))))))
     (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
       (finalize! dist ind n k out-idx out-dst)
-      {:idx out-idx :dst out-dst})))
+      {:idx out-idx :dst out-dst}))))
 
 ;; nn-descent stores -cos (on L2-normalized rows). Convert to -log2(cos) so the
 ;; approximate path matches the brute path and feeds UMAP's fuzzy-set a proper

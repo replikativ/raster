@@ -34,5 +34,8 @@
       ;; every slot must be a real neighbor (not the 1e308 sentinel)
       (is (> finite (* 0.99 n k))
           (str "only " finite "/" (* n k) " finite distances — neighbors not populated"))
-      ;; approximate recall should be high on well-separated blobs
-      (is (> recall 0.8) (str "NN-descent recall vs brute " recall " should exceed 0.8")))))
+      ;; approximate recall should be high on well-separated blobs. The
+      ;; reverse-augmented local-join (exploring 2-hop via reverse neighbours, not
+      ;; just forward) lifted recall from ~0.66 to ~0.90 on hard high-dim data and
+      ;; ~0.99 here; guard against regressing to the forward-only plateau.
+      (is (> recall 0.95) (str "NN-descent recall vs brute " recall " should exceed 0.95")))))
