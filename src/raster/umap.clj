@@ -20,6 +20,7 @@
                             mod bit-and bit-or bit-xor
                             bit-shift-left bit-shift-right unsigned-bit-shift-right])
   (:require [raster.core :refer [deftm]]
+            [raster.par.runtime :as rt]
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == pow fast-pow mod
                                     bit-and bit-or bit-xor
@@ -67,24 +68,23 @@
 ;;   eonsn   epoch_of_next_negative_sample (init = epn copy, mutated)
 ;;   states  long[n_vertices*3] per-vertex RNG state (mutated)
 ;; ----------------------------------------------------------------------
-(deftm optimize-layout!
+(deftm optimize-layout-chunk!
+  "Hot per-edge kernel: process edges [lo,hi) for one epoch (epd, alpha) of the
+  layout SGD. Side-effecting — racy in-place updates to emb and per-vertex RNG
+  state, which are safe under parallel-for! because contiguous chunks of a
+  head-sorted edge list own disjoint head-vertex ranges (numba-style benign
+  races; SGD tolerates the rare lost update)."
   (All [T] [emb :- (Array T) head :- (Array int) tail :- (Array int)
    eps :- (Array double) epn :- (Array double)
    eons :- (Array double) eonsn :- (Array double)
    states :- (Array long)
-   a :- Double b :- Double gamma :- Double init-alpha :- Double
-   n-vertices :- Long dim :- Long n-epochs :- Long]
-  :- (Array T)
-  (let [n-edges (alength eps)
-        bm1 (- b 1.0)]
-    (dotimes [ep n-epochs]
-      (let [epd (double ep)
-            ;; umap updates alpha at the end of each epoch; epoch ep therefore
-            ;; runs with init*(1-(ep-1)/N) (and ep=0 samples nothing).
-            alpha (if (== ep 0)
-                    init-alpha
-                    (* init-alpha (- 1.0 (/ (double (dec ep)) (double n-epochs)))))]
-        (dotimes [i n-edges]
+   a :- Double b :- Double gamma :- Double alpha :- Double
+   n-vertices :- Long dim :- Long epd :- Double lo :- Long hi :- Long]
+  :- Long
+  (let [bm1 (- b 1.0)]
+    (loop [i lo]
+      (if (< i hi)
+        (do
           (when (<= (aget eons i) epd)
             (let [j (long (aget head i))
                   k (long (aget tail i))
@@ -136,5 +136,28 @@
                             od (aget emb (+ kb2 d))
                             g (if (> gcn 0.0) (uclip (* gcn (- cd od))) 0.0)]
                         (aset emb (+ jb d) (+ cd (* g alpha)))))))
-                (aset eonsn i (+ (aget eonsn i) (* (double n-neg) (aget epn i))))))))))
-    emb)))
+                (aset eonsn i (+ (aget eonsn i) (* (double n-neg) (aget epn i)))))))
+          (recur (+ i 1)))
+        hi)))))
+
+(defn optimize-layout!
+  "Run the layout SGD. Epochs are sequential (alpha decays); each epoch's edge
+  loop is dispatched through raster.par.runtime/parallel-for! across
+  *par-threads* threads (1 = serial/deterministic — the path the quality tests
+  use). Mirrors numba's prange: racy in-place embedding updates + per-vertex
+  RNG, no locks; SGD tolerates the rare lost update. emb is mutated and returned."
+  [emb head tail eps epn eons eonsn states a b gamma init-alpha n-vertices dim n-epochs]
+  (let [n-edges (alength eps)]
+    (dotimes [ep n-epochs]
+      (let [epd (double ep)
+            ;; umap updates alpha at the end of each epoch; epoch ep runs with
+            ;; init*(1-(ep-1)/N) (ep=0 samples nothing).
+            alpha (if (== ep 0)
+                    init-alpha
+                    (* init-alpha (- 1.0 (/ (double (dec ep)) (double n-epochs)))))]
+        (rt/parallel-for! n-edges
+          (fn [lo hi]
+            (optimize-layout-chunk! emb head tail eps epn eons eonsn states
+                                    a b gamma alpha n-vertices dim epd
+                                    (long lo) (long hi))))))
+    emb))
