@@ -5,7 +5,8 @@
   neighbor distance to the 1e308 'far' sentinel (recall collapsed to ~0)."
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.set :as set]
-            [raster.spatial.nndescent :as nnd]))
+            [raster.spatial.nndescent :as nnd]
+            [raster.umap.knn]))
 
 (defn- blobs
   "n points in `dim` dims from `nc` separated Gaussian blobs; flat double[n*dim]."
@@ -39,3 +40,19 @@
       ;; just forward) lifted recall from ~0.66 to ~0.90 on hard high-dim data and
       ;; ~0.99 here; guard against regressing to the forward-only plateau.
       (is (> recall 0.95) (str "NN-descent recall vs brute " recall " should exceed 0.95")))))
+
+(deftest euclidean-nndescent-recall
+  (testing "euclidean NN-descent (n>threshold) matches exact brute euclidean kNN"
+    (let [n 5000 dim 20 k 15
+          X (blobs n dim 10 3)
+          {ai :idx ad :dst} (nnd/euclidean-knn (aclone X) n dim k)
+          bi (let [oi (int-array (* n k)) od (double-array (* n k))]
+               (raster.umap.knn/knn-brute! (aclone X) n dim k oi od) oi)
+          recall (/ (double (reduce + (for [i (range n)]
+                              (count (set/intersection
+                                       (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))
+                                       (set (for [t (range k)] (aget ^ints bi (+ (* i k) t)))))))))
+                    (* n k))]
+      ;; euclidean distances must be non-negative and self at 0
+      (is (= 0.0 (aget ^doubles ad 0)) "self distance should be 0")
+      (is (> recall 0.9) (str "euclidean NN-descent recall " recall " should exceed 0.9")))))

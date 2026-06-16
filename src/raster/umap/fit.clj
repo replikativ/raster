@@ -102,13 +102,15 @@
 
   The deftm kernels run via lazy-JIT (fully devirtualized). For repeated/large
   workloads, compile-aot any kernel externally — no need to bake it in here."
-  [X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed]
-              :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42}}]
+  [X n dim & {:keys [k out-dim n-epochs neg-rate gamma init seed metric]
+              :or {k 15 out-dim 2 neg-rate 5.0 gamma 1.0 init :auto seed 42 metric :cosine}}]
   (let [n (long n) dim (long dim) k (long k) out-dim (long out-dim)
         ne (long (or n-epochs (if (clojure.core/> n 10000) 200 500)))
         nk (clojure.core/* n k)
-        ;; 1. cosine kNN (normalizes X in place; -log2 cos distances, self first)
-        {:keys [idx dst]} (nnd/cosine-knn X n dim k)
+        ;; 1. kNN — cosine (normalizes X in place, -log2 cos) or euclidean (raw X)
+        {:keys [idx dst]} (if (= metric :euclidean)
+                            (nnd/euclidean-knn X n dim k)
+                            (nnd/cosine-knn X n dim k))
         ;; 2. fuzzy simplicial set
         sigmas (double-array n) rhos (double-array n)
         _ (graph/smooth-knn-dist! dst n k sigmas rhos)

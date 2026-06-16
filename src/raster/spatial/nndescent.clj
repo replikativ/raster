@@ -33,6 +33,15 @@
       (- 0.0 (par/reduce acc 0.0 d dim
                          (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))))))
 
+(deftm eucl-dist
+  "Squared euclidean distance between rows a and b (monotone in euclidean, so the
+   kNN ordering/heap is identical; the orchestrator sqrts the kept distances)."
+  (All [T] [data :- (Array T) a :- Long b :- Long dim :- Long] :- Double
+    (let [ab (* a dim) bb (* b dim)]
+      (par/reduce acc 0.0 d dim
+                  (let [df (- (aget data (+ ab d)) (aget data (+ bb d)))]
+                    (+ acc (* df df)))))))
+
 ;; Bounded max-heap push with dedup + "new" flag, on point's sub-array [base,base+k).
 ;; Root = worst (max) distance. Returns 1 if inserted, 0 otherwise.
 (deftm flagged-heap-push!
@@ -66,13 +75,15 @@
 ;; seed: self (dist=-1 -> cos 1) + k random neighbors per point
 (deftm init-random!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
-   rng-state :- (Array long) n :- Long dim :- Long k :- Long] :- (Array double)
+   rng-state :- (Array long) n :- Long dim :- Long k :- Long metric :- Long] :- (Array double)
   (dotimes [i n]
-    (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i i dim) i 1)
+    (flagged-heap-push! dist ind flags (* i k) k
+                        (if (== metric 1) (eucl-dist data i i dim) (cos-dist data i i dim)) i 1)
     (dotimes [t k]
       (let [j (mod (u/tau-rand-int! rng-state 0) n)]
         (when (not (== j i))
-          (flagged-heap-push! dist ind flags (* i k) k (cos-dist data i j dim) j 1)))))
+          (flagged-heap-push! dist ind flags (* i k) k
+                              (if (== metric 1) (eucl-dist data i j dim) (cos-dist data i j dim)) j 1)))))
   dist))
 
 ;; seed from RP-tree leaves: all-pairs within each leaf
@@ -220,7 +231,7 @@
 (deftm local-join-owned-rev!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
             rev :- (Array int) rcnt :- (Array int)
-            bstart :- Long bend :- Long dim :- Long k :- Long rmax :- Long] :- Long
+            bstart :- Long bend :- Long dim :- Long k :- Long rmax :- Long metric :- Long] :- Long
   (loop [p bstart upd 0]
     (if (< p bend)
       (let [pb (* p k)
@@ -236,7 +247,8 @@
                                     (let [b (long (aget ind (+ ab l)))]
                                       (if (or (< b 0) (== b p))
                                         (recur (inc l) v)
-                                        (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k (cos-dist data p b dim) b 1)))))
+                                        (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
+                                          (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
                                     v))]
                          (recur (inc j) uu))))
                    u))
@@ -247,14 +259,16 @@
                    (let [q (long (aget rev (+ (* p rmax) j)))]
                      (if (or (< q 0) (== q p))
                        (recur (inc j) u)
-                       (let [u' (+ u (flagged-heap-push! dist ind flags pb k (cos-dist data p q dim) q 1))
+                       (let [dq (if (== metric 1) (eucl-dist data p q dim) (cos-dist data p q dim))
+                             u' (+ u (flagged-heap-push! dist ind flags pb k dq q 1))
                              qb (* q k)
                              uu (loop [l 0 v u']
                                   (if (< l k)
                                     (let [b (long (aget ind (+ qb l)))]
                                       (if (or (< b 0) (== b p))
                                         (recur (inc l) v)
-                                        (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k (cos-dist data p b dim) b 1)))))
+                                        (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
+                                          (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
                                     v))]
                          (recur (inc j) uu))))
                    u))]
@@ -263,13 +277,13 @@
 
 (defn parallel-local-join-rev!
   "Reverse-augmented owned local-join across point-blocks (futures). Race-free."
-  [data dist ind flags rev rcnt n dim k rmax n-threads]
+  [data dist ind flags rev rcnt n dim k rmax metric n-threads]
   (let [n (long n) n-threads (long (max 1 (long n-threads)))
         bs (long (Math/ceil (/ (double n) n-threads)))]
     (->> (range n-threads)
          (mapv (fn [t] (future (local-join-owned-rev! data dist ind flags rev rcnt
                                                       (long (* t bs)) (long (min n (* (inc (long t)) bs)))
-                                                      (long dim) (long k) (long rmax)))))
+                                                      (long dim) (long k) (long rmax) (long metric)))))
          (mapv deref)
          (reduce clojure.core/+))))
 
@@ -304,10 +318,12 @@
    Returns {:idx int[n*k] :dst double[n*k] (raw -cos, self first)}; cosine-knn
    applies neg-cos->log2! to convert to -log2(cos)."
   ;; X may be double[] or float[] — the kernels are parametric (All [T]).
-  [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads]
-               :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1}}]
-  (let [n (long n) dim (long dim) k (long k)
-        _ (knn/l2-normalize! X n dim)
+  ;; :metric 0 = cosine (L2-normalize + RP-tree init), 1 = euclidean (no normalize,
+  ;; random init only — angular RP-trees don't fit euclidean geometry).
+  [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads max-candidates metric]
+               :or {n-trees 4 n-iters 12 leaf-size 30 seed 42 n-threads 1 max-candidates 30 metric 0}}]
+  (let [n (long n) dim (long dim) k (long k) metric (long metric)
+        _ (when (clojure.core/zero? metric) (knn/l2-normalize! X n dim))
         dist (double-array (clojure.core/* n k))
         ind (int-array (clojure.core/* n k))
         flags (int-array (clojure.core/* n k))
@@ -324,17 +340,19 @@
                                                (long (clojure.core/+ seed (clojure.core/* tree-i 1000037) 104729))])
                             nl (rp/build-rptree-leaves! X n dim leaf-size idx rng-t hp stk ls le)]
                         (init-leaves! X dist ind flags idx ls le (long nl) dim k)))]
-    (if (clojure.core/> n-threads 1)
-      (->> (range n-trees) (mapv (fn [ti] (future (build-tree! ti)))) (mapv deref))
-      (dotimes [ti n-trees] (build-tree! ti)))
-    (init-random! X dist ind flags rng n dim k)
+    ;; angular RP-trees only seed the cosine metric; euclidean uses random init
+    (when (clojure.core/zero? metric)
+      (if (clojure.core/> n-threads 1)
+        (->> (range n-trees) (mapv (fn [ti] (future (build-tree! ti)))) (mapv deref))
+        (dotimes [ti n-trees] (build-tree! ti))))
+    (init-random! X dist ind flags rng n dim k metric)
     ;; refine — reverse-augmented owned local-join (rev capped at rmax candidates)
-    (let [rmax (long (clojure.core/* 2 k))
+    (let [rmax (long (max (long max-candidates) k))
           rev (int-array (clojure.core/* n rmax))
           rcnt (int-array n)
           ;; warm the parametric kernel for X's dtype on an empty range BEFORE the
           ;; futures fan out — concurrent first-call specialization races to null.
-          _ (local-join-owned-rev! X dist ind flags rev rcnt 0 0 dim k rmax)]
+          _ (local-join-owned-rev! X dist ind flags rev rcnt 0 0 dim k rmax metric)]
     (loop [it 0]
       (when (clojure.core/< it n-iters)
         ;; Build the reverse adjacency for this round, then do a reverse-augmented
@@ -342,11 +360,15 @@
         ;; forward neighbours and the points that point AT it (reverse). This is the
         ;; core NN-descent recall mechanism; forward-only plateaus ~0.78 recall.
         (build-reverse! ind rev rcnt n k rmax)
-        (let [upd (parallel-local-join-rev! X dist ind flags rev rcnt n dim k rmax n-threads)]
+        (let [upd (parallel-local-join-rev! X dist ind flags rev rcnt n dim k rmax metric n-threads)]
           (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
             (recur (clojure.core/inc it))))))
     (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
       (finalize! dist ind n k out-idx out-dst)
+      ;; euclidean stored squared distances (monotone) — convert to true euclidean
+      (when (clojure.core/== metric 1)
+        (dotimes [i (clojure.core/* n k)]
+          (clojure.core/aset ^doubles out-dst i (Math/sqrt (clojure.core/aget ^doubles out-dst i)))))
       {:idx out-idx :dst out-dst}))))
 
 ;; nn-descent stores -cos (on L2-normalized rows). Convert to -log2(cos) so the
@@ -381,6 +403,20 @@
       (let [r (nn-descent X n dim k :n-threads n-threads)]
         (neg-cos->log2! (:dst r) (clojure.core/* n k))
         r))))
+
+(defn euclidean-knn
+  "Euclidean kNN that auto-selects exact brute-force (small n) vs approximate
+   NN-descent (large n). Returns {:idx :dst} (dst = euclidean distance, self
+   first at 0). X is NOT normalized. Mirrors umap's metric='euclidean'."
+  [X n dim k & {:keys [threshold n-threads]
+                :or {threshold 4096
+                     n-threads (.availableProcessors (Runtime/getRuntime))}}]
+  (let [n (long n) dim (long dim) k (long k)]
+    (if (clojure.core/< n threshold)
+      (let [oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
+        (knn/knn-brute! X n dim k oi od)
+        {:idx oi :dst od})
+      (nn-descent X n dim k :n-threads n-threads :metric 1))))
 
 ;; ====================================================================
 ;; int8 / uint8 NN-descent — quantized large-data path (EVoC dtype paths).
