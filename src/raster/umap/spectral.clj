@@ -2,17 +2,24 @@
   "Spectral initialization — the dim smallest non-trivial eigenvectors of the
   normalized graph Laplacian L = I - D^-1/2 A D^-1/2 (umap.spectral.spectral_layout).
 
-  Uses dense LAPACK eigh (exact, run once). Fine for prototype-scale n; the
-  scalable path is matrix-free Lanczos (raster.linalg.iterative/lanczos) with a
-  (cI - L) spectral transform to reach the bottom of the spectrum — swap in later
-  for large graphs.
+  Two paths, selected by graph size:
+    - tiny n (<= dense-cutoff): dense LAPACK eigh (exact, O(n^3) but n is small).
+    - large n: matrix-free Lanczos on the spectral-transformed operator
+        M = I + D^-1/2 A D^-1/2          (eigenvalues in [0,2])
+      The smallest eigenvectors of L are the LARGEST of M, and Lanczos converges
+      fastest to the largest end of the spectrum. We take the top dim+1 of M,
+      drop the trivial one (eigenvalue ~2, the all-ones-ish vector), and keep dim.
 
   All array number-crunching is deftm; `spectral-init` is a thin orchestrator."
   (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == abs max])
-  (:require [raster.core :refer [deftm]]
+  (:require [raster.core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == abs max sqrt]]
-            [raster.linalg.eigen :as eigen]))
+            [raster.linalg.eigen :as eigen]
+            [raster.linalg.iterative :as it]))
+
+;; Below this vertex count, the dense O(n^3) eigh is faster than Lanczos setup.
+(def ^:const dense-cutoff 256)
 
 ;; Degree of each vertex = sum of incident edge weights. The graph is stored
 ;; symmetric (both directions), so summing over `head` covers every incidence.
@@ -24,11 +31,17 @@
       (aset deg i (+ (aget deg i) (aget weights e)))))
   deg)
 
-;; inv-sqrt-deg[i] = 1 / sqrt(deg[i])
+;; inv-sqrt-deg[i] = 1 / sqrt(deg[i]); guard isolated vertices (deg 0) -> 0.
 (deftm inv-sqrt!
   [deg :- (Array double) isd :- (Array double) n :- Long] :- (Array double)
-  (dotimes [i n] (aset isd i (/ 1.0 (sqrt (aget deg i)))))
+  (dotimes [i n]
+    (let [d (aget deg i)]
+      (aset isd i (if (> d 0.0) (/ 1.0 (sqrt d)) 0.0))))
   isd)
+
+;; ---------------------------------------------------------------------------
+;; Dense path (tiny n)
+;; ---------------------------------------------------------------------------
 
 ;; Dense normalized Laplacian from a symmetric edge list (both directions present).
 ;; Writes L[n*n] row-major: L = I - D^-1/2 A D^-1/2.
@@ -55,6 +68,40 @@
         (aset emb (+ (* i dim) c) (aget evecs (+ src i))))))
   emb)
 
+;; ---------------------------------------------------------------------------
+;; Matrix-free path (large n)
+;; ---------------------------------------------------------------------------
+
+;; out = M x = x + D^-1/2 A (D^-1/2 x), matrix-free over the symmetric edge list.
+;; tmp is scratch of length n. A is symmetric (both edge directions present), so
+;; the single sweep over `head` accumulates the full sparse mat-vec.
+(deftm norm-adj-matvec!
+  [head :- (Array int) tail :- (Array int) weights :- (Array double)
+   isd :- (Array double) x :- (Array double) out :- (Array double)
+   tmp :- (Array double) n :- Long n-edges :- Long]
+  :- (Array double)
+  (dotimes [i n] (aset tmp i (* (aget isd i) (aget x i))))
+  (dotimes [i n] (aset out i 0.0))
+  (dotimes [e n-edges]
+    (let [i (long (aget head e))
+          j (long (aget tail e))]
+      (aset out i (+ (aget out i) (* (aget weights e) (aget tmp j))))))
+  (dotimes [i n] (aset out i (+ (aget x i) (* (aget isd i) (aget out i)))))
+  out)
+
+;; Copy lanczos eigenvector c+1 (object-array of double[], index 0 = trivial top
+;; of M, dropped) into embedding column c.
+(deftm pack-eigvec-column!
+  [ev :- (Array double) emb :- (Array double) n :- Long dim :- Long c :- Long]
+  :- (Array double)
+  (dotimes [i n]
+    (aset emb (+ (* i dim) c) (aget ev i)))
+  emb)
+
+;; ---------------------------------------------------------------------------
+;; Shared post-processing
+;; ---------------------------------------------------------------------------
+
 ;; Scale an embedding so max|coord| = expansion (umap scales spectral init to ~10).
 (deftm scale-embedding!
   [emb :- (Array double) expansion :- Double] :- (Array double)
@@ -64,21 +111,229 @@
     (dotimes [i n] (aset emb i (* (aget emb i) s)))
     emb))
 
-;; Thin orchestrator: allocate, run the deftm kernels + LAPACK eigh, assemble.
-(defn spectral-init
-  [^ints head ^ints tail ^doubles weights n dim]
-  (let [n (long n) dim (long dim)
-        ne (alength weights)
+;; ---------------------------------------------------------------------------
+;; Orchestrator
+;; ---------------------------------------------------------------------------
+
+;; Exact eigh of the dense normalized Laplacian. Returns the n*dim row-major
+;; embedding (smallest non-trivial eigenvectors). Used for tiny graphs.
+(deftm dense-spectral
+  [head :- (Array int) tail :- (Array int) weights :- (Array double)
+   isd :- (Array double) n :- Long dim :- Long ne :- Long] :- (Array double)
+  (let [L     (double-array (* n n))
+        _     (build-norm-laplacian! head tail weights isd L n ne)
+        res   (eigen/eigh L n)
+        evecs (aget res 1)
+        emb   (double-array (* n dim))
+        _     (extract-eigvecs! evecs emb n dim)]
+    emb))
+
+;; Matrix-free Lanczos on M = I + D^-1/2 A D^-1/2. Returns the n*dim embedding,
+;; or a zero-length array if Lanczos returned fewer than dim+1 eigenpairs (the
+;; orchestrator detects this and falls back to the dense path).
+(deftm lanczos-spectral
+  [head :- (Array int) tail :- (Array int) weights :- (Array double)
+   isd :- (Array double) n :- Long dim :- Long ne :- Long] :- (Array double)
+  (let [tmp     (double-array n)
+        mv      (ftm [x :- (Array double) out :- (Array double)] :- (Array double)
+                  (norm-adj-matvec! head tail weights isd x out tmp n ne))
+        k       (+ dim 1)
+        ;; Enough Krylov steps to resolve the top k eigenpairs of a clustered
+        ;; bottom-of-Laplacian spectrum, capped at n.
+        maxiter (long (min (long n) (max (long 256) (* 8 k))))
+        res     (it/lanczos mv n k 1.0e-4 maxiter)
+        eigvecs (aget res 1)]
+    (if (< (alength eigvecs) k)
+      (double-array 0)
+      (let [emb (double-array (* n dim))]
+        (dotimes [c dim]
+          (pack-eigvec-column! (aget eigvecs (+ c 1)) emb n dim c))
+        emb))))
+
+;; Spectral embedding of a CONNECTED symmetric weighted graph. Returns the n*dim
+;; row-major embedding. Dense eigh for tiny graphs, matrix-free Lanczos otherwise;
+;; falls back to dense if Lanczos under-delivers. (`spectral-init` handles the
+;; disconnected case by calling this per component.)
+(deftm connected-spectral
+  [head :- (Array int) tail :- (Array int) weights :- (Array double)
+   n :- Long dim :- Long] :- (Array double)
+  (let [ne  (alength weights)
         deg (double-array n)
         _   (degrees! head weights deg ne)
         isd (double-array n)
-        _   (inv-sqrt! deg isd n)
-        L   (double-array (* n n))
-        _   (build-norm-laplacian! head tail weights isd L n ne)
-        res (eigen/eigh L n)
-        evals ^doubles (clojure.core/aget ^objects res 0)
-        evecs ^doubles (clojure.core/aget ^objects res 1)
-        emb (double-array (* n dim))
-        _   (extract-eigvecs! evecs emb n dim)]
-    {:emb emb
-     :evals (vec (take (clojure.core/inc dim) evals))}))
+        _   (inv-sqrt! deg isd n)]
+    (if (<= n dense-cutoff)
+      (dense-spectral head tail weights isd n dim ne)
+      (let [e (lanczos-spectral head tail weights isd n dim ne)]
+        (if (== (alength e) 0)
+          (dense-spectral head tail weights isd n dim ne)
+          e)))))
+
+;; ---------------------------------------------------------------------------
+;; Connected components (union-find) — for disconnected graphs
+;; ---------------------------------------------------------------------------
+
+;; Root of x's set (no compression here; union does the linking).
+(deftm find-root [parent :- (Array int) x :- Long] :- Long
+  (loop [r (long x)]
+    (let [p (long (aget parent r))]
+      (if (== p r) r (recur p)))))
+
+;; Union-find over the edge list; writes parent[i] = component root for each i.
+(deftm connected-components!
+  [head :- (Array int) tail :- (Array int) parent :- (Array int)
+   n :- Long ne :- Long] :- (Array int)
+  (dotimes [i n] (aset parent i (int i)))
+  (dotimes [e ne]
+    (let [a (find-root parent (long (aget head e)))
+          b (find-root parent (long (aget tail e)))]
+      (when (not (== a b))
+        (if (< a b) (aset parent b (int a)) (aset parent a (int b))))))
+  (dotimes [i n] (aset parent i (int (find-root parent (long i)))))
+  parent)
+
+;; Relabel roots to dense ids in [0,c): label[i] = component id. Returns c.
+;; remap is scratch of length n (root index -> dense id, -1 = unseen).
+(deftm densify-labels!
+  [parent :- (Array int) label :- (Array int) remap :- (Array int) n :- Long] :- Long
+  (dotimes [i n] (aset remap i (int -1)))
+  (loop [i 0 c 0]
+    (if (< i n)
+      (let [r (long (aget parent i))]
+        (if (== (aget remap r) -1)
+          (do (aset remap r (int c)) (aset label i (int c)) (recur (inc i) (inc c)))
+          (do (aset label i (aget remap r)) (recur (inc i) c))))
+      c)))
+
+;; ---------------------------------------------------------------------------
+;; Multi-component layout — per-component spectral + ±eye meta-placement
+;; ---------------------------------------------------------------------------
+
+;; Meta-embedding of c components into dim-space. Walks the coordinate axes with
+;; alternating sign and growing radius: components 0..dim-1 -> +e_axis, the next
+;; dim -> -e_axis, then +2e_axis, etc. For c <= 2*dim this is exactly umap's
+;; ±eye placement; beyond that it keeps producing distinct, separated centers.
+;; (Tier C would instead place centers at data-space centroids.)
+(deftm meta-embedding!
+  [meta :- (Array double) c :- Long dim :- Long] :- (Array double)
+  (dotimes [t (* c dim)] (aset meta t 0.0))
+  (loop [i 0 axis 0 sign 1.0 rad 1.0]
+    (when (< i c)
+      (aset meta (+ (* i dim) axis) (* sign rad))
+      (let [axis2 (+ axis 1)]
+        (if (>= axis2 dim)
+          (if (> sign 0.0)
+            (recur (+ i 1) 0 -1.0 rad)
+            (recur (+ i 1) 0 1.0 (+ rad 1.0)))
+          (recur (+ i 1) axis2 sign rad)))))
+  meta)
+
+;; Scale a (per-component) embedding in place so max|coord| = 1.
+(deftm normalize-unit! [emb :- (Array double) n :- Long dim :- Long] :- (Array double)
+  (let [nd (* n dim)
+        mx (loop [i 0 m 0.0] (if (< i nd) (recur (inc i) (max m (abs (aget emb i)))) m))
+        s  (/ 1.0 (max 1.0e-12 mx))]
+    (dotimes [i nd] (aset emb i (* (aget emb i) s)))
+    emb))
+
+;; Write a component's (normalized) sub-embedding into the global embedding at its
+;; global vertex ids, translated to the component's meta-center * spacing.
+(deftm scatter-component!
+  [sub :- (Array double) emb :- (Array double) verts :- (Array int)
+   meta :- (Array double) ci :- Long sz :- Long dim :- Long spacing :- Double]
+  :- (Array double)
+  (dotimes [l sz]
+    (let [g (long (aget verts l))]
+      (dotimes [d dim]
+        (aset emb (+ (* g dim) d)
+              (+ (aget sub (+ (* l dim) d))
+                 (* spacing (aget meta (+ (* ci dim) d))))))))
+  emb)
+
+;; Place a too-small component (size <= dim+1, no meaningful spectral structure):
+;; all its vertices sit at the meta-center * spacing plus a tiny deterministic
+;; spread so coincident points don't collapse the layout.
+(deftm place-small!
+  [emb :- (Array double) verts :- (Array int) meta :- (Array double)
+   ci :- Long sz :- Long dim :- Long spacing :- Double] :- (Array double)
+  (dotimes [l sz]
+    (let [g (long (aget verts l))]
+      (dotimes [d dim]
+        (aset emb (+ (* g dim) d)
+              (+ (* spacing (aget meta (+ (* ci dim) d)))
+                 (* 0.001 (+ (double l) (* 0.13 (double d)))))))))
+  emb)
+
+;; --- collection glue (dynamic per-component grouping; deftm can't express this) ---
+
+(defn- component-vertices
+  "Vector (indexed by component id) of int[] global vertex ids in that component."
+  [^ints label ^long n ^long c]
+  (let [lists (vec (repeatedly c #(java.util.ArrayList.)))]
+    (dotimes [i n]
+      (.add ^java.util.ArrayList (nth lists (clojure.core/aget label i)) (int i)))
+    (mapv (fn [^java.util.ArrayList al]
+            (let [a (int-array (.size al))]
+              (dotimes [k (.size al)] (clojure.core/aset a k (int (.get al k))))
+              a))
+          lists)))
+
+(defn- induced-subgraph
+  "Sub-edge-list for component `ci` with LOCAL vertex ids (g2l must be filled for
+  this component's vertices). Returns [head' tail' weights']. Edges are internal
+  to a component by construction, so filtering on head's label suffices."
+  [^ints head ^ints tail ^doubles weights ^ints label ci ^ints g2l ne]
+  (let [ci (long ci) ne (long ne)
+        sh (java.util.ArrayList.) st (java.util.ArrayList.) sw (java.util.ArrayList.)]
+    (dotimes [e ne]
+      (when (clojure.core/== ci (clojure.core/aget label (clojure.core/aget head e)))
+        (.add sh (clojure.core/aget g2l (clojure.core/aget head e)))
+        (.add st (clojure.core/aget g2l (clojure.core/aget tail e)))
+        (.add sw (clojure.core/aget weights e))))
+    (let [m (.size sh)
+          h (int-array m) t (int-array m) w (double-array m)]
+      (dotimes [k m]
+        (clojure.core/aset h k (int (.get sh k)))
+        (clojure.core/aset t k (int (.get st k)))
+        (clojure.core/aset w k (double (.get sw k))))
+      [h t w])))
+
+(defn- multi-component-layout
+  "Embed each connected component spectrally, normalize to unit radius, and place
+  components at ±eye meta-centers so they don't overlap."
+  [^ints head ^ints tail ^doubles weights ^ints label n c dim]
+  (let [n (long n) c (long c) dim (long dim)
+        ne (alength weights)
+        emb (double-array (clojure.core/* n dim))
+        meta (double-array (clojure.core/* c dim))
+        _ (meta-embedding! meta c dim)
+        spacing 3.0
+        comp-verts (component-vertices label n c)
+        g2l (int-array n)]
+    (dotimes [ci c]
+      (let [verts ^ints (nth comp-verts ci)
+            sz (alength verts)]
+        (dotimes [l sz] (clojure.core/aset g2l (clojure.core/aget verts l) (int l)))
+        (if (clojure.core/<= sz (clojure.core/inc dim))
+          (place-small! emb verts meta ci sz dim spacing)
+          (let [[sh st sw] (induced-subgraph head tail weights label ci g2l ne)
+                sub (connected-spectral sh st sw sz dim)]
+            (normalize-unit! sub sz dim)
+            (scatter-component! sub emb verts meta ci sz dim spacing)))))
+    emb))
+
+(defn spectral-init
+  "Spectral embedding of a symmetric weighted graph (edge list head/tail/weights).
+  Returns the n*dim row-major embedding. Single connected component -> direct
+  spectral solve; multiple components -> per-component spectral + meta-placement."
+  [^ints head ^ints tail ^doubles weights n dim]
+  (let [n (long n) dim (long dim)
+        ne (alength weights)
+        parent (int-array n)
+        _ (connected-components! head tail parent n ne)
+        label (int-array n)
+        remap (int-array n)
+        c (long (densify-labels! parent label remap n))]
+    (if (clojure.core/== c 1)
+      (connected-spectral head tail weights n dim)
+      (multi-component-layout head tail weights label n c dim))))

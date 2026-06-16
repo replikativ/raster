@@ -121,7 +121,7 @@
         ;; 4. low-dim init — f64 embedding (see dtype NOTE above: f32 emb makes the
         ;;    SGD ~168x slower via mixed-precision dispatch; quality is identical).
         emb (case mode
-              :spectral (let [{e :emb} (spectral/spectral-init head tail weights n out-dim)]
+              :spectral (let [e (spectral/spectral-init head tail weights n out-dim)]
                           (spectral/scale-embedding! e 10.0)
                           (add-noise! e seed))
               :random (random-init n out-dim seed))

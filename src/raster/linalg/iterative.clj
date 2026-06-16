@@ -32,6 +32,7 @@
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm ftm broadcast reduce!]]
             [raster.arrays :refer [aget aset alength aclone acopy!]]
+            [raster.linalg.eigen :as eigen]
             [raster.math :as m]
             [raster.numeric :as n]))
 
@@ -558,8 +559,19 @@
                                      (if (> i 0)
                                        (aset e (- i 1) (aget beta-arr i))
                                        nil))
-                          Z        (double-array (* am am))
+                          ;; Solve the small am×am tridiagonal eigenproblem via
+                          ;; LAPACK eigh (dsyevd). am ≤ maxiter ≪ n, so this dense
+                          ;; solve is cheap, and it avoids the hand-rolled
+                          ;; tridiag-qr-eigen (which produced NaN — 0/0 Givens with
+                          ;; no deflation). eigh's row-major eigenvectors match the
+                          ;; Z layout lanczos-extract expects.
+                          T        (double-array (* am am))
                           _        (dotimes [i am]
-                                     (aset Z (+ (* i am) i) 1.0))
-                          _        (tridiag-qr-eigen d e Z am tol)]
-                      (lanczos-extract-eigenvectors d Z V n am k))))
+                                     (aset T (+ (* i am) i) (aget d i))
+                                     (when (< i (- am 1))
+                                       (aset T (+ (* i am) (+ i 1)) (aget e i))
+                                       (aset T (+ (* (+ i 1) am) i) (aget e i))))
+                          tres     (eigen/eigh T am)
+                          tevals   (aget tres 0)
+                          tevecs   (aget tres 1)]
+                      (lanczos-extract-eigenvectors tevals tevecs V n am k))))
