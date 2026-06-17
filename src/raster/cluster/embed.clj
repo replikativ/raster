@@ -8,7 +8,7 @@
     negative  : k = ((n+p)·i·rng) mod n_vertices (uint32 wrap); if d²>1e-2:
                 gc = 4/((1+0.25·d²)·d²); grad clipped to [-4,4]
 
-  Reuses raster.umap/uclip. The whole multi-epoch solve compiles to one method."
+  Uses a local uclip (gradient clip to [-4,4]). The whole multi-epoch solve compiles to one method."
   (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == mod bit-and])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]

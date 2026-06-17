@@ -8,7 +8,7 @@
 
   Dense Prim is O(n²) — correct and exact for prototype scale; the KDTree+Boruvka
   approach EVoC uses is the large-n optimization (a later swap). Reuses
-  raster.umap.knn/knn-brute! for the core distances."
+  raster.knn/knn-brute! for the core distances."
   (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == max])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]

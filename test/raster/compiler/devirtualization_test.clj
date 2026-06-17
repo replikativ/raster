@@ -12,9 +12,11 @@
   (:require [clojure.test :refer [deftest testing is]]
             [raster.tooling.inspect :as inspect]
             [raster.compiler.pipeline :as pipeline]
-            [raster.umap :as umap]
-            [raster.umap.graph :as graph]
             [raster.spatial.nndescent :as nnd]))
+
+;; NOTE: the UMAP-layer devirt cases (optimize-layout-chunk!, graph kernels) moved
+;; to the umap-rstr library's test suite when UMAP was factored out. This gate now
+;; covers the raster-resident hot kernels (NN-descent).
 
 (def ^:private get-walked-body @#'pipeline/get-walked-body)
 
@@ -36,13 +38,7 @@
     ;; These must be exactly 0 — any runtime-dispatched numeric op in these tight
     ;; loops is a type-transport regression (e.g. TC not run in the source ns).
     ;; [var dtype] — dtype disambiguates parametric (All [T]) overloads.
-    (doseq [[v dtype] [[#'umap/optimize-layout-chunk! :double] ; parametric over emb
-                       [#'umap/optimize-layout-chunk! :float]  ; f32: mixed double×float
-                                                               ; via if-bound gc must
-                                                               ; devirt (was 888x boxing)
-                       [#'graph/smooth-knn-dist! nil]     ; inline (if ...) result now typed
-                       [#'graph/membership-strengths! nil]
-                       [#'nnd/cos-dist :double]           ; parametric (f32+f64)
+    (doseq [[v dtype] [[#'nnd/cos-dist :double]           ; parametric (f32+f64)
                        [#'nnd/local-join! nil]]]
       (let [{:keys [devirtualized dispatched]} (dispatch-counts v dtype)]
         (is (zero? dispatched)
