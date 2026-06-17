@@ -87,6 +87,75 @@ site. `emit-if-handler` emits both then/else and reconciles *actual* types (it
 already fixed a related :bool stack-map bug), so it is likely already sound —
 verify, don't assume.
 
+## GAP 6 — RESOLVED: upstream TC typo in `clojure.lang.Numbers/minus`
+
+ROOT CAUSE (found by reducing erf to a minimal case): `clojure.core/-` inlines to
+`clojure.lang.Numbers/minus`, whose TC annotation in
+`typed/clj.checker/src/typed/clj/checker/base_env.clj` had a **typo** in its
+binary mixed-arg overload:
+
+```clojure
+[(t/U Double Long) (t/U Double Long) -> Long]   ; should be -> Double
+```
+
+So `(- double double)` (no expected type, e.g. a `let`-binding init) matched this
+overload and inferred **Long** → Option X applied it → `double→long` truncation →
+`erf(1)` = 0.0, etc. Every analogous overload (`unchecked_minus`,
+`unchecked_multiply`, `quotient`) correctly returns `Double`; `+`/`*` have no such
+overload, which is why only `-` broke. base_env.clj is upstream (untouched by the
+fork) — so this is an **upstream TC bug**.
+
+**Fix (the clean root fix):** one token in base_env.clj — `-> Long` → `-> Double`
+on the `Numbers/minus` mixed overload. Verified: `(- d d)`→Double, `(- l l)`→Long
+(integer subtraction preserved), `(- l d)`→Double, `erf` `result`→Double. No
+raster code change, no regression. Worth upstreaming.
+
+**Rejected alternatives:**
+- *Walker float-evidence guard* — band-aid / pattern-matching; reverted.
+- *Convert deftm bodies to raster.numeric (the convention)* — regression-prone:
+  `raster.numeric/(/ 1 2)` = `0` (integer division) vs `clojure.core` `1/2`, so it
+  is **not** a drop-in; converting `econ.clj` broke its Newton solver. (Convention
+  hygiene remains worthwhile but must be done op-by-op with care, not wholesale.)
+
+(Historical analysis of the narrowing mechanism kept below for context.)
+
+## GAP 6-orig — narrowing tags silently truncate (TC imprecision)  [SUPERSEDED by the typo fix]
+
+The 5 wrong-value FAILs after Option D (erf-one, erfc, erfinv, normal-quantile,
+econ log-utility — all return ~0) trace to a single mechanism: TC infers a
+**`Long`** type for a binding whose value is a **`Double`**, Option X faithfully
+applies it, and the backend coerces `double → long` → fractional values < 1
+truncate to 0 → the whole result collapses.
+
+Confirmed: `raster.sci.special/erf` binding tags =
+`{sign double, x double, t double, y double, result long}` — `result`
+(`(- 1.0 (* y (m/exp …)))`, value ≈ 0.84) is typed **`Long`** by TC (raw
+`u/expr-type`, not a tag-conversion artifact). `(erf 1.0)` → 0.0.
+
+The basic ops type fine in isolation (`(- 1.0 (* a b))` over Doubles → Double;
+`(- 1.0 (* (* x x) (exp x)))` → Double); the mis-inference only appears in the
+full `let`-chain context — a TC occurrence-typing / `Val`-propagation (PR #193)
+interaction, not one bad annotation. Surfaced by Option X because the sparse
+metadata path never tagged these bindings (walker's structural inference gave
+the correct `double`).
+
+**Two-level fix:**
+- **Soundness guard (defense-in-depth, do first).** A binding tag must never
+  silently *truncate*. Replace the blunt `(or tc-tag (infer-binding-tag …))`
+  with a **reconciliation**: when TC says `long`/`int` but `infer-binding-tag`
+  (structural) says a floating type — or the init is obviously double-producing
+  (`1.0` literals, `/`, `exp`, `sqrt`, `fma`, …) — do **not** narrow; keep the
+  floating tag. TC tags then *fill gaps* (additive) but can't *corrupt values*
+  (destructive). This makes "rely on TC" safe even when TC is imprecise, and is
+  the principled answer to the earlier `(or tc-tag …)` question.
+- **TC precision (the real root, `tc_warnings_agenda`).** Fix the numeric TC
+  inference so double arithmetic in these contexts infers `Double`. Harder,
+  context-dependent; tracked with the broader TC-annotation cleanup.
+
+This subsumes GAP 2 (f32 `[J`/`[F`): same family — TC/array-element type vs.
+emitted array type; the reconciliation guard should also refuse to apply an
+array-element tag that contradicts the init's actual array type.
+
 ## GAP 2 — f32 array binding mis-typed as long-array  [ACTIVE]
 
 `compiled-mlp-gradient-f32-test`: `ClassCastException [J cannot be cast to [F` in
