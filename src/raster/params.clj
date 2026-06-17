@@ -30,6 +30,7 @@
             [raster.ad.reverse]      ; required so synthesized train-step bodies resolve
             [raster.arrays]
             [raster.compiler.core.params :as params]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.params-flatten :as pf]
             [raster.compiler.pipeline :as pipeline]
             [raster.dl.optim]))
@@ -40,7 +41,8 @@
 
 (defn- parse-typed-params
   "Return [params annotations] from a typed param vector like
-  [a :- Long, b :- (HMap ...)]. Untyped params become annotation nil."
+  [a :- Long, b :- (HMap ...)]. Untyped params become annotation nil.
+  Also accepts the metadata form `^{:- T} a` (see types/param-type-meta)."
   [param-vec]
   (loop [items (seq param-vec)
          params []
@@ -51,11 +53,11 @@
             rest-items (next items)]
         (if (and rest-items (= ':- (first rest-items)))
           (recur (next (next rest-items))
-                 (conj params item)
+                 (conj params (types/strip-type-meta item))
                  (conj anns (second rest-items)))
           (recur rest-items
-                 (conj params item)
-                 (conj anns nil)))))))
+                 (conj params (types/strip-type-meta item))
+                 (conj anns (types/param-type-meta item))))))))
 
 (defn- parse-defmodel-args
   "Parse defmodel's args: [param-vec :- ret-type body...] OR
@@ -65,7 +67,7 @@
         rest1 (rest args)
         [ret body] (if (= :- (first rest1))
                      [(second rest1) (drop 2 rest1)]
-                     [nil rest1])
+                     [(types/meta-type-annotation param-vec) rest1])
         [params anns] (parse-typed-params param-vec)]
     {:params params :anns anns :ret ret :body (vec body)}))
 
