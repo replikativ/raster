@@ -2,7 +2,7 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/data.json {:mvn/version "2.5.1"}
         org.typedclojure/typed.clj.checker {:git/url "https://github.com/whilo/typedclojure"
-                                            :git/sha "5c6412026dea6a7cd24e1eb4f1b3408b350f7f4f"
+                                            :git/sha "ea66226f7e998f88e779b6ec3bb7332049728438"
                                             :deps/root "typed/clj.checker"}
         org.replikativ/pattern {:mvn/version "1.0.449"}
         org.replikativ/beichte {:mvn/version "0.2.7"}}

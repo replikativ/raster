@@ -195,5 +195,13 @@ to source bindings. Not the root cause of GAP 1, but correct hygiene to keep.
   all trace to GAP 1/2.
 - Next: prototype GAP 1 fix (context-directed branch-result coercion) and
   re-run the full suite under the local Option-X TC.
-- Then: typedclojure#195 — rebase fork onto upstream + reframe (AST not metadata,
-  drop tag-suppression), address GAP 3.
+- DONE: fork rebased onto upstream/main (clean) + split into focused upstream PRs:
+  - #195 (reframed) — core/let exposes per-binding types on the checked AST (was
+    `::binding-types` metadata + tag-suppression; now the let* checked node). GAP 3
+    (double-check) noted as follow-up in the PR.
+  - #241 — `Numbers/minus` mixed-overload typo (`-> Long` → `-> Double`); the GAP 6 root fix.
+  - #242 — loop binding-type inference from inits.
+  - #243 — `unchecked-*` annotation corrections (splits out the #193 review concern).
+  - #244 — nth/Top/instance-method limitations + reify debug-prn removal.
+  - #245 — `with-recorded-deps` skip when cache disabled (perf).
+  raster pins the combined `integration` branch (whilo fork @ ea66226f7) until these land.
