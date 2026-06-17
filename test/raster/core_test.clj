@@ -38,6 +38,40 @@
     (is (= :object (specific [1 2 3])))))
 
 ;; ================================================================
+;; Metadata-form type annotations: ^{:- T} (Rich Hickey / TypedClojure style)
+;; ================================================================
+
+(deftm meta-ann [^{:- Long} x] :long)
+(deftm meta-ann [^{:- String} x] :string)
+;; TypedClojure's fully-qualified metadata key is also accepted
+(deftm meta-ann [^{:typed.clojure/type Double} x] :double)
+;; inline and metadata forms may be mixed in one arglist
+(deftm meta-mixed [^{:- Long} x y :- String] [x y])
+;; return type via metadata: ^{:- Ret} goes BEFORE the arg vector,
+;; mirroring Clojure's own ^long [x] return-hint convention.
+(deftm meta-ret ^{:- Long} [x :- Long] (* x x))
+
+(deftest metadata-annotation-test
+  (testing "^{:- T} dispatches identically to inline x :- T"
+    (is (= :long   (meta-ann 42)))
+    (is (= :string (meta-ann "hi"))))
+  (testing "^{:typed.clojure/type T} is recognized"
+    (is (= :double (meta-ann 3.14))))
+  (testing "metadata and inline forms mix freely"
+    (is (= [7 "ok"] (meta-mixed 7 "ok"))))
+  (testing "ftm accepts the metadata form too"
+    (is (= 6.25 ((ftm [^{:- Double} y] :- Double (* y y)) 2.5))))
+  (testing "return type via ^{:- Ret} before the arg vector"
+    (is (= 49 (meta-ret 7)))
+    ;; the metadata return type drives the same ::return-tag as inline :- Long
+    (let [v (->> (ns-publics 'raster.core-test) keys
+                 (filter #(re-find #"meta-ret_m_" (str %)))
+                 (map #(ns-resolve 'raster.core-test %)) first)]
+      (is (= 'long (:raster.core/return-tag (meta v))))))
+  (testing "ftm return type via ^{:- Ret} before the arg vector"
+    (is (= 9.0 ((ftm ^{:- Double} [y :- Double] (* y y)) 3.0)))))
+
+;; ================================================================
 ;; Multi-arity dispatch
 ;; ================================================================
 

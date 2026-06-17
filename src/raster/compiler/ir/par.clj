@@ -275,6 +275,31 @@
                                                     (list 'clojure.core/aget src 'src-pos__)))))))
                 out)))))
 
+(defn expand-par-gather!
+  "Expand a (raster.par/gather out src index n [stride]) form to sequential loop."
+  [form]
+  (let [args (rest form)]
+    (case (count args)
+      4 (let [[out src index n] args
+              i-sym (gensym "i__")]
+          (list 'let ['n__ (list 'int n)]
+                (list 'dotimes [i-sym 'n__]
+                      (list 'clojure.core/aset out i-sym
+                            (list 'clojure.core/aget src
+                                  (list 'clojure.core/aget index i-sym))))
+                out))
+      5 (let [[out src index n stride] args
+              i-sym (gensym "i__")
+              d-sym (gensym "d__")]
+          (list 'let ['n__ (list 'int n) 'stride__ (list 'int stride)]
+                (list 'dotimes [i-sym 'n__]
+                      (list 'let ['sbase__ (list '* (list 'clojure.core/aget index i-sym) 'stride__)
+                                  'obase__ (list '* i-sym 'stride__)]
+                            (list 'dotimes [d-sym 'stride__]
+                                  (list 'clojure.core/aset out (list '+ 'obase__ d-sym)
+                                        (list 'clojure.core/aget src (list '+ 'sbase__ d-sym))))))
+                out)))))
+
 (defn expand-par-reduce-by-key
   "Expand a (raster.par/reduce-by-key output keys vals n op) form to sequential loop."
   [form]
@@ -314,6 +339,9 @@
 
     (and (seq? form) (= 'raster.par/scatter! (first form)))
     (expand-par-forms (expand-par-scatter! form))
+
+    (and (seq? form) (= 'raster.par/gather (first form)))
+    (expand-par-forms (expand-par-gather! form))
 
     (and (seq? form) (= 'raster.par/reduce-by-key (first form)))
     (expand-par-forms (expand-par-reduce-by-key form))
@@ -355,6 +383,7 @@
                     'raster.par/scan-exclusive 'par/scan-exclusive
                     'raster.par/stencil! 'par/stencil!
                     'raster.par/scatter! 'par/scatter!
+                    'raster.par/gather 'par/gather
                     'raster.par/reduce-by-key 'par/reduce-by-key
                     'raster.par/map-void! 'par/map-void!
                     'raster.par/rng-fill! 'par/rng-fill!
@@ -397,6 +426,11 @@
   "Check if a form is a raster.par/scatter! parallel scatter."
   [form]
   (and (seq? form) (contains? #{'raster.par/scatter! 'par/scatter!} (first form))))
+
+(defn par-gather-form?
+  "Check if a form is a raster.par/gather parallel gather."
+  [form]
+  (and (seq? form) (contains? #{'raster.par/gather 'par/gather} (first form))))
 
 (defn par-reduce-by-key-form?
   "Check if a form is a raster.par/reduce-by-key parallel reduction."

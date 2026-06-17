@@ -172,6 +172,14 @@
            (= 'raster.par/stencil! resolved)))
     :par-stencil
 
+    (and (seq? form)
+         (let [head (first form)
+               resolved (if (and (symbol? head) (namespace head))
+                          (resolve-aliased-symbol head (:source-ns ctx))
+                          head)]
+           (= 'raster.par/gather resolved)))
+    :par-gather
+
     ;; Pure par/map — first-class IR form (NOT a typed macro)
     (and (seq? form)
          (let [head (first form)
@@ -370,7 +378,17 @@
       (if (and (seq? result)
                (not (:raster.type/tag (meta result)))
                (instance? clojure.lang.IObj result))
-        (let [head (first result)]
+        (let [head (first result)
+              type-env (:type-env ctx)
+              ;; Tag of an already-walked sub-form (bottom-up: inner forms are
+              ;; walked+stamped before their parent).
+              walked-tag (fn [w]
+                           (cond
+                             (seq? w)    (or (:raster.type/tag (meta w))
+                                             (inf/infer-rewritten-tag w nil type-env))
+                             (symbol? w) (or (:raster.type/tag (meta w))
+                                             (inf/type-env-tag type-env w))
+                             :else       (inf/literal-tag w)))]
           (cond
             ;; .invk — read ret-tag from impl-sym metadata
             (and (= '.invk head) (symbol? (second result)))
@@ -380,6 +398,51 @@
             ;; Primitive cast — (double x), (float x), etc.
             (contains? types/primitive-info head)
             (vary-meta result assoc :raster.type/tag head)
+            ;; if — result type is the (agreeing) type of its value branches.
+            ;; A recur branch carries no value, so the result is the OTHER branch;
+            ;; this also types loop bodies of the form (if test (recur ...) acc).
+            ;; Only stamp when the type is unambiguous (both value branches agree)
+            ;; so a genuine union stays untyped (and thus dispatched — correct).
+            (and (= 'if head) (>= (count result) 3))
+            (let [recur? (fn [x] (and (seq? x) (= 'recur (first x))))
+                  then (nth result 2)
+                  els  (when (> (count result) 3) (nth result 3))
+                  tt   (when-not (recur? then) (walked-tag then))
+                  et   (when (and els (not (recur? els))) (walked-tag els))
+                  rtag (cond
+                         (and tt et (= tt et))      tt
+                         (and tt els (recur? els))  tt
+                         (and et (recur? then))     et
+                         :else nil)]              ; one-arm/ambiguous → leave untyped
+              (if rtag (vary-meta result assoc :raster.type/tag rtag) result))
+            ;; let*/loop*/do — result type is the last body form's type.
+            (contains? '#{let* loop* do} head)
+            (if-let [t (walked-tag (last result))]
+              (vary-meta result assoc :raster.type/tag t)
+              result)
+            ;; case — result type is the (agreeing) type of all clause results
+            ;; (every 2nd clause element) plus the optional trailing default.
+            (= 'case head)
+            (let [clauses (drop 2 result)
+                  pairs?  (even? (count clauses))
+                  results (concat (map second (partition 2 (if pairs? clauses (butlast clauses))))
+                                  (when-not pairs? [(last clauses)]))
+                  tags    (map walked-tag results)]
+              (if (and (seq tags) (every? some? tags) (apply = tags))
+                (vary-meta result assoc :raster.type/tag (first tags))
+                result))
+            ;; try — result type is the (agreeing) type of the body's last form and
+            ;; each catch's last form (finally never yields the value).
+            (= 'try head)
+            (let [parts   (rest result)
+                  cf?     (fn [f] (and (seq? f) (contains? #{'catch 'finally} (first f))))
+                  body    (take-while (complement cf?) parts)
+                  catches (filter #(and (seq? %) (= 'catch (first %))) parts)
+                  vforms  (concat (when (seq body) [(last body)]) (map last catches))
+                  tags    (map walked-tag vforms)]
+              (if (and (seq tags) (every? some? tags) (apply = tags))
+                (vary-meta result assoc :raster.type/tag (first tags))
+                result))
             :else result))
         result))))
 
@@ -682,6 +745,32 @@
                             out-tag (assoc :tag out-tag :raster.type/tag out-tag)
                             elem-type (assoc :raster.type/elem-type elem-type)))
         result))))
+
+;; ================================================================
+;; Branch: par/gather (first-class IR — preserved for the SIMD vgather pass,
+;; not macroexpanded to a scalar loop)
+;; ================================================================
+
+(defmethod walk-form :par-gather [form ctx]
+  ;; (raster.par/gather out src index n [stride]) — keep symbolic; the SIMD
+  ;; pass emits a hardware vgather (DoubleVector.fromArray index-map form),
+  ;; else expand-par-gather! lowers it to a scalar loop.
+  (let [args       (vec (rest form))
+        out-sym    (first args)
+        out-tag    (ctx-get-tag ctx out-sym)
+        hinted-out (if (and out-tag (types/array-tag? out-tag))
+                     (stamp-type-meta out-sym out-tag)
+                     out-sym)
+        elem-type  (case out-tag
+                     floats :float doubles :double longs :long ints :int
+                     nil)
+        result     (list* 'raster.par/gather hinted-out
+                          (mapv #(walk % ctx) (rest args)))]
+    (if (or out-tag elem-type)
+      (with-meta result (cond-> {}
+                          out-tag (assoc :tag out-tag :raster.type/tag out-tag)
+                          elem-type (assoc :raster.type/elem-type elem-type)))
+      result)))
 
 ;; ================================================================
 ;; Branch: pure par/map (first-class IR, not typed macro)

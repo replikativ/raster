@@ -139,7 +139,7 @@
                   (let [params (mapv #(with-meta % nil) (remove #{'&} source-params))
                         tags (mapv #(or (:tag (meta %)) 'Object) (remove #{'&} source-params))
                         annotations (mapv (fn [t] (if (= t 'Object) nil t)) tags)
-                        result (inf/tc-analyze-deftm-body '<specialize> params annotations source-body)]
+                        result (inf/tc-analyze-deftm-body '<specialize> params annotations source-body source-ns)]
                     (:binding-tags result))
                   (catch Throwable _ nil))
             ;; Walk the body with unified type-env + TC binding tags

@@ -1,6 +1,7 @@
 (ns raster.linalg.iterative-test
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.linalg.iterative :refer [cg gmres bicgstab pcg jacobi-precond]]
+            [raster.linalg.iterative :refer [cg gmres bicgstab pcg jacobi-precond lanczos
+                                             lanczos-tridiag]]
             [raster.core :refer [ftm]]))
 
 (def ^:const TOL 1e-3)
@@ -409,3 +410,47 @@
                                                               (clojure.core/aget ^doubles x-true i)))))))]
       (is (< err-tight err-loose)
           (str "Tight tol error " err-tight " should be less than loose tol error " err-loose)))))
+
+;; ================================================================
+;; Lanczos symmetric eigensolver
+;; ================================================================
+
+;; Diagonal matrix diag(1,2,3,4,5): eigenvalues are 1..5, eigenvectors the
+;; standard basis. Largest-magnitude k=3 are 5, 4, 3.
+(def diag5-matvec
+  (ftm [x :- (Array double) y :- (Array double)] :- (Array double)
+       (dotimes [i 5] (aset y i (* (+ (double i) 1.0) (aget x i))))
+       y))
+
+(deftest lanczos-diagonal-test
+  (testing "lanczos recovers the largest-magnitude eigenvalues (regression: the
+            tridiagonal solve used to produce NaN via a 0/0 Givens rotation)"
+    (let [res   (lanczos diag5-matvec 5 3 1e-9 20)
+          evals (aget ^objects res 0)]
+      (is (approx= 5.0 (aget ^doubles evals 0)))
+      (is (approx= 4.0 (aget ^doubles evals 1)))
+      (is (approx= 3.0 (aget ^doubles evals 2)))
+      (is (not (Double/isNaN (aget ^doubles evals 0)))))))
+
+;; 3x3 Laplacian [[2 -1 0][-1 2 -1][0 -1 2]] — symmetric, eigenvalues
+;; 2-sqrt2, 2, 2+sqrt2 = {0.5858, 2.0, 3.4142}. Largest is 2+sqrt2.
+(deftest lanczos-laplacian-test
+  (testing "lanczos top eigenvalue of the 3x3 Laplacian"
+    (let [res   (lanczos laplacian-matvec 3 3 1e-10 10)
+          evals (aget ^objects res 0)]
+      (is (approx= 3.41421 (aget ^doubles evals 0) 1e-3))
+      (is (approx= 2.0     (aget ^doubles evals 1) 1e-3)))))
+
+(deftest lanczos-early-termination-test
+  (testing "lanczos-tridiag stops well before maxiter once the k wanted Ritz pairs
+            converge (Ritz-residual check), instead of always running maxiter steps"
+    (let [dn 60
+          mv (ftm [x :- (Array double) y :- (Array double)] :- (Array double)
+                  (dotimes [i dn] (aset y i (* (+ (double i) 1.0) (aget x i))))
+                  y)
+          maxit 300
+          alpha (double-array maxit) beta (double-array maxit)
+          V (double-array (* maxit dn)) w (double-array dn)
+          am (long (lanczos-tridiag mv alpha beta V w dn maxit 1e-6 3))]
+      (is (> am 3) "must build at least k+1 vectors")
+      (is (< am 100) (str "should converge early, took " am " of " maxit " steps")))))

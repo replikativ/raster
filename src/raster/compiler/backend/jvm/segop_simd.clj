@@ -29,6 +29,7 @@
 (def ^:private simd-unary-ops descriptor/simd-unary-ops)
 (def ^:private simd-lanewise-unary-ops descriptor/simd-lanewise-unary-ops)
 (def ^:private simd-binary-ops descriptor/simd-binary-ops)
+(def ^:private simd-lanewise-binary-ops descriptor/simd-lanewise-binary-ops)
 (def ^:private simd-ternary-ops descriptor/simd-ternary-ops)
 
 (def ^:private simd-compare-ops
@@ -242,6 +243,7 @@
             (contains? simd-unary-ops math-sym) [1 math-sym]
             (contains? simd-lanewise-unary-ops math-sym) [1 math-sym]
             (contains? simd-binary-ops math-sym) [2 math-sym]
+            (contains? simd-lanewise-binary-ops math-sym) [2 math-sym]
             (contains? simd-ternary-ops math-sym) [3 math-sym]))
         ;; raster.numeric/* → try both clojure.core/* and bare *
         (= ns-str "raster.numeric")
@@ -252,6 +254,7 @@
             (contains? simd-unary-ops core-sym) [1 core-sym]
             (contains? simd-binary-ops bare-sym) [2 bare-sym]
             (contains? simd-binary-ops core-sym) [2 core-sym]
+            (contains? simd-lanewise-binary-ops bare-sym) [2 bare-sym]
             (contains? simd-ternary-ops bare-sym) [3 bare-sym]
             (contains? simd-ternary-ops core-sym) [3 core-sym]))
         :else nil))))
@@ -279,6 +282,10 @@
     (simd-able? (second expr) idx-sym)
     (and (seq? expr) (= 3 (count expr))
          (contains? simd-binary-ops (first expr)))
+    (and (simd-able? (nth expr 1) idx-sym)
+         (simd-able? (nth expr 2) idx-sym))
+    (and (seq? expr) (= 3 (count expr))
+         (contains? simd-lanewise-binary-ops (first expr)))
     (and (simd-able? (nth expr 1) idx-sym)
          (simd-able? (nth expr 2) idx-sym))
     (and (seq? expr) (= 4 (count expr))
@@ -450,6 +457,11 @@
       (and (seq? expr) (= 3 (count expr)) (contains? simd-binary-ops (first expr)))
       (list (simd-binary-ops (first expr)) (recur-fn (nth expr 1)) (recur-fn (nth expr 2)))
 
+      ;; binary lanewise (pow via SVML POW): base.lanewise(OP, argVec)
+      (and (seq? expr) (= 3 (count expr)) (contains? simd-lanewise-binary-ops (first expr)))
+      (list '.lanewise (recur-fn (nth expr 1)) (simd-lanewise-binary-ops (first expr))
+            (recur-fn (nth expr 2)))
+
       (and (seq? expr) (= 4 (count expr)) (contains? simd-ternary-ops (first expr)))
       (list (simd-ternary-ops (first expr))
             (recur-fn (nth expr 1)) (recur-fn (nth expr 2)) (recur-fn (nth expr 3)))
@@ -504,9 +516,13 @@
                 (list (simd-unary-ops op-sym) (recur-fn (first args)))
                 (contains? simd-lanewise-unary-ops op-sym)
                 (list '.lanewise (recur-fn (first args)) (simd-lanewise-unary-ops op-sym)))
-            2 (when (contains? simd-binary-ops op-sym)
+            2 (cond
+                (contains? simd-binary-ops op-sym)
                 (list (simd-binary-ops op-sym)
-                      (recur-fn (first args)) (recur-fn (second args))))
+                      (recur-fn (first args)) (recur-fn (second args)))
+                (contains? simd-lanewise-binary-ops op-sym)
+                (list '.lanewise (recur-fn (first args))
+                      (simd-lanewise-binary-ops op-sym) (recur-fn (second args))))
             3 (when (contains? simd-ternary-ops op-sym)
                 (list (simd-ternary-ops op-sym)
                       (recur-fn (first args))
@@ -641,6 +657,45 @@
                   simd-loop)))))))
 
 ;; ================================================================
+;; par/gather → SIMD hardware vgather
+;; ================================================================
+
+(defn compile-par-gather
+  "Compile (raster.par/gather out src index n) to a SIMD vgather loop:
+     out[j..j+L) = src[index[j..j+L)]
+   via DoubleVector.fromArray(species, src, 0, index, j) (hardware vgather),
+   stored contiguously into out, with a scalar tail. Flat (non-strided) form
+   only; returns SIMD S-expr or nil. elem-type ∈ {:double :float}."
+  [out src index n elem-type]
+  (let [{:keys [species-expr from-array]} (get simd-type-info elem-type)
+        vec-tag     (case elem-type :double 'jdk.incubator.vector.DoubleVector
+                          :float 'jdk.incubator.vector.FloatVector)
+        species-sym (vary-meta (gensym "sp__") assoc :tag 'jdk.incubator.vector.VectorSpecies)
+        lanes-sym   (vary-meta (gensym "lanes__") assoc :tag 'long)
+        n-sym       (vary-meta (gensym "n__") assoc :tag 'long)
+        j-sym       (vary-meta (gensym "j__") assoc :tag 'long)
+        gv-sym      (vary-meta (gensym "gv__") assoc :tag vec-tag)]
+    (when species-expr
+      (list 'let* [species-sym species-expr
+                   lanes-sym (list '.length species-sym)
+                   n-sym (list 'int n)]
+            (list 'loop* [j-sym '(int 0)]
+                  (list 'if (list '<= (list '+ j-sym lanes-sym) n-sym)
+                        ;; vgather: src[index[j..j+L)] → contiguous out[j..j+L)
+                        (list 'let* [gv-sym (list from-array species-sym src 0 index j-sym)]
+                              (list '.intoArray gv-sym out j-sym)
+                              (list 'recur (list '+ j-sym lanes-sym)))
+                        ;; scalar tail
+                        (list 'loop* [j-sym j-sym]
+                              (list 'if (list '< j-sym n-sym)
+                                    (list 'do
+                                          (list 'clojure.core/aset out j-sym
+                                                (list 'clojure.core/aget src
+                                                      (list 'clojure.core/aget index j-sym)))
+                                          (list 'recur (list 'inc j-sym)))
+                                    out))))))))
+
+;; ================================================================
 ;; SegRed → SIMD (multi-accumulator)
 ;; ================================================================
 
@@ -728,6 +783,26 @@
                         simd-elems (vec (for [k (range nacc)]
                                           (let [e (emit-simd elem-expr idx (nth vec-envs k) species-sym elem-type)]
                                             (if (seq? e) (with-meta (apply list e) {:tag vec-tag}) e))))
+                        ;; FMA fusion: acc + a[i]*b[i] → DoubleVector.fma(b,c)=this*b+c → one
+                        ;; vfmadd231pd. Crucially we inline the fromArray loads INTO the .fma so
+                        ;; C2 folds the memory load into the FMA instruction (vfmadd ymm,ymm,[mem])
+                        ;; and unrolls deeply — matching hand-tuned Java. Pre-binding loads to vec
+                        ;; syms yields register-only FMA + separate vmovupd (slower, shallow unroll).
+                        fma-f1 (when (and (= op '+) (contains? #{:double :float} elem-type)
+                                          (seq? elem-expr) (= 3 (count elem-expr))
+                                          (contains? #{'* 'clojure.core/* 'raster.numeric/*} (first elem-expr)))
+                                 (nth elem-expr 1))
+                        fma-f2 (when fma-f1 (nth elem-expr 2))
+                        fuse-fma? (and fma-f1 (aget-form? fma-f1 idx) (aget-form? fma-f2 idx))
+                        fma-load (fn [factor k]   ;; inline (fromArray species arr (base + j + k*lanes))
+                                   (let [[arr0 base] (aget-form? factor idx)
+                                         arr (if (and (seq? arr0)
+                                                      (contains? #{'double 'float 'clojure.core/double 'clojure.core/float}
+                                                                 (first arr0)))
+                                               (second arr0) arr0)
+                                         k-offset (if (zero? k) j-sym (list '+ j-sym (list '* (int k) lanes-sym)))
+                                         off (if base (list '+ base k-offset) k-offset)]
+                                     (with-meta (list from-array species-sym arr off) {:tag vec-tag})))
                         identity-val (reduce-identity op elem-type)
                         ;; Build per-array, per-accumulator offset loads
                         ;; For each arr, combine: base-offset + j + k*lanes
@@ -745,14 +820,20 @@
                                                    (nth arr-groups k)))]
                                  (make-arr-load-bindings arr-vec-offsets species-sym from-array))))
                         elem-syms (vec (for [k (range nacc)] (tag-vec (gensym (str "el" k "__")))))
-                        inner-binds (vec (mapcat (fn [k]
-                                                   (concat (nth chunk-loads k)
-                                                           [(nth elem-syms k) (nth simd-elems k)]))
-                                                 (range nacc)))
+                        inner-binds (if fuse-fma?
+                                      []   ;; loads are inlined into the .fma below
+                                      (vec (mapcat (fn [k]
+                                                     (concat (nth chunk-loads k)
+                                                             [(nth elem-syms k) (nth simd-elems k)]))
+                                                   (range nacc))))
                         recur-args (into [(list '+ j-sym stride-sym)]
                                          (for [k (range nacc)]
-                                           (with-meta (list method (nth vacc-syms k) (nth elem-syms k))
-                                             {:tag vec-tag})))
+                                           (if fuse-fma?
+                                             ;; vacc_k = a[..]*b[..] + vacc_k, loads inline → memory-operand FMA
+                                             (with-meta (list '.fma (fma-load fma-f1 k) (fma-load fma-f2 k) (nth vacc-syms k))
+                                               {:tag vec-tag})
+                                             (with-meta (list method (nth vacc-syms k) (nth elem-syms k))
+                                               {:tag vec-tag}))))
                         combine (reduce (fn [a b] (with-meta (list method a b) {:tag vec-tag}))
                                         (map (fn [k] (nth vacc-syms k)) (range nacc)))
                         scalar-bcasts (vec (mapcat (fn [[s sv]] [sv (list broadcast species-sym (list cf s))])

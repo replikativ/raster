@@ -54,6 +54,7 @@
             [raster.compiler.backend.jvm.valhalla :as valhalla]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.backend.jvm.bytecode :as bytecode]
+            [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.core.typed-dispatch :as typed-dispatch]
             [raster.runtime.callsites :as callsites]))
 
@@ -212,9 +213,11 @@
   (let [{:keys [validate? fn-label tc-eager? defer-walk? simplify?]
          :or {validate? true tc-eager? false defer-walk? false simplify? *simplify?*}} opts
         ;; Parse return type and body from ret-args
+        ;; Return type: inline `:- Ret` after the arg vector, else metadata
+        ;; `^{:- Ret}` on the arg vector itself (mirrors Clojure's ^long [x]).
         [ret-type body] (if (= :- (first ret-args))
                           [(second ret-args) (nnext ret-args)]
-                          [nil ret-args])
+                          [(types/meta-type-annotation param-vec) ret-args])
         ;; Parse typed params
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         tags (types/extract-tags params annotations)
@@ -229,7 +232,7 @@
         tc-ret-tag (when (and tc-eager? (not explicit-ret-tag) (seq annotations))
                      (try
                        (:ret-tag (inf/tc-analyze-deftm-body
-                                  (or fn-label '<infer>) params annotations body))
+                                  (or fn-label '<infer>) params annotations body *ns*))
                        (catch Throwable _ nil)))
         ret-tag (or explicit-ret-tag tc-ret-tag)
         ;; Validate
@@ -249,7 +252,7 @@
         tc-binding-tags (when tc-eager?
                           (try
                             (:binding-tags (inf/tc-analyze-deftm-body
-                                            (or fn-label '<ftm>) params annotations body))
+                                            (or fn-label '<ftm>) params annotations body *ns*))
                             (catch Throwable _ nil)))
         ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
@@ -309,11 +312,42 @@
   (let [type-env (build-walker-type-env params annotations)
         tc-binding-tags (try
                           (:binding-tags (inf/tc-analyze-deftm-body
-                                          '<jit> params annotations source-body))
+                                          '<jit> params annotations source-body source-ns))
                           (catch Throwable _ nil))
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) source-body)))
+
+(def ^:dynamic *jit-simd?*
+  "Opt-in: vectorize par/map and par/reduce in the lazy-JIT bytecode upgrade via
+  the JDK Vector API (par-simd/simd-pass), the same codegen compile-aot uses.
+
+  Default FALSE. The emitted vector bytecode is correct and identical to
+  compile-aot's, but when a small kernel (e.g. a dim~50 cos-dist) is invoked
+  through the deftm `.invk` interface inside a hot loop, C2's escape analysis
+  fails to scalarize the per-call DoubleVector temporaries — they heap-allocate
+  every call, and at millions of calls that is a large net regression (measured
+  ~12x on UMAP kNN) despite the loop body being 'vectorized'. compile-aot does
+  not hit this because it inlines the kernel into its caller so EA can see the
+  whole region. Until lazy-JIT SIMD is made reliably scalarizable across the
+  .invk boundary, SIMD out of the box lives in compile-aot; bind this to true to
+  opt a lazy-JIT kernel into SIMD when you know it pays (large bounds, or the
+  kernel is the whole hot method). simd-pass keeps a scalar tail + falls back to
+  a scalar loop, so results stay correct (reductions reorder FP adds like BLAS)."
+  false)
+
+(defn- simd-expand-jit-body
+  "Replace par forms in a lazy-JIT walked body with SIMD code when *jit-simd?*.
+  Per-form: vectorize via simd-pass, else leave the par form for bytecode's
+  scalar expansion. Never throws — a failed form keeps its scalar shape."
+  [walked-body source-ns]
+  (if-not *jit-simd?*
+    walked-body
+    (binding [*ns* (or source-ns *ns*)]
+      (mapv (fn [form]
+              (try (:form (par-simd/simd-pass form))
+                   (catch Throwable _ form)))
+            walked-body))))
 
 (clojure.core/defn ^:no-doc do-bytecode-upgrade!
   "Compile a deftm body to bytecode and swap the -impl var.
@@ -336,6 +370,8 @@
                                     (catch Throwable _
                                       walked-body))
                                walked-body)
+              ;; Vectorize par/map + par/reduce out of the box (scalar fallback inside).
+              effective-body (simd-expand-jit-body effective-body source-ns)
               class-name (str "raster.compiled.DT_"
                               (.replace (str mangled-sym) "." "_")
                               "_" (bit-and (hash effective-body) 0x7FFFFFFF)
@@ -542,12 +578,24 @@
     (deftm foo [x :- Long] :- Long (* x x))
     (deftm foo [x :- String] (count x))
 
+  Annotations may equivalently be given as metadata (the Rich-Hickey /
+  TypedClojure style). A param type goes on the param symbol; the return
+  type goes on the arg vector, before it (mirroring Clojure's ^long [x]):
+
+    (deftm foo ^{:- Long} [x :- Long] (* x x))           ; return via metadata
+    (deftm foo [^{:- Long} x] :- Long (* x x))           ; param via metadata
+    (deftm foo [^{:typed.clojure/type Long} x] ...)       ; TC's fully-qualified key
+
+  Inline and metadata forms may be freely mixed; inline wins if both are
+  present on the same position. The metadata annotation flows through the
+  identical machinery, so (Array T), (Fn [..] R), (Param T) etc. all work.
+
   Type inference is automatic:
   - Record field types inferred via typedclojure (use :field keyword access)
   - Let bindings auto-hinted (no manual ^doubles needed)
   - Calls to other deftm functions devirtualized at compile time
 
-  Also supports legacy ^Tag metadata on parameters."
+  Also supports legacy ^Tag (:tag) metadata on parameters."
   {:arglists '([name [params...] :- RetType & body]
                [name docstring [params...] & body])}
   [fn-name & args]
@@ -607,7 +655,7 @@
               after-params (rest all-rest)
               [ret-type body] (if (= :- (first after-params))
                                 [(second after-params) (nnext after-params)]
-                                [nil after-params])
+                                [(types/meta-type-annotation param-vec) after-params])
               {:keys [params annotations]} (types/parse-typed-params param-vec)
             ;; Build annotation forms preserving type variables
               ann-forms (mapv (fn [ann] (or ann 'Object)) annotations)
@@ -1442,7 +1490,7 @@
         ;; same as prepare-typed-body does for normal deftm
         tc-binding-tags (try
                           (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
-                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec)))
+                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec source-ns)))
                           (catch Throwable e
                             (println (str "WARNING: TC analysis failed during parametric specialization of `"
                                           fn-name "`: " (.getMessage e)))

@@ -17,8 +17,9 @@
 (defn- par-mutation-form?
   "True if expr is a par form that mutates an output buffer.
    par/map!, par/scan, par/scan-exclusive, par/stencil!, par/map-void!,
-   par/scatter!, par/butterfly!, par/rng-fill!, par/collect!, par/active-ids!
-   all write to an output buffer. par/reduce and par/map (pure) are not mutations."
+   par/scatter!, par/gather, par/butterfly!, par/rng-fill!, par/collect!,
+   par/active-ids! all write to an output buffer (arg 0). par/reduce and
+   par/map (pure) are not mutations."
   [expr]
   (and (par/par-form? expr)
        (not (par/par-reduce-form? expr))
@@ -35,6 +36,17 @@
       (if (symbol? buf-arg)
         #{buf-arg}
         (extract-mutation-targets buf-arg)))
+
+    ;; Array writes (aset / clojure.core/aset / raster.arrays/aset!) mutate their
+    ;; FIRST arg (the array). Without this, a `_`-bound array-fill loop whose value
+    ;; is unused is wrongly eliminated as dead — leaving the array unwritten.
+    (and (seq? expr)
+         (symbol? (first expr))
+         (>= (count expr) 2)
+         (descriptor/aset-op? (first expr)))
+    (if (symbol? (second expr))
+      #{(second expr)}
+      (extract-mutation-targets (second expr)))
 
     (and (seq? expr)
          (symbol? (first expr))

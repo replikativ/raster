@@ -251,8 +251,12 @@
         _ (acopy! X 0 X-c 0 (* n-samples n-feat))
         _ (center! X-c mean n-samples n-feat)
         ;; X_new = X_centered @ components^T  [n-samples, n-components]
+        ;; dgemm-nt! is C = A @ B^T with (m k n) -> (M=m, K=k, N=n): here
+        ;; A=X-c[n-samples,n-feat], B=components[n-comp,n-feat] -> M=n-samples,
+        ;; K=n-feat (the contracted dim), N=n-comp. (k/n were swapped -> wrote a
+        ;; [n-samples,n-feat] result into an [n-samples,n-comp] buffer = OOB stomp.)
         X-new (double-array (* n-samples n-comp))]
-    (blas/dgemm-nt! X-c components X-new n-samples n-comp n-feat 1.0 0.0)
+    (blas/dgemm-nt! X-c components X-new n-samples n-feat n-comp 1.0 0.0)
     X-new))
 
 (deftm inverse-transform

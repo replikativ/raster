@@ -428,3 +428,101 @@
                   (aset pos j (unchecked-add-int (aget pos j) 1)))
                 (recur (inc k)))))]
     (->CSRMatrix new-rp new-ci new-vs n m nz)))
+
+;; Per-row merge using a marker array (tag = i+1) so no per-row clearing is
+;; needed and column order within a row is irrelevant. A and B must share shape.
+
+(deftm csr-add
+  "Linear combination alpha*A + beta*B of two CSR matrices (union of patterns)."
+  [A :- CSRMatrix alpha :- Double B :- CSRMatrix beta :- Double] :- CSRMatrix
+  (let [n   (.-nrows A)
+        nc  (.-ncols A)
+        arp (.-rowptr A) aci (.-colidx A) avs (.-values A)
+        brp (.-rowptr B) bci (.-colidx B) bvs (.-values B)
+        mark (int-array nc)
+        rowcnt (int-array n)
+        ;; pass 1: union size per row
+        _ (dotimes [i n]
+            (let [tag (inc i)]
+              (loop [k (aget arp i)]
+                (when (< k (aget arp (inc i)))
+                  (let [j (aget aci k)]
+                    (when (not (n/== (aget mark j) tag))
+                      (aset mark j tag) (aset rowcnt i (n/+ (aget rowcnt i) 1))))
+                  (recur (inc k))))
+              (loop [k (aget brp i)]
+                (when (< k (aget brp (inc i)))
+                  (let [j (aget bci k)]
+                    (when (not (n/== (aget mark j) tag))
+                      (aset mark j tag) (aset rowcnt i (n/+ (aget rowcnt i) 1))))
+                  (recur (inc k))))))
+        rowptr (int-array (inc n))
+        _ (dotimes [i n] (aset rowptr (inc i) (n/+ (aget rowptr i) (aget rowcnt i))))
+        total (aget rowptr n)
+        out-ci (int-array total)
+        out-vs (double-array total)
+        acc (double-array nc)
+        mark2 (int-array nc)]                ; separate marker for pass 2
+    ;; pass 2: accumulate values, list touched cols in appearance order
+    (dotimes [i n]
+      (let [tag (inc i)
+            start (aget rowptr i)
+            wa (loop [k (aget arp i) w start]
+                 (if (< k (aget arp (inc i)))
+                   (let [j (aget aci k)]
+                     (if (n/== (aget mark2 j) tag)
+                       (do (aset acc j (n/+ (aget acc j) (n/* alpha (aget avs k)))) (recur (inc k) w))
+                       (do (aset mark2 j tag) (aset acc j (n/* alpha (aget avs k)))
+                           (aset out-ci w (int j)) (recur (inc k) (inc w)))))
+                   w))
+            wb (loop [k (aget brp i) w wa]
+                 (if (< k (aget brp (inc i)))
+                   (let [j (aget bci k)]
+                     (if (n/== (aget mark2 j) tag)
+                       (do (aset acc j (n/+ (aget acc j) (n/* beta (aget bvs k)))) (recur (inc k) w))
+                       (do (aset mark2 j tag) (aset acc j (n/* beta (aget bvs k)))
+                           (aset out-ci w (int j)) (recur (inc k) (inc w)))))
+                   w))]
+        (loop [p start] (when (< p wb) (aset out-vs p (aget acc (aget out-ci p))) (recur (inc p))))))
+    (->CSRMatrix rowptr out-ci out-vs n nc total)))
+
+(deftm csr-hadamard
+  "Elementwise (Hadamard) product A∘B of two CSR matrices (intersection of patterns)."
+  [A :- CSRMatrix B :- CSRMatrix] :- CSRMatrix
+  (let [n   (.-nrows A)
+        nc  (.-ncols A)
+        arp (.-rowptr A) aci (.-colidx A) avs (.-values A)
+        brp (.-rowptr B) bci (.-colidx B) bvs (.-values B)
+        mark (int-array nc)
+        accb (double-array nc)
+        rowcnt (int-array n)
+        ;; pass 1: intersection size per row
+        _ (dotimes [i n]
+            (let [tag (inc i)]
+              (loop [k (aget brp i)]
+                (when (< k (aget brp (inc i))) (aset mark (aget bci k) tag) (recur (inc k))))
+              (loop [k (aget arp i)]
+                (when (< k (aget arp (inc i)))
+                  (when (n/== (aget mark (aget aci k)) tag)
+                    (aset rowcnt i (n/+ (aget rowcnt i) 1)))
+                  (recur (inc k))))))
+        rowptr (int-array (inc n))
+        _ (dotimes [i n] (aset rowptr (inc i) (n/+ (aget rowptr i) (aget rowcnt i))))
+        total (aget rowptr n)
+        out-ci (int-array total)
+        out-vs (double-array total)]
+    (dotimes [i n]
+      (let [tag (inc i)]
+        (loop [k (aget brp i)]
+          (when (< k (aget brp (inc i)))
+            (let [j (aget bci k)] (aset mark j tag) (aset accb j (aget bvs k)))
+            (recur (inc k))))
+        (loop [k (aget arp i) w (aget rowptr i)]
+          (if (< k (aget arp (inc i)))
+            (let [j (aget aci k)]
+              (if (n/== (aget mark j) tag)
+                (do (aset out-ci w (int j)) (aset out-vs w (n/* (aget avs k) (aget accb j)))
+                    (recur (inc k) (inc w)))
+                (recur (inc k) w)))
+            nil))))
+    (->CSRMatrix rowptr out-ci out-vs n nc total)))

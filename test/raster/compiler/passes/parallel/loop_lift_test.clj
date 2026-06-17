@@ -216,3 +216,114 @@
       (is (= 0 (:maps-detected stats)))
       (is (= 0 (:reduces-detected stats)))
       (is (= '(+ 1 2) form)))))
+
+;; ================================================================
+;; Hand-written loop/recur reduction recovery (Option A)
+;; Matchers are metadata-aware (descriptor/semantic-op), so they handle both
+;; bare ops and walker-devirtualized (.invk impl ...) forms, and emit the
+;; original body (preserving invokedynamic dispatch).
+;; ================================================================
+
+(deftest detect-handloop-reduce
+  (testing "Hand (loop [i 0 acc 0.0] (if (< i n) (recur (+ i 1) (+ acc ...)) acc)) lifts to par/reduce"
+    (let [form '(loop [d 0 acc 0.0]
+                  (if (raster.numeric/< d n)
+                    (recur (raster.numeric/+ d 1)
+                           (raster.numeric/+ acc (raster.numeric/* (clojure.core/aget a d)
+                                                                   (clojure.core/aget b d))))
+                    acc))
+          {:keys [form stats]} (loop-lift/lift-parallel-forms form)]
+      (is (= 1 (:reduces-detected stats)))
+      (is (= 'raster.par/reduce (first form)))
+      ;; the update body is emitted verbatim (no rewriting): the original
+      ;; operators are preserved, so a devirtualized .invk body keeps its typed
+      ;; invokedynamic dispatch (here the equivalent bare ops are preserved).
+      (is (re-find #"raster.numeric/\*" (pr-str form))
+          "original operator preserved verbatim in lifted body"))))
+
+(deftest induction-var-from-test-not-init
+  (testing "Both-init-zero loop: induction var comes from the loop TEST, not an init guess"
+    ;; (loop [i 0 next-idx 0] (if (< i n) (recur (+ i 1) (+ next-idx 1)) next-idx))
+    ;; index MUST be i (the tested var). Guessing by init value would swap to
+    ;; next-idx and miscompile (the bug that broke gsdm).
+    (let [form '(loop [i 0 next-idx 0]
+                  (if (raster.numeric/< i n)
+                    (recur (raster.numeric/+ i 1) (raster.numeric/+ next-idx 1))
+                    next-idx))
+          {:keys [form stats]} (loop-lift/lift-parallel-forms form)]
+      (is (= 1 (:reduces-detected stats)))
+      ;; (raster.par/reduce acc init IDX bound body)
+      (is (= 'i (nth form 3)) "index must be the variable tested by (< i n)")
+      (is (= 'n (nth form 4)) "bound must be n"))))
+
+(deftest reduce-soundness-gates
+  (testing "Non-associative / out-of-shape reductions are NOT lifted"
+    (let [lifts? (fn [f] (:reduces-detected (:stats (loop-lift/lift-parallel-forms f))))
+          sub '(loop [d 0 acc 0.0] (if (raster.numeric/< d n)
+                                     (recur (raster.numeric/+ d 1)
+                                            (raster.numeric/- acc (clojure.core/aget a d))) acc))
+          gt  '(loop [d 0 acc 0.0] (if (raster.numeric/> d n)
+                                     (recur (raster.numeric/+ d 1)
+                                            (raster.numeric/+ acc (clojure.core/aget a d))) acc))
+          ser '(loop [d 0 acc 0.0] (if (raster.numeric/< d n)
+                                     (recur (raster.numeric/+ d 1)
+                                            (raster.numeric/+ acc (raster.numeric/* acc (clojure.core/aget a d)))) acc))]
+      (is (= 0 (lifts? sub)) "subtraction (non-associative) must not lift")
+      (is (= 0 (lifts? gt))  "non-< bound must not lift")
+      (is (= 0 (lifts? ser)) "accumulator inside the element (serial dep) must not lift"))))
+
+(deftest reduce-soundness-gates-extended
+  (testing "Lift fires ONLY when all preconditions are proven (no false positives)"
+    (let [r? (fn [f] (:reduces-detected (:stats (loop-lift/lift-parallel-forms f))))]
+      ;; bound must be loop-invariant (not reference index/acc)
+      (is (= 0 (r? '(loop [i 0 acc 0.0]
+                      (if (raster.numeric/< i acc)
+                        (recur (raster.numeric/+ i 1) (raster.numeric/+ acc (clojure.core/aget a i))) acc))))
+          "bound referencing a loop var must not lift")
+      ;; a side effect in a do before recur must not be silently dropped
+      (is (= 0 (r? '(loop [i 0 acc 0.0]
+                      (if (raster.numeric/< i n)
+                        (do (clojure.core/aset log i acc)
+                            (recur (raster.numeric/+ i 1) (raster.numeric/+ acc (clojure.core/aget a i)))) acc))))
+          "do-wrapped side effect must not lift (would be dropped)")
+      ;; exit value must not reference the index (would escape its scope)
+      (is (= 0 (r? '(loop [i 0 acc 0.0]
+                      (if (raster.numeric/< i n)
+                        (recur (raster.numeric/+ i 1) (raster.numeric/+ acc (clojure.core/aget a i)))
+                        (raster.numeric// acc i)))))
+          "post-fn referencing the index must not lift")
+      ;; element must be pure
+      (is (= 0 (r? '(loop [i 0 acc 0.0]
+                      (if (raster.numeric/< i n)
+                        (recur (raster.numeric/+ i 1) (raster.numeric/+ acc (some.ns/sfx! i))) acc))))
+          "impure element must not lift")
+      ;; but an invariant post-fn (mean) is fine
+      (is (= 1 (r? '(loop [i 0 acc 0.0]
+                      (if (raster.numeric/< i n)
+                        (recur (raster.numeric/+ i 1) (raster.numeric/+ acc (clojure.core/aget a i)))
+                        (raster.numeric// acc n)))))
+          "post-fn over loop-invariants (mean) lifts"))))
+
+(deftest reduce-commutative-monoid-coverage
+  (testing "Commutative monoids (incl. integer bitwise) lift; non-monoids bail"
+    (let [r? (fn [f] (:reduces-detected (:stats (loop-lift/lift-parallel-forms f))))]
+      (is (= 1 (r? '(loop [d 0 acc 0]
+                      (if (raster.numeric/< d n)
+                        (recur (raster.numeric/+ d 1) (clojure.core/bit-xor acc (clojure.core/aget a d))) acc))))
+          "bit-xor (commutative monoid) lifts")
+      (is (= 1 (r? '(loop [d 0 acc -1]
+                      (if (raster.numeric/< d n)
+                        (recur (raster.numeric/+ d 1) (clojure.core/bit-and acc (clojure.core/aget a d))) acc))))
+          "bit-and lifts")
+      (is (= 1 (r? '(loop [d 0 acc 0.0]
+                      (if (raster.numeric/< d n)
+                        (recur (raster.numeric/+ d 1) (raster.numeric/max acc (clojure.core/aget a d))) acc))))
+          "max lifts")
+      (is (= 0 (r? '(loop [d 0 acc 0.0]
+                      (if (raster.numeric/< d n)
+                        (recur (raster.numeric/+ d 1) (raster.numeric/- acc (clojure.core/aget a d))) acc))))
+          "subtraction (not a commutative monoid) bails")
+      (is (= 0 (r? '(loop [d 0 acc 1.0]
+                      (if (raster.numeric/< d n)
+                        (recur (raster.numeric/+ d 1) (raster.numeric// acc (clojure.core/aget a d))) acc))))
+          "division (not a commutative monoid) bails"))))

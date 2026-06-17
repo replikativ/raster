@@ -302,3 +302,20 @@
   (testing "Double zero?"
     (is (zero? 0.0))
     (is (not (zero? 1.0)))))
+
+(deftest fast-pow-accuracy-test
+  (testing "fast-pow matches Math/pow within ~3e-5 rel err over x∈(0,100], n∈[0.5,1.1]"
+    (let [r (java.util.Random. 123)
+          max-err (loop [i 0 mx 0.0]
+                    (if (< i 50000)
+                      (let [x (clojure.core/+ 0.001 (clojure.core/* 100.0 (.nextDouble r)))
+                            n (clojure.core/+ 0.5 (clojure.core/* 0.6 (.nextDouble r)))
+                            exact (Math/pow x n)
+                            approx (raster.numeric/fast-pow x n)
+                            e (clojure.core/abs (clojure.core// (clojure.core/- approx exact) exact))]
+                        (recur (clojure.core/inc i) (clojure.core/max mx e)))
+                      mx))]
+      (is (< max-err 3.0e-5) (str "max rel err " max-err))))
+  (testing "exact-ish on integer powers"
+    (is (< (clojure.core/abs (clojure.core/- (raster.numeric/fast-pow 3.0 2.0) 9.0)) 1.0e-3))
+    (is (< (clojure.core/abs (clojure.core/- (raster.numeric/fast-pow 2.0 10.0) 1024.0)) 1.0))))
