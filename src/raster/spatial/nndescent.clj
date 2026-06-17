@@ -295,11 +295,12 @@
                 :or {threshold 4096
                      n-threads (.availableProcessors (Runtime/getRuntime))}}]
   (let [n (long n) dim (long dim) k (long k)]
-    ;; cos-dist (and knn-brute-cosine!) both assume L2-normalized rows, so
-    ;; normalize once up front — covers BOTH paths (norms vary in real data).
-    (knn/l2-normalize! X n dim)
+    ;; cos-dist and knn-brute-cosine! both assume L2-normalized rows. The brute
+    ;; path normalizes here; the nn-descent path normalizes itself (it's also a
+    ;; public entry point), so we don't normalize twice.
     (if (clojure.core/< n threshold)
       (let [oi (int-array (clojure.core/* n k)) od (double-array (clojure.core/* n k))]
+        (knn/l2-normalize! X n dim)
         (knn/knn-brute-cosine! X n dim k oi od)
         {:idx oi :dst od})
       (let [r (nn-descent X n dim k :n-threads n-threads)]
