@@ -91,6 +91,34 @@
         (is (approx= (aget X i) (aget X-rec i) 1e-8)
             (str "Round-trip error at " i))))))
 
+(deftest pca-transform-reduce-dims-test
+  (testing "transform with n-components < n-features matches a manual projection
+  (guards the dgemm-nt! dim-swap that wrote [m,n-feat] into the [m,n-comp] buffer
+  = native OOB; the old roundtrip test used n-comp==n-feat so the swap was a no-op)"
+    (let [m 60, n 8, k 3
+          rng (java.util.Random. 7)
+          X (double-array (* m n))
+          _ (dotimes [i m]
+              (dotimes [j n]
+                (aset X (+ (* i n) j) (* (double (inc j)) (.nextGaussian rng)))))  ; distinct col scales
+          result (pca/pca-full X m n k)
+          xnew ^doubles (pca/transform X result m)
+          mean ^doubles (:mean result)
+          comps ^doubles (:components result)]
+      (is (== (* m k) (alength xnew)) "transform output is [m, n-comp]")
+      ;; reference: (X - mean) @ components^T, computed without BLAS
+      (let [worst (loop [i 0, w 0.0]
+                    (if (>= i m) w
+                        (recur (inc i)
+                               (loop [c 0, w w]
+                                 (if (>= c k) w
+                                     (let [ref (loop [j 0, s 0.0]
+                                                 (if (>= j n) s
+                                                     (recur (inc j) (+ s (* (- (aget X (+ (* i n) j)) (aget mean j))
+                                                                            (aget comps (+ (* c n) j)))))))]
+                                       (recur (inc c) (max w (Math/abs (- (aget xnew (+ (* i k) c)) ref))))))))))]
+        (is (< worst 1e-9) (str "transform vs manual projection, worst abs diff " worst))))))
+
 (deftest pca-auto-solver-test
   (testing "Auto solver produces valid results"
     (let [[X m n] (make-test-data 100)
