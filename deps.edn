@@ -4,8 +4,7 @@
         org.typedclojure/typed.clj.checker {:git/url "https://github.com/whilo/typedclojure"
                                             :git/sha "5c6412026dea6a7cd24e1eb4f1b3408b350f7f4f"
                                             :deps/root "typed/clj.checker"}
-        pangloss/pattern {:git/url "https://github.com/replikativ/pattern"
-                          :git/sha "7db8472e8c166c8a95705bf4f9ac9b12810766be"}
+        org.replikativ/pattern {:mvn/version "1.0.449"}
         org.replikativ/beichte {:mvn/version "0.2.7"}}
  :aliases
  {:test {:extra-paths ["test"]
