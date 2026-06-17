@@ -1,13 +1,11 @@
 (ns raster.spatial.kdtree-test
-  "Self-contained tests: KD-tree kNN is exact vs brute-force; Boruvka MST is a
-  valid minimum spanning tree (total weight == dense Prim)."
+  "Self-contained tests: KD-tree kNN is exact vs brute-force; RP-tree forest leaf
+  coverage; NN-descent recall (dense + quantized byte)."
   (:require [clojure.test :refer [deftest testing is]]
             [raster.spatial.kdtree :as kd]
             [raster.spatial.rptree]
             [raster.spatial.nndescent]
-            [raster.knn :as knn]
-            [raster.cluster.mst :as mst]
-            [raster.cluster.boruvka :as bor]))
+            [raster.knn :as knn]))
 
 (defn- rand-data [n dim seed]
   (let [r (java.util.Random. seed) a (double-array (* n dim))]
@@ -33,14 +31,8 @@
       (is (= n set-ok) "every row's neighbor set matches brute-force")
       (is (< dmax 1e-9) "squared distances match"))))
 
-(deftest boruvka-mst-equals-prim
-  (testing "Boruvka MST has identical total weight to dense Prim (valid min tree)"
-    (let [n 250 dim 2 ms 5 X (rand-data n dim 2)
-          p (mst/mutual-reachability-mst X n dim ms)
-          b (bor/boruvka-mst X n dim ms)
-          tot (fn [m] (reduce + 0.0 (map #(aget ^doubles (:w m) %) (range (alength ^doubles (:w m))))))]
-      (is (= (clojure.core/dec n) (alength ^doubles (:w b))) "n-1 edges")
-      (is (< (Math/abs (- (tot p) (tot b))) 1e-6) "same total weight as Prim"))))
+;; (Boruvka-MST-equals-Prim moved to the evoc-rstr library's test suite with the
+;; clustering code.)
 
 ;; ================================================================
 ;; RP-tree forest + NN-descent (approximate kNN)
