@@ -29,18 +29,18 @@
    the backend handles affine-offset loads. (Accumulates in f64 even for f32 data
    — more precise than umap's f32 rdist, irrelevant to kNN ordering/recall.)"
   (All [T] [data :- (Array T) a :- Long b :- Long dim :- Long] :- Double
-    (let [ab (* a dim) bb (* b dim)]
-      (- 0.0 (par/reduce acc 0.0 d dim
-                         (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))))))
+       (let [ab (* a dim) bb (* b dim)]
+         (- 0.0 (par/reduce acc 0.0 d dim
+                            (+ acc (* (aget data (+ ab d)) (aget data (+ bb d)))))))))
 
 (deftm eucl-dist
   "Squared euclidean distance between rows a and b (monotone in euclidean, so the
    kNN ordering/heap is identical; the orchestrator sqrts the kept distances)."
   (All [T] [data :- (Array T) a :- Long b :- Long dim :- Long] :- Double
-    (let [ab (* a dim) bb (* b dim)]
-      (par/reduce acc 0.0 d dim
-                  (let [df (- (aget data (+ ab d)) (aget data (+ bb d)))]
-                    (+ acc (* df df)))))))
+       (let [ab (* a dim) bb (* b dim)]
+         (par/reduce acc 0.0 d dim
+                     (let [df (- (aget data (+ ab d)) (aget data (+ bb d)))]
+                       (+ acc (* df df)))))))
 
 ;; Bounded max-heap push with dedup + "new" flag, on point's sub-array [base,base+k).
 ;; Root = worst (max) distance. Returns 1 if inserted, 0 otherwise.
@@ -75,63 +75,63 @@
 ;; seed: self (dist=-1 -> cos 1) + k random neighbors per point
 (deftm init-random!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
-   rng-state :- (Array long) n :- Long dim :- Long k :- Long metric :- Long] :- (Array double)
-  (dotimes [i n]
-    (flagged-heap-push! dist ind flags (* i k) k
-                        (if (== metric 1) (eucl-dist data i i dim) (cos-dist data i i dim)) i 1)
-    (dotimes [t k]
-      (let [j (mod (u/tau-rand-int! rng-state 0) n)]
-        (when (not (== j i))
-          (flagged-heap-push! dist ind flags (* i k) k
-                              (if (== metric 1) (eucl-dist data i j dim) (cos-dist data i j dim)) j 1)))))
-  dist))
+            rng-state :- (Array long) n :- Long dim :- Long k :- Long metric :- Long] :- (Array double)
+       (dotimes [i n]
+         (flagged-heap-push! dist ind flags (* i k) k
+                             (if (== metric 1) (eucl-dist data i i dim) (cos-dist data i i dim)) i 1)
+         (dotimes [t k]
+           (let [j (mod (u/tau-rand-int! rng-state 0) n)]
+             (when (not (== j i))
+               (flagged-heap-push! dist ind flags (* i k) k
+                                   (if (== metric 1) (eucl-dist data i j dim) (cos-dist data i j dim)) j 1)))))
+       dist))
 
 ;; seed from RP-tree leaves: all-pairs within each leaf
 (deftm init-leaves!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
-   idx :- (Array int) leaf-start :- (Array int) leaf-end :- (Array int)
-   n-leaves :- Long dim :- Long k :- Long] :- (Array double)
-  (dotimes [lf n-leaves]
-    (let [s (long (aget leaf-start lf)) e (long (aget leaf-end lf))]
-      (loop [p s]
-        (when (< p e)
-          (loop [q (+ p 1)]
-            (when (< q e)
-              (let [a (long (aget idx p)) b (long (aget idx q))
-                    dd (cos-dist data a b dim)]
-                (flagged-heap-push! dist ind flags (* a k) k dd b 1)
-                (flagged-heap-push! dist ind flags (* b k) k dd a 1))
-              (recur (inc q))))
-          (recur (inc p))))))
-  dist))
+            idx :- (Array int) leaf-start :- (Array int) leaf-end :- (Array int)
+            n-leaves :- Long dim :- Long k :- Long] :- (Array double)
+       (dotimes [lf n-leaves]
+         (let [s (long (aget leaf-start lf)) e (long (aget leaf-end lf))]
+           (loop [p s]
+             (when (< p e)
+               (loop [q (+ p 1)]
+                 (when (< q e)
+                   (let [a (long (aget idx p)) b (long (aget idx q))
+                         dd (cos-dist data a b dim)]
+                     (flagged-heap-push! dist ind flags (* a k) k dd b 1)
+                     (flagged-heap-push! dist ind flags (* b k) k dd a 1))
+                   (recur (inc q))))
+               (recur (inc p))))))
+       dist))
 
 ;; one refinement iteration: local join over each point's neighbor list (push
 ;; both directions makes the graph symmetric -> reverse neighbors propagate).
 (deftm local-join!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
-   n :- Long dim :- Long k :- Long] :- Long
-  (loop [i 0 upd 0]
-    (if (< i n)
-      (let [ib (* i k)
-            u2 (loop [j 0 u upd]
-                 (if (< j k)
-                   (let [a (long (aget ind (+ ib j)))]
-                     (if (< a 0)
-                       (recur (inc j) u)
-                       (let [u3 (loop [l (+ j 1) uu u]
-                                  (if (< l k)
-                                    (let [b (long (aget ind (+ ib l)))]
-                                      (if (< b 0)
-                                        (recur (inc l) uu)
-                                        (let [dd (cos-dist data a b dim)
-                                              r1 (flagged-heap-push! dist ind flags (* a k) k dd b 1)
-                                              r2 (flagged-heap-push! dist ind flags (* b k) k dd a 1)]
-                                          (recur (inc l) (+ (+ uu r1) r2)))))
-                                    uu))]
-                         (recur (inc j) u3))))
-                   u))]
-        (recur (inc i) u2))
-      upd))))
+            n :- Long dim :- Long k :- Long] :- Long
+       (loop [i 0 upd 0]
+         (if (< i n)
+           (let [ib (* i k)
+                 u2 (loop [j 0 u upd]
+                      (if (< j k)
+                        (let [a (long (aget ind (+ ib j)))]
+                          (if (< a 0)
+                            (recur (inc j) u)
+                            (let [u3 (loop [l (+ j 1) uu u]
+                                       (if (< l k)
+                                         (let [b (long (aget ind (+ ib l)))]
+                                           (if (< b 0)
+                                             (recur (inc l) uu)
+                                             (let [dd (cos-dist data a b dim)
+                                                   r1 (flagged-heap-push! dist ind flags (* a k) k dd b 1)
+                                                   r2 (flagged-heap-push! dist ind flags (* b k) k dd a 1)]
+                                               (recur (inc l) (+ (+ uu r1) r2)))))
+                                         uu))]
+                              (recur (inc j) u3))))
+                        u))]
+             (recur (inc i) u2))
+           upd))))
 
 ;; local join over a block of points [bstart,bend) — for CPU-multicore via
 ;; Clojure futures (raster par = SIMD/GPU, not CPU-thread; these irregular heap
@@ -170,29 +170,29 @@
 ;; (Hogwild-tolerant). This is the parallelizable form of EVoC's block-owned apply.
 (deftm local-join-owned!
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
-   bstart :- Long bend :- Long dim :- Long k :- Long] :- Long
-  (loop [p bstart upd 0]
-    (if (< p bend)
-      (let [pb (* p k)
-            u2 (loop [j 0 u upd]
-                 (if (< j k)
-                   (let [a (long (aget ind (+ pb j)))]
-                     (if (< a 0)
-                       (recur (inc j) u)
-                       (let [ab (* a k)
-                             u3 (loop [l 0 uu u]
-                                  (if (< l k)
-                                    (let [b (long (aget ind (+ ab l)))]
-                                      (if (or (< b 0) (== b p))
-                                        (recur (inc l) uu)
-                                        (let [dd (cos-dist data p b dim)
-                                              r (flagged-heap-push! dist ind flags pb k dd b 1)]
-                                          (recur (inc l) (+ uu r)))))
-                                    uu))]
-                         (recur (inc j) u3))))
-                   u))]
-        (recur (inc p) u2))
-      upd))))
+            bstart :- Long bend :- Long dim :- Long k :- Long] :- Long
+       (loop [p bstart upd 0]
+         (if (< p bend)
+           (let [pb (* p k)
+                 u2 (loop [j 0 u upd]
+                      (if (< j k)
+                        (let [a (long (aget ind (+ pb j)))]
+                          (if (< a 0)
+                            (recur (inc j) u)
+                            (let [ab (* a k)
+                                  u3 (loop [l 0 uu u]
+                                       (if (< l k)
+                                         (let [b (long (aget ind (+ ab l)))]
+                                           (if (or (< b 0) (== b p))
+                                             (recur (inc l) uu)
+                                             (let [dd (cos-dist data p b dim)
+                                                   r (flagged-heap-push! dist ind flags pb k dd b 1)]
+                                               (recur (inc l) (+ uu r)))))
+                                         uu))]
+                              (recur (inc j) u3))))
+                        u))]
+             (recur (inc p) u2))
+           upd))))
 
 (defn parallel-local-join!
   "CPU-multicore local-join via futures over point-blocks. Race-free writes
@@ -232,48 +232,48 @@
   (All [T] [data :- (Array T) dist :- (Array double) ind :- (Array int) flags :- (Array int)
             rev :- (Array int) rcnt :- (Array int)
             bstart :- Long bend :- Long dim :- Long k :- Long rmax :- Long metric :- Long] :- Long
-  (loop [p bstart upd 0]
-    (if (< p bend)
-      (let [pb (* p k)
+       (loop [p bstart upd 0]
+         (if (< p bend)
+           (let [pb (* p k)
             ;; (1) forward first-hop a, explore forward(a)
-            u1 (loop [j 0 u upd]
-                 (if (< j k)
-                   (let [a (long (aget ind (+ pb j)))]
-                     (if (< a 0)
-                       (recur (inc j) u)
-                       (let [ab (* a k)
-                             uu (loop [l 0 v u]
-                                  (if (< l k)
-                                    (let [b (long (aget ind (+ ab l)))]
-                                      (if (or (< b 0) (== b p))
-                                        (recur (inc l) v)
-                                        (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
-                                          (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
-                                    v))]
-                         (recur (inc j) uu))))
-                   u))
+                 u1 (loop [j 0 u upd]
+                      (if (< j k)
+                        (let [a (long (aget ind (+ pb j)))]
+                          (if (< a 0)
+                            (recur (inc j) u)
+                            (let [ab (* a k)
+                                  uu (loop [l 0 v u]
+                                       (if (< l k)
+                                         (let [b (long (aget ind (+ ab l)))]
+                                           (if (or (< b 0) (== b p))
+                                             (recur (inc l) v)
+                                             (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
+                                               (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
+                                         v))]
+                              (recur (inc j) uu))))
+                        u))
             ;; (2) reverse first-hop q: push q, then explore forward(q)
-            rc (long (aget rcnt p))
-            u2 (loop [j 0 u u1]
-                 (if (< j rc)
-                   (let [q (long (aget rev (+ (* p rmax) j)))]
-                     (if (or (< q 0) (== q p))
-                       (recur (inc j) u)
-                       (let [dq (if (== metric 1) (eucl-dist data p q dim) (cos-dist data p q dim))
-                             u' (+ u (flagged-heap-push! dist ind flags pb k dq q 1))
-                             qb (* q k)
-                             uu (loop [l 0 v u']
-                                  (if (< l k)
-                                    (let [b (long (aget ind (+ qb l)))]
-                                      (if (or (< b 0) (== b p))
-                                        (recur (inc l) v)
-                                        (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
-                                          (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
-                                    v))]
-                         (recur (inc j) uu))))
-                   u))]
-        (recur (inc p) u2))
-      upd))))
+                 rc (long (aget rcnt p))
+                 u2 (loop [j 0 u u1]
+                      (if (< j rc)
+                        (let [q (long (aget rev (+ (* p rmax) j)))]
+                          (if (or (< q 0) (== q p))
+                            (recur (inc j) u)
+                            (let [dq (if (== metric 1) (eucl-dist data p q dim) (cos-dist data p q dim))
+                                  u' (+ u (flagged-heap-push! dist ind flags pb k dq q 1))
+                                  qb (* q k)
+                                  uu (loop [l 0 v u']
+                                       (if (< l k)
+                                         (let [b (long (aget ind (+ qb l)))]
+                                           (if (or (< b 0) (== b p))
+                                             (recur (inc l) v)
+                                             (let [dd (if (== metric 1) (eucl-dist data p b dim) (cos-dist data p b dim))]
+                                               (recur (inc l) (+ v (flagged-heap-push! dist ind flags pb k dd b 1))))))
+                                         v))]
+                              (recur (inc j) uu))))
+                        u))]
+             (recur (inc p) u2))
+           upd))))
 
 (defn parallel-local-join-rev!
   "Reverse-augmented owned local-join across point-blocks (futures). Race-free."
@@ -321,7 +321,7 @@
   ;; :metric 0 = cosine (L2-normalize + RP-tree init), 1 = euclidean (no normalize,
   ;; random init only — angular RP-trees don't fit euclidean geometry).
   [X n dim k & {:keys [n-trees n-iters leaf-size seed n-threads max-candidates metric]
-               :or {leaf-size 30 seed 42 n-threads 1 max-candidates 30 metric 0}}]
+                :or {leaf-size 30 seed 42 n-threads 1 max-candidates 30 metric 0}}]
   (let [n (long n) dim (long dim) k (long k) metric (long metric)
         ;; scale forest size + iterations with n (pynndescent heuristics) — a fixed
         ;; small forest gives terrible recall at large n (garbage graph).
@@ -357,23 +357,23 @@
           ;; warm the parametric kernel for X's dtype on an empty range BEFORE the
           ;; futures fan out — concurrent first-call specialization races to null.
           _ (local-join-owned-rev! X dist ind flags rev rcnt 0 0 dim k rmax metric)]
-    (loop [it 0]
-      (when (clojure.core/< it n-iters)
+      (loop [it 0]
+        (when (clojure.core/< it n-iters)
         ;; Build the reverse adjacency for this round, then do a reverse-augmented
         ;; owned local-join: each point explores 2-hop neighbours via BOTH its
         ;; forward neighbours and the points that point AT it (reverse). This is the
         ;; core NN-descent recall mechanism; forward-only plateaus ~0.78 recall.
-        (build-reverse! ind rev rcnt n k rmax)
-        (let [upd (parallel-local-join-rev! X dist ind flags rev rcnt n dim k rmax metric n-threads)]
-          (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
-            (recur (clojure.core/inc it))))))
-    (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
-      (finalize! dist ind n k out-idx out-dst)
+          (build-reverse! ind rev rcnt n k rmax)
+          (let [upd (parallel-local-join-rev! X dist ind flags rev rcnt n dim k rmax metric n-threads)]
+            (when (clojure.core/> upd (quot (clojure.core/* n k) 50))   ; stop when <2% updated
+              (recur (clojure.core/inc it))))))
+      (let [out-idx (int-array (clojure.core/* n k)) out-dst (double-array (clojure.core/* n k))]
+        (finalize! dist ind n k out-idx out-dst)
       ;; euclidean stored squared distances (monotone) — convert to true euclidean
-      (when (clojure.core/== metric 1)
-        (dotimes [i (clojure.core/* n k)]
-          (clojure.core/aset ^doubles out-dst i (Math/sqrt (clojure.core/aget ^doubles out-dst i)))))
-      {:idx out-idx :dst out-dst}))))
+        (when (clojure.core/== metric 1)
+          (dotimes [i (clojure.core/* n k)]
+            (clojure.core/aset ^doubles out-dst i (Math/sqrt (clojure.core/aget ^doubles out-dst i)))))
+        {:idx out-idx :dst out-dst}))))
 
 ;; nn-descent stores -cos (on L2-normalized rows). Convert to -log2(cos) so the
 ;; approximate path matches the brute path and feeds UMAP's fuzzy-set a proper
