@@ -13,7 +13,7 @@
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == max sqrt]]
-            [raster.umap.knn :as knn]))
+            [raster.knn :as knn]))
 
 ;; core[i] = rdist (squared euclidean) to the min_samples-th neighbor. dst is the
 ;; euclidean knn-brute! output with k = min_samples+1 (self at col 0), so the

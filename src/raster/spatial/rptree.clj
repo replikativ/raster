@@ -11,7 +11,7 @@
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == mod sqrt]]
-            [raster.umap :as u]))
+            [raster.tausworthe :as u]))
 
 ;; Partition idx[start,end) by a random hyperplane; collect leaf ranges.
 ;; Reorders `idx`; writes leaf-start[]/leaf-end[]; returns the leaf count.

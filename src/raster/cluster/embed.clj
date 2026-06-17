@@ -12,8 +12,12 @@
   (:refer-clojure :exclude [aget aset alength + - * / < > <= >= == mod bit-and])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength]]
-            [raster.numeric :refer [+ - * / < > <= >= == sqrt mod bit-and]]
-            [raster.umap :refer [uclip]]))
+            [raster.numeric :refer [+ - * / < > <= >= == sqrt mod bit-and]]))
+
+;; Clamp gradient into [-4, 4] (umap.layouts.clip) — local to keep clustering
+;; independent of the UMAP layer (umap-rstr).
+(deftm uclip [v :- Double] :- Double
+  (if (> v 4.0) 4.0 (if (< v -4.0) -4.0 v)))
 
 (deftm node-embedding-layout!
   [emb :- (Array double) head :- (Array int) tail :- (Array int)

@@ -5,7 +5,7 @@
             [raster.spatial.kdtree :as kd]
             [raster.spatial.rptree]
             [raster.spatial.nndescent]
-            [raster.umap.knn :as knn]
+            [raster.knn :as knn]
             [raster.cluster.mst :as mst]
             [raster.cluster.boruvka :as bor]))
 
@@ -69,9 +69,9 @@
           X (let [r (java.util.Random. 3) a (double-array (* n dim))]
               (dotimes [i (* n dim)] (aset a i (.nextGaussian r))) a)
           Xn (double-array (seq X))
-          _ (raster.umap.knn/l2-normalize! Xn n dim)
+          _ (raster.knn/l2-normalize! Xn n dim)
           bi (int-array (* n k)) bd (double-array (* n k))
-          _ (raster.umap.knn/knn-brute-cosine! Xn n dim k bi bd)
+          _ (raster.knn/knn-brute-cosine! Xn n dim k bi bd)
           ni (:idx (raster.spatial.nndescent/nn-descent (double-array (seq X)) n dim k))
           recall (/ (reduce + (for [i (range n)]
                      (count (clojure.set/intersection

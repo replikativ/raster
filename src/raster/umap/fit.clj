@@ -19,7 +19,7 @@
             [raster.arrays :refer [aget aset alength]]
             [raster.numeric :refer [+ - * / < > <= >= == mod]]
             [raster.umap :as u]
-            [raster.umap.knn :as knn]
+            [raster.knn :as knn]
             [raster.umap.graph :as graph]
             [raster.umap.spectral :as spectral]
             [raster.spatial.nndescent :as nnd]))

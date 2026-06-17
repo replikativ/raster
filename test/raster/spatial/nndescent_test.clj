@@ -6,7 +6,7 @@
   (:require [clojure.test :refer [deftest testing is]]
             [clojure.set :as set]
             [raster.spatial.nndescent :as nnd]
-            [raster.umap.knn]))
+            [raster.knn]))
 
 (defn- blobs
   "n points in `dim` dims from `nc` separated Gaussian blobs; flat double[n*dim]."
@@ -47,7 +47,7 @@
           X (blobs n dim 10 3)
           {ai :idx ad :dst} (nnd/euclidean-knn (aclone X) n dim k)
           bi (let [oi (int-array (* n k)) od (double-array (* n k))]
-               (raster.umap.knn/knn-brute! (aclone X) n dim k oi od) oi)
+               (raster.knn/knn-brute! (aclone X) n dim k oi od) oi)
           recall (/ (double (reduce + (for [i (range n)]
                               (count (set/intersection
                                        (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))

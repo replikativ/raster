@@ -1,4 +1,4 @@
-(ns raster.umap.knn
+(ns raster.knn
   "Nearest-neighbor search for the UMAP/EVoC pipeline.
 
   `knn-brute!` is an exact O(n^2 d) brute-force kNN — the baseline used by

@@ -17,8 +17,8 @@
             [raster.numeric :refer [+ - * / < > <= >= == mod bit-and bit-or]]
             [raster.math :as rm]
             [raster.par :as par]
-            [raster.umap :as u]
-            [raster.umap.knn :as knn]
+            [raster.tausworthe :as u]
+            [raster.knn :as knn]
             [raster.spatial.rptree :as rp]))
 
 ;; distance = -dot (fast_cosine on L2-normalized rows; smaller = nearer)
