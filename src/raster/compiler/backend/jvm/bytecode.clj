@@ -3731,6 +3731,15 @@
     (.labelBinding code after-try)
     :ref))
 
+(defn- statically-diverges?
+  "True if a branch expression provably does not fall through to the merge —
+  it transfers control elsewhere (throw) or back-edges a loop (recur). Such
+  branches leave nothing on the operand stack and must be excluded from the
+  merge result-type vote."
+  [form]
+  (and (seq? form) (symbol? (first form))
+       (contains? #{"throw" "recur"} (name (first form)))))
+
 (defn- emit-case*
   "Emit bytecode for (case* ge shift mask default imap &rest)."
   [code args locals ctx]
@@ -3756,12 +3765,21 @@
       (.lookupswitch code default-label switch-cases)
       (let [branch-exprs (mapv (fn [[_ [_ result-expr]]] result-expr) sorted-entries)
             all-exprs (conj branch-exprs default-expr)
-            inferred-types (mapv #(infer-arg-stack-type % locals) all-exprs)
-            value-types (filterv some? inferred-types)
-            uniform-prim? (and (seq value-types)
-                               (apply = value-types)
-                               (primitive? (first value-types)))
-            result-type (if uniform-prim? (first value-types) :ref)]
+            ;; Only branches that actually reach the merge vote on the result type;
+            ;; statically-diverging branches (throw/recur) leave nothing on the stack.
+            ;; Require EVERY reaching branch to have a KNOWN, matching primitive type.
+            ;; If any is unknown (e.g. a loop, whose result infer-arg-stack-type can't
+            ;; predict), fall to :ref and box all primitive branch results so the
+            ;; operand stack is uniform at the merge. (Predicting > emitting would
+            ;; otherwise leave one branch primitive and another boxed → JVM verifier
+            ;; "stack size mismatch".)
+            value-exprs (remove statically-diverges? all-exprs)
+            inferred-types (mapv #(infer-arg-stack-type % locals) value-exprs)
+            uniform-prim? (and (seq inferred-types)
+                               (every? some? inferred-types)
+                               (apply = inferred-types)
+                               (primitive? (first inferred-types)))
+            result-type (if uniform-prim? (first inferred-types) :ref)]
         (doseq [[[_ [test-val result-expr]] label] (map vector sorted-entries case-labels)]
           (.labelBinding code label)
           (let [t (emit-form code result-expr locals ctx)]
