@@ -38,8 +38,9 @@
     ;; These must be exactly 0 — any runtime-dispatched numeric op in these tight
     ;; loops is a type-transport regression (e.g. TC not run in the source ns).
     ;; [var dtype] — dtype disambiguates parametric (All [T]) overloads.
-    (doseq [[v dtype] [[#'nnd/cos-dist :double]           ; parametric (f32+f64)
-                       [#'nnd/local-join! nil]]]
+    (doseq [[v dtype] [[#'nnd/cos-dist :double]              ; parametric (f32+f64)
+                       [#'nnd/local-join-owned-rev! :double]]] ; live NN-descent join
+
       (let [{:keys [devirtualized dispatched]} (dispatch-counts v dtype)]
         (is (zero? dispatched)
             (str v " has " dispatched " undevirtualized dispatch op(s) ("
