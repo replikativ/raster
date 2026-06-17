@@ -188,6 +188,43 @@
     (reduce merge {} (map collect-binding-types-from-ast form))
     :else nil))
 
+;; TC stamps each checked node's type under this key (= typed.cljc.checker.utils/expr-type).
+(def ^:private tc-expr-type-key :typed.cljc.checker.utils/expr-type)
+
+(defn- tcr->dispatch-tag
+  "TCResult / raw type / [Type FilterSet] → raster dispatch tag, or nil."
+  [tcr]
+  (let [t (cond
+            (vector? tcr) (first tcr)
+            :else (try (:t tcr) (catch Exception _ tcr)))]
+    (cond
+      (nil? t) nil
+      (symbol? t) (or (class-sym->dispatch-tag t) (get tc-alias->dispatch-tag t))
+      :else (tc-type->tag t))))
+
+(defn- collect-binding-types-from-checked-ast
+  "Walk a TC :checked-ast, collecting {binding-sym → dispatch-tag} from the
+   u/expr-type stamped on each :let / :loop binding node. This replaces reading
+   ::binding-types form metadata: let*/loop* and (via Option X) the core/let
+   extension all expose per-binding types directly on the binding AST nodes."
+  [ast]
+  (let [acc (atom {})]
+    (letfn [(walk [x]
+              (when (map? x)
+                (when (#{:let :loop} (:op x))
+                  (doseq [b (:bindings x)]
+                    (let [sym (:form b)
+                          tag (when-let [tcr (get b tc-expr-type-key)]
+                                (tcr->dispatch-tag tcr))]
+                      ;; key by the original (de-uniquified) symbol
+                      (when (and tag (symbol? sym))
+                        (swap! acc assoc sym tag)))))
+                (doseq [k (:children x)]
+                  (let [v (get x k)]
+                    (if (vector? v) (doseq [c v] (walk c)) (walk v))))))]
+      (walk ast))
+    @acc))
+
 (defn- raster-ann->tc-type
   "Convert a Raster type annotation to a TypedClojure type form.
   (Fn [Double] Double) → [Double :-> Double]
@@ -270,10 +307,9 @@
                                                  (mapv name (types/extract-tags params annotations))
                                                  " may return: " type-strs
                                                  ". Consider adding :- RetType or fixing branches.")))
-                    ;; Extract per-binding types from checked AST
+                    ;; Extract per-binding types straight off the checked AST nodes
                       binding-tags (when-let [ast (:checked-ast result)]
-                                     (let [out-form (:out-form result)]
-                                       (collect-binding-types-from-ast out-form)))]
+                                     (collect-binding-types-from-checked-ast ast))]
                   {:ret-tag (when rng (tc-type->tag rng))
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
@@ -326,8 +362,8 @@
                         (try (check-fn wrapped {})
                              (catch Throwable _ nil))))]
       (when (and result (empty? (:type-errors result)))
-        (let [out-form (:out-form result)]
-          (collect-binding-types-from-ast out-form))))
+        (when-let [ast (:checked-ast result)]
+          (collect-binding-types-from-checked-ast ast))))
     (catch Throwable _ nil)))
 
 ;; ================================================================
