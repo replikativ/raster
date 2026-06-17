@@ -211,8 +211,14 @@
     :stability-warning — warning if return type is unstable (Union)
     :binding-tags      — {sym → dispatch-tag} for all let bindings
 
-  This gives the walker complete type information from a single TC pass."
-  [fn-name params annotations body]
+  This gives the walker complete type information from a single TC pass.
+
+  source-ns (optional): the namespace the body was written in. TC's analyzer
+  resolves bare/refer'd vars (e.g. `pow` from raster.numeric) against *ns*, so at
+  re-walk time (compile-aot / lazy JIT, which run in a different ns than the
+  definition) *ns* must be bound to the source ns or every refer'd op fails to
+  resolve — yielding a TCError return and discarding ALL inferred binding types."
+  [fn-name params annotations body & [source-ns]]
   (try
     ;; Skip TC analysis for fully-untyped methods (all Object/Any params).
     ;; These are polymorphic fallbacks where TC can't add value — every operation
@@ -227,7 +233,12 @@
                                    params annotations))
             body-expr (if (= 1 (count body)) (first body) (cons 'do body))
             wrapped (list 'clojure.core.typed/fn fn-params body-expr)
-            result (try (check-fn wrapped {:checked-ast true
+            ;; Resolve refer'd ops against the body's own namespace.
+            result (binding [*ns* (if source-ns
+                                    (if (instance? clojure.lang.Namespace source-ns)
+                                      source-ns (the-ns source-ns))
+                                    *ns*)]
+                     (try (check-fn wrapped {:checked-ast true
                                            :check-config {:check-form-eval :never}})
                         (catch Throwable e1
                           ;; Fallback: retry without checked-ast if TC's internal
@@ -236,7 +247,7 @@
                                (catch Throwable e2
                                  (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
                                                (.getMessage e1) " → retry: " (.getMessage e2)))
-                                 nil))))]
+                                 nil)))))]
         (when result
           (when (and (seq (:type-errors result))
                      (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
@@ -792,6 +803,29 @@
           (contains? types/primitive-info head)
           head
 
+           ;; if/when expression — result type = numeric unification of the
+           ;; branch types (widen mismatched numeric branches to the larger).
+           ;; MUST precede the symbol-head clause below, which would otherwise
+           ;; match 'if (a symbol) and short-circuit to nil. Without this, a
+           ;; local bound to (if …) is untyped → downstream mixed-precision
+           ;; arithmetic on it (double gc × float diff) falls to the boxing
+           ;; variadic dispatch (~96x Valhalla / ~888x GraalVM in float kernels).
+          (= 'if head)
+          (let [branch-tag (fn [b] (or (infer-rewritten-tag b nil type-env)
+                                       (literal-tag b)
+                                       (when (symbol? b) (type-env-tag type-env b))))
+                then-tag (branch-tag (nth rewritten-form 2 nil))
+                else-tag (when (>= (count rewritten-form) 4)
+                           (branch-tag (nth rewritten-form 3)))
+                rank '{int 1 long 2 float 3 double 4}]
+            (cond
+              (nil? else-tag) then-tag
+              (nil? then-tag) else-tag
+              (= then-tag else-tag) then-tag
+              (and (rank then-tag) (rank else-tag))
+              (if (>= (rank then-tag) (rank else-tag)) then-tag else-tag)
+              :else (or (promote-tag then-tag else-tag) then-tag else-tag)))
+
            ;; Devirtualized call
           (and (symbol? head) (not= '.invk head))
           (when-let [v (resolve head)]
@@ -1170,6 +1204,12 @@
    (when-let [t (when (and (seq? init) (contains? alloc-sym->array-tag (first init)))
                   (get alloc-sym->array-tag (first init)))]
      (trace-inferred sym t :array-alloc))
+   ;; if/when result — type from the (walked) branches (see infer-rewritten-tag).
+   ;; A local bound to (if …) is otherwise untyped, forcing downstream
+   ;; mixed-precision arithmetic onto the boxing variadic path.
+   (when-let [t (when (and (seq? rewritten-init) (= 'if (first rewritten-init)))
+                  (infer-rewritten-tag rewritten-init init type-env))]
+     (trace-inferred sym t :if))
    ;; Fn-info return type — TC doesn't know walker fn-info
    (when-let [t (when (and (seq? init) (symbol? (first init)))
                   (when-let [info (type-env-fn-info type-env (first init))]

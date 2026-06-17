@@ -476,6 +476,25 @@
                                  :rows rows-expr
                                  :cols cols-expr}))))))))))))))))
 
+(defn- test-index+bound
+  "For a loop test `(< i n)` or its devirtualized form `(.invk lt-impl i n)`,
+   return [index-var bound-expr] using semantic call-args so devirtualized
+   comparisons are handled without rewriting the form. Unwraps (long i)/(int i)
+   casts on the index. Returns [nil nil] if not a 2-argument comparison."
+  [test]
+  (let [args (vec (descriptor/call-args test))]
+    (if (= 2 (count args))
+      (let [lhs (first args)
+            idx (cond
+                  (symbol? lhs) lhs
+                  (and (seq? lhs)
+                       (contains? #{'long 'int 'clojure.core/long 'clojure.core/int} (first lhs))
+                       (= 2 (count lhs)))
+                  (second lhs)
+                  :else nil)]
+        [idx (second args)])
+      [nil nil])))
+
 (defn normalize-loop
   "Normalize loop*, loop, and dotimes into a unified representation.
 	Returns {:kind :map-loop|:reduce-loop, :index-sym sym, :bound bound,
@@ -520,8 +539,7 @@
                                        work-forms)]
                       {:kind :map-loop
                        :index-sym idx-sym
-                       :bound (when (and (seq? test) (= 3 (count test)))
-                                (nth test 2))
+                       :bound (second (test-index+bound test))
                        :body-forms work-forms})))
 
                 (= 'when head)
@@ -535,26 +553,30 @@
                 :else nil))))
 
         (= 2 (count pairs))
+        ;; Identify the induction variable from the LOOP TEST, not from init
+        ;; values. The bound test (< i n) unambiguously names the index `i`;
+        ;; the other var is the accumulator. Guessing by init value is unsound
+        ;; when both vars start at 0 (e.g. (loop [i 0 next-idx 0] ...)) — it can
+        ;; swap index and accumulator and miscompile.
         (let [[[sym1 init1] [sym2 init2]] pairs
               int-zero? (fn [x] (and (integer? x) (zero? x)))
-              [idx-sym acc-sym acc-init]
-              (cond
-                (and (int-zero? init1) (not (int-zero? init2))) [sym1 sym2 init2]
-                (and (int-zero? init2) (not (int-zero? init1))) [sym2 sym1 init1]
-                (int-zero? init2) [sym2 sym1 init1]
-                :else nil)
               body-form (last body)]
-          (when (and idx-sym
-                     (seq? body-form)
-                     (= 'if (first body-form)))
-            {:kind :reduce-loop
-             :index-sym idx-sym
-             :acc-sym acc-sym
-             :acc-init acc-init
-             :bound (let [test (second body-form)]
-                      (when (and (seq? test) (= 3 (count test)))
-                        (nth test 2)))
-             :body-form body-form}))
+          (when (and (seq? body-form) (= 'if (first body-form)))
+            (let [test (second body-form)
+                  [test-var bound-expr] (test-index+bound test)
+                  [idx-sym idx-init acc-sym acc-init]
+                  (cond
+                    (= test-var sym1) [sym1 init1 sym2 init2]
+                    (= test-var sym2) [sym2 init2 sym1 init1]
+                    :else nil)]
+              ;; index must start at 0 to map onto a [0,bound) SOAC
+              (when (and idx-sym (int-zero? idx-init))
+                {:kind :reduce-loop
+                 :index-sym idx-sym
+                 :acc-sym acc-sym
+                 :acc-init acc-init
+                 :bound bound-expr
+                 :body-form body-form}))))
 
         :else nil))
 
@@ -654,10 +676,9 @@
             recur-form (find-recur-form then-branch)]
         (when recur-form
           (let [recur-args (vec (rest recur-form))
+                ;; Index step must be a +1 affine step (inc / (+ i 1)).
                 idx-update? (fn [expr]
-                              (and (seq? expr)
-                                   (descriptor/increment-op? (first expr))
-                                   (= (second expr) index-sym)))
+                              (= 1 (descriptor/affine-step expr index-sym)))
                 [update-expr idx-update-expr]
                 (cond
                   (and (= 2 (count recur-args))
@@ -669,12 +690,13 @@
                   [(second recur-args) (first recur-args)]
 
                   :else [nil nil])]
-            (when update-expr
+            (when (and update-expr
+                       ;; only (< i n) → contiguous [0,bound) iteration
+                       (descriptor/less-than-op? (descriptor/semantic-op test)))
               {:acc-sym acc-sym
                :acc-init acc-init
                :index-sym index-sym
-               :bound-expr (when (and (seq? test) (= 3 (count test)))
-                             (nth test 2))
+               :bound-expr (second (test-index+bound test))
                :test-expr test
                :then-branch then-branch
                :else-expr else-branch

@@ -174,12 +174,17 @@
             dispatch-class (.defineClass ^clojure.lang.DynamicClassLoader cl cname bytes nil)
             ctor (.getDeclaredConstructor dispatch-class (into-array Class [clojure.lang.IFn]))
             instance (.newInstance ctor (into-array Object [dispatch-fn]))]
-        ;; Set impl fields
+        ;; Set impl fields. parametric-specialize! registers the impl *var* (so a
+        ;; later recompile is visible) while regular specialization registers the
+        ;; impl instance directly — deref the var here so the typed field holds an
+        ;; IFn__ instance either way. Without this, the parametric path (e.g. float
+        ;; (All [T]) kernels) fails the field set ("can not set IFn__… to Var"),
+        ;; silently falls back to untyped dispatch, and runs ~30x slower interpreted.
         (doseq [[{:keys [typed-impl]} fname] (map vector iface-infos field-names)]
-          (when typed-impl
+          (when-let [ti (if (var? typed-impl) (deref typed-impl) typed-impl)]
             (let [f (.getDeclaredField dispatch-class fname)]
               (.setAccessible f true)
-              (.set f instance typed-impl))))
+              (.set f instance ti))))
         instance))))
 
 (defn update-dispatch-impl!

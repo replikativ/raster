@@ -72,6 +72,7 @@
 (def ^:private int-box-cd  (ClassDesc/ofDescriptor "Ljava/lang/Integer;"))
 (def ^:private long-box-cd (ClassDesc/ofDescriptor "Ljava/lang/Long;"))
 (def ^:private dbl-box-cd  (ClassDesc/ofDescriptor "Ljava/lang/Double;"))
+(def ^:private bool-box-cd (ClassDesc/ofDescriptor "Ljava/lang/Boolean;"))
 (def ^:private ifn-cd (ClassDesc/ofDescriptor "Lclojure/lang/IFn;"))
 (def ^:private var-cd (ClassDesc/ofDescriptor "Lclojure/lang/Var;"))
 (def ^:private rt-cd  (ClassDesc/ofDescriptor "Lclojure/lang/RT;"))
@@ -231,8 +232,8 @@
           (if (every? #(= :float (infer-arg-stack-type % locals)) args)
             :float
             :double))
-        ;; Comparison ops produce :ref (Boolean.TRUE/FALSE from emit-comparison)
-        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :ref
+        ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
+        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
         ;; Only returns a primitive type when BOTH branches are known
         ;; to produce the same primitive. Conservative: returns nil when
@@ -828,6 +829,8 @@
                                                                               (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
                                                        :int    (.invokestatic code int-box-cd "valueOf"
                                                                               (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                                                       :bool   (.invokestatic code bool-box-cd "valueOf"
+                                                                              (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [Z-cd])))
                                                        :long   (.invokestatic code long-box-cd "valueOf"
                                                                               (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
                                                        :void   (.aconst_null code)
@@ -837,6 +840,11 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
+        _ (when-let [dir (System/getProperty "raster.dumpdir")]
+            (try (java.nio.file.Files/write
+                  (.toPath (java.io.File. dir (str (clojure.string/replace class-name "." "_") ".class")))
+                  bytes (make-array java.nio.file.OpenOption 0))
+                 (catch Throwable _ nil)))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class-desc class-desc
@@ -1101,6 +1109,8 @@
                                                                                    (MethodTypeDesc/of flt-box-cd (into-array ClassDesc [F-cd])))
                                                            :int     (.invokestatic code int-box-cd "valueOf"
                                                                                    (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
+                                                           :bool    (.invokestatic code bool-box-cd "valueOf"
+                                                                                   (MethodTypeDesc/of bool-box-cd (into-array ClassDesc [Z-cd])))
                                                            :long    (.invokestatic code long-box-cd "valueOf"
                                                                                    (MethodTypeDesc/of long-box-cd (into-array ClassDesc [J-cd])))
                                                            :void    (.aconst_null code)
@@ -1736,16 +1746,18 @@
               "<"  (.iflt code true-label) "<=" (.ifle code true-label)
               ">"  (.ifgt code true-label) ">=" (.ifge code true-label)
               "==" (.ifeq code true-label) "not=" (.ifne code true-label))))))
-    ;; Return Boolean.FALSE/TRUE (not int 0/1) so Clojure truthiness works.
-    ;; int 0 is truthy in Clojure, which breaks (and (> j 0) ...) short-circuit.
-    (.getstatic code (ClassDesc/of "java.lang" "Boolean") "FALSE"
-                (ClassDesc/of "java.lang" "Boolean"))
+    ;; Produce primitive int 0/1 (:bool), NOT a boxed Boolean — matching the
+    ;; type-predicate emitters above and Clojure's own intrinsic comparison
+    ;; codegen. Consumers branch on :bool directly (if/when/loop → ifeq, 0=false)
+    ;; or box at an Object boundary via emit-coerce [:bool :ref] (Boolean.valueOf,
+    ;; 0→Boolean.FALSE preserves truthiness). Eager Boolean.TRUE/FALSE boxing made
+    ;; every comparison impl a 22-byte box→unbox round-trip C2 won't inline.
+    (.ldc code (int 0))
     (.goto_ code end-label)
     (.labelBinding code true-label)
-    (.getstatic code (ClassDesc/of "java.lang" "Boolean") "TRUE"
-                (ClassDesc/of "java.lang" "Boolean"))
+    (.ldc code (int 1))
     (.labelBinding code end-label)
-    :ref))
+    :bool))
 
 (defn- emit-minmax
   "Emit min/max bytecode. Variadic: (min a b c) → Math.min(Math.min(a, b), c).
@@ -2098,7 +2110,7 @@
     (let [t    (emit-form code (first args) locals ctx)
           inc? (contains? #{"inc" "unchecked-inc" "unchecked-inc-int"} head-name)]
       (case t
-        :int    (do (.ldc code (int 1))  (if inc? (.iadd code) (.isub code)) :int)
+        (:int :bool) (do (.ldc code (int 1))  (if inc? (.iadd code) (.isub code)) :int)
         :long   (do (.ldc code (long 1)) (if inc? (.ladd code) (.lsub code)) :long)
         :double (do (.ldc code 1.0)      (if inc? (.dadd code) (.dsub code)) :double)
         :float  (do (.ldc code (float 1.0)) (if inc? (.fadd code) (.fsub code)) :float)
@@ -2871,27 +2883,64 @@
                     locals pairs)]
     (emit-body code body new-locals ctx)))
 
+(defn- comparison-pred-parts
+  "Return [op-name arg1 arg2] when `pred` is a 2-arg comparison the if-handler can
+   branch-fold to IF_ICMPxx — whether written bare/qualified (`(< a b)`,
+   `(raster.numeric/< a b)`) or devirtualized by the walker to `.invk`
+   (`(.invk raster.numeric/_lt__m_long_long-impl a b)`). Folding the .invk form is
+   essential for hot loops: otherwise every loop/`if` test compiles to an
+   invokedynamic call into the comparison impl (which boxes through
+   Boolean.TRUE/FALSE) instead of a single IF_ICMPxx — and C2's counted-loop
+   recognition needs the IF_ICMPxx at the back-edge."
+  [pred]
+  (when (and (seq? pred) (symbol? (first pred)))
+    (let [h (first pred)]
+      (cond
+        (and (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h))
+             (= 2 (count (rest pred))))
+        [(name h) (nth pred 1) (nth pred 2)]
+
+        ;; devirtualized, pre-macroexpand: (.invk impl a b)
+        (and (= '.invk h) (= 3 (count (rest pred))) (symbol? (second pred)))
+        (when-let [op (util/impl->op (second pred))]
+          (when (contains? #{"<" "<=" ">" ">=" "==" "not="} (name op))
+            [(name op) (nth pred 2) (nth pred 3)]))
+
+        ;; devirtualized, post-macroexpand dot-form: (. impl invk a b)
+        ;; (macroexpand-all-preserving rewrites (.invk impl a b) to this)
+        (and (= '. h) (= 4 (count (rest pred)))
+             (= 'invk (nth pred 2)) (symbol? (nth pred 1)))
+        (when-let [op (util/impl->op (nth pred 1))]
+          (when (contains? #{"<" "<=" ">" ">=" "==" "not="} (name op))
+            [(name op) (nth pred 3) (nth pred 4)]))))))
+
 (defn- emit-if-handler
   "Emit bytecode for (if pred then else).
   Handles branch folding for int/long/double comparisons, Clojure truthiness
   for refs, and type merging between branches (boxing only when needed)."
   [code args locals ctx]
   (let [[pred then else] args
+        ;; Distinguish a PRESENT else expression from a falsy else VALUE: `else`
+        ;; can legitimately be the literal `false` or `nil` (e.g. and/or fusion
+        ;; emits `(if cmp then false)`), so `(if else …)` truthiness would wrongly
+        ;; treat those as "no else branch" and push null instead of emitting them
+        ;; — a latent bug that surfaced as a stack-map mismatch once comparison
+        ;; then-branches became primitive :bool. Key off the arg count instead.
+        has-else? (>= (count args) 3)
         else-label (.newLabel code)
         end-label  (.newLabel code)
         ;; Branch folding: if pred is (< a b), emit IF_ICMPGE directly
         ;; instead of materializing boolean. Critical for C2 counted loop
         ;; recognition which requires IF_ICMPxx at the loop back-edge.
+        cmp-parts (comparison-pred-parts pred)
         branch-folded?
-        (when (and (seq? pred) (symbol? (first pred)))
-          (let [pn (name (first pred))]
-            (when (and (contains? #{"<" "<=" ">" ">=" "==" "not="} pn)
-                       (= 2 (count (rest pred))))
-              (let [a1 (nth pred 1) a2 (nth pred 2)
-                    val-ctx (dissoc ctx :void-context)
-                    t1 (emit-form code a1 locals val-ctx)
-                    t2 (emit-form code a2 locals val-ctx)]
-                (cond
+        (when cmp-parts
+          (let [pn (nth cmp-parts 0)
+                a1 (nth cmp-parts 1) a2 (nth cmp-parts 2)
+                val-ctx (dissoc ctx :void-context)
+                t1 (emit-form code a1 locals val-ctx)
+                t2 (emit-form code a2 locals val-ctx)]
+            (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
                   (and (= t1 :int) (= t2 :int))
                   (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
@@ -2934,7 +2983,7 @@
                     (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
                           ">" (.ifle code else-label) ">=" (.iflt code else-label)
                           "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                    true))))))
+                    true))))
         ;; Predicate must always produce a value (to branch on),
         ;; so strip :void-context from ctx.
         pred-type (when-not branch-folded?
@@ -2963,7 +3012,7 @@
         ;; Then branch diverges (throw/recur) — never falls through.
         ;; No goto needed. Else branch is the only value-producing path.
         (do (.labelBinding code else-label)
-            (let [else-type (if else
+            (let [else-type (if has-else?
                               (emit-form code else locals ctx)
                               (do (.aconst_null code) :ref))]
               (when (primitive? else-type)
@@ -2979,7 +3028,7 @@
         ;; (Integer(0) is truthy, but int 0 with ifeq is correctly falsy).
         :else
         (let [else-type-pred (cond
-                               (nil? else) :ref
+                               (not has-else?) :ref
                                (symbol? else) (:type (get locals else))
                                :else (infer-arg-stack-type else locals))
               skip-box? (and (primitive? then-type)
@@ -2992,7 +3041,7 @@
             (emit-box-to-ref code then-type))
           (.goto_ code end-label)
           (.labelBinding code else-label)
-          (let [else-type (if else
+          (let [else-type (if has-else?
                             (emit-form code else locals ctx)
                             (do (.aconst_null code) :ref))]
             (cond
@@ -3067,11 +3116,15 @@
             ;; Only used for the var-reference path; local path keeps Object return.
             ret-tag-meta (:raster.type/ret-tag (meta obj))
             ^Class prim-ret-class (case ret-tag-meta
-                                    (double Double) Double/TYPE
-                                    (long Long)     Long/TYPE
-                                    (int Integer)   Integer/TYPE
-                                    (float Float)   Float/TYPE
-                                    (void Void)     Void/TYPE
+                                    (double Double)   Double/TYPE
+                                    (long Long)       Long/TYPE
+                                    (int Integer)     Integer/TYPE
+                                    (float Float)     Float/TYPE
+                                    ;; Comparison/boolean ops: bind compute_prim's
+                                    ;; primitive boolean return (zero-boxing) instead
+                                    ;; of falling back to the boxed invk → Object path.
+                                    (boolean Boolean) Boolean/TYPE
+                                    (void Void)       Void/TYPE
                                     nil)
             is-var? (and (namespace obj) (not (get locals obj)))]
         (if is-var?
@@ -3479,24 +3532,74 @@
                                 (MethodTypeDesc/of obj-cd (into-array ClassDesc [obj-cd])))
               :ref))))))
 
+(defn- widen-loop-type
+  "Slot type for a loop var = LUB(init type, recur-value type), promoting only in
+  the value-preserving numeric direction (never narrowing). This matters because
+  e.g. (loop [d 0] ... (recur (inc d) ...)) has an int init but a long recur value
+  (Clojure's 0 is a Long; the walker widens uses to long). Without unification the
+  var is stored as int and every iteration round-trips i2l…l2i, which defeats C2's
+  counted-loop recognition and blocks SuperWord auto-vectorization. Unifying to
+  long yields a clean long counted loop. Returns init-t when no safe widening
+  applies."
+  [init-t recur-t]
+  (let [num? #{:int :long :float :double}
+        rank {:int 0 :long 1 :float 2 :double 3}]
+    (cond
+      (or (nil? recur-t) (= init-t recur-t)) init-t
+      (not (and (num? init-t) (num? recur-t))) init-t
+      ;; long and float can't represent each other exactly → promote to double
+      (or (= init-t :double) (= recur-t :double)) :double
+      (or (and (= init-t :long) (= recur-t :float))
+          (and (= init-t :float) (= recur-t :long))) :double
+      (> (rank recur-t) (rank init-t)) recur-t
+      :else init-t)))
+
+(defn- loop-recur-arg-types
+  "Infer, for each of the n loop vars, the widest stack type its recur values
+  produce — without emitting. Scans only recur forms that target THIS loop
+  (skips nested loop*/fn* which retarget recur). Used to widen loop-var slots."
+  [body n locals]
+  (let [acc (atom (vec (repeat n nil)))
+        rank {:int 0 :long 1 :float 2 :double 3}
+        widest (fn [a b] (cond (nil? a) b (nil? b) a
+                               (>= (get rank a -1) (get rank b -1)) a :else b))]
+    (letfn [(scan [form]
+              (cond
+                (and (seq? form) (= 'recur (first form)))
+                (doseq [[i a] (map-indexed vector (rest form))]
+                  (when (< i n)
+                    (swap! acc update i widest (infer-arg-stack-type a locals))))
+                (and (seq? form) (symbol? (first form))
+                     (contains? #{"loop*" "fn*"} (name (first form)))) nil
+                (seq? form) (run! scan (rest form))
+                (vector? form) (run! scan form)
+                :else nil))]
+      (run! scan body))
+    @acc))
+
 (defn- emit-loop*
   "Emit bytecode for (loop* [bindings] body...)."
   [code args locals ctx]
   (let [[bindings & body] args
-        pairs (partition 2 bindings)
+        pairs (vec (partition 2 bindings))
         loop-label (.newLabel code)
+        ;; Type each loop var as LUB(init, recur values) so a long-recurring
+        ;; counter isn't pinned to int (which blocks vectorization).
+        recur-types (loop-recur-arg-types body (count pairs) locals)
         loop-locals (reduce
-                     (fn [locs [sym init]]
+                     (fn [locs [[sym init] rt]]
                        (let [t (emit-form code init locs (dissoc ctx :void-context))
-                             slot (alloc-slot! ctx t)]
-                         (case t
-                           :double (.dstore code slot)
-                           :long   (.lstore code slot)
-                           (:int :bool) (.istore code slot)
-                           :float  (.fstore code slot)
-                           (.astore code slot))
-                         (assoc locs sym {:slot slot :type t})))
-                     locals pairs)
+                             slot-t (widen-loop-type t rt)]
+                         (when (not= t slot-t) (emit-coerce code t slot-t))
+                         (let [slot (alloc-slot! ctx slot-t)]
+                           (case slot-t
+                             :double (.dstore code slot)
+                             :long   (.lstore code slot)
+                             (:int :bool) (.istore code slot)
+                             :float  (.fstore code slot)
+                             (.astore code slot))
+                           (assoc locs sym {:slot slot :type slot-t}))))
+                     locals (map vector pairs recur-types))
         loop-var-syms (mapv first pairs)]
     (.labelBinding code loop-label)
     (let [ctx (assoc ctx :loop-label loop-label
@@ -4462,6 +4565,11 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
+        _ (when-let [dir (System/getProperty "raster.dumpdir")]
+            (try (java.nio.file.Files/write
+                  (.toPath (java.io.File. dir (str (clojure.string/replace class-name "." "_") ".class")))
+                  bytes (make-array java.nio.file.OpenOption 0))
+                 (catch Throwable _ nil)))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class cls

@@ -214,6 +214,42 @@
 (deftm pow [x :- Double, n :- Long] :- Double (Math/pow x (double n)))
 (deftm pow [x :- Float, n :- Float] :- Float (float (Math/pow (double x) (double n))))
 
+(deftm fast-pow
+  "Fast approximate x^n for x > 0, via 2^(n·log2 x) with degree-5 minimax-fit
+  polynomials over the IEEE mantissa/exponent split. Max relative error
+  ~2.4e-5 over x∈[1e-3,100], n∈[0.5,1.1].
+
+  For perf-sensitive code where ~1e-5 accuracy is acceptable (e.g. SGD layout
+  gradients, where the result is clipped anyway). Requires x > 0 — NOT a
+  full-precision drop-in for pow. Avoids Math/pow's slow libm range reduction:
+  ~15 FP ops + 2 bit casts, all inline-able."
+  [x :- Double, n :- Double] :- Double
+  (let [bits (Double/doubleToRawLongBits x)
+        ;; log2(x) = unbiased-exponent + log2(mantissa), mantissa in [1,2)
+        xexp (double (- (bit-and (unsigned-bit-shift-right bits 52) 0x7ff) 1023))
+        mant (Double/longBitsToDouble
+              (bit-or (bit-and bits 0xfffffffffffff) 0x3ff0000000000000))
+        ;; Horner: log2(mant) ≈ ((((c5 m + c4) m + c3) m + c2) m + c1) m + c0
+        lm   (+ (* (+ (* (+ (* (+ (* (+ (* 0.04342890785229833 mant)
+                                        -0.4048671746887665) mant)
+                                  1.5939013644311786) mant)
+                            -3.4924942814448627) mant)
+                      5.046876046257392) mant)
+                -2.7868129542772677)
+        pw   (* n (+ xexp lm))
+        ;; 2^pw = 2^floor(pw) · 2^frac(pw)
+        fi   (Math/floor pw)
+        fr   (- pw fi)
+        q    (+ (* (+ (* (+ (* (+ (* (+ (* 0.001894379423521989 fr)
+                                        0.008940582529443615) fr)
+                                  0.05587655686843709) fr)
+                            0.24013169187238942) fr)
+                      0.6931567766987405) fr)
+                0.9999997696337165)
+        scale (Double/longBitsToDouble
+               (bit-shift-left (+ (long fi) 1023) 52))]
+    (* q scale)))
+
 ;; Extract the real-valued part of any numeric type.
 ;; For plain numbers, identity. For Dual types, extracts .v.
 ;; Used by ODE step-size control (error norms should NOT be differentiated).

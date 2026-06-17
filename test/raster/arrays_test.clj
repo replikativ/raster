@@ -381,3 +381,16 @@
     (is (= 0 (argmin (float-array [42.0])))))
   (testing "argmin float[] all same"
     (is (= 0 (argmin (float-array [2.0 2.0 2.0]))))))
+
+(deftest byte-array-test
+  (testing "aget/aset/alength on byte[] (signed elements)"
+    (let [b (byte-array [10 -5 100 -128 127])]
+      (is (= 5 (alength b)))
+      (is (= (byte 100) (aget b 2)))
+      (is (= (byte -128) (aget b 3)))
+      (aset b 0 (byte 42))
+      (is (= (byte 42) (aget b 0)))))
+  (testing "byte[] supports signed (int8) and unsigned (uint8) interpretation"
+    (let [b (byte-array [-5])]
+      (is (= -5 (long (aget b 0))) "signed int8")
+      (is (= 251 (clojure.core/bit-and (long (aget b 0)) 0xFF)) "unsigned uint8"))))

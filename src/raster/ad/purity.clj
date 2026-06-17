@@ -62,6 +62,8 @@
           'zero? 'pos? 'neg? 'even? 'odd? 'not
           'nil? 'some? 'identical? 'instance?
           'aget 'alength 'aclone
+          'bit-and 'bit-or 'bit-xor 'bit-not
+          'bit-shift-left 'bit-shift-right 'unsigned-bit-shift-right
           'Math/sin 'Math/cos 'Math/tan 'Math/exp 'Math/log 'Math/sqrt
           'Math/pow 'Math/abs 'Math/max 'Math/min 'Math/atan2
           'Math/floor 'Math/ceil 'Math/round 'Math/fma
@@ -71,7 +73,9 @@
                double float long int byte short
                zero? pos? neg? even? odd? not
                nil? some? identical? instance?
-               aget alength aclone])))
+               aget alength aclone
+               bit-and bit-or bit-xor bit-not
+               bit-shift-left bit-shift-right unsigned-bit-shift-right])))
 
 (defn- impure-mutating-op?
   "Check if a qualified op is impure (convention: name ends with !)."
