@@ -3929,9 +3929,15 @@
   [code args locals ctx]
   (let [param-vec (first args)
         rest-args (rest args)
-        [_ret-type body] (if (= :- (first rest-args))
-                           [(second rest-args) (nnext rest-args)]
-                           [nil rest-args])
+        [_ret-type after] (if (= :- (first rest-args))
+                            [(second rest-args) (nnext rest-args)]
+                            [nil rest-args])
+        ;; Strip walker `:raster.walker/source-body <vec>` markers: bytecode emits
+        ;; the WALKED (devirtualized) body, never the raw source body (which is kept
+        ;; only for AD transparency and contains bare, unqualified deftm calls).
+        ;; Loop handles >1 marker if an ftm was walked more than once.
+        body (loop [a after]
+               (if (= :raster.walker/source-body (first a)) (recur (nnext a)) a))
         plain-params (vec (loop [items (seq param-vec) result []]
                             (if-not items
                               result

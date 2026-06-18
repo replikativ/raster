@@ -777,6 +777,9 @@
       (when (symbol? arr-sym)
         (let [env-tag (type-env-tag type-env arr-sym)]
           (or (type-env-element type-env arr-sym)
+              ;; Element dispatch tag carried on the symbol (stamped at the binding
+              ;; site) — survives a re-walk whose env doesn't reach a captured var.
+              (:raster.type/element (meta arr-sym))
               (get types/primitive-array-element-types env-tag)
               (get types/primitive-array-element-types (:tag (meta arr-sym)))
               (get @types/soa-reverse-registry env-tag)))))))
@@ -1429,6 +1432,11 @@
                           (var? resolved)
                           (symbol (str (.name (.ns ^clojure.lang.Var resolved)))
                                   (str (.sym ^clojure.lang.Var resolved)))
+                          ;; Bare class name (e.g. (new Foo ...), (catch Foo e),
+                          ;; or a class in value position): qualify to its FQN so
+                          ;; the backend resolves it with no ns context.
+                          (class? resolved)
+                          (symbol (.getName ^Class resolved))
                           :else expr))
                       (and (namespace expr)
                            (try (the-ns (symbol (namespace expr))) true
