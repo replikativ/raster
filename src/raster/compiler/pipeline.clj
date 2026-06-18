@@ -57,6 +57,7 @@
             [clojure.walk :as walk]
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.dialects :as dialects]
+            [raster.compiler.ir.invariants :as invariants]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.method-entry :as me]
             [raster.core :as rcore]))
@@ -187,13 +188,24 @@
 ;; ================================================================
 
 (def ^:private ^:dynamic *validate-dialects?*
-  "When true, validate IR structure at each pass boundary.
-  Default true. Disable for production performance."
+  "Structural validation at each pass boundary: dialect-shape checkers +
+  always-on structural invariants (cheap). Default true."
   true)
 
+(def ^:dynamic *validate-deep?*
+  "Deep SEMANTIC invariants (qualify-upfront, type-tag presence, op
+  classification) at pass boundaries. Cross-cutting properties a dialect grammar
+  cannot express. Currently WARN-only; default off (enable in CI / tests).
+  Independent of how a pass is implemented — runs at the same boundary seam
+  whether the pass is direct-walking or a pattern `defpass`."
+  false)
+
 (defn- validate-dialect!
-  "Validate form against dialect. Throws on failure with detailed error."
-  [dialect-key form pass-key]
+  "Validate form against dialect at a pass boundary. Throws on a structural
+  violation (dialect shape or always-on structural invariant); warns on a deep
+  semantic invariant when *validate-deep?* is set. `opts` carries :active-params
+  (the deftm params), needed to exclude them from the qualify-upfront check."
+  [dialect-key form pass-key opts]
   (when *validate-dialects?*
     (when-let [[valid? validate-fn] (get dialects/dialect-checkers dialect-key)]
       (when-not (valid? form)
@@ -204,7 +216,10 @@
                            :validation-error details
                            :form-preview (pr-str (if (seq? form)
                                                    (take 3 form)
-                                                   form))})))))))
+                                                   form))})))))
+    (invariants/check-structural! dialect-key form pass-key))
+  (when *validate-deep?*
+    (invariants/check-deep! dialect-key form pass-key (:active-params opts))))
 
 ;; ================================================================
 ;; Pass functions — each takes (form, opts) → form or {:form :stats}
@@ -700,7 +715,7 @@
                    result (pass-fn f opts)
                    f' (pass-result-form result)]
                 ;; Validate output against target dialect (fails hard)
-               (validate-dialect! to f' pass-key)
+               (validate-dialect! to f' pass-key opts)
                [f' to]))
            [form :walked] passes)))
 
@@ -733,7 +748,7 @@
                                  current-dialect))
                   result (pass-fn (:form acc) opts)
                   new-form (pass-result-form result)]
-              (validate-dialect! to new-form pass-key)
+              (validate-dialect! to new-form pass-key opts)
               (-> acc
                   (assoc :form new-form :dialect to)
                   (assoc-in [:stages to] new-form)
