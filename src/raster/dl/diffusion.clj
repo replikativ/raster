@@ -23,15 +23,15 @@
 (deftm linear-beta-schedule (All [T] [num-steps :- Long beta-start :- Double beta-end :- Double]
                                  :- (Array double)
                                  (par/map [i num-steps]
-                                          (+ beta-start (* (/ (double i) (double (- num-steps 1))) (- beta-end beta-start))))))
+                                          (n/+ beta-start (n/* (n// (double i) (double (- num-steps 1))) (n/- beta-end beta-start))))))
 
 (deftm cosine-beta-schedule (All [T] [num-steps :- Long s :- Double] :- (Array double)
                                  (par/map [i num-steps]
-                                          (let [t1 (/ (double i) (double num-steps))
-                                                t2 (/ (double (+ i 1)) (double num-steps))
-                                                a1 (m/cos (* (/ (+ t1 s) (+ 1.0 s)) (* 0.5 n/pi)))
-                                                a2 (m/cos (* (/ (+ t2 s) (+ 1.0 s)) (* 0.5 n/pi)))
-                                                b (n/min 0.999 (- 1.0 (/ (* a2 a2) (* a1 a1))))]
+                                          (let [t1 (n// (double i) (double num-steps))
+                                                t2 (n// (double (+ i 1)) (double num-steps))
+                                                a1 (m/cos (n/* (n// (n/+ t1 s) (n/+ 1.0 s)) (n/* 0.5 n/pi)))
+                                                a2 (m/cos (n/* (n// (n/+ t2 s) (n/+ 1.0 s)) (n/* 0.5 n/pi)))
+                                                b (n/min 0.999 (n/- 1.0 (n// (n/* a2 a2) (n/* a1 a1))))]
                                             (n/max 0.0001 b)))))
 
 (deftm cosine-beta-schedule (All [T] [num-steps :- Long] :- (Array double)
@@ -42,7 +42,7 @@
                                          alphas-cumprod (n/similar betas)]
                                      (loop [i 0 prod 1.0]
                                        (when (< i n)
-                                         (let [a (* prod (- 1.0 (aget betas i)))]
+                                         (let [a (n/* prod (n/- 1.0 (aget betas i)))]
                                            (aset alphas-cumprod i a)
                                            (recur (inc i) a))))
                                      alphas-cumprod)))
@@ -54,9 +54,9 @@
 (deftm forward-noise (All [T] [x0 :- (Array T) noise :- (Array T)
                                alpha-t :- Double n :- Long] :- (Array T)
                           (let [sqrt-alpha (n/sqrt alpha-t)
-                                sqrt-1ma (n/sqrt (- 1.0 alpha-t))]
+                                sqrt-1ma (n/sqrt (n/- 1.0 alpha-t))]
                             (broadcast [x0 noise]
-                                       (+ (* sqrt-alpha x0) (* sqrt-1ma noise))))))
+                                       (n/+ (n/* sqrt-alpha x0) (n/* sqrt-1ma noise))))))
 
 ;; forward-noise rrule
 (tmpl/merge-into-template! 'raster.dl.diffusion/forward-noise
@@ -81,10 +81,10 @@
 (deftm predict-x0 (All [T] [xt :- (Array T) eps-pred :- (Array T)
                             alpha-t :- Double n :- Long] :- (Array T)
                        (let [sqrt-alpha (n/sqrt alpha-t)
-                             sqrt-1ma (n/sqrt (- 1.0 alpha-t))
-                             inv-sqrt-alpha (/ 1.0 sqrt-alpha)]
+                             sqrt-1ma (n/sqrt (n/- 1.0 alpha-t))
+                             inv-sqrt-alpha (n// 1.0 sqrt-alpha)]
                          (broadcast [xt eps-pred]
-                                    (* inv-sqrt-alpha (- xt (* sqrt-1ma eps-pred)))))))
+                                    (n/* inv-sqrt-alpha (n/- xt (n/* sqrt-1ma eps-pred)))))))
 
 ;; ================================================================
 ;; DDPM reverse sampling step
@@ -96,12 +96,12 @@
                                   alpha-bar-t :- Double n :- Long]
                              :- (Array T)
                              (let [;; mu = (1/sqrt(alpha_t)) * (x_t - beta_t/sqrt(1-alpha_bar_t) * eps)
-                                   inv-sqrt-alpha (/ 1.0 (n/sqrt alpha-t))
-                                   coeff (/ beta-t (n/sqrt (- 1.0 alpha-bar-t)))
+                                   inv-sqrt-alpha (n// 1.0 (n/sqrt alpha-t))
+                                   coeff (n// beta-t (n/sqrt (n/- 1.0 alpha-bar-t)))
                                    sigma (n/sqrt beta-t)]
                                (broadcast [xt eps-pred noise]
-                                          (+ (* inv-sqrt-alpha (- xt (* coeff eps-pred)))
-                                             (* sigma noise))))))
+                                          (n/+ (n/* inv-sqrt-alpha (n/- xt (n/* coeff eps-pred)))
+                                               (n/* sigma noise))))))
 
 ;; ================================================================
 ;; Backward helper for forward-noise
@@ -112,13 +112,13 @@
                                         alpha-t :- Double n :- Long]
                                    :- (Array Object)
                                    (let [sqrt-alpha (n/sqrt alpha-t)
-                                         sqrt-1ma (n/sqrt (- 1.0 alpha-t))
+                                         sqrt-1ma (n/sqrt (n/- 1.0 alpha-t))
                                          dx0 (n/similar dy)
                                          d-noise (n/similar dy)]
                                      (dotimes [i n]
                                        (let [dyi (aget dy i)]
-                                         (aset dx0 i (* dyi sqrt-alpha))
-                                         (aset d-noise i (* dyi sqrt-1ma))))
+                                         (aset dx0 i (n/* dyi sqrt-alpha))
+                                         (aset d-noise i (n/* dyi sqrt-1ma))))
                                      (object-array [dx0 d-noise]))))
 
 ;; ================================================================
