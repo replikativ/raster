@@ -2315,6 +2315,33 @@
     (.invokestatic code class-desc "invoke" method-type)
     return-stack-type))
 
+;; Numeric widening ranks for overload selection (int < long < float < double).
+;; A boxed/unknown numeric arg (:ref/nil) ranks as double so we never pick a
+;; narrowing primitive overload for it.
+(def ^:private stack-numeric-rank {:int 1 :bool 1 :long 2 :float 3 :double 4 :ref 4 nil 4})
+
+(defn- class-numeric-rank [^Class c]
+  (condp identical? c
+    Integer/TYPE 1 Long/TYPE 2 Float/TYPE 3 Double/TYPE 4 nil))
+
+(defn- pick-widening-numeric-method
+  "From candidate overloads whose params are ALL numeric primitives, pick the
+  one that accepts every arg by widening (param rank >= arg rank) with the
+  tightest total fit. Prevents choosing a NARROWING overload (e.g.
+  Math.min(int,int) for [:double :ref] args) that would truncate the doubles to
+  0 — the static-call selector must never truncate an argument. Returns nil when
+  no candidate is all-numeric (caller falls back to ref/hint matching)."
+  [candidates arg-types]
+  (let [ranked (keep (fn [^java.lang.reflect.Method m]
+                       (let [pranks (mapv class-numeric-rank (.getParameterTypes m))]
+                         (when (and (every? some? pranks)
+                                    (every? true?
+                                            (map (fn [pr at] (>= (long pr) (long (get stack-numeric-rank at 4))))
+                                                 pranks arg-types)))
+                           [(reduce + pranks) m])))
+                     candidates)]
+    (when (seq ranked) (second (apply min-key first ranked)))))
+
 (defn- emit-java-static-call
   "Emit bytecode for Java static method calls (e.g. Math/sin, System/arraycopy).
   Resolves the class and method via reflection, disambiguates overloads by
@@ -2343,9 +2370,14 @@
                                                 (or (nil? at) (= at (class-type->stack pt))))
                                               (.getParameterTypes m) arg-types)))
                                candidates)
+        ;; Numeric widening: never pick a NARROWING primitive overload (it
+        ;; truncates an arg — e.g. Math.min(int,int) on doubles → 0). nil when
+        ;; the candidates aren't all-numeric (falls through to :hint matching).
+        widened (pick-widening-numeric-method candidates arg-types)
         method    (cond
                     (<= (count candidates) 1) (first candidates)
                     (= 1 (count stack-matched)) (first stack-matched)
+                    widened widened
                     ;; Ambiguous ref types — use :hint from locals for precise matching
                     :else
                     (let [hint-resolve
