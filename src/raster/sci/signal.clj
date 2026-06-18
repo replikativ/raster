@@ -24,43 +24,43 @@
 
 (deftm hann [n :- Long] :- (Array double)
   (let [n-1 (double (dec n))
-        two-pi (* 2.0 n/pi)]
+        two-pi (n/* 2.0 n/pi)]
     (par/map [i n]
-             (* 0.5 (- 1.0 (m/cos (/ (* two-pi (double i)) n-1)))))))
+             (n/* 0.5 (n/- 1.0 (m/cos (n// (n/* two-pi (double i)) n-1)))))))
 
 (deftm hamming [n :- Long] :- (Array double)
   (let [n-1 (double (dec n))
-        two-pi (* 2.0 n/pi)]
+        two-pi (n/* 2.0 n/pi)]
     (par/map [i n]
-             (- 0.54 (* 0.46 (m/cos (/ (* two-pi (double i)) n-1)))))))
+             (n/- 0.54 (n/* 0.46 (m/cos (n// (n/* two-pi (double i)) n-1)))))))
 
 (deftm blackman [n :- Long] :- (Array double)
   (let [n-1 (double (dec n))
-        two-pi (* 2.0 n/pi)
-        four-pi (* 4.0 n/pi)]
+        two-pi (n/* 2.0 n/pi)
+        four-pi (n/* 4.0 n/pi)]
     (par/map [i n]
              (let [x (double i)]
-               (+ (- 0.42 (* 0.5 (m/cos (/ (* two-pi x) n-1))))
-                  (* 0.08 (m/cos (/ (* four-pi x) n-1))))))))
+               (n/+ (n/- 0.42 (n/* 0.5 (m/cos (n// (n/* two-pi x) n-1))))
+                    (n/* 0.08 (m/cos (n// (n/* four-pi x) n-1))))))))
 
 (deftm besseli0-kaiser
   "Modified Bessel function I0(x) via series expansion for Kaiser window."
   [x :- Double] :- Double
-  (let [half-x (* 0.5 x)]
+  (let [half-x (n/* 0.5 x)]
     (loop [k 1 term 1.0 sum 1.0]
-      (if (or (> k 25) (< (n/abs term) (* 1e-16 (n/abs sum))))
+      (if (or (> k 25) (< (n/abs term) (n/* 1e-16 (n/abs sum))))
         sum
-        (let [t (/ half-x (double k))
-              new-term (* term t t)]
-          (recur (inc k) new-term (+ sum new-term)))))))
+        (let [t (n// half-x (double k))
+              new-term (n/* (n/* term t) t)]
+          (recur (inc k) new-term (n/+ sum new-term)))))))
 
 (deftm kaiser [n :- Long beta :- Double] :- (Array double)
   (let [n-1 (double (dec n))
-        inv-i0-beta (/ 1.0 (besseli0-kaiser beta))]
+        inv-i0-beta (n// 1.0 (besseli0-kaiser beta))]
     (par/map [i n]
-             (let [ratio (- (* 2.0 (/ (double i) n-1)) 1.0)
-                   arg (* beta (n/sqrt (n/max 0.0 (- 1.0 (* ratio ratio)))))]
-               (* (besseli0-kaiser arg) inv-i0-beta)))))
+             (let [ratio (n/- (n/* 2.0 (n// (double i) n-1)) 1.0)
+                   arg (n/* beta (n/sqrt (n/max 0.0 (n/- 1.0 (n/* ratio ratio)))))]
+               (n/* (besseli0-kaiser arg) inv-i0-beta)))))
 
 ;; ================================================================
 ;; Spectral analysis — Welch method
@@ -83,7 +83,7 @@
                     (if (>= i nperseg)
                       s
                       (let [wi (aget window i)]
-                        (recur (inc i) (+ s (* wi wi))))))
+                        (recur (inc i) (n/+ s (n/* wi wi))))))
         psd (double-array n-freqs)
         seg (double-array nperseg)]
     ;; Average periodograms over segments
@@ -93,30 +93,30 @@
                      (do
                        ;; Extract and window segment
                        (dotimes [j nperseg]
-                         (aset seg j (* (aget x (+ start j)) (aget window j))))
+                         (aset seg j (n/* (aget x (+ start j)) (aget window j))))
                        ;; FFT
                        (let [[re im] (fft/fft seg)]
                          ;; Accumulate one-sided periodogram
                          (dotimes [k n-freqs]
                            (let [rk (aget re k)
                                  ik (aget im k)
-                                 power (+ (* rk rk) (* ik ik))]
-                             (aset psd k (+ (aget psd k) power)))))
+                                 power (n/+ (n/* rk rk) (n/* ik ik))]
+                             (aset psd k (n/+ (aget psd k) power)))))
                        (recur (+ start step) (inc cnt)))))]
       ;; Normalize: PSD = sum / (n-segs * win-power)
-      (let [norm (/ 1.0 (* (double n-segs) win-power))]
+      (let [norm (n// 1.0 (n/* (double n-segs) win-power))]
         (dotimes [k n-freqs]
-          (aset psd k (* (aget psd k) norm)))
+          (aset psd k (n/* (aget psd k) norm)))
         ;; Double interior bins (one-sided spectrum)
         (loop [k 1]
           (when (< k (dec n-freqs))
-            (aset psd k (* (aget psd k) 2.0))
+            (aset psd k (n/* (aget psd k) 2.0))
             (recur (inc k)))))
       ;; Frequency axis: k / nperseg for k = 0..n-freqs-1 (normalized)
       (let [freqs (double-array n-freqs)
-            inv-n (/ 1.0 (double nperseg))]
+            inv-n (n// 1.0 (double nperseg))]
         (dotimes [k n-freqs]
-          (aset freqs k (* (double k) inv-n)))
+          (aset freqs k (n/* (double k) inv-n)))
         (object-array [freqs psd])))))
 
 ;; ================================================================
@@ -148,8 +148,8 @@
             b (aget xi i)
             c (aget yr i)
             d (aget yi i)]
-        (aset prod-re i (+ (* a c) (* b d)))
-        (aset prod-im i (- (* b c) (* a d)))))
+        (aset prod-re i (n/+ (n/* a c) (n/* b d)))
+        (aset prod-im i (n/- (n/* b c) (n/* a d)))))
     ;; IFFT
     (let [[res-re _] (fft/ifft prod-re prod-im)
           result (double-array out-len)]
@@ -188,8 +188,8 @@
             b (aget xi i)
             c (aget yr i)
             d (aget yi i)]
-        (aset prod-re i (- (* a c) (* b d)))
-        (aset prod-im i (+ (* a d) (* b c)))))
+        (aset prod-re i (n/- (n/* a c) (n/* b d)))
+        (aset prod-im i (n/+ (n/* a d) (n/* b c)))))
     ;; IFFT and take first out-len samples
     (let [[res-re _] (fft/ifft prod-re prod-im)
           result (double-array out-len)]
@@ -210,9 +210,9 @@
                           bn (double-array nz)
                           an (double-array nz)
                           _ (dotimes [i nb]
-                              (aset bn i (/ (aget b i) a0)))
+                              (aset bn i (n// (aget b i) a0)))
                           _ (dotimes [i na]
-                              (aset an i (/ (aget a i) a0)))
+                              (aset an i (n// (aget a i) a0)))
         ;; State (delay line), length nz-1 (or 1 if nz<=1)
                           nstate (max 1 (dec nz))
                           z (double-array nstate)
@@ -221,21 +221,21 @@
                       (dotimes [n nx]
                         (let [xn (aget x n)
             ;; Output: y[n] = b[0]*x[n] + z[0]
-                              yn (+ (* (aget bn 0) xn) (aget z 0))]
+                              yn (n/+ (n/* (aget bn 0) xn) (aget z 0))]
                           (aset y n yn)
         ;; Update delay line: z[i] = b[i+1]*x[n] - a[i+1]*y[n] + z[i+1]
                           (loop [i 0]
                             (when (< i (dec nstate))
                               (let [bi1 (aget bn (inc i))
                                     ai1 (aget an (inc i))]
-                                (aset z i (+ (- (* bi1 xn) (* ai1 yn)) (aget z (inc i)))))
+                                (aset z i (n/+ (n/- (n/* bi1 xn) (n/* ai1 yn)) (aget z (inc i)))))
                               (recur (inc i))))
         ;; Last state element (no z[i+1] term)
                           (when (> nstate 0)
                             (let [last-i (dec nstate)
                                   bi1 (if (< (inc last-i) nz) (aget bn (inc last-i)) 0.0)
                                   ai1 (if (< (inc last-i) nz) (aget an (inc last-i)) 0.0)]
-                              (aset z last-i (- (* bi1 xn) (* ai1 yn)))))))
+                              (aset z last-i (n/- (n/* bi1 xn) (n/* ai1 yn)))))))
                       y)))
 
 ;; ================================================================
@@ -250,28 +250,28 @@
   Returns filter coefficients (length numtaps) with Hamming window applied."
   [numtaps :- Long cutoff :- Double fs :- Double] :- (Array double)
   (let [h (double-array numtaps)
-        fc (/ cutoff (* 0.5 fs))  ;; normalized cutoff [0, 1]
+        fc (n// cutoff (n/* 0.5 fs))  ;; normalized cutoff [0, 1]
         m (double (dec numtaps))
-        half-m (* 0.5 m)
+        half-m (n/* 0.5 m)
         win (hamming numtaps)]
     ;; Ideal sinc lowpass
     (dotimes [i numtaps]
-      (let [n-shifted (- (double i) half-m)]
+      (let [n-shifted (n/- (double i) half-m)]
         (if (< (n/abs n-shifted) 1e-15)
           (aset h i fc)
-          (aset h i (/ (m/sin (* n/pi fc n-shifted))
-                       (* n/pi n-shifted))))))
+          (aset h i (n// (m/sin (n/* (n/* n/pi fc) n-shifted))
+                         (n/* n/pi n-shifted))))))
     ;; Apply window
     (dotimes [i numtaps]
-      (aset h i (* (aget h i) (aget win i))))
+      (aset h i (n/* (aget h i) (aget win i))))
     ;; Normalize to unit DC gain
     (let [sum (loop [i 0 s 0.0]
                 (if (>= i numtaps)
                   s
-                  (recur (inc i) (+ s (aget h i)))))
-          inv-sum (/ 1.0 sum)]
+                  (recur (inc i) (n/+ s (aget h i)))))
+          inv-sum (n// 1.0 sum)]
       (dotimes [i numtaps]
-        (aset h i (* (aget h i) inv-sum))))
+        (aset h i (n/* (aget h i) inv-sum))))
     h))
 
 ;; ================================================================
@@ -302,20 +302,20 @@
                    a1 (aget sos (+ base 4))
                    a2 (aget sos (+ base 5))
               ;; Normalize by a0
-                   inv-a0 (/ 1.0 a0)
-                   b0n (* b0 inv-a0)
-                   b1n (* b1 inv-a0)
-                   b2n (* b2 inv-a0)
-                   a1n (* a1 inv-a0)
-                   a2n (* a2 inv-a0)]
+                   inv-a0 (n// 1.0 a0)
+                   b0n (n/* b0 inv-a0)
+                   b1n (n/* b1 inv-a0)
+                   b2n (n/* b2 inv-a0)
+                   a1n (n/* a1 inv-a0)
+                   a2n (n/* a2 inv-a0)]
           ;; Direct Form II Transposed for this section
                (loop [n 0 z1 0.0 z2 0.0]
                  (if (>= n nx)
                    nil
                    (let [xn (aget buf-in n)
-                         yn (+ (* b0n xn) z1)
-                         new-z1 (+ (* b1n xn) (- (* a1n yn)) z2)
-                         new-z2 (- (* b2n xn) (* a2n yn))]
+                         yn (n/+ (n/* b0n xn) z1)
+                         new-z1 (n/+ (n/+ (n/* b1n xn) (n/- (n/* a1n yn))) z2)
+                         new-z2 (n/- (n/* b2n xn) (n/* a2n yn))]
                      (aset buf-out n yn)
                      (recur (inc n) new-z1 new-z2))))
           ;; Copy output to input for next section
