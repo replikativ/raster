@@ -1429,6 +1429,11 @@
                           (var? resolved)
                           (symbol (str (.name (.ns ^clojure.lang.Var resolved)))
                                   (str (.sym ^clojure.lang.Var resolved)))
+                          ;; Bare class name (e.g. (new Foo ...), (catch Foo e),
+                          ;; or a class in value position): qualify to its FQN so
+                          ;; the backend resolves it with no ns context.
+                          (class? resolved)
+                          (symbol (.getName ^Class resolved))
                           :else expr))
                       (and (namespace expr)
                            (try (the-ns (symbol (namespace expr))) true
