@@ -777,6 +777,9 @@
       (when (symbol? arr-sym)
         (let [env-tag (type-env-tag type-env arr-sym)]
           (or (type-env-element type-env arr-sym)
+              ;; Element dispatch tag carried on the symbol (stamped at the binding
+              ;; site) — survives a re-walk whose env doesn't reach a captured var.
+              (:raster.type/element (meta arr-sym))
               (get types/primitive-array-element-types env-tag)
               (get types/primitive-array-element-types (:tag (meta arr-sym)))
               (get @types/soa-reverse-registry env-tag)))))))
