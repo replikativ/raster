@@ -86,8 +86,25 @@
            (apply set/union #{}
                   (for [arity arities]
                     (let [params (first arity)
-                          fn-bound (into bound (filter symbol? params))]
-                      (apply set/union #{} (map #(free-syms % fn-bound) (rest arity)))))))
+                          fn-bound (into bound (filter symbol? params))
+                          ;; A walked ftm arity is, after the param vector:
+                          ;;   [:- <ret>]?  :raster.walker/source-body <raw-vec>  <walked-body...>
+                          ;; The `:- <ret>` is type syntax (not a value), and the
+                          ;; source-body payload is the deliberately-unqualified raw
+                          ;; body kept for AD transparency. Neither is real code to
+                          ;; scan for captures — the walked-body alone is fully
+                          ;; qualified (.invk + ns-qualified calls). Scanning the
+                          ;; raw payload/annotations leaks type heads (`Array`) and
+                          ;; unqualified callees as bogus free vars.
+                          ;; Strip leading `:- <ret>` and any `:raster.walker/
+                          ;; source-body <vec>` pairs (an ftm may be walked more
+                          ;; than once, nesting multiple source-body markers).
+                          after (loop [a (rest arity)]
+                                  (cond
+                                    (= :- (first a)) (recur (drop 2 a))
+                                    (= :raster.walker/source-body (first a)) (recur (drop 2 a))
+                                    :else a))]
+                      (apply set/union #{} (map #(free-syms % fn-bound) after))))))
 
          ;; try/catch/finally — catch binds exception variable
          :special

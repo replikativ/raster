@@ -801,9 +801,18 @@
                               ;; Scalar-only functions (no array params) default to
                               ;; double precision — the JVM's native floating-point type.
                                 :double)
+            ;; The deftm's defining namespace — threaded into the passes so any
+            ;; re-walk (pe-rewalk) recognizes deftm calls and devirtualizes them.
+            ;; Without it the re-walk runs under *ns* and silently leaves deftm
+            ;; calls un-devirtualized (and bare in lifted closure helpers).
+            source-ns (let [m (meta resolved-var)]
+                        (or (when-let [s (:raster.core/deftm-source-ns m)]
+                              (try (the-ns s) (catch Exception _ nil)))
+                            (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
                           :active-params active-params :dtype effective-dtype}
-                   param-env (assoc :param-env param-env))
+                   param-env (assoc :param-env param-env)
+                   source-ns (assoc :source-ns source-ns))
             compile! (fn []
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)

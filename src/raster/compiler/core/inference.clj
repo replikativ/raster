@@ -188,6 +188,52 @@
     (reduce merge {} (map collect-binding-types-from-ast form))
     :else nil))
 
+;; TC stamps each checked node's type under this key (= typed.cljc.checker.utils/expr-type).
+(def ^:private tc-expr-type-key :typed.cljc.checker.utils/expr-type)
+
+(defn- tcr->dispatch-tag
+  "TCResult / raw type / [Type FilterSet] → raster dispatch tag, or nil."
+  [tcr]
+  (let [t (cond
+            (vector? tcr) (first tcr)
+            :else (try (:t tcr) (catch Exception _ tcr)))]
+    (cond
+      (nil? t) nil
+      (symbol? t) (or (class-sym->dispatch-tag t) (get tc-alias->dispatch-tag t))
+      :else (tc-type->tag t))))
+
+(defn- collect-binding-types-from-checked-ast
+  "Walk a TC :checked-ast, collecting {binding-sym → dispatch-tag} from the
+   u/expr-type stamped on each :let / :loop binding node. This replaces reading
+   ::binding-types form metadata: let*/loop* and (via Option X) the core/let
+   extension all expose per-binding types directly on the binding AST nodes.
+
+   Keyed by the original (de-uniquified) symbol, since the walker looks tags up by
+   source name. A name may be bound in more than one scope with DIFFERENT types
+   (shadowing — e.g. a macro like `broadcast` reusing a binding name for its loop
+   element, scalar, over an outer array of the same name). Conflating those would
+   mis-tag the outer binding, so a symbol with conflicting tags across scopes is
+   dropped (left for the walker to infer per-scope); a symbol consistently typed
+   everywhere keeps its tag."
+  [ast]
+  (let [acc (atom {})]                       ; sym → set of observed tags
+    (letfn [(walk [x]
+              (when (map? x)
+                (when (#{:let :loop} (:op x))
+                  (doseq [b (:bindings x)]
+                    (let [sym (:form b)
+                          tag (when-let [tcr (get b tc-expr-type-key)]
+                                (tcr->dispatch-tag tcr))]
+                      (when (and tag (symbol? sym))
+                        (swap! acc update sym (fnil conj #{}) tag)))))
+                (doseq [k (:children x)]
+                  (let [v (get x k)]
+                    (if (vector? v) (doseq [c v] (walk c)) (walk v))))))]
+      (walk ast))
+    (into {} (keep (fn [[sym tags]]
+                     (when (= 1 (count tags)) [sym (first tags)]))
+                   @acc))))
+
 (defn- raster-ann->tc-type
   "Convert a Raster type annotation to a TypedClojure type form.
   (Fn [Double] Double) → [Double :-> Double]
@@ -239,15 +285,15 @@
                                       source-ns (the-ns source-ns))
                                     *ns*)]
                      (try (check-fn wrapped {:checked-ast true
-                                           :check-config {:check-form-eval :never}})
-                        (catch Throwable e1
+                                             :check-config {:check-form-eval :never}})
+                          (catch Throwable e1
                           ;; Fallback: retry without checked-ast if TC's internal
                           ;; compilation fails (e.g., primitive :tag on let bindings)
-                          (try (check-fn wrapped {})
-                               (catch Throwable e2
-                                 (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
-                                               (.getMessage e1) " → retry: " (.getMessage e2)))
-                                 nil)))))]
+                            (try (check-fn wrapped {})
+                                 (catch Throwable e2
+                                   (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
+                                                 (.getMessage e1) " → retry: " (.getMessage e2)))
+                                   nil)))))]
         (when result
           (when (and (seq (:type-errors result))
                      (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
@@ -270,10 +316,9 @@
                                                  (mapv name (types/extract-tags params annotations))
                                                  " may return: " type-strs
                                                  ". Consider adding :- RetType or fixing branches.")))
-                    ;; Extract per-binding types from checked AST
+                    ;; Extract per-binding types straight off the checked AST nodes
                       binding-tags (when-let [ast (:checked-ast result)]
-                                     (let [out-form (:out-form result)]
-                                       (collect-binding-types-from-ast out-form)))]
+                                     (collect-binding-types-from-checked-ast ast))]
                   {:ret-tag (when rng (tc-type->tag rng))
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
@@ -326,8 +371,8 @@
                         (try (check-fn wrapped {})
                              (catch Throwable _ nil))))]
       (when (and result (empty? (:type-errors result)))
-        (let [out-form (:out-form result)]
-          (collect-binding-types-from-ast out-form))))
+        (when-let [ast (:checked-ast result)]
+          (collect-binding-types-from-checked-ast ast))))
     (catch Throwable _ nil)))
 
 ;; ================================================================
@@ -1389,6 +1434,17 @@
                            (try (the-ns (symbol (namespace expr))) true
                                 (catch Exception _ false)))
                       expr
+                      ;; Java static-call head `Class/method` where the namespace
+                      ;; part is a simple (imported) class name, not a loaded ns:
+                      ;; qualify Class to its FQN so the backend resolves it with no
+                      ;; ns context (e.g. MemorySegment/ofArray ->
+                      ;; java.lang.foreign.MemorySegment/ofArray when inlined out of
+                      ;; the ns that imported it).
+                      (and (namespace expr)
+                           (class? (try (ns-resolve source-ns (symbol (namespace expr)))
+                                        (catch Exception _ nil))))
+                      (symbol (.getName ^Class (ns-resolve source-ns (symbol (namespace expr))))
+                              (name expr))
                       :else
                       (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
                         (symbol (str (.name (.ns v))) (str (.sym v)))
