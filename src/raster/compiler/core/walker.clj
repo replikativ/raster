@@ -89,17 +89,21 @@
   "Stamp type metadata onto a symbol. Always sets :raster.type/tag (compiler
   canonical). Only sets Clojure :tag for non-primitive types (arrays, classes,
   interfaces) — Clojure rejects :tag on locals with primitive initializers.
-  Also sets :raster.type/fn-info for typed function interfaces.
+  Also sets :raster.type/fn-info for typed function interfaces, and
+  :raster.type/element for the element dispatch tag of Object[]/parametric arrays
+  so it travels on the AST (survives re-walks that don't re-bind a captured var).
   This is the ONLY place type metadata should be attached to symbols."
-  [sym tag]
-  (if tag
-    (let [;; Clojure :tag is safe for arrays and classes, not bare primitives
-          clj-hint (inf/compute-binding-hint tag sym)]
-      (cond-> (vary-meta sym assoc :raster.type/tag tag)
-        clj-hint (vary-meta assoc :tag clj-hint)
-        (types/fn-type-tag? tag)
-        (vary-meta assoc :raster.type/fn-info {:iface-name tag})))
-    sym))
+  ([sym tag] (stamp-type-meta sym tag nil))
+  ([sym tag element]
+   (if tag
+     (let [;; Clojure :tag is safe for arrays and classes, not bare primitives
+           clj-hint (inf/compute-binding-hint tag sym)]
+       (cond-> (vary-meta sym assoc :raster.type/tag tag)
+         clj-hint (vary-meta assoc :tag clj-hint)
+         (types/fn-type-tag? tag)
+         (vary-meta assoc :raster.type/fn-info {:iface-name tag})
+         element (vary-meta assoc :raster.type/element element)))
+     sym)))
 
 (defn ctx-get-tag
   "Get the dispatch tag for a symbol.
@@ -120,9 +124,13 @@
   (get-in (:type-env ctx) [sym :fn-info]))
 
 (defn ctx-get-element
-  "Get element type for an Object[] symbol."
+  "Get the element dispatch tag for an Object[]/parametric symbol. Reads the ctx
+  type-env first, then a carried `:raster.type/element` on the symbol (stamped at
+  the binding site) so the element survives a re-walk that doesn't re-bind a
+  captured var — mirroring ctx-get-tag."
   [ctx sym]
-  (get-in (:type-env ctx) [sym :element]))
+  (or (get-in (:type-env ctx) [sym :element])
+      (when (symbol? sym) (:raster.type/element (meta sym)))))
 
 ;; ================================================================
 ;; Form Classification
@@ -511,7 +519,7 @@
                                                 {:source-ns (:source-ns ctx)}))
                  elem-tag (inf/infer-element-tag init tag type-env)
                  hint (inf/compute-binding-hint tag sym)
-                 sym (stamp-type-meta sym (or hint tag))]
+                 sym (stamp-type-meta sym (or hint tag) elem-tag)]
              [(conj binds sym rewritten-init)
               (cond-> ctx
                 tag (ctx-assoc-type sym tag)

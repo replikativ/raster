@@ -407,6 +407,10 @@
   (raster.par/pmap idx bound cast body)
   Returns {:idx :bound :cast :body} + optional :elem-type from metadata."
   [form]
+  ;; Key convention (NOT drift): the element type is carried on AST METADATA under
+  ;; the namespaced :raster.type/elem-type, and translated here into the bare
+  ;; :elem-type field of the plain info maps handed to the backend. Namespaced on
+  ;; metadata, bare on plain data maps — this is the single translation boundary.
   (let [[_ idx bound cast body] form
         elem-type (:raster.type/elem-type (meta form))]
     (cond-> {:idx idx :bound bound :cast cast :body body}
