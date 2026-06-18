@@ -172,6 +172,8 @@
 ;; Mark +, *, - as reducible (variadic via fold)
 (set-reducible! #'+)
 (set-reducible! #'*)
+(set-reducible! #'-)
+(set-reducible! #'/)
 
 ;; ================================================================
 ;; Number tower: abs, sign, clamp, min, max, zero?

@@ -12,8 +12,9 @@
 
    The rrule is registered so reverse-mode AD differentiates through
    fixed-point-solve calls automatically."
+  (:refer-clojure :exclude [+ - * /])
   (:require [raster.core :refer [deftm ftm]]
-            [raster.numeric :as n]
+            [raster.numeric :as n :refer [+ - * /]]
             [raster.ad.templates :as tmpl]))
 
 ;; ================================================================
