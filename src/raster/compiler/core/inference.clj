@@ -285,15 +285,15 @@
                                       source-ns (the-ns source-ns))
                                     *ns*)]
                      (try (check-fn wrapped {:checked-ast true
-                                           :check-config {:check-form-eval :never}})
-                        (catch Throwable e1
+                                             :check-config {:check-form-eval :never}})
+                          (catch Throwable e1
                           ;; Fallback: retry without checked-ast if TC's internal
                           ;; compilation fails (e.g., primitive :tag on let bindings)
-                          (try (check-fn wrapped {})
-                               (catch Throwable e2
-                                 (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
-                                               (.getMessage e1) " → retry: " (.getMessage e2)))
-                                 nil)))))]
+                            (try (check-fn wrapped {})
+                                 (catch Throwable e2
+                                   (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
+                                                 (.getMessage e1) " → retry: " (.getMessage e2)))
+                                   nil)))))]
         (when result
           (when (and (seq (:type-errors result))
                      (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
@@ -1434,6 +1434,17 @@
                            (try (the-ns (symbol (namespace expr))) true
                                 (catch Exception _ false)))
                       expr
+                      ;; Java static-call head `Class/method` where the namespace
+                      ;; part is a simple (imported) class name, not a loaded ns:
+                      ;; qualify Class to its FQN so the backend resolves it with no
+                      ;; ns context (e.g. MemorySegment/ofArray ->
+                      ;; java.lang.foreign.MemorySegment/ofArray when inlined out of
+                      ;; the ns that imported it).
+                      (and (namespace expr)
+                           (class? (try (ns-resolve source-ns (symbol (namespace expr)))
+                                        (catch Exception _ nil))))
+                      (symbol (.getName ^Class (ns-resolve source-ns (symbol (namespace expr))))
+                              (name expr))
                       :else
                       (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
                         (symbol (str (.name (.ns v))) (str (.sym v)))

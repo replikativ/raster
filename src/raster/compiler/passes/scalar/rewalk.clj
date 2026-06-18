@@ -61,6 +61,7 @@
           rewalked (try
                      (walker/walk-body optimized
                                        (cond-> {:type-env type-env}
+                                         (:source-ns opts) (assoc :source-ns (:source-ns opts))
                                          (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)))
                      (catch Exception e
                        (binding [*out* *err*]

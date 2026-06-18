@@ -102,9 +102,17 @@
     sym))
 
 (defn ctx-get-tag
-  "Get the dispatch tag for a symbol."
+  "Get the dispatch tag for a symbol.
+
+  Reads the ctx type-env first (the per-walk cache), then falls back to a tag
+  carried on the symbol itself (`:raster.type/tag` metadata stamped at the
+  reference site by a prior walk). Carrying the type on the AST means a re-walk
+  over restructured code (PE/CSE/inline) keeps a binding's type even when the
+  re-derived ctx type-env doesn't reach into a nested scope (e.g. an ftm closure
+  capturing an outer var)."
   [ctx sym]
-  (get-in (:type-env ctx) [sym :tag]))
+  (or (get-in (:type-env ctx) [sym :tag])
+      (when (symbol? sym) (:raster.type/tag (meta sym)))))
 
 (defn ctx-get-fn-info
   "Get fn-info for a symbol."
