@@ -577,9 +577,17 @@
 (defmethod walk-form :ftm [form ctx]
   (let [[ftm-sym param-vec & body-args] form
         ;; Parse optional return type: (ftm [params] :- RetType body...)
-        [ret-type body] (if (= :- (first body-args))
+        [ret-type tail] (if (= :- (first body-args))
                           [(second body-args) (nnext body-args)]
                           [nil body-args])
+        ;; Idempotency: the pipeline walks ftms more than once (walk → inline →
+        ;; pe-rewalk). An already-walked ftm carries its raw body in a
+        ;; `:raster.walker/source-body <vec>` marker; preserve that original raw
+        ;; body and re-walk only the walked body. Re-wrapping would NEST a second
+        ;; source-body and double the (64KB-method-limit-sensitive) payload.
+        already-walked? (= :raster.walker/source-body (first tail))
+        src-body (if already-walked? (second tail) (vec tail))
+        body     (if already-walked? (nnext tail) tail)
         ;; Parse typed params: [a :- Double, b :- Long] → extract names + types
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         ;; Add params to walker context with their type annotations
@@ -597,10 +605,10 @@
         ;; body uses raster.numeric dispatch (handles Dual) unlike walked .invk calls.
         result (if ret-type
                  (list* ftm-sym param-vec :- ret-type
-                        :raster.walker/source-body (vec body)
+                        :raster.walker/source-body src-body
                         walked-body)
                  (list* ftm-sym param-vec
-                        :raster.walker/source-body (vec body)
+                        :raster.walker/source-body src-body
                         walked-body))]
     result))
 
