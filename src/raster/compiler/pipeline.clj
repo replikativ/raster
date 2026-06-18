@@ -809,10 +809,21 @@
                         (or (when-let [s (:raster.core/deftm-source-ns m)]
                               (try (the-ns s) (catch Exception _ nil)))
                             (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+            ;; Param annotations ({sym -> typedclojure annotation}), so the PE
+            ;; re-walk reconstructs the SAME type-env as walk-1 (array :element,
+            ;; (Fn ...) :fn-info) instead of a tag-only env that under-devirtualizes.
+            param-annotations (let [m (meta resolved-var)
+                                    ps (:raster.core/deftm-params m)
+                                    anns (or (:raster.core/deftm-annotations m)
+                                             (when-let [tags (:raster.core/deftm-tags m)]
+                                               (mapv (fn [t] (if (= t 'Object) nil t)) tags)))]
+                                (when (and ps anns (= (count ps) (count anns)))
+                                  (zipmap (map #(if (symbol? %) % (symbol (name %))) ps) anns)))
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
                           :active-params active-params :dtype effective-dtype}
                    param-env (assoc :param-env param-env)
-                   source-ns (assoc :source-ns source-ns))
+                   source-ns (assoc :source-ns source-ns)
+                   param-annotations (assoc :param-annotations param-annotations))
             compile! (fn []
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)

@@ -51,10 +51,22 @@
                       (assoc param-env (with-meta (if (symbol? lr) lr (symbol (name lr))) nil) scalar-tag)
                       param-env)
           ;; Type-env from param-env. Uses build-param-type-env for consistency
-          ;; with definition-time and AOT-time walks.
+          ;; with the definition-time and AOT-time walks — including the param
+          ;; ANNOTATIONS so array :element and (Fn ...) :fn-info survive the
+          ;; re-walk (the 2-arg form dropped them, diverging from walk-1 and
+          ;; under-devirtualizing parametric / fn-param code).
+          param-annotations (:param-annotations opts)
           type-env (inf/build-param-type-env
                     (vec (keys param-env))
-                    (vec (vals param-env)))
+                    (vec (vals param-env))
+                    (when param-annotations
+                      (mapv #(get param-annotations %) (keys param-env))))
+          ;; Fail loud: a re-walk with no source-ns runs under *ns* and silently
+          ;; devirtualizes nothing (the GAP-A drift). compile-aot always threads
+          ;; it; warn if a future caller forgets.
+          _ (when-not (:source-ns opts)
+              (binding [*out* *err*]
+                (println "WARNING: pe-rewalk invoked without :source-ns — deftm calls will not devirtualize")))
           ;; TC binding tags: run TC once on the post-AD form for systematic
           ;; type inference of all let bindings.
           tc-binding-tags (inf/tc-infer-binding-tags param-env optimized)
