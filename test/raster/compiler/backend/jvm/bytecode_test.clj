@@ -5,6 +5,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm ftm]]
             [raster.ad.reverse]
+            [raster.arrays :as arr]
+            [raster.numeric :as rn]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.mem-merge :as mm]))
 
@@ -538,3 +540,33 @@
       (is (< (Math/abs (- 0.6 (aget W 0))) 1e-10))
       (is (< (Math/abs (- 1.5 (aget W 1))) 1e-10))
       (is (< (Math/abs (- 2.4 (aget W 2))) 1e-10)))))
+
+;; ================================================================
+;; Branch-merge stack-map regression
+;;
+;; (if cond <const> <deep .invk-arithmetic with a loop>): the if-emitter's
+;; skip-box? optimization predicts the else-branch's stack type; when that
+;; prediction disagreed with the actually-emitted type it boxed the else to a
+;; ref while the then-branch was left an unboxed primitive — different stack
+;; heights at the join => "Stack size mismatch" bytecode-verifier failure.
+;; This is the trapz/besselj0 shape (raster.numeric .invk arithmetic).
+;; ================================================================
+
+(deftm bc-if-deep-arith-loop [ys :- (Array double), dx :- Double] :- Double
+  (if (< (arr/alength ys) 2)
+    0.0
+    (let [n-1 (dec (arr/alength ys))]
+      (rn/* dx
+            (rn/+ (rn/* 0.5 (rn/+ (double (arr/aget ys 0)) (double (arr/aget ys n-1))))
+                  (loop [i 1 s 0.0]
+                    (if (>= i n-1)
+                      s
+                      (recur (inc i) (rn/+ s (double (arr/aget ys i)))))))))))
+
+(deftest if-merge-deep-arith-loop-test
+  (testing "if with a constant then-branch and a deep .invk-arithmetic else
+            containing a loop compiles and computes correctly"
+    ;; Call directly to exercise the lazy-JIT bytecode path (where the
+    ;; skip-box? misprediction occurs — compile-aot's richer inference hides
+    ;; it). trapezoidal sum of [0 1 4 9] dx=1: 0.5*(0+9) + (1+4) = 9.5
+    (is (== 9.5 (bc-if-deep-arith-loop (double-array [0.0 1.0 4.0 9.0]) 1.0)))))

@@ -3064,12 +3064,22 @@
               (do (.aconst_null code)
                   (.labelBinding code end-label)
                   :ref)
-              ;; Different types or prediction was wrong — box else
+              ;; Prediction was wrong. The skip-box? path already committed the
+              ;; then-branch to an UNBOXED primitive (then-type); boxing else to
+              ;; :ref here would leave a 1-slot ref on the else path against a
+              ;; 1-or-2-slot primitive on the then path => branch-merge stack
+              ;; mismatch (the bug). Reconcile by COERCING else to then-type.
+              ;; When not skip-box?, then is already :ref, so box else to match.
               :else
-              (do (when (primitive? else-type)
-                    (emit-box-to-ref code else-type))
-                  (.labelBinding code end-label)
-                  (if skip-box? then-type :ref)))))))))
+              (if skip-box?
+                (do (when (not= else-type then-type)
+                      (emit-coerce code else-type then-type))
+                    (.labelBinding code end-label)
+                    then-type)
+                (do (when (primitive? else-type)
+                      (emit-box-to-ref code else-type))
+                    (.labelBinding code end-label)
+                    :ref)))))))))
 
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
