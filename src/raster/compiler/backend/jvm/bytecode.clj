@@ -553,14 +553,6 @@
     (try (par/expand-par-reduce form)
          (catch Throwable _ form))
 
-    ;; Pure par/pmap (value-producing, no output buffer): the lazy-JIT path
-    ;; doesn't run the `materialize` pipeline pass, so a `raster.par/pmap` form
-    ;; (e.g. from `broadcast`) would leak to the Java static-call emitter and
-    ;; fail with "Cannot resolve class: raster.par". Materialize it here (alloc
-    ;; + par/map!) and re-expand. Symbolic + load-order independent.
-    (par/par-map-pure-form? form)
-    (pre-expand-par-forms (:form (materialize/materialize-pass form nil)))
-
     ;; Replace (dotimes [i n] body) with int-counted loop*
     (and (seq? form)
          (let [h (first form)]
@@ -581,6 +573,17 @@
     (vector? form)
     (with-meta (mapv pre-expand-par-forms form) (meta form))
     :else form))
+
+(defn- materialize-form
+  "Run the `materialize` pass on a single form: pure par/pmap (value-producing,
+  no output buffer — e.g. from `broadcast`) → alloc + par/map!. Used in the
+  lazy-JIT compile chain AFTER macroexpand-all, so it sees only plain-symbol
+  let* (the pass's input dialect) — running it earlier would rewrite a `let`
+  with destructuring to `let*` and orphan the destructured symbols. Keeps the
+  JIT path lowering pure par forms via the same pass compile-aot uses, so they
+  can't diverge (otherwise pure par/pmap leaks unlowered to the emitter)."
+  [form]
+  (:form (materialize/materialize-pass form nil)))
 
 ;; Forward declarations for mutual recursion
 (declare emit-form)
@@ -4541,7 +4544,7 @@
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)]
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
@@ -4616,7 +4619,7 @@
                                                             :source-ns  source-ns
                                                             :typed-sibling-methods typed-sibling-methods}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        target-st (:stack-type return-info)
                                                        ret-cd (:class-desc return-info)]
