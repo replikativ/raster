@@ -6,6 +6,7 @@
   special forms + function calls.  Same approach as partial-cps/ioc.clj.
   This generalizes to arbitrary Clojure code in deftm bodies."
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.util :as util]
@@ -551,6 +552,15 @@
     (par/par-reduce-form? form)
     (try (par/expand-par-reduce form)
          (catch Throwable _ form))
+
+    ;; Pure par/pmap (value-producing, no output buffer): the lazy-JIT path
+    ;; doesn't run the `materialize` pipeline pass, so a `raster.par/pmap` form
+    ;; (e.g. from `broadcast`) would leak to the Java static-call emitter and
+    ;; fail with "Cannot resolve class: raster.par". Materialize it here (alloc
+    ;; + par/map!) and re-expand. Symbolic + load-order independent.
+    (par/par-map-pure-form? form)
+    (pre-expand-par-forms (:form (materialize/materialize-pass form nil)))
+
     ;; Replace (dotimes [i n] body) with int-counted loop*
     (and (seq? form)
          (let [h (first form)]
