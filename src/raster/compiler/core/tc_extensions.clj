@@ -156,11 +156,13 @@
 ;; Each returns nil when args aren't all Value types, falling through
 ;; to TC's normal annotation-based checking.
 
+;; Value-folding only. +,-,* are NOT here — they go through the single-check
+;; promoting handler (promoted-ops below), because the value-only handler must
+;; fall through to TC's normal re-check when args aren't constants, which
+;; doubles work at every nesting level (O(2^depth) — a depth-8 clojure.core
+;; Horner polynomial took ~32s). quot/rem/mod/max/min are rarely deeply nested.
 (def ^:private arithmetic-ops
-  {'clojure.core/*    *
-   'clojure.core/+    +
-   'clojure.core/-    -
-   'clojure.core/quot quot
+  {'clojure.core/quot quot
    'clojure.core/rem  rem
    'clojure.core/mod  mod
    'clojure.core/max  max
@@ -300,37 +302,52 @@
 
 (defn- make-promoting-handler
   "Create an invoke-special handler that applies numeric promotion.
-  First tries Value propagation (constant folding), then falls back
-  to promotion-based type inference."
+  Checks each argument EXACTLY ONCE, then either constant-folds (when every
+  arg is a Value type) or promotes (Julia-style numeric widening). Returns the
+  fully checked expr, never nil-falling-through to TC's normal re-checking.
+
+  Checking args once is load-bearing for performance: the arguments of a
+  nested arithmetic expression are themselves raster.numeric calls, so any
+  re-check of the args re-invokes this handler on the whole subtree. The old
+  shape (probe via value-handler — which checks all args — then re-check all
+  args to promote) doubled the work at every nesting level, compounding to
+  ~O(4^depth): a depth-10 nested expression took ~131s to type-check. Checking
+  once makes it O(depth) (~18ms at depth 30)."
   [op-fn]
-  (let [value-handler (make-value-propagating-handler op-fn)]
-    (fn [{:keys [args] :as expr} expected opts]
-      ;; Try constant propagation first
-      (or (value-handler expr expected opts)
-          ;; Fall back to numeric promotion
-          (let [check-expr (check-expr-from-opts opts)]
-            (when (and check-expr (seq args))
-              (let [cargs (mapv #(check-expr % nil opts) args)
-                    types (mapv (comp r/ret-t u/expr-type) cargs)
-                    promoted (promote-numeric-types types opts)]
-                (when promoted
-                  (-> expr
-                      (assoc :args cargs
-                             u/expr-type (below/maybe-check-below
-                                          (r/ret promoted)
-                                          expected
-                                          opts)))))))))))
+  (fn [{:keys [args] :as expr} expected opts]
+    (let [check-expr (check-expr-from-opts opts)]
+      (when (and check-expr (seq args))
+        (let [cargs (mapv #(check-expr % nil opts) args)
+              types (mapv (comp r/ret-t u/expr-type) cargs)
+              vals  (when (every? r/Value? types) (mapv :val types))
+              ret   (cond
+                      (and vals (every? number? vals))
+                      (r/ret (r/Value-maker (apply op-fn vals)))
+                      :else
+                      (when-let [promoted (promote-numeric-types types opts)]
+                        (r/ret promoted)))]
+          (when ret
+            (-> expr
+                (assoc :args cargs
+                       u/expr-type (below/maybe-check-below ret expected opts)))))))))
 
-;; Register promoting handlers for raster.numeric arithmetic ops.
-;; These override TC's normal overload resolution with promotion-aware
-;; type inference, matching the runtime behavior.
-(def ^:private raster-numeric-ops
-  {'raster.numeric/*    *
-   'raster.numeric/+    +
-   'raster.numeric/-    -
-   'raster.numeric//    /})
+;; Register promoting handlers for arithmetic ops. These override TC's normal
+;; overload resolution with promotion-aware, single-check type inference,
+;; matching the runtime behavior. clojure.core/{+,-,*} are included (scalar
+;; numeric code — e.g. raster.sci.special — uses clojure.core arithmetic on
+;; Doubles) so that deeply-nested expressions check in O(depth), not O(2^depth).
+;; clojure.core// is intentionally excluded: it can yield a Ratio (e.g. (/ 1 2)),
+;; which numeric promotion would mis-type — it falls through to TC's builtin.
+(def ^:private promoted-ops
+  {'raster.numeric/*  *
+   'raster.numeric/+  +
+   'raster.numeric/-  -
+   'raster.numeric//  /
+   'clojure.core/*    *
+   'clojure.core/+    +
+   'clojure.core/-    -})
 
-(doseq [[sym op-fn] raster-numeric-ops
+(doseq [[sym op-fn] promoted-ops
         :let [handler (make-promoting-handler op-fn)]]
   (defmethod chk/-invoke-special sym
     [expr expected opts]
