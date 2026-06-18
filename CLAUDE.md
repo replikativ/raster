@@ -277,6 +277,16 @@ Clojure arithmetic bypasses typed dispatch and is invisible to the walker. Simil
 The only exception is internal compiler emit code (e.g., `clojure.core/aset` in expanded
 loop bodies) which intentionally bypasses dispatch for direct JVM primitives.
 
+`inc`/`dec` (and `quot`/`rem`/`mod`) stay `clojure.core`: they are integer
+index/counter steppers, never polymorphic float arithmetic. They are already
+optimal on every backend — a zero-cost `ladd`/`lsub` intrinsic in the bytecode
+compiler, `+1`/`-1` in the GPU C emitter, and they are the keys the SIMD
+loop-lift induction-variable matcher (`op_descriptor`) recognizes. Routing them
+through `raster.numeric` would regress the hot path and risk boxing array
+indices. Integer index/counter arithmetic with `+ - * /` (e.g. `(+ (* row n) col)`
+for a flat array index) likewise stays `clojure.core` — only genuine
+floating-point computation goes through `raster.numeric`.
+
 **Centralize operator classification.** Compiler passes must not maintain independent
 hardcoded sets of operator symbols. Operator properties (simplifiable, SIMD-capable,
 effectful, type-preserving, allocating) belong in the op-descriptor registry. Passes

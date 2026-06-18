@@ -14,9 +14,10 @@
     (newton (ftm [x :- Double] :- Double (- (* x x) 2.0))
             (ftm [x :- Double] :- Double (* 2.0 x))
             1.5)"
+  (:refer-clojure :exclude [+ - * /])
   (:require [raster.core :refer [deftm ftm]]
             [raster.math :as m]
-            [raster.numeric :as n]))
+            [raster.numeric :as n :refer [+ - * /]]))
 
 ;; ================================================================
 ;; Bisection method

@@ -6,7 +6,9 @@
    Effort:     Newton-Raphson FOC solver for equal-shares compensation
 
    All functions are deftm — zero allocation, primitive fast-path."
-  (:require [raster.core :refer [deftm]]))
+  (:refer-clojure :exclude [+ - * /])
+  (:require [raster.core :refer [deftm]]
+            [raster.numeric :as n :refer [+ - * /]]))
 
 ;; ================================================================
 ;; Production function: Y = a*E + b*E^β
