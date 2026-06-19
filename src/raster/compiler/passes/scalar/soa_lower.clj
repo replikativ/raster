@@ -18,9 +18,10 @@
    deftm* (a `.invk` returning a value type whose body is a bare constructor) is
    NOT inlined by the current inliner, so such calls don't explode yet — that's a
    separable follow-on (extend inlinable-body? / inline value-type deftms)."
-  (:require [raster.compiler.core.types :as types]))
+  (:require [raster.compiler.core.types :as types]
+            [clojure.walk :as walk]))
 
-(defn- field-arr-sym [soa-sym field-name]
+(defn field-arr-sym [soa-sym field-name]
   (symbol (str (name soa-sym) "_" (name field-name))))
 
 (defn soa-param-env
@@ -33,8 +34,25 @@
           (keep (fn [{:keys [sym tag]}]
                   (when-let [scalar-tag (get rev tag)]
                     (when-let [info (get reg scalar-tag)]
-                      [sym {:scalar-tag scalar-tag :fields (:fields info)}])))
+                      [sym {:scalar-tag scalar-tag :soa-tag tag :fields (:fields info)}])))
                 param-specs))))
+
+(defn collect-soa-env
+  "Body-tag-based SoA detection (the shared replacement for the GPU's
+   collect-soa-expansions): scan body for symbols whose :tag is a registered SoA
+   type → {soa-sym → {:scalar-tag :soa-tag :fields}}."
+  [body]
+  (let [rev @types/soa-reverse-registry reg @types/soa-registry acc (atom {})]
+    (walk/postwalk
+     (fn [f]
+       (when (and (symbol? f) (:tag (meta f)))
+         (when-let [scalar (get rev (:tag (meta f)))]
+           (when-let [info (get reg scalar)]
+             (swap! acc assoc (symbol (name f))
+                    {:scalar-tag scalar :soa-tag (:tag (meta f)) :fields (:fields info)}))))
+       f)
+     body)
+    @acc))
 
 (defn expand-params
   "Replace each SoA param with its per-field array params (in field order)."
@@ -153,12 +171,20 @@
     (vector? form) (mapv #(lower ctx %) form)
     :else form))
 
+(defn lower-body
+  "Scalar-replace value-type access in body given a SoA env (the shared lowering
+   the GPU pass calls after computing its env via collect-soa-env)."
+  [soa-env body]
+  (lower {:soa soa-env :exploded {}} body))
+
 (defn soa-lower
-  "Top-level: expand SoA params + scalar-replace value-type access in the body.
-   Returns {:body body' :params param-specs'}. No-op when no SoA params."
+  "Top-level (wasm): expand SoA params + scalar-replace value-type access.
+   Returns {:body body' :params param-specs' :soa-expansion {soa-sym → info}}.
+   No-op when no SoA params."
   [body param-specs]
   (let [soa-env (soa-param-env param-specs)]
     (if (empty? soa-env)
-      {:body body :params param-specs}
-      {:body   (lower {:soa soa-env :exploded {}} body)
-       :params (expand-params param-specs soa-env)})))
+      {:body body :params param-specs :soa-expansion {}}
+      {:body          (lower-body soa-env body)
+       :params        (expand-params param-specs soa-env)
+       :soa-expansion soa-env})))
