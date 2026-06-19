@@ -8,8 +8,7 @@
             [raster.core :refer [deftm]]
             [raster.numeric]
             [raster.arrays]
-            [raster.compiler.pipeline :as pl]
-            [raster.compiler.backend.wasm.emit :as wemit])
+            [raster.compiler.pipeline :as pl])
   (:import [com.dylibso.chicory.wasm Parser]
            [com.dylibso.chicory.runtime Instance]))
 
@@ -22,27 +21,12 @@
           (recur (clojure.core/inc (long i))))
       n)))
 
-(defn- post-pass-ir
-  "The exact S-expr compile-aot hands the bytecode backend (pipeline.clj)."
-  [v]
-  (let [g (resolve 'raster.compiler.pipeline/get-walked-body)
-        b (resolve 'raster.compiler.pipeline/build-param-env)
-        c (resolve 'raster.compiler.pipeline/clean-params)
-        p (resolve 'raster.compiler.pipeline/get-params)]
-    (pl/run-passes (first (g v :double)) pl/forward-passes
-                   {:inline? true :simd? false :dtype :double
-                    :active-params (c (p v :double)) :param-env (b v :double)
-                    :source-ns (.ns ^clojure.lang.Var v)})))
-
 (defn- instantiate [^bytes wasm]
   (-> (Instance/builder (Parser/parse wasm)) (.build)))
 
 (deftest saxpy-emits-valid-and-correct-wasm
-  (let [m (wemit/compile-kernel
-           {:name "saxpy"
-            :params [{:sym 'a :tag 'double} {:sym 'x :tag 'doubles}
-                     {:sym 'y :tag 'doubles} {:sym 'n :tag 'long}]
-            :ir (post-pass-ir #'saxpy-k!)})
+  ;; Exercises the wired pipeline entry: deftm → compile-wasm → .wasm bytes.
+  (let [m (pl/compile-wasm #'saxpy-k! :name "saxpy")
         inst (instantiate (:bytes m))      ; parse = validate; throws on malformed
         mem  (.memory inst)
         saxpy (.export inst "saxpy")

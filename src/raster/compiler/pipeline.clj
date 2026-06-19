@@ -28,6 +28,7 @@
             [raster.compiler.passes.scalar.rewalk :as rewalk]
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
@@ -865,6 +866,46 @@
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))
+
+(defn compile-wasm
+  "Compile a deftm var to a WebAssembly module (Track A — browser/WASI target).
+   Reuses compile-aot's front-half (walker → forward-passes) to produce the same
+   post-pass IR, then emits a .wasm via backend/wasm/emit instead of JVM bytecode.
+
+   Returns {:bytes byte[] :name str :param-types [valtype-kw...] :params [{:sym :tag}]}.
+   The exported fn takes the params in order; array params are (ptr) byte-offsets
+   into the exported `memory`, with element data the caller writes/reads through a
+   typed-array view (see cljs-sandbox for the cljs side).
+
+   v1: scalar, single-function, param-only kernels (no hoisted intermediate
+   buffers); `:simd? false` is forced (the JVM Vector-API SIMD lowering is
+   JVM-only — a wasm-SIMD128 path is a later increment)."
+  [f-var & {:keys [dtype name] :or {dtype :double}}]
+  (let [resolved      (or (resolve-deftm-var f-var dtype) f-var)
+        walked-body   (get-walked-body f-var dtype)
+        params        (get-params f-var dtype)
+        active-params (clean-params params)
+        param-env     (build-param-env f-var dtype)
+        source-ns     (let [m (meta resolved)]
+                        (or (when-let [s (:raster.core/deftm-source-ns m)]
+                              (try (the-ns s) (catch Exception _ nil)))
+                            (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
+        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
+               param-env (assoc :param-env param-env)
+               source-ns (assoc :source-ns source-ns))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
+        form (run-passes raw-form forward-passes opts)
+        ;; ordered {:sym :tag} from the deftm metadata (tags are walker tags:
+        ;; 'double / 'doubles / 'long …)
+        d-params (:raster.core/deftm-params (meta resolved))
+        d-tags   (:raster.core/deftm-tags (meta resolved))
+        param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
+                                     :tag (symbol t)})
+                          d-params d-tags)]
+    (wasm-emit/compile-kernel
+     {:name (or name (str (:name (meta resolved))))
+      :params param-specs
+      :ir form})))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)
