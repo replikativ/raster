@@ -45,8 +45,17 @@
       raster.numeric// (keyword (str pfx ".div"))   ; f64/f32 only; integer / is rare
       nil)))
 
+(defn- cmp-op
+  "Comparison opcode for base (lt/gt/le/ge/eq/ne) at operand valtype vt.
+   Float compares are unsigned-name-free; integer compares are signed."
+  [base vt]
+  (case vt
+    :f64 (keyword (str "f64." base))
+    :f32 (keyword (str "f32." base))
+    (keyword (str "i32." (case base "lt" "lt_s" "gt" "gt_s" "le" "le_s" "ge" "ge_s" base)))))
+
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val)
+(declare emit-val infer-vt)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -77,10 +86,14 @@
         (= h 'clojure.core/aget)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
-        (= h 'clojure.core/<)  (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i :i32.lt_s)))
-        (= h 'clojure.core/<=) (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i :i32.le_s)))
-        (= h 'clojure.core/>)  (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i :i32.gt_s)))
-        (= h 'clojure.core/>=) (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i :i32.ge_s)))
+        (#{'clojure.core/< 'clojure.core/<= 'clojure.core/> 'clojure.core/>=
+           'clojure.core/== 'clojure.core/= 'clojure.core/not=} h)
+        (let [v0 (infer-vt ctx (A 0))
+              vt (if (#{:f64 :f32} v0) v0 (infer-vt ctx (A 1)))  ; float if either operand is float
+              base (case h clojure.core/< "lt" clojure.core/<= "le"
+                          clojure.core/> "gt" clojure.core/>= "ge"
+                          clojure.core/not= "ne" "eq")]
+          (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i (cmp-op base vt)))))
         (= h 'clojure.core/inc)(-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.add)))
         (= h 'clojure.core/dec)(-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.sub)))
         (= h '.invk)
@@ -110,8 +123,11 @@
         :else :i32))
     :else :i32))
 
+(declare emit-dotimes)
+
 (defn- emit-effect
-  "Side-effecting statement that leaves nothing on the stack (e.g. aset)."
+  "Side-effecting statement that leaves nothing on the stack (aset / when / do /
+   dotimes)."
   [ctx node]
   (let [h (first node), A (vec (rest node))]
     (cond
@@ -119,6 +135,12 @@
       (let [[arr idx v] A elem (get-in ctx [:elems arr])]
         (-> (addr ctx arr idx) (into (emit-val ctx v)) (into (e/mem-store (:store elem) (:align elem) 0))))
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
+      (= h 'when)                                   ; (when cond body…) — void, no else
+      (-> (emit-val ctx (first A))
+          (into [(e/op :if) e/empty-block])
+          (into (vec (mapcat #(emit-effect ctx %) (rest A))))
+          (into [(e/op :end)]))
+      (= h 'dotimes) (emit-dotimes ctx node)
       :else (throw (ex-info (str "unhandled effect head " h) {:node node})))))
 
 (defn- emit-recur
@@ -182,12 +204,35 @@
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
 
+(defn- emit-dotimes
+  "(dotimes [i n] body…) → a void counted loop. Emits:
+     i = 0
+     block { loop { br_if 1 (i >= n) ; body-effects ; i++ ; br 0 } }
+   Labels from inside the loop body: loop=0, block=1."
+  [ctx node]
+  (let [[_ [isym ncnt] & body] node
+        idx  (alloc! ctx :i32)
+        ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})
+        loop-body (-> (e/local-get idx)
+                      (into (emit-val ctx' ncnt))
+                      (into (e/i :i32.ge_s))
+                      (into (e/br-if 1))                       ; exit block when i >= n
+                      (into (vec (mapcat #(emit-effect ctx' %) body)))
+                      (into (e/local-get idx)) (into (e/i32-const 1)) (into (e/i :i32.add))
+                      (into (e/local-set idx))
+                      (into (e/br 0)))]                        ; re-loop
+    (-> (e/i32-const 0) (into (e/local-set idx))
+        (into (e/block (e/loop* loop-body))))))
+
 (defn- emit-result
-  "Emit an expression in result (tail) position → [bytes ret-vt]. Handles let*
-   (allocating a local per binding), do (effects then tail), loop, and scalar
-   value expressions."
+  "Emit an expression in result (tail) position → [bytes ret-vt] (ret-vt = nil for
+   void). Handles let* (a local per binding), do (effects then tail), loop, dotimes
+   (void), when (void), and scalar value expressions."
   [ctx node]
   (cond
+    (and (seq? node) (= 'dotimes (first node))) [(emit-dotimes ctx node) nil]
+    (and (seq? node) (= 'when (first node)))    [(emit-effect ctx node) nil]
+
     (and (seq? node) (= 'let* (first node)))
     (let [[_ binds & body] node
           [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
@@ -220,13 +265,14 @@
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
         ctx {:env env0 :elems elems :base (count params) :locals (atom [])}
         [body-bytes ret-vt] (emit-result ctx ir)
+        result-types (if ret-vt [ret-vt] [])     ; nil ret-vt = void (array-mutating)
         locals @(:locals ctx)]
     {:name name
      :param-types param-vts
-     :result-types [ret-vt]
+     :result-types result-types
      :bytes (e/build-module
-             {:types [(e/functype param-vts [ret-vt])]
+             {:types [(e/functype param-vts result-types)]
               :funcs [{:name name :type-idx 0
-                       :param-types param-vts :result-types [ret-vt]
+                       :param-types param-vts :result-types result-types
                        :locals locals :body body-bytes}]
               :memory {:min mem-pages :max mem-pages :export "memory"}})}))

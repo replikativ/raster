@@ -32,6 +32,11 @@
                                                      (raster.arrays/aget y i))))
       acc)))
 
+(deftm relu-k! [x :- (Array double), out :- (Array double), n :- Long] :- nil
+  (dotimes [i n]
+    (when (clojure.core/> (raster.arrays/aget x i) 0.0)
+      (raster.arrays/aset out i (raster.arrays/aget x i)))))
+
 (deftm dot-f32-k [x :- (Array float), y :- (Array float), n :- Long] :- Float
   (loop [i 0 acc (float 0.0)]
     (if (clojure.core/< (long i) (long n))
@@ -92,6 +97,22 @@
             got (Double/longBitsToDouble (aget r 0))
             exp (reduce + (map #(* (double %) 2.0) (range n)))]
         (is (< (Math/abs (- got exp)) 1e-6) (str "dot=" got " exp=" exp))))))
+
+(deftest relu-dotimes-when-void-kernel
+  (testing "dotimes + when + void function + f64 comparison"
+    (let [m (pl/compile-wasm #'relu-k! :name "relu")
+          inst (instantiate (:bytes m))
+          mem (.memory inst)
+          n 1000]
+      (is (= [] (:result-types m)) "void kernel has no result")
+      (dotimes [i n] (.writeF64 mem (* 8 i) (- (double i) 500.0)) (.writeF64 mem (* 8 (+ n i)) 0.0))
+      (.apply (.export inst "relu") (long-array [0 (* 8 n) n]))
+      (let [bad (count (filter (fn [i]
+                                 (let [xi (- (double i) 500.0)
+                                       got (.readDouble mem (* 8 (+ n i)))]
+                                   (> (Math/abs (- got (max xi 0.0))) 1e-9)))
+                               (range n)))]
+        (is (zero? bad) (str bad " relu mismatches"))))))
 
 (deftest dot-f32-kernel
   (testing "f32 reduction: f32 element loads, f32 arith, f32 result"
