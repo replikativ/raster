@@ -1,0 +1,124 @@
+(ns asteroids.game
+  "Cross-platform Geometric Asteroids — the game logic, written once (.cljc) and
+   run on the JVM (deftm/bytecode kernels) and the browser (wasm kernels via the
+   generated asteroids.kernels cljs API). Pure, immutable: (update-game state
+   input dt) → state'. The platform shell (Canvas2D/Vulkan + input + loop) lives
+   per-platform and reads `render-data`.
+
+   The physics — integrating each shape's position+angle with toroidal wrap — is
+   `asteroids.kernels/move-shape` (a value-type `deftm`, compiled to wasm on cljs).
+   Everything else (split hierarchy, spawn, collision, scoring, ship, bullets) is
+   plain portable `defn` glue. A shape = {:sides n :kin Shape}; `sides` is the
+   polygon identity (glue), `kin` the kinematic value type that crosses to wasm."
+  (:require [asteroids.kernels :as k]))
+
+(def ^:const W 1024.0)
+(def ^:const H 768.0)
+(def ^:const TAU (* 2.0 #?(:clj Math/PI :cljs js/Math.PI)))
+
+;; --- portable host math (the only non-defn glue; tiny reader-conditional shim) -
+(defn- cos [x] (#?(:clj Math/cos :cljs js/Math.cos) x))
+(defn- sin [x] (#?(:clj Math/sin :cljs js/Math.sin) x))
+(defn- rnd ^double [] (rand))
+
+;; --- geometric decomposition hierarchy (mirrors the desktop shapes.clj) -------
+(def split-rule {8 {:kids [4 4]   :scale 0.70}
+                 6 {:kids [5 5 5] :scale 0.65}
+                 5 {:kids [4 3]   :scale 0.70}
+                 4 {:kids [3 3]   :scale 0.75}
+                 3 nil})
+(defn score [sides] (case sides 3 50 4 30 5 25 6 20 8 15 10))
+
+;; --- shapes -------------------------------------------------------------------
+(defn ->shape [sides x y vx vy size]
+  {:sides sides :kin (k/->Shape x y vx vy (rnd) (- (rnd) 0.5) size)})
+
+(defn spawn-shape [sides]
+  (let [a (* (rnd) TAU) sp (+ 25.0 (* (rnd) 45.0))]
+    (loop []
+      (let [x (* (rnd) W) y (* (rnd) H)]
+        (if (and (< (Math/abs (- x (/ W 2.0))) 250.0) (< (Math/abs (- y (/ H 2.0))) 200.0))
+          (recur)
+          (->shape sides x y (* sp (cos a)) (* sp (sin a)) 34.0))))))
+
+(defn spawn-wave [wave]
+  (vec (repeatedly (+ 4 wave) #(spawn-shape (nth [6 8 5 6 8] (int (* (rnd) 5)))))))
+
+(defn- split-shape [{:keys [sides kin]}]
+  (when-let [{:keys [kids scale]} (split-rule sides)]
+    (let [cz (* scale (:size kin)) n (count kids)]
+      (map-indexed
+       (fn [i ks]
+         (let [a (/ (* TAU i) n) sv (+ 20.0 (* (rnd) 40.0))]
+           (->shape ks (+ (:x kin) (* 8.0 (cos a))) (+ (:y kin) (* 8.0 (sin a)))
+                    (+ (:vx kin) (* sv (cos a))) (+ (:vy kin) (* sv (sin a))) cz)))
+       kids))))
+
+;; --- state --------------------------------------------------------------------
+(defn init-state []
+  {:ship {:x (/ W 2.0) :y (/ H 2.0) :vx 0.0 :vy 0.0 :angle (- (/ TAU 4.0))}
+   :asteroids (spawn-wave 1) :bullets [] :score 0 :lives 3 :wave 1 :over false :cooldown 0.0})
+
+(def ^:const SHIP-ACCEL 300.0)
+(def ^:const SHIP-TURN 4.0)
+(def ^:const BULLET-SPEED 500.0)
+
+(defn- step-ship [{:keys [x y vx vy angle] :as ship} input dt]
+  (let [angle (cond-> angle (:left input) (- (* SHIP-TURN dt)) (:right input) (+ (* SHIP-TURN dt)))
+        vx (if (:up input) (+ vx (* SHIP-ACCEL (cos angle) dt)) vx)
+        vy (if (:up input) (+ vy (* SHIP-ACCEL (sin angle) dt)) vy)
+        vx (* vx 0.99) vy (* vy 0.99)]
+    {:x (mod (+ x (* vx dt)) W) :y (mod (+ y (* vy dt)) H) :vx vx :vy vy :angle angle}))
+
+(defn- circle-hit? [ax ay bx by r] (let [dx (- ax bx) dy (- ay by)] (< (+ (* dx dx) (* dy dy)) (* r r))))
+
+(defn update-game
+  "Advance one frame. input = #{:left :right :up :fire} (a set or map of flags)."
+  [{:keys [ship asteroids bullets score lives wave over cooldown] :as state} input dt]
+  (if over
+    (if (:fire input) (assoc (init-state) :over false) state)
+    (let [w (double W) h (double H)
+          ;; physics: move every shape's kin via the wasm/bytecode kernel
+          asteroids (mapv (fn [a] (update a :kin #(k/move-shape % dt w h))) asteroids)
+          ship (step-ship ship input dt)
+          cooldown (max 0.0 (- cooldown dt))
+          ;; fire
+          [bullets cooldown] (if (and (:fire input) (<= cooldown 0.0))
+                               [(conj bullets {:x (+ (:x ship) (* 20.0 (cos (:angle ship))))
+                                               :y (+ (:y ship) (* 20.0 (sin (:angle ship))))
+                                               :vx (+ (:vx ship) (* BULLET-SPEED (cos (:angle ship))))
+                                               :vy (+ (:vy ship) (* BULLET-SPEED (sin (:angle ship)))) :ttl 1.5})
+                                0.15]
+                               [bullets cooldown])
+          ;; move + cull bullets
+          bullets (->> bullets
+                       (map (fn [b] (-> b (update :x + (* (:vx b) dt)) (update :y + (* (:vy b) dt))
+                                        (update :ttl - dt))))
+                       (filterv (fn [b] (and (pos? (:ttl b)) (<= 0 (:x b) w) (<= 0 (:y b) h)))))
+          ;; collisions: bullet vs shape → split
+          [asteroids bullets score]
+          (loop [as asteroids, out [], sc score, dead #{}]
+            (if (empty? as)
+              [out (vec (remove dead bullets)) sc]
+              (let [a (first as) kin (:kin a)
+                    hit (first (filter #(and (not (dead %)) (circle-hit? (:x %) (:y %) (:x kin) (:y kin) (:size kin))) bullets))]
+                (if hit
+                  (recur (rest as) (into out (split-shape a)) (+ sc (score (:sides a))) (conj dead hit))
+                  (recur (rest as) (conj out a) sc dead)))))
+          ;; ship vs shape → lose a life
+          ship-hit (some (fn [{:keys [kin]}] (circle-hit? (:x ship) (:y ship) (:x kin) (:y kin) (+ 12.0 (:size kin)))) asteroids)
+          lives (if ship-hit (dec lives) lives)
+          ship (if ship-hit (assoc ship :x (/ W 2.0) :y (/ H 2.0) :vx 0.0 :vy 0.0) ship)
+          cleared? (empty? asteroids)
+          wave (if cleared? (inc wave) wave)
+          asteroids (if cleared? (spawn-wave wave) asteroids)]
+      {:ship ship :asteroids asteroids :bullets bullets :score score
+       :lives lives :wave wave :cooldown cooldown :over (<= lives 0)})))
+
+(defn render-data
+  "Platform-agnostic draw list: {:ship {x y angle} :polys [{:x :y :angle :size :sides}] :bullets [{:x :y}] :hud …}."
+  [{:keys [ship asteroids bullets score lives wave over]}]
+  {:ship (select-keys ship [:x :y :angle])
+   :polys (mapv (fn [{:keys [sides kin]}] {:x (:x kin) :y (:y kin) :angle (:angle kin) :size (:size kin) :sides sides}) asteroids)
+   :bullets (mapv #(select-keys % [:x :y]) bullets)
+   :hud {:score score :lives lives :wave wave :over over}})
