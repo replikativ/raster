@@ -9,7 +9,10 @@
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      ;; Pure-JVM WebAssembly runtime — validates + executes the
+                      ;; emitted wasm in-process (Track A backend tests).
+                      com.dylibso.chicory/runtime {:mvn/version "1.5.1"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"

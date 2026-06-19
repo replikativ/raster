@@ -3,3 +3,6 @@ node_modules/
 public/js/
 .cpcache/
 *.log
+
+# generated wasm artifacts (regenerable via node/emit_kernels.mjs / the JVM emitter)
+public/*.wasm

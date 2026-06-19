@@ -7,7 +7,7 @@
 (deftm saxpy! [a :- Double, x :- (Array double), y :- (Array double), n :- Long] :- Long
   (loop [i 0]
     (if (clojure.core/< (long i) (long n))
-      (do (raster.arrays/aset! y (long i)
+      (do (raster.arrays/aset y (long i)
             (raster.numeric/+ (raster.numeric/* a (raster.arrays/aget x i))
                               (raster.arrays/aget y i)))
           (recur (clojure.core/inc (long i))))
