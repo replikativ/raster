@@ -29,6 +29,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
+            [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
@@ -922,6 +923,15 @@
            (let [s (if (map? s) s {:var s})]
              (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
          specs)))
+
+(defn compile-wgsl
+  "Compile a deftm var to a WGSL compute shader (Track C — WebGPU compute).
+   WebGPU has no f64, so the front-half runs at :float (f32) and the emitter
+   targets f32 storage buffers. Returns {:wgsl str :array-params :scalar-params
+   :n-sym :workgroup} — the host binds arrays as f32 storage buffers in order,
+   then a uniform struct (scalars + _n). v1: elementwise maps."
+  [f-var & {:keys [name]}]
+  (wgsl-emit/compile-kernel (wasm-kernel-spec f-var :float name false)))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)
