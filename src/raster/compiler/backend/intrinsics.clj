@@ -58,16 +58,16 @@
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}
    :max {:arity 2 :kind :fn :wasm (vt3 :f64.max :f32.max nil) :c {:fn "fmax" :glsl "max"} :wgsl {:fn "max"}}
-   ;; transcendentals — wasm has no opcode; sin/cos/tan/exp lower to an inline
-   ;; polynomial (:wasm :poly, see backend.wasm.transcendental). log/pow/fma need
-   ;; exponent-bit ops the encoder lacks → no :wasm facet (clear error). GPU has all.
+   ;; transcendentals — wasm has no opcode; all lower to an inline polynomial
+   ;; (:wasm :poly, see backend.wasm.transcendental): sin/cos/tan + exp via
+   ;; squaring, log via sqrt-reduction, pow=exp(y·log x), fma=a·b+c. No bit ops.
    :sin {:arity 1 :kind :fn :wasm :poly :c {:fn "sin"} :wgsl {:fn "sin"}}
    :cos {:arity 1 :kind :fn :wasm :poly :c {:fn "cos"} :wgsl {:fn "cos"}}
    :tan {:arity 1 :kind :fn :wasm :poly :c {:fn "tan"} :wgsl {:fn "tan"}}
    :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}}
-   :log {:arity 1 :kind :fn :c {:fn "log"} :wgsl {:fn "log"}}
-   :pow {:arity 2 :kind :fn :c {:fn "pow"} :wgsl {:fn "pow"}}
-   :fma {:arity 3 :kind :fn :c {:fn "fma"} :wgsl {:fn "fma"}}})
+   :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
+   :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
+   :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}})
 
 ;; ---------------------------------------------------------------------------
 ;; Normalization: any op form → canonical key

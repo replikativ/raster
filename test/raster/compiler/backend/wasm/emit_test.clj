@@ -239,20 +239,37 @@
 (deftm cos-k [x :- Double] :- Double (raster.math/cos x))
 (deftm tan-k [x :- Double] :- Double (raster.math/tan x))
 (deftm exp-k [x :- Double] :- Double (raster.math/exp x))
+(deftm log-k [x :- Double] :- Double (raster.math/log x))
+(deftm pow-k [x :- Double, y :- Double] :- Double (raster.math/pow x y))
+(deftm fma-k [x :- Double, y :- Double, z :- Double] :- Double (raster.math/fma x y z))
 
 (defn- call1 [inst nm x]
   (Double/longBitsToDouble (aget (.apply (.export inst nm) (long-array [(Double/doubleToRawLongBits x)])) 0)))
+(defn- calln [inst nm xs]
+  (Double/longBitsToDouble (aget (.apply (.export inst nm) (long-array (map #(Double/doubleToRawLongBits %) xs))) 0)))
 
 (deftest transcendentals-inline-polynomial
-  (testing "sin/cos/tan/exp emit valid wasm matching Math within poly accuracy"
+  (testing "sin/cos/tan/exp/log/pow/fma emit valid wasm matching Math (poly accuracy)"
     (let [si (instantiate (:bytes (pl/compile-wasm #'sin-k :name "sin")))
           ci (instantiate (:bytes (pl/compile-wasm #'cos-k :name "cos")))
           ti (instantiate (:bytes (pl/compile-wasm #'tan-k :name "tan")))
-          ei (instantiate (:bytes (pl/compile-wasm #'exp-k :name "exp")))]
+          ei (instantiate (:bytes (pl/compile-wasm #'exp-k :name "exp")))
+          li (instantiate (:bytes (pl/compile-wasm #'log-k :name "log")))
+          pi (instantiate (:bytes (pl/compile-wasm #'pow-k :name "pow")))
+          fi (instantiate (:bytes (pl/compile-wasm #'fma-k :name "fma")))]
       (doseq [x [0.0 0.5 1.0 2.0 3.0 -1.0 -2.5 5.0 10.0 -7.3]]
         (is (< (Math/abs (- (call1 si "sin" x) (Math/sin x))) 5e-5) (str "sin " x))
         (is (< (Math/abs (- (call1 ci "cos" x) (Math/cos x))) 5e-5) (str "cos " x))
         (is (< (Math/abs (/ (- (call1 ei "exp" x) (Math/exp x)) (Math/exp x))) 1e-9) (str "exp " x)))
       ;; tan away from its poles
       (doseq [x [0.0 0.5 1.0 -1.0 2.0 3.0 -2.5]]
-        (is (< (Math/abs (- (call1 ti "tan" x) (Math/tan x))) 1e-4) (str "tan " x))))))
+        (is (< (Math/abs (- (call1 ti "tan" x) (Math/tan x))) 1e-4) (str "tan " x)))
+      ;; log (x>0)
+      (doseq [x [0.001 0.5 1.0 2.0 2.718281828 10.0 100.0 1000.0]]
+        (is (< (Math/abs (- (call1 li "log" x) (Math/log x))) 1e-9) (str "log " x)))
+      ;; pow (x>0) and fma — multi-arg poly lowering
+      (doseq [[x y] [[2.0 10.0] [2.0 0.5] [10.0 3.0] [1.5 2.5] [3.0 -2.0] [100.0 0.25]]]
+        (is (< (Math/abs (/ (- (calln pi "pow" [x y]) (Math/pow x y)) (Math/pow x y))) 1e-9)
+            (str "pow " x " " y)))
+      (doseq [[x y z] [[2.0 3.0 1.0] [-1.5 4.0 0.5] [10.0 0.1 -2.0]]]
+        (is (< (Math/abs (- (calln fi "fma" [x y z]) (+ (* x y) z))) 1e-12) (str "fma " x y z))))))

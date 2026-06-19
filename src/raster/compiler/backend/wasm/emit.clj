@@ -167,15 +167,16 @@
              (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
       :infix (let [vt (or vt-hint (operand-vt))
                    opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
-               (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
+               ;; left-fold n-ary operands so (* a b c) can't silently drop c
+               (reduce (fn [acc a] (-> acc (into (emit-val ctx a)) (into (e/i opk))))
+                       (emit-val ctx (first args)) (rest args)))
       :fn (if (ix/wasm-poly? k)
             ;; transcendental → inline polynomial form, emitted via the normal path.
-            ;; f32: compute in f64 (promote arg) and demote the result.
-            (let [vt (or vt-hint (infer-vt ctx (first args)))
-                  arg (first args)]
+            ;; f32: compute in f64 (promote args) and demote the result.
+            (let [vt (or vt-hint (infer-vt ctx (first args)))]
               (if (= vt :f32)
-                (emit-val ctx (list 'float (tr/form k (list 'double arg))))
-                (emit-val ctx (tr/form k arg))))
+                (emit-val ctx (list 'float (tr/form k (map #(list 'double %) args))))
+                (emit-val ctx (tr/form k args))))
             (let [vt (or vt-hint (infer-vt ctx (first args)))
                   opk (or (ix/wasm-op k vt)
                           (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
