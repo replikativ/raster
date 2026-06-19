@@ -2368,7 +2368,21 @@
         cls       (or (try (Class/forName cls-short) (catch Exception _ nil))
                       (when-let [resolved (ns-resolve src-ns (symbol cls-short))]
                         (when (class? resolved) resolved))
-                      (throw (ex-info (str "Cannot resolve class: " cls-short) {:symbol head})))
+                      ;; Not a class. If the "class" part is actually a Clojure
+                      ;; namespace, the head is a qualified var reference that didn't
+                      ;; resolve (a typo, a missing require, or a name that doesn't
+                      ;; exist) — it reached here only because the dispatcher treats
+                      ;; any unresolved ns/name as a static call. Fail with an
+                      ;; actionable operator-level message, not "Cannot resolve class".
+                      (throw (ex-info
+                              (if (find-ns (symbol cls-short))
+                                (str "Unresolved operator `" head "`: namespace `" cls-short
+                                     "` has no var `" meth-name "`. It is not a deftm, "
+                                     "intrinsic, or Java static method — check the name "
+                                     "(e.g. `raster.arrays/aset`, not `aset!`) or add a require.")
+                                (str "Cannot resolve operator `" head "`: `" cls-short
+                                     "` is neither a class nor a loaded namespace."))
+                              {:symbol head :class cls-short :method meth-name})))
         candidates (filterv #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
                                   (= (.getParameterCount ^java.lang.reflect.Method %) (count args)))
                             (.getMethods cls))
