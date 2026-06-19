@@ -425,7 +425,7 @@
 
 (def aset-ops
   "Array write operations."
-  #{'aset 'clojure.core/aset 'raster.arrays/aset! 'raster.arrays/aset})
+  #{'aset 'clojure.core/aset 'raster.arrays/aset})
 
 (def alength-ops
   "Array length operations."
@@ -434,7 +434,7 @@
 (def array-mutating-base-names
   "Unqualified short names of array-mutating ops.
    Used by effects.clj to classify ns-publics (which have unqualified keys)."
-  #{'aset 'aset!})
+  #{'aset})
 
 (def void-ops
   "Operations that produce no value (void return type).

@@ -273,7 +273,7 @@ op-descriptor registry rather than separate per-concern registries.
 through the compiler (`deftm`/`ftm` bodies, AD templates, rrule grads-fns) must use
 `raster.numeric/+`, `raster.numeric/*`, etc. — never bare `+` or `clojure.core/+`. Bare
 Clojure arithmetic bypasses typed dispatch and is invisible to the walker. Similarly, use
-`raster.arrays/aget`, `raster.arrays/aset!`, `raster.arrays/alength` for array operations.
+`raster.arrays/aget`, `raster.arrays/aset`, `raster.arrays/alength` for array operations.
 The only exception is internal compiler emit code (e.g., `clojure.core/aset` in expanded
 loop bodies) which intentionally bypasses dispatch for direct JVM primitives.
 

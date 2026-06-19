@@ -27,7 +27,7 @@
                                 (println "WARNING: effects.clj failed to load" ns-sym "-" (.getMessage e)))
                               nil)))
                         '[raster.numeric raster.math]))
-          ;; Register raster.arrays: aget/alength → :pure, aset/aset! → :local
+          ;; Register raster.arrays: aget/alength → :pure, aset → :local
           array-entries
           (try
             (require 'raster.arrays)
