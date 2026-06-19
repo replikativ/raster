@@ -62,3 +62,21 @@
       (is (str/includes? wf "@group(1) @binding(0) var tex: texture_2d<f32>;"))
       (is (str/includes? wf "@group(1) @binding(1) var tex_s: sampler;"))
       (is (str/includes? wf "textureSample(tex, tex_s, vUv)")))))
+
+(def arr-spec
+  '{:uniform        {:name "U" :fields [[:mvp :mat4]]}
+    :attributes     [[inPos vec3 0] [inUv vec2 1] [inLayer float 2]]
+    :varyings       [[vUv vec2 0] [vLayer float 1]]
+    :texture-arrays [[atlas 0]]
+    :vertex         [(set-position (* mvp (vec4 inPos 1.0))) (out vUv inUv) (out vLayer inLayer)]
+    :fragment       [(color (sample-layer atlas vUv vLayer))]})
+
+(deftest texture-array-shader-emit
+  (testing "R5a: sampler2DArray / texture_2d_array + sample-layer, GLSL and WGSL"
+    (let [{_ :vert gf :frag} (s/->glsl arr-spec)]
+      (is (str/includes? gf "uniform sampler2DArray atlas;"))
+      (is (str/includes? gf "texture(atlas, vec3(vUv, vLayer))")))
+    (let [{_ :vert wf :frag} (s/->wgsl arr-spec)]
+      (is (str/includes? wf "var atlas: texture_2d_array<f32>;"))
+      (is (str/includes? wf "var atlas_s: sampler;"))
+      (is (str/includes? wf "textureSample(atlas, atlas_s, vUv, i32(vLayer))")))))

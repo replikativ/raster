@@ -96,3 +96,40 @@
   (r/bind-texture! frame pipeline tex)
   (r/bind-mesh! frame mesh)
   (r/draw-indexed! frame (:index-count mesh) 0))
+
+;; --- R5a: texture-array variant (block-atlas style) ---------------------------
+;; Same cube, but each vertex carries a layer index and the fragment samples a
+;; 2-layer array (layer 0 = checker, layer 1 = stripes); faces alternate layer.
+(def ^:const STRIDE-ARR 24)        ; pos3 (12) + uv2 (8) + layer (4)
+
+(def cube-verts-arr
+  (vec (mapcat (fn [fi [c rt up]]
+                 (let [ly (double (mod fi 2))
+                       bl (v3 - (v3 - c rt) up) br (v3 - (v3 + c rt) up)
+                       tr (v3 + (v3 + c rt) up) tl (v3 + (v3 - c rt) up)]
+                   (concat bl [0.0 0.0 ly] br [1.0 0.0 ly] tr [1.0 1.0 ly] tl [0.0 1.0 ly])))
+               (range 6) faces)))
+
+(defn atlas-pixels
+  "Flat RGBA8, layer-major: layer 0 grayscale checker, layer 1 orange stripes."
+  [w h]
+  (vec (concat
+        (mapcat (fn [i] (let [x (rem i w) y (quot i w)
+                              on (zero? (mod (+ (quot x 8) (quot y 8)) 2)) v (if on 230 60)]
+                          [v v v 255])) (range (* w h)))
+        (mapcat (fn [i] (let [x (rem i w) on (zero? (mod (quot x 8) 2))]
+                          (if on [220 90 30 255] [40 40 50 255]))) (range (* w h))))))
+
+(def array-shader
+  '{:uniform        {:name "U" :fields [[:mvp :mat4]]}
+    :attributes     [[inPos vec3 0] [inUv vec2 1] [inLayer float 2]]
+    :varyings       [[vUv vec2 0] [vLayer float 1]]
+    :texture-arrays [[atlas 0]]
+    :vertex         [(set-position (* mvp (vec4 inPos 1.0))) (out vUv inUv) (out vLayer inLayer)]
+    :fragment       [(color (sample-layer atlas vUv vLayer))]})
+
+(def array-pipeline-spec
+  {:shader array-shader :topology :triangles :depth? true :cull :none
+   :vertex {:stride STRIDE-ARR :attributes [{:location 0 :format :float3 :offset 0}
+                                            {:location 1 :format :float2 :offset 12}
+                                            {:location 2 :format :float :offset 20}]}})

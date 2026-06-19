@@ -78,12 +78,17 @@
 
 ;; --- texture declarations ----------------------------------------------------
 (defn- textures [spec] (:textures spec))
-(defn- texture-names [spec] (set (map (comp name first) (textures spec))))
+(defn- texture-arrays [spec] (:texture-arrays spec))
 (defn- stage-textures
-  "The [name binding] texture entries referenced in a stage's statements."
+  "The [name binding] 2D-texture entries referenced in a stage's statements."
   [stage-stmts spec]
   (let [used (all-syms stage-stmts)]
     (filter (fn [[n _]] (used (name n))) (textures spec))))
+(defn- stage-texture-arrays
+  "The [name binding] 2D-array-texture entries referenced in a stage."
+  [stage-stmts spec]
+  (let [used (all-syms stage-stmts)]
+    (filter (fn [[n _]] (used (name n))) (texture-arrays spec))))
 
 ;; --- expression emitter (dialect-parameterized) ------------------------------
 (defn- emit-expr [e {:keys [vec-suffix kind] :as dial} ufields]
@@ -104,6 +109,13 @@
                    (case kind
                      :glsl (str "texture(" tex ", " uv ")")
                      :wgsl (str "textureSample(" tex ", " tex "_s, " uv ")")))
+        ;; (sample-layer atlas uv layer) → 2D-array sample at integer layer
+        "sample-layer" (let [tex (name (first args))
+                             uv (emit-expr (second args) dial ufields)
+                             ly (emit-expr (nth args 2) dial ufields)]
+                         (case kind
+                           :glsl (str "texture(" tex ", vec3(" uv ", " ly "))")
+                           :wgsl (str "textureSample(" tex ", " tex "_s, " uv ", i32(" ly "))")))
         (throw (ex-info "unknown shader op" {:op op}))))
     :else (throw (ex-info "bad shader expr" {:expr e}))))
 
@@ -111,8 +123,10 @@
 (def ^:private glsl-dial {:vec-suffix "" :kind :glsl})
 
 (defn- glsl-tex-decls [stage-stmts spec]
-  (str/join "" (map (fn [[n b]] (str "layout(set=0, binding=" b ") uniform sampler2D " (name n) ";\n"))
-                    (stage-textures stage-stmts spec))))
+  (str (str/join "" (map (fn [[n b]] (str "layout(set=0, binding=" b ") uniform sampler2D " (name n) ";\n"))
+                         (stage-textures stage-stmts spec)))
+       (str/join "" (map (fn [[n b]] (str "layout(set=0, binding=" b ") uniform sampler2DArray " (name n) ";\n"))
+                         (stage-texture-arrays stage-stmts spec)))))
 
 (defn- glsl-uniform-decl [spec]
   (when (seq (uniform-fields spec))
@@ -164,10 +178,14 @@
 (def ^:private wgsl-dial {:vec-suffix "<f32>" :kind :wgsl})
 
 (defn- wgsl-tex-decls [stage-stmts spec]
-  (str/join "" (map (fn [[n b]]
-                      (str "@group(1) @binding(" (* 2 b) ") var " (name n) ": texture_2d<f32>;\n"
-                           "@group(1) @binding(" (inc (* 2 b)) ") var " (name n) "_s: sampler;\n"))
-                    (stage-textures stage-stmts spec))))
+  (str (str/join "" (map (fn [[n b]]
+                           (str "@group(1) @binding(" (* 2 b) ") var " (name n) ": texture_2d<f32>;\n"
+                                "@group(1) @binding(" (inc (* 2 b)) ") var " (name n) "_s: sampler;\n"))
+                         (stage-textures stage-stmts spec)))
+       (str/join "" (map (fn [[n b]]
+                           (str "@group(1) @binding(" (* 2 b) ") var " (name n) ": texture_2d_array<f32>;\n"
+                                "@group(1) @binding(" (inc (* 2 b)) ") var " (name n) "_s: sampler;\n"))
+                         (stage-texture-arrays stage-stmts spec)))))
 
 (defn- wgsl-uniform-decl [spec]
   (when (seq (uniform-fields spec))

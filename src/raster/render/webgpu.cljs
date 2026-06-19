@@ -17,9 +17,10 @@
             [raster.render.shader :as shader]
             [applied-science.js-interop :as j]))
 
-(declare run-loop! make-pipeline* make-mesh* upload-mesh* make-static-mesh* make-texture* ensure-depth!)
+(declare run-loop! make-pipeline* make-mesh* upload-mesh* make-static-mesh*
+         make-texture* make-texture-array* ensure-depth!)
 
-(def ^:private vfmt {:float2 "float32x2" :float3 "float32x3" :float4 "float32x4"})
+(def ^:private vfmt {:float "float32" :float2 "float32x2" :float3 "float32x3" :float4 "float32x4"})
 (def ^:private vtopo {:lines "line-list" :triangles "triangle-list"})
 (def ^:private cullmode {:back "back" :front "front" :none "none"})
 
@@ -44,7 +45,7 @@
                  (reset! (:bg texture)
                          (j/call device :createBindGroup
                                  #js {:layout (j/call (:pipeline pipeline) :getBindGroupLayout 1)
-                                      :entries #js [#js {:binding 0 :resource (j/call (:texture texture) :createView)}
+                                      :entries #js [#js {:binding 0 :resource (:view texture)}
                                                     #js {:binding 1 :resource (:sampler texture)}]})))]
       (j/call pass :setBindGroup 1 bg)))
   (-draw! [_ vertex-count first-vertex]
@@ -60,6 +61,7 @@
   (-upload-mesh! [_ mesh verts] (upload-mesh* device mesh verts))
   (-make-static-mesh [_ verts indices stride] (make-static-mesh* device verts indices stride))
   (-make-texture [_ opts] (make-texture* device opts))
+  (-make-texture-array [_ opts] (make-texture-array* device opts))
   (-run! [this opts] (run-loop! this opts)))
 
 (defn- ensure-depth!
@@ -139,6 +141,24 @@
             #js {:bytesPerRow (* width 4) :rowsPerImage height}
             #js [width height 1])
     {:texture tex
+     :view (j/call tex :createView)
+     :sampler (j/call device :createSampler #js {:magFilter f :minFilter f})
+     :bg (atom nil)}))
+
+(defn- make-texture-array* [device {:keys [width height layers pixels filter]}]
+  (let [data (js/Uint8Array. (clj->js (vec pixels)))
+        tex (j/call device :createTexture
+                    #js {:size #js [width height layers] :format "rgba8unorm"
+                         :usage (bit-or (j/get js/GPUTextureUsage :TEXTURE_BINDING)
+                                        (j/get js/GPUTextureUsage :COPY_DST))})
+        f (name (or filter :nearest))]
+    ;; layer-major data → one writeTexture covering all array layers
+    (j/call (j/get device :queue) :writeTexture
+            #js {:texture tex} data
+            #js {:bytesPerRow (* width 4) :rowsPerImage height}
+            #js [width height layers])
+    {:texture tex
+     :view (j/call tex :createView #js {:dimension "2d-array"})
      :sampler (j/call device :createSampler #js {:magFilter f :minFilter f})
      :bg (atom nil)}))
 

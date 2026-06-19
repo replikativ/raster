@@ -15,4 +15,9 @@
   :ccube {:target     :browser
           :output-dir "public/cube-js"
           :asset-path "/cube-js"
-          :modules    {:main {:init-fn cube.web-gpu/init}}}}}
+          :modules    {:main {:init-fn cube.web-gpu/init}}}
+  ;; R5a validation: texture-array (block-atlas) cube
+  :ccubearray {:target     :browser
+               :output-dir "public/cubearray-js"
+               :asset-path "/cubearray-js"
+               :modules    {:main {:init-fn cube.web-array/init}}}}}

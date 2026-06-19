@@ -22,7 +22,7 @@
   (:refer-clojure :exclude [run!]))
 
 ;; --- vocabulary ---------------------------------------------------------------
-(def format-floats {:float2 2 :float3 3 :float4 4})
+(def format-floats {:float 1 :float2 2 :float3 3 :float4 4})
 (defn format-bytes [fmt] (* 4 (get format-floats fmt)))
 
 ;; --- protocols ----------------------------------------------------------------
@@ -47,6 +47,10 @@
   (-make-texture [this opts]
     "A 2D texture + sampler. opts = {:width :height :pixels <flat RGBA8 byte/int
      seq, row-major> :filter :nearest|:linear}. Returns an opaque texture handle.")
+  (-make-texture-array [this opts]
+    "A 2D-array texture + sampler (e.g. a block atlas). opts = {:width :height
+     :layers n :pixels <flat RGBA8 seq, layer-major (layer0 rows, layer1 rows, …)>
+     :filter}. Bound like a texture; sampled via the shader's (sample-layer …).")
   (-run! [this opts]
     "Drive the game loop. opts = {:init-state s :update (fn [state input dt] s')
      :render (fn [state frame]) :clear-color [r g b a] :title str}. `input` is a
@@ -69,6 +73,7 @@
 (defn upload-mesh!     [r mesh verts]        (-upload-mesh! r mesh verts))
 (defn make-static-mesh [r verts indices stride] (-make-static-mesh r verts indices stride))
 (defn make-texture     [r opts]              (-make-texture r opts))
+(defn make-texture-array [r opts]            (-make-texture-array r opts))
 (defn run!             [r opts]              (-run! r opts))
 
 (defn bind-pipeline! [f p]            (-bind-pipeline! f p))

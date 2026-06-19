@@ -25,6 +25,7 @@
 
 (defn- vk-format [fmt]
   (case fmt
+    :float  VK13/VK_FORMAT_R32_SFLOAT
     :float2 VK13/VK_FORMAT_R32G32_SFLOAT
     :float3 VK13/VK_FORMAT_R32G32B32_SFLOAT
     :float4 VK13/VK_FORMAT_R32G32B32A32_SFLOAT))
@@ -99,7 +100,7 @@
           ubytes (shader/uniform-bytes shader)
           push-flags (vk-stage-flags stages)
           push-c (when (and (pos? ubytes) (seq stages)) {:size ubytes :stages push-flags})
-          textured? (seq (:textures shader))
+          textured? (or (seq (:textures shader)) (seq (:texture-arrays shader)))
           lay (when textured? (:layout (texture/create-textured-pipeline-layout (:device ctx) push-c)))
           info (pipeline/create-graphics-pipeline
                 (:device ctx)
@@ -139,6 +140,17 @@
                                           :filter-mode (or filter :linear))
           ds (texture/allocate-texture-descriptor-set (:device ctx) pool layout tex-rec)]
       {:texture tex-rec :desc-set ds}))
+  (-make-texture-array [_ {:keys [width height layers pixels filter]}]
+    (let [{:keys [layout pool]} (ensure-tex! ctx tex)
+          pv  (vec pixels)
+          per (* (long width) (long height) 4)
+          imgs (mapv (fn [li] {:name (str li)
+                               :pixels (byte-array (map unchecked-byte (subvec pv (* li per) (* (inc li) per))))
+                               :width width :height height})
+                     (range layers))
+          ta (texture/create-texture-array ctx imgs :filter-mode (or filter :nearest))
+          ds (texture/allocate-texture-array-descriptor-set (:device ctx) pool layout ta)]
+      {:texture-array ta :desc-set ds}))
   (-run! [_ {:keys [init-state update render clear-color title]
              :or {clear-color [0.0 0.0 0.0 1.0] title "Raster"}}]
     (let [fsync (frame/create-frame-sync ctx)
