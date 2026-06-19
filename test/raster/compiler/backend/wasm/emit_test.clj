@@ -32,6 +32,14 @@
                                                      (raster.arrays/aget y i))))
       acc)))
 
+(deftm dot-f32-k [x :- (Array float), y :- (Array float), n :- Long] :- Float
+  (loop [i 0 acc (float 0.0)]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
+                                                     (raster.arrays/aget y i))))
+      acc)))
+
 (deftm scaled-sum-k [x :- (Array double), n :- Long, s :- Double] :- Double
   (let [half (raster.numeric/* s 0.5)]
     (loop [i 0 acc 0.0]
@@ -84,6 +92,19 @@
             got (Double/longBitsToDouble (aget r 0))
             exp (reduce + (map #(* (double %) 2.0) (range n)))]
         (is (< (Math/abs (- got exp)) 1e-6) (str "dot=" got " exp=" exp))))))
+
+(deftest dot-f32-kernel
+  (testing "f32 reduction: f32 element loads, f32 arith, f32 result"
+    (let [m (pl/compile-wasm #'dot-f32-k :name "dotf" :dtype :float)
+          inst (instantiate (:bytes m))
+          mem (.memory inst)
+          n 1000]
+      (is (= [:f32] (:result-types m)))
+      (dotimes [i n] (.writeF32 mem (* 4 i) (float i)) (.writeF32 mem (* 4 (+ n i)) (float 2.0)))
+      (let [r (.apply (.export inst "dotf") (long-array [0 (* 4 n) n]))
+            got (Float/intBitsToFloat (unchecked-int (aget r 0)))
+            exp (reduce + (map #(* (float %) 2.0) (range n)))]
+        (is (< (Math/abs (- got exp)) 1.0) (str "dot-f32=" got " exp=" exp))))))
 
 (deftest scaled-sum-let-binding-kernel
   (testing "let* binding (local alloc) wrapping a loop"

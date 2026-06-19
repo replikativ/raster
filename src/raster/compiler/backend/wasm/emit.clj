@@ -37,12 +37,12 @@
     :else :i32))
 
 (defn- arith-op [sem vt]
-  (let [f? (#{:f64 :f32} vt)]
+  (let [pfx (case vt :f64 "f64" :f32 "f32" "i32")]
     (case sem
-      raster.numeric/+ (if f? :f64.add :i32.add)
-      raster.numeric/- (if f? :f64.sub :i32.sub)
-      raster.numeric/* (if f? :f64.mul :i32.mul)
-      raster.numeric// :f64.div
+      raster.numeric/+ (keyword (str pfx ".add"))
+      raster.numeric/- (keyword (str pfx ".sub"))
+      raster.numeric/* (keyword (str pfx ".mul"))
+      raster.numeric// (keyword (str pfx ".div"))   ; f64/f32 only; integer / is rare
       nil)))
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
@@ -69,7 +69,11 @@
     (seq? node)
     (let [h (first node), A (vec (rest node))]
       (cond
-        (#{'long 'int 'double} h) (emit-val ctx (first A)) ; index casts: identity in v1
+        (#{'long 'int 'double} h) (emit-val ctx (first A)) ; index/f64 casts: identity
+        (= h 'float)                                        ; f32 cast / literal
+        (let [x (first A)]
+          (cond (number? x) (e/f32-const x)                 ; (float 0.0) → f32 literal
+                :else (into (emit-val ctx x) (e/i :f32.demote_f64)))) ; (float <f64>) → demote
         (= h 'clojure.core/aget)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
@@ -99,7 +103,9 @@
     (case (:raster.type/tag (meta node))
       double :f64, float :f32, long :i32, int :i32
       (cond
-        (#{'long 'int 'double} (first node)) (infer-vt ctx (second node))
+        (= 'float (first node))  :f32
+        (= 'double (first node)) :f64
+        (#{'long 'int} (first node)) (infer-vt ctx (second node))
         (= 'clojure.core/aget (first node))  (get-in ctx [:elems (second node) :vt] :f64)
         :else :i32))
     :else :i32))
@@ -156,7 +162,7 @@
         ;; allocate loop-var locals; inits emitted with the OUTER env (loop vars
         ;; not yet in scope for their own inits)
         loop-vars (mapv (fn [[sym init]]
-                          (let [vt (if (float? init) :f64 :i32)]
+                          (let [vt (infer-vt ctx init)]  ; 0→i32, 0.0→f64, (float 0.0)→f32
                             {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
                         pairs)
         inits (vec (mapcat (fn [{:keys [idx init]}]
