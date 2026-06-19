@@ -5,16 +5,25 @@ The **same** game runs on the JVM and in the browser. The game logic lives in
 — integrating each shape's position + angle with toroidal wrap — is a raster
 `deftm` value-type kernel in [`../kernels.clj`](../kernels.clj):
 
-- **JVM**: `deftm` → typed dispatch → bytecode. Shell: [`../jvm.clj`](../jvm.clj)
-  (Swing/Java2D). Run it with
-  `clojure -Sdeps '{:paths ["src" "examples"]}' -M -m asteroids.jvm` from the repo root.
-- **Browser**: `deftm` → **WebAssembly** (via `raster.compiler.cljs-emit`), driven
-  by a Canvas2D shell ([`src/asteroids/web.cljs`](src/asteroids/web.cljs)). The
+- **JVM**: `deftm` → typed dispatch → bytecode.
+  - Vulkan shell [`../vk_main.clj`](../vk_main.clj) — renders through the portable
+    renderer (`raster.render` + the Vulkan backend). Run from the repo root:
+    `clojure -M:vulkan -m asteroids.vk-main`.
+  - Swing/Java2D shell [`../jvm.clj`](../jvm.clj) (no GPU deps):
+    `clojure -Sdeps '{:paths ["src" "examples"]}' -M -m asteroids.jvm`.
+- **Browser**: `deftm` → **WebAssembly** (via `raster.compiler.cljs-emit`), rendered
+  through **WebGPU** ([`src/asteroids/web_gpu.cljs`](src/asteroids/web_gpu.cljs)). The
   generated `asteroids.kernels` cljs namespace marshals the `Shape` value type over
-  the wasm boundary; `raster.wasm` (shipped in the project `src/`) is the loader.
+  the wasm boundary; `raster.wasm` (in the project `src/`) is the loader. A Canvas2D
+  shell ([`src/asteroids/web.cljs`](src/asteroids/web.cljs)) remains as a no-WebGPU
+  fallback (point the `:casteroids` build's `:init-fn` at `asteroids.web/init`).
 
-`asteroids.game` requires `asteroids.kernels` and gets the right implementation per
-platform — the `.clj` `deftm` on the JVM, the generated `.cljs` in the browser.
+The browser and the JVM Vulkan shell render through the **same** scene code
+([`../render.cljc`](../render.cljc), `asteroids.render`) against the **same**
+portable `raster.render` protocol — only the backend differs (`raster.render.webgpu`
+vs `raster.render.vulkan`). `asteroids.game` requires `asteroids.kernels` and gets
+the right physics per platform — the `.clj` `deftm` on the JVM, the generated `.cljs`
+(wasm) in the browser.
 
 ## Play in the browser
 

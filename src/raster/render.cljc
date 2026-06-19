@@ -19,7 +19,7 @@
        to NDC using the `viewport` uniform. (Y handedness differs between Vulkan
        and WebGPU — handled in each backend's shader source, not here.)
      - a dynamic mesh is a reusable GPU vertex buffer rewritten each frame."
-  #?(:clj (:refer-clojure :exclude [])))
+  (:refer-clojure :exclude [run!]))
 
 ;; --- vocabulary ---------------------------------------------------------------
 (def format-floats {:float2 2 :float3 3 :float4 4})
