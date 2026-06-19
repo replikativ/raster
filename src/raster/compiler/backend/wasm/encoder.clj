@@ -73,9 +73,20 @@
    :f64.min 0xa4 :f64.max 0xa5 :f64.sqrt 0x9f :f64.abs 0x99 :f64.neg 0x9a
    ;; conversions
    :i32.wrap_i64 0xa7 :i64.extend_i32_s 0xac
+   :f32.convert_i32_s 0xb2
    :f64.convert_i32_s 0xb7 :f64.convert_i64_s 0xb9
    :i32.trunc_f64_s 0xaa :i64.trunc_f64_s 0xb0
    :f32.demote_f64 0xb6 :f64.promote_f32 0xbb})
+
+(def simd-op
+  "SIMD (v128) sub-opcodes — emitted as 0xfd ++ uleb(subop). f64x2 = 2-wide f64,
+   f32x4 = 4-wide f32 (the lane widths the loop vectorizer targets)."
+  {:v128.load 0x00 :v128.store 0x0b
+   :f32x4.splat 0x13 :f64x2.splat 0x14
+   :f32x4.add 0xe4 :f32x4.sub 0xe5 :f32x4.mul 0xe6 :f32x4.div 0xe7
+   :f32x4.min 0xe8 :f32x4.max 0xe9
+   :f64x2.add 0xf0 :f64x2.sub 0xf1 :f64x2.mul 0xf2 :f64x2.div 0xf3
+   :f64x2.min 0xf4 :f64x2.max 0xf5})
 
 ;; ---------------------------------------------------------------------------
 ;; instruction helpers — each returns a byte vector
@@ -94,6 +105,10 @@
 ;; memarg = align (uleb) ++ offset (uleb)
 (defn mem-load  [op-key align offset] (into (into [(op op-key)] (uleb align)) (uleb offset)))
 (defn mem-store [op-key align offset] (into (into [(op op-key)] (uleb align)) (uleb offset)))
+;; SIMD: 0xfd prefix ++ uleb(subop) [++ memarg for load/store]
+(defn v [simd-key] (into [0xfd] (uleb (simd-op simd-key))))
+(defn v128-load  [align offset] (into (into [0xfd] (uleb (simd-op :v128.load)))  (into (uleb align) (uleb offset))))
+(defn v128-store [align offset] (into (into [0xfd] (uleb (simd-op :v128.store))) (into (uleb align) (uleb offset))))
 (defn block  [body] (into (into [(op :block) empty-block] body) [(op :end)]))
 (defn loop*  [body] (into (into [(op :loop)  empty-block] body) [(op :end)]))
 ;; block whose result is a single value of valtype vt-kw

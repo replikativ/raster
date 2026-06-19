@@ -16,8 +16,8 @@
   (loop [i 0]
     (if (clojure.core/< (long i) (long n))
       (do (raster.arrays/aset y (long i)
-            (raster.numeric/+ (raster.numeric/* a (raster.arrays/aget x i))
-                              (raster.arrays/aget y i)))
+                              (raster.numeric/+ (raster.numeric/* a (raster.arrays/aget x i))
+                                                (raster.arrays/aget y i)))
           (recur (clojure.core/inc (long i))))
       n)))
 
@@ -159,3 +159,51 @@
             got (Double/longBitsToDouble (aget r 0))
             exp (* 2.0 (reduce + (range n)))]  ; half=2.0 → 2*Σi
         (is (< (Math/abs (- got exp)) 1e-6) (str "scaled-sum=" got " exp=" exp))))))
+
+;; ── SIMD128 (opt-in) ──────────────────────────────────────────────────────
+;; Chicory cannot EXECUTE v128, so here we assert the SIMD module is structurally
+;; valid (Parser/parse validates — malformed/ill-typed bytes throw) and actually
+;; vectorized (contains the 0xfd SIMD prefix), and that the scalar build of the
+;; same kernel still runs correctly. Execution of the v128 path is validated on
+;; node/V8 (cljs-sandbox; f64 vadd + saxpy across sizes incl. odd remainders).
+(deftm vadd-simd! [a :- (Array double), b :- (Array double), out :- (Array double), n :- Long] :- nil
+  (dotimes [i n]
+    (raster.arrays/aset out i (raster.numeric/+ (raster.arrays/aget a i) (raster.arrays/aget b i)))))
+
+(defn- has-v128? [m] (boolean (some #(= (bit-and (long %) 0xff) 0xfd) (seq (:bytes m)))))
+
+(deftest simd-elementwise-f64-vectorizes-and-validates
+  (testing "f64 elementwise map: SIMD build is valid v128, scalar build runs"
+    (let [simd   (pl/compile-wasm #'vadd-simd! :name "vadd" :wasm-simd? true)
+          scalar (pl/compile-wasm #'vadd-simd! :name "vadd")]
+      ;; SIMD module is structurally valid wasm and actually used v128
+      (is (some? (Parser/parse (:bytes simd))))
+      (is (has-v128? simd) "vectorizer emitted v128 instructions")
+      (is (not (has-v128? scalar)) "scalar build has no v128")
+      ;; functional reference via the scalar build (Chicory can run it)
+      (let [inst (instantiate (:bytes scalar)) mem (.memory inst) n 100]
+        (dotimes [i n] (.writeF64 mem (* 8 i) (double i)) (.writeF64 mem (* 8 (+ n i)) (double (* 10 i))))
+        (.apply (.export inst "vadd") (long-array [0 (* 8 n) (* 8 (* 2 n)) n]))
+        (let [bad (count (filter #(not= (.readDouble mem (* 8 (+ (* 2 n) %))) (double (* 11 %))) (range n)))]
+          (is (zero? bad) (str bad " vadd mismatches")))))))
+
+(deftm vaddf-simd! [a :- (Array float), b :- (Array float), out :- (Array float), n :- Long] :- nil
+  (dotimes [i n]
+    (raster.arrays/aset out i (raster.numeric/+ (raster.arrays/aget a i) (raster.arrays/aget b i)))))
+
+(deftest f32-elementwise-scalar-runs
+  (testing "f32 elementwise map (scalar): f32.load/f32.add/f32.store, no f64 demote"
+    ;; regression for type-aware (float …) casts — previously emitted f32.demote_f64
+    ;; over an already-f32 value → validation failure.
+    (let [m (pl/compile-wasm #'vaddf-simd! :name "vaddf" :dtype :float)
+          inst (instantiate (:bytes m)) mem (.memory inst) n 100]
+      (dotimes [i n] (.writeF32 mem (* 4 i) (float i)) (.writeF32 mem (* 4 (+ n i)) (float (* 10 i))))
+      (.apply (.export inst "vaddf") (long-array [0 (* 4 n) (* 4 (* 2 n)) n]))
+      (let [bad (count (filter #(not= (.readFloat mem (* 4 (+ (* 2 n) %))) (float (* 11 %))) (range n)))]
+        (is (zero? bad) (str bad " f32 vadd mismatches"))))))
+
+(deftest f32-elementwise-simd-vectorizes-and-validates
+  (testing "f32 elementwise map: SIMD build is valid v128 (f32x4), 4-wide"
+    (let [simd (pl/compile-wasm #'vaddf-simd! :name "vaddf" :dtype :float :wasm-simd? true)]
+      (is (some? (Parser/parse (:bytes simd))))
+      (is (has-v128? simd) "f32 vectorizer emitted v128 instructions"))))

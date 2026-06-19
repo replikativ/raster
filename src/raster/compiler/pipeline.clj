@@ -881,7 +881,7 @@
    v1: scalar, single-function, param-only kernels (no hoisted intermediate
    buffers); `:simd? false` is forced (the JVM Vector-API SIMD lowering is
    JVM-only — a wasm-SIMD128 path is a later increment)."
-  [f-var & {:keys [dtype name] :or {dtype :double}}]
+  [f-var & {:keys [dtype name wasm-simd?] :or {dtype :double}}]
   (let [resolved      (or (resolve-deftm-var f-var dtype) f-var)
         walked-body   (get-walked-body f-var dtype)
         params        (get-params f-var dtype)
@@ -909,7 +909,8 @@
     (wasm-emit/compile-kernel
      {:name (or name (str (:name (meta resolved))))
       :params lowered-params
-      :ir lowered-body})))
+      :ir lowered-body
+      :simd? wasm-simd?})))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)

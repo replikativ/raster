@@ -89,11 +89,23 @@
     (seq? node)
     (let [h (first node), A (vec (rest node))]
       (cond
-        (#{'long 'int 'double} h) (emit-val ctx (first A)) ; index/f64 casts: identity
-        (= h 'float)                                        ; f32 cast / literal
+        (#{'long 'int} h) (emit-val ctx (first A))          ; integer index casts: identity (i32)
+        (= h 'double)                                       ; f64 cast / literal — type-aware
         (let [x (first A)]
-          (cond (number? x) (e/f32-const x)                 ; (float 0.0) → f32 literal
-                :else (into (emit-val ctx x) (e/i :f32.demote_f64)))) ; (float <f64>) → demote
+          (if (number? x)
+            (e/f64-const (double x))
+            (let [xv (infer-vt ctx x)]
+              (cond-> (emit-val ctx x)
+                (= xv :f32) (into (e/i :f64.promote_f32))     ; (double <f32>) → promote
+                (= xv :i32) (into (e/i :f64.convert_i32_s)))))) ; (double <i32>) → convert
+        (= h 'float)                                        ; f32 cast / literal — type-aware
+        (let [x (first A)]
+          (if (number? x)
+            (e/f32-const x)                                  ; (float 0.0) → f32 literal
+            (let [xv (infer-vt ctx x)]
+              (cond-> (emit-val ctx x)
+                (= xv :f64) (into (e/i :f32.demote_f64))      ; (float <f64>) → demote
+                (= xv :i32) (into (e/i :f32.convert_i32_s)))))) ; (float <i32>) → convert
         (= h 'clojure.core/aget)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
@@ -159,7 +171,7 @@
         :else :i32))
     :else :i32))
 
-(declare emit-dotimes)
+(declare emit-dotimes emit-dotimes-scalar)
 
 (defn- emit-effect
   "Side-effecting statement that leaves nothing on the stack (aset / when / do /
@@ -221,9 +233,18 @@
     (swap! a conj vt)
     idx))
 
-(declare emit-result)
+(declare emit-result emit-loop-scalar simd-loop-plan emit-loop-simd)
 
 (defn- emit-loop
+  "(loop [v init ...] (if cond <recur|do…recur> <result>)) → [bytes ret-vt].
+   When ctx :simd? is set and the loop is an elementwise counted map, emits a
+   v128 main loop + scalar remainder; otherwise the scalar loop."
+  [ctx node]
+  (if-let [plan (and (:simd? ctx) (simd-loop-plan ctx node))]
+    (emit-loop-simd ctx node plan)
+    (emit-loop-scalar ctx node)))
+
+(defn- emit-loop-scalar
   "(loop [v init ...] (if cond <recur|do…recur> <result>)) → [bytes ret-vt].
    Returns the non-recur (else) value via block(result vt){ loop ; unreachable }."
   [ctx node]
@@ -252,11 +273,208 @@
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
 
+;; ─────────────────────────────────────────────────────────────────────────
+;; SIMD128 vectorization of elementwise dotimes-maps (opt-in via ctx :simd?).
+;; Targets (dotimes [i n] (aset out i <pure-elementwise>)…) where every store
+;; indexes exactly i and the value is composed only of (aget arr i), arithmetic
+;; (+,-,*,/), scalar literals and loop-invariant scalars. Emits a v128 main loop
+;; (2-wide f64 / 4-wide f32) plus a scalar remainder loop. Cannot run under
+;; Chicory (no v128) — validate execution via node/V8.
+;; ─────────────────────────────────────────────────────────────────────────
+
+(def ^:private simd-op-suffix {"+" "add" "-" "sub" "*" "mul" "/" "div"})
+
+(defn- simd-op-of
+  "If node is a vectorizable arithmetic op, return its suffix (add/sub/mul/div)."
+  [node]
+  (let [h (first node)
+        sym (cond (= h '.invk) (:raster.op/original (meta node))
+                  (#{'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//} h) h
+                  :else nil)]
+    (when sym (simd-op-suffix (name sym)))))
+
+(defn- simd-op-args [node] (if (= '.invk (first node)) (drop 2 node) (rest node)))
+
+(defn- simd-index-ok?
+  "Array index is exactly the loop var (optionally wrapped in a long/int cast)."
+  [i-sym idx]
+  (or (= idx i-sym)
+      (and (seq? idx) (#{'long 'int} (first idx)) (= (second idx) i-sym))))
+
+(defn- simd-pure?
+  "node is an elementwise-pure value: aget@i, arith of pure, scalar literal, or a
+   loop-invariant scalar (NOT the bare loop var — it differs per lane)."
+  [i-sym node]
+  (cond
+    (number? node) true
+    (symbol? node) (not= node i-sym)
+    (seq? node)
+    (let [h (first node)]
+      (cond
+        (= h 'clojure.core/aget) (simd-index-ok? i-sym (nth node 2))
+        (#{'long 'int 'double 'float} h) (simd-pure? i-sym (last node))
+        (and (= 2 (count node)) (simd-op-suffix (name h))) false  ; unary +/- unsupported
+        (simd-op-of node) (every? #(simd-pure? i-sym %) (simd-op-args node))
+        :else false))
+    :else false))
+
+(defn- simd-arr-vts
+  "All array element vts referenced (stored-to + aget-loaded) in stores."
+  [ctx stores]
+  (letfn [(go [node acc]
+              (cond
+                (and (seq? node) (= 'clojure.core/aget (first node)))
+                (conj acc (get-in ctx [:elems (second node) :vt]))
+                (seq? node) (reduce #(go %2 %1) acc (rest node))
+                :else acc))]
+    (reduce (fn [acc [arr _ v]] (go v (conj acc (get-in ctx [:elems arr :vt])))) #{} stores)))
+
+(defn- simd-vectorizable?
+  "Analyze a dotimes for SIMD. Returns {:lane-vt :lanes :stores :n :body} or nil.
+   Every body form must be an (aset arr i pure) store; all arrays one f64/f32 type."
+  [ctx node]
+  (let [[_ [isym ncnt] & body] node
+        flat (mapcat (fn f [x]
+                       (cond (and (seq? x) (= 'do (first x))) (mapcat f (rest x))
+                             (and (seq? x) (= 'let* (first x)) (empty? (second x))) (mapcat f (drop 2 x))
+                             :else [x]))
+                     body)
+        stores (mapv (fn [x]
+                       (when (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))
+                                  (simd-index-ok? isym (nth x 2)) (simd-pure? isym (nth x 3)))
+                         [(nth x 1) (nth x 2) (nth x 3)]))
+                     flat)]
+    (when (and (seq flat) (every? some? stores))
+      (let [vts (simd-arr-vts ctx stores)]
+        (when (and (= 1 (count vts)) (#{:f64 :f32} (first vts)))
+          (let [lane-vt (first vts)]
+            {:lane-vt lane-vt :lanes (case lane-vt :f64 2 :f32 4)
+             :stores stores :n ncnt :body body :isym isym}))))))
+
+(declare emit-vexpr)
+
+(defn- emit-vexpr
+  "Emit an elementwise-pure expression as a v128 value (lane-vt-wide)."
+  [ctx lane-vt node]
+  (let [splat (if (= lane-vt :f64) :f64x2.splat :f32x4.splat)]
+    (cond
+      (number? node)
+      (into (if (= lane-vt :f64) (e/f64-const node) (e/f32-const (float node))) (e/v splat))
+      (symbol? node)
+      (into (e/local-get (get-in ctx [:env node :idx])) (e/v splat))
+      (seq? node)
+      (let [h (first node)]
+        (cond
+          (= h 'clojure.core/aget)
+          (let [[_ arr idx] node] (into (addr ctx arr idx) (e/v128-load 0 0)))
+          (#{'long 'int 'double 'float} h) (emit-vexpr ctx lane-vt (last node))
+          :else
+          (let [suf (simd-op-of node)
+                [o1 o2] (simd-op-args node)
+                pfx (if (= lane-vt :f64) "f64x2" "f32x4")]
+            (-> (emit-vexpr ctx lane-vt o1)
+                (into (emit-vexpr ctx lane-vt o2))
+                (into (e/v (keyword (str pfx "." suf)))))))))))
+
+(defn- emit-dotimes-simd
+  "Vectorized counted loop: v128 main loop (step = lanes) + scalar remainder.
+     i=0; block{ loop{ (i+lanes)>n → br1; <v128 stores>; i+=lanes; br0 }}
+          block{ loop{ i>=n → br1; <scalar stores>; i++; br0 }}"
+  [ctx node {:keys [lane-vt lanes stores n body isym]}]
+  (let [idx  (alloc! ctx :i32)
+        ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})
+        vmain (-> (e/local-get idx) (into (e/i32-const lanes)) (into (e/i :i32.add))
+                  (into (emit-val ctx' n)) (into (e/i :i32.gt_s)) (into (e/br-if 1))
+                  (into (vec (mapcat (fn [[arr idx-node v]]
+                                       (-> (addr ctx' arr idx-node)
+                                           (into (emit-vexpr ctx' lane-vt v))
+                                           (into (e/v128-store 0 0))))
+                                     stores)))
+                  (into (e/local-get idx)) (into (e/i32-const lanes)) (into (e/i :i32.add))
+                  (into (e/local-set idx)) (into (e/br 0)))
+        srem (-> (e/local-get idx) (into (emit-val ctx' n)) (into (e/i :i32.ge_s)) (into (e/br-if 1))
+                 (into (vec (mapcat #(emit-effect ctx' %) body)))
+                 (into (e/local-get idx)) (into (e/i32-const 1)) (into (e/i :i32.add))
+                 (into (e/local-set idx)) (into (e/br 0)))]
+    (-> (e/i32-const 0) (into (e/local-set idx))
+        (into (e/block (e/loop* vmain)))
+        (into (e/block (e/loop* srem))))))
+
+(defn- counted-inc?
+  "node increments i-sym by exactly 1 (inc / unchecked-inc-int / unchecked-inc)."
+  [i-sym node]
+  (and (seq? node) (symbol? (first node))
+       (#{"inc" "unchecked-inc-int" "unchecked-inc"} (name (first node)))
+       (= (second node) i-sym)))
+
+(defn- simd-loop-plan
+  "Match a vectorizable counted loop the passes lower dotimes into:
+     (loop* [i 0] (if (< i n) (do <aset-stores…> (recur (inc i))) els))
+   Returns {:lane-vt :lanes :stores :n :isym :els :then-body} or nil."
+  [ctx node]
+  (let [[_ bindvec ifform] node]
+    (when (and (vector? bindvec) (= 2 (count bindvec))
+               (seq? ifform) (= 4 (count ifform)) (= 'if (first ifform)))
+      (let [isym (first bindvec)
+            init (second bindvec)
+            zero? (or (= init 0) (and (seq? init) (#{'int 'long} (first init)) (= 0 (second init))))
+            [_ cnd then els] ifform]
+        (when (and zero? (symbol? isym)
+                   (seq? cnd) (symbol? (first cnd)) (= "<" (name (first cnd))) (= isym (second cnd))
+                   (seq? then) (= 'do (first then)))
+          (let [n      (nth cnd 2)
+                stores (mapv (fn [x]
+                               (when (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))
+                                          (simd-index-ok? isym (nth x 2)) (simd-pure? isym (nth x 3)))
+                                 [(nth x 1) (nth x 2) (nth x 3)]))
+                             (butlast (rest then)))
+                tail   (last then)]
+            (when (and (seq stores) (every? some? stores)
+                       (seq? tail) (= 'recur (first tail)) (counted-inc? isym (second tail)))
+              (let [vts (simd-arr-vts ctx stores)]
+                (when (and (= 1 (count vts)) (#{:f64 :f32} (first vts)))
+                  (let [lane-vt (first vts)]
+                    {:lane-vt lane-vt :lanes (if (= lane-vt :f64) 2 4)
+                     :stores stores :n n :isym isym :els els :then-body (vec (rest then))}))))))))))
+
+(defn- emit-loop-simd
+  "Vectorized counted loop → [bytes ret-vt]. v128 main loop (step = lanes) + scalar
+   remainder, then the loop's else value (matches emit-loop-scalar's return)."
+  [ctx node {:keys [lane-vt lanes stores n isym els then-body]}]
+  (let [idx  (alloc! ctx :i32)
+        ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})
+        vmain (-> (e/local-get idx) (into (e/i32-const lanes)) (into (e/i :i32.add))
+                  (into (emit-val ctx' n)) (into (e/i :i32.gt_s)) (into (e/br-if 1))
+                  (into (vec (mapcat (fn [[arr idx-node v]]
+                                       (-> (addr ctx' arr idx-node)
+                                           (into (emit-vexpr ctx' lane-vt v))
+                                           (into (e/v128-store 0 0))))
+                                     stores)))
+                  (into (e/local-get idx)) (into (e/i32-const lanes)) (into (e/i :i32.add))
+                  (into (e/local-set idx)) (into (e/br 0)))
+        srem (-> (e/local-get idx) (into (emit-val ctx' n)) (into (e/i :i32.ge_s)) (into (e/br-if 1))
+                 (into (vec (mapcat #(emit-effect ctx' %) (butlast then-body))))  ; stores (drop recur)
+                 (into (e/local-get idx)) (into (e/i32-const 1)) (into (e/i :i32.add))
+                 (into (e/local-set idx)) (into (e/br 0)))]
+    [(-> (e/i32-const 0) (into (e/local-set idx))
+         (into (e/block (e/loop* vmain)))
+         (into (e/block (e/loop* srem)))
+         (into (emit-val ctx' els)))
+     (infer-vt ctx' els)]))
+
 (defn- emit-dotimes
   "(dotimes [i n] body…) → a void counted loop. Emits:
      i = 0
      block { loop { br_if 1 (i >= n) ; body-effects ; i++ ; br 0 } }
-   Labels from inside the loop body: loop=0, block=1."
+   Labels from inside the loop body: loop=0, block=1.
+   When ctx :simd? is set and the loop is an elementwise map, emits a v128 main
+   loop + scalar remainder instead."
+  [ctx node]
+  (if-let [plan (and (:simd? ctx) (simd-vectorizable? ctx node))]
+    (emit-dotimes-simd ctx node plan)
+    (emit-dotimes-scalar ctx node)))
+
+(defn- emit-dotimes-scalar
   [ctx node]
   (let [[_ [isym ncnt] & body] node
         idx  (alloc! ctx :i32)
@@ -312,12 +530,13 @@
   "Compile a kernel IR to a wasm module byte[].
    params: ordered [{:sym :tag}].  ir: post-pass S-expr. The result type is
    inferred from the IR (loop else-value / scalar body).
+   :simd? enables SIMD128 vectorization of elementwise dotimes-maps.
    Returns {:bytes byte[] :name :param-types [vt...] :result-types [vt...]}."
-  [{:keys [name params ir mem-pages] :or {mem-pages 256}}]
+  [{:keys [name params ir mem-pages simd?] :or {mem-pages 256}}]
   (let [param-vts (mapv #(tag->vt (:tag %)) params)
         env0 (into {} (map-indexed (fn [idx {:keys [sym tag]}] [sym {:idx idx :vt (tag->vt tag)}]) params))
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
-        ctx {:env env0 :elems elems :base (count params) :locals (atom [])}
+        ctx {:env env0 :elems elems :base (count params) :locals (atom []) :simd? simd?}
         [body-bytes ret-vt] (emit-result ctx ir)
         result-types (if ret-vt [ret-vt] [])     ; nil ret-vt = void (array-mutating)
         locals @(:locals ctx)]
