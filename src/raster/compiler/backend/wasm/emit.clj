@@ -66,15 +66,26 @@
         (into (emit-val ctx idx-node))
         (into (e/i32-const eb)) (into (e/i :i32.mul)) (into (e/i :i32.add)))))
 
+(defn- void-effect-form?
+  "A form producing no value (side-effect only): dotimes/when, or a do whose tail
+   is itself a void effect. Such a form bound in a let* (e.g. the inliner's
+   (let* [_ret (dotimes …)] _ret) body-lift) is emitted as an effect, not a value."
+  [node]
+  (and (seq? node)
+       (let [h (first node)]
+         (or (#{'dotimes 'when} h)
+             (and (= 'do h) (void-effect-form? (last node)))))))
+
 (defn- emit-val
   "Emit a value-producing expression → byte vector."
   [ctx node]
   (cond
     (integer? node) (e/i32-const node)
     (float? node)   (e/f64-const node)
-    (symbol? node)  (let [{:keys [idx]} (get-in ctx [:env node])]
-                      (when-not idx (throw (ex-info (str "unbound sym " node) {:node node})))
-                      (e/local-get idx))
+    (symbol? node)  (let [{:keys [idx void]} (get-in ctx [:env node])]
+                      (cond void []                       ; void-bound sym carries no value
+                            idx  (e/local-get idx)
+                            :else (throw (ex-info (str "unbound sym " node) {:node node}))))
     (seq? node)
     (let [h (first node), A (vec (rest node))]
       (cond
@@ -115,9 +126,12 @@
         (= h 'let*)
         (let [[binds & body] A
               [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                          (let [vt (infer-vt c init) idx (alloc! c vt)]
-                                            [(assoc-in c [:env s] {:idx idx :vt vt})
-                                             (-> acc (into (emit-val c init)) (into (e/local-set idx)))]))
+                                          (if (void-effect-form? init)
+                                            [(assoc-in c [:env s] {:void true})
+                                             (into acc (emit-effect c init))]
+                                            (let [vt (infer-vt c init) idx (alloc! c vt)]
+                                              [(assoc-in c [:env s] {:idx idx :vt vt})
+                                               (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
                                         [ctx []] (partition 2 binds))
               tail (if (= 1 (count body)) (first body) (cons 'do body))]
           (into init-bytes (emit-val ctx' tail)))
@@ -149,7 +163,7 @@
 
 (defn- emit-effect
   "Side-effecting statement that leaves nothing on the stack (aset / when / do /
-   dotimes)."
+   let* / dotimes)."
   [ctx node]
   (let [h (first node), A (vec (rest node))]
     (cond
@@ -157,6 +171,18 @@
       (let [[arr idx v] A elem (get-in ctx [:elems arr])]
         (-> (addr ctx arr idx) (into (emit-val ctx v)) (into (e/mem-store (:store elem) (:align elem) 0))))
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
+      ;; let* in effect position (e.g. soa-lower floats arg bindings out of a
+      ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
+      (= h 'let*)
+      (let [[binds & body] A
+            [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
+                                        (if (void-effect-form? init)
+                                          [(assoc-in c [:env s] {:void true}) (into acc (emit-effect c init))]
+                                          (let [vt (infer-vt c init) idx (alloc! c vt)]
+                                            [(assoc-in c [:env s] {:idx idx :vt vt})
+                                             (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
+                                      [ctx []] (partition 2 binds))]
+        (into init-bytes (vec (mapcat #(emit-effect ctx' %) body))))
       (= h 'when)                                   ; (when cond body…) — void, no else
       (-> (emit-val ctx (first A))
           (into [(e/op :if) e/empty-block])
@@ -255,13 +281,19 @@
     (and (seq? node) (= 'dotimes (first node))) [(emit-dotimes ctx node) nil]
     (and (seq? node) (= 'when (first node)))    [(emit-effect ctx node) nil]
 
+    ;; void-bound symbol in tail position (e.g. (let* [_ret (dotimes …)] _ret))
+    (and (symbol? node) (get-in ctx [:env node :void])) [[] nil]
+
     (and (seq? node) (= 'let* (first node)))
     (let [[_ binds & body] node
           [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                      (let [vt (infer-vt c init)
-                                            idx (alloc! c vt)]
-                                        [(assoc-in c [:env s] {:idx idx :vt vt})
-                                         (-> acc (into (emit-val c init)) (into (e/local-set idx)))]))
+                                      (if (void-effect-form? init)
+                                        [(assoc-in c [:env s] {:void true})
+                                         (into acc (emit-effect c init))]
+                                        (let [vt (infer-vt c init)
+                                              idx (alloc! c vt)]
+                                          [(assoc-in c [:env s] {:idx idx :vt vt})
+                                           (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
                                     [ctx []] (partition 2 binds))
           tail (if (= 1 (count body)) (first body) (cons 'do body))
           [b ret] (emit-result ctx' tail)]

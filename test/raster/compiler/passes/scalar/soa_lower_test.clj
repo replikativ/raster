@@ -68,3 +68,37 @@
       (let [bad (count (filter (fn [i] (not= (.readDouble mem (* 8 (+ (* 2 n) i))) (double (* 3 i))))
                                (range n)))]
         (is (zero? bad) (str bad " get-re mismatches"))))))
+
+;; value-type HELPER deftm: returns a bare (->Cplx …) constructor. The inliner
+;; must inline it (inlinable-body? accepts value-type ctor tails) so soa-lower
+;; can scalar-replace the result; soa-lower floats the inlined let*-of-args out
+;; of the store and preserves .invk op metadata; the emitter handles the void
+;; dotimes binding + let*-in-effect-position the inliner/float produce.
+(deftm cadd-el [a :- Cplx, b :- Cplx] :- Cplx
+  (->Cplx (raster.numeric/+ (.re a) (.re b)) (raster.numeric/+ (.im a) (.im b))))
+
+(deftm cadd-via-helper! [as :- CplxSoA, bs :- CplxSoA, os :- CplxSoA, n :- Long] :- nil
+  (dotimes [i n]
+    (aset-cplx! os i (cadd-el (aget-cplx as i) (aget-cplx bs i)))))
+
+(deftest value-type-helper-deftm-inlines
+  (testing "value-type helper deftm inlines + lowers + runs (Cplx add via cadd-el)"
+    (let [m (pl/compile-wasm #'cadd-via-helper! :name "caddh")]
+      (is (= 7 (count (:param-types m))))   ; 3 SoA × 2 fields + n
+      (is (= [] (:result-types m)))
+      (let [inst (instantiate (:bytes m))
+            mem  (.memory inst)
+            n    64]
+        ;; layout: as_re@0 as_im@n bs_re@2n bs_im@3n os_re@4n os_im@5n
+        (dotimes [i n]
+          (.writeF64 mem (* 8 i) (double i))
+          (.writeF64 mem (* 8 (+ n i)) (double (* 2 i)))
+          (.writeF64 mem (* 8 (+ (* 2 n) i)) 10.0)
+          (.writeF64 mem (* 8 (+ (* 3 n) i)) 100.0))
+        (.apply (.export inst "caddh")
+                (long-array [0 (* 8 n) (* 8 (* 2 n)) (* 8 (* 3 n)) (* 8 (* 4 n)) (* 8 (* 5 n)) n]))
+        (let [bad (count (filter (fn [i]
+                                   (or (not= (.readDouble mem (* 8 (+ (* 4 n) i))) (+ (double i) 10.0))
+                                       (not= (.readDouble mem (* 8 (+ (* 5 n) i))) (+ (double (* 2 i)) 100.0))))
+                                 (range n)))]
+          (is (zero? bad) (str bad " helper-add mismatches")))))))

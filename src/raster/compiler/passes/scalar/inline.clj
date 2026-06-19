@@ -18,15 +18,30 @@
 (def ^:private call-head util/call-head)
 (def ^:private call-args util/call-args)
 
+(defn- value-ctor-call?
+  "True if body is a bare (->Type ...) constructor for a registered value type.
+   These tail-constructor bodies are inlinable: inline-one-pass substitutes the
+   args into the constructor and binds the result, which the soa-lower SROA pass
+   then scalar-replaces field-by-field. Without this, a value-type helper deftm
+   (e.g. (deftm cadd [a :- Cpx b :- Cpx] :- Cpx (->Cpx ...))) stays an opaque
+   .invk that soa-lower cannot explode."
+  [body]
+  (and (seq? body) (symbol? (first body))
+       (let [h (name (first body))]
+         (and (.startsWith h "->")
+              (contains? @types/soa-registry (symbol (subs h 2)))))))
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
-   Only forms with decomposable structure (let*, loop, dotimes, do,
-   .invk, par) are inlinable. Bare function calls are not — they
-   need let* wrapping for the inliner to decompose."
+   Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
+   inlinable, as are bare value-type constructor tails (see value-ctor-call?).
+   Other bare function calls are not — they need let* wrapping for the inliner
+   to decompose."
   [body]
   (and (seq? body)
-       (contains? #{:binding :scope :do :invk :par}
-                  (:kind (form/form-info body)))))
+       (or (contains? #{:binding :scope :do :invk :par}
+                      (:kind (form/form-info body)))
+           (value-ctor-call? body))))
 
 (def ^:private prim-or-array-tags
   "Tags that are safe for inlining even when body has scoped forms.
@@ -146,10 +161,10 @@
                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
                                       (when (inf/try-parametric-specialize!
-                                              (symbol (namespace base-sym) (name base-sym)) arg-tags)
-                                          (let [new-methods (mapcat identity
-                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
+                                             (symbol (namespace base-sym) (name base-sym)) arg-tags)
+                                        (let [new-methods (mapcat identity
+                                                                  (vals @(:raster.core/dispatch-table (meta v))))]
+                                          (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
                                 ;; Single method fallback: safe when no other overloads exist
                                 ;; AND function is not parametric. Parametric functions
                                 ;; may need a different specialization that hasn't been
@@ -705,10 +720,10 @@
                                       method (or (when (seq arg-tags)
                                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                                        (when (inf/try-parametric-specialize!
-                                                               (symbol (namespace var-sym) (name var-sym)) arg-tags)
-                                                           (let [new-methods (mapcat val @dt)]
-                                                             (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                            new-methods))))))
+                                                              (symbol (namespace var-sym) (name var-sym)) arg-tags)
+                                                         (let [new-methods (mapcat val @dt)]
+                                                           (first (filter #(= (vec arg-tags) (vec (:tags %)))
+                                                                          new-methods))))))
                                            ;; Non-parametric single method: safe (no other overloads possible)
                                                  (when (and (= 1 (count all-methods)) (not has-parametric?))
                                                    (first all-methods)))
@@ -1411,11 +1426,11 @@
                                              entries))
                               ;; No exact match — try parametric specialization for (All [T]) functions
                               (when (inf/try-parametric-specialize!
-                                      (symbol (namespace (first expr)) (name (first expr))) arg-tags)
-                                  (let [new-entries (get @dt-atom (count args))]
-                                    (first (filter (fn [e]
-                                                     (= (vec arg-tags) (vec (:tags e))))
-                                                   new-entries))))))]
+                                     (symbol (namespace (first expr)) (name (first expr))) arg-tags)
+                                (let [new-entries (get @dt-atom (count args))]
+                                  (first (filter (fn [e]
+                                                   (= (vec arg-tags) (vec (:tags e))))
+                                                 new-entries))))))]
               (when match
                 (let [mn (str (types/mangle (symbol (name (first expr))) (:tags match)))
                       ms (symbol (str (:mangled-ns match)) mn)

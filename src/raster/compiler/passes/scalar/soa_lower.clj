@@ -98,6 +98,14 @@
         (when-let [scalar (get @types/soa-reverse-registry (:tag (meta sym)))]
           {:scalar-tag scalar :fields (:fields (get @types/soa-registry scalar))}))))
 
+(defn- relist
+  "Rebuild a seq form from new children, preserving the original metadata so
+   :raster.op/original / :raster.type/tag survive lowering (the backend reads
+   them off devirtualized .invk nodes)."
+  [orig children]
+  (let [l (apply list children)]
+    (if-let [m (meta orig)] (with-meta l m) l)))
+
 (declare lower)
 
 (defn- explode
@@ -138,7 +146,7 @@
           fname (subs (str (first form)) 1)]
       (if (and ex (contains? ex fname))
         (get ex fname)
-        (apply list (map #(lower ctx %) form))))     ; non-value-type field access → recurse
+        (relist form (map #(lower ctx %) form))))     ; non-value-type field access → recurse
 
     ;; let* — bind exploded value-locals into ctx and DROP their bindings
     (and (seq? form) (= 'let* (first form)))
@@ -149,6 +157,22 @@
                                  [c (conj bs s (lower c e))]))
                              [ctx []] (partition 2 binds))]
       (apply list 'let* (vec out) (map #(lower ctx' %) body)))
+
+    ;; SoA store whose value is wrapped in a binding/do (e.g. from inlining a
+    ;; value-type helper deftm): float the wrapper out so the store lands on the
+    ;; explodable tail. (aset soa i (let* [bs] … v)) → (let* [bs] … (aset soa i v)),
+    ;; then re-lower — the let*/do clauses handle the bindings and the aset clause
+    ;; handles the now-bare constructor/exploded-local tail.
+    (and (seq? form) (aset-head? (first form)) (soa-info-for ctx (second form))
+         (seq? (nth form 3 nil)) (#{'let* 'do} (first (nth form 3))))
+    (let [[head soa-raw i v] form
+          wrap-head (first v)
+          [binds body] (if (= 'let* wrap-head) [(second v) (drop 2 v)] [nil (rest v)])
+          stored (list head soa-raw i (last body))
+          floated (if (= 'let* wrap-head)
+                    (apply list 'let* binds (concat (butlast body) [stored]))
+                    (apply list 'do (concat (butlast body) [stored])))]
+      (lower ctx floated))
 
     ;; SoA store: (aset[-k]! soa i v) → per-field stores
     (and (seq? form) (aset-head? (first form)) (soa-info-for ctx (second form)))
@@ -167,7 +191,7 @@
     (and (seq? form) (explode ctx form))
     (throw (ex-info "value-type value in a non-consuming position (escapes)" {:form form}))
 
-    (seq? form) (apply list (map #(lower ctx %) form))
+    (seq? form) (relist form (map #(lower ctx %) form))
     (vector? form) (mapv #(lower ctx %) form)
     :else form))
 
