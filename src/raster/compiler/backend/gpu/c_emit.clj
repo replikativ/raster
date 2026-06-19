@@ -11,8 +11,7 @@
 
   Usage:
     (binding [*emit-config* opencl-config
-              *scalar-type* \"float\"
-              *soa-expansions* {}]
+              *scalar-type* \"float\"]
       (emit-expr body idx-sym array-syms \"idx\"))"
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
@@ -28,8 +27,6 @@
   "Backend-specific emission configuration.
   Keys:
     :cast-style       - :c for (float)x, :glsl for float(x)
-    :struct-ctor      - :c99 for (T){.x=a}, :glsl for T(a,b), :cpp for T{a,b}
-    :struct-typedef   - :c99 for 'typedef struct{...}T;', :glsl/:cpp for 'struct T{...};'
     :atomic-add-int   - function name for int atomic add
     :atomic-add-float - function name or :cas-helper for CAS loop
     :float-abs        - \"fabs\" or \"abs\"
@@ -37,8 +34,6 @@
     :float-min        - \"fmin\" or \"min\"
     :float-suffix?    - append 'f' to float literals"
   {:cast-style      :c
-   :struct-ctor     :c99
-   :struct-typedef  :c99
    :atomic-add-int  "atomic_add"
    :atomic-add-float :cas-helper
    :float-abs       "fabs"
@@ -48,8 +43,6 @@
 
 (def opencl-config
   {:cast-style      :c
-   :struct-ctor     :c99
-   :struct-typedef  :c99
    :atomic-add-int  "atomic_add"
    :atomic-add-float :cas-helper
    :float-abs       "fabs"
@@ -59,8 +52,6 @@
 
 (def glsl-config
   {:cast-style      :glsl
-   :struct-ctor     :glsl
-   :struct-typedef  :glsl
    :atomic-add-int  "atomicAdd"
    :atomic-add-float "atomicAdd"
    :float-abs       "abs"
@@ -73,8 +64,6 @@
 
 (def hip-config
   {:cast-style      :c
-   :struct-ctor     :cpp
-   :struct-typedef  :cpp
    :atomic-add-int  "atomicAdd"
    :atomic-add-float "atomicAdd"
    :float-abs       "fabsf"
@@ -87,10 +76,6 @@
 ;; ================================================================
 
 (def ^:dynamic *scalar-type* "double")
-
-(def ^:dynamic *soa-expansions*
-  "Maps symbol-name-as-symbol -> {:scalar-tag :soa-tag :fields [{:name :element-tag :array-tag}...]}"
-  {})
 
 (def ^:dynamic *idx-sym*
   "The par loop index symbol (always uint/int). Used by infer-c-type."
@@ -316,12 +301,9 @@
 
     (and (seq? expr) (descriptor/aget-op? (first expr))
          (>= (count expr) 3))
-    (let [arr     (second expr)
-          arr-sym (when (symbol? arr) (symbol (name arr)))]
-      (if-let [soa-info (get *soa-expansions* arr-sym)]
-        (name (:scalar-tag soa-info))
-        (let [tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
-          (get tag->ctype tag *scalar-type*))))
+    (let [arr (second expr)
+          tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
+      (get tag->ctype tag *scalar-type*))
 
     (and (seq? expr)
          (contains? #{'unchecked-add-int 'unchecked-subtract-int
@@ -408,21 +390,6 @@
     ;; :c and :cpp both use C-style casts
     (str "(" type-name ")(" inner-str ")")))
 
-(defn- emit-struct-ctor
-  "Emit a struct constructor according to backend config."
-  [type-name fields-with-values]
-  (case (:struct-ctor *emit-config*)
-    :c99  (str "(" type-name "){ "
-               (str/join ", " (map (fn [[fname val]] (str "." fname "=" val))
-                                   fields-with-values))
-               " }")
-    :glsl (str type-name "("
-               (str/join ", " (map second fields-with-values))
-               ")")
-    :cpp  (str type-name "{"
-               (str/join ", " (map second fields-with-values))
-               "}")))
-
 (defn- resolve-op
   "Resolve an op symbol to a C function name, applying backend overrides."
   [op]
@@ -446,33 +413,21 @@
   "Emit an S-expression as a C statement (with trailing semicolon)."
   [expr idx-sym array-syms opencl-idx]
   (cond
-    ;; aset on SoA array -> field-by-field writes via temp struct
+    ;; aset -> array write (SoA stores are scalar-replaced upstream by soa-lower)
     (and (seq? expr)
          (descriptor/aset-op? (first expr))
          (>= (count expr) 4))
     (let [[_ arr idx-e val-e] expr
-          arr-sym (when (symbol? arr) (symbol (name arr)))]
-      (if-let [soa-info (get *soa-expansions* arr-sym)]
-        (let [scalar-name (name (:scalar-tag soa-info))
-              idx-str (emit-expr idx-e idx-sym array-syms opencl-idx)
-              val-str (emit-expr val-e idx-sym array-syms opencl-idx)
-              fields  (:fields soa-info)
-              arr-c   (c-symbol arr)
-              writes  (str/join " "
-                                (map (fn [{:keys [name]}]
-                                       (str arr-c "_" name "[" idx-str "] = _soa_tmp." name ";"))
-                                     fields))]
-          (str "{ " scalar-name " _soa_tmp = " val-str "; " writes " }"))
-        (let [val-str (emit-expr val-e idx-sym array-syms opencl-idx)
-              idx-str (emit-expr idx-e idx-sym array-syms opencl-idx)
-              ;; GLSL: cast value to target array type
-              arr-ctype (when (and (not (supports-stmt-expr?)) (symbol? arr))
-                          (or (get element-tag->c (or (:raster.type/tag (meta arr)) (:tag (meta arr))))
-                              *scalar-type*))
-              val-str (if arr-ctype
-                        (str arr-ctype "(" val-str ")")
-                        val-str)]
-          (str (c-symbol arr) "[" idx-str "] = " val-str ";"))))
+          val-str (emit-expr val-e idx-sym array-syms opencl-idx)
+          idx-str (emit-expr idx-e idx-sym array-syms opencl-idx)
+          ;; GLSL: cast value to target array type
+          arr-ctype (when (and (not (supports-stmt-expr?)) (symbol? arr))
+                      (or (get element-tag->c (or (:raster.type/tag (meta arr)) (:tag (meta arr))))
+                          *scalar-type*))
+          val-str (if arr-ctype
+                    (str arr-ctype "(" val-str ")")
+                    val-str)]
+      (str (c-symbol arr) "[" idx-str "] = " val-str ";"))
 
     ;; when -> void if
     (and (seq? expr) (= 'when (first expr)))
@@ -758,52 +713,15 @@
          (str n "[" opencl-idx "]")
          (if (= expr idx-sym) opencl-idx n)))
 
-     ;; (.field expr) -> struct field access
-     (and (seq? expr) (= 2 (count expr))
-          (symbol? (first expr))
-          (str/starts-with? (name (first expr)) "."))
-     (let [field-name (subs (name (first expr)) 1)
-           obj-str    (emit-expr (second expr) idx-sym array-syms opencl-idx)]
-       (str "(" obj-str ")." field-name))
-
-     ;; (->Type arg...) -> struct constructor
-     (and (seq? expr) (symbol? (first expr))
-          (str/starts-with? (name (first expr)) "->"))
-     (let [type-name  (subs (name (first expr)) 2)
-           scalar-tag (symbol type-name)
-           soa-reg    @types/soa-registry
-           soa-info   (get soa-reg scalar-tag)
-           fields     (:fields soa-info)
-           args       (rest expr)]
-       (if (and soa-info (= (count fields) (count args)))
-         (emit-struct-ctor type-name
-                           (map (fn [{:keys [name]} arg]
-                                  [name (emit-expr arg idx-sym array-syms opencl-idx)])
-                                fields args))
-         ;; Fallback: function-call style
-         (str type-name "("
-              (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args))
-              ")")))
-
-     ;; aget on SoA array -> struct literal from flat reads
+     ;; aget -> array read (SoA reads/field projection are scalar-replaced
+     ;; upstream by soa-lower, so only plain per-field arrays reach here)
      (and (seq? expr)
           (descriptor/aget-op? (first expr))
           (>= (count expr) 3))
-     (let [arr     (second expr)
-           arr-sym (when (symbol? arr) (symbol (name arr)))
+     (let [arr      (second expr)
            idx-expr (nth expr 2)]
-       (if-let [soa-info (get *soa-expansions* arr-sym)]
-         (let [scalar-name (name (:scalar-tag soa-info))
-               idx-str     (emit-expr idx-expr idx-sym array-syms opencl-idx)
-               arr-c       (c-symbol arr)
-               fields      (:fields soa-info)]
-           (emit-struct-ctor scalar-name
-                             (map (fn [{:keys [name]}]
-                                    [name (str arr-c "_" name "[" idx-str "]")])
-                                  fields)))
-         ;; plain array aget
-         (str (c-symbol arr) "["
-              (emit-expr idx-expr idx-sym array-syms opencl-idx) "]")))
+       (str (c-symbol arr) "["
+            (emit-expr idx-expr idx-sym array-syms opencl-idx) "]"))
 
      ;; Primitive cast
      (and (seq? expr)
@@ -1219,18 +1137,14 @@
 
     (and (seq? expr) (descriptor/aget-op? (first expr))
          (>= (count expr) 3))
-    (let [arr      (second expr)
-          arr-sym  (when (symbol? arr) (symbol (name arr)))
-          soa-info (when arr-sym (get *soa-expansions* arr-sym))]
-      (if soa-info
-        (:scalar-tag soa-info)
-        (or (when (symbol? arr)
-              (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int}
-                   (or (:raster.type/tag (meta arr)) (:tag (meta arr)))))
-            ;; Fall back to scalar type for untagged arrays
-            (when *scalar-type*
-              (get {"float" 'float "double" 'double "int" 'int "long" 'long}
-                   *scalar-type*)))))
+    (let [arr (second expr)]
+      (or (when (symbol? arr)
+            (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int}
+                 (or (:raster.type/tag (meta arr)) (:tag (meta arr)))))
+          ;; Fall back to scalar type for untagged arrays
+          (when *scalar-type*
+            (get {"float" 'float "double" 'double "int" 'int "long" 'long}
+                 *scalar-type*))))
 
     (and (seq? expr) (contains? #{'. 'clojure.core/.} (first expr)))
     ;; Field access on a struct — infer scalar type
@@ -1450,49 +1364,6 @@
        f)
      body)
     @types))
-
-(defn collect-soa-expansions
-  "Collect SoA expansion info for symbols in body that have SoA type tags."
-  [body]
-  (let [result  (atom {})
-        soa-rev (try @types/soa-reverse-registry (catch Exception _ {}))
-        soa-reg (try @types/soa-registry (catch Exception _ {}))]
-    (walk/postwalk
-     (fn [f]
-       (when (and (symbol? f) (:tag (meta f)))
-         (let [tag        (:tag (meta f))
-               scalar-tag (get soa-rev tag)]
-           (when scalar-tag
-             (let [soa-info (get soa-reg scalar-tag)]
-               (when soa-info
-                 (swap! result assoc (symbol (name f))
-                        {:scalar-tag scalar-tag
-                         :soa-tag    tag
-                         :fields     (:fields soa-info)}))))))
-       f)
-     body)
-    @result))
-
-(defn emit-struct-typedefs
-  "Emit C struct type declarations for all scalar defvalue types in soa-expansions."
-  [soa-expansions]
-  (when (seq soa-expansions)
-    (let [seen (atom #{})]
-      (->> (vals soa-expansions)
-           (keep (fn [{:keys [scalar-tag fields]}]
-                   (when-not (@seen scalar-tag)
-                     (swap! seen conj scalar-tag)
-                     (let [field-decls (str/join " "
-                                                 (map (fn [{:keys [name element-tag]}]
-                                                        (str (get element-tag->c element-tag "float")
-                                                             " " name ";"))
-                                                      fields))
-                           tname (clojure.core/name scalar-tag)]
-                       (case (:struct-typedef *emit-config*)
-                         :c99  (str "typedef struct { " field-decls " } " tname ";")
-                         :glsl (str "struct " tname " { " field-decls " };")
-                         :cpp  (str "struct " tname " { " field-decls " };"))))))
-           (str/join "\n")))))
 
 (defn collect-written-arrays
   "Collect array symbols that are written to via aset or atomic-add!."

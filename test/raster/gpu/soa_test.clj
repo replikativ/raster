@@ -127,8 +127,8 @@
        f))
    body))
 
-(deftest soa-kernel-struct-typedef-test
-  (testing "SoA kernel includes struct typedef"
+(deftest soa-kernel-no-struct-typedef-test
+  (testing "SoA kernel is fully scalar-replaced — no struct typedef, no struct ops"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(aset particles i (aget particles i)))
@@ -136,10 +136,12 @@
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
       (is (some? source))
-      (is (str/includes? source "typedef struct"))
-      (is (str/includes? source "float x;"))
-      (is (str/includes? source "float vy;"))
-      (is (str/includes? source "} TestParticle;")))))
+      ;; SROA pass eliminates the value type before the C emitter sees it
+      (is (not (str/includes? source "typedef struct")))
+      (is (not (str/includes? source "TestParticle")))
+      ;; aget->aset roundtrip lowers to per-field array copies
+      (is (str/includes? source "particles_x[idx] = particles_x[idx];"))
+      (is (str/includes? source "particles_vy[idx] = particles_vy[idx];")))))
 
 (deftest soa-kernel-flat-params-test
   (testing "SoA arrays decompose into flat __global pointers"
@@ -157,8 +159,8 @@
       ;; Should NOT have a single particles param
       (is (not (re-find #"__global float\* particles[^_]" source))))))
 
-(deftest soa-kernel-aget-struct-literal-test
-  (testing "SoA aget emits C99 designated initializer"
+(deftest soa-kernel-aget-field-projects-test
+  (testing "SoA aget + field projection scalar-replaces to the per-field array read"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(let* [p (aget particles i)]
@@ -166,35 +168,37 @@
                 {'particles 'TestParticleSoA 'out 'floats})
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
-      ;; C99 struct literal from aget
-      (is (str/includes? source "(TestParticle){ .x=particles_x[idx]")))))
+      ;; (.x (aget particles i)) → particles_x[idx], no struct literal
+      (is (str/includes? source "particles_x[idx]"))
+      (is (not (str/includes? source "(TestParticle)"))))))
 
 (deftest soa-kernel-aset-fieldwise-test
-  (testing "SoA aset decomposes into field-by-field writes"
+  (testing "SoA aset decomposes into field-by-field writes (no temp struct)"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(aset particles i (->TestParticle 1.0 2.0 3.0 4.0)))
                 {'particles 'TestParticleSoA})
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
-      (is (str/includes? source "_soa_tmp"))
-      (is (str/includes? source "particles_x[idx] = _soa_tmp.x;"))
-      (is (str/includes? source "particles_vy[idx] = _soa_tmp.vy;")))))
+      (is (not (str/includes? source "_soa_tmp")))
+      (is (str/includes? source "particles_x[idx] = 1.0"))
+      (is (str/includes? source "particles_vy[idx] = 4.0")))))
 
-(deftest soa-kernel-constructor-c99-test
-  (testing "->Type emits C99 designated initializer"
+(deftest soa-kernel-constructor-scalar-replaced-test
+  (testing "->Type construction in aset scalar-replaces to per-field stores"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(aset particles i (->TestParticle 0.0 0.0 1.0 1.0)))
                 {'particles 'TestParticleSoA})
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
-      ;; Constructor should use C99 designated initializer, not function call
-      (is (str/includes? source "(TestParticle){ .x="))
-      (is (not (str/includes? source "TestParticle("))))))
+      ;; No struct constructor of any form survives the SROA pass
+      (is (not (str/includes? source "TestParticle")))
+      (is (str/includes? source "particles_x[idx] = 0.0"))
+      (is (str/includes? source "particles_vx[idx] = 1.0")))))
 
 (deftest soa-kernel-field-access-test
-  (testing ".field emits struct field access on SoA aget"
+  (testing ".field on a value-type local projects to the per-field array (no struct access)"
     (let [body (tag-body
                 (list 'raster.par/map-void! 'i 'n
                       '(let* [p (aget particles i)]
@@ -202,9 +206,9 @@
                 {'particles 'TestParticleSoA 'out 'floats})
           result (opencl-pass/opencl-pass body :dtype :float)
           source (:source (first (:kernels result)))]
-      ;; Field access on a struct (either via let-inlined struct literal or local var)
-      (is (or (str/includes? source "(p).x")
-              (str/includes? source ").x"))))))
+      ;; .x of the SoA-bound local resolves to the flat field array read
+      (is (str/includes? source "particles_x[idx]"))
+      (is (not (str/includes? source ").x"))))))
 
 (deftest soa-expansions-in-kernel-result-test
   (testing "Kernel result includes soa-expansions map"
