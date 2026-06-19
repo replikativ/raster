@@ -27,7 +27,7 @@
                  5 {:kids [4 3]   :scale 0.70}
                  4 {:kids [3 3]   :scale 0.75}
                  3 nil})
-(defn score [sides] (case sides 3 50 4 30 5 25 6 20 8 15 10))
+(defn shape-score [sides] (case sides 3 50 4 30 5 25 6 20 8 15 10))
 
 ;; --- shapes -------------------------------------------------------------------
 (defn ->shape [sides x y vx vy size]
@@ -39,7 +39,7 @@
       (let [x (* (rnd) W) y (* (rnd) H)]
         (if (and (< (Math/abs (- x (/ W 2.0))) 250.0) (< (Math/abs (- y (/ H 2.0))) 200.0))
           (recur)
-          (->shape sides x y (* sp (cos a)) (* sp (sin a)) 34.0))))))
+          (->shape sides x y (* sp (cos a)) (* sp (sin a)) 48.0))))))
 
 (defn spawn-wave [wave]
   (vec (repeatedly (+ 4 wave) #(spawn-shape (nth [6 8 5 6 8] (int (* (rnd) 5)))))))
@@ -103,7 +103,7 @@
               (let [a (first as) kin (:kin a)
                     hit (first (filter #(and (not (dead %)) (circle-hit? (:x %) (:y %) (:x kin) (:y kin) (:size kin))) bullets))]
                 (if hit
-                  (recur (rest as) (into out (split-shape a)) (+ sc (score (:sides a))) (conj dead hit))
+                  (recur (rest as) (into out (split-shape a)) (+ sc (shape-score (:sides a))) (conj dead hit))
                   (recur (rest as) (conj out a) sc dead)))))
           ;; ship vs shape → lose a life
           ship-hit (some (fn [{:keys [kin]}] (circle-hit? (:x ship) (:y ship) (:x kin) (:y kin) (+ 12.0 (:size kin)))) asteroids)
