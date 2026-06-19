@@ -45,6 +45,14 @@
 (def ^:private aget-form? segop-simd/aget-form?)
 (defn- simd-able-expr? [expr idx] (segop-simd/simd-able? expr idx))
 
+;; Integer index/offset/bound arithmetic must emit as clojure.core primitives —
+;; bare symbols resolve to raster.numeric in the kernel ns and box per iteration.
+;; See segop-simd's ix+ rationale / CLAUDE.md (integer index arith stays clojure.core).
+(defn- ix+ [a b] (list 'clojure.core/+ a b))
+(defn- ix- [a b] (list 'clojure.core/- a b))
+(defn- ix<= [a b] (list 'clojure.core/<= a b))
+(defn- ix< [a b] (list 'clojure.core/< a b))
+
 (defn- collect-scalars
   "Collect scalar symbols from body expression (delegates to segop-simd analysis)."
   [body-expr idx-sym]
@@ -243,9 +251,9 @@
               load-bindings (vec (mapcat
                                   (fn [s]
                                     (let [{:keys [left center right]} (get arr-shifted-syms s)]
-                                      [left (list from-array species-sym s (list '- j-sym 1))
+                                      [left (list from-array species-sym s (ix- j-sym 1))
                                        center (list from-array species-sym s j-sym)
-                                       right (list from-array species-sym s (list '+ j-sym 1))]))
+                                       right (list from-array species-sym s (ix+ j-sym 1))]))
                                   arr-syms))
               ;; Build vec-env for body emission: map each aget pattern to its shifted vector
               ;; We need a custom approach: rewrite body replacing agets with vector refs
@@ -333,18 +341,18 @@
                   (list 'do
                 ;; Fill boundary elements with boundary value
                         (list 'clojure.core/aset out 0 (or boundary 0.0))
-                        (list 'clojure.core/aset out (list '- n-sym 1) (or boundary 0.0))
+                        (list 'clojure.core/aset out (ix- n-sym 1) (or boundary 0.0))
                 ;; SIMD interior loop: [radius, n-radius) with vector width steps
                         (if (seq scalar-broadcast-bindings)
                           (list 'let* (vec scalar-broadcast-bindings)
                                 (list 'loop* [j-sym (list 'int radius)]
-                                      (list 'if (list '<= (list '+ j-sym lanes-sym) (list '- n-sym radius))
+                                      (list 'if (ix<= (ix+ j-sym lanes-sym) (ix- n-sym radius))
                                             (list 'let* (vec (concat load-bindings [simd-result-sym simd-body-expr]))
                                                   (list '.intoArray simd-result-sym out j-sym)
-                                                  (list 'recur (list '+ j-sym lanes-sym)))
+                                                  (list 'recur (ix+ j-sym lanes-sym)))
                         ;; Scalar tail
                                             (list 'loop* [j-sym j-sym]
-                                                  (list 'if (list '< j-sym (list '- n-sym radius))
+                                                  (list 'if (ix< j-sym (ix- n-sym radius))
                                                         (list 'do scalar-aset
                                                               (list 'recur (list 'inc j-sym)))
                                                         out)))))
