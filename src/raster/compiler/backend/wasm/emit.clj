@@ -55,7 +55,7 @@
     (keyword (str "i32." (case base "lt" "lt_s" "gt" "gt_s" "le" "le_s" "ge" "ge_s" base)))))
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt)
+(declare emit-val infer-vt emit-effect alloc!)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -102,6 +102,18 @@
               opk (or (arith-op sem vt) (throw (ex-info (str "unhandled .invk op " sem) {})))
               [_impl o1 o2] A]
           (-> (emit-val ctx o1) (into (emit-val ctx o2)) (into (e/i opk))))
+        ;; let* / do in VALUE position (introduced by inlined deftm calls)
+        (= h 'let*)
+        (let [[binds & body] A
+              [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
+                                          (let [vt (infer-vt c init) idx (alloc! c vt)]
+                                            [(assoc-in c [:env s] {:idx idx :vt vt})
+                                             (-> acc (into (emit-val c init)) (into (e/local-set idx)))]))
+                                        [ctx []] (partition 2 binds))
+              tail (if (= 1 (count body)) (first body) (cons 'do body))]
+          (into init-bytes (emit-val ctx' tail)))
+        (= h 'do)
+        (into (vec (mapcat #(emit-effect ctx %) (butlast A))) (emit-val ctx (last A)))
         :else (throw (ex-info (str "unhandled value head " h) {:node node}))))
     :else (throw (ex-info (str "unhandled value node " (pr-str node)) {}))))
 
@@ -119,6 +131,7 @@
         (= 'float (first node))  :f32
         (= 'double (first node)) :f64
         (#{'long 'int} (first node)) (infer-vt ctx (second node))
+        (#{'let* 'do} (first node)) (infer-vt ctx (last node))  ; value of tail
         (= 'clojure.core/aget (first node))  (get-in ctx [:elems (second node) :vt] :f64)
         :else :i32))
     :else :i32))

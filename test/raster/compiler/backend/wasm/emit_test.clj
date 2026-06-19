@@ -32,6 +32,14 @@
                                                      (raster.arrays/aget y i))))
       acc)))
 
+(deftm sq-k [x :- Double] :- Double (raster.numeric/* x x))
+
+(deftm sumsq-k [a :- (Array double), n :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i)) (raster.numeric/+ acc (sq-k (raster.arrays/aget a i))))
+      acc)))
+
 (deftm relu-k! [x :- (Array double), out :- (Array double), n :- Long] :- nil
   (dotimes [i n]
     (when (clojure.core/> (raster.arrays/aget x i) 0.0)
@@ -97,6 +105,19 @@
             got (Double/longBitsToDouble (aget r 0))
             exp (reduce + (map #(* (double %) 2.0) (range n)))]
         (is (< (Math/abs (- got exp)) 1e-6) (str "dot=" got " exp=" exp))))))
+
+(deftest sumsq-inlined-deftm-kernel
+  (testing "deftm→deftm call (sq-k) inlined → let* in value position"
+    (let [m (pl/compile-wasm #'sumsq-k :name "sumsq")
+          inst (instantiate (:bytes m))
+          mem (.memory inst)
+          n 100]
+      (is (= [:f64] (:result-types m)))
+      (dotimes [i n] (.writeF64 mem (* 8 i) (double i)))
+      (let [r (.apply (.export inst "sumsq") (long-array [0 n]))
+            got (Double/longBitsToDouble (aget r 0))
+            exp (reduce + (map #(* (double %) (double %)) (range n)))]
+        (is (< (Math/abs (- got exp)) 1e-6) (str "sumsq=" got " exp=" exp))))))
 
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
