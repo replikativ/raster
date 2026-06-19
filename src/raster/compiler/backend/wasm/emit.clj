@@ -553,6 +553,13 @@
 
     (and (seq? node) (#{'loop 'loop*} (first node))) (emit-loop ctx node)
 
+    ;; value-type return: (->Type e0 e1 …) → wasm multi-value return. Each field
+    ;; expr is pushed; ret-vt is a VECTOR of valtypes (the value type's fields).
+    ;; (soa-lower/lower-value-fn leaves the constructor tail intact for us.)
+    (and (seq? node) (symbol? (first node)) (.startsWith (name (first node)) "->"))
+    (let [args (rest node)]
+      [(vec (mapcat #(emit-val ctx %) args)) (mapv #(infer-vt ctx %) args)])
+
     :else [(emit-val ctx node) (infer-vt ctx node)]))
 
 (defn- compile-fn
@@ -567,7 +574,8 @@
         ctx {:env env0 :elems elems :base (count params) :locals (atom []) :simd? simd?}
         [body-bytes ret-vt] (emit-result ctx ir)]
     {:name name :param-types param-vts
-     :result-types (if ret-vt [ret-vt] [])
+     ;; ret-vt: nil = void · keyword = single value · vector = multi-value (value-type return)
+     :result-types (cond (nil? ret-vt) [] (vector? ret-vt) ret-vt :else [ret-vt])
      :locals @(:locals ctx) :body body-bytes}))
 
 (defn compile-module

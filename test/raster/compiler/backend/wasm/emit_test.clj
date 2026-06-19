@@ -207,3 +207,25 @@
     (let [simd (pl/compile-wasm #'vaddf-simd! :name "vaddf" :dtype :float :wasm-simd? true)]
       (is (some? (Parser/parse (:bytes simd))))
       (is (has-v128? simd) "f32 vectorizer emitted v128 instructions"))))
+
+;; ── value-type boundary (defvalue-in / defvalue-out deftm → wasm) ───────────
+;; A scalar value-type param expands to per-field scalar params; a (->Type …)
+;; return becomes a wasm multi-value return. This is the per-element value-type
+;; path that lets defvalue flow over the cljs↔wasm boundary (cross-platform games).
+(raster.core/defvalue WV2 [x :- Double, y :- Double])
+
+(deftm wv2-move [s :- WV2, dx :- Double, dy :- Double] :- WV2
+  (->WV2 (raster.numeric/+ (.x s) dx) (raster.numeric/+ (.y s) dy)))
+
+(deftest value-type-in-out-multivalue
+  (testing "value-type param → per-field scalars; value-type return → multi-value"
+    (let [m (pl/compile-wasm #'wv2-move :name "wv2move")]
+      (is (= [:f64 :f64 :f64 :f64] (:param-types m)))   ; s.x s.y dx dy
+      (is (= [:f64 :f64] (:result-types m)))            ; (->WV2 …) multi-value
+      (let [inst (instantiate (:bytes m))
+            r (.apply (.export inst "wv2move")
+                      (long-array [(Double/doubleToRawLongBits 1.0) (Double/doubleToRawLongBits 2.0)
+                                   (Double/doubleToRawLongBits 10.0) (Double/doubleToRawLongBits 20.0)]))]
+        (is (= 2 (alength r)))
+        (is (= 11.0 (Double/longBitsToDouble (aget r 0))))
+        (is (= 22.0 (Double/longBitsToDouble (aget r 1))))))))

@@ -888,10 +888,18 @@
         form (run-passes raw-form forward-passes opts)
         d-params (:raster.core/deftm-params (meta resolved))
         d-tags   (:raster.core/deftm-tags (meta resolved))
+        return-tag (:raster.core/return-tag (meta resolved))
         param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
                                      :tag (symbol t)})
                           d-params d-tags)
-        {lowered-body :body lowered-params :params} (soa-lower/soa-lower form param-specs)]
+        value-reg @raster.compiler.core.types/soa-registry
+        ;; scalar value-type kernel (value-type param or return) vs SoA-array kernel
+        value-fn? (or (some #(contains? value-reg (:tag %)) param-specs)
+                      (contains? value-reg return-tag))
+        {lowered-body :body lowered-params :params}
+        (if value-fn?
+          (soa-lower/lower-value-fn form param-specs return-tag)
+          (soa-lower/soa-lower form param-specs))]
     {:name (or name (str (:name (meta resolved))))
      :params lowered-params :ir lowered-body :simd? wasm-simd?}))
 

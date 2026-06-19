@@ -212,3 +212,80 @@
       {:body          (lower-body soa-env body)
        :params        (expand-params param-specs soa-env)
        :soa-expansion soa-env})))
+
+;; ─────────────────────────────────────────────────────────────────────────
+;; Scalar value-type boundary (value-type-in / value-type-out deftms → wasm).
+;; A param `s :- Shape` (Shape a registered value type) becomes per-field scalar
+;; params (s_x, s_y, …); `(.x s)` projects to the field param; a `(->Shape …)`
+;; return tail is left intact for the emitter to turn into a wasm multi-value
+;; return. This is the per-element value-type path (SoA batching is separate).
+;; ─────────────────────────────────────────────────────────────────────────
+
+(defn scalar-value-param-env
+  "Params whose :tag is a registered SCALAR value type (Shape, not ShapeSoA) →
+   {sym → {:scalar-tag tag :fields [{:name :element-tag …}]}}."
+  [param-specs]
+  (let [reg @types/soa-registry]
+    (into {} (keep (fn [{:keys [sym tag]}]
+                     (when-let [info (get reg tag)]
+                       [sym {:scalar-tag tag :fields (:fields info)}]))
+                   param-specs))))
+
+(defn- expand-scalar-params
+  "Replace each scalar value-type param with its per-field scalar params."
+  [param-specs env]
+  (vec (mapcat (fn [{:keys [sym] :as p}]
+                 (if-let [info (get env sym)]
+                   (mapv (fn [{:keys [name element-tag]}]
+                           {:sym (field-arr-sym sym name) :tag element-tag})
+                         (:fields info))
+                   [p]))
+               param-specs)))
+
+(defn- ctor-call? [x]
+  (and (seq? x) (symbol? (first x)) (.startsWith (name (first x)) "->")))
+
+(defn- unwrap-ctor-return
+  "Put a value-type-constructor return in TAIL position. The front-half body-lift
+   wraps it as (let* [… [r (->Type …)]] r); collapse that so emit-result sees the
+   constructor as the return (→ wasm multi-value). Recurses through let*/do tails."
+  [form]
+  (if (and (seq? form) (#{'let* 'do} (first form)))
+    (if (= 'let* (first form))
+      (let [[_ binds & body] form
+            body (vec body)
+            tail (peek body)
+            pairs (vec (partition 2 binds))
+            lp   (peek pairs)]
+        (if (and (symbol? tail) lp (= tail (first lp)) (ctor-call? (second lp)))
+          (recur (apply list 'let* (vec (apply concat (pop pairs)))
+                        (conj (subvec body 0 (dec (count body))) (second lp))))
+          (apply list 'let* binds (conj (subvec body 0 (dec (count body)))
+                                        (unwrap-ctor-return tail)))))
+      (let [body (vec (rest form))]
+        (apply list 'do (conj (subvec body 0 (dec (count body)))
+                              (unwrap-ctor-return (peek body))))))
+    form))
+
+(defn lower-value-fn
+  "Lower a value-type-in/out deftm for the wasm backend. `param-specs` ordered
+   {:sym :tag}; `return-tag` the deftm's return type tag (may be a value type).
+   Projects (.field s) on scalar value-type params to the per-field param sym;
+   leaves a (->Type …) return tail for the emitter (→ multi-value return).
+   Returns {:body :params :ret-fields} (ret-fields = the value-type's fields, or
+   nil for a scalar/void return)."
+  [body param-specs return-tag]
+  (let [env        (scalar-value-param-env param-specs)
+        param-syms (set (keys env))
+        body' (walk/postwalk
+               (fn [f]
+                 (if (and (seq? f) (= 2 (count f)) (symbol? (first f))
+                          (.startsWith (str (first f)) ".")
+                          (contains? param-syms (second f)))
+                   (field-arr-sym (second f) (subs (str (first f)) 1))
+                   f))
+               body)
+        body' (if (get @types/soa-registry return-tag) (unwrap-ctor-return body') body')]
+    {:body      body'
+     :params    (expand-scalar-params param-specs env)
+     :ret-fields (:fields (get @types/soa-registry return-tag))}))
