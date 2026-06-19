@@ -1,8 +1,0 @@
-node_modules/
-.shadow-cljs/
-public/js/
-.cpcache/
-*.log
-
-# generated wasm artifacts (regenerable via node/emit_kernels.mjs / the JVM emitter)
-public/*.wasm

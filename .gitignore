@@ -19,3 +19,6 @@ docs/
 .claude/
 valhalla-env.sh
 _site/
+
+# local dev sandbox for the cljs/browser port (not shipped; testing strategy TBD)
+/cljs-sandbox/
