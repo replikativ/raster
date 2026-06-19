@@ -47,75 +47,110 @@
                    [p]))
                param-specs)))
 
+(defn- local-name [head] (let [s (str head)] (subs s (inc (.lastIndexOf s "/")))))
+
 (defn- constructor->scalar-tag
   "(->Cx …) head → scalar tag 'Cx if registered, else nil."
   [head]
-  (let [s (str head)
-        local (subs s (inc (.lastIndexOf s "/")))]   ; strip ns qualifier
+  (let [local (local-name head)]
     (when (.startsWith local "->")
       (let [t (symbol (subs local 2))]
         (when (get @types/soa-registry t) t)))))
-
-(defn- soa-accessor? [prefix head soa-sym soa-env]
-  (and (symbol? soa-sym)
-       (get soa-env (symbol (name soa-sym)))
-       (let [s (str head)
-             local (subs s (inc (.lastIndexOf s "/")))]
-         (.startsWith local prefix))))
 
 (defn- field-access-head? [head]
   (and (symbol? head)
        (let [s (str head)]
          (and (.startsWith s ".") (> (count s) 1) (not (#{".invk" "."} s))))))
 
+(defn- aget-head? [head]
+  (or (#{'aget 'clojure.core/aget 'raster.arrays/aget} head)
+      (.startsWith (local-name head) "aget-")))
+
+(defn- aset-head? [head]
+  (or (#{'aset 'clojure.core/aset 'raster.arrays/aset 'raster.arrays/aset!} head)
+      (.startsWith (local-name head) "aset-")))
+
+;; ctx: {:soa {soa-sym → soa-info}  :exploded {local-sym → {field-name → expr}}}
+(defn- soa-info-for
+  "soa-info for a symbol, via param env or its :tag (the GPU idiom: aget on a
+   SoA-typed symbol). nil if not a SoA value."
+  [ctx sym]
+  (when (symbol? sym)
+    (or (get (:soa ctx) (symbol (name sym)))
+        (when-let [scalar (get @types/soa-reverse-registry (:tag (meta sym)))]
+          {:scalar-tag scalar :fields (:fields (get @types/soa-registry scalar))}))))
+
 (declare lower)
 
 (defn- explode
-  "If form is value-type-valued and explodable, return {field-name → lowered-field-expr}; else nil."
-  [soa-env form]
-  (when (seq? form)
+  "If form is value-type-valued and explodable, return {field-name → lowered-field-expr};
+   else nil. Handles: exploded local sym, construction, SoA element read (named accessor
+   or plain aget on a SoA-typed symbol)."
+  [ctx form]
+  (cond
+    (symbol? form) (get-in ctx [:exploded form])
+    (seq? form)
     (let [head (first form)]
       (cond
-        ;; construction (->Cx a b …)
         (constructor->scalar-tag head)
-        (let [scalar (constructor->scalar-tag head)
-              fields (:fields (get @types/soa-registry scalar))]
-          (zipmap (map :name fields) (map #(lower soa-env %) (rest form))))
-        ;; SoA element read (aget-cx soa i)
-        (soa-accessor? "aget-" head (second form) soa-env)
-        (let [soa (symbol (name (second form)))
-              i   (lower soa-env (nth form 2))
-              info (get soa-env soa)]
+        (let [fields (:fields (get @types/soa-registry (constructor->scalar-tag head)))]
+          (zipmap (map :name fields) (map #(lower ctx %) (rest form))))
+        (and (aget-head? head) (soa-info-for ctx (second form)))
+        (let [soa  (symbol (name (second form)))
+              i    (lower ctx (nth form 2))
+              info (soa-info-for ctx (second form))]
           (into {} (map (fn [{nm :name}]
                           [nm (list 'clojure.core/aget (field-arr-sym soa nm) i)])
                         (:fields info))))
-        :else nil))))
+        :else nil))
+    :else nil))
 
 (defn- lower
-  "Rewrite a form, scalar-replacing SoA/value-type access. Returns the rewritten form."
-  [soa-env form]
+  "Scalar-replace SoA/value-type access. ctx threads SoA params + exploded locals."
+  [ctx form]
   (cond
+    ;; bare exploded local reaching a non-projection position → escape (unsupported v1)
+    (and (symbol? form) (contains? (:exploded ctx) form))
+    (throw (ex-info (str "value-type local escapes (used non-projectively): " form)
+                    {:sym form}))
+
+    ;; (.field x) where x explodes → the field expr
     (and (seq? form) (field-access-head? (first form)))
-    (let [ex (explode soa-env (second form))
-          fname (subs (str (first form)) 1)]            ; ".re" → "re" (field :name is a string)
+    (let [ex (explode ctx (second form))
+          fname (subs (str (first form)) 1)]
       (if (and ex (contains? ex fname))
         (get ex fname)
-        (apply list (map #(lower soa-env %) form))))   ; not explodable → recurse
+        (apply list (map #(lower ctx %) form))))     ; non-value-type field access → recurse
 
-    (and (seq? form) (soa-accessor? "aset-" (first form) (second form) soa-env))
+    ;; let* — bind exploded value-locals into ctx and DROP their bindings
+    (and (seq? form) (= 'let* (first form)))
+    (let [[_ binds & body] form
+          [ctx' out] (reduce (fn [[c bs] [s e]]
+                               (if-let [ex (explode c e)]
+                                 [(assoc-in c [:exploded s] ex) bs]   ; virtual: drop binding
+                                 [c (conj bs s (lower c e))]))
+                             [ctx []] (partition 2 binds))]
+      (apply list 'let* (vec out) (map #(lower ctx' %) body)))
+
+    ;; SoA store: (aset[-k]! soa i v) → per-field stores
+    (and (seq? form) (aset-head? (first form)) (soa-info-for ctx (second form)))
     (let [[_ soa-raw i v] form
-          soa (symbol (name soa-raw))
-          info (get soa-env soa)
-          ex (explode soa-env v)
-          i' (lower soa-env i)]
+          soa  (symbol (name soa-raw))
+          info (soa-info-for ctx soa-raw)
+          ex   (explode ctx v)
+          i'   (lower ctx i)]
       (if ex
         (cons 'do (map (fn [{nm :name}]
                          (list 'clojure.core/aset (field-arr-sym soa nm) i' (get ex nm)))
                        (:fields info)))
-        (apply list (map #(lower soa-env %) form))))
+        (throw (ex-info "aset of a non-explodable value-type" {:value v}))))
 
-    (seq? form) (apply list (map #(lower soa-env %) form))
-    (vector? form) (mapv #(lower soa-env %) form)
+    ;; a value-type value reaching a generic (non-consuming) position → escape
+    (and (seq? form) (explode ctx form))
+    (throw (ex-info "value-type value in a non-consuming position (escapes)" {:form form}))
+
+    (seq? form) (apply list (map #(lower ctx %) form))
+    (vector? form) (mapv #(lower ctx %) form)
     :else form))
 
 (defn soa-lower
@@ -125,5 +160,5 @@
   (let [soa-env (soa-param-env param-specs)]
     (if (empty? soa-env)
       {:body body :params param-specs}
-      {:body   (lower soa-env body)
+      {:body   (lower {:soa soa-env :exploded {}} body)
        :params (expand-params param-specs soa-env)})))

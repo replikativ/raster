@@ -86,16 +86,17 @@
         (= h 'clojure.core/aget)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
-        (#{'clojure.core/< 'clojure.core/<= 'clojure.core/> 'clojure.core/>=
-           'clojure.core/== 'clojure.core/= 'clojure.core/not=} h)
+        ;; comparisons — match by local name (bare or clojure.core-qualified)
+        (#{"<" "<=" ">" ">=" "==" "=" "not="} (name h))
         (let [v0 (infer-vt ctx (A 0))
               vt (if (#{:f64 :f32} v0) v0 (infer-vt ctx (A 1)))  ; float if either operand is float
-              base (case h clojure.core/< "lt" clojure.core/<= "le"
-                          clojure.core/> "gt" clojure.core/>= "ge"
-                          clojure.core/not= "ne" "eq")]
+              base (case (name h) "<" "lt" "<=" "le" ">" "gt" ">=" "ge" "not=" "ne" "eq")]
           (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i (cmp-op base vt)))))
-        (= h 'clojure.core/inc)(-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.add)))
-        (= h 'clojure.core/dec)(-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.sub)))
+        ;; integer step (inc/dec, incl. unchecked-*-int)
+        (#{"inc" "unchecked-inc-int" "unchecked-inc"} (name h))
+        (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.add)))
+        (#{"dec" "unchecked-dec-int" "unchecked-dec"} (name h))
+        (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.sub)))
         (= h '.invk)
         (let [sem (:raster.op/original (meta node))
               vt  (case (:raster.type/tag (meta node)) double :f64 float :f32 :i32)
@@ -271,7 +272,7 @@
           [b ret] (emit-result ctx (last stmts))]
       [(into (vec (mapcat #(emit-effect ctx %) (butlast stmts))) b) ret])
 
-    (and (seq? node) (= 'loop (first node))) (emit-loop ctx node)
+    (and (seq? node) (#{'loop 'loop*} (first node))) (emit-loop ctx node)
 
     :else [(emit-val ctx node) (infer-vt ctx node)]))
 

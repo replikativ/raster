@@ -26,6 +26,11 @@
       (is (= '[as_re as_im n] (mapv :sym expanded)))
       (is (= '[doubles doubles long] (mapv :tag expanded))))))
 
+(deftm get-re-soa! [ps :- CplxSoA, out :- (Array double), n :- Long] :- nil
+  (dotimes [i n]
+    (let [p (aget-cplx ps i)]                ; value-type LOCAL bound to a SoA read
+      (raster.arrays/aset out i (.re p)))))   ; projected → (aget ps_re i)
+
 (defn- instantiate [^bytes wasm] (-> (Instance/builder (Parser/parse wasm)) (.build)))
 
 (deftest cadd-soa-compiles-and-runs
@@ -50,3 +55,16 @@
                                        (not= (.readDouble mem (* 8 (+ (* 5 n) i))) (+ (double (* 2 i)) 100.0))))
                                  (range n)))]
           (is (zero? bad) (str bad " complex-add mismatches")))))))
+
+(deftest value-type-local-projection
+  (testing "let-bound value-type local: (let [p (aget-cplx ps i)] … (.re p)) → (aget ps_re i)"
+    (let [m (pl/compile-wasm #'get-re-soa! :name "getre")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    32]
+      ;; layout: ps_re@0 ps_im@n out@2n
+      (dotimes [i n] (.writeF64 mem (* 8 i) (double (* 3 i))) (.writeF64 mem (* 8 (+ n i)) 0.0))
+      (.apply (.export inst "getre") (long-array [0 (* 8 n) (* 8 (* 2 n)) n]))
+      (let [bad (count (filter (fn [i] (not= (.readDouble mem (* 8 (+ (* 2 n) i))) (double (* 3 i))))
+                               (range n)))]
+        (is (zero? bad) (str bad " get-re mismatches"))))))
