@@ -868,6 +868,32 @@
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))
 
+(defn- wasm-kernel-spec
+  "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm
+   emitter: walker → forward-passes → soa-lower (value-type SoA → per-field arrays)."
+  [f-var dtype name wasm-simd?]
+  (let [resolved      (or (resolve-deftm-var f-var dtype) f-var)
+        walked-body   (get-walked-body f-var dtype)
+        active-params (clean-params (get-params f-var dtype))
+        param-env     (build-param-env f-var dtype)
+        source-ns     (let [m (meta resolved)]
+                        (or (when-let [s (:raster.core/deftm-source-ns m)]
+                              (try (the-ns s) (catch Exception _ nil)))
+                            (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
+        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
+               param-env (assoc :param-env param-env)
+               source-ns (assoc :source-ns source-ns))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
+        form (run-passes raw-form forward-passes opts)
+        d-params (:raster.core/deftm-params (meta resolved))
+        d-tags   (:raster.core/deftm-tags (meta resolved))
+        param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
+                                     :tag (symbol t)})
+                          d-params d-tags)
+        {lowered-body :body lowered-params :params} (soa-lower/soa-lower form param-specs)]
+    {:name (or name (str (:name (meta resolved))))
+     :params lowered-params :ir lowered-body :simd? wasm-simd?}))
+
 (defn compile-wasm
   "Compile a deftm var to a WebAssembly module (Track A — browser/WASI target).
    Reuses compile-aot's front-half (walker → forward-passes) to produce the same
@@ -882,35 +908,20 @@
    buffers); `:simd? false` is forced (the JVM Vector-API SIMD lowering is
    JVM-only — a wasm-SIMD128 path is a later increment)."
   [f-var & {:keys [dtype name wasm-simd?] :or {dtype :double}}]
-  (let [resolved      (or (resolve-deftm-var f-var dtype) f-var)
-        walked-body   (get-walked-body f-var dtype)
-        params        (get-params f-var dtype)
-        active-params (clean-params params)
-        param-env     (build-param-env f-var dtype)
-        source-ns     (let [m (meta resolved)]
-                        (or (when-let [s (:raster.core/deftm-source-ns m)]
-                              (try (the-ns s) (catch Exception _ nil)))
-                            (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
-        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
-               param-env (assoc :param-env param-env)
-               source-ns (assoc :source-ns source-ns))
-        raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
-        form (run-passes raw-form forward-passes opts)
-        ;; ordered {:sym :tag} from the deftm metadata (tags are walker tags:
-        ;; 'double / 'doubles / 'long …)
-        d-params (:raster.core/deftm-params (meta resolved))
-        d-tags   (:raster.core/deftm-tags (meta resolved))
-        param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
-                                     :tag (symbol t)})
-                          d-params d-tags)
-        ;; Scalar-replace value-type aggregates (SoA params → per-field arrays;
-        ;; aget-soa/.field/->Scalar/aset-soa! → primitive array ops).
-        {lowered-body :body lowered-params :params} (soa-lower/soa-lower form param-specs)]
-    (wasm-emit/compile-kernel
-     {:name (or name (str (:name (meta resolved))))
-      :params lowered-params
-      :ir lowered-body
-      :simd? wasm-simd?})))
+  (wasm-emit/compile-kernel (wasm-kernel-spec f-var dtype name wasm-simd?)))
+
+(defn compile-wasm-module
+  "Compile several deftm vars into ONE wasm module that shares a single linear
+   memory — so a program's data lives in one buffer addressed by all the exported
+   kernels (vs compile-wasm's one-module-per-kernel). Each spec is either a var or
+   {:var v :name str :dtype kw :wasm-simd? bool}.
+   Returns {:bytes byte[] :exports [{:name :param-types :result-types} …]}."
+  [specs]
+  (wasm-emit/compile-module
+   (mapv (fn [s]
+           (let [s (if (map? s) s {:var s})]
+             (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
+         specs)))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)

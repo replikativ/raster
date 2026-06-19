@@ -555,26 +555,42 @@
 
     :else [(emit-val ctx node) (infer-vt ctx node)]))
 
-(defn compile-kernel
-  "Compile a kernel IR to a wasm module byte[].
-   params: ordered [{:sym :tag}].  ir: post-pass S-expr. The result type is
-   inferred from the IR (loop else-value / scalar body).
-   :simd? enables SIMD128 vectorization of elementwise dotimes-maps.
-   Returns {:bytes byte[] :name :param-types [vt...] :result-types [vt...]}."
-  [{:keys [name params ir mem-pages simd?] :or {mem-pages 256}}]
+(defn- compile-fn
+  "Compile one kernel IR to its per-function pieces (no module wrapper).
+   {:name :params [{:sym :tag}] :ir :simd?} →
+   {:name :param-types :result-types :locals :body}. Result type is inferred
+   from the IR (loop else-value / scalar body); nil = void (array-mutating)."
+  [{:keys [name params ir simd?]}]
   (let [param-vts (mapv #(tag->vt (:tag %)) params)
         env0 (into {} (map-indexed (fn [idx {:keys [sym tag]}] [sym {:idx idx :vt (tag->vt tag)}]) params))
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
         ctx {:env env0 :elems elems :base (count params) :locals (atom []) :simd? simd?}
-        [body-bytes ret-vt] (emit-result ctx ir)
-        result-types (if ret-vt [ret-vt] [])     ; nil ret-vt = void (array-mutating)
-        locals @(:locals ctx)]
-    {:name name
-     :param-types param-vts
-     :result-types result-types
-     :bytes (e/build-module
-             {:types [(e/functype param-vts result-types)]
-              :funcs [{:name name :type-idx 0
-                       :param-types param-vts :result-types result-types
-                       :locals locals :body body-bytes}]
-              :memory {:min mem-pages :max mem-pages :export "memory"}})}))
+        [body-bytes ret-vt] (emit-result ctx ir)]
+    {:name name :param-types param-vts
+     :result-types (if ret-vt [ret-vt] [])
+     :locals @(:locals ctx) :body body-bytes}))
+
+(defn compile-module
+  "Compile several kernels into ONE wasm module that shares a single linear
+   memory — so a program's SoA data lives in one buffer addressed by all the
+   exported kernels (vs one module/one memory per kernel).
+   kernels: [{:name :params :ir :simd?} …].
+   Returns {:bytes byte[] :exports [{:name :param-types :result-types} …]}."
+  [kernels & {:keys [mem-pages] :or {mem-pages 256}}]
+  (let [fns   (mapv compile-fn kernels)
+        types (mapv #(e/functype (:param-types %) (:result-types %)) fns)
+        funcs (vec (map-indexed (fn [i f] (assoc f :type-idx i)) fns))]
+    {:bytes (e/build-module
+             {:types types :funcs funcs
+              :memory {:min mem-pages :max mem-pages :export "memory"}})
+     :exports (mapv #(select-keys % [:name :param-types :result-types]) fns)}))
+
+(defn compile-kernel
+  "Compile a single kernel IR to a one-function wasm module (its own memory).
+   For multiple kernels sharing one memory use compile-module.
+   Returns {:bytes byte[] :name :param-types [vt…] :result-types [vt…]}."
+  [{:keys [mem-pages] :or {mem-pages 256} :as kernel}]
+  (let [m (compile-module [kernel] :mem-pages mem-pages)
+        x (first (:exports m))]
+    {:bytes (:bytes m) :name (:name x)
+     :param-types (:param-types x) :result-types (:result-types x)}))
