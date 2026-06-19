@@ -29,6 +29,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
@@ -901,11 +902,14 @@
         d-tags   (:raster.core/deftm-tags (meta resolved))
         param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
                                      :tag (symbol t)})
-                          d-params d-tags)]
+                          d-params d-tags)
+        ;; Scalar-replace value-type aggregates (SoA params → per-field arrays;
+        ;; aget-soa/.field/->Scalar/aset-soa! → primitive array ops).
+        {lowered-body :body lowered-params :params} (soa-lower/soa-lower form param-specs)]
     (wasm-emit/compile-kernel
      {:name (or name (str (:name (meta resolved))))
-      :params param-specs
-      :ir form})))
+      :params lowered-params
+      :ir lowered-body})))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)

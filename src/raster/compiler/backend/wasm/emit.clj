@@ -102,6 +102,14 @@
               opk (or (arith-op sem vt) (throw (ex-info (str "unhandled .invk op " sem) {})))
               [_impl o1 o2] A]
           (-> (emit-val ctx o1) (into (emit-val ctx o2)) (into (e/i opk))))
+        ;; bare raster.numeric/{+,-,*,/} — SROA output isn't re-devirtualized, and
+        ;; the op IS the head (no .invk wrapper); type from the operands.
+        (#{'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//} h)
+        (let [[o1 o2] A
+              v0 (infer-vt ctx o1)
+              vt (if (#{:f64 :f32} v0) v0 (infer-vt ctx o2))
+              opk (arith-op h vt)]
+          (-> (emit-val ctx o1) (into (emit-val ctx o2)) (into (e/i opk))))
         ;; let* / do in VALUE position (introduced by inlined deftm calls)
         (= h 'let*)
         (let [[binds & body] A
