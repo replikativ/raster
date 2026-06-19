@@ -1,0 +1,13 @@
+{
+  "name": "geometric-asteroids-web",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Browser build of cross-platform Geometric Asteroids (raster deftm -> wasm).",
+  "scripts": {
+    "watch": "shadow-cljs watch casteroids",
+    "release": "shadow-cljs release casteroids"
+  },
+  "devDependencies": {
+    "shadow-cljs": "2.28.20"
+  }
+}

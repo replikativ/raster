@@ -1,0 +1,11 @@
+;; Browser playground for cross-platform Geometric Asteroids.
+;;   src               — asteroids.web (Canvas2D shell) + generated asteroids.kernels
+;;   ../..             — asteroids.game (.cljc, shared with the JVM build)
+;;   ../../../src      — raster.wasm (the cljs↔wasm runtime loader, shipped with raster)
+{:paths ["src"]
+ :deps  {org.clojure/clojure        {:mvn/version "1.12.0"}
+         org.clojure/clojurescript  {:mvn/version "1.11.132"}
+         thheller/shadow-cljs       {:mvn/version "2.28.20"}
+         applied-science/js-interop {:mvn/version "0.4.2"}}
+ :aliases
+ {:cljs {:extra-paths ["../.." "../../../src"]}}}

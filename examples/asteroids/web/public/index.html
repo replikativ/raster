@@ -1,0 +1,20 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Geometric Asteroids — cross-platform (cljs + raster→wasm)</title>
+  <style>
+    html, body { margin: 0; height: 100%; background: #000; color: #ccc;
+                 font-family: Georgia, 'Times New Roman', serif; overflow: hidden; }
+    canvas { display: block; background: #000; }
+    #hud { position: fixed; top: 10px; left: 16px; font-size: 18px; letter-spacing: 1px; }
+    #sub { position: fixed; bottom: 10px; left: 16px; font-size: 13px; color: #666; }
+  </style>
+</head>
+<body>
+  <canvas id="game" width="1024" height="768"></canvas>
+  <div id="hud"></div>
+  <div id="sub">↑ thrust · ← → rotate · space fire · one .cljc game · physics = raster deftm → wasm</div>
+  <script src="/js/main.js"></script>
+</body>
+</html>

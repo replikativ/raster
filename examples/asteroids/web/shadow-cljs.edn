@@ -1,0 +1,13 @@
+;; Browser build for cross-platform Geometric Asteroids.
+;;   npm install            # once (fetches shadow-cljs)
+;;   npx shadow-cljs watch casteroids   # dev, http://localhost:8080
+;;   npx shadow-cljs release casteroids # optimized build
+;; Regenerate the wasm kernels + generated cljs (after editing ../kernels.clj):
+;;   (cd ../../.. && clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/asteroids/web/gen.clj)
+{:deps    {:aliases [:cljs]}
+ :dev-http {8080 "public"}
+ :builds
+ {:casteroids {:target     :browser
+               :output-dir "public/js"
+               :asset-path "/js"
+               :modules    {:main {:init-fn asteroids.web/init}}}}}

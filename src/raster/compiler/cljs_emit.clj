@@ -47,7 +47,9 @@
   (let [arglist   (mapv (comp symbol :name) params)
         call-args (vec (mapcat (fn [{:keys [kind name fields]}]
                                  (if (= :value kind)
-                                   (map #(list (symbol (str ".-" %)) (symbol name)) fields)  ; (.-x s)
+                                   ;; keyword/ILookup access — rename-safe under :advanced
+                                   ;; (a record's raw (.-x s) can't be type-inferred → externs warning)
+                                   (map #(list (keyword (clojure.core/name %)) (symbol name)) fields)  ; (:x s)
                                    [(symbol name)]))
                                params))
         call (list* (list 'kfn export) call-args)]

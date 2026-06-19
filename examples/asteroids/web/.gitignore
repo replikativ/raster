@@ -1,0 +1,4 @@
+/node_modules/
+/.shadow-cljs/
+/.cpcache/
+/public/js/
