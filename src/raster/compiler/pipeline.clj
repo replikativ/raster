@@ -901,7 +901,12 @@
           (soa-lower/lower-value-fn form param-specs return-tag)
           (soa-lower/soa-lower form param-specs))]
     {:name (or name (str (:name (meta resolved))))
-     :params lowered-params :ir lowered-body :simd? wasm-simd?}))
+     :params lowered-params :ir lowered-body :simd? wasm-simd?
+     ;; the ORIGINAL (pre-lowering) semantic signature — for the cljs marshaling
+     ;; codegen: which params/return are value types (and their field order).
+     :sig {:param-names (mapv :sym param-specs)   ; already plain symbols
+           :param-tags  (mapv :tag param-specs)
+           :return-tag  return-tag}}))
 
 (defn compile-wasm
   "Compile a deftm var to a WebAssembly module (Track A — browser/WASI target).
@@ -924,13 +929,17 @@
    memory — so a program's data lives in one buffer addressed by all the exported
    kernels (vs compile-wasm's one-module-per-kernel). Each spec is either a var or
    {:var v :name str :dtype kw :wasm-simd? bool}.
-   Returns {:bytes byte[] :exports [{:name :param-types :result-types} …]}."
+   Returns {:bytes byte[] :exports [{:name :param-types :result-types :sig} …]}
+   where :sig is the original semantic signature (for cljs marshaling codegen)."
   [specs]
-  (wasm-emit/compile-module
-   (mapv (fn [s]
-           (let [s (if (map? s) s {:var s})]
-             (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
-         specs)))
+  (let [kspecs (mapv (fn [s]
+                       (let [s (if (map? s) s {:var s})]
+                         (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
+                     specs)
+        sig-by-name (into {} (map (juxt :name :sig) kspecs))
+        module (wasm-emit/compile-module kspecs)]
+    (update module :exports
+            (fn [exs] (mapv #(assoc % :sig (sig-by-name (:name %))) exs)))))
 
 (defn compile-wgsl
   "Compile a deftm var to a WGSL compute shader (Track C — WebGPU compute).
