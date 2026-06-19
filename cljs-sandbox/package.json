@@ -10,7 +10,8 @@
     "release": "shadow-cljs release app"
   },
   "dependencies": {
-    "binaryen": "^123.0.0"
+    "binaryen": "^123.0.0",
+    "puppeteer-core": "^25.1.0"
   },
   "devDependencies": {
     "shadow-cljs": "^2.28.0"

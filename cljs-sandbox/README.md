@@ -33,6 +33,31 @@ npx shadow-cljs watch app
 # open http://localhost:8080  (Chrome/Edge, or Safari 26 / Firefox Nightly for WebGPU)
 ```
 
+### Automated run (no manual browser) — `node/run_browser.mjs`
+
+Drives headful Chromium on `DISPLAY=:0` (real GPU → real WebGPU adapter),
+serves `public/`, runs the experiments, prints console + the `#log` text, and
+writes `/tmp/sandbox_screenshot.png`.
+
+```bash
+node_modules/.bin/shadow-cljs compile app      # DEV build — see externs note below
+DISPLAY=:0 node node/run_browser.mjs
+```
+
+Last local run (Chrome 148 on :0): `navigator.gpu present: true`,
+`requestAdapter ok: true`, **WebGPU saxpy PASS (max|gpu-cpu| = 0)**, WebGL2
+triangle drawn.
+
+### ⚠️ externs lesson (matters for the real backend)
+
+A `release` (advanced-compilation) build **munged** the WebGPU method names
+(`.requestDevice`/`.createBuffer` → `f.lc …`) because ClojureScript ships no
+WebGPU externs → runtime `TypeError`. A **dev build (`compile`/`watch`) does not
+munge**, so the experiments pass there. For the real port, WebGPU/WebGL interop
+must go through **`applied-science/js-interop` (`j/call`/`j/get`)** or supplied
+externs so release builds survive. (wasm interop is unaffected — it's
+ArrayBuffer + integer offsets, nothing to munge.)
+
 WebGPU availability in 2026: Chrome/Edge default; Safari 26+; **Firefox Linux is
 Nightly-only** (so on this dev box, test WebGPU in Chrome). The page degrades
 gracefully and logs why if `navigator.gpu` is missing.
