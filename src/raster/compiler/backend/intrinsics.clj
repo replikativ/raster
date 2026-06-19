@@ -52,8 +52,9 @@
    :sqrt  (math1 :f64.sqrt :f32.sqrt "sqrt")
    :abs   {:arity 1 :kind :fn :wasm (vt3 :f64.abs :f32.abs nil) :c {:fn "fabs" :glsl "abs"} :wgsl {:fn "abs"}}
    :floor (math1 :f64.floor :f32.floor "floor")
-   :ceil  {:arity 1 :kind :fn :c {:fn "ceil"} :wgsl {:fn "ceil"}}      ; no wasm opcode (use floor/neg)
-   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"}}
+   :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
+   :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
+   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"}}    ; returns int — no wasm
    :neg   {:arity 1 :kind :fn :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}
@@ -67,7 +68,34 @@
    :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}}
    :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
    :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
-   :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}})
+   :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}
+   ;; broader elementary set — all wasm via composition/polynomial (see
+   ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
+   ;; omitted → GPU keeps its generated-helper fallback, no regression).
+   :asin  {:arity 1 :kind :fn :wasm :poly :c {:fn "asin"} :wgsl {:fn "asin"}}
+   :acos  {:arity 1 :kind :fn :wasm :poly :c {:fn "acos"} :wgsl {:fn "acos"}}
+   :atan  {:arity 1 :kind :fn :wasm :poly :c {:fn "atan"} :wgsl {:fn "atan"}}
+   :atan2 {:arity 2 :kind :fn :wasm :poly :c {:fn "atan2"} :wgsl {:fn "atan2"}}
+   :sinh  {:arity 1 :kind :fn :wasm :poly :c {:fn "sinh"} :wgsl {:fn "sinh"}}
+   :cosh  {:arity 1 :kind :fn :wasm :poly :c {:fn "cosh"} :wgsl {:fn "cosh"}}
+   :tanh  {:arity 1 :kind :fn :wasm :poly :c {:fn "tanh"} :wgsl {:fn "tanh"}}
+   :asinh {:arity 1 :kind :fn :wasm :poly :c {:fn "asinh"} :wgsl {:fn "asinh"}}
+   :acosh {:arity 1 :kind :fn :wasm :poly :c {:fn "acosh"} :wgsl {:fn "acosh"}}
+   :atanh {:arity 1 :kind :fn :wasm :poly :c {:fn "atanh"} :wgsl {:fn "atanh"}}
+   :cbrt  {:arity 1 :kind :fn :wasm :poly :c {:fn "cbrt"}}
+   :log2  {:arity 1 :kind :fn :wasm :poly :c {:fn "log2"} :wgsl {:fn "log2"}}
+   :log10 {:arity 1 :kind :fn :wasm :poly :c {:fn "log10"}}
+   :exp2  {:arity 1 :kind :fn :wasm :poly :c {:fn "exp2"} :wgsl {:fn "exp2"}}
+   :exp10 {:arity 1 :kind :fn :wasm :poly}
+   :expm1 {:arity 1 :kind :fn :wasm :poly :c {:fn "expm1"}}
+   :log1p {:arity 1 :kind :fn :wasm :poly :c {:fn "log1p"}}
+   :hypot {:arity 2 :kind :fn :wasm :poly :c {:fn "hypot"}}
+   :deg2rad {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "radians"}}
+   :rad2deg {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "degrees"}}
+   :clamp {:arity 3 :kind :fn :wasm :poly :wgsl {:fn "clamp"}}
+   :signum {:arity 1 :kind :fn :wasm :poly :wgsl {:fn "sign"}}
+   :copysign {:arity 2 :kind :fn :wasm :poly :c {:fn "copysign"}}
+   :flipsign {:arity 2 :kind :fn :wasm :poly}})
 
 ;; ---------------------------------------------------------------------------
 ;; Normalization: any op form → canonical key
@@ -79,9 +107,15 @@
   {"+" :+ "-" :- "*" :* "/" :div
    "<" :lt ">" :gt "<=" :le ">=" :ge "==" :eq "=" :eq "not=" :ne "!=" :ne
    "rem" :rem "unchecked-remainder-int" :rem "mod" :mod "quot" :quot
-   "sqrt" :sqrt "abs" :abs "floor" :floor "ceil" :ceil "round" :round
+   "sqrt" :sqrt "abs" :abs "floor" :floor "ceil" :ceil "round" :round "trunc" :trunc
    "min" :min "max" :max "sin" :sin "cos" :cos "tan" :tan "exp" :exp "log" :log
-   "pow" :pow "fma" :fma})
+   "pow" :pow "fma" :fma
+   "asin" :asin "acos" :acos "atan" :atan "atan2" :atan2
+   "sinh" :sinh "cosh" :cosh "tanh" :tanh "asinh" :asinh "acosh" :acosh "atanh" :atanh
+   "cbrt" :cbrt "log2" :log2 "log10" :log10 "exp2" :exp2 "exp10" :exp10
+   "expm1" :expm1 "log1p" :log1p "hypot" :hypot "deg2rad" :deg2rad "rad2deg" :rad2deg
+   "clamp" :clamp "signum" :signum "copysign" :copysign "copySign" :copysign
+   "flipsign" :flipsign})
 
 ;; mangled devirtualized prefix → canonical key (e.g. _plus__m_double_double)
 (def ^:private mangled-prefix->key

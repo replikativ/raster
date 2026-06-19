@@ -273,3 +273,67 @@
             (str "pow " x " " y)))
       (doseq [[x y z] [[2.0 3.0 1.0] [-1.5 4.0 0.5] [10.0 0.1 -2.0]]]
         (is (< (Math/abs (- (calln fi "fma" [x y z]) (+ (* x y) z))) 1e-12) (str "fma " x y z))))))
+
+;; Broader elementary-math set — all lower to wasm via composition/polynomial
+;; (backend.wasm.transcendental), exercising the emitter's generality: value-
+;; position if (atan reduction, atan2 quadrants, cbrt/signum sign), abs/sqrt/min/max.
+(deftm asin-k [x :- Double] :- Double (raster.math/asin x))
+(deftm atan-k [x :- Double] :- Double (raster.math/atan x))
+(deftm atan2-k [y :- Double, x :- Double] :- Double (raster.math/atan2 y x))
+(deftm sinh-k [x :- Double] :- Double (raster.math/sinh x))
+(deftm tanh-k [x :- Double] :- Double (raster.math/tanh x))
+(deftm asinh-k [x :- Double] :- Double (raster.math/asinh x))
+(deftm cbrt-k [x :- Double] :- Double (raster.math/cbrt x))
+(deftm log10-k [x :- Double] :- Double (raster.math/log10 x))
+(deftm exp2-k [x :- Double] :- Double (raster.math/exp2 x))
+(deftm hypot-k [x :- Double, y :- Double] :- Double (raster.math/hypot x y))
+(deftm clamp-k [x :- Double, lo :- Double, hi :- Double] :- Double (raster.math/clamp x lo hi))
+(deftm ceil-k [x :- Double] :- Double (raster.math/ceil x))
+(deftm trunc-k [x :- Double] :- Double (raster.math/trunc x))
+(deftm signum-k [x :- Double] :- Double (raster.math/signum x))
+
+(deftest elementary-math-inline
+  (testing "inverse/hyperbolic/log-family/rounding/sign all emit valid wasm vs Math"
+    (let [as (instantiate (:bytes (pl/compile-wasm #'asin-k :name "asin")))
+          at (instantiate (:bytes (pl/compile-wasm #'atan-k :name "atan")))
+          a2 (instantiate (:bytes (pl/compile-wasm #'atan2-k :name "atan2")))
+          sh (instantiate (:bytes (pl/compile-wasm #'sinh-k :name "sinh")))
+          th (instantiate (:bytes (pl/compile-wasm #'tanh-k :name "tanh")))
+          ah (instantiate (:bytes (pl/compile-wasm #'asinh-k :name "asinh")))
+          cb (instantiate (:bytes (pl/compile-wasm #'cbrt-k :name "cbrt")))
+          lt (instantiate (:bytes (pl/compile-wasm #'log10-k :name "log10")))
+          e2 (instantiate (:bytes (pl/compile-wasm #'exp2-k :name "exp2")))
+          hy (instantiate (:bytes (pl/compile-wasm #'hypot-k :name "hypot")))
+          cl (instantiate (:bytes (pl/compile-wasm #'clamp-k :name "clamp")))
+          ce (instantiate (:bytes (pl/compile-wasm #'ceil-k :name "ceil")))
+          tr (instantiate (:bytes (pl/compile-wasm #'trunc-k :name "trunc")))
+          sg (instantiate (:bytes (pl/compile-wasm #'signum-k :name "signum")))]
+      (doseq [x [-0.9 -0.3 0.0 0.4 0.9]]
+        (is (< (Math/abs (- (call1 as "asin" x) (Math/asin x))) 5e-5) (str "asin " x)))
+      (doseq [x [-5.0 -1.0 0.3 3.0 20.0]]
+        (is (< (Math/abs (- (call1 at "atan" x) (Math/atan x))) 5e-5) (str "atan " x)))
+      ;; atan2 across all quadrants + axes
+      (doseq [[y x] [[1.0 1.0] [1.0 -1.0] [-1.0 -1.0] [-1.0 1.0] [1.0 0.0] [-1.0 0.0]]]
+        (is (< (Math/abs (- (calln a2 "atan2" [y x]) (Math/atan2 y x))) 5e-5) (str "atan2 " y " " x)))
+      (doseq [x [-3.0 -0.5 0.0 0.5 3.0]]
+        (is (< (Math/abs (- (call1 sh "sinh" x) (Math/sinh x))) 1e-9) (str "sinh " x))
+        (is (< (Math/abs (- (call1 th "tanh" x) (Math/tanh x))) 1e-9) (str "tanh " x))
+        (is (< (Math/abs (- (call1 ah "asinh" x) (Math/log (+ x (Math/sqrt (+ (* x x) 1.0)))))) 1e-9) (str "asinh " x)))
+      ;; cbrt incl. negative and the zero guard
+      (doseq [x [27.0 -8.0 0.0 1000.0 -0.001]]
+        (is (< (Math/abs (- (call1 cb "cbrt" x) (Math/cbrt x))) 1e-6) (str "cbrt " x)))
+      (doseq [x [0.5 10.0 1000.0]]
+        (is (< (Math/abs (- (call1 lt "log10" x) (Math/log10 x))) 1e-9) (str "log10 " x)))
+      (doseq [x [-3.0 0.0 10.0]]
+        (is (< (Math/abs (/ (- (call1 e2 "exp2" x) (Math/pow 2.0 x)) (Math/pow 2.0 x))) 1e-9) (str "exp2 " x)))
+      (is (< (Math/abs (- (calln hy "hypot" [3.0 4.0]) 5.0)) 1e-9))
+      (is (= 3.0 (calln cl "clamp" [5.0 0.0 3.0])))
+      (is (= 0.0 (calln cl "clamp" [-1.0 0.0 3.0])))
+      (is (= 2.0 (calln cl "clamp" [2.0 0.0 3.0])))
+      (is (= 3.0 (call1 ce "ceil" 2.1)))
+      (is (= -2.0 (call1 ce "ceil" -2.1)))
+      (is (= 2.0 (call1 tr "trunc" 2.9)))
+      (is (= -2.0 (call1 tr "trunc" -2.9)))
+      (is (= -1.0 (call1 sg "signum" -5.0)))
+      (is (= 1.0 (call1 sg "signum" 5.0)))
+      (is (= 0.0 (call1 sg "signum" 0.0))))))
