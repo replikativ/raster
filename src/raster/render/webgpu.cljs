@@ -12,6 +12,7 @@
    All host interop goes through applied-science.js-interop (string-keyed, so it
    survives :advanced renaming); descriptors are #js literals (string keys too)."
   (:require [raster.render :as r]
+            [raster.render.shader :as shader]
             [applied-science.js-interop :as j]))
 
 (declare run-loop! make-pipeline* make-mesh* upload-mesh*)
@@ -45,8 +46,9 @@
   (-run! [this opts] (run-loop! this opts)))
 
 (defn- make-pipeline* [device fmt spec]
-  (let [{:keys [shaders topology vertex uniform-size]} spec
-        wgsl (:wgsl shaders)
+  (let [{:keys [shader topology vertex]} spec
+        wgsl (shader/->wgsl shader)
+        uniform-size (shader/uniform-bytes shader)
         vs (j/call device :createShaderModule #js {:code (:vert wgsl)})
         fs (j/call device :createShaderModule #js {:code (:frag wgsl)})
         attrs (apply array (map (fn [{:keys [location format offset]}]

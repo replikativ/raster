@@ -6,6 +6,7 @@
    cpu-to-gpu vertex buffer; uniforms → push-constants; the run loop → the vk
    frame loop with a GLFW input-system mapped to the game's key-action set."
   (:require [raster.render :as r]
+            [raster.render.shader :as shader]
             [raster.vk.gpu :as gpu]
             [raster.vk.frame :as frame]
             [raster.vk.pipeline :as pipeline]
@@ -26,6 +27,12 @@
 (defn- vk-topology [topo]
   (case topo :lines :lines :triangles :triangles :triangles))
 
+(defn- vk-stage-flags [stages]
+  (reduce (fn [acc s] (bit-or acc (case s
+                                    :vertex VK13/VK_SHADER_STAGE_VERTEX_BIT
+                                    :fragment VK13/VK_SHADER_STAGE_FRAGMENT_BIT)))
+          0 stages))
+
 ;; --- per-frame command recorder ----------------------------------------------
 (defrecord VkFrame [^VkCommandBuffer cb]
   r/Frame
@@ -39,7 +46,7 @@
               fb  (.mallocFloat stack (alength arr))]
           (.put fb arr) (.flip fb)
           (VK13/vkCmdPushConstants cb (long (:layout pipeline))
-                                   VK13/VK_SHADER_STAGE_VERTEX_BIT 0 fb))
+                                   (int (:push-stages pipeline)) 0 fb))
         (finally (MemoryStack/stackPop)))))
   (-bind-mesh! [_ mesh]
     (let [stack (MemoryStack/stackPush)]
@@ -55,8 +62,11 @@
 (defrecord VulkanRenderer [ctx]
   r/Renderer
   (-make-pipeline [_ spec]
-    (let [{:keys [shaders topology vertex uniform-size blend?]} spec
-          {:keys [vert frag]} (:glsl shaders)
+    (let [{:keys [shader topology vertex blend?]} spec
+          {:keys [vert frag]} (shader/->glsl shader)
+          stages (shader/uniform-stages shader)
+          ubytes (shader/uniform-bytes shader)
+          push-flags (vk-stage-flags stages)
           info (pipeline/create-graphics-pipeline
                 (:device ctx)
                 {:vert-glsl vert :frag-glsl frag
@@ -64,15 +74,16 @@
                  :color-format (:format (:swapchain-info ctx))
                  :depth-format 0
                  :blend? (boolean blend?)
-                 :push-constants (when (and uniform-size (pos? uniform-size))
-                                   {:size uniform-size :stages VK13/VK_SHADER_STAGE_VERTEX_BIT})
+                 :push-constants (when (and (pos? ubytes) (seq stages))
+                                   {:size ubytes :stages push-flags})
                  :vertex-bindings [{:binding 0 :stride (:stride vertex)}]
                  :vertex-attributes (mapv (fn [{:keys [location format offset]}]
                                             {:location location :binding 0
                                              :format (vk-format format) :offset offset})
                                           (:attributes vertex))})]
-      ;; expose :pipeline + :layout for the Frame command verbs
-      {:pipeline (:pipeline info) :layout (:layout info) :info info}))
+      ;; expose :pipeline + :layout + :push-stages for the Frame command verbs
+      {:pipeline (:pipeline info) :layout (:layout info)
+       :push-stages push-flags :info info}))
   (-make-mesh [_ max-verts stride]
     (let [buf (mem/create-buffer (:allocator ctx) (* (long max-verts) (long stride))
                                  :vertex :cpu-to-gpu)]

@@ -58,51 +58,23 @@
        (emit-loop! acc (corners (:x s) (:y s) 12.0 3 (+ (:angle s) HALF-PI)) ship-color))
      (reduce (fn [a b] (emit-cross! a (:x b) (:y b) bullet-color 2.5)) acc (:bullets rd)))))
 
-;; --- shaders ------------------------------------------------------------------
-(def vert-glsl
-  "#version 450
-layout(location=0) in vec2 inPos;
-layout(location=1) in vec3 inColor;
-layout(push_constant) uniform U { vec4 viewport; } u;
-layout(location=0) out vec3 vColor;
-void main() {
-  vec2 ndc = (inPos / u.viewport.xy) * 2.0 - 1.0;
-  gl_Position = vec4(ndc, 0.0, 1.0);   // Vulkan NDC is Y-down, matching screen space
-  vColor = inColor;
-}")
-
-(def frag-glsl
-  "#version 450
-layout(location=0) in vec3 vColor;
-layout(location=0) out vec4 outColor;
-void main() { outColor = vec4(vColor, 1.0); }")
-
-(def vert-wgsl
-  "struct U { viewport: vec4<f32>, };
-@group(0) @binding(0) var<uniform> u: U;
-struct VSOut { @builtin(position) pos: vec4<f32>, @location(0) color: vec3<f32>, };
-@vertex
-fn main(@location(0) inPos: vec2<f32>, @location(1) inColor: vec3<f32>) -> VSOut {
-  var o: VSOut;
-  let ndc = (inPos / u.viewport.xy) * 2.0 - 1.0;
-  o.pos = vec4<f32>(ndc.x, -ndc.y, 0.0, 1.0);   // WebGPU NDC is Y-up: flip
-  o.color = inColor;
-  return o;
-}")
-
-(def frag-wgsl
-  "@fragment
-fn main(@location(0) color: vec3<f32>) -> @location(0) vec4<f32> {
-  return vec4<f32>(color, 1.0);
-}")
+;; --- shader (ONE description → GLSL for Vulkan, WGSL for WebGPU) ---------------
+;; The author writes set-position in Vulkan-style (Y-down) clip space; the WGSL
+;; emitter flips Y for WebGPU. No hand-written per-platform shader source.
+(def shader
+  '{:uniform    {:name "U" :fields [[:viewport :vec4]]}
+    :attributes [[inPos vec2 0] [inColor vec3 1]]
+    :varyings   [[vColor vec3 0]]
+    :vertex     [(let ndc vec2 (- (* (/ inPos (swizzle viewport xy)) 2.0) 1.0))
+                 (set-position (vec4 (swizzle ndc x) (swizzle ndc y) 0.0 1.0))
+                 (out vColor inColor)]
+    :fragment   [(color (vec4 vColor 1.0))]})
 
 (def pipeline-spec
-  {:shaders {:glsl {:vert vert-glsl :frag frag-glsl}
-             :wgsl {:vert vert-wgsl :frag frag-wgsl}}
+  {:shader shader
    :topology :lines
    :vertex {:stride STRIDE :attributes [{:location 0 :format :float2 :offset 0}
-                                        {:location 1 :format :float3 :offset 8}]}
-   :uniform-size 16})
+                                        {:location 1 :format :float3 :offset 8}]}})
 
 (defn draw-scene!
   "Upload this frame's geometry and record the draw. `rnd` is the renderer, `frame`
