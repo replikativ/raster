@@ -83,7 +83,7 @@
           :ns-default build}
   :valhalla {:extra-paths ["classes"]
              :jvm-opts ["-XX:ReservedCodeCacheSize=512m"
-                        "-Xmx12g"
+                        "-Xmx8g"
                         "--enable-preview"
                         "--add-exports" "java.base/jdk.internal.vm.annotation=ALL-UNNAMED"
                         "--add-exports" "java.base/jdk.internal.classfile.components=ALL-UNNAMED"

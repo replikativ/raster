@@ -92,6 +92,58 @@
       (is (segop-simd/compile-segmap segmap 'out 'double)
           "Should produce SIMD form for array+array"))))
 
+;; ----------------------------------------------------------------------------
+;; Regression: same array read at TWO distinct affine bases must NOT collapse to
+;; one vector load. Before the load-site fix, vector loads were keyed by array
+;; symbol, so (- (aget data (+ ab i)) (aget data (+ bb i))) loaded `data` once and
+;; emitted (.sub v v) = 0 — silently wrong (0.0 at dim=16/64, partial elsewhere).
+;; ----------------------------------------------------------------------------
+
+(deftest collect-load-sites-distinguishes-bases
+  (testing "one array at two affine bases yields two distinct load sites"
+    (is (= '[[data ab] [data bb]]
+           (segop-simd/collect-load-sites
+            '(let [df (- (aget data (+ ab d)) (aget data (+ bb d)))] (* df df))
+            'd))))
+  (testing "same base appears once (CSE), simple index has nil base"
+    (is (= '[[data ab]]
+           (segop-simd/collect-load-sites '(* (aget data (+ ab d)) (aget data (+ ab d))) 'd)))
+    (is (= '[[a nil] [b nil]]
+           (segop-simd/collect-load-sites '(+ (aget a i) (aget b i)) 'i)))))
+
+(defn- from-array-loads [form]
+  (filter #(and (seq? %)
+                (= 'jdk.incubator.vector.DoubleVector/fromArray (first %)))
+          (all-nodes form)))
+
+(deftest compile-segmap-two-bases-distinct-loads
+  (testing "par/map! reading one array at two bases emits two distinct loads"
+    (let [form '(raster.par/map! out i 100 double
+                                 (- (aget data (+ ab i)) (aget data (+ bb i))))
+          segmap (par->segmap form)
+          result (segop-simd/compile-segmap segmap 'out 'double)
+          loads (from-array-loads result)
+          offsets (set (map #(nth % 3) loads))]
+      (is result "Should produce SIMD form")
+      (is (>= (count loads) 2) "Should emit a separate load per base, not collapse to one")
+      (is (= 2 (count offsets))
+          (str "The two loads must use distinct offset expressions, got: " offsets)))))
+
+(deftest compile-segred-two-bases-distinct-loads
+  (testing "par/reduce of (* df df) with df across two bases emits two distinct loads"
+    (let [form '(raster.par/reduce acc 0.0 d 100
+                                   (let [df (- (aget data (+ ab d)) (aget data (+ bb d)))]
+                                     (+ acc (* df df))))
+          segred (par->segred form)
+          result (segop-simd/compile-segred segred)
+          loads (from-array-loads result)
+          ;; per accumulator there are 2 distinct-base loads; distinct *offset shapes*
+          ;; (modulo the k*lanes term) must reference both ab and bb
+          offset-syms (set (mapcat #(filter symbol? (all-nodes (nth % 3))) loads))]
+      (is result "Should produce SIMD form")
+      (is (contains? offset-syms 'ab) "loads must reference base ab")
+      (is (contains? offset-syms 'bb) "loads must reference base bb — not collapse to one"))))
+
 (deftest compile-segmap-fma
   (testing "compile-segmap handles fma"
     (let [form '(raster.par/map! out i 100 double
