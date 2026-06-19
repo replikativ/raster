@@ -93,6 +93,8 @@
 (defn mem-store [op-key align offset] (into (into [(op op-key)] (uleb align)) (uleb offset)))
 (defn block  [body] (into (into [(op :block) empty-block] body) [(op :end)]))
 (defn loop*  [body] (into (into [(op :loop)  empty-block] body) [(op :end)]))
+;; block whose result is a single value of valtype vt-kw
+(defn block-t [vt-kw body] (into (into [(op :block) (valtype vt-kw)] body) [(op :end)]))
 
 ;; ---------------------------------------------------------------------------
 ;; module assembly

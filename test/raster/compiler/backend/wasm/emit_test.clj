@@ -21,6 +21,17 @@
           (recur (clojure.core/inc (long i))))
       n)))
 
+(deftm poly-k [x :- Double] :- Double
+  (raster.numeric/+ (raster.numeric/* x x) x))
+
+(deftm dot-k [x :- (Array double), y :- (Array double), n :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
+                                                     (raster.arrays/aget y i))))
+      acc)))
+
 (defn- instantiate [^bytes wasm]
   (-> (Instance/builder (Parser/parse wasm)) (.build)))
 
@@ -44,3 +55,24 @@
                                                    (+ (* a i) (* 0.5 i))))))
                             0.0 (range n))]
         (is (< max-err 1e-9) (str "saxpy max-err=" max-err))))))
+
+(deftest poly-scalar-kernel
+  (testing "scalar f64 kernel returns its value"
+    (let [m (pl/compile-wasm #'poly-k :name "poly")
+          inst (instantiate (:bytes m))
+          r (.apply (.export inst "poly") (long-array [(Double/doubleToRawLongBits 3.0)]))]
+      (is (= [:f64] (:result-types m)))
+      (is (< (Math/abs (- (Double/longBitsToDouble (aget r 0)) 12.0)) 1e-12)))))
+
+(deftest dot-reduction-kernel
+  (testing "multi-var loop reduction returns f64 accumulator"
+    (let [m (pl/compile-wasm #'dot-k :name "dot")
+          inst (instantiate (:bytes m))
+          mem (.memory inst)
+          n 1000]
+      (is (= [:f64] (:result-types m)))
+      (dotimes [i n] (.writeF64 mem (* 8 i) (double i)) (.writeF64 mem (* 8 (+ n i)) 2.0))
+      (let [r (.apply (.export inst "dot") (long-array [0 (* 8 n) n]))
+            got (Double/longBitsToDouble (aget r 0))
+            exp (reduce + (map #(* (double %) 2.0) (range n)))]
+        (is (< (Math/abs (- got exp)) 1e-6) (str "dot=" got " exp=" exp))))))
