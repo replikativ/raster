@@ -17,6 +17,7 @@
             [clojure.walk :as walk]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.core :as rcore]))
 
 ;; ================================================================
@@ -179,42 +180,13 @@
 ;; Devirtualized arithmetic → C operator/function mapping
 ;; ================================================================
 
-(def ^:private mangled-prefix->c-op
-  "Maps mangled deftm name prefixes (from types/mangle) back to C operators or functions.
-  These prefixes appear after devirtualization, e.g. _plus__m_double_double for (+ a b).
-  Binary infix ops map to their C operator string; unary/math functions map to C function names."
-  {"_plus_"  {:kind :infix  :op "+"}
-   "_minus_" {:kind :infix  :op "-"}
-   "_star_"  {:kind :infix  :op "*"}
-   "_div_"   {:kind :infix  :op "/"}
-   "_lt_"    {:kind :infix  :op "<"}
-   "_gt_"    {:kind :infix  :op ">"}
-   "_lteq_"  {:kind :infix  :op "<="}
-   "_gteq_"  {:kind :infix  :op ">="}
-   "mod"     {:kind :floored-mod}
-   "rem"     {:kind :infix  :op "%"}
-   "quot"    {:kind :infix  :op "/"}
-   "sin"     {:kind :fn     :op "sin"}
-   "cos"     {:kind :fn     :op "cos"}
-   "tan"     {:kind :fn     :op "tan"}
-   "exp"     {:kind :fn     :op "exp"}
-   "log"     {:kind :fn     :op "log"}
-   "sqrt"    {:kind :fn     :op "sqrt"}
-   "abs"     {:kind :fn     :op "fabs"}
-   "pow"     {:kind :fn     :op "pow"}
-   "floor"   {:kind :fn     :op "floor"}
-   "ceil"    {:kind :fn     :op "ceil"}
-   "round"   {:kind :fn     :op "round"}
-   "fma"     {:kind :fn     :op "fma"}})
-
 (defn- mangled-name->c-op
-  "Given a mangled deftm symbol name like '_plus__m_double_double', extract the
-  base op prefix and look up the corresponding C operator/function.
-  Returns {:kind :infix/:fn, :op \"...\"} or nil."
+  "C/OpenCL/GLSL lowering for a mangled devirtualized impl name (e.g.
+  '_plus__m_double_double' or 'sqrt__m_double'), via the shared intrinsics
+  registry. Returns {:kind :infix/:fn/:floored-mod :op \"...\"} or nil.
+  GLSL fn-name overrides (abs vs fabs, min vs max) keyed off the emit config."
   [sym-name]
-  (when-let [idx (str/index-of sym-name "_m_")]
-    (let [prefix (subs sym-name 0 idx)]
-      (get mangled-prefix->c-op prefix))))
+  (intrinsics/c-lowering sym-name (= :glsl (:cast-style *emit-config*))))
 
 ;; ================================================================
 ;; Type mappings

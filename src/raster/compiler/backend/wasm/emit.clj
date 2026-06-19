@@ -14,7 +14,8 @@
    memory). Float element type from the array param's tag (doubles→f64, floats→f32).
    Every loop returns its non-recur (else) value, so the function result type is
    the deftm's return tag."
-  (:require [raster.compiler.backend.wasm.encoder :as e]))
+  (:require [raster.compiler.backend.wasm.encoder :as e]
+            [raster.compiler.backend.intrinsics :as ix]))
 
 ;; --- tag → wasm types ------------------------------------------------------
 (def ^:private array-tag->elem
@@ -36,26 +37,11 @@
     (array-tag? tag) :i32
     :else :i32))
 
-(defn- arith-op [sem vt]
-  (let [pfx (case vt :f64 "f64" :f32 "f32" "i32")]
-    (case sem
-      raster.numeric/+ (keyword (str pfx ".add"))
-      raster.numeric/- (keyword (str pfx ".sub"))
-      raster.numeric/* (keyword (str pfx ".mul"))
-      raster.numeric// (keyword (str pfx ".div"))   ; f64/f32 only; integer / is rare
-      nil)))
-
-(defn- cmp-op
-  "Comparison opcode for base (lt/gt/le/ge/eq/ne) at operand valtype vt.
-   Float compares are unsigned-name-free; integer compares are signed."
-  [base vt]
-  (case vt
-    :f64 (keyword (str "f64." base))
-    :f32 (keyword (str "f32." base))
-    (keyword (str "i32." (case base "lt" "lt_s" "gt" "gt_s" "le" "le_s" "ge" "ge_s" base)))))
+;; Operator/intrinsic lowering (which wasm opcode for op@vt) is owned by
+;; raster.compiler.backend.intrinsics — emit dispatches through ix/wasm-op.
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt emit-effect alloc!)
+(declare emit-val infer-vt emit-effect alloc! emit-intrinsic)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -109,31 +95,25 @@
         (= h 'clojure.core/aget)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
-        ;; comparisons — match by local name (bare or clojure.core-qualified)
-        (#{"<" "<=" ">" ">=" "==" "=" "not="} (name h))
-        (let [v0 (infer-vt ctx (A 0))
-              vt (if (#{:f64 :f32} v0) v0 (infer-vt ctx (A 1)))  ; float if either operand is float
-              base (case (name h) "<" "lt" "<=" "le" ">" "gt" ">=" "ge" "not=" "ne" "eq")]
-          (-> (emit-val ctx (A 0)) (into (emit-val ctx (A 1))) (into (e/i (cmp-op base vt)))))
-        ;; integer step (inc/dec, incl. unchecked-*-int)
+        ;; integer step (inc/dec, incl. unchecked-*-int) — index/counter steppers
         (#{"inc" "unchecked-inc-int" "unchecked-inc"} (name h))
         (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.add)))
         (#{"dec" "unchecked-dec-int" "unchecked-dec"} (name h))
         (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.sub)))
+        ;; value-position if → typed if/else block
+        (= h 'if)
+        (let [[c t e] A
+              tv (infer-vt ctx t)
+              vt (if (= tv :i32) (infer-vt ctx e) tv)]
+          (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))
+        ;; devirtualized typed call: op + element vt from carried metadata
         (= h '.invk)
-        (let [sem (:raster.op/original (meta node))
-              vt  (case (:raster.type/tag (meta node)) double :f64 float :f32 :i32)
-              opk (or (arith-op sem vt) (throw (ex-info (str "unhandled .invk op " sem) {})))
-              [_impl o1 o2] A]
-          (-> (emit-val ctx o1) (into (emit-val ctx o2)) (into (e/i opk))))
-        ;; bare raster.numeric/{+,-,*,/} — SROA output isn't re-devirtualized, and
-        ;; the op IS the head (no .invk wrapper); type from the operands.
-        (#{'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//} h)
-        (let [[o1 o2] A
-              v0 (infer-vt ctx o1)
-              vt (if (#{:f64 :f32} v0) v0 (infer-vt ctx o2))
-              opk (arith-op h vt)]
-          (-> (emit-val ctx o1) (into (emit-val ctx o2)) (into (e/i opk))))
+        (let [vt (case (:raster.type/tag (meta node)) double :f64 float :f32 :i32)]
+          (emit-intrinsic ctx (:raster.op/original (meta node)) (drop 1 A) vt))
+        ;; any registered numeric op / intrinsic (arith, comparison, rem/mod,
+        ;; Math, min/max) — dispatched through backend.intrinsics (single table).
+        (and (symbol? h) (ix/canonical h))
+        (emit-intrinsic ctx h A nil)
         ;; let* / do in VALUE position (introduced by inlined deftm calls)
         (= h 'let*)
         (let [[binds & body] A
@@ -152,6 +132,50 @@
         :else (throw (ex-info (str "unhandled value head " h) {:node node}))))
     :else (throw (ex-info (str "unhandled value node " (pr-str node)) {}))))
 
+(defn- emit-rem-mod
+  "rem/mod via the registry's :special path. i32 → native rem_s; float → a - q*b
+   (q = floor for mod, trunc for rem). a,b are pure value exprs (loads + arith)
+   so duplicating a is sound."
+  [ctx k a b]
+  (let [av (infer-vt ctx a)
+        vt (if (#{:f64 :f32} av) av :i32)]
+    (if (= vt :i32)
+      (-> (emit-val ctx a) (into (emit-val ctx b)) (into (e/i :i32.rem_s)))
+      (let [f64? (= vt :f64)
+            qop (if (= k :mod) (if f64? :f64.floor :f32.floor) (if f64? :f64.trunc :f32.trunc))
+            dop (if f64? :f64.div :f32.div) mop (if f64? :f64.mul :f32.mul) sop (if f64? :f64.sub :f32.sub)]
+        (-> (emit-val ctx a)                                       ; a
+            (into (emit-val ctx a)) (into (emit-val ctx b)) (into (e/i dop)) (into (e/i qop)) ; q
+            (into (emit-val ctx b)) (into (e/i mop))               ; q*b
+            (into (e/i sop)))))))                                  ; a - q*b
+
+(defn- emit-intrinsic
+  "Emit a registered numeric op / intrinsic via the backend.intrinsics table.
+   `op` is the canonical-able op form; `args` the (already op-stripped) operands;
+   `vt-hint` the element valtype from .invk metadata (nil → infer from operands).
+   Comparisons take their opcode at the operand vt but yield i32 (bool)."
+  [ctx op args vt-hint]
+  (let [k (ix/canonical op)
+        d (ix/descriptor op)
+        operand-vt (fn [] (let [v0 (infer-vt ctx (first args))]
+                            (if (#{:f64 :f32} v0) v0 (infer-vt ctx (second args)))))]
+    (case (:kind d)
+      :special (emit-rem-mod ctx k (first args) (second args))
+      :cmp (let [vt (operand-vt)
+                 opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
+             (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
+      :infix (let [vt (or vt-hint (operand-vt))
+                   opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
+               (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
+      :fn (let [vt (or vt-hint (infer-vt ctx (first args)))
+                opk (or (ix/wasm-op k vt)
+                        (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
+                                             " (transcendental? needs import/polynomial)") {:op op})))]
+            (if (= 2 (:arity d))
+              (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk)))
+              (-> (emit-val ctx (first args)) (into (e/i opk)))))
+      (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
+
 (defn- infer-vt
   "Result valtype of an expression, from env + carried :raster.type/tag."
   [ctx node]
@@ -162,13 +186,19 @@
     (seq? node)
     (case (:raster.type/tag (meta node))
       double :f64, float :f32, long :i32, int :i32
-      (cond
-        (= 'float (first node))  :f32
-        (= 'double (first node)) :f64
-        (#{'long 'int} (first node)) (infer-vt ctx (second node))
-        (#{'let* 'do} (first node)) (infer-vt ctx (last node))  ; value of tail
-        (= 'clojure.core/aget (first node))  (get-in ctx [:elems (second node) :vt] :f64)
-        :else :i32))
+      (let [h (first node)]
+        (cond
+          (= 'float h)  :f32
+          (= 'double h) :f64
+          (#{'long 'int} h) (infer-vt ctx (second node))
+          (#{'let* 'do} h) (infer-vt ctx (last node))    ; value of tail
+          (= 'if h) (let [tv (infer-vt ctx (nth node 2))] ; then-branch type
+                      (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))
+          (= 'clojure.core/aget h)  (get-in ctx [:elems (second node) :vt] :f64)
+          ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
+          ;; math / rem-mod → element type of first operand
+          (ix/canonical h) (if (= :cmp (ix/kind h)) :i32 (infer-vt ctx (second node)))
+          :else :i32)))
     :else :i32))
 
 (declare emit-dotimes emit-dotimes-scalar)
@@ -282,16 +312,15 @@
 ;; Chicory (no v128) — validate execution via node/V8.
 ;; ─────────────────────────────────────────────────────────────────────────
 
-(def ^:private simd-op-suffix {"+" "add" "-" "sub" "*" "mul" "/" "div"})
+;; canonical arith key → SIMD lane-op suffix (f64x2.<suffix> / f32x4.<suffix>)
+(def ^:private simd-suffix {:+ "add" :- "sub" :* "mul" :div "div"})
 
 (defn- simd-op-of
-  "If node is a vectorizable arithmetic op, return its suffix (add/sub/mul/div)."
+  "If node is a SIMD-vectorizable arithmetic op (registry :infix arith), return
+   its lane-op suffix (add/sub/mul/div); else nil."
   [node]
-  (let [h (first node)
-        sym (cond (= h '.invk) (:raster.op/original (meta node))
-                  (#{'raster.numeric/+ 'raster.numeric/- 'raster.numeric/* 'raster.numeric//} h) h
-                  :else nil)]
-    (when sym (simd-op-suffix (name sym)))))
+  (let [op (if (= '.invk (first node)) (:raster.op/original (meta node)) (first node))]
+    (simd-suffix (ix/canonical op))))
 
 (defn- simd-op-args [node] (if (= '.invk (first node)) (drop 2 node) (rest node)))
 
@@ -313,7 +342,7 @@
       (cond
         (= h 'clojure.core/aget) (simd-index-ok? i-sym (nth node 2))
         (#{'long 'int 'double 'float} h) (simd-pure? i-sym (last node))
-        (and (= 2 (count node)) (simd-op-suffix (name h))) false  ; unary +/- unsupported
+        (and (= 2 (count node)) (simd-suffix (ix/canonical h))) false  ; unary +/- unsupported
         (simd-op-of node) (every? #(simd-pure? i-sym %) (simd-op-args node))
         :else false))
     :else false))

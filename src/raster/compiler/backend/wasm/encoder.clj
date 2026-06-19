@@ -65,12 +65,14 @@
    :i32.lt_s 0x48 :i32.gt_s 0x4a :i32.le_s 0x4c :i32.ge_s 0x4e
    :f64.eq 0x61 :f64.ne 0x62 :f64.lt 0x63 :f64.gt 0x64 :f64.le 0x65 :f64.ge 0x66
    :f32.eq 0x5b :f32.ne 0x5c :f32.lt 0x5d :f32.gt 0x5e :f32.le 0x5f :f32.ge 0x60
-   :i32.add 0x6a :i32.sub 0x6b :i32.mul 0x6c :i32.div_s 0x6d
+   :i32.add 0x6a :i32.sub 0x6b :i32.mul 0x6c :i32.div_s 0x6d :i32.rem_s 0x6f
    :i64.add 0x7c :i64.sub 0x7d :i64.mul 0x7e
    :f32.add 0x92 :f32.sub 0x93 :f32.mul 0x94 :f32.div 0x95
    :f32.min 0x96 :f32.max 0x97 :f32.sqrt 0x91 :f32.abs 0x8b :f32.neg 0x8c
+   :f32.floor 0x8e :f32.trunc 0x8f
    :f64.add 0xa0 :f64.sub 0xa1 :f64.mul 0xa2 :f64.div 0xa3
    :f64.min 0xa4 :f64.max 0xa5 :f64.sqrt 0x9f :f64.abs 0x99 :f64.neg 0x9a
+   :f64.floor 0x9c :f64.trunc 0x9d :select 0x1b
    ;; conversions
    :i32.wrap_i64 0xa7 :i64.extend_i32_s 0xac
    :f32.convert_i32_s 0xb2
@@ -113,6 +115,9 @@
 (defn loop*  [body] (into (into [(op :loop)  empty-block] body) [(op :end)]))
 ;; block whose result is a single value of valtype vt-kw
 (defn block-t [vt-kw body] (into (into [(op :block) (valtype vt-kw)] body) [(op :end)]))
+;; value-position if: cond already on stack → if(result vt){then}else{else}
+(defn if-t [vt-kw then-bytes else-bytes]
+  (-> [(op :if) (valtype vt-kw)] (into then-bytes) (into [(op :else)]) (into else-bytes) (into [(op :end)])))
 
 ;; ---------------------------------------------------------------------------
 ;; module assembly
