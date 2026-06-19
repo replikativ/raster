@@ -1,0 +1,22 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>raster cljs sandbox — WebGPU compute + WebGL2</title>
+    <style>
+      body { font: 14px/1.5 ui-monospace, monospace; margin: 1.5rem; max-width: 60rem; }
+      h1 { font-size: 1.2rem; } h2 { font-size: 1rem; margin-top: 1.5rem; }
+      #log { white-space: pre-wrap; background: #f5f5f5; padding: 1rem; border-radius: 6px; }
+      canvas { border: 1px solid #ccc; margin-top: .5rem; }
+    </style>
+  </head>
+  <body>
+    <h1>raster cljs sandbox</h1>
+    <p>Experiments for the raster browser port. Open the console too.</p>
+    <h2>WebGPU compute (saxpy, f32) — vs CPU reference</h2>
+    <div id="log">loading…</div>
+    <h2>WebGL2 render (hello triangle)</h2>
+    <canvas id="gl" width="320" height="240"></canvas>
+    <script src="/js/main.js"></script>
+  </body>
+</html>
