@@ -3,7 +3,7 @@
    WebGPU, from a single description. Guards the surface the renderer backends rely
    on — uniform layout/stages, GLSL push-constant + gl_Position, WGSL uniform buffer
    + the WebGPU Y-flip."
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.render.shader :as s]))
 
@@ -38,3 +38,27 @@
     ;; WebGPU NDC is Y-up: the emitter flips Y, the author does not
     (is (str/includes? vert "out.position = vec4<f32>(_p.x, -_p.y, _p.z, _p.w);"))
     (is (str/includes? frag "return vec4<f32>(vColor, 1.0);"))))
+
+(def tex-spec
+  '{:uniform    {:name "U" :fields [[:mvp :mat4]]}
+    :attributes [[inPos vec3 0] [inUv vec2 1]]
+    :varyings   [[vUv vec2 0]]
+    :textures   [[tex 0]]
+    :vertex     [(set-position (* mvp (vec4 inPos 1.0))) (out vUv inUv)]
+    :fragment   [(color (sample tex vUv))]})
+
+(deftest textured-shader-emit
+  (testing "R4: texture decls + sample op + mat4 uniform, GLSL and WGSL"
+    (is (= 64 (s/uniform-bytes tex-spec)))           ; mat4
+    (let [{gv :vert gf :frag} (s/->glsl tex-spec)]
+      (is (str/includes? gv "uniform U {\n  mat4 mvp;"))
+      (is (str/includes? gv "(u.mvp * vec4(inPos, 1.0))"))
+      (is (str/includes? gf "layout(set=0, binding=0) uniform sampler2D tex;"))
+      (is (str/includes? gf "texture(tex, vUv)")))
+    (let [{wv :vert wf :frag} (s/->wgsl tex-spec)]
+      (is (str/includes? wv "mvp: mat4x4<f32>"))
+      ;; texture decls only in the stage that samples (fragment), not vertex
+      (is (not (str/includes? wv "texture_2d")))
+      (is (str/includes? wf "@group(1) @binding(0) var tex: texture_2d<f32>;"))
+      (is (str/includes? wf "@group(1) @binding(1) var tex_s: sampler;"))
+      (is (str/includes? wf "textureSample(tex, tex_s, vUv)")))))

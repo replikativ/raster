@@ -2,3 +2,4 @@
 /.shadow-cljs/
 /.cpcache/
 /public/js/
+/public/cube-js/

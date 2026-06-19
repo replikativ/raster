@@ -76,8 +76,17 @@
       (used-in? (:vertex spec) uf)   (conj :vertex)
       (used-in? (:fragment spec) uf) (conj :fragment))))
 
+;; --- texture declarations ----------------------------------------------------
+(defn- textures [spec] (:textures spec))
+(defn- texture-names [spec] (set (map (comp name first) (textures spec))))
+(defn- stage-textures
+  "The [name binding] texture entries referenced in a stage's statements."
+  [stage-stmts spec]
+  (let [used (all-syms stage-stmts)]
+    (filter (fn [[n _]] (used (name n))) (textures spec))))
+
 ;; --- expression emitter (dialect-parameterized) ------------------------------
-(defn- emit-expr [e {:keys [vec-suffix] :as dial} ufields]
+(defn- emit-expr [e {:keys [vec-suffix kind] :as dial} ufields]
   (cond
     (number? e) (fmt-num e)
     (symbol? e) (let [n (name e)] (if (ufields n) (str "u." n) n))
@@ -90,11 +99,20 @@
         ("vec2" "vec3" "vec4")
         (str (name op) vec-suffix "("
              (str/join ", " (map #(emit-expr % dial ufields) args)) ")")
+        ;; (sample tex uv) → texture sample (combined sampler2D vs split texture+sampler)
+        "sample" (let [tex (name (first args)) uv (emit-expr (second args) dial ufields)]
+                   (case kind
+                     :glsl (str "texture(" tex ", " uv ")")
+                     :wgsl (str "textureSample(" tex ", " tex "_s, " uv ")")))
         (throw (ex-info "unknown shader op" {:op op}))))
     :else (throw (ex-info "bad shader expr" {:expr e}))))
 
 ;; --- GLSL --------------------------------------------------------------------
-(def ^:private glsl-dial {:vec-suffix ""})
+(def ^:private glsl-dial {:vec-suffix "" :kind :glsl})
+
+(defn- glsl-tex-decls [stage-stmts spec]
+  (str/join "" (map (fn [[n b]] (str "layout(set=0, binding=" b ") uniform sampler2D " (name n) ";\n"))
+                    (stage-textures stage-stmts spec))))
 
 (defn- glsl-uniform-decl [spec]
   (when (seq (uniform-fields spec))
@@ -120,6 +138,7 @@
          (str/join "\n" (map (fn [[n t l]] (str "layout(location=" l ") out " (glsl-type (tkey t)) " " (name n) ";"))
                              (:varyings spec))) "\n"
          (or (when (contains? (uniform-stages spec) :vertex) (glsl-uniform-decl spec)) "")
+         (glsl-tex-decls (:vertex spec) spec)
          "void main() {\n"
          (str/join "\n" (map #(glsl-stmt % glsl-dial uf) (:vertex spec)))
          "\n}\n")))
@@ -131,6 +150,7 @@
                              (:varyings spec))) "\n"
          "layout(location=0) out vec4 outColor;\n"
          (or (when (contains? (uniform-stages spec) :fragment) (glsl-uniform-decl spec)) "")
+         (glsl-tex-decls (:fragment spec) spec)
          "void main() {\n"
          (str/join "\n" (map #(glsl-stmt % glsl-dial uf) (:fragment spec)))
          "\n}\n")))
@@ -141,7 +161,13 @@
   {:vert (glsl-vertex spec) :frag (glsl-fragment spec)})
 
 ;; --- WGSL --------------------------------------------------------------------
-(def ^:private wgsl-dial {:vec-suffix "<f32>"})
+(def ^:private wgsl-dial {:vec-suffix "<f32>" :kind :wgsl})
+
+(defn- wgsl-tex-decls [stage-stmts spec]
+  (str/join "" (map (fn [[n b]]
+                      (str "@group(1) @binding(" (* 2 b) ") var " (name n) ": texture_2d<f32>;\n"
+                           "@group(1) @binding(" (inc (* 2 b)) ") var " (name n) "_s: sampler;\n"))
+                    (stage-textures stage-stmts spec))))
 
 (defn- wgsl-uniform-decl [spec]
   (when (seq (uniform-fields spec))
@@ -165,6 +191,7 @@
                      "out"          [(str "  out." (name (first args)) " = " (emit-expr (second args) wgsl-dial uf) ";")])))
                (:vertex spec))]
     (str (or (when (contains? (uniform-stages spec) :vertex) (wgsl-uniform-decl spec)) "")
+         (wgsl-tex-decls (:vertex spec) spec)
          "struct VSOut {\n  @builtin(position) position: vec4<f32>,\n"
          (str/join "\n" (map (fn [[n t l]] (str "  @location(" l ") " (name n) ": " (wgsl-type (tkey t)) ",")) (:varyings spec)))
          "\n};\n@vertex\nfn main(" params ") -> VSOut {\n  var out: VSOut;\n"
@@ -183,6 +210,7 @@
                      "color" [(str "  return " (emit-expr (first args) wgsl-dial uf) ";")])))
                (:fragment spec))]
     (str (or (when (contains? (uniform-stages spec) :fragment) (wgsl-uniform-decl spec)) "")
+         (wgsl-tex-decls (:fragment spec) spec)
          "@fragment\nfn main(" params ") -> @location(0) vec4<f32> {\n"
          (str/join "\n" stmts)
          "\n}\n")))
