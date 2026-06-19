@@ -136,6 +136,73 @@
           (into (emit-then ctx (last stmts) loop-idxs loop-depth))))
     :else (throw (ex-info (str "loop then-branch must end in recur, got " (pr-str node)) {}))))
 
+(defn- alloc!
+  "Reserve a new function-local of valtype vt, return its index. Locals are
+   collected in the ctx :locals atom; index = base (after params) + position."
+  [ctx vt]
+  (let [a (:locals ctx)
+        idx (+ (:base ctx) (count @a))]
+    (swap! a conj vt)
+    idx))
+
+(declare emit-result)
+
+(defn- emit-loop
+  "(loop [v init ...] (if cond <recur|do…recur> <result>)) → [bytes ret-vt].
+   Returns the non-recur (else) value via block(result vt){ loop ; unreachable }."
+  [ctx node]
+  (let [[_ bindvec ifform] node
+        pairs (vec (partition 2 bindvec))
+        ;; allocate loop-var locals; inits emitted with the OUTER env (loop vars
+        ;; not yet in scope for their own inits)
+        loop-vars (mapv (fn [[sym init]]
+                          (let [vt (if (float? init) :f64 :i32)]
+                            {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
+                        pairs)
+        inits (vec (mapcat (fn [{:keys [idx init]}]
+                             (into (emit-val ctx init) (e/local-set idx))) loop-vars))
+        ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
+                     ctx loop-vars)
+        loop-idxs (mapv :idx loop-vars)
+        [_ cnd then els] ifform
+        ret-vt (infer-vt ctx' els)
+        ;; depths from inside the if: if=0, loop=1, block=2
+        if-bytes (-> (emit-val ctx' cnd)
+                     (into [(e/op :if) e/empty-block])
+                     (into (emit-then ctx' then loop-idxs 1))
+                     (into [(e/op :else)])
+                     (into (emit-val ctx' els)) (into (e/br 2))
+                     (into [(e/op :end)]))]
+    [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
+     ret-vt]))
+
+(defn- emit-result
+  "Emit an expression in result (tail) position → [bytes ret-vt]. Handles let*
+   (allocating a local per binding), do (effects then tail), loop, and scalar
+   value expressions."
+  [ctx node]
+  (cond
+    (and (seq? node) (= 'let* (first node)))
+    (let [[_ binds & body] node
+          [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
+                                      (let [vt (infer-vt c init)
+                                            idx (alloc! c vt)]
+                                        [(assoc-in c [:env s] {:idx idx :vt vt})
+                                         (-> acc (into (emit-val c init)) (into (e/local-set idx)))]))
+                                    [ctx []] (partition 2 binds))
+          tail (if (= 1 (count body)) (first body) (cons 'do body))
+          [b ret] (emit-result ctx' tail)]
+      [(into init-bytes b) ret])
+
+    (and (seq? node) (= 'do (first node)))
+    (let [stmts (vec (rest node))
+          [b ret] (emit-result ctx (last stmts))]
+      [(into (vec (mapcat #(emit-effect ctx %) (butlast stmts))) b) ret])
+
+    (and (seq? node) (= 'loop (first node))) (emit-loop ctx node)
+
+    :else [(emit-val ctx node) (infer-vt ctx node)]))
+
 (defn compile-kernel
   "Compile a kernel IR to a wasm module byte[].
    params: ordered [{:sym :tag}].  ir: post-pass S-expr. The result type is
@@ -145,40 +212,9 @@
   (let [param-vts (mapv #(tag->vt (:tag %)) params)
         env0 (into {} (map-indexed (fn [idx {:keys [sym tag]}] [sym {:idx idx :vt (tag->vt tag)}]) params))
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
-        base (count params)
-        ;; ir = (let* [] body)  (v1: empty let* bindings)
-        body (let [[h binds & more] ir]
-               (assert (and (= h 'let*) (empty? binds)) "v1 expects (let* [] body)")
-               (if (= 1 (count more)) (first more) (cons 'do more)))
-        {:keys [locals body-bytes ret-vt]}
-        (if (and (seq? body) (= 'loop (first body)))
-          ;; ---- loop kernel: returns its if-else value ----
-          (let [[_ bindvec ifform] body
-                loop-vars (map-indexed (fn [k [sym init]]
-                                         {:sym sym :idx (+ base k)
-                                          :vt (if (float? init) :f64 :i32) :init init})
-                                       (partition 2 bindvec))
-                loop-idxs (mapv :idx loop-vars)
-                ctx {:env (reduce (fn [e {:keys [sym idx vt]}] (assoc e sym {:idx idx :vt vt}))
-                                  env0 loop-vars)
-                     :elems elems}
-                [_ cnd then els] ifform
-                ret-vt (infer-vt ctx els)
-                inits (vec (mapcat (fn [{:keys [idx init]}]
-                                     (into (emit-val ctx init) (e/local-set idx))) loop-vars))
-                ;; depths from inside the if: if=0, loop=1, block=2
-                if-bytes (-> (emit-val ctx cnd)
-                             (into [(e/op :if) e/empty-block])
-                             (into (emit-then ctx then loop-idxs 1))
-                             (into [(e/op :else)])
-                             (into (emit-val ctx els)) (into (e/br 2))
-                             (into [(e/op :end)]))]
-            {:ret-vt ret-vt
-             :locals (mapv :vt loop-vars)
-             :body-bytes (into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))})
-          ;; ---- scalar kernel: body value is the result ----
-          (let [ctx {:env env0 :elems elems}]
-            {:ret-vt (infer-vt ctx body) :locals [] :body-bytes (emit-val ctx body)}))]
+        ctx {:env env0 :elems elems :base (count params) :locals (atom [])}
+        [body-bytes ret-vt] (emit-result ctx ir)
+        locals @(:locals ctx)]
     {:name name
      :param-types param-vts
      :result-types [ret-vt]

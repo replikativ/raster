@@ -32,6 +32,14 @@
                                                      (raster.arrays/aget y i))))
       acc)))
 
+(deftm scaled-sum-k [x :- (Array double), n :- Long, s :- Double] :- Double
+  (let [half (raster.numeric/* s 0.5)]
+    (loop [i 0 acc 0.0]
+      (if (clojure.core/< (long i) (long n))
+        (recur (clojure.core/inc (long i))
+               (raster.numeric/+ acc (raster.numeric/* half (raster.arrays/aget x i))))
+        acc))))
+
 (defn- instantiate [^bytes wasm]
   (-> (Instance/builder (Parser/parse wasm)) (.build)))
 
@@ -76,3 +84,15 @@
             got (Double/longBitsToDouble (aget r 0))
             exp (reduce + (map #(* (double %) 2.0) (range n)))]
         (is (< (Math/abs (- got exp)) 1e-6) (str "dot=" got " exp=" exp))))))
+
+(deftest scaled-sum-let-binding-kernel
+  (testing "let* binding (local alloc) wrapping a loop"
+    (let [m (pl/compile-wasm #'scaled-sum-k :name "ss")
+          inst (instantiate (:bytes m))
+          mem (.memory inst)
+          n 1000]
+      (dotimes [i n] (.writeF64 mem (* 8 i) (double i)))
+      (let [r (.apply (.export inst "ss") (long-array [0 n (Double/doubleToRawLongBits 4.0)]))
+            got (Double/longBitsToDouble (aget r 0))
+            exp (* 2.0 (reduce + (range n)))]  ; half=2.0 → 2*Σi
+        (is (< (Math/abs (- got exp)) 1e-6) (str "scaled-sum=" got " exp=" exp))))))
