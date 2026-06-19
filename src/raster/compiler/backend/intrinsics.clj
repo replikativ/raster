@@ -58,11 +58,13 @@
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}
    :max {:arity 2 :kind :fn :wasm (vt3 :f64.max :f32.max nil) :c {:fn "fmax" :glsl "max"} :wgsl {:fn "max"}}
-   ;; transcendentals — no wasm opcode (need import / polynomial); GPU has them
-   :sin {:arity 1 :kind :fn :c {:fn "sin"} :wgsl {:fn "sin"}}
-   :cos {:arity 1 :kind :fn :c {:fn "cos"} :wgsl {:fn "cos"}}
-   :tan {:arity 1 :kind :fn :c {:fn "tan"} :wgsl {:fn "tan"}}
-   :exp {:arity 1 :kind :fn :c {:fn "exp"} :wgsl {:fn "exp"}}
+   ;; transcendentals — wasm has no opcode; sin/cos/tan/exp lower to an inline
+   ;; polynomial (:wasm :poly, see backend.wasm.transcendental). log/pow/fma need
+   ;; exponent-bit ops the encoder lacks → no :wasm facet (clear error). GPU has all.
+   :sin {:arity 1 :kind :fn :wasm :poly :c {:fn "sin"} :wgsl {:fn "sin"}}
+   :cos {:arity 1 :kind :fn :wasm :poly :c {:fn "cos"} :wgsl {:fn "cos"}}
+   :tan {:arity 1 :kind :fn :wasm :poly :c {:fn "tan"} :wgsl {:fn "tan"}}
+   :exp {:arity 1 :kind :fn :wasm :poly :c {:fn "exp"} :wgsl {:fn "exp"}}
    :log {:arity 1 :kind :fn :c {:fn "log"} :wgsl {:fn "log"}}
    :pow {:arity 2 :kind :fn :c {:fn "pow"} :wgsl {:fn "pow"}}
    :fma {:arity 3 :kind :fn :c {:fn "fma"} :wgsl {:fn "fma"}}})
@@ -107,7 +109,14 @@
   "Encoder opcode keyword for op at element valtype vt, or nil if the op has no
    wasm lowering for that vt (caller surfaces a clear error)."
   [op vt]
-  (get-in table [(canonical op) :wasm vt]))
+  (let [w (get-in table [(canonical op) :wasm])]
+    (when (map? w) (get w vt))))
+
+(defn wasm-poly?
+  "True when op lowers to an inline polynomial on wasm (transcendentals with no
+   native opcode — see backend.wasm.transcendental)."
+  [op]
+  (= :poly (get-in table [(canonical op) :wasm])))
 
 (defn kind [op] (:kind (descriptor op)))
 (defn arity [op] (:arity (descriptor op)))

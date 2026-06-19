@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.numeric]
+            [raster.math]
             [raster.arrays]
             [raster.compiler.pipeline :as pl])
   (:import [com.dylibso.chicory.wasm Parser]
@@ -229,3 +230,29 @@
         (is (= 2 (alength r)))
         (is (= 11.0 (Double/longBitsToDouble (aget r 0))))
         (is (= 22.0 (Double/longBitsToDouble (aget r 1))))))))
+
+;; Transcendentals — wasm has no sin/cos/exp opcode; they lower to an inline
+;; polynomial (backend.wasm.transcendental): sin/cos floor-reduce + degree-9
+;; minimax; exp = x/1024 + Taylor + 10 squarings; tan = sin/cos. tan/cos exercise
+;; the infer-vt fix (a let* used as a `/` operand must infer its own tail's vt).
+(deftm sin-k [x :- Double] :- Double (raster.math/sin x))
+(deftm cos-k [x :- Double] :- Double (raster.math/cos x))
+(deftm tan-k [x :- Double] :- Double (raster.math/tan x))
+(deftm exp-k [x :- Double] :- Double (raster.math/exp x))
+
+(defn- call1 [inst nm x]
+  (Double/longBitsToDouble (aget (.apply (.export inst nm) (long-array [(Double/doubleToRawLongBits x)])) 0)))
+
+(deftest transcendentals-inline-polynomial
+  (testing "sin/cos/tan/exp emit valid wasm matching Math within poly accuracy"
+    (let [si (instantiate (:bytes (pl/compile-wasm #'sin-k :name "sin")))
+          ci (instantiate (:bytes (pl/compile-wasm #'cos-k :name "cos")))
+          ti (instantiate (:bytes (pl/compile-wasm #'tan-k :name "tan")))
+          ei (instantiate (:bytes (pl/compile-wasm #'exp-k :name "exp")))]
+      (doseq [x [0.0 0.5 1.0 2.0 3.0 -1.0 -2.5 5.0 10.0 -7.3]]
+        (is (< (Math/abs (- (call1 si "sin" x) (Math/sin x))) 5e-5) (str "sin " x))
+        (is (< (Math/abs (- (call1 ci "cos" x) (Math/cos x))) 5e-5) (str "cos " x))
+        (is (< (Math/abs (/ (- (call1 ei "exp" x) (Math/exp x)) (Math/exp x))) 1e-9) (str "exp " x)))
+      ;; tan away from its poles
+      (doseq [x [0.0 0.5 1.0 -1.0 2.0 3.0 -2.5]]
+        (is (< (Math/abs (- (call1 ti "tan" x) (Math/tan x))) 1e-4) (str "tan " x))))))

@@ -15,6 +15,7 @@
    Every loop returns its non-recur (else) value, so the function result type is
    the deftm's return tag."
   (:require [raster.compiler.backend.wasm.encoder :as e]
+            [raster.compiler.backend.wasm.transcendental :as tr]
             [raster.compiler.backend.intrinsics :as ix]))
 
 ;; --- tag → wasm types ------------------------------------------------------
@@ -167,13 +168,21 @@
       :infix (let [vt (or vt-hint (operand-vt))
                    opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
                (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
-      :fn (let [vt (or vt-hint (infer-vt ctx (first args)))
-                opk (or (ix/wasm-op k vt)
-                        (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
-                                             " (transcendental? needs import/polynomial)") {:op op})))]
-            (if (= 2 (:arity d))
-              (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk)))
-              (-> (emit-val ctx (first args)) (into (e/i opk)))))
+      :fn (if (ix/wasm-poly? k)
+            ;; transcendental → inline polynomial form, emitted via the normal path.
+            ;; f32: compute in f64 (promote arg) and demote the result.
+            (let [vt (or vt-hint (infer-vt ctx (first args)))
+                  arg (first args)]
+              (if (= vt :f32)
+                (emit-val ctx (list 'float (tr/form k (list 'double arg))))
+                (emit-val ctx (tr/form k arg))))
+            (let [vt (or vt-hint (infer-vt ctx (first args)))
+                  opk (or (ix/wasm-op k vt)
+                          (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
+                                               " (transcendental? needs import/polynomial)") {:op op})))]
+              (if (= 2 (:arity d))
+                (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk)))
+                (-> (emit-val ctx (first args)) (into (e/i opk))))))
       (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
 
 (defn- infer-vt
@@ -191,7 +200,14 @@
           (= 'float h)  :f32
           (= 'double h) :f64
           (#{'long 'int} h) (infer-vt ctx (second node))
-          (#{'let* 'do} h) (infer-vt ctx (last node))    ; value of tail
+          ;; let* — bind its locals so the tail's refs resolve (a let* used as an
+          ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
+          ;; may reference a binding introduced inside it).
+          (= 'let* h) (let [c' (reduce (fn [c [s init]]
+                                         (assoc-in c [:env s] {:vt (infer-vt c init)}))
+                                       ctx (partition 2 (second node)))]
+                        (infer-vt c' (last node)))
+          (= 'do h) (infer-vt ctx (last node))           ; value of tail
           (= 'if h) (let [tv (infer-vt ctx (nth node 2))] ; then-branch type
                       (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))
           (= 'clojure.core/aget h)  (get-in ctx [:elems (second node) :vt] :f64)
