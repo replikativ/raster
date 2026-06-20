@@ -331,6 +331,31 @@
             (is (= ex (Double/longBitsToDouble (aget r 0))) (str "x dx=" dx " dy=" dy))
             (is (= ey (Double/longBitsToDouble (aget r 1))) (str "y dx=" dx " dy=" dy))))))))
 
+;; value-type return whose field is a REDUCTION LOOP accumulating a nested call.
+;; Regression: in the value-fn pipeline the accumulator stays generic until the
+;; late devirtualizer (resolve-generic-deftm-calls), which used to build the .invk
+;; without :raster.type/tag → emit defaulted it to i32 → invalid f64/i32 wasm.
+;; (This is the fbm2d-octave-loop shape that blocked biome-climate's wasm.)
+(deftm wv2-reduce [n :- Long, step :- Double] :- WV2
+  (let [acc (loop [i 0 a 0.0]
+              (if (clojure.core/= (long i) (long n))
+                a
+                (recur (clojure.core/inc (long i))
+                       (raster.numeric/+ a (sq-k step)))))]   ; sq-k: a nested deftm call
+    (->WV2 acc 0.0)))
+
+(deftest value-type-return-with-reduction-loop
+  (testing "value return whose field is a loop accumulating a nested call (f64, not i32)"
+    (let [m (pl/compile-wasm #'wv2-reduce :name "wv2red")]
+      (is (= [:f64 :f64] (:result-types m)))
+      (let [inst (instantiate (:bytes m))                ; parse = validate
+            db   #(Double/doubleToRawLongBits (double %))]
+        (doseq [[n step] [[0 2.0] [1 3.0] [5 1.5] [10 0.5]]]
+          (let [r (.apply (.export inst "wv2red") (long-array [n (db step)]))]
+            (is (= (* (double n) (* step step)) (Double/longBitsToDouble (aget r 0)))
+                (str "acc n=" n " step=" step))
+            (is (= 0.0 (Double/longBitsToDouble (aget r 1))))))))))
+
 ;; Transcendentals — wasm has no sin/cos/exp opcode; they lower to an inline
 ;; polynomial (backend.wasm.transcendental): sin/cos floor-reduce + degree-9
 ;; minimax; exp = x/1024 + Taylor + 10 squarings; tan = sin/cos. tan/cos exercise

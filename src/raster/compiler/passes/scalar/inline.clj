@@ -1468,8 +1468,13 @@
                                          (try (not (fn? @(resolve ms-impl)))
                                               (catch Exception _ false)))]
                       (if (and impl-v typed-iface (or primitive-ret? bc-compiled?))
-                        ;; Full devirtualization: .invk impl-sym with typed interface tag
-                        (util/make-invk (vary-meta ms-impl assoc :tag typed-iface) args (meta expr))
+                        ;; Full devirtualization: .invk impl-sym with typed interface tag.
+                        ;; Carry the semantic return type as :raster.type/tag on the node
+                        ;; (the walker does the same) so backends that read it — e.g. the
+                        ;; wasm emitter's element-type selection — don't default to i32.
+                        (util/make-invk (vary-meta ms-impl assoc :tag typed-iface) args
+                                        (cond-> (or (meta expr) {})
+                                          ret-tag (assoc :raster.type/tag ret-tag)))
                         ;; Mangled call — still resolved, just not .invk
                         (let [r (cons ms args)]
                           (if-let [m (meta expr)] (with-meta r m) r))))))))))))))
