@@ -217,6 +217,24 @@
             (into (emit-val ctx b)) (into (e/i mop))               ; q*b
             (into (e/i sop)))))))                                  ; a - q*b
 
+(defn- emit-operand-at
+  "Emit `node`, coercing its value to valtype `vt` when its own type differs — so a
+   mixed-type op (e.g. `(>= (double dx) (long 0))`, valid in Clojure via numeric
+   promotion) gets matching operand types on the wasm stack instead of an i32/f64
+   mismatch. Only the genuine cross-type cases insert a conversion."
+  [ctx vt node]
+  (let [nv (infer-vt ctx node)
+        b  (emit-val ctx node)]
+    (cond
+      (= nv vt) b
+      (and (= vt :f64) (= nv :i32)) (into b (e/i :f64.convert_i32_s))
+      (and (= vt :f32) (= nv :i32)) (into b (e/i :f32.convert_i32_s))
+      (and (= vt :f64) (= nv :f32)) (into b (e/i :f64.promote_f32))
+      (and (= vt :f32) (= nv :f64)) (into b (e/i :f32.demote_f64))
+      (and (= vt :i32) (= nv :f64)) (into b (e/i :i32.trunc_f64_s))
+      (and (= vt :i32) (= nv :f32)) (into b (e/i :i32.trunc_f32_s))
+      :else b)))
+
 (defn- emit-intrinsic
   "Emit a registered numeric op / intrinsic via the backend.intrinsics table.
    `op` is the canonical-able op form; `args` the (already op-stripped) operands;
@@ -231,7 +249,7 @@
       :special (emit-rem-mod ctx k (first args) (second args))
       :cmp (let [vt (operand-vt)
                  opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
-             (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
+             (-> (emit-operand-at ctx vt (first args)) (into (emit-operand-at ctx vt (second args))) (into (e/i opk))))
       :infix (if (and (= k :-) (= 1 (count args)))
                ;; unary minus → negate (the n-ary fold would wrongly emit identity)
                (let [vt (or vt-hint (infer-vt ctx (first args)))]
@@ -241,9 +259,10 @@
                    (-> (e/i32-const 0) (into (emit-val ctx (first args))) (into (e/i :i32.sub)))))
                (let [vt (or vt-hint (operand-vt))
                      opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
-                 ;; left-fold n-ary operands so (* a b c) can't silently drop c
-                 (reduce (fn [acc a] (-> acc (into (emit-val ctx a)) (into (e/i opk))))
-                         (emit-val ctx (first args)) (rest args))))
+                 ;; left-fold n-ary operands so (* a b c) can't silently drop c;
+                 ;; coerce each to the op vt (mixed f64/int operands)
+                 (reduce (fn [acc a] (-> acc (into (emit-operand-at ctx vt a)) (into (e/i opk))))
+                         (emit-operand-at ctx vt (first args)) (rest args))))
       :fn (if (ix/wasm-poly? k)
             ;; transcendental → inline polynomial form, emitted via the normal path.
             ;; f32: compute in f64 (promote args) and demote the result.
@@ -256,8 +275,8 @@
                           (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
                                                " (transcendental? needs import/polynomial)") {:op op})))]
               (if (= 2 (:arity d))
-                (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk)))
-                (-> (emit-val ctx (first args)) (into (e/i opk))))))
+                (-> (emit-operand-at ctx vt (first args)) (into (emit-operand-at ctx vt (second args))) (into (e/i opk)))
+                (-> (emit-operand-at ctx vt (first args)) (into (e/i opk))))))
       (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
 
 (defn- infer-vt

@@ -268,6 +268,23 @@
   (testing "default budget inlines small callees (still one valid module)"
     (is (some? (Parser/parse (:bytes (pl/compile-wasm #'sqsum-k :name "ss")))))))
 
+;; mixed-type operands: a double compared with an integer literal — (>= x 0) walks
+;; to (>= (double x) (long 0)). Clojure promotes; wasm needs both operands at the
+;; op's vt. Regression for the operand-coercion fix (surfaced by ray-intersects-aabb?).
+(deftm mixcmp-k [x :- Double] :- Long
+  (if (clojure.core/>= x 0)
+    1
+    (if (clojure.core/< x -5) 2 0)))
+
+(deftest wasm-mixed-type-operand-coercion
+  (testing "double compared/combined with integer literals coerces, not i32/f64 mismatch"
+    (let [m    (pl/compile-wasm #'mixcmp-k :name "mix")
+          inst (instantiate (:bytes m))]
+      (is (= [:i32] (:result-types m)))
+      (doseq [[x e] [[3.0 1] [0.0 1] [-2.0 0] [-9.0 2]]]
+        (is (= e (aget (.apply (.export inst "mix") (long-array [(Double/doubleToRawLongBits x)])) 0))
+            (str "mix " x))))))
+
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
     (let [m (pl/compile-wasm #'relu-k! :name "relu")
