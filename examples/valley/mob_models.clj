@@ -3,7 +3,9 @@
   Each mob is a collection of boxes (head, body, legs) with walk animation.
   Uses the same 9-float vertex format as terrain: [x y z u v dayLight nightLight texLayer ao]."
   (:refer-clojure :exclude [defn])
-  (:require [raster.core :refer [defn deftm]]))
+  (:require [raster.core :refer [defn deftm]]
+            [raster.linalg.core :as lin :refer [->Vec3]])
+  (:import [raster.linalg.core Vec3]))
 
 (set! *warn-on-reflection* true)
 
@@ -82,16 +84,16 @@
                       {:name :arm-r  :size [0.08 0.6 0.08] :offset [0.25 0.85 0.0]  :tex 98}]}
 
    :lurker {:boxes [{:name :body   :size [0.3 0.8 0.3] :offset [0.0 0.5 0.0] :tex 100}
-                     {:name :head   :size [0.35 0.35 0.35] :offset [0.0 1.35 0.0] :tex 101
-                      :pivot [0.0 1.3 0.0] :axis :x}
-                     {:name :leg-fl :size [0.12 0.5 0.12] :offset [-0.1 0.0 0.1]  :tex 100
-                      :pivot [0.0 0.5 0.0] :axis :x}
-                     {:name :leg-fr :size [0.12 0.5 0.12] :offset [0.1 0.0 0.1]   :tex 100
-                      :pivot [0.0 0.5 0.0] :axis :x}
-                     {:name :leg-bl :size [0.12 0.5 0.12] :offset [-0.1 0.0 -0.1] :tex 100
-                      :pivot [0.0 0.5 0.0] :axis :x}
-                     {:name :leg-br :size [0.12 0.5 0.12] :offset [0.1 0.0 -0.1]  :tex 100
-                      :pivot [0.0 0.5 0.0] :axis :x}]}
+                    {:name :head   :size [0.35 0.35 0.35] :offset [0.0 1.35 0.0] :tex 101
+                     :pivot [0.0 1.3 0.0] :axis :x}
+                    {:name :leg-fl :size [0.12 0.5 0.12] :offset [-0.1 0.0 0.1]  :tex 100
+                     :pivot [0.0 0.5 0.0] :axis :x}
+                    {:name :leg-fr :size [0.12 0.5 0.12] :offset [0.1 0.0 0.1]   :tex 100
+                     :pivot [0.0 0.5 0.0] :axis :x}
+                    {:name :leg-bl :size [0.12 0.5 0.12] :offset [-0.1 0.0 -0.1] :tex 100
+                     :pivot [0.0 0.5 0.0] :axis :x}
+                    {:name :leg-br :size [0.12 0.5 0.12] :offset [0.1 0.0 -0.1]  :tex 100
+                     :pivot [0.0 0.5 0.0] :axis :x}]}
 
    :spider {:boxes [{:name :body   :size [0.6 0.25 0.8] :offset [0.0 0.25 0.0] :tex 102}
                     {:name :head   :size [0.35 0.3 0.3] :offset [0.0 0.35 0.5]  :tex 103
@@ -109,24 +111,26 @@
 ;; >4 args so casts are inside the body.
 
 (deftm rotate-x
-  "Rotate point [x y z] around pivot by angle (radians) on X axis."
+  "Rotate point [x y z] around pivot by angle (radians) on X axis. Returns a Vec3
+   (allocation-free value type — scalarized on the JVM, multi-value over wasm)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double]
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dy (- y py) dz (- z pz)
         c (Math/cos angle) s (Math/sin angle)]
-    [x
-     (+ py (- (* c dy) (* s dz)))
-     (+ pz (+ (* s dy) (* c dz)))]))
+    (->Vec3 x
+            (+ py (- (* c dy) (* s dz)))
+            (+ pz (+ (* s dy) (* c dz))))))
 
 (deftm rotate-y
-  "Rotate point [x y z] around pivot by angle (radians) on Y axis."
+  "Rotate point [x y z] around pivot by angle (radians) on Y axis. Returns a Vec3
+   (allocation-free value type — see rotate-x)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double]
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dx (- x px) dz (- z pz)
         c (Math/cos angle) s (Math/sin angle)]
-    [(+ px (+ (* c dx) (* s dz)))
-     y
-     (+ pz (- (* c dz) (* s dx)))]))
+    (->Vec3 (+ px (+ (* c dx) (* s dz)))
+            y
+            (+ pz (- (* c dz) (* s dx))))))
 
 (defn- emit-box-verts!
   "Emit 24 vertices (6 faces x 4 verts) and 36 indices for a box.
@@ -247,17 +251,18 @@
                 (let [lx (double (aget verts v))
                       ly (double (aget verts (+ v 1)))
                       lz (double (aget verts (+ v 2)))
-                      ;; Apply leg rotation around pivot
-                      [lx ly lz] (if (and is-leg? pivot (not (zero? leg-rot)))
-                                   (let [[px py pz] pivot]
-                                     (rotate-x lx ly lz px py pz leg-rot))
-                                   [lx ly lz])
+                      ;; Apply leg rotation around pivot (Vec3, allocation-free)
+                      ^Vec3 lv (if (and is-leg? pivot (not (zero? leg-rot)))
+                                 (let [[px py pz] pivot]
+                                   (rotate-x lx ly lz px py pz leg-rot))
+                                 (->Vec3 lx ly lz))
+                      lx (.x lv) ly (.y lv) lz (.z lv)
                       ;; Apply yaw rotation around origin
-                      [rx _ry rz] (rotate-y lx ly lz 0.0 0.0 0.0 yaw)
+                      ^Vec3 rv (rotate-y lx ly lz 0.0 0.0 0.0 yaw)
                       ;; Translate to world position
-                      fx (+ (double rx) wx)
+                      fx (+ (.x rv) wx)
                       fy (+ ly wy)
-                      fz (+ (double rz) wz)]
+                      fz (+ (.z rv) wz)]
                   (aset verts v (float fx))
                   (aset verts (+ v 1) (float fy))
                   (aset verts (+ v 2) (float fz)))

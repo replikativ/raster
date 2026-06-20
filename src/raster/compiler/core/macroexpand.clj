@@ -25,6 +25,32 @@
       (with-meta result (merge (meta result) m))
       result)))
 
+(defn- unwrap-int-cast
+  "Unwrap a trivial integer cast around a literal: (long 3)/(int 3) → 3. Other
+   forms pass through unchanged."
+  [k]
+  (if (and (seq? k)
+           (symbol? (first k)) (#{"long" "int"} (name (first k)))
+           (= 2 (count k)) (integer? (second k)))
+    (second k)
+    k))
+
+(defn normalize-case-keys
+  "In a `(case test k0 e0 k1 e1 … [default])` form, unwrap trivially-cast integer
+   test-constants — `(long 0)` → `0`. `clojure.core/case` requires literal
+   compile-time test constants; an integer literal coerced to `(long 0)` by an
+   upstream re-walk would otherwise be read as a 2-element key-list `(long 0)` and
+   fail to macroexpand. A genuine multi-constant key list (e.g. `(0 1 2)`) is left
+   intact (its head is not a long/int cast symbol)."
+  [form]
+  (let [[c test & clauses] form
+        has-default (odd? (count clauses))
+        default (when has-default (last clauses))
+        pairs (partition 2 (if has-default (butlast clauses) clauses))
+        norm (mapcat (fn [[k e]] [(unwrap-int-cast k) e]) pairs)]
+    (with-meta (apply list c test (concat norm (when has-default [default])))
+      (meta form))))
+
 (defn macroexpand-all-preserving
   "Like clojure.walk/macroexpand-all but preserves metadata on forms.
 
@@ -35,7 +61,13 @@
    shape instead of the generic `loop*` expansion."
   ([form] (macroexpand-all-preserving form (constantly false)))
   ([form skip-head?]
-   (let [expanded (if (and (seq? form)
+   (let [;; normalize case test-constants (an upstream re-walk may coerce integer
+         ;; keys to (long N), which clojure.core/case can't macroexpand)
+         form (if (and (seq? form) (symbol? (first form))
+                       (= "case" (name (first form))))
+                (normalize-case-keys form)
+                form)
+         expanded (if (and (seq? form)
                            (not (and (symbol? (first form)) (skip-head? (first form)))))
                     (macroexpand form)
                     form)

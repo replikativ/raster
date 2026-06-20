@@ -308,6 +308,29 @@
         (is (= 11.0 (Double/longBitsToDouble (aget r 0))))
         (is (= 22.0 (Double/longBitsToDouble (aget r 1))))))))
 
+;; Step 4: value-type return with a scalar `if` per field (the normalize-xz
+;; pattern). Keeping the constructor a single value-tail and pushing branching
+;; into each scalar arg avoids a multi-value `if` — the geometry kernels return
+;; Vec2/3/4 this way instead of allocating a double-array.
+(deftm wv2-norm [dx :- Double, dy :- Double] :- WV2
+  (let [len (raster.math/sqrt (raster.numeric/+ (raster.numeric/* dx dx) (raster.numeric/* dy dy)))]
+    (->WV2 (if (raster.numeric/> len 0.001) (raster.numeric// dx len) 0.0)
+           (if (raster.numeric/> len 0.001) (raster.numeric// dy len) 1.0))))
+
+(deftest value-type-return-with-scalar-if
+  (testing "Vec2-style value return whose fields contain scalar ifs (sqrt is exact)"
+    (let [m (pl/compile-wasm #'wv2-norm :name "wv2norm")]
+      (is (= [:f64 :f64] (:result-types m)))
+      (let [inst (instantiate (:bytes m))
+            db   #(Double/doubleToRawLongBits (double %))]
+        (doseq [[dx dy] [[3.0 4.0] [0.0 0.0] [-5.0 12.0] [1.0 0.0]]]
+          (let [r   (.apply (.export inst "wv2norm") (long-array [(db dx) (db dy)]))
+                len (Math/sqrt (+ (* dx dx) (* dy dy)))
+                ex  (if (> len 0.001) (/ dx len) 0.0)
+                ey  (if (> len 0.001) (/ dy len) 1.0)]
+            (is (= ex (Double/longBitsToDouble (aget r 0))) (str "x dx=" dx " dy=" dy))
+            (is (= ey (Double/longBitsToDouble (aget r 1))) (str "y dx=" dx " dy=" dy))))))))
+
 ;; Transcendentals — wasm has no sin/cos/exp opcode; they lower to an inline
 ;; polynomial (backend.wasm.transcendental): sin/cos floor-reduce + degree-9
 ;; minimax; exp = x/1024 + Taylor + 10 squarings; tan = sin/cos. tan/cos exercise

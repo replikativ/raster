@@ -14,7 +14,9 @@
     - Geometry (distance, direction, rotation, ray intersection)
     - Terrain (biome classification, height sampling, cave detection)"
   (:require [raster.core :refer [deftm]]
-            [raster.noise :as noise]))
+            [raster.linalg.core :as lin :refer [->Vec2 ->Vec3 ->Vec4]]
+            [raster.noise :as noise])
+  (:import [raster.linalg.core Vec2 Vec3 Vec4]))
 
 ;; ================================================================
 ;; Constants — def ^:const inlined by the bytecode compiler
@@ -101,18 +103,18 @@
         by1 (long (Math/floor (+ y h -0.01)))]
     (loop [bx bx0]
       (if (> bx bx1) 0
-        (if (pos? (loop [bz bz0]
-                    (if (> bz bz1) 0
-                      (if (pos? (loop [by by0]
-                                  (if (> by by1) 0
-                                    (if (pos? (world-block-solid? blocks solid-arr
-                                                bx by bz cx cy cz))
-                                      1
-                                      (recur (+ by 1))))))
-                        1
-                        (recur (+ bz 1))))))
-          1
-          (recur (+ bx 1)))))))
+          (if (pos? (loop [bz bz0]
+                      (if (> bz bz1) 0
+                          (if (pos? (loop [by by0]
+                                      (if (> by by1) 0
+                                          (if (pos? (world-block-solid? blocks solid-arr
+                                                                        bx by bz cx cy cz))
+                                            1
+                                            (recur (+ by 1))))))
+                            1
+                            (recur (+ bz 1))))))
+            1
+            (recur (+ bx 1)))))))
 
 (deftm ground-check
   "Check if there's a solid block directly below feet.
@@ -180,18 +182,13 @@
     (Math/sqrt (+ (* dx dx) (* dy dy) (* dz dz)))))
 
 (deftm normalize-xz
-  "Normalize XZ direction. Returns [nx nz] as 2-element double array."
-  [dx :- Double, dz :- Double] :- (Array double)
+  "Normalize XZ direction. Returns a Vec2 (allocation-free value type — the wasm
+   backend lowers it to a multi-value return; the JVM scalarizes it)."
+  [dx :- Double, dz :- Double] :- Vec2
   (let [len (Math/sqrt (+ (* dx dx) (* dz dz)))]
-    (if (> len 0.001)
-      (let [out (double-array 2)]
-        (aset out 0 (/ dx len))
-        (aset out 1 (/ dz len))
-        out)
-      (let [out (double-array 2)]
-        (aset out 0 0.0)
-        (aset out 1 1.0)
-        out))))
+    ;; scalar `if` in each component keeps the constructor a single value-tail
+    (->Vec2 (if (> len 0.001) (/ dx len) 0.0)
+            (if (> len 0.001) (/ dz len) 1.0))))
 
 (deftm dir-toward-xz
   "Normalized XZ direction from (mx,mz) toward (tx,tz). Returns [dx dz] vector."
@@ -203,30 +200,26 @@
       [0.0 1.0])))
 
 (deftm rotate-x
-  "Rotate (x,y,z) around pivot (px,py,pz) by angle on X axis.
-  Returns [rx ry rz] as 3-element double array."
+  "Rotate (x,y,z) around pivot (px,py,pz) by angle on X axis. Returns a Vec3
+   (allocation-free value type — see normalize-xz)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double] :- (Array double)
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dy (- y py) dz (- z pz)
-        c (Math/cos angle) s (Math/sin angle)
-        out (double-array 3)]
-    (aset out 0 x)
-    (aset out 1 (+ py (- (* c dy) (* s dz))))
-    (aset out 2 (+ pz (+ (* s dy) (* c dz))))
-    out))
+        c (Math/cos angle) s (Math/sin angle)]
+    (->Vec3 x
+            (+ py (- (* c dy) (* s dz)))
+            (+ pz (+ (* s dy) (* c dz))))))
 
 (deftm rotate-y
-  "Rotate (x,y,z) around pivot (px,py,pz) by angle on Y axis.
-  Returns [rx ry rz] as 3-element double array."
+  "Rotate (x,y,z) around pivot (px,py,pz) by angle on Y axis. Returns a Vec3
+   (allocation-free value type — see normalize-xz)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double] :- (Array double)
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dx (- x px) dz (- z pz)
-        c (Math/cos angle) s (Math/sin angle)
-        out (double-array 3)]
-    (aset out 0 (+ px (+ (* c dx) (* s dz))))
-    (aset out 1 y)
-    (aset out 2 (+ pz (- (* c dz) (* s dx))))
-    out))
+        c (Math/cos angle) s (Math/sin angle)]
+    (->Vec3 (+ px (+ (* c dx) (* s dz)))
+            y
+            (+ pz (- (* c dz) (* s dx))))))
 
 (deftm ray-intersects-aabb?
   "Ray-AABB intersection test. Returns 1 if ray hits box, 0 if not.
@@ -255,28 +248,23 @@
 ;; ================================================================
 
 (deftm biome-climate
-  "Compute temperature and humidity at world (wx, wz).
-  Returns [temp humid erosion mushroom] as 4-element double array."
+  "Compute temperature and humidity at world (wx, wz). Returns a Vec4 of
+   [temp humid erosion mushroom] (allocation-free value type — see normalize-xz)."
   [temp-perm :- (Array int), humid-perm :- (Array int),
    detail-perm :- (Array int), mush-perm :- (Array int),
-   wx :- Double, wz :- Double] :- (Array double)
-  (let [out (double-array 4)
-        temp (+ 0.5 (* 0.5 (noise/fbm2d temp-perm
-                              (* wx BIOME-FREQ) (* wz BIOME-FREQ)
-                              3 0.5 2.0)))
+   wx :- Double, wz :- Double] :- Vec4
+  (let [temp (+ 0.5 (* 0.5 (noise/fbm2d temp-perm
+                                        (* wx BIOME-FREQ) (* wz BIOME-FREQ)
+                                        3 0.5 2.0)))
         humid (+ 0.5 (* 0.5 (noise/fbm2d humid-perm
-                               (* wx BIOME-FREQ) (* wz BIOME-FREQ)
-                               3 0.5 2.0)))
+                                         (* wx BIOME-FREQ) (* wz BIOME-FREQ)
+                                         3 0.5 2.0)))
         erosion (noise/fbm2d detail-perm
-                  (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0))
-                  2 0.5 2.0)
+                             (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0))
+                             2 0.5 2.0)
         mush (noise/perlin2d mush-perm
-               (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
-    (aset out 0 temp)
-    (aset out 1 humid)
-    (aset out 2 erosion)
-    (aset out 3 mush)
-    out))
+                             (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
+    (->Vec4 temp humid erosion mush)))
 
 (deftm terrain-height
   "Get terrain surface height at world (wx, wz).
@@ -285,25 +273,25 @@
    wx :- Double, wz :- Double,
    height-scale :- Double, base-offset :- Double] :- Long
   (let [h (noise/fbm2d height-perm
-            (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ)
-            4 0.5 2.0)
+                       (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ)
+                       4 0.5 2.0)
         detail (noise/fbm2d detail-perm
-                 (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0))
-                 2 0.6 2.0)]
+                            (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0))
+                            2 0.6 2.0)]
     (long (+ (double BASE-HEIGHT) base-offset (* h height-scale) (* detail 4.0)))))
 
 (deftm has-cave?
   "Check if world position (wx,wy,wz) is carved out by cave noise."
   [cave-perm :- (Array int), wx :- Double, wy :- Double, wz :- Double] :- Long
   (let [v (noise/fbm3d cave-perm
-            (* wx CAVE-FREQ) (* wy CAVE-FREQ) (* wz CAVE-FREQ)
-            2 0.5 2.0)]
+                       (* wx CAVE-FREQ) (* wy CAVE-FREQ) (* wz CAVE-FREQ)
+                       2 0.5 2.0)]
     (if (> (Math/abs v) CAVE-THRESHOLD) 1 0)))
 
 (deftm has-lava-pool?
   "Check if position should have a lava pool (underground, noise-based)."
   [cave-perm :- (Array int), wx :- Double, wy :- Double, wz :- Double] :- Long
   (if (> wy 20.0) 0
-    (let [v (noise/perlin3d cave-perm
-              (* wx (/ 1.0 25.0)) (* wy (/ 1.0 15.0)) (* wz (/ 1.0 25.0)))]
-      (if (> v 0.7) 1 0))))
+      (let [v (noise/perlin3d cave-perm
+                              (* wx (/ 1.0 25.0)) (* wy (/ 1.0 15.0)) (* wz (/ 1.0 25.0)))]
+        (if (> v 0.7) 1 0))))
