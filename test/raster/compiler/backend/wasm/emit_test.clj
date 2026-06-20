@@ -220,6 +220,35 @@
           (let [r (.apply (.export inst "callsq") (long-array [(Double/doubleToRawLongBits y)]))]
             (is (= (* y y) (Double/longBitsToDouble (aget r 0))) (str "callsq " y))))))))
 
+;; 1B recursion: a recursive deftm can't be inlined (would diverge); the inliner's
+;; recursion guard keeps the call, and compile-wasm discovers it + emits a wasm
+;; self/sibling `call`. (Recursion StackOverflowed compile-aot before the guard.)
+(deftm fact-k [m :- Long] :- Long
+  (if (clojure.core/<= (long m) (long 1))
+    1
+    (clojure.core/* (long m) (fact-k (clojure.core/- (long m) 1)))))
+
+(declare odd-k)
+(deftm even-k [m :- Long] :- Long
+  (if (clojure.core/= (long m) (long 0)) 1 (odd-k (clojure.core/- (long m) 1))))
+(deftm odd-k [m :- Long] :- Long
+  (if (clojure.core/= (long m) (long 0)) 0 (even-k (clojure.core/- (long m) 1))))
+
+(deftest wasm-recursion
+  (testing "self-recursion → wasm self-call (validates + runs)"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'fact-k :name "fact")))]
+      (doseq [[n e] [[1 1] [5 120] [10 3628800]]]
+        (is (= e (aget (.apply (.export inst "fact") (long-array [n])) 0)) (str "fact " n)))))
+  (testing "mutual recursion → sibling internal functions calling each other"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'even-k :name "evn")))]
+      (doseq [n [0 1 2 7 10]]
+        (is (= (if (even? n) 1 0)
+               (aget (.apply (.export inst "evn") (long-array [n])) 0))
+            (str "even " n)))))
+  (testing "recursion also no longer StackOverflows compile-aot (JVM)"
+    (let [f (pl/compile-aot #'fact-k)]
+      (is (= 3628800 (f 10))))))
+
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
     (let [m (pl/compile-wasm #'relu-k! :name "relu")

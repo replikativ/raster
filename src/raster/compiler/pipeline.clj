@@ -29,6 +29,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
+            [raster.compiler.backend.intrinsics :as ix]
             [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
             [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
@@ -920,6 +921,28 @@
            :param-tags  (mapv :tag param-specs)
            :return-tag  return-tag}}))
 
+(defn- intrinsic-invk?
+  "True if an .invk node calls a registered intrinsic (raster.numeric/Math/…) —
+   these are emitted inline by the wasm backend, never as a `call`."
+  [node]
+  (and (seq? node) (= '.invk (first node))
+       (let [op (:raster.op/original (meta node))]
+         (and (symbol? op) (ix/canonical op)))))
+
+(defn- discover-callees
+  "Set of impl-syms of non-intrinsic deftm callees that survive (un-inlined) in ir.
+   Each becomes a sibling wasm function invoked via `call` (recursion today;
+   size-driven outlining later)."
+  [ir]
+  (let [out (atom #{})]
+    (walk/postwalk
+     (fn [x]
+       (when (and (seq? x) (= '.invk (first x)) (not (intrinsic-invk? x)))
+         (swap! out conj (second x)))
+       x)
+     ir)
+    @out))
+
 (defn compile-wasm
   "Compile a deftm var to a WebAssembly module (Track A — browser/WASI target).
    Reuses compile-aot's front-half (walker → forward-passes) to produce the same
@@ -934,7 +957,38 @@
    buffers); `:simd? false` is forced (the JVM Vector-API SIMD lowering is
    JVM-only — a wasm-SIMD128 path is a later increment)."
   [f-var & {:keys [dtype name wasm-simd?] :or {dtype :double}}]
-  (wasm-emit/compile-kernel (wasm-kernel-spec f-var dtype name wasm-simd?)))
+  (let [root  (wasm-kernel-spec f-var dtype name wasm-simd?)
+        rv    (or (resolve-deftm-var f-var dtype) f-var)
+        root-rkey (symbol (str (.ns ^clojure.lang.Var rv)) (clojure.core/name (.sym ^clojure.lang.Var rv)))
+        ;; transitive discovery of non-inlined (non-intrinsic) deftm callees that
+        ;; survive in the IR — recursion guard keeps recursive calls, and (later)
+        ;; the outline pass will introduce others. Each becomes a sibling wasm fn.
+        result (loop [pending (vec (discover-callees (:ir root)))
+                      by-key  {}            ; callee impl-sym → kernel spec
+                      root-ck nil]          ; root's own :call-key if self-recursive
+                 (if (empty? pending)
+                   {:by-key by-key :root-ck root-ck}
+                   (let [impl (peek pending), more (pop pending)
+                         rkey (inline/recursion-key impl)]
+                     (cond
+                       (= rkey root-rkey)            ; self-call → resolves to the root fn
+                       (recur more by-key impl)
+                       (contains? by-key impl)       ; already compiled
+                       (recur more by-key root-ck)
+                       :else
+                       (let [cv   (resolve rkey)
+                             spec (assoc (wasm-kernel-spec cv dtype (str (clojure.core/name (inline/recursion-key impl))) wasm-simd?)
+                                         :call-key impl :export? false)]
+                         (recur (into more (discover-callees (:ir spec)))
+                                (assoc by-key impl spec) root-ck))))))
+        callees (vals (:by-key result))
+        root*   (cond-> (assoc root :export? true)
+                  (:root-ck result) (assoc :call-key (:root-ck result)))
+        module  (wasm-emit/compile-module (into [root*] callees))
+        entry   (first (:exports module))]
+    {:bytes (:bytes module)
+     :name (:name entry) :param-types (:param-types entry)
+     :result-types (:result-types entry) :sig (:sig root)}))
 
 (defn compile-wasm-module
   "Compile several deftm vars into ONE wasm module that shares a single linear

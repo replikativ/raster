@@ -62,6 +62,23 @@
   #{'double 'long 'float 'int 'byte 'short 'char 'boolean
     'doubles 'floats 'longs 'ints 'objects 'bytes 'shorts 'chars 'booleans})
 
+(def ^:dynamic *inlining*
+  "Set of recursion-keys for deftm callees currently being inlined (the inline
+   stack). A callee already on the stack is recursive — inlining it would not
+   terminate — so it is kept as a call instead. Handles self- and mutual
+   recursion. Backends that can't call (none currently) would need to reject."
+  #{})
+
+(defn recursion-key
+  "Stable identity of a callee for recursion detection — the base dispatch symbol,
+   independent of arity mangling and the -impl suffix. e.g.
+   ns/fact_m_long-impl → ns/fact."
+  [impl-sym]
+  (let [n (name impl-sym)
+        n (if (.endsWith ^String n "-impl") (subs n 0 (- (count n) 5)) n)
+        n (if-let [i (str/index-of n "_m_")] (subs n 0 i) n)]
+    (symbol (namespace impl-sym) n)))
+
 (def ^:private trivial-cast?
   "Cast/coercion calls that are cheap to duplicate — single arg, no allocation."
   #{'long 'double 'float 'int 'byte 'short 'char
@@ -1254,8 +1271,11 @@
    (cond
      (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
      (let [impl-sym (second form)
+           rkey (recursion-key impl-sym)
            has-rule? (and preserve-templates? (first (rt/resolve-template impl-sym)))
-           deftm-info (when-not has-rule? (try-resolve-deftm impl-sym))]
+           ;; recursive callee (already being inlined) → keep as a call, don't recurse
+           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
+                        (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                body-form (first walked-body)
@@ -1297,7 +1317,10 @@
                                 [p a]))))
                          callee-params)
                    inlined (subst-syms param-subst body-form)
-                   result (inline-invk inlined policy)]
+                   ;; mark this callee as on the inline stack while re-processing its
+                   ;; body, so a recursive self-call inside stays a call (terminates)
+                   result (binding [*inlining* (conj *inlining* rkey)]
+                            (inline-invk inlined policy))]
                ;; Wrap in let* with lifted bindings if any were emitted
                (if (seq @lifted-bindings)
                  (list 'let* (vec @lifted-bindings) result)
