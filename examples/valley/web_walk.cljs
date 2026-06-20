@@ -1,8 +1,10 @@
 (ns valley.web-walk
-  "WebGPU browser shell for the valley single-chunk walker (Phase 2b-A). The physics
-   + terrain kernels run as wasm (generated valley.kernels, perms + chunk scratch in
-   wasm memory); valley.walk drives the player and renders via WebGPU — the same
-   .cljc as the JVM Vulkan walk shell (vk_walk). Controls: WASD move, arrows look."
+  "WebGPU browser shell for the valley multi-chunk walker (option C). Physics + terrain
+   run as wasm (generated valley.kernels, perms + chunk scratch in wasm memory); the
+   world spans several 16³ chunks and physics uses a player-centred 16³ window stitched
+   each frame — the SAME .cljc as the JVM Vulkan walk shell (vk_walk). The marshaling
+   is unchanged: the shim uploads the stitched window as the kernel's blocks array.
+   Controls: WASD move, arrows look."
   (:require [raster.render :as r]
             [raster.render.webgpu :as gpu]
             [valley.slice :as slice]
@@ -14,12 +16,12 @@
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
                (let [pipeline (r/make-pipeline rnd slice/pipeline-spec)
-                     world    (walk/build-world)
+                     world    (walk/build-grid 3 1 3)         ; 48×16×48 multi-chunk world
                      mesh     (r/make-static-mesh rnd (:verts world) (:indices world) slice/STRIDE)
                      tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 3
                                                         :pixels (slice/atlas-pixels 16 16) :filter :nearest})
                      aspect   (/ 1024.0 768.0)
-                     state    (atom (walk/player-init (:blocks world)))]
+                     state    (atom (walk/grid-player-init world))]
                  (set! (.-__valley js/window)
                        #js {:player (fn [] (clj->js {:pos (vec (:pos @state)) :vel (vec (:vel @state))
                                                      :yaw (:yaw @state) :on-ground (:on-ground @state)}))
@@ -27,7 +29,7 @@
                  (r/run! rnd
                          {:init-state @state
                           :clear-color [0.55 0.75 0.95 1.0]
-                          :update (fn [p input dt] (reset! state (walk/player-update world p input dt)) @state)
+                          :update (fn [p input dt] (reset! state (walk/grid-player-update world p input dt)) @state)
                           :render (fn [p frame]
                                     (r/bind-pipeline! frame pipeline)
                                     (r/set-uniform! frame pipeline (walk/mvp p aspect))

@@ -62,6 +62,60 @@
                                  0 0 0 HALF-W HEIGHT dx dz dt)]
     (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g))))
 
+;; --- multi-chunk world walker (option C) -------------------------------------
+;; Same kernel, same marshaling; the only difference from single-chunk is that each
+;; frame we stitch a player-centred 16³ window from the world (chunk/stitch-window!)
+;; and call integrate-physics! against it at origin 0, translating the player position
+;; into and out of window-local coords around the call.
+
+(defn build-grid
+  "A cw×ch×cd-chunk world + its full render mesh + a reusable 16³ stitch scratch.
+   Flat for now (walkable across seams without step-up); swap gen-flat-world →
+   gen-world once the physics gains step-up to walk real terrain."
+  [cw ch cd]
+  (let [world (chunk/gen-flat-world cw ch cd 8)
+        m     (chunk/mesh-world world)]
+    (assoc world :verts (:verts m) :indices (:indices m)
+           :scratch (chunk/iarray (* chunk/CS chunk/CS chunk/CS)))))
+
+(defn grid-player-init
+  "Spawn above the world centre column for a short visible fall onto the terrain."
+  [world]
+  (let [cx (quot (long (:wx world)) 2)
+        cz (quot (long (:wz world)) 2)
+        top (loop [y (dec (long (:wy world)))]
+              (cond (< y 0) 0
+                    (pos? (chunk/world-block world cx y cz)) (inc y)
+                    :else (recur (dec y))))]
+    {:pos (chunk/darray [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)])
+     :vel (chunk/darray [0.0 0.0 0.0])
+     :yaw 0.0 :pitch -0.2 :on-ground false}))
+
+(defn grid-player-update
+  "Player physics against the multi-chunk world via a player-centred window."
+  [world player input dt]
+  (let [{:keys [pos vel yaw pitch]} player
+        on?   (fn [a] (if (contains? input a) 1.0 0.0))
+        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))))
+        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down)))) (max -1.5) (min 1.5))
+        fx (sin yaw)  fz (- (cos yaw))
+        rx (cos yaw)  rz (sin yaw)
+        fwd (* MOVE dt (- (on? :w) (on? :s)))
+        strf (* MOVE dt (- (on? :d) (on? :a)))
+        dx (+ (* fx fwd) (* rx strf))
+        dz (+ (* fz fwd) (* rz strf))
+        ;; window origin: centre the (tiny) player AABB in a 16³ window
+        wox (- (long #?(:clj (Math/floor (aget pos 0)) :cljs (js/Math.floor (aget pos 0)))) 8)
+        woy (- (long #?(:clj (Math/floor (aget pos 1)) :cljs (js/Math.floor (aget pos 1)))) 8)
+        woz (- (long #?(:clj (Math/floor (aget pos 2)) :cljs (js/Math.floor (aget pos 2)))) 8)
+        scratch (chunk/stitch-window! world (:scratch world) wox woy woz)]
+    ;; → window-local, step, → world (vel is a delta: translation-invariant)
+    (aset pos 0 (- (aget pos 0) wox)) (aset pos 1 (- (aget pos 1) woy)) (aset pos 2 (- (aget pos 2) woz))
+    (let [g (k/integrate-physics! pos vel scratch (:solid world)
+                                  0 0 0 HALF-W HEIGHT dx dz dt)]
+      (aset pos 0 (+ (aget pos 0) wox)) (aset pos 1 (+ (aget pos 1) woy)) (aset pos 2 (+ (aget pos 2) woz))
+      (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g)))))
+
 (defn player-cam
   "Render camera built from the player: eye at feet + EYE, reusing slice/fly-mvp."
   [player]
