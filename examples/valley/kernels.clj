@@ -38,3 +38,11 @@
 (defn integrate-physics!
   [pos vel blocks solid cx cy cz hw h dx dz dt]   ; >4 args → no primitive hint
   (vc/integrate-physics! pos vel blocks solid cx cy cz hw h dx dz dt))
+
+;; Batch mob physics. JVM: the world block array is used directly (zero-copy), so
+;; upload-world! is a no-op; the browser shim uploads the resident world once.
+(defn upload-world! [_blocks _solid] nil)
+
+(defn integrate-physics-batch!
+  [pos vel dxs dzs blocks solid n wxd wyd wzd hw h dt]
+  (vc/integrate-physics-batch! pos vel dxs dzs blocks solid n wxd wyd wzd hw h dt))

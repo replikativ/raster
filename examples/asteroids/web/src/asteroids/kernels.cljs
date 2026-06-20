@@ -4,10 +4,10 @@
   (:require [raster.wasm :as w]))
 
 (defonce M (atom nil))
+(defn ready? [] (some? @M))
 (defn init!
   ([src] (init! src (cljs.core/js-obj)))
   ([src env] (.then (w/instantiate! src env) (fn [s] (reset! M s) s))))
-(defn ready? [] (some? @M))
 (defn- kfn [n] (w/export @M n))
 
 (defrecord Shape [x y vx vy angle spin size])
