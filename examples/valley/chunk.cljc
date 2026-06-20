@@ -173,6 +173,71 @@
     (gen-into! b CS CS x0 z0 x0 z0 (+ x0 CS) (+ z0 CS))
     {:blocks b :light (column-skylight b)}))
 
+(defn- skylight-into!
+  "Top-down skylight (0/15) into the region [rx0,rx1)×[rz0,rz1) of light buffer (dims AW×COL-H×AD,
+   origin ox,oz) from block buffer b. Per-column, no cross-column bleed."
+  [b light AW AD ox oz rx0 rz0 rx1 rz1]
+  (let [AW (long AW) AD (long AD) ox (long ox) oz (long oz)]
+    (doseq [wx (range rx0 rx1) wz (range rz0 rz1)]
+      (let [lx (- (long wx) ox) lz (- (long wz) oz)]
+        (loop [ly (dec COL-H) lit true]
+          (when (>= ly 0)
+            (let [i (+ lx (* lz AW) (* ly AW AD))
+                  air (zero? (aget #?(:clj ^ints b :cljs b) i))]
+              (if (and lit air)
+                (do (aset #?(:clj ^ints light :cljs light) i #?(:clj (int 15) :cljs 15)) (recur (dec ly) true))
+                (recur (dec ly) false)))))))))
+
+(defn- region-minus
+  "Rectangle difference R \\ O (O ⊆ R) as ≤4 disjoint rects [x0 z0 x1 z1] (left/right/top/bottom)."
+  [rx0 rz0 rx1 rz1 ox0 oz0 ox1 oz1]
+  (filter (fn [[a b c d]] (and (< a c) (< b d)))
+          [[rx0 rz0 ox0 rz1] [ox1 rz0 rx1 rz1] [ox0 rz0 ox1 oz0] [ox0 oz1 ox1 rz1]]))
+
+;; --- active buffer: the loaded ring as one moving flat world ------------------------------
+;; A "stream" is a world map {:blocks :light :wx :wy :wz :aox :aoz :rg :center :solid :scratch}
+;; whose flat arrays cover chunks within `rg` of `center`. All consumers (mesher, stitch,
+;; mob kernel) treat it as a flat world at buffer-local coords; world↔buffer offset = (aox,aoz).
+(defn make-stream
+  "Create an active buffer centred on chunk (pcx,pcz) with data radius `rg` (chunks)."
+  [pcx pcz rg]
+  (let [rg (long rg) AW (* (+ (* 2 rg) 1) CS)
+        aox (* (- (long pcx) rg) CS) aoz (* (- (long pcz) rg) CS)
+        buf (iarray (* AW COL-H AW)) light (iarray (* AW COL-H AW))]
+    (gen-into! buf AW AW aox aoz aox aoz (+ aox AW) (+ aoz AW))
+    (skylight-into! buf light AW AW aox aoz aox aoz (+ aox AW) (+ aoz AW))
+    {:blocks buf :light light :wx AW :wy COL-H :wz AW :aox aox :aoz aoz
+     :rg rg :center [(long pcx) (long pcz)] :solid (solid-table)
+     :scratch (iarray (* CS CS CS))}))
+
+(defn recenter-stream
+  "Re-centre the active buffer on chunk (pcx,pcz): retained columns are copied, newly-entered
+   strips generated (seamless — canopy radius = tree margin). Returns the updated stream (or the
+   same one if the centre is unchanged)."
+  [s pcx pcz]
+  (let [pcx (long pcx) pcz (long pcz)]
+    (if (= (:center s) [pcx pcz])
+      s
+      (let [rg (long (:rg s)) AW (* (+ (* 2 rg) 1) CS)
+            naox (* (- pcx rg) CS) naoz (* (- pcz rg) CS)
+            oaox (long (:aox s)) oaoz (long (:aoz s))
+            ob #?(:clj ^ints (:blocks s) :cljs (:blocks s)) ol #?(:clj ^ints (:light s) :cljs (:light s))
+            nb (iarray (* AW COL-H AW)) nl (iarray (* AW COL-H AW))
+            ox0 (max naox oaox) oz0 (max naoz oaoz)
+            ox1 (min (+ naox AW) (+ oaox AW)) oz1 (min (+ naoz AW) (+ oaoz AW))]
+        ;; copy retained overlap
+        (doseq [wx (range ox0 ox1) wz (range oz0 oz1)]
+          (let [olx (- wx oaox) olz (- wz oaoz) nlx (- wx naox) nlz (- wz naoz)]
+            (dotimes [ly COL-H]
+              (let [oi (+ olx (* olz AW) (* ly AW AW)) ni (+ nlx (* nlz AW) (* ly AW AW))]
+                (aset #?(:clj ^ints nb :cljs nb) ni (aget ob oi))
+                (aset #?(:clj ^ints nl :cljs nl) ni (aget ol oi))))))
+        ;; generate newly-entered strips
+        (doseq [[sx0 sz0 sx1 sz1] (region-minus naox naoz (+ naox AW) (+ naoz AW) ox0 oz0 ox1 oz1)]
+          (gen-into! nb AW AW naox naoz sx0 sz0 sx1 sz1)
+          (skylight-into! nb nl AW AW naox naoz sx0 sz0 sx1 sz1))
+        (assoc s :blocks nb :light nl :aox naox :aoz naoz :center [pcx pcz])))))
+
 (defn gen-world
   "A flat cw×ch×cd-chunk world generated from valley.kernels/terrain-height over
    continuous world coords (so terrain flows across chunk seams). Caves carved by
