@@ -150,16 +150,24 @@
         on-ground? (> ground-y -0.5)
         new-my (if (and on-ground? (< vy 0.0)) ground-y new-my)
         vy (if (and on-ground? (< vy 0.0)) 0.0 vy)
-        ;; Horizontal: try X then Z
+        ;; Horizontal with 1-block step-up: try X then Z; if a move is blocked by a
+        ;; single-block rise that has headroom above it, climb the step (grounded only).
+        ;; (aabb-collides? returns 1 when blocked, 0 when clear — `(< _ 1)` means clear.)
         try-mx (+ mx dx)
-        try-mz (+ mz dz)
         coll-x (aabb-collides? blocks solid-arr try-mx new-my mz hw h cx cy cz)
-        new-mx (if (pos? coll-x) mx try-mx)
-        coll-z (aabb-collides? blocks solid-arr new-mx new-my try-mz hw h cx cy cz)
-        new-mz (if (pos? coll-z) mz try-mz)]
+        step-x? (and on-ground? (pos? coll-x)
+                     (< (aabb-collides? blocks solid-arr try-mx (+ new-my 1.0) mz hw h cx cy cz) 1))
+        new-mx (if (pos? coll-x) (if step-x? try-mx mx) try-mx)
+        my-x (if step-x? (+ new-my 1.0) new-my)
+        try-mz (+ mz dz)
+        coll-z (aabb-collides? blocks solid-arr new-mx my-x try-mz hw h cx cy cz)
+        step-z? (and on-ground? (pos? coll-z)
+                     (< (aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h cx cy cz) 1))
+        new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
+        my-final (if step-z? (+ my-x 1.0) my-x)]
     ;; Write back
     (aset pos 0 new-mx)
-    (aset pos 1 new-my)
+    (aset pos 1 my-final)
     (aset pos 2 new-mz)
     (aset vel 1 vy)
     (if on-ground? 1 0)))

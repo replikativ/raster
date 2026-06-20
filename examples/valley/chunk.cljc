@@ -72,10 +72,16 @@
    get right). Returns {:blocks :wx :wy :wz :solid}."
   [^long cw ^long ch ^long cd]
   (let [wx (* cw CS) wy (* ch CS) wz (* cd CS)
-        b  (iarray (* wx wy wz))]
+        b  (iarray (* wx wy wz))
+        base 4
+        ;; terrain-height is smooth (≤1-block steps); offset by the world min and CLAMP
+        ;; into [base, wy). mod-wrapping would inject huge artificial cliffs — keep the
+        ;; smooth profile so the player's 1-block step-up can climb it.
+        raw  (vec (for [x (range wx) z (range wz)] (long (k/terrain-height x z))))
+        minh (reduce min raw)]
     (dotimes [x wx]
       (dotimes [z wz]
-        (let [h (+ 4 (mod (k/terrain-height x z) (max 1 (- wy 4))))]  ; fit in [4,wy)
+        (let [h (max base (min (dec wy) (+ base (- (nth raw (+ (* x wz) z)) minh))))]
           (dotimes [y wy]
             (when (< y h)
               (aset b (world-idx x y z wx wz)

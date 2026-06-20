@@ -70,10 +70,10 @@
 
 (defn build-grid
   "A cw×ch×cd-chunk world + its full render mesh + a reusable 16³ stitch scratch.
-   Flat for now (walkable across seams without step-up); swap gen-flat-world →
-   gen-world once the physics gains step-up to walk real terrain."
+   Real terrain (valley.kernels/terrain-height) — walkable because integrate-physics!
+   does 1-block step-up. gen-flat-world remains for a flat test plane."
   [cw ch cd]
-  (let [world (chunk/gen-flat-world cw ch cd 8)
+  (let [world (chunk/gen-world cw ch cd)
         m     (chunk/mesh-world world)]
     (assoc world :verts (:verts m) :indices (:indices m)
            :scratch (chunk/iarray (* chunk/CS chunk/CS chunk/CS)))))

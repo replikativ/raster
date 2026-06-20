@@ -65,6 +65,69 @@ on the forked columns, score, keep or discard — rollback / what-if / ensemble 
 the DB side costing nothing. The bitemporal branch additionally lets you query "state
 as of sim-tick T" while the column always holds "now".
 
+## Optimal deftm/wasm integration: resident columns, Datahike indexes rows
+
+The materialized-view model above describes *correctness*. The *optimal* form removes
+all per-frame copying by making the kernel's own memory the column store:
+
+> **The columns the kernels operate on ARE the resident storage for hot state, living
+> in the kernel's native memory; Datahike is the relational index over *rows*, not the
+> storage of hot values.**
+
+```
+  Datahike (truth for structure)              Resident columns (truth for hot values)
+  ┌────────────────────────────┐             ┌─────────────────────────────────────┐
+  │ entity registry: eid → row  │──row index─▶│ Position[3·N]  Velocity[3·N]  …       │
+  │ cold attrs (faction, hp,    │             │ SoA, addressed by row                 │
+  │   inventory, relations)     │             │ lives in: Java arrays (JVM)           │
+  │ history / forks / queries   │             │           wasm linear memory (browser)│
+  └────────────────────────────┘             │           GPU buffer (device)         │
+         ▲  reconcile (rare)                  └─────────────────────────────────────┘
+         │  column → datoms at checkpoint/                     ▲
+         │  save / relational-query-on-hot-attr               │ kernels read/write IN PLACE
+         └────────────────────────────────────────────────────┘  (zero marshal)
+```
+
+What makes it optimal, specifically for deftm/wasm:
+
+- **The kernel's memory is the column store — no marshaling step.** On the JVM a column
+  is a `double[]` deftm reads via `aget` at primitive speed. In wasm a column is a
+  *permanent* region of linear memory at a fixed offset; the kernel reads/writes byte
+  offsets directly and JS reads the same bytes via typed-array views for rendering. This
+  is the delta from the current `integrate-physics!` shim, which uploads pos/vel/blocks
+  into scratch *every call* and reads them back — if the columns *live* in linear
+  memory, the call just passes base offsets and mutates in place. Same ptr,len ABI,
+  pointed at resident allocations instead of per-frame scratch.
+- **One kernel over the whole column.** `integrate-physics!` becomes
+  `integrate-physics-batch!` sweeping N rows in one deftm pass (the SIMD/GPU sweet spot)
+  instead of one marshaled call per entity.
+- **Backend-parametric.** "Resident column" = Java array | wasm linear-memory region |
+  GPU buffer. The kernel backend changes; the column abstraction and the eid→row bridge
+  (portable `.cljc`) do not — the same model reaches GPU for free.
+
+What Datahike stores, and does not:
+
+- **Stores**: eid→row, all *cold* attrs, relations, and free snapshots/forks for
+  simulation rollback (`@conn` ~0.2 µs + CoW the column buffers — valley.state's
+  existing CoW-chunk trick, generalized to entity columns).
+- **Does not store**: per-frame hot values as datoms (redundant — the column is the
+  truth, and the 2.5 µs/ent JVM / 20 µs/ent cljs writeback is exactly what deferral
+  avoids). Hot values reach Datahike only at reconcile (checkpoint/save), or never if
+  queried by row instead of by Datalog.
+- **Block world**: the bulk-hot case of the same rule — chunk arrays are resident
+  columns; Datahike holds only chunk metadata (coord→key, dirty). This is why option C's
+  windowed physics is pure array work that never touches Datahike.
+
+For hot-attr *spatial* queries ("entities within radius"), use a spatial index
+(grid/BVH) derived from the position column — not a Datalog range scan. Datalog is for
+relational/cold selection; the spatial index for geometric selection; the column for the
+math.
+
+**Staging.** Single player + option C does not need the column system (one entity).
+The mobs phase (N>1) is the natural entry point: introduce the eid→row bridge + resident
+pos/vel columns in linear memory + the batch kernel + reconcile-at-checkpoint. It is not
+a rewrite — the valley.state CoW pattern and the wasm ABI are already ~80 % of it.
+
 ## `fast-transact`: the synchronous write-behind path
 
 `valley.state/fast-transact` is a direct-index transact that bypasses the async writer,
