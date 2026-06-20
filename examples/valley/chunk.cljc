@@ -92,6 +92,10 @@
 ;; global normalization — so every column generates identically regardless of load order).
 ;; ============================================================================
 (def ^:const COL-H 48)         ; column height (blocks) — taller than the demo box for peaks/caves
+(def ^:const STREAM-RG 5)      ; data radius (chunks): active buffer covers ±RG
+(def ^:const STREAM-R 4)       ; mesh/render radius (< RG so meshed columns have neighbours)
+(def ^:const STREAM-BUDGET 2)  ; columns meshed per frame (spread pop-in)
+(def ^:const STREAM-AW (* (+ (* 2 STREAM-RG) 1) CS))   ; active-buffer width/depth (blocks)
 (def ^:const TERRAIN-BASE 4)   ; lowest solid level
 (def ^:const TERRAIN-REF 38)   ; fixed vertical reference (replaces the old global world-min)
 (def ^:const SEA-LEVEL 14)     ; lakes fill below this

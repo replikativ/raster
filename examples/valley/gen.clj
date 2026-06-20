@@ -10,6 +10,7 @@
          '[raster.noise :as noise]
          '[clojure.java.io :as io])
 (require 'valley.core)
+(require 'valley.chunk)   ; streaming active-buffer dims (single source of truth)
 
 (def web-dir "examples/asteroids/web")
 ;; perm tables — must match examples/valley/kernels.clj (the JVM facade)
@@ -48,8 +49,9 @@
                        {:sym 'MVEL :view :f64 :bytes (* 8 3 K)}
                        {:sym 'MDXS :view :f64 :bytes (* 8 K)}
                        {:sym 'MDZS :view :f64 :bytes (* 8 K)}]
-            ;; uploaded once (the big resident world block array)
-            :resident [{:sym 'WBLK :view :i32 :bytes (* 4 64 64 64)}
+            ;; resident world = the streaming active buffer (re-uploaded on recenter); sized
+            ;; STREAM-AW × COL-H × STREAM-AW so the browser mob batch kernel sees the full ring.
+            :resident [{:sym 'WBLK :view :i32 :bytes (* 4 valley.chunk/STREAM-AW valley.chunk/COL-H valley.chunk/STREAM-AW)}
                        {:sym 'WSOL :view :i8  :bytes 64}]
             :uploads  [{:fn "upload-world!" :args '[blocks solid]
                         :set '[[WBLK blocks] [WSOL solid]]}]
