@@ -178,6 +178,8 @@
         last  (atom (js/performance.now))
         acc   (atom 0.0)
         fixed (/ 1.0 60.0)
+        mdx   (atom 0.0) mdy (atom 0.0)        ; pointer-lock delta accumulated per frame
+        canvas (:canvas rnd)
         [cr cg cb ca] clear-color]
     (.addEventListener js/document "keydown"
                        (fn [e] (when-let [a (key->action (j/get e :code))]
@@ -185,6 +187,13 @@
                                  (when (= a :fire) (j/call e :preventDefault)))))
     (.addEventListener js/document "keyup"
                        (fn [e] (when-let [a (key->action (j/get e :code))] (swap! input disj a))))
+    ;; mouse-look: click to grab the pointer, then accumulate movement while locked
+    (when canvas
+      (.addEventListener canvas "click" (fn [_] (j/call canvas :requestPointerLock)))
+      (.addEventListener js/document "mousemove"
+                         (fn [e] (when (= (j/get js/document :pointerLockElement) canvas)
+                                   (swap! mdx + (j/get e :movementX))
+                                   (swap! mdy + (j/get e :movementY))))))
     (letfn [(one-frame [now]
               ;; dt clamped to [0, 0.1]: the lower clamp matters — the first frame's
               ;; rAF timestamp can predate `last` (set after a slow init), giving a
@@ -193,10 +202,14 @@
               (let [dt (max 0.0 (min 0.1 (/ (- now @last) 1000.0)))]
                 (reset! last now)
                 (swap! acc + dt)
-                (loop [] (when (>= @acc fixed)
-                           (swap! state #(update % @input fixed))
-                           (swap! acc - fixed)
-                           (recur)))
+                ;; frame's mouse delta applied once (on the first sub-step), then zeroed
+                (let [dx @mdx dy @mdy]
+                  (reset! mdx 0.0) (reset! mdy 0.0)
+                  (loop [fst true]
+                    (when (>= @acc fixed)
+                      (swap! state #(update % (if fst (with-meta @input {:mouse [dx dy]}) @input) fixed))
+                      (swap! acc - fixed)
+                      (recur false))))
                 (let [enc  (j/call device :createCommandEncoder)
                       view (j/call (j/call context :getCurrentTexture) :createView)
                       pdesc #js {:colorAttachments

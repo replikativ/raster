@@ -96,8 +96,10 @@
   [world player input dt]
   (let [{:keys [pos vel yaw pitch]} player
         on?   (fn [a] (if (contains? input a) 1.0 0.0))
-        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))))
-        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down)))) (max -1.5) (min 1.5))
+        [mdx mdy] (or (:mouse (meta input)) [0.0 0.0])   ; pointer-lock delta (px)
+        sens  0.0025
+        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))) (* (- sens) mdx))
+        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down))) (* (- sens) mdy)) (max -1.5) (min 1.5))
         fx (sin yaw)  fz (- (cos yaw))
         rx (cos yaw)  rz (sin yaw)
         fwd (* MOVE dt (- (on? :w) (on? :s)))

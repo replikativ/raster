@@ -169,7 +169,10 @@
         :input-system inp-sys
         :clear-color clear-color
         :title title
-        :update-fn (fn [state polled dt] (update state (->actions polled) dt))
+        :update-fn (fn [state polled dt]
+                     ;; carry the GLFW mouse delta alongside the action set (metadata,
+                     ;; non-breaking — keyboard-only code still treats input as a set)
+                     (update state (with-meta (->actions polled) {:mouse (:mouse-delta polled)}) dt))
         :render-fn (fn [state cb _ctx _frame-info] (render state (->VkFrame cb)))}))))
 
 (defn make-renderer
