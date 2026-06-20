@@ -337,3 +337,44 @@
       (is (= -1.0 (call1 sg "signum" -5.0)))
       (is (= 1.0 (call1 sg "signum" 5.0)))
       (is (= 0.0 (call1 sg "signum" 0.0))))))
+
+;; R5b wasm emitter extensions (driven by raster.noise): integer bitwise ops +
+;; shifts, value-position `case` (gradient-hash dispatch), unary minus, and a
+;; `loop` in value position (a reduction bound in a let).
+(deftm bitops-k [a :- Long, b :- Long] :- Long
+  (let [x (bit-and a b) y (bit-or a b) z (bit-xor a b)
+        s (bit-shift-left a 2) r (bit-shift-right b 1)]
+    (clojure.core/+ x (clojure.core/+ y (clojure.core/+ z (clojure.core/+ s r))))))
+
+(deftm grad-case-k [h :- Long, x :- Double, y :- Double] :- Double
+  (case (int (bit-and h 3))
+    0 (raster.numeric/+ x y)
+    1 (raster.numeric/+ (raster.numeric/- x) y)
+    2 (raster.numeric/- x y)
+    3 (raster.numeric/- (raster.numeric/- x) y)))
+
+(deftm vloop-k [n :- Long] :- Double
+  (let [s (loop [i 0 acc 0.0]
+            (if (clojure.core/= (long i) (long n)) acc
+                (recur (clojure.core/inc (long i)) (raster.numeric/+ acc 1.0))))]
+    (raster.numeric/* s 2.0)))
+
+(deftest wasm-bitwise-case-vloop
+  (testing "bitwise + shifts"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'bitops-k :name "bit")))]
+      (doseq [[a b] [[12 10] [255 3] [7 1]]]
+        (let [got (aget (.apply (.export inst "bit") (long-array [a b])) 0)
+              exp (+ (bit-and a b) (bit-or a b) (bit-xor a b) (bit-shift-left a 2) (bit-shift-right b 1))]
+          (is (= exp got) (str "bitops " a " " b))))))
+  (testing "value-position case + unary minus (grad2d shape) vs reference"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'grad-case-k :name "gc")))
+          ref (fn [h x y] (case (bit-and h 3) 0 (+ x y) 1 (+ (- x) y) 2 (- x y) 3 (- (- x) y)))]
+      (doseq [h [0 1 2 3 7 10]]
+        (let [got (Double/longBitsToDouble (aget (.apply (.export inst "gc")
+                                                         (long-array [h (Double/doubleToRawLongBits 0.5) (Double/doubleToRawLongBits 0.7)])) 0))]
+          (is (< (Math/abs (- got (ref h 0.5 0.7))) 1e-12) (str "grad-case h=" h))))))
+  (testing "loop in value position (let-bound reduction)"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'vloop-k :name "vl")))]
+      (doseq [n [0 1 5 17]]
+        (let [got (Double/longBitsToDouble (aget (.apply (.export inst "vl") (long-array [n])) 0))]
+          (is (= (* 2.0 n) got) (str "vloop n=" n)))))))

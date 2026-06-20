@@ -23,7 +23,8 @@
   {'doubles {:vt :f64 :bytes 8 :align 3 :load :f64.load :store :f64.store}
    'floats  {:vt :f32 :bytes 4 :align 2 :load :f32.load :store :f32.store}
    'longs   {:vt :i64 :bytes 8 :align 3 :load :i64.load :store :i64.store}
-   'ints    {:vt :i32 :bytes 4 :align 2 :load :i32.load :store :i32.store}})
+   'ints    {:vt :i32 :bytes 4 :align 2 :load :i32.load :store :i32.store}
+   'bytes   {:vt :i32 :bytes 1 :align 0 :load :i32.load8_s :store :i32.store8}})
 
 (defn- array-tag? [tag] (contains? array-tag->elem tag))
 
@@ -42,7 +43,7 @@
 ;; raster.compiler.backend.intrinsics — emit dispatches through ix/wasm-op.
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt emit-effect alloc! emit-intrinsic)
+(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur?)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -63,6 +64,23 @@
          (or (#{'dotimes 'when} h)
              (and (= 'do h) (void-effect-form? (last node)))))))
 
+(defn- synth-case
+  "Lower (case test k0 e0 k1 e1 … [default]) to a let*+if-chain IR form (test bound
+   once, compared against each integer key). For an exhaustive case with no default,
+   the last clause's value becomes the final else."
+  [args]
+  (let [test (first args)
+        clauses (vec (rest args))
+        has-default (odd? (count clauses))
+        default (when has-default (peek clauses))
+        pairs (partition 2 (if has-default (pop clauses) clauses))
+        g (gensym "case_g_")
+        base (if has-default default (second (last pairs)))
+        fold-pairs (if has-default pairs (butlast pairs))]
+    (list 'let* [g test]
+          (reduce (fn [els [k e]] (list 'if (list 'clojure.core/== g k) e els))
+                  base (reverse fold-pairs)))))
+
 (defn- emit-val
   "Emit a value-producing expression → byte vector."
   [ctx node]
@@ -76,7 +94,11 @@
     (seq? node)
     (let [h (first node), A (vec (rest node))]
       (cond
-        (#{'long 'int} h) (emit-val ctx (first A))          ; integer index casts: identity (i32)
+        (#{'long 'int} h)                                   ; integer cast → i32
+        (let [x (first A) xv (infer-vt ctx x)]
+          (cond-> (emit-val ctx x)
+            (= xv :f64) (into (e/i :i32.trunc_f64_s))        ; (long (Math/floor d)) etc.
+            (= xv :f32) (into (e/i :i32.trunc_f32_s))))
         (= h 'double)                                       ; f64 cast / literal — type-aware
         (let [x (first A)]
           (if (number? x)
@@ -101,12 +123,30 @@
         (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.add)))
         (#{"dec" "unchecked-dec-int" "unchecked-dec"} (name h))
         (-> (emit-val ctx (A 0)) (into (e/i32-const 1)) (into (e/i :i32.sub)))
+        ;; numeric predicates → compare against a typed zero (bool/i32 result)
+        (#{"zero?" "pos?" "neg?"} (name h))
+        (let [x (A 0) vt (infer-vt ctx x)
+              zc (case vt :f64 (e/f64-const 0.0) :f32 (e/f32-const 0.0) (e/i32-const 0))
+              k  (case (name h) "zero?" :eq "pos?" :gt "neg?" :lt)]
+          (-> (emit-val ctx x) (into zc) (into (e/i (ix/wasm-op k vt)))))
         ;; value-position if → typed if/else block
         (= h 'if)
         (let [[c t e] A
               tv (infer-vt ctx t)
               vt (if (= tv :i32) (infer-vt ctx e) tv)]
           (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))
+        ;; case → lower to a let*+if-chain, emitted via the normal path
+        (#{'case 'clojure.core/case} h)
+        (emit-val ctx (synth-case A))
+        ;; (or a b …) / (and a b …) → nested if on bool (i32) operands
+        (#{'or 'clojure.core/or} h)
+        (emit-val ctx (reduce (fn [els c] (list 'if c 1 els)) 0 (reverse A)))
+        (#{'and 'clojure.core/and} h)
+        (emit-val ctx (reduce (fn [els c] (list 'if c els 0)) 1 (reverse A)))
+        ;; loop in VALUE position (e.g. an inlined reduction as a let* binding init)
+        ;; — emit-loop already yields a value-producing block(result vt); take bytes.
+        (#{'loop 'loop*} h)
+        (first (emit-loop ctx node))
         ;; devirtualized typed call: op + element vt from carried metadata
         (= h '.invk)
         (let [vt (case (:raster.type/tag (meta node)) double :f64 float :f32 :i32)]
@@ -116,7 +156,7 @@
         (and (symbol? h) (ix/canonical h))
         (emit-intrinsic ctx h A nil)
         ;; let* / do in VALUE position (introduced by inlined deftm calls)
-        (= h 'let*)
+        (#{'let* 'let} h)
         (let [[binds & body] A
               [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
                                           (if (void-effect-form? init)
@@ -165,11 +205,18 @@
       :cmp (let [vt (operand-vt)
                  opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
              (-> (emit-val ctx (first args)) (into (emit-val ctx (second args))) (into (e/i opk))))
-      :infix (let [vt (or vt-hint (operand-vt))
-                   opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
-               ;; left-fold n-ary operands so (* a b c) can't silently drop c
-               (reduce (fn [acc a] (-> acc (into (emit-val ctx a)) (into (e/i opk))))
-                       (emit-val ctx (first args)) (rest args)))
+      :infix (if (and (= k :-) (= 1 (count args)))
+               ;; unary minus → negate (the n-ary fold would wrongly emit identity)
+               (let [vt (or vt-hint (infer-vt ctx (first args)))]
+                 (case vt
+                   :f64 (-> (emit-val ctx (first args)) (into (e/i :f64.neg)))
+                   :f32 (-> (emit-val ctx (first args)) (into (e/i :f32.neg)))
+                   (-> (e/i32-const 0) (into (emit-val ctx (first args))) (into (e/i :i32.sub)))))
+               (let [vt (or vt-hint (operand-vt))
+                     opk (or (ix/wasm-op k vt) (throw (ex-info (str "no wasm lowering for " k " @ " vt) {:op op})))]
+                 ;; left-fold n-ary operands so (* a b c) can't silently drop c
+                 (reduce (fn [acc a] (-> acc (into (emit-val ctx a)) (into (e/i opk))))
+                         (emit-val ctx (first args)) (rest args))))
       :fn (if (ix/wasm-poly? k)
             ;; transcendental → inline polynomial form, emitted via the normal path.
             ;; f32: compute in f64 (promote args) and demote the result.
@@ -200,17 +247,25 @@
         (cond
           (= 'float h)  :f32
           (= 'double h) :f64
-          (#{'long 'int} h) (infer-vt ctx (second node))
+          (#{'long 'int} h) :i32                          ; an integer cast yields i32
           ;; let* — bind its locals so the tail's refs resolve (a let* used as an
           ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
           ;; may reference a binding introduced inside it).
-          (= 'let* h) (let [c' (reduce (fn [c [s init]]
-                                         (assoc-in c [:env s] {:vt (infer-vt c init)}))
-                                       ctx (partition 2 (second node)))]
-                        (infer-vt c' (last node)))
+          (#{'let* 'let} h) (let [c' (reduce (fn [c [s init]]
+                                               (assoc-in c [:env s] {:vt (infer-vt c init)}))
+                                             ctx (partition 2 (second node)))]
+                              (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
           (= 'if h) (let [tv (infer-vt ctx (nth node 2))] ; then-branch type
                       (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))
+          (#{'case 'clojure.core/case} h) (infer-vt ctx (nth node 3)) ; first clause's value
+          (#{'or 'clojure.core/or 'and 'clojure.core/and} h) :i32      ; bool result
+          (and (symbol? h) (#{"zero?" "pos?" "neg?"} (name h))) :i32   ; predicate → bool
+          (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
+          (let [c' (reduce (fn [c [s init]] (assoc-in c [:env s] {:vt (infer-vt c init)}))
+                           ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
+                ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
+            (infer-vt c' (if (ends-in-recur? then) els then)))
           (= 'clojure.core/aget h)  (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
@@ -232,7 +287,7 @@
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
       ;; let* in effect position (e.g. soa-lower floats arg bindings out of a
       ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
-      (= h 'let*)
+      (#{'let* 'let} h)
       (let [[binds & body] A
             [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
                                         (if (void-effect-form? init)
@@ -259,8 +314,15 @@
       (into (vec (mapcat #(e/local-set %) (reverse loop-idxs))))
       (into (e/br loop-depth))))
 
+(defn- ends-in-recur?
+  "Does this branch hand control back to the loop (a recur, possibly after a do)?"
+  [node]
+  (and (seq? node)
+       (or (= 'recur (first node))
+           (and (#{'do 'let* 'let} (first node)) (ends-in-recur? (last node))))))
+
 (defn- emit-then
-  "then-branch of the loop's if: optional effects (a `do`) ending in a recur."
+  "recur-branch of the loop's if: optional effects (a `do`) ending in a recur."
   [ctx node loop-idxs loop-depth]
   (cond
     (and (seq? node) (= 'recur (first node)))
@@ -269,7 +331,20 @@
     (let [stmts (vec (rest node))]
       (-> (vec (mapcat #(emit-effect ctx %) (butlast stmts)))
           (into (emit-then ctx (last stmts) loop-idxs loop-depth))))
-    :else (throw (ex-info (str "loop then-branch must end in recur, got " (pr-str node)) {}))))
+    ;; let*/let before the recur — bind locals, then recurse into the tail
+    (and (seq? node) (#{'let* 'let} (first node)))
+    (let [[binds & body] (rest node)
+          [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
+                                      (if (void-effect-form? init)
+                                        [(assoc-in c [:env s] {:void true})
+                                         (into acc (emit-effect c init))]
+                                        (let [vt (infer-vt c init) idx (alloc! c vt)]
+                                          [(assoc-in c [:env s] {:idx idx :vt vt})
+                                           (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
+                                    [ctx []] (partition 2 binds))
+          tail (if (= 1 (count body)) (first body) (cons 'do body))]
+      (into init-bytes (emit-then ctx' tail loop-idxs loop-depth)))
+    :else (throw (ex-info (str "loop recur-branch must end in recur, got " (pr-str node)) {}))))
 
 (defn- alloc!
   "Reserve a new function-local of valtype vt, return its index. Locals are
@@ -309,14 +384,27 @@
                      ctx loop-vars)
         loop-idxs (mapv :idx loop-vars)
         [_ cnd then els] ifform
-        ret-vt (infer-vt ctx' els)
-        ;; depths from inside the if: if=0, loop=1, block=2
-        if-bytes (-> (emit-val ctx' cnd)
-                     (into [(e/op :if) e/empty-block])
-                     (into (emit-then ctx' then loop-idxs 1))
-                     (into [(e/op :else)])
-                     (into (emit-val ctx' els)) (into (e/br 2))
-                     (into [(e/op :end)]))]
+        ;; the loop's `if` may have the recur in EITHER branch:
+        ;;   (if cont? (recur …) result)   — recur in then
+        ;;   (if done? result (recur …))   — recur in else (e.g. fbm reductions)
+        recur-then? (ends-in-recur? then)
+        result (if recur-then? els then)
+        ret-vt (infer-vt ctx' result)
+        ;; depths from inside the if: if=0, loop=1, block=2. The result branch
+        ;; leaves its value then br 2 (out of the block); the recur branch br 1.
+        if-bytes (if recur-then?
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into (emit-then ctx' then loop-idxs 1))
+                       (into [(e/op :else)])
+                       (into (emit-val ctx' els)) (into (e/br 2))
+                       (into [(e/op :end)]))
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into (emit-val ctx' then)) (into (e/br 2))
+                       (into [(e/op :else)])
+                       (into (emit-then ctx' els loop-idxs 1))
+                       (into [(e/op :end)])))]
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
 
@@ -548,7 +636,7 @@
     ;; void-bound symbol in tail position (e.g. (let* [_ret (dotimes …)] _ret))
     (and (symbol? node) (get-in ctx [:env node :void])) [[] nil]
 
-    (and (seq? node) (= 'let* (first node)))
+    (and (seq? node) (#{'let* 'let} (first node)))
     (let [[_ binds & body] node
           [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
                                       (if (void-effect-form? init)

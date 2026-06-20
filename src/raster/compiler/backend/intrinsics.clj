@@ -44,6 +44,13 @@
    :ge {:arity 2 :kind :cmp :wasm (vt3 :f64.ge :f32.ge :i32.ge_s) :c ">=" :wgsl ">="}
    :eq {:arity 2 :kind :cmp :wasm (vt3 :f64.eq :f32.eq :i32.eq) :c "==" :wgsl "=="}
    :ne {:arity 2 :kind :cmp :wasm (vt3 :f64.ne :f32.ne :i32.ne) :c "!=" :wgsl "!="}
+   ;; integer bitwise + shifts (i32/i64); used by hashing / noise / bit twiddling
+   :bit-and {:arity 2 :kind :infix :wasm {:i32 :i32.and :i64 :i64.and} :c "&" :wgsl "&"}
+   :bit-or  {:arity 2 :kind :infix :wasm {:i32 :i32.or :i64 :i64.or} :c "|" :wgsl "|"}
+   :bit-xor {:arity 2 :kind :infix :wasm {:i32 :i32.xor :i64 :i64.xor} :c "^" :wgsl "^"}
+   :shl     {:arity 2 :kind :infix :wasm {:i32 :i32.shl :i64 :i64.shl} :c "<<" :wgsl "<<"}
+   :shr     {:arity 2 :kind :infix :wasm {:i32 :i32.shr_s :i64 :i64.shr_s} :c ">>" :wgsl ">>"}
+   :ushr    {:arity 2 :kind :infix :wasm {:i32 :i32.shr_u :i64 :i64.shr_u} :c ">>" :wgsl ">>"}
    ;; integer remainder / modulo / quotient
    :rem  {:arity 2 :kind :special :wasm {:i32 :i32.rem_s} :c "%" :wgsl "%"}
    :mod  {:arity 2 :kind :special :c :floored-mod :wgsl :floored-mod}
@@ -107,6 +114,8 @@
   {"+" :+ "-" :- "*" :* "/" :div
    "<" :lt ">" :gt "<=" :le ">=" :ge "==" :eq "=" :eq "not=" :ne "!=" :ne
    "rem" :rem "unchecked-remainder-int" :rem "mod" :mod "quot" :quot
+   "bit-and" :bit-and "bit-or" :bit-or "bit-xor" :bit-xor
+   "bit-shift-left" :shl "bit-shift-right" :shr "unsigned-bit-shift-right" :ushr
    "sqrt" :sqrt "abs" :abs "floor" :floor "ceil" :ceil "round" :round "trunc" :trunc
    "min" :min "max" :max "sin" :sin "cos" :cos "tan" :tan "exp" :exp "log" :log
    "pow" :pow "fma" :fma
