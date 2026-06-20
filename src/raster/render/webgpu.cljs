@@ -163,8 +163,8 @@
      :bg (atom nil)}))
 
 (def ^:private key->action
-  {"ArrowLeft" :left "ArrowRight" :right "ArrowUp" :up "Space" :fire
-   "KeyW" :w "KeyA" :a "KeyS" :s "KeyD" :d})
+  {"ArrowLeft" :left "ArrowRight" :right "ArrowUp" :up "ArrowDown" :down "Space" :fire
+   "KeyW" :w "KeyA" :a "KeyS" :s "KeyD" :d "KeyQ" :q "KeyE" :e})
 
 (defn- run-loop! [rnd {:keys [init-state update render clear-color]
                        :or {clear-color [0.0 0.0 0.0 1.0]}}]

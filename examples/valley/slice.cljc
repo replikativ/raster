@@ -58,13 +58,42 @@
         flat (mapcat identity hm)]
     {:hm hm :lo (reduce min flat) :hi (reduce max flat)}))
 
-(defn mvp
-  "Orbiting camera around the terrain centre at its mean height."
-  [t aspect lo hi]
-  (let [cx (* 0.5 W) cz (* 0.5 W) mid (* 0.5 (+ lo hi)) rad (* 1.4 W)
-        eye [(+ cx (* rad (cos (* 0.25 t)))) (+ hi 18.0) (+ cz (* rad (sin (* 0.25 t))))]]
+;; --- keyboard fly camera (portable; input is the render protocol's action set) --
+(def ^:const MOVE 26.0)   ; blocks / second
+(def ^:const TURN 1.7)    ; radians / second
+
+(defn fly-init
+  "Camera state above the terrain centre, looking down-ish at it."
+  [hi]
+  {:pos [(* 0.5 W) (+ (double hi) 14.0) (+ (* 0.5 W) 34.0)] :yaw 0.0 :pitch -0.35})
+
+(defn- forward-vec [yaw pitch]
+  (let [cp (cos pitch)] [(* (sin yaw) cp) (sin pitch) (* (- (cos yaw)) cp)]))
+
+(defn fly-update
+  "Advance the fly camera from the active action set. WASD move, arrows look,
+   Q/E down/up."
+  [cam input dt]
+  (let [{:keys [pos yaw pitch]} cam
+        on?   (fn [a] (if (contains? input a) 1.0 0.0))
+        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))))
+        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down)))) (max -1.5) (min 1.5))
+        fwd   (forward-vec yaw pitch)
+        rgt   [(cos yaw) 0.0 (sin yaw)]
+        mv    (* MOVE dt)
+        step  (fn [p d s] [(+ (p 0) (* (d 0) s)) (+ (p 1) (* (d 1) s)) (+ (p 2) (* (d 2) s))])
+        pos   (-> pos
+                  (step fwd (* mv (- (on? :w) (on? :s))))
+                  (step rgt (* mv (- (on? :d) (on? :a))))
+                  (step [0.0 1.0 0.0] (* mv (- (on? :e) (on? :q)))))]
+    {:pos pos :yaw yaw :pitch pitch}))
+
+(defn fly-mvp [cam aspect]
+  (let [{:keys [pos yaw pitch]} cam
+        f (forward-vec yaw pitch)
+        center [(+ (pos 0) (f 0)) (+ (pos 1) (f 1)) (+ (pos 2) (f 2))]]
     (mat-mul (perspective 0.9 aspect 0.1 400.0)
-             (look-at eye [cx (double mid) cz] [0.0 1.0 0.0]))))
+             (look-at pos center [0.0 1.0 0.0]))))
 
 (defn- id-at
   "Block id from a heightmap: 0 air, 1 grass (surface), 2 dirt (≤3 below), 3 stone."
@@ -130,12 +159,9 @@
                                         {:location 1 :format :float2 :offset 12}
                                         {:location 2 :format :float :offset 20}]}})
 
-(defn draw-terrain!
-  "lo/hi are the terrain height bounds from mesh-terrain (for the camera) — the GPU
-   `mesh` handle doesn't carry them."
-  [_rnd frame pipeline mesh tex t aspect lo hi]
+(defn draw-terrain! [_rnd frame pipeline mesh tex cam aspect]
   (r/bind-pipeline! frame pipeline)
-  (r/set-uniform! frame pipeline (mvp t aspect lo hi))
+  (r/set-uniform! frame pipeline (fly-mvp cam aspect))
   (r/bind-texture! frame pipeline tex)
   (r/bind-mesh! frame mesh)
   (r/draw-indexed! frame (:index-count mesh) 0))

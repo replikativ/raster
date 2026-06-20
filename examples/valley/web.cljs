@@ -18,13 +18,13 @@
                      tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 3
                                                         :pixels (slice/atlas-pixels 16 16) :filter :nearest})
                      aspect   (/ 1024.0 768.0)
-                     st       (atom 0.0)]
+                     cam      (atom (slice/fly-init (:hi m)))]
                  (set! (.-__valley js/window)
-                       #js {:t (fn [] @st) :verts (quot (count (:verts m)) 6)
+                       #js {:cam (fn [] (clj->js @cam)) :verts (quot (count (:verts m)) 6)
                             :lo (:lo m) :hi (:hi m)})
                  (r/run! rnd
-                         {:init-state 0.0
+                         {:init-state (slice/fly-init (:hi m))
                           :clear-color [0.55 0.75 0.95 1.0]
-                          :update (fn [t _input dt] (reset! st (+ t dt)))
-                          :render (fn [t frame] (slice/draw-terrain! rnd frame pipeline mesh tex t aspect (:lo m) (:hi m)))}))))
+                          :update (fn [c input dt] (reset! cam (slice/fly-update c input dt)) @cam)
+                          :render (fn [c frame] (slice/draw-terrain! rnd frame pipeline mesh tex c aspect))}))))
       (.catch (fn [e] (js/console.error "valley init failed:" e)))))

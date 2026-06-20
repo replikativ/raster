@@ -17,7 +17,7 @@
     (println "valley mesh:" (quot (count (:verts m)) 6) "verts," (count (:indices m)) "indices,"
              "heights" (:lo m) "-" (:hi m))
     (r/run! rnd
-            {:init-state {:t 0.0}
+            {:init-state (slice/fly-init (:hi m))
              :clear-color [0.55 0.75 0.95 1.0]
-             :update (fn [s _input dt] (update s :t + dt))
-             :render (fn [s frame] (slice/draw-terrain! rnd frame pipeline mesh tex (:t s) aspect (:lo m) (:hi m)))})))
+             :update (fn [cam input dt] (slice/fly-update cam input dt))
+             :render (fn [cam frame] (slice/draw-terrain! rnd frame pipeline mesh tex cam aspect))})))

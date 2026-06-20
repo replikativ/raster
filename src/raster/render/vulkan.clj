@@ -155,8 +155,8 @@
              :or {clear-color [0.0 0.0 0.0 1.0] title "Raster"}}]
     (let [fsync (frame/create-frame-sync ctx)
           inp-sys (input/create-input-system (:window ctx))
-          key->action {:up :up :left :left :right :right :space :fire
-                       :w :w :a :a :s :s :d :d}
+          key->action {:up :up :down :down :left :left :right :right :space :fire
+                       :w :w :a :a :s :s :d :d :q :q :e :e}
           ->actions (fn [polled]
                       (persistent!
                        (reduce-kv (fn [s k a]
