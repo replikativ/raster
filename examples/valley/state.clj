@@ -78,35 +78,42 @@
   [db datom-triples]
   (let [tx (inc (:max-tx db))
         datoms (mapv (fn [[e a v]] (dd/datom e a v tx)) datom-triples)
-        ;; Batch update: transient all indices
-        eavt (transient (:eavt db))
-        aevt (transient (:aevt db))
-        avet (transient (:avet db))
-        op-count (:op-count db)]
-    ;; Upsert: remove old values, insert new
-    (doseq [[e a _v] datom-triples]
-      (when-let [old (first (dbi/search db [e a]))]
-        (let [oc (inc op-count)]
-          (di/-remove eavt old :eavt oc)
-          (di/-remove aevt old :aevt oc)
-          (di/-remove avet old :avet oc))))
-    (doseq [d datoms]
-      (let [oc (inc op-count)]
-        (di/-insert eavt d :eavt oc)
-        (di/-insert aevt d :aevt oc)
-        (di/-insert avet d :avet oc)))
+        op-count (:op-count db)
+        oc (inc op-count)
+        ;; Upsert: remove old values, then insert new. CAPTURE every -remove/-insert
+        ;; return and thread it through the indices. The cljs PSS transient is a
+        ;; functional facade — conj!/disj! return a NEW set; transient/persistent! are
+        ;; identity — so discarding the return (which the JVM in-place transient
+        ;; forgives) silently drops the update in ClojureScript. Capturing is the
+        ;; correct transient contract and is right on both runtimes.
+        [eavt aevt avet]
+        (reduce (fn [[ea ae av] [e a _v]]
+                  (if-let [old (first (dbi/search db [e a]))]
+                    [(di/-remove ea old :eavt oc)
+                     (di/-remove ae old :aevt oc)
+                     (di/-remove av old :avet oc)]
+                    [ea ae av]))
+                [(transient (:eavt db)) (transient (:aevt db)) (transient (:avet db))]
+                datom-triples)
+        [eavt aevt avet]
+        (reduce (fn [[ea ae av] d]
+                  [(di/-insert ea d :eavt oc)
+                   (di/-insert ae d :aevt oc)
+                   (di/-insert av d :avet oc)])
+                [eavt aevt avet]
+                datoms)]
     (let [new-db (assoc db
-                   :eavt (persistent! eavt)
-                   :aevt (persistent! aevt)
-                   :avet (persistent! avet)
-                   :max-tx tx
-                   :op-count (+ op-count (count datoms)))]
+                        :eavt (persistent! eavt)
+                        :aevt (persistent! aevt)
+                        :avet (persistent! avet)
+                        :max-tx tx
+                        :op-count (+ op-count (count datoms)))]
       (db/map->TxReport
-        {:db-before db
-         :db-after new-db
-         :tx-data datoms
-         :tempids {:db/current-tx tx}
-         :tx-meta {:db/txInstant (java.util.Date.)}}))))
+       {:db-before db
+        :db-after new-db
+        :tx-data datoms
+        :tempids {:db/current-tx tx}
+        :tx-meta {:db/txInstant (java.util.Date.)}}))))
 
 (defn fast-transact!
   "Fast-transact and swap the connection's db atom.
@@ -154,9 +161,9 @@
   "Mark all chunks as shared (CoW). Returns new chunk map."
   [chunk-map]
   (persistent!
-    (reduce-kv (fn [m k chunk]
-                 (assoc! m k (assoc chunk :shared true)))
-               (transient {}) chunk-map)))
+   (reduce-kv (fn [m k chunk]
+                (assoc! m k (assoc chunk :shared true)))
+              (transient {}) chunk-map)))
 
 ;; ================================================================
 ;; World state container
@@ -223,15 +230,15 @@
   [^WorldState world mob-type x y z hostile?]
   (let [conn (:conn world)
         result (d/transact conn
-                 [{:entity-kind :mob
-                   :mob-type mob-type
-                   :px (double x) :py (double y) :pz (double z)
-                   :vx 0.0 :vy 0.0 :vz 0.0
-                   :yaw (* (rand) 2.0 Math/PI)
-                   :health (long 20) :max-health (long 20)
-                   :entity-state (long (get state-codes :idle 0))
-                   :hostile (boolean hostile?)
-                   :on-ground false}])]
+                           [{:entity-kind :mob
+                             :mob-type mob-type
+                             :px (double x) :py (double y) :pz (double z)
+                             :vx 0.0 :vy 0.0 :vz 0.0
+                             :yaw (* (rand) 2.0 Math/PI)
+                             :health (long 20) :max-health (long 20)
+                             :entity-state (long (get state-codes :idle 0))
+                             :hostile (boolean hostile?)
+                             :on-ground false}])]
     ;; Return the new entity ID
     (-> result :tempids vals first)))
 
@@ -247,11 +254,11 @@
   [db]
   (d/q '[:find ?e ?px ?py ?pz ?vx ?vy ?vz ?yaw ?hp ?mt ?st ?hostile ?ground
          :where [?e :entity-kind :mob]
-                [?e :px ?px] [?e :py ?py] [?e :pz ?pz]
-                [?e :vx ?vx] [?e :vy ?vy] [?e :vz ?vz]
-                [?e :yaw ?yaw] [?e :health ?hp]
-                [?e :mob-type ?mt] [?e :entity-state ?st]
-                [?e :hostile ?hostile] [?e :on-ground ?ground]]
+         [?e :px ?px] [?e :py ?py] [?e :pz ?pz]
+         [?e :vx ?vx] [?e :vy ?vy] [?e :vz ?vz]
+         [?e :yaw ?yaw] [?e :health ?hp]
+         [?e :mob-type ?mt] [?e :entity-state ?st]
+         [?e :hostile ?hostile] [?e :on-ground ?ground]]
        db))
 
 (defn mobs->maps
@@ -295,20 +302,20 @@
         st-ref (dbi/-ref-for db :entity-state)
         ground-ref (dbi/-ref-for db :on-ground)]
     (vec (mapcat (fn [m]
-                  (let [eid (:db/id m)
-                        ^doubles pos (:pos m)
-                        ^doubles vel (:vel m)]
-                    [[eid px-ref (aget pos 0)]
-                     [eid py-ref (aget pos 1)]
-                     [eid pz-ref (aget pos 2)]
-                     [eid vx-ref (double (aget vel 0))]
-                     [eid vy-ref (double (or (:vy m) (aget vel 1)))]
-                     [eid vz-ref (double (aget vel 2))]
-                     [eid yaw-ref (double (:yaw m))]
-                     [eid ground-ref (boolean (:on-ground? m))]
-                     [eid hp-ref (long (:health m))]
-                     [eid st-ref (long (get state-codes (:state m) 0))]]))
-                mobs))))
+                   (let [eid (:db/id m)
+                         ^doubles pos (:pos m)
+                         ^doubles vel (:vel m)]
+                     [[eid px-ref (aget pos 0)]
+                      [eid py-ref (aget pos 1)]
+                      [eid pz-ref (aget pos 2)]
+                      [eid vx-ref (double (aget vel 0))]
+                      [eid vy-ref (double (or (:vy m) (aget vel 1)))]
+                      [eid vz-ref (double (aget vel 2))]
+                      [eid yaw-ref (double (:yaw m))]
+                      [eid ground-ref (boolean (:on-ground? m))]
+                      [eid hp-ref (long (:health m))]
+                      [eid st-ref (long (get state-codes (:state m) 0))]]))
+                 mobs))))
 
 (defn all-mob-eids
   "Get all mob entity IDs from a db snapshot."
@@ -321,14 +328,14 @@
   (d/q '[:find [?e ...]
          :in $ ?cx ?cz ?r2
          :where [?e :entity-kind :mob]
-                [?e :px ?px]
-                [?e :pz ?pz]
-                [(- ?px ?cx) ?dx]
-                [(- ?pz ?cz) ?dz]
-                [(* ?dx ?dx) ?dx2]
-                [(* ?dz ?dz) ?dz2]
-                [(+ ?dx2 ?dz2) ?d2]
-                [(< ?d2 ?r2)]]
+         [?e :px ?px]
+         [?e :pz ?pz]
+         [(- ?px ?cx) ?dx]
+         [(- ?pz ?cz) ?dz]
+         [(* ?dx ?dx) ?dx2]
+         [(* ?dz ?dz) ?dz2]
+         [(+ ?dx2 ?dz2) ?d2]
+         [(< ?d2 ?r2)]]
        db (double px) (double pz) (* (double r) (double r))))
 
 (defn hostile-mobs
@@ -347,9 +354,9 @@
         vy-ref (dbi/-ref-for db :vy)
         ground-ref (dbi/-ref-for db :on-ground)]
     (vec (mapcat (fn [[eid px py pz vy on-ground]]
-                  [[eid px-ref px]
-                   [eid py-ref py]
-                   [eid pz-ref pz]
-                   [eid vy-ref vy]
-                   [eid ground-ref on-ground]])
-                updates))))
+                   [[eid px-ref px]
+                    [eid py-ref py]
+                    [eid pz-ref pz]
+                    [eid vy-ref vy]
+                    [eid ground-ref on-ground]])
+                 updates))))
