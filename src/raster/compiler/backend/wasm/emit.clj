@@ -64,22 +64,20 @@
          (or (#{'dotimes 'when} h)
              (and (= 'do h) (void-effect-form? (last node)))))))
 
-(defn- synth-case
-  "Lower (case test k0 e0 k1 e1 … [default]) to a let*+if-chain IR form (test bound
-   once, compared against each integer key). For an exhaustive case with no default,
-   the last clause's value becomes the final else."
+(defn- synth-case*
+  "Lower the macroexpanded `case*` special form
+     (case* test shift mask default {hash [testval result] …} switch-type test-type)
+   into a let*-bound nested-if chain: the test is bound once and compared against
+   each integer testval. The exhaustive-case `default` (a throw) becomes the final
+   else and lowers to `unreachable`. Only `:int` test-types occur in numeric
+   kernels (the walker keys cases on integers)."
   [args]
-  (let [test (first args)
-        clauses (vec (rest args))
-        has-default (odd? (count clauses))
-        default (when has-default (peek clauses))
-        pairs (partition 2 (if has-default (pop clauses) clauses))
+  (let [[test _shift _mask default clause-map] args
         g (gensym "case_g_")
-        base (if has-default default (second (last pairs)))
-        fold-pairs (if has-default pairs (butlast pairs))]
+        clauses (vals clause-map)]                       ; each = [testval result]
     (list 'let* [g test]
           (reduce (fn [els [k e]] (list 'if (list 'clojure.core/== g k) e els))
-                  base (reverse fold-pairs)))))
+                  default (reverse clauses)))))
 
 (defn- emit-val
   "Emit a value-producing expression → byte vector."
@@ -94,12 +92,12 @@
     (seq? node)
     (let [h (first node), A (vec (rest node))]
       (cond
-        (#{'long 'int} h)                                   ; integer cast → i32
+        (and (symbol? h) (#{"long" "int"} (name h)))        ; integer cast → i32
         (let [x (first A) xv (infer-vt ctx x)]
           (cond-> (emit-val ctx x)
             (= xv :f64) (into (e/i :i32.trunc_f64_s))        ; (long (Math/floor d)) etc.
             (= xv :f32) (into (e/i :i32.trunc_f32_s))))
-        (= h 'double)                                       ; f64 cast / literal — type-aware
+        (and (symbol? h) (= "double" (name h)))             ; f64 cast / literal — type-aware
         (let [x (first A)]
           (if (number? x)
             (e/f64-const (double x))
@@ -107,7 +105,7 @@
               (cond-> (emit-val ctx x)
                 (= xv :f32) (into (e/i :f64.promote_f32))     ; (double <f32>) → promote
                 (= xv :i32) (into (e/i :f64.convert_i32_s)))))) ; (double <i32>) → convert
-        (= h 'float)                                        ; f32 cast / literal — type-aware
+        (and (symbol? h) (= "float" (name h)))              ; f32 cast / literal — type-aware
         (let [x (first A)]
           (if (number? x)
             (e/f32-const x)                                  ; (float 0.0) → f32 literal
@@ -129,20 +127,23 @@
               zc (case vt :f64 (e/f64-const 0.0) :f32 (e/f32-const 0.0) (e/i32-const 0))
               k  (case (name h) "zero?" :eq "pos?" :gt "neg?" :lt)]
           (-> (emit-val ctx x) (into zc) (into (e/i (ix/wasm-op k vt)))))
-        ;; value-position if → typed if/else block
+        ;; value-position if → typed if/else block. Constant-truthy conditions
+        ;; (a `cond`'s :else, or true/nil/false) fold to the taken branch — wasm
+        ;; has no notion of a keyword/nil "condition".
         (= h 'if)
-        (let [[c t e] A
-              tv (infer-vt ctx t)
-              vt (if (= tv :i32) (infer-vt ctx e) tv)]
-          (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))
-        ;; case → lower to a let*+if-chain, emitted via the normal path
-        (#{'case 'clojure.core/case} h)
-        (emit-val ctx (synth-case A))
-        ;; (or a b …) / (and a b …) → nested if on bool (i32) operands
-        (#{'or 'clojure.core/or} h)
-        (emit-val ctx (reduce (fn [els c] (list 'if c 1 els)) 0 (reverse A)))
-        (#{'and 'clojure.core/and} h)
-        (emit-val ctx (reduce (fn [els c] (list 'if c els 0)) 1 (reverse A)))
+        (let [[c t e] A]
+          (cond
+            (or (true? c) (keyword? c)) (emit-val ctx t)
+            (or (nil? c) (false? c))    (emit-val ctx e)
+            :else (let [tv (infer-vt ctx t)
+                        vt (if (= tv :i32) (infer-vt ctx e) tv)]
+                    (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))))
+        ;; case* (macroexpanded) → lower to a let*+if-chain, emitted via normal path
+        (= h 'case*)
+        (emit-val ctx (synth-case* A))
+        ;; exhaustive-case default / unreachable code
+        (= h 'throw)
+        (e/i :unreachable)
         ;; loop in VALUE position (e.g. an inlined reduction as a let* binding init)
         ;; — emit-loop already yields a value-producing block(result vt); take bytes.
         (#{'loop 'loop*} h)
@@ -245,9 +246,9 @@
       double :f64, float :f32, long :i32, int :i32
       (let [h (first node)]
         (cond
-          (= 'float h)  :f32
-          (= 'double h) :f64
-          (#{'long 'int} h) :i32                          ; an integer cast yields i32
+          (and (symbol? h) (= "float" (name h)))  :f32
+          (and (symbol? h) (= "double" (name h))) :f64
+          (and (symbol? h) (#{"long" "int"} (name h))) :i32 ; an integer cast yields i32
           ;; let* — bind its locals so the tail's refs resolve (a let* used as an
           ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
           ;; may reference a binding introduced inside it).
@@ -256,10 +257,13 @@
                                              ctx (partition 2 (second node)))]
                               (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
-          (= 'if h) (let [tv (infer-vt ctx (nth node 2))] ; then-branch type
-                      (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))
-          (#{'case 'clojure.core/case} h) (infer-vt ctx (nth node 3)) ; first clause's value
-          (#{'or 'clojure.core/or 'and 'clojure.core/and} h) :i32      ; bool result
+          (= 'if h) (let [c (nth node 1)]               ; fold constant-truthy conditions
+                      (cond
+                        (or (true? c) (keyword? c)) (infer-vt ctx (nth node 2))
+                        (or (nil? c) (false? c))    (infer-vt ctx (nth node 3))
+                        :else (let [tv (infer-vt ctx (nth node 2))]
+                                (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))))
+          (= 'case* h) (infer-vt ctx (second (first (vals (nth node 5))))) ; first clause's result
           (and (symbol? h) (#{"zero?" "pos?" "neg?"} (name h))) :i32   ; predicate → bool
           (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
           (let [c' (reduce (fn [c [s init]] (assoc-in c [:env s] {:vt (infer-vt c init)}))
@@ -297,11 +301,19 @@
                                              (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
                                       [ctx []] (partition 2 binds))]
         (into init-bytes (vec (mapcat #(emit-effect ctx' %) body))))
-      (= h 'when)                                   ; (when cond body…) — void, no else
-      (-> (emit-val ctx (first A))
-          (into [(e/op :if) e/empty-block])
-          (into (vec (mapcat #(emit-effect ctx %) (rest A))))
-          (into [(e/op :end)]))
+      (= h 'if)                                     ; (if c then [else]) in void position
+      (let [[c t e] A]
+        (cond
+          (or (true? c) (keyword? c)) (emit-effect ctx t)
+          (or (nil? c) (false? c))    (if (some? e) (emit-effect ctx e) [])
+          :else
+          (-> (emit-val ctx c)
+              (into [(e/op :if) e/empty-block])
+              (into (emit-effect ctx t))
+              (into (if (some? e) (into [(e/op :else)] (emit-effect ctx e)) []))
+              (into [(e/op :end)]))))
+      (= h 'case*) (emit-effect ctx (synth-case* A))
+      (= h 'throw) (e/i :unreachable)               ; exhaustive-case default
       (= h 'dotimes) (emit-dotimes ctx node)
       :else (throw (ex-info (str "unhandled effect head " h) {:node node})))))
 
@@ -631,7 +643,8 @@
   [ctx node]
   (cond
     (and (seq? node) (= 'dotimes (first node))) [(emit-dotimes ctx node) nil]
-    (and (seq? node) (= 'when (first node)))    [(emit-effect ctx node) nil]
+    ;; void `if` (no else) in tail position — a macroexpanded `when`/`when-let`.
+    (and (seq? node) (= 'if (first node)) (= 3 (count node))) [(emit-effect ctx node) nil]
 
     ;; void-bound symbol in tail position (e.g. (let* [_ret (dotimes …)] _ret))
     (and (symbol? node) (get-in ctx [:env node :void])) [[] nil]

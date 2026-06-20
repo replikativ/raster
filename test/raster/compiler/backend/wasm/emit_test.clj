@@ -378,3 +378,37 @@
       (doseq [n [0 1 5 17]]
         (let [got (Double/longBitsToDouble (aget (.apply (.export inst "vl") (long-array [n])) 0))]
           (is (= (* 2.0 n) got) (str "vloop n=" n)))))))
+
+;; Generic macroexpansion (Step 1): the wasm backend macroexpands at the last
+;; moment, so arbitrary core macros (cond / when / when-let) lower to the ~12
+;; special forms with no per-macro emitter handler. `dotimes` is kept un-expanded
+;; for the SIMD vectorizer.
+(deftm classify-k [x :- Double] :- Double
+  (cond
+    (clojure.core/< x 0.0) -1.0
+    (clojure.core/< x 1.0) 0.0
+    :else 1.0))
+
+(deftm clamp-neg-k! [a :- (Array double), n :- Long] :- nil
+  ;; when inside dotimes body (effect position) → if; dotimes itself stays un-expanded
+  (dotimes [i n]
+    (when (clojure.core/< (raster.arrays/aget a i) 0.0)
+      (raster.arrays/aset a i 0.0))))
+
+(deftest wasm-macroexpand-cond-when
+  (testing "cond → nested-if value"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'classify-k :name "cl")))
+          ref  (fn [x] (cond (< x 0.0) -1.0 (< x 1.0) 0.0 :else 1.0))]
+      (doseq [x [-2.5 -0.0 0.5 0.999 1.0 7.0]]
+        (let [got (Double/longBitsToDouble
+                   (aget (.apply (.export inst "cl") (long-array [(Double/doubleToRawLongBits x)])) 0))]
+          (is (= (ref x) got) (str "classify x=" x))))))
+  (testing "when inside dotimes → conditional store (void kernel)"
+    (let [inst (instantiate (:bytes (pl/compile-wasm #'clamp-neg-k! :name "cn")))
+          mem  (.memory inst)
+          xs   [-1.0 2.0 -3.5 0.0 4.0]
+          n    (count xs)]
+      (dotimes [i n] (.writeF64 mem (* 8 i) (double (nth xs i))))
+      (.apply (.export inst "cn") (long-array [0 n]))
+      (doseq [i (range n)]
+        (is (= (max 0.0 (nth xs i)) (.readDouble mem (* 8 i))) (str "clamp i=" i))))))

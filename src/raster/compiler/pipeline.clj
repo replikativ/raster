@@ -51,6 +51,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.macroexpand :as mex]
             [raster.ad.purity :as purity]
             [raster.ad.reverse :as ad-reverse]
             [raster.compiler.core.util :as util]
@@ -899,9 +900,20 @@
         {lowered-body :body lowered-params :params}
         (if value-fn?
           (soa-lower/lower-value-fn form param-specs return-tag)
-          (soa-lower/soa-lower form param-specs))]
+          (soa-lower/soa-lower form param-specs))
+        ;; Macroexpand at the last moment (mirrors the JVM bytecode backend): the
+        ;; walker leaves high-level forms (let/loop/case/cond/when/or/and) for the
+        ;; passes to match; the emitter only needs the ~12 special forms. Bind *ns*
+        ;; to the kernel's source ns so source-local macros resolve. Meta is
+        ;; preserved (:raster.type/tag, :raster.op/original).
+        ;; Keep `dotimes` un-expanded: the emitter's SIMD vectorizer matches its
+        ;; counted-loop shape directly (generic loop* expansion would defeat it).
+        wasm-skip-head? (fn [h] (= "dotimes" (clojure.core/name h)))
+        expanded-body (binding [*ns* (or source-ns *ns*)]
+                        (mex/resugar-interop
+                         (mex/macroexpand-all-preserving lowered-body wasm-skip-head?)))]
     {:name (or name (str (:name (meta resolved))))
-     :params lowered-params :ir lowered-body :simd? wasm-simd?
+     :params lowered-params :ir expanded-body :simd? wasm-simd?
      ;; the ORIGINAL (pre-lowering) semantic signature — for the cljs marshaling
      ;; codegen: which params/return are value types (and their field order).
      :sig {:param-names (mapv :sym param-specs)   ; already plain symbols
