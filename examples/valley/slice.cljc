@@ -130,9 +130,12 @@
                                         {:location 1 :format :float2 :offset 12}
                                         {:location 2 :format :float :offset 20}]}})
 
-(defn draw-terrain! [_rnd frame pipeline mesh tex t aspect]
+(defn draw-terrain!
+  "lo/hi are the terrain height bounds from mesh-terrain (for the camera) — the GPU
+   `mesh` handle doesn't carry them."
+  [_rnd frame pipeline mesh tex t aspect lo hi]
   (r/bind-pipeline! frame pipeline)
-  (r/set-uniform! frame pipeline (mvp t aspect (:lo mesh) (:hi mesh)))
+  (r/set-uniform! frame pipeline (mvp t aspect lo hi))
   (r/bind-texture! frame pipeline tex)
   (r/bind-mesh! frame mesh)
   (r/draw-indexed! frame (:index-count mesh) 0))

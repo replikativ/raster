@@ -25,4 +25,10 @@
   :cvoxel {:target     :browser
            :output-dir "public/voxel-js"
            :asset-path "/voxel-js"
-           :modules    {:main {:init-fn voxel.web/init}}}}}
+           :modules    {:main {:init-fn voxel.web/init}}}
+  ;; valley terrain slice: valley.core terrain kernels (wasm, perms in memory)
+  ;; + valley.slice mesher + array-textured render
+  :cvalley {:target     :browser
+            :output-dir "public/valley-js"
+            :asset-path "/valley-js"
+            :modules    {:main {:init-fn valley.web/init}}}}}
