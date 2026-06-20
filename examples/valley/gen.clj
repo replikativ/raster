@@ -64,6 +64,9 @@
               :args '[x z]
               :call [[:const 'HP] [:const 'DP] [:const 'TP] [:const 'UP] [:const 'MP]
                      [:const 'SCALES] [:const 'OFFSETS] 'x 'z]}
+             {:var #'valley.core/biome-index :export "biome_index" :fn "biome-index"
+              :args '[x z]
+              :call [[:const 'TP] [:const 'UP] [:const 'DP] [:const 'MP] 'x 'z]}
              {:var #'valley.core/integrate-physics! :export "integrate_physics" :fn "integrate-physics!"
               :args '[pos vel blocks solid cx cy cz hw h dx dz dt]
               :call [[:inout 'POS 'pos] [:inout 'VEL 'vel] [:in 'BLK 'blocks] [:in 'SOL 'solid]

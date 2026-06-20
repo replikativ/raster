@@ -5,7 +5,7 @@
    k/upload-world!). This is the optimal state model (design/state-model.md) made
    visible: hot mob state lives in columns the kernel sweeps in one call each frame."
   (:require [valley.chunk :as chunk]
-            [valley.slice :as slice]
+            [valley.tex :as tex]
             [valley.kernels :as k]))
 
 (defn- cos [x] (#?(:clj Math/cos :cljs js/Math.cos) x))
@@ -14,7 +14,7 @@
 (def ^:const SPEED 2.5)     ; blocks / second
 (def ^:const HALF-W 0.6)
 (def ^:const HEIGHT 1.4)
-(def ^:const MOB-LAYER 3.0) ; 4th atlas layer (see atlas-pixels)
+(def ^:const MOB-LAYER 22.0) ; mob layer (after the 22 terrain layers; see atlas-pixels)
 
 (defn spawn
   "N mobs scattered on the world surface. Uploads the resident world to the kernel
@@ -94,19 +94,21 @@
             vert (fn [face ci]
                    (let [c (nth face ci) [u v] (nth face-uv ci)]
                      [(+ x0 (* (nth c 0) HALF-W)) (+ py (* (nth c 1) HEIGHT)) (+ z0 (* (nth c 2) HALF-W))
-                      u v MOB-LAYER]))]
+                      u v MOB-LAYER 1.0]))]   ; pos3 uv2 layer shade (valley.tex/STRIDE)
         (doseq [f faces]
           (vswap! out (fn [t] (reduce conj! t (concat (vert f 0) (vert f 1) (vert f 2)
                                                       (vert f 0) (vert f 2) (vert f 3))))))))
     (persistent! @out)))
 
-;; --- 4-layer atlas: the 3 terrain layers (grass/dirt/stone) + a red mob layer ----
+;; --- atlas: valley.tex terrain layers (0..21) + a red mob layer (22) ----
 (defn- mob-pixels [w h]
   (mapcat (fn [i] (let [n (- (mod (* (+ i 1) 2654435761) 40) 20)]
                     [(max 0 (min 255 (+ 200 n))) (max 0 (min 255 (+ 60 n))) (max 0 (min 255 (+ 60 n))) 255]))
           (range (* w h))))
 
+(def ^:const N-LAYERS (inc tex/N-LAYERS))   ; terrain layers + 1 mob layer
+
 (defn atlas-pixels
-  "Terrain atlas (3 layers) + a 4th mob layer — flat RGBA8, layer-major."
-  [w h]
-  (vec (concat (slice/atlas-pixels w h) (mob-pixels w h))))
+  "valley.tex terrain layers + a red mob layer — flat RGBA8, layer-major."
+  [_w _h]
+  (vec (concat (tex/atlas-pixels) (mob-pixels tex/TEX tex/TEX))))

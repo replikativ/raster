@@ -19,5 +19,6 @@
 (defn terrain-height [x z] (let [m (deref M)] (let [r ((w/export m "terrain_height") 0 2048 x z 18.0 -4.0)] r)))
 (defn has-cave? [x y z] (let [m (deref M)] (let [r ((w/export m "has_cave") 4096 x y z)] r)))
 (defn surface-height-biome [x z] (let [m (deref M)] (let [r ((w/export m "surface_height_biome") 0 2048 6144 8192 10240 12288 12376 x z)] r)))
+(defn biome-index [x z] (let [m (deref M)] (let [r ((w/export m "biome_index") 6144 8192 2048 10240 x z)] r)))
 (defn integrate-physics! [pos vel blocks solid cx cy cz hw h dx dz dt] (let [m (deref M)] (.set (w/f64-view m) pos 3614) (.set (w/f64-view m) vel 3617) (.set (w/i32-view m) blocks 3116) (.set (w/i8-view m) solid 28848) (let [r ((w/export m "integrate_physics") 28912 28936 12464 28848 cx cy cz hw h dx dz dt)] (.set pos (.subarray (w/f64-view m) 3614 (+ 3614 (alength pos)))) (.set vel (.subarray (w/f64-view m) 3617 (+ 3617 (alength vel)))) r)))
 (defn integrate-physics-batch! [pos vel dxs dzs blocks solid n wxd wyd wzd hw h dt] (let [m (deref M)] (.set (w/f64-view m) pos 3620) (.set (w/f64-view m) vel 6692) (.set (w/f64-view m) dxs 9764) (.set (w/f64-view m) dzs 10788) (let [r ((w/export m "batch") 28960 53536 78112 86304 94496 1143072 n wxd wyd wzd hw h dt)] (.set pos (.subarray (w/f64-view m) 3620 (+ 3620 (alength pos)))) (.set vel (.subarray (w/f64-view m) 6692 (+ 6692 (alength vel)))) r)))

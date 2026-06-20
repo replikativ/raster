@@ -5,7 +5,8 @@
    the JVM (Java primitive arrays) and browser (typed arrays in wasm memory) on the
    same code. The player physics (integrate-physics!) runs against this chunk via
    the valley.kernels facade."
-  (:require [valley.kernels :as k]))
+  (:require [valley.kernels :as k]
+            [valley.tex :as tex]))
 
 (def ^:const CS 16)                       ; chunk size (valley CHUNK-SIZE)
 (def ^:const STRIDE 24)                   ; pos3 + uv2 + layer (matches valley.slice)
@@ -18,12 +19,11 @@
 
 (defn idx ^long [^long x ^long y ^long z] (+ x (* z CS) (* y CS CS)))
 
-;; block ids: 0 air, 1 grass, 2 dirt, 3 stone. solid table = 62 bytes (1=solid).
+;; block ids (cf valley.tex/block-faces): 0 air, 1 grass, 2 dirt, 3 stone, 4 sand,
+;; 5 snowy-grass, 6 snow, 7 podzol, 8 sandstone, 9 mountain-stone. All 1..9 solid.
 (defn solid-table []
   (let [s (barray 62)]
-    (aset s 1 #?(:clj (byte 1) :cljs 1))
-    (aset s 2 #?(:clj (byte 1) :cljs 1))
-    (aset s 3 #?(:clj (byte 1) :cljs 1))
+    (dotimes [i 9] (aset s (inc i) #?(:clj (byte 1) :cljs 1)))
     s))
 
 (defn gen-chunk
@@ -66,6 +66,15 @@
 (defn world-idx [wx wy wz wx-dim wz-dim]   ; >4 args ⇒ no primitive hints (params or return)
   (+ (long wx) (* (long wz) (long wx-dim)) (* (long wy) (long wx-dim) (long wz-dim))))
 
+;; biome (0..10) → surface / fill block id (cf valley.terrain/biomes)
+;; 0 desert 1 savanna 2 plains 3 forest 4 jungle 5 swamp 6 taiga 7 tundra
+;; 8 snowy-forest 9 mountains 10 mushroom
+(def ^:private biome-surface [4 1 1 1 1 1 7 5 5 3 1])
+(def ^:private biome-fill    [8 2 2 2 2 2 2 2 2 3 2])
+;; chunk face index (faces vector order: +z -z +x -x +y -y) → block-faces index
+;; (block-faces order: top bottom north south east west)
+(def ^:private face->bf [2 3 4 5 0 1])
+
 (defn gen-world
   "A flat cw×ch×cd-chunk world generated from valley.kernels/terrain-height over
    continuous world coords (so terrain flows across chunk seams — the thing C must
@@ -74,17 +83,24 @@
   (let [wx (* cw CS) wy (* ch CS) wz (* cd CS)
         b  (iarray (* wx wy wz))
         base 4
-        ;; biome-aware height (cf valley.terrain): smooth, offset by the world min and
-        ;; CLAMP into [base, wy) — keeps the profile climbable by the 1-block step-up.
-        raw  (vec (for [x (range wx) z (range wz)] (long (k/surface-height-biome x z))))
-        minh (reduce min raw)]
+        ;; biome-aware height + surface/fill blocks (cf valley.terrain). Height is
+        ;; offset by the world min and CLAMPed into [base, wy) — climbable by step-up.
+        raw   (vec (for [x (range wx) z (range wz)] (long (k/surface-height-biome x z))))
+        ;; biomes change on a 256-block scale; sample at ×8 coords so a demo-sized world
+        ;; spans several biomes (desert/plains/taiga/tundra/mountains patches).
+        biome (vec (for [x (range wx) z (range wz)] (long (k/biome-index (* x 8) (* z 8)))))
+        minh  (reduce min raw)]
     (dotimes [x wx]
       (dotimes [z wz]
-        (let [h (max base (min (dec wy) (+ base (- (nth raw (+ (* x wz) z)) minh))))]
+        (let [ci   (+ (* x wz) z)
+              h    (max base (min (dec wy) (+ base (- (nth raw ci) minh))))
+              bi   (nth biome ci)
+              surf (nth biome-surface bi)
+              fill (nth biome-fill bi)]
           (dotimes [y wy]
             (when (< y h)
               (aset b (world-idx x y z wx wz)
-                    (cond (= y (dec h)) 1 (>= y (- h 3)) 2 :else 3)))))))
+                    (int (cond (= y (dec h)) surf (>= y (- h 3)) fill :else 3))))))))
     {:blocks b :wx wx :wy wy :wz wz :solid (solid-table)}))
 
 (defn gen-flat-world
@@ -139,21 +155,25 @@
     {:verts (persistent! @vb) :indices (persistent! @ib)}))
 
 (defn mesh-world
-  "Face mesh of a whole multi-chunk world (interior faces culled across chunk seams,
-   since culling uses world-block, not per-chunk bounds). {:verts :indices}."
+  "Textured face mesh of a multi-chunk world: per-face texture layer (valley.tex) +
+   directional shade. Interior faces culled across seams (culling uses world-block).
+   Vertex = pos3 uv2 layer shade (valley.tex/STRIDE). {:verts :indices}."
   [world]
   (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))
         vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
     (doseq [x (range WX) y (range WY) z (range WZ)]
       (let [id (world-block world x y z)]
         (when (pos? id)
-          (let [layer (double (dec id))]
-            (doseq [[[nx ny nz] corners] faces]
+          (dotimes [fi 6]
+            (let [[[nx ny nz] corners] (nth faces fi)]
               (when (zero? (world-block world (+ x nx) (+ y ny) (+ z nz)))
-                (let [base @vc]
+                (let [bf    (nth face->bf fi)
+                      layer (double (tex/face-layer id bf))
+                      shade (double (nth tex/face-shade bf))
+                      base  @vc]
                   (dotimes [ci 4]
                     (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)]
-                      (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz)) u v layer])))))
+                      (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz)) u v layer shade])))))
                   (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
                   (vswap! vc + 4))))))))
     {:verts (persistent! @vb) :indices (persistent! @ib)}))

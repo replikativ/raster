@@ -184,7 +184,11 @@
     (.addEventListener js/document "keyup"
                        (fn [e] (when-let [a (key->action (j/get e :code))] (swap! input disj a))))
     (letfn [(one-frame [now]
-              (let [dt (min 0.1 (/ (- now @last) 1000.0))]
+              ;; dt clamped to [0, 0.1]: the lower clamp matters — the first frame's
+              ;; rAF timestamp can predate `last` (set after a slow init), giving a
+              ;; negative dt that would drive the fixed-step accumulator negative and
+              ;; stall updates for seconds.
+              (let [dt (max 0.0 (min 0.1 (/ (- now @last) 1000.0)))]
                 (reset! last now)
                 (swap! acc + dt)
                 (loop [] (when (>= @acc fixed)

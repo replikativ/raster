@@ -7,6 +7,7 @@
   (:require [raster.render :as r]
             [raster.render.webgpu :as gpu]
             [valley.slice :as slice]
+            [valley.tex :as vtex]
             [valley.walk :as walk]
             [valley.swarm :as swarm]
             [valley.kernels :as k]))
@@ -17,15 +18,15 @@
   (-> (k/init! "/valley_kernels.wasm")
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
-               (let [pipeline (r/make-pipeline rnd slice/pipeline-spec)
-                     world    (walk/build-grid 3 2 3)
-                     mesh     (r/make-static-mesh rnd (:verts world) (:indices world) slice/STRIDE)
-                     tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 4
+               (let [pipeline (r/make-pipeline rnd vtex/pipeline-spec)
+                     world    (walk/build-grid 4 2 4)
+                     mesh     (r/make-static-mesh rnd (:verts world) (:indices world) vtex/STRIDE)
+                     tex      (r/make-texture-array rnd {:width 16 :height 16 :layers swarm/N-LAYERS
                                                         :pixels (swarm/atlas-pixels 16 16) :filter :nearest})
                      aspect   (/ 1024.0 768.0)
                      player   (atom (walk/grid-player-init world))
                      swarm-st  (atom (swarm/spawn world NMOBS))   ; uploads resident world
-                     mob-mesh (r/make-mesh rnd (* NMOBS swarm/VERTS-PER-MOB) slice/STRIDE)]
+                     mob-mesh (r/make-mesh rnd (* NMOBS swarm/VERTS-PER-MOB) vtex/STRIDE)]
                  (set! (.-__valley js/window)
                        #js {:player (fn [] (clj->js {:pos (vec (:pos @player)) :vel (vec (:vel @player))
                                                     :on-ground (:on-ground @player)}))

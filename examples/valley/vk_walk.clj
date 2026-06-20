@@ -8,6 +8,7 @@
   (:require [raster.render :as r]
             [raster.render.vulkan :as vkr]
             [valley.slice :as slice]
+            [valley.tex :as vtex]
             [valley.walk :as walk]
             [valley.swarm :as swarm]))
 
@@ -15,13 +16,13 @@
 
 (defn -main [& _]
   (let [rnd      (vkr/make-renderer :width 1024 :height 768 :title "Valley — Walk + Mobs (raster.render)")
-        pipeline (r/make-pipeline rnd slice/pipeline-spec)
-        world    (walk/build-grid 3 2 3)            ; 48×32×48 biome world
-        mesh     (r/make-static-mesh rnd (:verts world) (:indices world) slice/STRIDE)
-        tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 4
+        pipeline (r/make-pipeline rnd vtex/pipeline-spec)
+        world    (walk/build-grid 4 2 4)            ; 64×32×64 biome world
+        mesh     (r/make-static-mesh rnd (:verts world) (:indices world) vtex/STRIDE)
+        tex      (r/make-texture-array rnd {:width 16 :height 16 :layers swarm/N-LAYERS
                                             :pixels (swarm/atlas-pixels 16 16) :filter :nearest})
         mob-st   (atom (swarm/spawn world NMOBS))
-        mob-mesh (r/make-mesh rnd (* NMOBS swarm/VERTS-PER-MOB) slice/STRIDE)
+        mob-mesh (r/make-mesh rnd (* NMOBS swarm/VERTS-PER-MOB) vtex/STRIDE)
         aspect   (/ 1024.0 768.0)]
     (println "valley world mesh:" (quot (count (:verts world)) 6) "verts," (:wx world) "x" (:wy world) "x" (:wz world)
              "blocks," NMOBS "mobs")

@@ -42,6 +42,11 @@
   ^long [x z]
   (vc/surface-height-biome hperm dperm tperm uperm mperm SCALES OFFSETS (double x) (double z)))
 
+(defn biome-index
+  "Biome 0..10 at world column (x,z)."
+  ^long [x z]
+  (vc/biome-index tperm uperm dperm mperm (double x) (double z)))
+
 ;; Player physics against one chunk. JVM: direct primitive-array call (zero-copy).
 ;; The cljs counterpart (generated kernels.cljs) marshals pos/vel/blocks/solid
 ;; through wasm memory and reads back the mutated pos/vel. Mutates pos + vel,
