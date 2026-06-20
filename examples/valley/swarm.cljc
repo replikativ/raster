@@ -41,44 +41,66 @@
 (def ^:private type-keys [:cow :pig :chicken :sheep])
 (def ^:const VERTS-PER-MOB (* 6 36))   ; ≤6 boxes × 6 faces × 6 verts
 
+(defn- spawn-at!
+  "Place mob i on the surface near world (cxw,czw) with a deterministic scatter."
+  [world pos wph typ i cxw czw]
+  (let [x (+ (long cxw) (- (mod (* i 7) 24) 12))
+        z (+ (long czw) (- (mod (* i 13) 24) 12))
+        top (loop [y (dec (long (:wy world)))]
+              (cond (< y 0) 0
+                    (pos? (chunk/world-block world x y z)) (inc y)
+                    :else (recur (dec y))))]
+    (aset pos (* i 3) (+ x 0.5))
+    (aset pos (+ (* i 3) 1) (+ (double top) 2.0))   ; above → fall onto terrain
+    (aset pos (+ (* i 3) 2) (+ z 0.5))
+    (aset wph i (* i 0.37))
+    (aset typ i (int (mod i 4)))))
+
 (defn spawn
-  "N mobs scattered on the world surface. Uploads the resident world to the kernel
-   (JVM no-op; browser writes the block array into wasm memory once)."
+  "N mobs scattered on the surface around the stream's centre. Uploads the resident world to
+   the kernel (JVM no-op; browser writes the active buffer into wasm memory)."
   [world n]
   (k/upload-world! (:blocks world) (:solid world))
   (let [pos (chunk/darray (* n 3)) vel (chunk/darray (* n 3))
         dxs (chunk/darray n) dzs (chunk/darray n)
         yaw (chunk/darray n) wph (chunk/darray n) typ (chunk/iarray n)
-        WX (long (:wx world)) WZ (long (:wz world))]
-    (dotimes [i n]
-      (let [x (+ 2 (mod (* i 7) (max 1 (- WX 4))))
-            z (+ 2 (mod (* i 13) (max 1 (- WZ 4))))
-            top (loop [y (dec (long (:wy world)))]
-                  (cond (< y 0) 0
-                        (pos? (chunk/world-block world x y z)) (inc y)
-                        :else (recur (dec y))))]
-        (aset pos (* i 3) (+ x 0.5))
-        (aset pos (+ (* i 3) 1) (+ (double top) 2.0))   ; spawn above → fall onto terrain
-        (aset pos (+ (* i 3) 2) (+ z 0.5))
-        (aset wph i (* i 0.37))
-        (aset typ i (int (mod i 4)))))
+        [cx cz] (or (:center world) [0 0])
+        cxw (+ (* (long cx) chunk/CS) 8) czw (+ (* (long cz) chunk/CS) 8)]
+    (dotimes [i n] (spawn-at! world pos wph typ i cxw czw))
     {:pos pos :vel vel :dxs dxs :dzs dzs :yaw yaw :wph wph :typ typ :n n :t 0.0 :world world}))
 
 (defn update!
-  "Wander AI (each mob heads in a slowly-rotating per-mob direction) + one batch physics
-   call over all mobs; per-mob yaw faces the move and walk-phase advances. In-place."
-  [mobs dt]
-  (let [{:keys [pos vel dxs dzs yaw wph n world]} mobs
-        t (+ (:t mobs) dt)]
-    (dotimes [i n]
-      (let [h (+ (* t 0.4) (* i 1.7))
-            dx (* (cos h) SPEED dt) dz (* (sin h) SPEED dt)]
-        (aset dxs i dx) (aset dzs i dz)
-        (aset yaw i (atan2 dx dz))
-        (aset wph i (+ (aget wph i) (* dt 3.0)))))
-    (k/integrate-physics-batch! pos vel dxs dzs (:blocks world) (:solid world)
-                                n (:wx world) (:wy world) (:wz world) HALF-W HEIGHT dt)
-    (assoc mobs :t t)))
+  "Wander AI + one batch physics call over all mobs against the (streaming) world `world`.
+   Mob positions are WORLD coords; offset to the active buffer for the kernel, then back. Mobs
+   that fall outside the buffer (the player walked away) respawn near the centre — a bounded
+   active set, the seed of the future per-chunk mob ownership. 2-arg = the fixed demo world
+   stored at spawn (:aox/:aoz absent → offset 0)."
+  ([mobs dt] (update! mobs (:world mobs) dt))
+  ([mobs world dt]
+   (let [{:keys [pos vel dxs dzs yaw wph typ n]} mobs
+         t (+ (:t mobs) dt)
+         aox (long (:aox world 0)) aoz (long (:aoz world 0))
+         AW (long (:wx world)) AD (long (:wz world))
+         [cx cz] (or (:center world) [0 0])
+         cxw (+ (* (long cx) chunk/CS) 8) czw (+ (* (long cz) chunk/CS) 8)]
+     (dotimes [i n]
+       (let [h (+ (* t 0.4) (* i 1.7))
+             dx (* (cos h) SPEED dt) dz (* (sin h) SPEED dt)]
+         (aset dxs i dx) (aset dzs i dz)
+         (aset yaw i (atan2 dx dz))
+         (aset wph i (+ (aget wph i) (* dt 3.0)))
+        ;; respawn mobs left outside the active buffer (margin 2)
+         (let [bx (- (aget pos (* i 3)) aox) bz (- (aget pos (+ (* i 3) 2)) aoz)]
+           (when (or (< bx 2) (>= bx (- AW 2)) (< bz 2) (>= bz (- AD 2)))
+             (spawn-at! world pos wph typ i cxw czw)))))
+    ;; → buffer-local, batch, → world
+     (dotimes [i n] (aset pos (* i 3) (- (aget pos (* i 3)) aox))
+              (aset pos (+ (* i 3) 2) (- (aget pos (+ (* i 3) 2)) aoz)))
+     (k/integrate-physics-batch! pos vel dxs dzs (:blocks world) (:solid world)
+                                 n AW (:wy world) AD HALF-W HEIGHT dt)
+     (dotimes [i n] (aset pos (* i 3) (+ (aget pos (* i 3)) aox))
+              (aset pos (+ (* i 3) 2) (+ (aget pos (+ (* i 3) 2)) aoz)))
+     (assoc mobs :t t))))
 
 (def ^:const REACH 3.5)   ; cull radius (blocks)
 

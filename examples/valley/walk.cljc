@@ -96,6 +96,18 @@
      ;; survival state: health (0..max), hotbar block ids + selected index, Q/E latch
      :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
 
+(defn stream-player-init
+  "Spawn above the streaming world's centre column (chunk :center) for a short visible fall."
+  [s]
+  (let [[cx cz] (:center s)
+        wx (+ (* (long cx) chunk/CS) 8) wz (+ (* (long cz) chunk/CS) 8)
+        top (chunk/column-height wx wz)]
+    {:pos (chunk/darray [(+ wx 0.5) (+ (double top) 3.0) (+ wz 0.5)])
+     :vel (chunk/darray [0.0 0.0 0.0])
+     :spawn [(+ wx 0.5) (+ (double top) 3.0) (+ wz 0.5)]
+     :yaw 0.0 :pitch -0.2 :on-ground false
+     :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
+
 (def ^:const VOID-Y -10.0)    ; below this → instant death (fell off the world)
 (def ^:const FALL-SAFE 13.0)  ; impact speed (blocks/s) you can survive unharmed
 (def ^:const FALL-SCALE 1.6)  ; health lost per (blocks/s) above FALL-SAFE
@@ -195,6 +207,13 @@
                    :health (:max-health player) :sel sel :qe qe?))
           (assoc player :yaw yaw :pitch pitch :on-ground on?
                  :health hp' :sel sel :qe qe?))))))
+
+(defn ring-update
+  "Mesh-ring bookkeeping for streaming: given the currently-loaded mesh keys (seq) and the
+   player chunk, return {:add [keys to mesh] :remove [keys to free]} for mesh radius R."
+  [loaded pcx pcz r]
+  (let [want (set (chunk/ring-cols pcx pcz r)) have (set loaded)]
+    {:add (vec (remove have want)) :remove (vec (remove want have))}))
 
 (defn player-cam
   "Render camera built from the player: eye at feet + EYE, reusing slice/fly-mvp."

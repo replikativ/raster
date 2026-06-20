@@ -224,18 +224,24 @@
             ob #?(:clj ^ints (:blocks s) :cljs (:blocks s)) ol #?(:clj ^ints (:light s) :cljs (:light s))
             nb (iarray (* AW COL-H AW)) nl (iarray (* AW COL-H AW))
             ox0 (max naox oaox) oz0 (max naoz oaoz)
-            ox1 (min (+ naox AW) (+ oaox AW)) oz1 (min (+ naoz AW) (+ oaoz AW))]
-        ;; copy retained overlap
-        (doseq [wx (range ox0 ox1) wz (range oz0 oz1)]
-          (let [olx (- wx oaox) olz (- wz oaoz) nlx (- wx naox) nlz (- wz naoz)]
-            (dotimes [ly COL-H]
-              (let [oi (+ olx (* olz AW) (* ly AW AW)) ni (+ nlx (* nlz AW) (* ly AW AW))]
-                (aset #?(:clj ^ints nb :cljs nb) ni (aget ob oi))
-                (aset #?(:clj ^ints nl :cljs nl) ni (aget ol oi))))))
-        ;; generate newly-entered strips
-        (doseq [[sx0 sz0 sx1 sz1] (region-minus naox naoz (+ naox AW) (+ naoz AW) ox0 oz0 ox1 oz1)]
-          (gen-into! nb AW AW naox naoz sx0 sz0 sx1 sz1)
-          (skylight-into! nb nl AW AW naox naoz sx0 sz0 sx1 sz1))
+            ox1 (min (+ naox AW) (+ oaox AW)) oz1 (min (+ naoz AW) (+ oaoz AW))
+            overlap? (and (< ox0 ox1) (< oz0 oz1))]
+        (if-not overlap?
+          ;; far jump (no overlap): generate the whole new region
+          (do (gen-into! nb AW AW naox naoz naox naoz (+ naox AW) (+ naoz AW))
+              (skylight-into! nb nl AW AW naox naoz naox naoz (+ naox AW) (+ naoz AW)))
+          (do
+            ;; copy retained overlap
+            (doseq [wx (range ox0 ox1) wz (range oz0 oz1)]
+              (let [olx (- wx oaox) olz (- wz oaoz) nlx (- wx naox) nlz (- wz naoz)]
+                (dotimes [ly COL-H]
+                  (let [oi (+ olx (* olz AW) (* ly AW AW)) ni (+ nlx (* nlz AW) (* ly AW AW))]
+                    (aset #?(:clj ^ints nb :cljs nb) ni (aget ob oi))
+                    (aset #?(:clj ^ints nl :cljs nl) ni (aget ol oi))))))
+            ;; generate newly-entered strips
+            (doseq [[sx0 sz0 sx1 sz1] (region-minus naox naoz (+ naox AW) (+ naoz AW) ox0 oz0 ox1 oz1)]
+              (gen-into! nb AW AW naox naoz sx0 sz0 sx1 sz1)
+              (skylight-into! nb nl AW AW naox naoz sx0 sz0 sx1 sz1))))
         (assoc s :blocks nb :light nl :aox naox :aoz naoz :center [pcx pcz])))))
 
 (defn gen-world
@@ -307,8 +313,11 @@
                 (cond (= y (dec s)) 1 (>= y (- s 3)) 2 :else 3)))))
     {:blocks b :wx wx :wy wy :wz wz :solid (solid-table)}))
 
+;; world-block/set-block! take WORLD coords; on a stream world they subtract the active-buffer
+;; origin (:aox/:aoz, default 0 for the fixed demo world) → buffer-local index.
 (defn world-block ^long [world ^long wx ^long wy ^long wz]
-  (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))]
+  (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))
+        wx (- wx (long (:aox world 0))) wz (- wz (long (:aoz world 0)))]
     (if (and (>= wx 0) (< wx WX) (>= wy 0) (< wy WY) (>= wz 0) (< wz WZ))
       ;; ^ints hint → primitive aget on the JVM (meshing + AO + light hit this heavily);
       ;; cljs ignores it (typed-array access is already direct).
@@ -320,7 +329,7 @@
    changed a cell. Used by mining (break = id 0, place = a block id)."
   [world wx wy wz id]
   (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))
-        wx (long wx) wy (long wy) wz (long wz)]
+        wx (- (long wx) (long (:aox world 0))) wy (long wy) wz (- (long wz) (long (:aoz world 0)))]
     (when (and (>= wx 0) (< wx WX) (>= wy 0) (< wy WY) (>= wz 0) (< wz WZ))
       (aset #?(:clj ^ints (:blocks world) :cljs (:blocks world)) (world-idx wx wy wz WX WZ) (int id))
       true)))
@@ -337,7 +346,8 @@
   [world scratch wox woy woz]   ; >4 params ⇒ no primitive hints on params/return
   (let [#?@(:clj  [b ^ints (:blocks world) scr ^ints scratch]
             :cljs [b (:blocks world) scr scratch])
-        wox (long wox) woy (long woy) woz (long woz)
+        ;; world → buffer-local origin (stream worlds carry :aox/:aoz; demo world → 0)
+        wox (- (long wox) (long (:aox world 0))) woy (long woy) woz (- (long woz) (long (:aoz world 0)))
         WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))
         WXZ (* WX WZ)]
     (dotimes [j CS]
@@ -435,37 +445,38 @@
    Vertex = pos3 uv2 layer shade light ao (valley.tex/STRIDE = 36). {:verts :indices}.
    `skylight` is precomputed (global). The block array + dims are hoisted into a fast
    primitive reader so the AO inner loop does no map lookups."
-  [world skylight x0 z0 x1 z1]
-  (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world)) WXZ (* WX WZ)
-        x0 (long x0) z0 (long z0) x1 (long x1) z1 (long z1)
-        b   #?(:clj ^ints (:blocks world) :cljs (:blocks world))
-        blk (fn [x y z] (let [x (long x) y (long y) z (long z)]
-                          (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
-                            (aget b (+ x (* z WX) (* y WXZ))) 0)))
-        oc  (fn [x y z] (opaque? (blk x y z)))
-        vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
-    (doseq [x (range x0 x1) y (range WY) z (range z0 z1)]
-      (let [id (blk x y z)]
-        (when (pos? id)
-          (dotimes [fi 6]
-            (let [[[nx ny nz] corners] (nth faces fi)
-                  nid (blk (+ x nx) (+ y ny) (+ z nz))]
+  ([world skylight x0 z0 x1 z1] (mesh-region world skylight x0 z0 x1 z1 0 0))
+  ([world skylight x0 z0 x1 z1 pxo pzo]
+   (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world)) WXZ (* WX WZ)
+         x0 (long x0) z0 (long z0) x1 (long x1) z1 (long z1) pxo (long pxo) pzo (long pzo)
+         b   #?(:clj ^ints (:blocks world) :cljs (:blocks world))
+         blk (fn [x y z] (let [x (long x) y (long y) z (long z)]
+                           (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
+                             (aget b (+ x (* z WX) (* y WXZ))) 0)))
+         oc  (fn [x y z] (opaque? (blk x y z)))
+         vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
+     (doseq [x (range x0 x1) y (range WY) z (range z0 z1)]
+       (let [id (blk x y z)]
+         (when (pos? id)
+           (dotimes [fi 6]
+             (let [[[nx ny nz] corners] (nth faces fi)
+                   nid (blk (+ x nx) (+ y ny) (+ z nz))]
               ;; transparency-aware: show the face if the neighbour doesn't occlude
               ;; (air or water), but cull water↔water interiors.
-              (when (and (not (opaque? nid)) (not (and (= id WATER) (= nid WATER))))
-                (let [bf    (nth face->bf fi)
-                      layer (double (tex/face-layer id bf))
-                      shade (double (nth tex/face-shade bf))
-                      lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
-                      base  @vc]
-                  (dotimes [ci 4]
-                    (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
-                          ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
-                      (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz))
-                                                          u v layer shade lit ao])))))
-                  (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
-                  (vswap! vc + 4))))))))
-    {:verts (persistent! @vb) :indices (persistent! @ib)}))
+               (when (and (not (opaque? nid)) (not (and (= id WATER) (= nid WATER))))
+                 (let [bf    (nth face->bf fi)
+                       layer (double (tex/face-layer id bf))
+                       shade (double (nth tex/face-shade bf))
+                       lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
+                       base  @vc]
+                   (dotimes [ci 4]
+                     (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
+                           ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
+                       (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox pxo)) (double (+ y oy)) (double (+ z oz pzo))
+                                                           u v layer shade lit ao])))))
+                   (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
+                   (vswap! vc + 4))))))))
+     {:verts (persistent! @vb) :indices (persistent! @ib)})))
 
 (defn mesh-world
   "Whole-world mesh (region covering all columns). 1-arg computes skylight; 2-arg reuses one."
@@ -512,3 +523,18 @@
   [x z]
   (distinct (map (fn [[dx dz]] (chunk-key (+ (long x) dx) (+ (long z) dz)))
                  [[0 0] [1 0] [-1 0] [0 1] [0 -1]])))
+
+(defn mesh-stream-column
+  "Flat tris (9 floats/vert) for column (cx,cz) read from the active buffer `s`, emitted in
+   ABSOLUTE world coords so meshes never move when the buffer re-centres."
+  [s cx cz]
+  (let [aox (long (:aox s)) aoz (long (:aoz s))
+        bx0 (- (* (long cx) CS) aox) bz0 (- (* (long cz) CS) aoz)]
+    (tris (mesh-region s (:light s) bx0 bz0 (+ bx0 CS) (+ bz0 CS) aox aoz) 9)))
+
+(defn ring-cols
+  "Column keys [cx cz] within Chebyshev radius `r` of chunk (pcx,pcz) (the mesh ring). Must be
+   ≤ the stream's data radius (rg) so every meshed column has its neighbours loaded."
+  [pcx pcz r]
+  (for [cx (range (- (long pcx) r) (+ (long pcx) r 1))
+        cz (range (- (long pcz) r) (+ (long pcz) r 1))] [cx cz]))
