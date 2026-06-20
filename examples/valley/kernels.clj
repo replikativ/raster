@@ -30,3 +30,11 @@
   "1 if (x,y,z) is carved out by cave noise."
   ^long [x y z]
   (vc/has-cave? cperm (double x) (double y) (double z)))
+
+;; Player physics against one chunk. JVM: direct primitive-array call (zero-copy).
+;; The cljs counterpart (generated kernels.cljs) marshals pos/vel/blocks/solid
+;; through wasm memory and reads back the mutated pos/vel. Mutates pos + vel,
+;; returns 1 if on ground.
+(defn integrate-physics!
+  [pos vel blocks solid cx cy cz hw h dx dz dt]   ; >4 args → no primitive hint
+  (vc/integrate-physics! pos vel blocks solid cx cy cz hw h dx dz dt))
