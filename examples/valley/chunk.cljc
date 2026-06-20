@@ -458,7 +458,9 @@
                            (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
                              (aget b (+ x (* z WX) (* y WXZ))) 0)))
          oc  (fn [x y z] (opaque? (blk x y z)))
-         vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
+         vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)
+         ;; water faces go in a separate sub-mesh (pos3 only) for the transparent water pass
+         wvb (volatile! (transient [])) wib (volatile! (transient [])) wvc (volatile! 0)]
      (doseq [x (range x0 x1) y (range WY) z (range z0 z1)]
        (let [id (blk x y z)]
          (when (pos? id)
@@ -468,24 +470,34 @@
               ;; transparency-aware: show the face if the neighbour doesn't occlude
               ;; (air or water), but cull water↔water interiors.
                (when (and (not (opaque? nid)) (not (and (= id WATER) (= nid WATER))))
-                 (let [bf    (nth face->bf fi)
-                       layer (double (tex/face-layer id bf))
-                       shade (double (nth tex/face-shade bf))
-                       lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
-                       base  @vc]
-                   (dotimes [ci 4]
-                     (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
-                           ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
-                       (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox pxo)) (double (+ y oy)) (double (+ z oz pzo))
-                                                           u v layer shade lit ao])))))
-                   (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
-                   (vswap! vc + 4))))))))
-     {:verts (persistent! @vb) :indices (persistent! @ib)})))
+                 (if (= id WATER)
+                   ;; water face: position only → water sub-mesh
+                   (let [base @wvc]
+                     (dotimes [ci 4]
+                       (let [[ox oy oz] (nth corners ci)]
+                         (vswap! wvb (fn [t] (reduce conj! t [(double (+ x ox pxo)) (double (+ y oy)) (double (+ z oz pzo))])))))
+                     (vswap! wib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
+                     (vswap! wvc + 4))
+                   ;; opaque face: full textured/lit/AO vertex → terrain sub-mesh
+                   (let [bf    (nth face->bf fi)
+                         layer (double (tex/face-layer id bf))
+                         shade (double (nth tex/face-shade bf))
+                         lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
+                         base  @vc]
+                     (dotimes [ci 4]
+                       (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
+                             ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
+                         (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox pxo)) (double (+ y oy)) (double (+ z oz pzo))
+                                                             u v layer shade lit ao])))))
+                     (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
+                     (vswap! vc + 4)))))))))
+     {:opaque {:verts (persistent! @vb)  :indices (persistent! @ib)}
+      :water  {:verts (persistent! @wvb) :indices (persistent! @wib)}})))
 
 (defn mesh-world
-  "Whole-world mesh (region covering all columns). 1-arg computes skylight; 2-arg reuses one."
+  "Whole-world opaque mesh (region covering all columns). 1-arg computes skylight; 2-arg reuses."
   ([world] (mesh-world world (compute-skylight world)))
-  ([world skylight] (mesh-region world skylight 0 0 (long (:wx world)) (long (:wz world)))))
+  ([world skylight] (:opaque (mesh-region world skylight 0 0 (long (:wx world)) (long (:wz world))))))
 
 (defn tris
   "Expand an indexed mesh ({:verts :indices}, fpv floats/vertex) into a flat triangle-list
@@ -512,10 +524,10 @@
   (for [cx (range (quot (long (:wx world)) CS)) cz (range (quot (long (:wz world)) CS))] [cx cz]))
 
 (defn mesh-column
-  "Flat triangle-list (9 floats/vert) for the column chunk at (cx,cz)."
+  "Flat triangle-list (9 floats/vert) for the column chunk at (cx,cz) (opaque only)."
   [world skylight cx cz]
   (let [x0 (* (long cx) CS) z0 (* (long cz) CS)]
-    (tris (mesh-region world skylight x0 z0 (+ x0 CS) (+ z0 CS)) 9)))
+    (tris (:opaque (mesh-region world skylight x0 z0 (+ x0 CS) (+ z0 CS))) 9)))
 
 ;; per-column GPU buffer capacity (verts). Avg surface column ≈ 8k; 32k is a safe ceiling.
 (def ^:const MAX-COLUMN-VERTS 32768)
@@ -529,12 +541,13 @@
                  [[0 0] [1 0] [-1 0] [0 1] [0 -1]])))
 
 (defn mesh-stream-column
-  "Flat tris (9 floats/vert) for column (cx,cz) read from the active buffer `s`, emitted in
-   ABSOLUTE world coords so meshes never move when the buffer re-centres."
+  "Column (cx,cz) meshed from the active buffer `s` in ABSOLUTE world coords (so meshes never
+   move on recentre). Returns {:opaque <tris 9 floats/vert> :water <tris 3 floats/vert>}."
   [s cx cz]
   (let [aox (long (:aox s)) aoz (long (:aoz s))
-        bx0 (- (* (long cx) CS) aox) bz0 (- (* (long cz) CS) aoz)]
-    (tris (mesh-region s (:light s) bx0 bz0 (+ bx0 CS) (+ bz0 CS) aox aoz) 9)))
+        bx0 (- (* (long cx) CS) aox) bz0 (- (* (long cz) CS) aoz)
+        mr (mesh-region s (:light s) bx0 bz0 (+ bx0 CS) (+ bz0 CS) aox aoz)]
+    {:opaque (tris (:opaque mr) 9) :water (tris (:water mr) 3)}))
 
 (defn ring-cols
   "Column keys [cx cz] within Chebyshev radius `r` of chunk (pcx,pcz) (the mesh ring). Must be

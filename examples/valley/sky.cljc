@@ -51,6 +51,10 @@
    so world + mobs dim into night with the same curve the sky uses."
   [t] (day-ratio t))
 
+(defn sky-colors
+  "Public [top bot] sky RGB at game-time t — the water shader reflects these."
+  [t] (let [[top bot _] (sky-cols t)] [top bot]))
+
 (defn- sun-dir [t]
   (let [ph (* (/ t DAY) TAU)
         x (sin ph) y (- (cos ph)) z 0.3
