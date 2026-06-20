@@ -55,13 +55,16 @@
         (into (e/i32-const eb)) (into (e/i :i32.mul)) (into (e/i :i32.add)))))
 
 (defn- void-effect-form?
-  "A form producing no value (side-effect only): dotimes/when, or a do whose tail
-   is itself a void effect. Such a form bound in a let* (e.g. the inliner's
-   (let* [_ret (dotimes …)] _ret) body-lift) is emitted as an effect, not a value."
+  "A form producing no value (side-effect only): an array store (aset), dotimes/
+   when, or a do whose tail is itself a void effect. Such a form bound in a let*
+   — e.g. the inliner's (let* [_ret (dotimes …)] _ret) body-lift, or trailing
+   `(aset …)` statements lifted to `_eff_` bindings — is emitted as an effect, not
+   a value."
   [node]
   (and (seq? node)
        (let [h (first node)]
          (or (#{'dotimes 'when} h)
+             (and (symbol? h) (= "aset" (name h)))
              (and (= 'do h) (void-effect-form? (last node)))))))
 
 (defn- synth-case*
@@ -327,22 +330,33 @@
       (into (e/br loop-depth))))
 
 (defn- ends-in-recur?
-  "Does this branch hand control back to the loop (a recur, possibly after a do)?"
+  "Does this branch hand control back to the loop — a recur, possibly after a do /
+   let*, or inside an if whose branches lead to a recur? An `if` with a recur on
+   one side and a loop-result value on the other is a CONTROL branch (handled by
+   emit-then), not a plain value, so it 'ends in recur' if EITHER side does."
   [node]
   (and (seq? node)
-       (or (= 'recur (first node))
-           (and (#{'do 'let* 'let} (first node)) (ends-in-recur? (last node))))))
+       (let [h (first node)]
+         (or (= 'recur h)
+             (and (#{'do 'let* 'let} h) (ends-in-recur? (last node)))
+             (and (= 'if h) (or (ends-in-recur? (nth node 2))
+                                (ends-in-recur? (nth node 3 nil))))))))
 
 (defn- emit-then
-  "recur-branch of the loop's if: optional effects (a `do`) ending in a recur."
-  [ctx node loop-idxs loop-depth]
+  "Emit a loop's recur-branch: effects/bindings ending in a recur, or an `if` that
+   splits into a recur side and a loop-result side (nested-loop early-exit, e.g.
+   aabb-collides?). `loop-depth` is the br target of the enclosing loop header;
+   `block-depth` is the br target of the result block (a result-producing branch
+   pushes its value then br's out). Each nested `if` adds one wasm block level, so
+   both depths increment when recursing through it."
+  [ctx node loop-idxs loop-depth block-depth]
   (cond
     (and (seq? node) (= 'recur (first node)))
     (emit-recur ctx (vec (rest node)) loop-idxs loop-depth)
     (and (seq? node) (= 'do (first node)))
     (let [stmts (vec (rest node))]
       (-> (vec (mapcat #(emit-effect ctx %) (butlast stmts)))
-          (into (emit-then ctx (last stmts) loop-idxs loop-depth))))
+          (into (emit-then ctx (last stmts) loop-idxs loop-depth block-depth))))
     ;; let*/let before the recur — bind locals, then recurse into the tail
     (and (seq? node) (#{'let* 'let} (first node)))
     (let [[binds & body] (rest node)
@@ -355,7 +369,23 @@
                                            (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
                                     [ctx []] (partition 2 binds))
           tail (if (= 1 (count body)) (first body) (cons 'do body))]
-      (into init-bytes (emit-then ctx' tail loop-idxs loop-depth)))
+      (into init-bytes (emit-then ctx' tail loop-idxs loop-depth block-depth)))
+    ;; if splitting into recur side + loop-result side. Each side either continues
+    ;; the loop (recur → emit-then) or yields the loop's result (value → br to the
+    ;; result block). The if itself adds a block level → depths +1 inside it.
+    (and (seq? node) (= 'if (first node)))
+    (let [[_ c a b] node
+          ld (inc loop-depth), bd (inc block-depth)
+          branch (fn [br-node]
+                   (if (ends-in-recur? br-node)
+                     (emit-then ctx br-node loop-idxs ld bd)
+                     (-> (emit-val ctx br-node) (into (e/br bd)))))]  ; loop result → leave block
+      (-> (emit-val ctx c)
+          (into [(e/op :if) e/empty-block])
+          (into (branch a))
+          (into [(e/op :else)])
+          (into (branch b))
+          (into [(e/op :end)])))
     :else (throw (ex-info (str "loop recur-branch must end in recur, got " (pr-str node)) {}))))
 
 (defn- alloc!
@@ -407,7 +437,7 @@
         if-bytes (if recur-then?
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-then ctx' then loop-idxs 1))
+                       (into (emit-then ctx' then loop-idxs 1 2))
                        (into [(e/op :else)])
                        (into (emit-val ctx' els)) (into (e/br 2))
                        (into [(e/op :end)]))
@@ -415,7 +445,7 @@
                        (into [(e/op :if) e/empty-block])
                        (into (emit-val ctx' then)) (into (e/br 2))
                        (into [(e/op :else)])
-                       (into (emit-then ctx' els loop-idxs 1))
+                       (into (emit-then ctx' els loop-idxs 1 2))
                        (into [(e/op :end)])))]
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))

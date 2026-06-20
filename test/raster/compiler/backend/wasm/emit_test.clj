@@ -146,6 +146,57 @@
         (let [got (aget (.apply (.export inst "blut") (long-array [0 id])) 0)]
           (is (= (ref id) got) (str "blut id=" id)))))))
 
+;; Step 3: nested loop whose recur lives inside an `if` (early-exit search). The
+;; outer loop's recur-branch is `(if (pos? <inner-loop>) 1 (recur …))` — one side
+;; yields the loop result, the other recurs. Mirrors aabb-collides?.
+(deftm find2d-k [grid :- (Array int), n :- Long, target :- Long] :- Long
+  (loop [i 0]
+    (if (clojure.core/>= (long i) (long n))
+      0
+      (if (clojure.core/pos?
+           (loop [j 0]
+             (if (clojure.core/>= (long j) (long n))
+               0
+               (if (clojure.core/= (long (raster.arrays/aget grid (int (clojure.core/+ (clojure.core/* i n) j))))
+                                   (long target))
+                 1
+                 (recur (clojure.core/inc (long j)))))))
+        1
+        (recur (clojure.core/inc (long i)))))))
+
+(deftest nested-loop-if-recur-kernel
+  (testing "nested loop with if-recur early exit vs JVM"
+    (let [m    (pl/compile-wasm #'find2d-k :name "find2d")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    5
+          grid (vec (range (* n n)))]                       ; 0..24, distinct
+      (is (= [:i32] (:result-types m)))
+      (dotimes [i (* n n)] (.writeI32 mem (* 4 i) (int (nth grid i))))
+      (doseq [target [0 12 24 99 -1]]
+        (let [got (aget (.apply (.export inst "find2d") (long-array [0 n target])) 0)
+              exp (long (find2d-k (int-array grid) n target))]
+          (is (= exp got) (str "find2d target=" target)))))))
+
+;; trailing `(aset …)` statements after a let* binding sequence are lifted to
+;; `_eff_` bindings; the emitter must route them through emit-effect, not emit-val.
+(deftm swap01-k! [a :- (Array double)] :- Long
+  (let [x (raster.arrays/aget a 0)
+        y (raster.arrays/aget a 1)]
+    (raster.arrays/aset a 0 y)
+    (raster.arrays/aset a 1 x)
+    1))
+
+(deftest trailing-aset-void-binding-kernel
+  (testing "trailing aset effect-bindings emit as effects, value tail returned"
+    (let [m    (pl/compile-wasm #'swap01-k! :name "swap01")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)]
+      (.writeF64 mem 0 3.0) (.writeF64 mem 8 7.0)
+      (is (= 1 (aget (.apply (.export inst "swap01") (long-array [0])) 0)))
+      (is (= 7.0 (.readDouble mem 0)))
+      (is (= 3.0 (.readDouble mem 8))))))
+
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
     (let [m (pl/compile-wasm #'relu-k! :name "relu")
