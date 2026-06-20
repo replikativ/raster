@@ -50,6 +50,27 @@
                                 n (:wx world) (:wy world) (:wz world) HALF-W HEIGHT dt)
     (assoc mobs :t t)))
 
+(def ^:const REACH 3.5)   ; cull radius (blocks)
+
+(defn cull-nearest!
+  "Despawn the nearest mob within REACH of (px,pz) — a nearest-neighbour query over the
+   position column + an O(1) swap-remove (last row moved into the freed slot, n--).
+   Returns the mobs with :n decremented (or unchanged if none in reach)."
+  [mobs px pz]
+  (let [{:keys [pos vel n]} mobs]
+    (loop [i 0 best -1 bd (* REACH REACH)]
+      (if (< i n)
+        (let [dx (- (aget pos (* i 3)) px) dz (- (aget pos (+ (* i 3) 2)) pz)
+              d (+ (* dx dx) (* dz dz))
+              hit? (< d bd)]
+          (recur (inc i) (if hit? i best) (if hit? d bd)))
+        (if (>= best 0)
+          (let [lst (dec n) bb (* best 3) lb (* lst 3)]
+            (aset pos bb (aget pos lb)) (aset pos (+ bb 1) (aget pos (+ lb 1))) (aset pos (+ bb 2) (aget pos (+ lb 2)))
+            (aset vel bb (aget vel lb)) (aset vel (+ bb 1) (aget vel (+ lb 1))) (aset vel (+ bb 2) (aget vel (+ lb 2)))
+            (assoc mobs :n lst))
+          mobs)))))
+
 ;; --- dynamic cube mesh (triangle list for the vertex-only dynamic mesh) -----------
 (def ^:private faces
   [[[0 0 1] [1 0 1] [1 1 1] [0 1 1]]

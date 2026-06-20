@@ -30,12 +30,14 @@
                        #js {:player (fn [] (clj->js {:pos (vec (:pos @player)) :vel (vec (:vel @player))
                                                     :on-ground (:on-ground @player)}))
                             :mob0   (fn [] (let [p (:pos @swarm-st)] #js [(aget p 0) (aget p 1) (aget p 2)]))
-                            :mobs   NMOBS})
+                            :mobs   (fn [] (:n @swarm-st))})
                  (r/run! rnd
                          {:init-state @player
                           :clear-color [0.55 0.75 0.95 1.0]
                           :update (fn [p input dt]
                                     (swap! swarm-st swarm/update! dt)
+                                    (when (contains? input :fire)
+                                      (let [pp (:pos p)] (swap! swarm-st swarm/cull-nearest! (aget pp 0) (aget pp 2))))
                                     (reset! player (walk/grid-player-update world p input dt)) @player)
                           :render (fn [p frame]
                                     (r/bind-pipeline! frame pipeline)

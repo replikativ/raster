@@ -30,6 +30,8 @@
              :clear-color [0.55 0.75 0.95 1.0]
              :update (fn [player input dt]
                        (swap! mob-st swarm/update! dt)
+                       (when (contains? input :fire)
+                         (let [p (:pos player)] (swap! mob-st swarm/cull-nearest! (aget p 0) (aget p 2))))
                        (walk/grid-player-update world player input dt))
              :render (fn [player frame]
                        (r/bind-pipeline! frame pipeline)
