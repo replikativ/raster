@@ -37,3 +37,4 @@
 (defn f64-view [m] (js/Float64Array. (buffer m)))
 (defn f32-view [m] (js/Float32Array. (buffer m)))
 (defn i32-view [m] (js/Int32Array. (buffer m)))
+(defn i8-view  [m] (js/Int8Array.  (buffer m)))

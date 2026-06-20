@@ -18,3 +18,20 @@
 
 (defn terrain-height [x z] ((w/export @M "terrain_height") 0 2048 x z HS BO))
 (defn has-cave? [x y z] ((w/export @M "has_cave") 4096 x y z))
+
+;; Player physics: marshal pos/vel/blocks/solid through wasm memory, call,
+;; read back the mutated pos/vel. Matches the JVM facade (kernels.clj) sig.
+(def ^:private BLK 8192) (def ^:private SOL 24576)
+(def ^:private POS 24640) (def ^:private VEL 24672)
+(defn integrate-physics! [pos vel blocks solid cx cy cz hw h dx dz dt]
+  (let [m @M]
+    (.set (w/i32-view m) blocks (quot BLK 4))
+    (.set (w/i8-view m)  solid  SOL)
+    (.set (w/f64-view m) pos    (quot POS 8))
+    (.set (w/f64-view m) vel    (quot VEL 8))
+    (let [r ((w/export m "integrate_physics")
+             POS VEL BLK SOL cx cy cz hw h dx dz dt)
+          fv (w/f64-view m)]
+      (.set pos (.subarray fv (quot POS 8) (+ (quot POS 8) 3)))
+      (.set vel (.subarray fv (quot VEL 8) (+ (quot VEL 8) 3)))
+      r)))

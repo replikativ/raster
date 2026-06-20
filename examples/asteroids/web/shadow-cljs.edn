@@ -31,4 +31,9 @@
   :cvalley {:target     :browser
             :output-dir "public/valley-js"
             :asset-path "/valley-js"
-            :modules    {:main {:init-fn valley.web/init}}}}}
+            :modules    {:main {:init-fn valley.web/init}}}
+  ;; valley single-chunk walker: chunk mesh + integrate-physics! (wasm) player
+  :cvalley-walk {:target     :browser
+                 :output-dir "public/valley-walk-js"
+                 :asset-path "/valley-walk-js"
+                 :modules    {:main {:init-fn valley.web-walk/init}}}}}
