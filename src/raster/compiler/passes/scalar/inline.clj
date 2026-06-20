@@ -69,6 +69,45 @@
    recursion. Backends that can't call (none currently) would need to reject."
   #{})
 
+(def ^:dynamic *inline-size-limit*
+  "When set (a node-count budget), a resolved callee whose body exceeds it is kept
+   as a CALL instead of inlined — unless it is on a fusable path (contains a loop
+   or par form), which must inline so SOAC/SIMD fusion can see it. nil (the JVM /
+   GPU default) means inline regardless of size — those backends rely on full
+   inlining for fusion + their own splitter (split.clj). Bound from the wasm path
+   to a generous, V8-calibrated budget so deftm->function happens only for large
+   straight-line callees (current kernels are far below it)."
+  nil)
+
+(defn- body-node-count
+  "Structural size of a form: total seq/coll nodes + leaves. Cheap proxy for
+   emitted size, backend-independent (vs split.clj's JVM-byte estimator)."
+  [form]
+  (cond
+    (seq? form)    (reduce + 1 (map body-node-count form))
+    (vector? form) (reduce + 1 (map body-node-count form))
+    (map? form)    (reduce + 1 (map body-node-count (mapcat identity form)))
+    :else 1))
+
+(defn- fusable-body?
+  "True if the body contains a loop/dotimes or a raster.par form — the constructs
+   the SOAC/SIMD fusion + wasm vectorizer operate on. Such callees must be inlined
+   (not outlined) so fusion can see their bodies; only large STRAIGHT-LINE callees
+   are eligible to become calls."
+  [form]
+  (let [found (volatile! false)]
+    ((fn scan [x]
+       (when-not @found
+         (when (seq? x)
+           (let [h (first x)]
+             (when (and (symbol? h)
+                        (or (#{'loop 'loop* 'dotimes} h)
+                            (.startsWith (str h) "raster.par/")))
+               (vreset! found true)))
+           (doseq [c x] (scan c)))))
+     form)
+    @found))
+
 (defn recursion-key
   "Stable identity of a callee for recursion detection — the base dispatch symbol,
    independent of arity mangling and the -impl suffix. e.g.
@@ -1279,9 +1318,15 @@
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                body-form (first walked-body)
-               safe? (safe-to-inline? deftm-info)]
-           (if (not safe?)
-             ;; Complex body -- keep as .invk, recurse into arguments only
+               safe? (safe-to-inline? deftm-info)
+               ;; size policy: large straight-line callees become calls (wasm path);
+               ;; fusable bodies (loop/par) always inline so fusion sees them.
+               within-budget? (or (nil? *inline-size-limit*)
+                                  (<= (body-node-count body-form) *inline-size-limit*)
+                                  (fusable-body? body-form))]
+           (if (or (not safe?) (not within-budget?))
+             ;; Complex body OR over the size budget -- keep as .invk (a call),
+             ;; recurse into arguments only.
              (let [args (drop 2 form)
                    new-args (map #(inline-invk % policy) args)]
                (util/make-invk impl-sym new-args (meta form)))

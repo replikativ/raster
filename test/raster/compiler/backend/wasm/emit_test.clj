@@ -10,7 +10,8 @@
             [raster.math]
             [raster.arrays]
             [raster.compiler.pipeline :as pl]
-            [raster.compiler.backend.wasm.emit :as we])
+            [raster.compiler.backend.wasm.emit :as we]
+            [raster.compiler.passes.scalar.inline :as inl])
   (:import [com.dylibso.chicory.wasm Parser]
            [com.dylibso.chicory.runtime Instance]))
 
@@ -248,6 +249,24 @@
   (testing "recursion also no longer StackOverflows compile-aot (JVM)"
     (let [f (pl/compile-aot #'fact-k)]
       (is (= 3628800 (f 10))))))
+
+;; 1B inline-size policy: a callee whose body exceeds the wasm budget is kept as a
+;; call (its own wasm function) rather than inlined; small callees still inline.
+;; sq-k (≈5 nodes) inlines at the default budget but outlines under a tiny one.
+(deftm sqsum-k [x :- Double] :- Double
+  (raster.numeric/+ (sq-k x) (sq-k x)))
+
+(deftest wasm-inline-size-policy
+  (testing "callee over the size budget → outlined wasm function, bit-exact"
+    (let [m    (binding [inl/*inline-size-limit* 2]   ; tiny budget → sq-k becomes a call
+                 (pl/compile-wasm #'sqsum-k :name "ss"))
+          inst (instantiate (:bytes m))]
+      (doseq [x [3.0 -2.0 0.5 0.0]]
+        (let [r (Double/longBitsToDouble
+                 (aget (.apply (.export inst "ss") (long-array [(Double/doubleToRawLongBits x)])) 0))]
+          (is (= (* 2.0 x x) r) (str "ss " x))))))
+  (testing "default budget inlines small callees (still one valid module)"
+    (is (some? (Parser/parse (:bytes (pl/compile-wasm #'sqsum-k :name "ss")))))))
 
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"

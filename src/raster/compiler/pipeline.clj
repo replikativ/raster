@@ -887,7 +887,14 @@
                param-env (assoc :param-env param-env)
                source-ns (assoc :source-ns source-ns))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
-        form (run-passes raw-form forward-passes opts)
+        ;; wasm inline budget: keep large straight-line callees as wasm functions
+        ;; (deftm->function) rather than inlining. 1200 nodes is generous — above
+        ;; every current kernel (biggest straight-line callee perlin3d ≈ 368) and
+        ;; aligned with V8's ~1250-node wasm inline-eligibility, so only genuinely
+        ;; large callees outline; fusable (loop/par) callees always inline. JVM/GPU
+        ;; leave the limit nil (inline all + split.clj). See .internal notes.
+        form (binding [inline/*inline-size-limit* (or inline/*inline-size-limit* 1200)]
+               (run-passes raw-form forward-passes opts))
         d-params (:raster.core/deftm-params (meta resolved))
         d-tags   (:raster.core/deftm-tags (meta resolved))
         return-tag (:raster.core/return-tag (meta resolved))
