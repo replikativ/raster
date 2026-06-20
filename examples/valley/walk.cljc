@@ -129,8 +129,8 @@
 
 (defn apply-edits!
   "Break (mouse left) / place selected block (mouse right) under the crosshair, in place.
-   Returns true if the world block array changed (→ shell re-meshes + re-lights). Reads this
-   frame's edge-triggered mouse buttons from input metadata (set by both backends)."
+   Returns the changed block coord [x y z] (→ shell re-meshes those columns), or nil. Reads
+   this frame's edge-triggered mouse buttons from input metadata (set by both backends)."
   [world player input]
   (let [b (:buttons (meta input))]
     (when (and b (or (contains? b :left) (contains? b :right)))
@@ -139,10 +139,10 @@
             r (raycast world (aget p 0) (+ (aget p 1) EYE) (aget p 2) dx dy dz REACH)]
         (when r
           (if (contains? b :left)
-            (let [[hx hy hz] (:hit r)] (chunk/set-block! world hx hy hz 0))
+            (let [[hx hy hz] (:hit r)] (chunk/set-block! world hx hy hz 0) [hx hy hz])
             (let [[qx qy qz] (:place r)
                   sel (nth (:hotbar player) (:sel player) chunk/LOG)]
-              (chunk/set-block! world qx qy qz sel))))))))
+              (chunk/set-block! world qx qy qz sel) [qx qy qz])))))))
 
 (defn grid-player-update
   "Player physics against the multi-chunk world via a player-centred window."

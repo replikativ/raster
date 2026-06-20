@@ -25,13 +25,17 @@
       (.then (fn [rnd]
                (let [pipeline (r/make-pipeline rnd vtex/pipeline-spec)
                      world    (walk/build-grid 4 2 4)
-                     ;; skylight computed once; block edits re-mesh with it (newly dug cells
-                     ;; read as dark — cave-like — which avoids a full relight on the main
-                     ;; thread). Whole-world re-mesh is a brief hitch per edit (cljs has no
-                     ;; worker thread here); per-chunk meshing is the future optimization.
+                     ;; skylight computed once; block edits re-mesh only the affected
+                     ;; column(s) (~17ms each) with it — newly dug cells read dark (cave-like),
+                     ;; avoiding a full relight. Per-column meshing keeps edits cheap on the
+                     ;; single browser thread.
                      sky0     (chunk/compute-skylight world)
-                     wverts   (atom (chunk/tris (chunk/mesh-world world sky0) 9))
-                     wmesh    (atom (r/upload-mesh! rnd (r/make-mesh rnd (* 3 (quot (count @wverts) 9)) vtex/STRIDE) @wverts))
+                     chunks   (atom (into {} (for [[cx cz] (chunk/chunk-coords world)]
+                                               [[cx cz] (r/upload-mesh! rnd (r/make-mesh rnd chunk/MAX-COLUMN-VERTS vtex/STRIDE)
+                                                                        (chunk/mesh-column world sky0 cx cz))])))
+                     remesh!  (fn [cols] (doseq [[cx cz] cols]
+                                           (swap! chunks update [cx cz]
+                                                  (fn [m] (r/upload-mesh! rnd m (chunk/mesh-column world sky0 cx cz))))))
                      tex      (r/make-texture-array rnd {:width 16 :height 16 :layers swarm/N-LAYERS
                                                         :pixels (swarm/atlas-pixels 16 16) :filter :nearest})
                      canvas   (:canvas rnd)
@@ -58,10 +62,9 @@
                                     (when (contains? input :fire)
                                       (let [pp (:pos p)] (swap! swarm-st swarm/cull-nearest! (aget pp 0) (aget pp 2))))
                                     (reset! player (walk/grid-player-update world p input dt))
-                                    ;; mining: edit + sync re-mesh (reuse sky0)
-                                    (when (walk/apply-edits! world @player input)
-                                      (reset! wverts (chunk/tris (chunk/mesh-world world sky0) 9))
-                                      (reset! wmesh (r/upload-mesh! rnd @wmesh @wverts)))
+                                    ;; mining: edit + re-mesh only the affected column(s)
+                                    (when-let [[ex _ ez] (walk/apply-edits! world @player input)]
+                                      (remesh! (chunk/edit-columns ex ez)))
                                     @player)
                           :render (fn [p frame]
                                     (r/bind-pipeline! frame sky-pipe)
@@ -73,8 +76,9 @@
                                                     (into (walk/mvp p (aspect))
                                                           [(sky/day-light @gt) 0.18 0.0 0.0]))  ; env: dayRatio, ambient
                                     (r/bind-texture! frame pipeline tex)
-                                    (r/bind-mesh! frame @wmesh)
-                                    (r/draw! frame (:vertex-count @wmesh) 0)
+                                    (doseq [[_ m] @chunks]
+                                      (r/bind-mesh! frame m)
+                                      (r/draw! frame (:vertex-count m) 0))
                                     (let [mm (r/upload-mesh! rnd mob-mesh (swarm/verts @swarm-st))]
                                       (r/bind-mesh! frame mm)
                                       (r/draw! frame (:vertex-count mm) 0))

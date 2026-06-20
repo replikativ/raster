@@ -278,44 +278,48 @@
       (not (zero? ny)) (ao-level (oc (+ bx sx) by bz) (oc bx by (+ bz sz)) (oc (+ bx sx) by (+ bz sz)))
       :else            (ao-level (oc (+ bx sx) by bz) (oc bx (+ by sy) bz) (oc (+ bx sx) (+ by sy) bz)))))
 
-(defn mesh-world
-  "Textured face mesh of a multi-chunk world: per-face texture layer (valley.tex) +
-   directional shade + baked skylight (per face) + ambient occlusion (per vertex).
-   Interior faces culled across seams. Vertex = pos3 uv2 layer shade light ao
-   (valley.tex/STRIDE = 36). {:verts :indices}. 1-arg computes skylight; 2-arg reuses a
-   precomputed one (so block edits skip the global light pass). The block array + dims are
-   hoisted into a fast primitive reader so the AO inner loop does no map lookups."
-  ([world] (mesh-world world (compute-skylight world)))
-  ([world skylight]
-   (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world)) WXZ (* WX WZ)
-         b   #?(:clj ^ints (:blocks world) :cljs (:blocks world))
-         blk (fn [x y z] (let [x (long x) y (long y) z (long z)]
-                           (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
-                             (aget b (+ x (* z WX) (* y WXZ))) 0)))
-         oc  (fn [x y z] (opaque? (blk x y z)))
-         vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
-     (doseq [x (range WX) y (range WY) z (range WZ)]
-       (let [id (blk x y z)]
-         (when (pos? id)
-           (dotimes [fi 6]
-             (let [[[nx ny nz] corners] (nth faces fi)
-                   nid (blk (+ x nx) (+ y ny) (+ z nz))]
+(defn mesh-region
+  "Textured face mesh of blocks in [x0,x1)×[0,WY)×[z0,z1) — neighbours are read across the
+   box boundary (from the full world) so seam culling + AO are correct between chunks.
+   Vertex = pos3 uv2 layer shade light ao (valley.tex/STRIDE = 36). {:verts :indices}.
+   `skylight` is precomputed (global). The block array + dims are hoisted into a fast
+   primitive reader so the AO inner loop does no map lookups."
+  [world skylight x0 z0 x1 z1]
+  (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world)) WXZ (* WX WZ)
+        x0 (long x0) z0 (long z0) x1 (long x1) z1 (long z1)
+        b   #?(:clj ^ints (:blocks world) :cljs (:blocks world))
+        blk (fn [x y z] (let [x (long x) y (long y) z (long z)]
+                          (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
+                            (aget b (+ x (* z WX) (* y WXZ))) 0)))
+        oc  (fn [x y z] (opaque? (blk x y z)))
+        vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
+    (doseq [x (range x0 x1) y (range WY) z (range z0 z1)]
+      (let [id (blk x y z)]
+        (when (pos? id)
+          (dotimes [fi 6]
+            (let [[[nx ny nz] corners] (nth faces fi)
+                  nid (blk (+ x nx) (+ y ny) (+ z nz))]
               ;; transparency-aware: show the face if the neighbour doesn't occlude
               ;; (air or water), but cull water↔water interiors.
-               (when (and (not (opaque? nid)) (not (and (= id WATER) (= nid WATER))))
-                 (let [bf    (nth face->bf fi)
-                       layer (double (tex/face-layer id bf))
-                       shade (double (nth tex/face-shade bf))
-                       lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
-                       base  @vc]
-                   (dotimes [ci 4]
-                     (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
-                           ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
-                       (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz))
-                                                           u v layer shade lit ao])))))
-                   (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
-                   (vswap! vc + 4))))))))
-     {:verts (persistent! @vb) :indices (persistent! @ib)})))
+              (when (and (not (opaque? nid)) (not (and (= id WATER) (= nid WATER))))
+                (let [bf    (nth face->bf fi)
+                      layer (double (tex/face-layer id bf))
+                      shade (double (nth tex/face-shade bf))
+                      lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
+                      base  @vc]
+                  (dotimes [ci 4]
+                    (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
+                          ao (double (nth ao-mult (corner-ao oc x y z nx ny nz ox oy oz)))]
+                      (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz))
+                                                          u v layer shade lit ao])))))
+                  (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
+                  (vswap! vc + 4))))))))
+    {:verts (persistent! @vb) :indices (persistent! @ib)}))
+
+(defn mesh-world
+  "Whole-world mesh (region covering all columns). 1-arg computes skylight; 2-arg reuses one."
+  ([world] (mesh-world world (compute-skylight world)))
+  ([world skylight] (mesh-region world skylight 0 0 (long (:wx world)) (long (:wz world)))))
 
 (defn tris
   "Expand an indexed mesh ({:verts :indices}, fpv floats/vertex) into a flat triangle-list
@@ -327,3 +331,33 @@
      (reduce (fn [out i] (let [b (* (long i) fpv)]
                            (reduce (fn [o k] (conj! o (nth v (+ b k)))) out (range fpv))))
              (transient []) indices))))
+
+;; --- per-column-chunk meshing (keystone for streaming + cheap edits) -----------------
+;; A "column chunk" is the CS×WY×CS stack at chunk coord (cx,cz). Re-meshing one column on a
+;; block edit is ~1/Ncols the cost of a whole-world re-mesh.
+(defn chunk-key
+  "Chunk coord [cx cz] containing world column (x,z)."
+  [x z] [(long (#?(:clj Math/floor :cljs js/Math.floor) (/ (double x) CS)))
+         (long (#?(:clj Math/floor :cljs js/Math.floor) (/ (double z) CS)))])
+
+(defn chunk-coords
+  "All [cx cz] column-chunk coords spanning the world."
+  [world]
+  (for [cx (range (quot (long (:wx world)) CS)) cz (range (quot (long (:wz world)) CS))] [cx cz]))
+
+(defn mesh-column
+  "Flat triangle-list (9 floats/vert) for the column chunk at (cx,cz)."
+  [world skylight cx cz]
+  (let [x0 (* (long cx) CS) z0 (* (long cz) CS)]
+    (tris (mesh-region world skylight x0 z0 (+ x0 CS) (+ z0 CS)) 9)))
+
+;; per-column GPU buffer capacity (verts). Avg surface column ≈ 8k; 32k is a safe ceiling.
+(def ^:const MAX-COLUMN-VERTS 32768)
+
+(defn edit-columns
+  "Set of column keys whose mesh must be rebuilt after a block edit at world (x,z): the
+   block's own column plus any horizontal neighbour column (an edge edit changes the
+   adjacent column's seam faces). 1–3 columns in practice."
+  [x z]
+  (distinct (map (fn [[dx dz]] (chunk-key (+ (long x) dx) (+ (long z) dz)))
+                 [[0 0] [1 0] [-1 0] [0 1] [0 -1]])))
