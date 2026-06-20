@@ -13,6 +13,8 @@
 
 (defn- cos [x] (#?(:clj Math/cos :cljs js/Math.cos) x))
 (defn- sin [x] (#?(:clj Math/sin :cljs js/Math.sin) x))
+(defn- ffloor [x] (long (#?(:clj Math/floor :cljs js/Math.floor) (double x))))
+(defn- fabs [x] (#?(:clj Math/abs :cljs js/Math.abs) (double x)))
 
 (def ^:const EYE 1.6)     ; eye height above feet
 (def ^:const HALF-W 0.3)  ; player AABB half-width
@@ -89,7 +91,53 @@
                     :else (recur (dec y))))]
     {:pos (chunk/darray [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)])
      :vel (chunk/darray [0.0 0.0 0.0])
-     :yaw 0.0 :pitch -0.2 :on-ground false}))
+     :yaw 0.0 :pitch -0.2 :on-ground false
+     ;; survival state: health (0..max), hotbar block ids + selected index, Q/E latch
+     :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
+
+(def ^:const REACH 6.0)   ; block interaction distance
+
+(defn- forward-vec [yaw pitch]
+  (let [cp (cos pitch)] [(* (sin yaw) cp) (sin pitch) (* (- (cos yaw)) cp)]))
+
+(defn raycast
+  "Amanatides–Woo voxel DDA from (ex,ey,ez) along (dx,dy,dz), up to `maxd` blocks. Returns
+   {:hit [x y z] :place [x y z]} for the first opaque block + the empty cell just before it
+   (placement target), or nil. Portable (no host types beyond Math floor/abs)."
+  [world ex ey ez dx dy dz maxd]
+  (let [big 1.0e9
+        sx (if (>= dx 0) 1 -1) sy (if (>= dy 0) 1 -1) sz (if (>= dz 0) 1 -1)
+        tdx (if (zero? dx) big (fabs (/ 1.0 dx)))
+        tdy (if (zero? dy) big (fabs (/ 1.0 dy)))
+        tdz (if (zero? dz) big (fabs (/ 1.0 dz)))
+        ix (ffloor ex) iy (ffloor ey) iz (ffloor ez)
+        bnd (fn [i e d s] (if (zero? d) big (/ (- (+ i (if (>= d 0) 1 0)) e) d)))]
+    (loop [vx ix vy iy vz iz
+           tmx (bnd ix ex dx sx) tmy (bnd iy ey dy sy) tmz (bnd iz ez dz sz)
+           px ix py iy pz iz]
+      (cond
+        (chunk/opaque? (chunk/world-block world vx vy vz)) {:hit [vx vy vz] :place [px py pz]}
+        (> (min tmx tmy tmz) maxd) nil
+        (and (<= tmx tmy) (<= tmx tmz)) (recur (+ vx sx) vy vz (+ tmx tdx) tmy tmz vx vy vz)
+        (<= tmy tmz)                    (recur vx (+ vy sy) vz tmx (+ tmy tdy) tmz vx vy vz)
+        :else                           (recur vx vy (+ vz sz) tmx tmy (+ tmz tdz) vx vy vz)))))
+
+(defn apply-edits!
+  "Break (mouse left) / place selected block (mouse right) under the crosshair, in place.
+   Returns true if the world block array changed (→ shell re-meshes + re-lights). Reads this
+   frame's edge-triggered mouse buttons from input metadata (set by both backends)."
+  [world player input]
+  (let [b (:buttons (meta input))]
+    (when (and b (or (contains? b :left) (contains? b :right)))
+      (let [p (:pos player)
+            [dx dy dz] (forward-vec (:yaw player) (:pitch player))
+            r (raycast world (aget p 0) (+ (aget p 1) EYE) (aget p 2) dx dy dz REACH)]
+        (when r
+          (if (contains? b :left)
+            (let [[hx hy hz] (:hit r)] (chunk/set-block! world hx hy hz 0))
+            (let [[qx qy qz] (:place r)
+                  sel (nth (:hotbar player) (:sel player) chunk/LOG)]
+              (chunk/set-block! world qx qy qz sel))))))))
 
 (defn grid-player-update
   "Player physics against the multi-chunk world via a player-centred window."
@@ -116,7 +164,13 @@
     (let [g (k/integrate-physics! pos vel scratch (:solid world)
                                   0 0 0 HALF-W HEIGHT dx dz dt)]
       (aset pos 0 (+ (aget pos 0) wox)) (aset pos 1 (+ (aget pos 1) woy)) (aset pos 2 (+ (aget pos 2) woz))
-      (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g)))))
+      ;; hotbar select: Q prev / E next, latched so one press = one step
+      (let [n   (count (:hotbar player))
+            qe? (or (contains? input :q) (contains? input :e))
+            sel (if (and qe? (not (:qe player)))
+                  (mod (+ (long (:sel player)) (if (contains? input :e) 1 -1)) n)
+                  (:sel player))]
+        (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g) :sel sel :qe qe?)))))
 
 (defn player-cam
   "Render camera built from the player: eye at feet + EYE, reusing slice/fly-mvp."

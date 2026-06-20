@@ -39,12 +39,13 @@
   (-bind-mesh! [_ mesh]
     (j/call pass :setVertexBuffer 0 (or (:vbuf mesh) (:buf mesh)))
     (when (:ibuf mesh) (j/call pass :setIndexBuffer (:ibuf mesh) "uint32")))
-  (-bind-texture! [_ pipeline texture]
-    ;; build (once, cached) a group-1 bind group against this pipeline's layout
+  (-bind-texture! [_ _pipeline texture]
+    ;; build (once, cached) a group-1 bind group against the SHARED texture layout, so it's
+    ;; compatible with every textured pipeline (not just the one that bound it first).
     (let [bg (or @(:bg texture)
                  (reset! (:bg texture)
                          (j/call device :createBindGroup
-                                 #js {:layout (j/call (:pipeline pipeline) :getBindGroupLayout 1)
+                                 #js {:layout (:bg-layout texture)
                                       :entries #js [#js {:binding 0 :resource (:view texture)}
                                                     #js {:binding 1 :resource (:sampler texture)}]})))]
       (j/call pass :setBindGroup 1 bg)))
@@ -64,6 +65,26 @@
   (-make-texture-array [_ opts] (make-texture-array* device opts))
   (-run! [this opts] (run-loop! this opts)))
 
+(defonce ^:private layouts* (atom {}))
+(defn- layouts
+  "Explicit, shared bind-group layouts (memoised per device): group 0 = uniform buffer,
+   group 1 = texture (2d or 2d-array) + sampler. Sharing them across pipelines makes a
+   single texture bind group compatible with EVERY textured pipeline (terrain, HUD, …) —
+   WebGPU 'auto' layouts are per-pipeline, so a cached bind group built for one pipeline is
+   rejected by another (the bug that broke the HUD). Mirrors the Vulkan shared descriptor layout."
+  [device]
+  (or (@layouts* device)
+      (let [vf (bit-or (j/get js/GPUShaderStage :VERTEX) (j/get js/GPUShaderStage :FRAGMENT))
+            f  (j/get js/GPUShaderStage :FRAGMENT)
+            mk-tex (fn [dim]
+                     (j/call device :createBindGroupLayout
+                             #js {:entries #js [#js {:binding 0 :visibility f :texture #js {:sampleType "float" :viewDimension dim}}
+                                                #js {:binding 1 :visibility f :sampler #js {:type "filtering"}}]}))
+            m {:uniform (j/call device :createBindGroupLayout
+                                #js {:entries #js [#js {:binding 0 :visibility vf :buffer #js {:type "uniform"}}]})
+               :tex-2d (mk-tex "2d") :tex-2d-array (mk-tex "2d-array")}]
+        (swap! layouts* assoc device m) m)))
+
 (defn- ensure-depth!
   "Create (once) a canvas-sized depth texture; record its view + the depth flag."
   [rnd]
@@ -76,6 +97,27 @@
               v (j/call tex :createView)]
           (swap! st assoc :depth? true :depth-view v)
           v))))
+
+;; Render scale: backing-store pixels per CSS pixel. 1.0 = render at CSS resolution (cheapest;
+;; fine for the nearest-filtered voxel look). Raise toward devicePixelRatio for sharper edges.
+(def ^:private RENDER-SCALE 1.0)
+
+(defn- resize!
+  "Fit the canvas to its CSS box at RENDER-SCALE and (re)create the depth texture to match.
+   The WebGPU context's drawing buffer tracks canvas.width/height automatically; only the
+   manually-managed depth texture + the projection aspect must follow (aspect is read from
+   the canvas each frame by the shells)."
+  [rnd]
+  (let [c (:canvas rnd)
+        cw (max 1 (j/get c :clientWidth)) ch (max 1 (j/get c :clientHeight))
+        w (js/Math.floor (* cw RENDER-SCALE)) h (js/Math.floor (* ch RENDER-SCALE))]
+    (when (or (not= w (j/get c :width)) (not= h (j/get c :height)))
+      (j/assoc! c :width w) (j/assoc! c :height h)
+      (let [st (:state rnd)
+            tex (j/call (:device rnd) :createTexture
+                        #js {:size #js [w h] :format "depth24plus"
+                             :usage (j/get js/GPUTextureUsage :RENDER_ATTACHMENT)})]
+        (swap! st assoc :depth? true :depth-view (j/call tex :createView))))))
 
 (defn- make-pipeline* [rnd spec]
   (let [device (:device rnd) fmt (:format rnd)
@@ -93,7 +135,15 @@
             (j/assoc! target :blend
                       #js {:color #js {:srcFactor "src-alpha" :dstFactor "one-minus-src-alpha" :operation "add"}
                            :alpha #js {:srcFactor "one" :dstFactor "zero" :operation "add"}}))
-        desc #js {:layout "auto"
+        ;; explicit (shared) pipeline layout so the texture bind group is cross-pipeline
+        ;; compatible — see `layouts`. group 0 = uniform; group 1 = texture (if any).
+        L         (layouts device)
+        arrayed?  (seq (:texture-arrays shader))
+        textured? (or arrayed? (seq (:textures shader)))
+        tex-l     (when textured? (if arrayed? (:tex-2d-array L) (:tex-2d L)))
+        plt       (j/call device :createPipelineLayout
+                          #js {:bindGroupLayouts (if textured? #js [(:uniform L) tex-l] #js [(:uniform L)])})
+        desc #js {:layout plt
                   :vertex #js {:module vs :entryPoint "main"
                                :buffers #js [#js {:arrayStride (:stride vertex) :attributes attrs}]}
                   :fragment #js {:module fs :entryPoint "main" :targets #js [target]}
@@ -107,7 +157,7 @@
         ubuf (j/call device :createBuffer
                      #js {:size (max 16 (or uniform-size 16)) :usage (buf-usage :UNIFORM :COPY_DST)})
         bg (j/call device :createBindGroup
-                   #js {:layout (j/call pipeline :getBindGroupLayout 0)
+                   #js {:layout (:uniform L)
                         :entries #js [#js {:binding 0 :resource #js {:buffer ubuf}}]})]
     {:pipeline pipeline :uniform-buf ubuf :bind-group bg}))
 
@@ -145,7 +195,7 @@
     {:texture tex
      :view (j/call tex :createView)
      :sampler (j/call device :createSampler #js {:magFilter f :minFilter f})
-     :bg (atom nil)}))
+     :bg-layout (:tex-2d (layouts device)) :bg (atom nil)}))
 
 (defn- make-texture-array* [device {:keys [width height layers pixels filter]}]
   (let [data (js/Uint8Array. (clj->js (vec pixels)))
@@ -162,7 +212,7 @@
     {:texture tex
      :view (j/call tex :createView #js {:dimension "2d-array"})
      :sampler (j/call device :createSampler #js {:magFilter f :minFilter f})
-     :bg (atom nil)}))
+     :bg-layout (:tex-2d-array (layouts device)) :bg (atom nil)}))
 
 (def ^:private key->action
   {"ArrowLeft" :left "ArrowRight" :right "ArrowUp" :up "ArrowDown" :down "Space" :fire
@@ -172,13 +222,13 @@
                        :or {clear-color [0.0 0.0 0.0 1.0]}}]
   (let [device (:device rnd)
         context (:context rnd)
-        depth-view (:depth-view @(:state rnd))
         state (atom init-state)
         input (atom #{})
         last  (atom (js/performance.now))
         acc   (atom 0.0)
         fixed (/ 1.0 60.0)
         mdx   (atom 0.0) mdy (atom 0.0)        ; pointer-lock delta accumulated per frame
+        btns  (atom #{})                       ; mouse buttons pressed this frame (edge)
         canvas (:canvas rnd)
         [cr cg cb ca] clear-color]
     (.addEventListener js/document "keydown"
@@ -187,13 +237,20 @@
                                  (when (= a :fire) (j/call e :preventDefault)))))
     (.addEventListener js/document "keyup"
                        (fn [e] (when-let [a (key->action (j/get e :code))] (swap! input disj a))))
-    ;; mouse-look: click to grab the pointer, then accumulate movement while locked
+    ;; mouse-look: click to grab the pointer, then accumulate movement while locked.
+    ;; mouse buttons (edge-triggered) drive break/place: left → :left, right → :right.
     (when canvas
       (.addEventListener canvas "click" (fn [_] (j/call canvas :requestPointerLock)))
+      (.addEventListener canvas "contextmenu" (fn [e] (j/call e :preventDefault)))
       (.addEventListener js/document "mousemove"
                          (fn [e] (when (= (j/get js/document :pointerLockElement) canvas)
                                    (swap! mdx + (j/get e :movementX))
-                                   (swap! mdy + (j/get e :movementY))))))
+                                   (swap! mdy + (j/get e :movementY)))))
+      (.addEventListener canvas "mousedown"
+                         (fn [e] (case (j/get e :button)
+                                   0 (swap! btns conj :left)
+                                   2 (swap! btns conj :right)
+                                   nil))))
     (letfn [(one-frame [now]
               ;; dt clamped to [0, 0.1]: the lower clamp matters — the first frame's
               ;; rAF timestamp can predate `last` (set after a slow init), giving a
@@ -202,16 +259,17 @@
               (let [dt (max 0.0 (min 0.1 (/ (- now @last) 1000.0)))]
                 (reset! last now)
                 (swap! acc + dt)
-                ;; frame's mouse delta applied once (on the first sub-step), then zeroed
-                (let [dx @mdx dy @mdy]
-                  (reset! mdx 0.0) (reset! mdy 0.0)
+                ;; frame's mouse delta + button presses applied once (first sub-step), then zeroed
+                (let [dx @mdx dy @mdy bs @btns]
+                  (reset! mdx 0.0) (reset! mdy 0.0) (reset! btns #{})
                   (loop [fst true]
                     (when (>= @acc fixed)
-                      (swap! state #(update % (if fst (with-meta @input {:mouse [dx dy]}) @input) fixed))
+                      (swap! state #(update % (if fst (with-meta @input {:mouse [dx dy] :buttons bs}) @input) fixed))
                       (swap! acc - fixed)
                       (recur false))))
                 (let [enc  (j/call device :createCommandEncoder)
                       view (j/call (j/call context :getCurrentTexture) :createView)
+                      depth-view (:depth-view @(:state rnd))   ; read fresh (resize swaps it)
                       pdesc #js {:colorAttachments
                                  #js [#js {:view view
                                            :clearValue #js {:r cr :g cg :b cb :a ca}
@@ -239,6 +297,14 @@
                  (j/call adapter :requestDevice)))
         (.then (fn [device]
                  (let [ctx (j/call canvas :getContext "webgpu")
-                       fmt (j/call gpu :getPreferredCanvasFormat)]
+                       fmt (j/call gpu :getPreferredCanvasFormat)
+                       rnd (->WebGPURenderer device ctx fmt canvas (atom {}))]
                    (j/call ctx :configure #js {:device device :format fmt :alphaMode "opaque"})
-                   (->WebGPURenderer device ctx fmt canvas (atom {}))))))))
+                   ;; responsive canvas: fill the viewport, size the backing store at
+                   ;; RENDER-SCALE, recreate depth on resize (ResizeObserver, not window 'resize').
+                   (let [s (j/get canvas :style)]
+                     (j/assoc! s :position "fixed") (j/assoc! s :left "0") (j/assoc! s :top "0")
+                     (j/assoc! s :width "100vw") (j/assoc! s :height "100vh") (j/assoc! s :display "block"))
+                   (resize! rnd)
+                   (j/call (js/ResizeObserver. (fn [_ _] (resize! rnd))) :observe canvas)
+                   rnd))))))

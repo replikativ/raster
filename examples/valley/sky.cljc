@@ -35,12 +35,21 @@
 (def ^:private night-top [0.02 0.02 0.08]) (def ^:private night-bot [0.05 0.05 0.16])
 (def ^:private dusk-bot [0.85 0.45 0.25])
 
+;; continuous triangular bump peaking 1.0 at `c`, 0.0 at ±`w` — replaces the old hard
+;; dusk? boolean that snapped the bottom colour at t=16500 (the visible lighting jump).
+(defn- bump [t c w] (max 0.0 (- 1.0 (/ (Math/abs (double (- (double t) c))) (double w)))))
+
 (defn- sky-cols [t]
-  (let [r (day-ratio t)
-        dusk? (or (and (> t 4500) (< t 7500)) (and (> t 16500) (< t 19500)))
+  (let [r  (day-ratio t)
+        dw (max (bump t 6000.0 1500.0) (bump t 18000.0 1500.0))   ; dawn + dusk glow
         top (lerp3 night-top day-top r)
-        bot (lerp3 night-bot (if dusk? dusk-bot day-bot) r)]
+        bot (lerp3 night-bot (lerp3 day-bot dusk-bot dw) r)]       ; orange blended in smoothly
     [top bot r]))
+
+(defn day-light
+  "Public day-ratio (0.05 deep night → 1.0 full day) for the terrain shader's env uniform,
+   so world + mobs dim into night with the same curve the sky uses."
+  [t] (day-ratio t))
 
 (defn- sun-dir [t]
   (let [ph (* (/ t DAY) TAU)
@@ -72,16 +81,19 @@
      (s 2) (u 2) (- (f 2)) 0.0, 0.0 0.0 0.0 1.0]))
 
 (defn uniform
-  "Flat float vector for the sky uniform: mvp(16) topCol(4) botCol(4) sun(4) — 28 floats."
+  "Flat float vector for the sky uniform: mvp(16) topCol(4) botCol(4) sun(4) starRot(4)
+   — 32 floats. starRot = [cos(ph) sin(ph) 0 0] where ph is the sun's hour-angle, so the
+   fragment shader can wheel the star field about the celestial axis with the sun."
   [game-time player aspect]
   (let [mvp (mat-mul (perspective 0.9 aspect 0.1 10.0) (rot-view (:yaw player) (:pitch player)))
         [top bot r] (sky-cols game-time)
-        [sx sy sz] (sun-dir game-time)]
-    (vec (concat mvp top [0.0] bot [0.0] [sx sy sz r]))))
+        [sx sy sz] (sun-dir game-time)
+        ph (* (/ (double game-time) DAY) TAU)]
+    (vec (concat mvp top [0.0] bot [0.0] [sx sy sz r] [(cos ph) (sin ph) 0.0 0.0]))))
 
 ;; --- shader (one source → GLSL + WGSL) -----------------------------------------------
 (def shader
-  '{:uniform   {:name "Sky" :fields [[:mvp :mat4] [:topCol :vec4] [:botCol :vec4] [:sun :vec4]]}
+  '{:uniform   {:name "Sky" :fields [[:mvp :mat4] [:topCol :vec4] [:botCol :vec4] [:sun :vec4] [:starRot :vec4]]}
     :attributes [[inDir vec3 0]]
     :varyings   [[vDir vec3 0]]
     :vertex     [(set-position (* mvp (vec4 inDir 1.0))) (out vDir inDir)]
@@ -91,7 +103,13 @@
                  (let sd float (dot d (swizzle sun xyz)))
                  (let disc float (smoothstep 0.9985 0.9996 sd))
                  (let glow float (* (pow (max sd 0.0) 48.0) 0.4))
-                 (let scell vec3 (floor (* d 110.0)))
+                 ;; rotate the view dir's x/y by the sun hour-angle so stars wheel with the sky
+                 (let sc float (swizzle starRot x))
+                 (let ss float (swizzle starRot y))
+                 (let rd vec3 (vec3 (- (* (swizzle d x) sc) (* (swizzle d y) ss))
+                                    (+ (* (swizzle d x) ss) (* (swizzle d y) sc))
+                                    (swizzle d z)))
+                 (let scell vec3 (floor (* rd 110.0)))
                  (let hsh float (fract (* (sin (dot scell (vec3 12.9898 78.233 37.719))) 43758.547)))
                  (let star float (* (smoothstep 0.993 1.0 hsh)
                                     (clamp (- 1.0 (* (swizzle sun w) 1.3)) 0.0 1.0)

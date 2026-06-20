@@ -170,9 +170,11 @@
         :clear-color clear-color
         :title title
         :update-fn (fn [state polled dt]
-                     ;; carry the GLFW mouse delta alongside the action set (metadata,
-                     ;; non-breaking — keyboard-only code still treats input as a set)
-                     (update state (with-meta (->actions polled) {:mouse (:mouse-delta polled)}) dt))
+                     ;; carry the GLFW mouse delta + this-frame button presses alongside the
+                     ;; action set (metadata, non-breaking — keyboard-only code still treats
+                     ;; input as a set). :buttons is edge-triggered (one click = one entry).
+                     (update state (with-meta (->actions polled)
+                                     {:mouse (:mouse-delta polled) :buttons (:mouse-pressed polled)}) dt))
         :render-fn (fn [state cb _ctx _frame-info] (render state (->VkFrame cb)))}))))
 
 (defn make-renderer

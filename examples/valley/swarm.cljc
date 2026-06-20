@@ -134,8 +134,11 @@
               ;; yaw rotate-y about origin, then translate to world
               rx (+ (* lx cy) (* lz sy))
               rz (+ (* (- lx) sy) (* lz cy))]
+          ;; pos3 uv2 layer shade light ao — light=ao=1.0 (mobs are sky-lit; the terrain
+          ;; shader dims them by day-ratio just like the world). Matches valley.tex/STRIDE.
           (vswap! out (fn [t] (-> t (conj! (+ wx rx)) (conj! (+ wy ly)) (conj! (+ wz rz))
-                                  (conj! u) (conj! v) (conj! (double tex)) (conj! shade)))))))))
+                                  (conj! u) (conj! v) (conj! (double tex)) (conj! shade)
+                                  (conj! 1.0) (conj! 1.0)))))))))
 
 (defn verts
   "Flat float seq of all mob box-models (triangle list) for the dynamic mesh."
