@@ -155,3 +155,22 @@
       (is (seq? walked))
       (is (= '.invk (first walked))
           "double+double should devirtualize to .invk"))))
+
+;; ================================================================
+;; case dispatch constants — qualified-head regression
+;; ================================================================
+
+(deftest qualified-case-classified-and-keys-preserved
+  (testing "clojure.core/case is classified :case, not a generic call"
+    (let [ctx (walker/make-ctx {})]
+      (is (= :case (walker/classify-form '(case (clojure.core/int h) 0 a 1 b) ctx)))
+      (is (= :case (walker/classify-form '(clojure.core/case (clojure.core/int h) 0 a 1 b) ctx)))))
+  (testing "walking a case (bare or qualified) leaves dispatch constants untouched"
+    ;; Regression: a qualified clojure.core/case fell through to the generic-call
+    ;; handler, which type-tagged integer keys 0 -> (long 0), later breaking
+    ;; clojure.core/case macroexpansion in the backends.
+    (doseq [head '[case clojure.core/case]]
+      (let [form   (list head '(clojure.core/int h) 0 'a 1 'b)
+            walked (wb form {'h 'long 'a 'double 'b 'double})
+            keys   (map first (partition 2 (drop 2 walked)))]
+        (is (= [0 1] keys) (str head " keys stay literal (not (long 0)/(long 1))"))))))
