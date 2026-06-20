@@ -87,6 +87,92 @@
 (defn- phash [x z]
   (mod (+ (* (+ (long x) 7) 374761393) (* (+ (long z) 13) 668265263)) 2147483647))
 
+;; ============================================================================
+;; Streaming world gen (Minetest-style: terrain is a PURE function of world (x,y,z) — no
+;; global normalization — so every column generates identically regardless of load order).
+;; ============================================================================
+(def ^:const COL-H 48)         ; column height (blocks) — taller than the demo box for peaks/caves
+(def ^:const TERRAIN-BASE 4)   ; lowest solid level
+(def ^:const TERRAIN-REF 38)   ; fixed vertical reference (replaces the old global world-min)
+(def ^:const SEA-LEVEL 14)     ; lakes fill below this
+(def ^:const TREE-MARGIN 2)    ; canopy horizontal radius → neighbour-root scan margin
+
+(defn column-height
+  "Absolute surface height at world column (wx,wz): the deterministic kernel height placed at a
+   FIXED reference (no world-min), clamped into [1, COL-H)."
+  ^long [wx wz]
+  (max 1 (min (dec COL-H) (+ TERRAIN-BASE (- (long (k/surface-height-biome wx wz)) TERRAIN-REF)))))
+
+(defn- gen-into!
+  "Fill region [rx0,rx1)×[0,COL-H)×[rz0,rz1) of array b (dims AW×COL-H×AD, world origin ox,oz)
+   with terrain+caves+water, then trees (roots scanned in a ±TREE-MARGIN ring so neighbour-rooted
+   canopies spill in identically). Writes are clipped to both the array and the region, so the
+   same routine generates one column (AW=CS) or a whole region (oracle) bit-identically."
+  [b AW AD ox oz rx0 rz0 rx1 rz1]
+  (let [AW (long AW) AD (long AD) ox (long ox) oz (long oz)
+        rx0 (long rx0) rz0 (long rz0) rx1 (long rx1) rz1 (long rz1)
+        lidx (fn [lx ly lz] (+ (long lx) (* (long lz) AW) (* (long ly) AW AD)))
+        in?  (fn [wx wy wz] (let [lx (- (long wx) ox) lz (- (long wz) oz) ly (long wy)]
+                              (and (>= lx 0) (< lx AW) (>= lz 0) (< lz AD) (>= ly 0) (< ly COL-H)
+                                   (>= (long wx) rx0) (< (long wx) rx1) (>= (long wz) rz0) (< (long wz) rz1))))
+        put  (fn [wx wy wz id] (when (in? wx wy wz)
+                                 (aset b (lidx (- (long wx) ox) (long wy) (- (long wz) oz)) (int id))))
+        air? (fn [wx wy wz] (or (not (in? wx wy wz))
+                                (zero? (aget #?(:clj ^ints b :cljs b)
+                                             (lidx (- (long wx) ox) (long wy) (- (long wz) oz))))))]
+    ;; terrain + caves + water for every column in the region
+    (doseq [wx (range rx0 rx1) wz (range rz0 rz1)]
+      (let [h    (column-height wx wz)
+            bi   (long (k/biome-index (* wx 8) (* wz 8)))
+            surf (nth biome-surface bi) fill (nth biome-fill bi)]
+        (dotimes [wy COL-H]
+          (when (and (< wy h)
+                     (not (and (> wy 1) (< wy (dec h)) (= 1 (long (k/has-cave? wx wy wz))))))
+            (put wx wy wz (cond (= wy (dec h)) surf (>= wy (- h 3)) fill :else 3))))
+        (when (< h SEA-LEVEL)
+          (loop [wy h] (when (< wy SEA-LEVEL) (put wx wy wz WATER) (recur (inc wy)))))))
+    ;; trees: scan roots in the margin ring, x then z (matches global order), place spillover
+    (doseq [wx (range (- rx0 TREE-MARGIN) (+ rx1 TREE-MARGIN))
+            wz (range (- rz0 TREE-MARGIN) (+ rz1 TREE-MARGIN))]
+      (let [h (column-height wx wz) bi (long (k/biome-index (* wx 8) (* wz 8)))]
+        (when (and (>= h SEA-LEVEL) (= 1 (long (nth biome-surface bi)))
+                   (zero? (mod (phash wx wz) 37)) (< (+ h 7) COL-H))
+          (let [th (+ 4 (mod (phash wx wz) 3)) top (+ h th)]
+            (dotimes [t th] (put wx (+ h t) wz LOG))
+            (doseq [dy [-2 -1]] (let [ly (+ top dy -1)]
+                                  (doseq [dx [-2 -1 0 1 2] dz [-2 -1 0 1 2]]
+                                    (when (and (not (and (= (iabs dx) 2) (= (iabs dz) 2)))
+                                               (air? (+ wx dx) ly (+ wz dz)))
+                                      (put (+ wx dx) ly (+ wz dz) LEAVES)))))
+            (doseq [dy [0 1]] (let [ly (+ top dy -1)]
+                                (doseq [dx [-1 0 1] dz [-1 0 1]]
+                                  (when (air? (+ wx dx) ly (+ wz dz))
+                                    (put (+ wx dx) ly (+ wz dz) LEAVES)))))))))
+    b))
+
+(defn- column-skylight
+  "Top-down skylight (0/15) for a CS×COL-H×CS column array (per-column, no cross-column bleed)."
+  [b]
+  (let [light #?(:clj ^ints (iarray (* CS COL-H CS)) :cljs (iarray (* CS COL-H CS)))]
+    (dotimes [lx CS]
+      (dotimes [lz CS]
+        (loop [ly (dec COL-H) lit true]
+          (when (>= ly 0)
+            (let [i (+ lx (* lz CS) (* ly CS CS))
+                  air (zero? (aget #?(:clj ^ints b :cljs b) i))]
+              (if (and lit air)
+                (do (aset light i #?(:clj (int 15) :cljs 15)) (recur (dec ly) true))
+                (recur (dec ly) false)))))))
+    light))
+
+(defn gen-column
+  "Deterministic CS×COL-H×CS column at chunk (cx,cz). {:blocks <int array> :light <int array>}."
+  [cx cz]
+  (let [x0 (* (long cx) CS) z0 (* (long cz) CS)
+        b  (iarray (* CS COL-H CS))]
+    (gen-into! b CS CS x0 z0 x0 z0 (+ x0 CS) (+ z0 CS))
+    {:blocks b :light (column-skylight b)}))
+
 (defn gen-world
   "A flat cw×ch×cd-chunk world generated from valley.kernels/terrain-height over
    continuous world coords (so terrain flows across chunk seams). Caves carved by
