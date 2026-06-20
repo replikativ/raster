@@ -216,7 +216,7 @@
 
 (def ^:private key->action
   {"ArrowLeft" :left "ArrowRight" :right "ArrowUp" :up "ArrowDown" :down "Space" :fire
-   "KeyW" :w "KeyA" :a "KeyS" :s "KeyD" :d "KeyQ" :q "KeyE" :e})
+   "KeyW" :w "KeyA" :a "KeyS" :s "KeyD" :d "KeyQ" :q "KeyE" :e "KeyF" :fly})
 
 (defn- run-loop! [rnd {:keys [init-state update render clear-color]
                        :or {clear-color [0.0 0.0 0.0 1.0]}}]

@@ -156,8 +156,12 @@
                   sel (nth (:hotbar player) (:sel player) chunk/LOG)]
               (chunk/set-block! world qx qy qz sel) [qx qy qz])))))))
 
+(def ^:const FLY-SPEED 14.0)   ; blocks/sec in fly mode (faster, for exploration)
+(declare grid-player-walk)
+
 (defn grid-player-update
-  "Player physics against the multi-chunk world via a player-centred window."
+  "Player update against the (streaming) world. Walk mode = gravity + AABB collision via a
+   player-centred window; fly mode (toggle F) = free 3D flight along the view, no physics."
   [world player input dt]
   (let [{:keys [pos vel yaw pitch]} player
         on?   (fn [a] (if (contains? input a) 1.0 0.0))
@@ -165,6 +169,31 @@
         sens  0.0025
         yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))) (* (- sens) mdx))
         pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down))) (* (- sens) mdy)) (max -1.5) (min 1.5))
+        ;; hotbar Q/E latch + fly F latch (one press = one toggle)
+        n   (count (:hotbar player))
+        qe? (or (contains? input :q) (contains? input :e))
+        sel (if (and qe? (not (:qe player)))
+              (mod (+ (long (:sel player)) (if (contains? input :e) 1 -1)) n)
+              (:sel player))
+        fl?  (contains? input :fly)
+        fly? (if (and fl? (not (:fl player))) (not (:fly player)) (boolean (:fly player)))]
+    (if fly?
+      ;; --- fly: move along the view direction (W/S), strafe (A/D); no gravity/collision ---
+      (let [[gx gy gz] (forward-vec yaw pitch)
+            mv (* FLY-SPEED dt (- (on? :w) (on? :s)))
+            st (* FLY-SPEED dt (- (on? :d) (on? :a)))]
+        (aset pos 0 (+ (aget pos 0) (* gx mv) (* (cos yaw) st)))
+        (aset pos 1 (+ (aget pos 1) (* gy mv)))
+        (aset pos 2 (+ (aget pos 2) (* gz mv) (* (sin yaw) st)))
+        (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
+        (assoc player :yaw yaw :pitch pitch :on-ground false :fly true :fl fl? :sel sel :qe qe?))
+      (grid-player-walk world player input dt yaw pitch sel qe? fl?))))
+
+(defn- grid-player-walk
+  "Walk-mode body (gravity + collision via the window stitch)."
+  [world player input dt yaw pitch sel qe? fl?]
+  (let [{:keys [pos vel]} player
+        on?   (fn [a] (if (contains? input a) 1.0 0.0))
         fx (sin yaw)  fz (- (cos yaw))
         rx (cos yaw)  rz (sin yaw)
         fwd (* MOVE dt (- (on? :w) (on? :s)))
@@ -182,13 +211,7 @@
           g (k/integrate-physics! pos vel scratch (:solid world)
                                   0 0 0 HALF-W HEIGHT dx dz dt)]
       (aset pos 0 (+ (aget pos 0) wox)) (aset pos 1 (+ (aget pos 1) woy)) (aset pos 2 (+ (aget pos 2) woz))
-      ;; hotbar select: Q prev / E next, latched so one press = one step
-      (let [n   (count (:hotbar player))
-            qe? (or (contains? input :q) (contains? input :e))
-            sel (if (and qe? (not (:qe player)))
-                  (mod (+ (long (:sel player)) (if (contains? input :e) 1 -1)) n)
-                  (:sel player))
-            on?     (= 1 g)
+      (let [on?     (= 1 g)
             ;; fall damage on the landing frame; void death below the world
             landed? (and on? (not (:on-ground player)))
             fall    (max 0.0 (- (double vy0)))             ; impact speed (vy0 < 0 falling)
@@ -203,9 +226,9 @@
           (let [[sx sy sz] (:spawn player)]               ; respawn: reset pos/vel + full health
             (aset pos 0 sx) (aset pos 1 sy) (aset pos 2 sz)
             (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
-            (assoc player :yaw yaw :pitch pitch :on-ground false
+            (assoc player :yaw yaw :pitch pitch :on-ground false :fly false :fl fl?
                    :health (:max-health player) :sel sel :qe qe?))
-          (assoc player :yaw yaw :pitch pitch :on-ground on?
+          (assoc player :yaw yaw :pitch pitch :on-ground on? :fly false :fl fl?
                  :health hp' :sel sel :qe qe?))))))
 
 (defn ring-update
