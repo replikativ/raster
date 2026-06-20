@@ -120,6 +120,32 @@
             exp (reduce + (map #(* (double %) (double %)) (range n)))]
         (is (< (Math/abs (- got exp)) 1e-6) (str "sumsq=" got " exp=" exp))))))
 
+;; Step 2: deftm→deftm inlining of an `if`-bodied helper that takes a primitive
+;; byte array. Exercises (a) ensure-walked-body! on a cold callee, (b) :branch
+;; bodies being inlinable, (c) byte-array params substituted directly (no aliased
+;; let* binding that would break the emitter's array :elems lookup).
+(deftm blut-k [tbl :- (Array byte), id :- Long] :- Long
+  (if (clojure.core/and (clojure.core/>= id 0) (clojure.core/<= id 7))
+    (long (raster.arrays/aget tbl (int id)))
+    0))
+
+(deftm blut-call-k [tbl :- (Array byte), id :- Long] :- Long
+  (clojure.core/+ (blut-k tbl id) (blut-k tbl (clojure.core/inc id))))
+
+(deftest deftm-call-bytearray-inline-kernel
+  (testing "if-bodied helper taking (Array byte) inlines without array aliasing"
+    (let [m    (pl/compile-wasm #'blut-call-k :name "blut")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          tbl  (vec (for [i (range 8)] (* i 3)))      ; 0,3,6,…21
+          ref  (fn [id] (+ (if (and (>= id 0) (<= id 7)) (nth tbl id) 0)
+                           (if (and (>= (inc id) 0) (<= (inc id) 7)) (nth tbl (inc id)) 0)))]
+      (is (= [:i32] (:result-types m)))
+      (.write mem 0 (byte-array (map byte tbl)))
+      (doseq [id [0 3 6 7 8]]
+        (let [got (aget (.apply (.export inst "blut") (long-array [0 id])) 0)]
+          (is (= (ref id) got) (str "blut id=" id)))))))
+
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
     (let [m (pl/compile-wasm #'relu-k! :name "relu")

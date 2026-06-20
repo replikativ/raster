@@ -34,12 +34,14 @@
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
    Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
-   inlinable, as are bare value-type constructor tails (see value-ctor-call?).
-   Other bare function calls are not — they need let* wrapping for the inliner
-   to decompose."
+   inlinable, as are bare value-type constructor tails (see value-ctor-call?)
+   and branch forms (if / case*) whose whole body is a single value expression
+   the inliner substitutes into the call site (e.g. predicate/lookup helpers like
+   chunk-block, block-solid?). Other bare function calls are not — they need
+   let* wrapping for the inliner to decompose."
   [body]
   (and (seq? body)
-       (or (contains? #{:binding :scope :do :invk :par}
+       (or (contains? #{:binding :scope :do :invk :par :branch}
                       (:kind (form/form-info body)))
            (value-ctor-call? body))))
 
@@ -49,6 +51,16 @@
    (.v, .partials) in the body that the bytecoder can't resolve after
    argument substitution."
   #{'double 'long 'float 'int 'doubles 'floats 'longs 'ints 'objects})
+
+(def ^:private arg-subst-skip-tags
+  "Param tags whose arguments are substituted DIRECTLY at an inline site, with no
+   typed-binding lift. Covers primitives and ALL primitive-array element types.
+   The lift exists only to carry type info for reference types (Dual/Complex/
+   records) through substitution; aliasing a primitive array additionally breaks
+   backends that key array metadata on the param symbol (the wasm emitter's
+   :elems). Single source of truth for both inline-deftm-calls and inline-invk."
+  #{'double 'long 'float 'int 'byte 'short 'char 'boolean
+    'doubles 'floats 'longs 'ints 'objects 'bytes 'shorts 'chars 'booleans})
 
 (def ^:private trivial-cast?
   "Cast/coercion calls that are cheap to duplicate — single arg, no allocation."
@@ -80,12 +92,19 @@
   (for value+grad/grad results stored in vars).
   :tags is the vector of deftm parameter type tags (e.g. ['doubles 'double ...])."
   [v]
-  (let [metadata (meta v)
+  (let [;; Materialize the walked body FIRST: ensure-walked-body! lazily walks the
+        ;; deftm and stamps deftm-params/deftm-tags/return-tag/typed-body onto the
+        ;; var. Reading (meta v) before this returns stale meta with no params, so
+        ;; a cold (never-JIT'd) callee like valley.core/chunk-block would fail the
+        ;; guard below even though its body is perfectly inlinable.
+        _ (when (instance? clojure.lang.Var v)
+            (try (rcore/ensure-walked-body! v) (catch Exception _ nil)))
+        metadata (meta v)
         ;; Also check the fn object's metadata (for value+grad results)
         val-metadata (when (instance? clojure.lang.Var v)
                        (try (meta @v) (catch Exception _ nil)))
         walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        (rcore/ensure-walked-body! v)
+                        (:raster.core/deftm-walked-body metadata)
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -1052,8 +1071,7 @@
                  ;; 2. Non-trivial call expressions: prevents duplication when the param
                  ;;    appears multiple times in the callee body (e.g. inside par/pmap
                  ;;    where CSE can't extract the duplicate afterward)
-                                 skip-tags #{'double 'long 'float 'int
-                                             'doubles 'floats 'longs 'ints 'objects}
+                                 skip-tags arg-subst-skip-tags
                                  param-subst
                                  (into {}
                                        (map-indexed
@@ -1251,8 +1269,7 @@
              (let [args (vec (drop 2 form))
                    {:keys [tags]} deftm-info
                    callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-                   skip-tags #{'double 'long 'float 'int
-                               'doubles 'floats 'longs 'ints 'objects}
+                   skip-tags arg-subst-skip-tags
                    ;; ANF lifting + typed bindings — same logic as inline-one-pass
                    lifted-bindings (atom [])
                    param-subst
