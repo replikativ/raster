@@ -98,8 +98,8 @@
     (seq? e)
     (let [[op & args] e]
       (case (name op)
-        ("+" "-" "*" "/") (str "(" (emit-expr (first args) dial ufields) " " (name op) " "
-                               (emit-expr (second args) dial ufields) ")")
+        ("+" "-" "*" "/") (str "(" (str/join (str " " (name op) " ")
+                                             (map #(emit-expr % dial ufields) args)) ")")
         "swizzle"         (str (emit-expr (first args) dial ufields) "." (name (second args)))
         ("vec2" "vec3" "vec4")
         (str (name op) vec-suffix "("
@@ -116,6 +116,13 @@
                          (case kind
                            :glsl (str "texture(" tex ", vec3(" uv ", " ly "))")
                            :wgsl (str "textureSample(" tex ", " tex "_s, " uv ", i32(" ly "))")))
+        ;; built-in functions with identical names + semantics in GLSL and WGSL —
+        ;; emit a plain call. (inverse is intentionally excluded: WGSL lacks it; pass a
+        ;; CPU-computed inverse as a uniform instead.)
+        ("mix" "clamp" "smoothstep" "step" "normalize" "dot" "cross" "length"
+               "pow" "sin" "cos" "tan" "exp" "log" "sqrt" "abs" "sign" "floor" "ceil"
+               "fract" "max" "min" "reflect" "distance")
+        (str (name op) "(" (str/join ", " (map #(emit-expr % dial ufields) args)) ")")
         (throw (ex-info "unknown shader op" {:op op}))))
     :else (throw (ex-info "bad shader expr" {:expr e}))))
 

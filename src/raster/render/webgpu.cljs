@@ -82,7 +82,7 @@
         {:keys [shader topology vertex depth? cull blend?]} spec
         wgsl (shader/->wgsl shader)
         uniform-size (shader/uniform-bytes shader)
-        _  (when depth? (ensure-depth! rnd))
+        _  (ensure-depth! rnd)   ; always: a depth-attached pass needs every pipeline to declare depthStencil
         vs (j/call device :createShaderModule #js {:code (:vert wgsl)})
         fs (j/call device :createShaderModule #js {:code (:frag wgsl)})
         attrs (apply array (map (fn [{:keys [location format offset]}]
@@ -98,9 +98,11 @@
                                :buffers #js [#js {:arrayStride (:stride vertex) :attributes attrs}]}
                   :fragment #js {:module fs :entryPoint "main" :targets #js [target]}
                   :primitive #js {:topology (vtopo topology) :cullMode (cullmode (or cull :none))}}
-        _ (when depth?
-            (j/assoc! desc :depthStencil
-                      #js {:format "depth24plus" :depthWriteEnabled true :depthCompare "less"}))
+        ;; always declare depthStencil (the pass always has a depth attachment);
+        ;; :depth? false → no write + always-pass (background/overlay like the sky)
+        _ (j/assoc! desc :depthStencil
+                    #js {:format "depth24plus" :depthWriteEnabled (boolean depth?)
+                         :depthCompare (if depth? "less" "always")})
         pipeline (j/call device :createRenderPipeline desc)
         ubuf (j/call device :createBuffer
                      #js {:size (max 16 (or uniform-size 16)) :usage (buf-usage :UNIFORM :COPY_DST)})

@@ -10,7 +10,8 @@
             [valley.slice :as slice]
             [valley.tex :as vtex]
             [valley.walk :as walk]
-            [valley.swarm :as swarm]))
+            [valley.swarm :as swarm]
+            [valley.sky :as sky]))
 
 (def ^:const NMOBS 48)
 
@@ -23,6 +24,9 @@
                                             :pixels (swarm/atlas-pixels 16 16) :filter :nearest})
         mob-st   (atom (swarm/spawn world NMOBS))
         mob-mesh (r/make-mesh rnd (* NMOBS swarm/VERTS-PER-MOB) vtex/STRIDE)
+        sky-pipe (r/make-pipeline rnd sky/pipeline-spec)
+        sky-mesh (r/make-static-mesh rnd sky/cube-verts sky/cube-indices sky/STRIDE)
+        gt       (atom 6000.0)
         aspect   (/ 1024.0 768.0)]
     (println "valley world mesh:" (quot (count (:verts world)) 6) "verts," (:wx world) "x" (:wy world) "x" (:wz world)
              "blocks," NMOBS "mobs")
@@ -30,11 +34,17 @@
             {:init-state (walk/grid-player-init world)
              :clear-color [0.55 0.75 0.95 1.0]
              :update (fn [player input dt]
+                       (swap! gt sky/advance dt)
                        (swap! mob-st swarm/update! dt)
                        (when (contains? input :fire)
                          (let [p (:pos player)] (swap! mob-st swarm/cull-nearest! (aget p 0) (aget p 2))))
                        (walk/grid-player-update world player input dt))
              :render (fn [player frame]
+                       ;; sky first (depth off) — terrain draws over it
+                       (r/bind-pipeline! frame sky-pipe)
+                       (r/set-uniform! frame sky-pipe (sky/uniform @gt player aspect))
+                       (r/bind-mesh! frame sky-mesh)
+                       (r/draw-indexed! frame (:index-count sky-mesh) 0)
                        (r/bind-pipeline! frame pipeline)
                        (r/set-uniform! frame pipeline (walk/mvp player aspect))
                        (r/bind-texture! frame pipeline tex)
