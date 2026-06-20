@@ -153,7 +153,21 @@
         (first (emit-loop ctx node))
         ;; devirtualized typed call: op + element vt from carried metadata
         (= h '.invk)
-        (let [vt (case (:raster.type/tag (meta node)) double :f64 float :f32 :i32)]
+        (let [tag (:raster.type/tag (meta node))
+              vt  (case tag
+                    double :f64, float :f32, (long int) :i32
+                    ;; No semantic tag — a devirtualization site failed to stamp it
+                    ;; (the walker, inline-invk, and resolve-generic-deftm-calls all
+                    ;; should). Recover the element type from the first operand
+                    ;; rather than silently defaulting to i32, which would miscompile
+                    ;; f64 arithmetic to integer ops. Warn so the missing stamp is
+                    ;; visible instead of producing wrong code.
+                    (let [v (infer-vt ctx (first (drop 1 A)))]
+                      (binding [*out* *err*]
+                        (println (str "WARNING: wasm emit — .invk " (:raster.op/original (meta node))
+                                      " has no :raster.type/tag; inferred " v
+                                      " from its operand. A devirtualization site didn't stamp it.")))
+                      v))]
           (emit-intrinsic ctx (:raster.op/original (meta node)) (drop 1 A) vt))
         ;; any registered numeric op / intrinsic (arith, comparison, rem/mod,
         ;; Math, min/max) — dispatched through backend.intrinsics (single table).
