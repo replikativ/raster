@@ -43,13 +43,36 @@
   (if (< y 3) (let [v (hash-byte x y 20)] [(+ 235 (m v 15)) (+ 240 (m v 12)) 255 255]) (dirt-px x y)))
 (defn- gravel-px [x y] (let [v (hash-byte x y 11)] [(+ 90 (m v 30)) (+ 85 (m v 25)) (+ 80 (m v 20)) 255]))
 
+;; --- mob skins (port of valley.textures cow/pig/chicken; layers 22..29) -------------
+(defn- cow-body-px [x y]
+  (let [v (hash-byte x y 44)]
+    (if (< (m (hash-byte (bit-shift-right x 2) (bit-shift-right y 2) 44) 10) 3)
+      [230 225 220 255]                                            ; white patch
+      [(+ 100 (m v 15)) (+ 60 (m v 12)) (+ 30 (m v 10)) 255])))    ; brown hide
+(defn- cow-head-px [x y]
+  (let [v (hash-byte x y 45)]
+    (if (and (> y 9) (> x 4) (< x 11)) [225 215 205 255]           ; muzzle
+        [(+ 100 (m v 15)) (+ 60 (m v 12)) (+ 30 (m v 10)) 255])))
+(defn- animal-leg-px [x y] (let [v (hash-byte x y 46)] [(+ 95 (m v 12)) (+ 65 (m v 10)) (+ 35 (m v 8)) 255]))
+(defn- pig-body-px [x y] (let [v (hash-byte x y 47)] [(+ 220 (m v 12)) (+ 150 (m v 10)) (+ 140 (m v 8)) 255]))
+(defn- pig-head-px [x y]
+  (let [v (hash-byte x y 48)]
+    (if (and (> y 10) (> x 5) (< x 10)) [200 130 125 255]          ; snout
+        [(+ 220 (m v 12)) (+ 150 (m v 10)) (+ 140 (m v 8)) 255])))
+(defn- pig-leg-px [x y] (let [v (hash-byte x y 49)] [(+ 205 (m v 10)) (+ 135 (m v 8)) (+ 125 (m v 8)) 255]))
+(defn- chicken-body-px [x y]
+  (let [v (hash-byte x y 50)] (if (< (m v 2) 1) [240 240 235 255] [220 218 212 255])))
+(defn- chicken-leg-px [x y] (let [v (hash-byte x y 51)] [(+ 225 (m v 15)) (+ 150 (m v 12)) 30 255]))
+
 ;; layer index -> pixel fn (matches the JVM atlas ordering for the terrain subset)
 (def ^:private layer-fns
   {0 stone-px 1 dirt-px 2 grass-top-px 3 grass-side-px 4 water-px 5 sand-px
    12 gravel-px 13 snow-px 14 ice-px 15 clay-px 16 sandstone-side-px 17 sandstone-top-px
-   19 podzol-top-px 20 snowy-grass-top-px 21 snowy-grass-side-px})
+   19 podzol-top-px 20 snowy-grass-top-px 21 snowy-grass-side-px
+   22 cow-body-px 23 cow-head-px 24 animal-leg-px 25 pig-body-px 26 pig-head-px
+   27 pig-leg-px 28 chicken-body-px 29 chicken-leg-px})
 
-(def ^:const N-LAYERS 22)   ; layers 0..21 (gaps filled with magenta debug)
+(def ^:const N-LAYERS 30)   ; 0..21 terrain, 22..29 mob skins (gaps = magenta debug)
 
 (defn atlas-pixels
   "Flat layer-major RGBA8 vector for all terrain texture layers (16×16 each)."
