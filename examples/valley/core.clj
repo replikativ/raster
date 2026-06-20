@@ -164,7 +164,10 @@
         step-z? (and on-ground? (pos? coll-z)
                      (< (aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h cx cy cz) 1))
         new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
-        my-final (if step-z? (+ my-x 1.0) my-x)]
+        my-step (if step-z? (+ my-x 1.0) my-x)
+        ;; cap total step-up to ONE block/frame: per-axis steps could otherwise stack to +2
+        ;; on a diagonal move into a corner (the "jumping at obstacles" bug).
+        my-final (if (> my-step (+ new-my 1.0)) (+ new-my 1.0) my-step)]
     ;; Write back
     (aset pos 0 new-mx)
     (aset pos 1 my-final)
@@ -246,7 +249,9 @@
             step-z? (and on-ground? (pos? coll-z)
                          (< (world-aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h wxd wyd wzd) 1))
             new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
-            my-final (if step-z? (+ my-x 1.0) my-x)]
+            my-step (if step-z? (+ my-x 1.0) my-x)
+            ;; cap total step-up to ONE block/frame (see integrate-physics!) — avoids diagonal +2
+            my-final (if (> my-step (+ new-my 1.0)) (+ new-my 1.0) my-step)]
         (aset positions b new-mx)
         (aset positions (+ b 1) my-final)
         (aset positions (+ b 2) new-mz)
