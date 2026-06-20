@@ -151,6 +151,15 @@
         ;; — emit-loop already yields a value-producing block(result vt); take bytes.
         (#{'loop 'loop*} h)
         (first (emit-loop ctx node))
+        ;; non-intrinsic deftm callee kept as a real wasm function (not inlined):
+        ;; push args, then `call` its function index. Intrinsics (raster.numeric,
+        ;; Math, …) fall through to inline emission below.
+        (and (= h '.invk)
+             (let [op (:raster.op/original (meta node))]
+               (and (not (and (symbol? op) (ix/canonical op)))
+                    (contains? (:fn-index ctx) (first A)))))
+        (-> (vec (mapcat #(emit-val ctx %) (drop 1 A)))   ; args (drop the impl sym)
+            (into (e/call (get (:fn-index ctx) (first A)))))
         ;; devirtualized typed call: op + element vt from carried metadata
         (= h '.invk)
         (let [tag (:raster.type/tag (meta node))
@@ -729,11 +738,12 @@
    {:name :params [{:sym :tag}] :ir :simd?} →
    {:name :param-types :result-types :locals :body}. Result type is inferred
    from the IR (loop else-value / scalar body); nil = void (array-mutating)."
-  [{:keys [name params ir simd?]}]
+  [{:keys [name params ir simd? fn-index]}]
   (let [param-vts (mapv #(tag->vt (:tag %)) params)
         env0 (into {} (map-indexed (fn [idx {:keys [sym tag]}] [sym {:idx idx :vt (tag->vt tag)}]) params))
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
-        ctx {:env env0 :elems elems :base (count params) :locals (atom []) :simd? simd?}
+        ctx {:env env0 :elems elems :base (count params) :locals (atom []) :simd? simd?
+             :fn-index (or fn-index {})}
         [body-bytes ret-vt] (emit-result ctx ir)]
     {:name name :param-types param-vts
      ;; ret-vt: nil = void · keyword = single value · vector = multi-value (value-type return)
@@ -747,13 +757,21 @@
    kernels: [{:name :params :ir :simd?} …].
    Returns {:bytes byte[] :exports [{:name :param-types :result-types} …]}."
   [kernels & {:keys [mem-pages] :or {mem-pages 256}}]
-  (let [fns   (mapv compile-fn kernels)
+  (let [;; callee dispatch table: each kernel's :call-key (the .invk impl sym other
+        ;; kernels reference) → its function index. Kernels with no :call-key (the
+        ;; independent-kernel case, e.g. asteroids) simply don't get called.
+        fn-index (into {} (keep-indexed (fn [i k] (when-let [ck (:call-key k)] [ck i])) kernels))
+        fns   (mapv #(compile-fn (assoc % :fn-index fn-index)) kernels)
         types (mapv #(e/functype (:param-types %) (:result-types %)) fns)
-        funcs (vec (map-indexed (fn [i f] (assoc f :type-idx i)) fns))]
+        funcs (vec (map-indexed (fn [i f] (assoc f :type-idx i
+                                                 :export? (:export? (nth kernels i) true)))
+                                fns))]
     {:bytes (e/build-module
              {:types types :funcs funcs
               :memory {:min mem-pages :max mem-pages :export "memory"}})
-     :exports (mapv #(select-keys % [:name :param-types :result-types]) fns)}))
+     :exports (vec (keep-indexed (fn [i f] (when (:export? (nth kernels i) true)
+                                             (select-keys f [:name :param-types :result-types])))
+                                 fns))}))
 
 (defn compile-kernel
   "Compile a single kernel IR to a one-function wasm module (its own memory).

@@ -174,8 +174,13 @@
                    (vec-section 5 [(if (:max memory)
                                      (into (into [0x01] (uleb (:min memory))) (uleb (:max memory)))
                                      (into [0x00] (uleb (:min memory))))]))
-        exports  (cond-> (vec (map-indexed (fn [idx f] (into (into (name-bytes (:name f)) [0x00]) (uleb idx)))
-                                           funcs))
+        ;; Export only funcs flagged :export? (default true). Internal functions
+        ;; (outlined chunks, non-entry callees) stay unexported but are still
+        ;; callable by index within the module.
+        exports  (cond-> (vec (keep-indexed (fn [idx f]
+                                              (when (:export? f true)
+                                                (into (into (name-bytes (:name f)) [0x00]) (uleb idx))))
+                                            funcs))
                    (:export memory) (conj (into (into (name-bytes (:export memory)) [0x02]) (uleb 0))))
         export-sec (vec-section 7 exports)
         code-sec (vec-section 10

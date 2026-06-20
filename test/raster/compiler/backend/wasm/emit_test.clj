@@ -9,7 +9,8 @@
             [raster.numeric]
             [raster.math]
             [raster.arrays]
-            [raster.compiler.pipeline :as pl])
+            [raster.compiler.pipeline :as pl]
+            [raster.compiler.backend.wasm.emit :as we])
   (:import [com.dylibso.chicory.wasm Parser]
            [com.dylibso.chicory.runtime Instance]))
 
@@ -196,6 +197,28 @@
       (is (= 1 (aget (.apply (.export inst "swap01") (long-array [0])) 0)))
       (is (= 7.0 (.readDouble mem 0)))
       (is (= 3.0 (.readDouble mem 8))))))
+
+;; 1B mechanism: a non-intrinsic deftm callee compiled as its own wasm function,
+;; invoked via `call` (not inlined). A caller (.invk callee-key args) whose op is
+;; non-intrinsic and whose key is in the module's fn-index emits a wasm call; the
+;; callee stays internal (:export? false). Hand-built specs exercise the emitter +
+;; multi-function assembly in isolation (the pipeline wiring comes with recursion).
+(deftest wasm-multifn-call-mechanism
+  (testing "caller emits `call` to an internal callee function"
+    (let [callee {:name "sq" :call-key 'sq-impl :export? false
+                  :params [{:sym 'x :tag 'double}]
+                  :ir '(raster.numeric/* x x)}
+          caller {:name "callsq" :export? true
+                  :params [{:sym 'y :tag 'double}]
+                  :ir (with-meta (list '.invk 'sq-impl 'y)
+                        {:raster.op/original 'user/sq :raster.type/tag 'double})}
+          m (we/compile-module [caller callee])]
+      (is (= [{:name "callsq" :param-types [:f64] :result-types [:f64]}] (:exports m))
+          "only the entry is exported; the callee is internal")
+      (let [inst (instantiate (:bytes m))]
+        (doseq [y [3.0 0.0 -4.0 1.5]]
+          (let [r (.apply (.export inst "callsq") (long-array [(Double/doubleToRawLongBits y)]))]
+            (is (= (* y y) (Double/longBitsToDouble (aget r 0))) (str "callsq " y))))))))
 
 (deftest relu-dotimes-when-void-kernel
   (testing "dotimes + when + void function + f64 comparison"
