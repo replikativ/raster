@@ -91,9 +91,14 @@
                     :else (recur (dec y))))]
     {:pos (chunk/darray [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)])
      :vel (chunk/darray [0.0 0.0 0.0])
+     :spawn [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)]   ; respawn point
      :yaw 0.0 :pitch -0.2 :on-ground false
      ;; survival state: health (0..max), hotbar block ids + selected index, Q/E latch
      :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
+
+(def ^:const VOID-Y -10.0)    ; below this → instant death (fell off the world)
+(def ^:const FALL-SAFE 13.0)  ; impact speed (blocks/s) you can survive unharmed
+(def ^:const FALL-SCALE 1.6)  ; health lost per (blocks/s) above FALL-SAFE
 
 (def ^:const REACH 6.0)   ; block interaction distance
 
@@ -161,7 +166,8 @@
         scratch (chunk/stitch-window! world (:scratch world) wox woy woz)]
     ;; → window-local, step, → world (vel is a delta: translation-invariant)
     (aset pos 0 (- (aget pos 0) wox)) (aset pos 1 (- (aget pos 1) woy)) (aset pos 2 (- (aget pos 2) woz))
-    (let [g (k/integrate-physics! pos vel scratch (:solid world)
+    (let [vy0 (aget vel 1)                                  ; downward speed entering the step
+          g (k/integrate-physics! pos vel scratch (:solid world)
                                   0 0 0 HALF-W HEIGHT dx dz dt)]
       (aset pos 0 (+ (aget pos 0) wox)) (aset pos 1 (+ (aget pos 1) woy)) (aset pos 2 (+ (aget pos 2) woz))
       ;; hotbar select: Q prev / E next, latched so one press = one step
@@ -169,8 +175,26 @@
             qe? (or (contains? input :q) (contains? input :e))
             sel (if (and qe? (not (:qe player)))
                   (mod (+ (long (:sel player)) (if (contains? input :e) 1 -1)) n)
-                  (:sel player))]
-        (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g) :sel sel :qe qe?)))))
+                  (:sel player))
+            on?     (= 1 g)
+            ;; fall damage on the landing frame; void death below the world
+            landed? (and on? (not (:on-ground player)))
+            fall    (max 0.0 (- (double vy0)))             ; impact speed (vy0 < 0 falling)
+            hp      (long (:health player))
+            hp'     (if (and landed? (> fall FALL-SAFE))
+                      (max 0 (- hp (long (#?(:clj Math/floor :cljs js/Math.floor)
+                                          (* (- fall FALL-SAFE) FALL-SCALE)))))
+                      hp)
+            void?   (< (aget pos 1) VOID-Y)
+            dead?   (or void? (<= hp' 0))]
+        (if dead?
+          (let [[sx sy sz] (:spawn player)]               ; respawn: reset pos/vel + full health
+            (aset pos 0 sx) (aset pos 1 sy) (aset pos 2 sz)
+            (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
+            (assoc player :yaw yaw :pitch pitch :on-ground false
+                   :health (:max-health player) :sel sel :qe qe?))
+          (assoc player :yaw yaw :pitch pitch :on-ground on?
+                 :health hp' :sel sel :qe qe?))))))
 
 (defn player-cam
   "Render camera built from the player: eye at feet + EYE, reusing slice/fly-mvp."
