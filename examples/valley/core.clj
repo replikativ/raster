@@ -370,6 +370,37 @@
                             2 0.6 2.0)]
     (long (+ (double BASE-HEIGHT) base-offset (* h height-scale) (* detail 4.0)))))
 
+(deftm biome-index
+  "Biome 0..10 from temperature/humidity/erosion/mushroom noise (cf valley.terrain/biome-at).
+   0 desert 1 savanna 2 plains 3 forest 4 jungle 5 swamp 6 taiga 7 tundra 8 snowy-forest
+   9 mountains 10 mushroom."
+  [temp-perm :- (Array int), humid-perm :- (Array int), detail-perm :- (Array int), mush-perm :- (Array int),
+   wx :- Double, wz :- Double] :- Long
+  (let [temp    (+ 0.5 (* 0.5 (noise/fbm2d temp-perm  (* wx BIOME-FREQ) (* wz BIOME-FREQ) 3 0.5 2.0)))
+        humid   (+ 0.5 (* 0.5 (noise/fbm2d humid-perm (* wx BIOME-FREQ) (* wz BIOME-FREQ) 3 0.5 2.0)))
+        erosion (noise/fbm2d detail-perm (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0)) 2 0.5 2.0)
+        mush    (noise/perlin2d mush-perm (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
+    (cond
+      (> erosion 0.6) 9
+      (> mush 0.85)   10
+      (> temp 0.65)   (cond (< humid 0.35) 0 (> humid 0.65) 4 :else 1)
+      (> temp 0.35)   (cond (< humid 0.3) 1 (> humid 0.7) 5 (> humid 0.5) 3 :else 2)
+      :else           (cond (> humid 0.45) 8 (> erosion 0.3) 6 :else 7))))
+
+(deftm surface-height-biome
+  "Biome-aware surface height (cf valley.terrain/surface-height). scales/offsets are
+   per-biome height-scale/base-offset indexed by biome-index."
+  [height-perm :- (Array int), detail-perm :- (Array int),
+   temp-perm :- (Array int), humid-perm :- (Array int), mush-perm :- (Array int),
+   scales :- (Array double), offsets :- (Array double),
+   wx :- Double, wz :- Double] :- Long
+  (let [bi     (biome-index temp-perm humid-perm detail-perm mush-perm wx wz)
+        h      (noise/fbm2d height-perm (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ) 4 0.5 2.0)
+        detail (noise/fbm2d detail-perm (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0)) 2 0.6 2.0)
+        scale  (aget scales (int bi))
+        offset (aget offsets (int bi))]
+    (long (+ (double BASE-HEIGHT) offset (* h scale) (* detail 4.0)))))
+
 (deftm has-cave?
   "Check if world position (wx,wy,wz) is carved out by cave noise."
   [cave-perm :- (Array int), wx :- Double, wy :- Double, wz :- Double] :- Long

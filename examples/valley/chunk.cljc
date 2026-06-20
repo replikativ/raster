@@ -74,10 +74,9 @@
   (let [wx (* cw CS) wy (* ch CS) wz (* cd CS)
         b  (iarray (* wx wy wz))
         base 4
-        ;; terrain-height is smooth (≤1-block steps); offset by the world min and CLAMP
-        ;; into [base, wy). mod-wrapping would inject huge artificial cliffs — keep the
-        ;; smooth profile so the player's 1-block step-up can climb it.
-        raw  (vec (for [x (range wx) z (range wz)] (long (k/terrain-height x z))))
+        ;; biome-aware height (cf valley.terrain): smooth, offset by the world min and
+        ;; CLAMP into [base, wy) — keeps the profile climbable by the 1-block step-up.
+        raw  (vec (for [x (range wx) z (range wz)] (long (k/surface-height-biome x z))))
         minh (reduce min raw)]
     (dotimes [x wx]
       (dotimes [z wz]

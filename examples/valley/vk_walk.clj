@@ -16,7 +16,7 @@
 (defn -main [& _]
   (let [rnd      (vkr/make-renderer :width 1024 :height 768 :title "Valley — Walk + Mobs (raster.render)")
         pipeline (r/make-pipeline rnd slice/pipeline-spec)
-        world    (walk/build-grid 3 1 3)            ; 48×16×48 multi-chunk world
+        world    (walk/build-grid 3 2 3)            ; 48×32×48 biome world
         mesh     (r/make-static-mesh rnd (:verts world) (:indices world) slice/STRIDE)
         tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 4
                                             :pixels (swarm/atlas-pixels 16 16) :filter :nearest})

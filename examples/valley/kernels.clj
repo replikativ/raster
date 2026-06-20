@@ -15,6 +15,12 @@
 (def ^:private hperm (noise/make-perm 1337))
 (def ^:private dperm (noise/make-perm 9001))
 (def ^:private cperm (noise/make-perm 4242))
+;; biome noise perms + per-biome height-scale/base-offset (cf valley.terrain/biomes)
+(def ^:private tperm (noise/make-perm 2222))
+(def ^:private uperm (noise/make-perm 3333))
+(def ^:private mperm (noise/make-perm 6666))
+(def ^:private SCALES  (double-array [8 12 16 20 28 6 20 10 18 48 12]))
+(def ^:private OFFSETS (double-array [-4 0 0 2 4 -6 3 -2 2 15 0]))
 
 ;; Biome height shaping for the slice (a single rolling-hills profile for now;
 ;; full per-biome params come with the biome pass in a later phase).
@@ -30,6 +36,11 @@
   "1 if (x,y,z) is carved out by cave noise."
   ^long [x y z]
   (vc/has-cave? cperm (double x) (double y) (double z)))
+
+(defn surface-height-biome
+  "Biome-aware surface height at world column (x,z)."
+  ^long [x z]
+  (vc/surface-height-biome hperm dperm tperm uperm mperm SCALES OFFSETS (double x) (double z)))
 
 ;; Player physics against one chunk. JVM: direct primitive-array call (zero-copy).
 ;; The cljs counterpart (generated kernels.cljs) marshals pos/vel/blocks/solid

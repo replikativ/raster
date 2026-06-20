@@ -70,8 +70,8 @@
 
 (defn build-grid
   "A cw×ch×cd-chunk world + its full render mesh + a reusable 16³ stitch scratch.
-   Real terrain (valley.kernels/terrain-height) — walkable because integrate-physics!
-   does 1-block step-up. gen-flat-world remains for a flat test plane."
+   Real biome terrain (valley.kernels/surface-height-biome) — walkable because
+   integrate-physics! does 1-block step-up. gen-flat-world remains for a flat test plane."
   [cw ch cd]
   (let [world (chunk/gen-world cw ch cd)
         m     (chunk/mesh-world world)]

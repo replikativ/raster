@@ -17,6 +17,12 @@
 (def DP (noise/make-perm 9001))
 (def CP (noise/make-perm 4242))
 (def HS 18.0) (def BO -4.0)
+;; biome noise perms + per-biome height-scale/base-offset (must match kernels.clj)
+(def TP (noise/make-perm 2222))
+(def UP (noise/make-perm 3333))
+(def MP (noise/make-perm 6666))
+(def SCALES  [8.0 12.0 16.0 20.0 28.0 6.0 20.0 10.0 18.0 48.0 12.0])
+(def OFFSETS [-4.0 0.0 0.0 2.0 4.0 -6.0 3.0 -2.0 2.0 15.0 0.0])
 
 (def K 1024)   ; CAP mobs for the batch columns
 
@@ -27,7 +33,12 @@
             ;; baked-at-init constant tables (written to memory by the generated init!)
             :consts   [{:sym 'HP :data (seq HP) :view :i32}
                        {:sym 'DP :data (seq DP) :view :i32}
-                       {:sym 'CP :data (seq CP) :view :i32}]
+                       {:sym 'CP :data (seq CP) :view :i32}
+                       {:sym 'TP :data (seq TP) :view :i32}
+                       {:sym 'UP :data (seq UP) :view :i32}
+                       {:sym 'MP :data (seq MP) :view :i32}
+                       {:sym 'SCALES  :data SCALES  :view :f64}
+                       {:sym 'OFFSETS :data OFFSETS :view :f64}]
             ;; per-call marshal buffers (single-player + batch mob columns)
             :scratch  [{:sym 'BLK  :view :i32 :bytes (* 4 16 16 16)}
                        {:sym 'SOL  :view :i8  :bytes 64}
@@ -49,6 +60,10 @@
              {:var #'valley.core/has-cave? :export "has_cave" :fn "has-cave?"
               :args '[x y z]
               :call [[:const 'CP] 'x 'y 'z]}
+             {:var #'valley.core/surface-height-biome :export "surface_height_biome" :fn "surface-height-biome"
+              :args '[x z]
+              :call [[:const 'HP] [:const 'DP] [:const 'TP] [:const 'UP] [:const 'MP]
+                     [:const 'SCALES] [:const 'OFFSETS] 'x 'z]}
              {:var #'valley.core/integrate-physics! :export "integrate_physics" :fn "integrate-physics!"
               :args '[pos vel blocks solid cx cy cz hw h dx dz dt]
               :call [[:inout 'POS 'pos] [:inout 'VEL 'vel] [:in 'BLK 'blocks] [:in 'SOL 'solid]

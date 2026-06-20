@@ -18,7 +18,7 @@
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
                (let [pipeline (r/make-pipeline rnd slice/pipeline-spec)
-                     world    (walk/build-grid 3 1 3)
+                     world    (walk/build-grid 3 2 3)
                      mesh     (r/make-static-mesh rnd (:verts world) (:indices world) slice/STRIDE)
                      tex      (r/make-texture-array rnd {:width 16 :height 16 :layers 4
                                                         :pixels (swarm/atlas-pixels 16 16) :filter :nearest})
