@@ -173,6 +173,88 @@
     (if on-ground? 1 0)))
 
 ;; ================================================================
+;; Batch mob physics — one kernel over the whole SoA column (mobs phase).
+;; Operates directly on a RESIDENT full-world block array in world coords (no
+;; per-mob window stitch); positions/velocities are SoA triples indexed by row.
+;; ================================================================
+
+(deftm world-solid?
+  "Solidity of the world block at (wx,wy,wz); 0 if out of bounds."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   wx :- Long, wy :- Long, wz :- Long,
+   wxd :- Long, wyd :- Long, wzd :- Long] :- Long
+  (if (and (>= wx 0) (< wx wxd) (>= wy 0) (< wy wyd) (>= wz 0) (< wz wzd))
+    (block-solid? solid-arr (long (aget blocks (int (+ wx (* wz wxd) (* wy wxd wzd))))))
+    0))
+
+(deftm world-aabb-collides?
+  "AABB at (x,y,z) hw×h collides with a solid world block? y = feet."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   x :- Double, y :- Double, z :- Double, hw :- Double, h :- Double,
+   wxd :- Long, wyd :- Long, wzd :- Long] :- Long
+  (let [r (* hw 0.5)
+        bx0 (long (Math/floor (- x r))) bx1 (long (Math/floor (+ x r)))
+        bz0 (long (Math/floor (- z r))) bz1 (long (Math/floor (+ z r)))
+        by0 (long (Math/floor y)) by1 (long (Math/floor (+ y h -0.01)))]
+    (loop [bx bx0]
+      (if (> bx bx1) 0
+          (if (pos? (loop [bz bz0]
+                      (if (> bz bz1) 0
+                          (if (pos? (loop [by by0]
+                                      (if (> by by1) 0
+                                          (if (pos? (world-solid? blocks solid-arr bx by bz wxd wyd wzd))
+                                            1 (recur (+ by 1))))))
+                            1 (recur (+ bz 1))))))
+            1 (recur (+ bx 1)))))))
+
+(deftm world-ground-check
+  "Block-top Y if a solid block is directly below feet, else -1.0."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   x :- Double, y :- Double, z :- Double, wxd :- Long, wyd :- Long, wzd :- Long] :- Double
+  (let [foot-y (long (Math/floor (- y 0.01))) bx (long (Math/floor x)) bz (long (Math/floor z))]
+    (if (pos? (world-solid? blocks solid-arr bx foot-y bz wxd wyd wzd))
+      (double (+ foot-y 1)) -1.0)))
+
+(deftm integrate-physics-batch!
+  "Integrate N mobs in place against a resident world block array. positions/velocities
+   are SoA triples [x0 y0 z0 x1 y1 z1 …]; mob i drifts by (dxs[i],dzs[i]). Gravity +
+   AABB collision + 1-block step-up, identical to integrate-physics!. Returns N."
+  [positions :- (Array double), velocities :- (Array double),
+   dxs :- (Array double), dzs :- (Array double),
+   blocks :- (Array int), solid-arr :- (Array byte),
+   n :- Long, wxd :- Long, wyd :- Long, wzd :- Long,
+   hw :- Double, h :- Double, dt :- Double] :- Long
+  (loop [i 0]
+    (if (< i n)
+      (let [b (* i 3)
+            mx (aget positions b) my (aget positions (+ b 1)) mz (aget positions (+ b 2))
+            vy (- (aget velocities (+ b 1)) (* GRAVITY dt))
+            new-my (+ my (* vy dt))
+            ground-y (world-ground-check blocks solid-arr mx new-my mz wxd wyd wzd)
+            on-ground? (> ground-y -0.5)
+            new-my (if (and on-ground? (< vy 0.0)) ground-y new-my)
+            vy (if (and on-ground? (< vy 0.0)) 0.0 vy)
+            dx (aget dxs i) dz (aget dzs i)
+            try-mx (+ mx dx)
+            coll-x (world-aabb-collides? blocks solid-arr try-mx new-my mz hw h wxd wyd wzd)
+            step-x? (and on-ground? (pos? coll-x)
+                         (< (world-aabb-collides? blocks solid-arr try-mx (+ new-my 1.0) mz hw h wxd wyd wzd) 1))
+            new-mx (if (pos? coll-x) (if step-x? try-mx mx) try-mx)
+            my-x (if step-x? (+ new-my 1.0) new-my)
+            try-mz (+ mz dz)
+            coll-z (world-aabb-collides? blocks solid-arr new-mx my-x try-mz hw h wxd wyd wzd)
+            step-z? (and on-ground? (pos? coll-z)
+                         (< (world-aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h wxd wyd wzd) 1))
+            new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
+            my-final (if step-z? (+ my-x 1.0) my-x)]
+        (aset positions b new-mx)
+        (aset positions (+ b 1) my-final)
+        (aset positions (+ b 2) new-mz)
+        (aset velocities (+ b 1) vy)
+        (recur (+ i 1)))
+      n)))
+
+;; ================================================================
 ;; Geometry — distance, direction, rotation, ray intersection
 ;; ================================================================
 
