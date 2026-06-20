@@ -20,4 +20,9 @@
   :ccubearray {:target     :browser
                :output-dir "public/cubearray-js"
                :asset-path "/cubearray-js"
-               :modules    {:main {:init-fn cube.web-array/init}}}}}
+               :modules    {:main {:init-fn cube.web-array/init}}}
+  ;; R5b voxel slice: deftm terrain (wasm) + mesher + array-textured render
+  :cvoxel {:target     :browser
+           :output-dir "public/voxel-js"
+           :asset-path "/voxel-js"
+           :modules    {:main {:init-fn voxel.web/init}}}}}
