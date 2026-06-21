@@ -100,11 +100,11 @@
 
             ;; Prefer B8G8R8A8_SRGB
             fmt (or (some (fn [i]
-                            (let [f (.get formats (int i))]
+                            (let [f ^VkSurfaceFormatKHR (.get formats (int i))]
                               (when (= (.format f) VK13/VK_FORMAT_B8G8R8A8_SRGB)
                                 {:format (.format f) :color-space (.colorSpace f)})))
                           (range (.remaining formats)))
-                    (let [f (.get formats 0)]
+                    (let [f ^VkSurfaceFormatKHR (.get formats 0)]
                       {:format (.format f) :color-space (.colorSpace f)}))
 
             image-count (max (inc (.minImageCount caps))

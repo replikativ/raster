@@ -9,14 +9,15 @@
 (def ^:const TEX 16)
 
 ;; 32-bit wrapping multiply (Java int* / JS Math.imul) — identical on both platforms.
-(defn- imul [a b]
+;; (named imul32 so it doesn't shadow cljs.core/imul)
+(defn- imul32 [a b]
   #?(:clj  (unchecked-int (* (unchecked-int a) (unchecked-int b)))
      :cljs (js/Math.imul a b)))
 
 (defn- hash-byte
   "JVM valley.textures/hash-byte, 32-bit: deterministic 0..255 noise."
   [x y seed]
-  (let [h (bit-xor (imul (+ x (* y 37) seed) (unchecked-int 2654435761)) (unchecked-int 0xDEADBEEF))]
+  (let [h (bit-xor (imul32 (+ x (* y 37) seed) (unchecked-int 2654435761)) (unchecked-int 0xDEADBEEF))]
     (bit-and (bit-xor h (unsigned-bit-shift-right h 16)) 0xFF)))
 
 (defn- m [v r] (mod v r))   ; like `rem` for the non-negative hash bytes

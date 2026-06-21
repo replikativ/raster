@@ -9,7 +9,9 @@
    [org.lwjgl.vulkan
     VK13 VkDevice VkCommandBuffer
     VkImageCreateInfo VkImageViewCreateInfo
-    VkSamplerCreateInfo VkBufferImageCopy]
+    VkSamplerCreateInfo VkBufferImageCopy
+    VkDescriptorSetLayoutBinding VkDescriptorPoolSize
+    VkDescriptorImageInfo VkWriteDescriptorSet]
    [org.lwjgl.util.vma Vma VmaAllocationCreateInfo]
    [org.lwjgl.system MemoryStack MemoryUtil]
    [java.nio ByteBuffer]))
@@ -118,7 +120,7 @@
         staging (mem/create-buffer allocator image-size :staging :cpu-to-gpu)
         _ (mem/with-mapped-buffer [bb allocator staging]
             (let [src (.duplicate pixels)]
-              (.put bb src)))
+              (.put ^java.nio.ByteBuffer bb src)))
 
         ;; Create GPU image
         stack (MemoryStack/stackPush)
@@ -470,7 +472,7 @@
   (let [stack (MemoryStack/stackPush)]
     (try
       (let [binding (org.lwjgl.vulkan.VkDescriptorSetLayoutBinding/calloc 1 stack)
-            _ (doto (.get binding 0)
+            _ (doto ^VkDescriptorSetLayoutBinding (.get binding 0)
                 (.binding 0)
                 (.descriptorType VK13/VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                 (.descriptorCount 1)
@@ -492,7 +494,7 @@
   (let [stack (MemoryStack/stackPush)]
     (try
       (let [pool-sizes (org.lwjgl.vulkan.VkDescriptorPoolSize/calloc 1 stack)
-            _ (doto (.get pool-sizes 0)
+            _ (doto ^VkDescriptorPoolSize (.get pool-sizes 0)
                 (.type VK13/VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER)
                 (.descriptorCount (int max-sets)))
             ci (doto (org.lwjgl.vulkan.VkDescriptorPoolCreateInfo/calloc stack)
@@ -522,12 +524,12 @@
           (throw (ex-info "Failed to allocate texture descriptor set" {:result r})))
         (let [desc-set (.get p-set 0)
               img-info (org.lwjgl.vulkan.VkDescriptorImageInfo/calloc 1 stack)
-              _ (doto (.get img-info 0)
+              _ (doto ^VkDescriptorImageInfo (.get img-info 0)
                   (.imageLayout VK13/VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                   (.imageView (:view tex))
                   (.sampler (:sampler tex)))
               write (org.lwjgl.vulkan.VkWriteDescriptorSet/calloc 1 stack)
-              _ (doto (.get write 0)
+              _ (doto ^VkWriteDescriptorSet (.get write 0)
                   (.sType VK13/VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
                   (.dstSet desc-set)
                   (.dstBinding 0)
@@ -554,12 +556,12 @@
           (throw (ex-info "Failed to allocate texture array descriptor set" {:result r})))
         (let [desc-set (.get p-set 0)
               img-info (org.lwjgl.vulkan.VkDescriptorImageInfo/calloc 1 stack)
-              _ (doto (.get img-info 0)
+              _ (doto ^VkDescriptorImageInfo (.get img-info 0)
                   (.imageLayout VK13/VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL)
                   (.imageView (:view ta))
                   (.sampler (:sampler ta)))
               write (org.lwjgl.vulkan.VkWriteDescriptorSet/calloc 1 stack)
-              _ (doto (.get write 0)
+              _ (doto ^VkWriteDescriptorSet (.get write 0)
                   (.sType VK13/VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET)
                   (.dstSet desc-set)
                   (.dstBinding 0)
