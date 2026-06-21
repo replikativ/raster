@@ -299,11 +299,25 @@
                 (-> (emit-operand-at ctx vt (first args)) (into (e/i opk))))))
       (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
 
+(defn- warn-unknown-vt
+  "G1: surface a type-inference miss (mirrors the .invk loud-recovery policy) and
+   default to :i32, instead of *silently* assuming i32 — a silent i32 on a float expr
+   miscompiles. A warning here means a node reached the emitter without a resolvable
+   type: a missing :raster.type/tag stamp, an unhandled form head, or an unbound symbol."
+  [node why]
+  (binding [*out* *err*]
+    (println (str "WARNING: wasm infer-vt — no type for " why ": " (pr-str node)
+                  " → defaulting to i32 (may miscompile a float expr).")))
+  :i32)
+
 (defn- infer-vt
-  "Result valtype of an expression, from env + carried :raster.type/tag."
+  "Result valtype of an expression, from env + carried :raster.type/tag. Genuinely
+   undeterminable types warn (warn-unknown-vt) rather than silently defaulting to i32."
   [ctx node]
   (cond
-    (symbol? node)  (get-in ctx [:env node :vt] :i32)
+    (symbol? node)  (if (contains? (:env ctx) node)
+                      (get-in ctx [:env node :vt] :i32)   ; in env w/o :vt = a void binding
+                      (warn-unknown-vt node "unbound symbol"))
     (float? node)   :f64
     (integer? node) :i32
     (seq? node)
@@ -330,6 +344,10 @@
                           (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))))
           (= 'case* h) (infer-vt ctx (second (first (vals (nth node 5))))) ; first clause's result
           (and (symbol? h) (#{"zero?" "pos?" "neg?"} (name h))) :i32   ; predicate → bool
+          ;; integer steppers (match emit-val's inc/dec) — i32 result, made explicit
+          ;; so it's intentional rather than relying on the unknown-head default
+          (and (symbol? h) (#{"inc" "unchecked-inc-int" "unchecked-inc"
+                              "dec" "unchecked-dec-int" "unchecked-dec"} (name h))) :i32
           (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
           (let [c' (reduce (fn [c [s init]] (assoc-in c [:env s] {:vt (infer-vt c init)}))
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
@@ -339,8 +357,8 @@
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
           (ix/canonical h) (if (= :cmp (ix/kind h)) :i32 (infer-vt ctx (second node)))
-          :else :i32)))
-    :else :i32))
+          :else (warn-unknown-vt node (str "unhandled head " h)))))
+    :else (warn-unknown-vt node "non-expression node")))
 
 (declare emit-dotimes emit-dotimes-scalar)
 
