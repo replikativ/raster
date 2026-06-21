@@ -16,7 +16,6 @@
 (def OFFSETS #js [-4.0 0.0 0.0 2.0 4.0 -6.0 3.0 -2.0 2.0 15.0 0.0])
 (defn init! ([src] (init! src (cljs.core/js-obj))) ([src env] (.then (w/instantiate! src env) (fn [s] (do (reset! M s) (.set (w/i32-view s) HP 0) (.set (w/i32-view s) DP 512) (.set (w/i32-view s) CP 1024) (.set (w/i32-view s) TP 1536) (.set (w/i32-view s) UP 2048) (.set (w/i32-view s) MP 2560) (.set (w/f64-view s) SCALES 1536) (.set (w/f64-view s) OFFSETS 1547) s)))))
 (defn upload-world! [blocks solid] (let [m (deref M)] (.set (w/i32-view m) blocks 23624) (.set (w/i8-view m) solid 6041888)))
-(defn terrain-height [x z] (let [m (deref M)] (let [r ((w/export m "terrain_height") 0 2048 x z 18.0 -4.0)] r)))
 (defn has-cave? [x y z] (let [m (deref M)] (let [r ((w/export m "has_cave") 4096 x y z)] r)))
 (defn surface-height-biome [x z] (let [m (deref M)] (let [r ((w/export m "surface_height_biome") 0 2048 6144 8192 10240 12288 12376 x z)] r)))
 (defn biome-index [x z] (let [m (deref M)] (let [r ((w/export m "biome_index") 6144 8192 2048 10240 x z)] r)))

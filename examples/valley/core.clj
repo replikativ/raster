@@ -364,20 +364,6 @@
                              (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
     (->Vec4 temp humid erosion mush)))
 
-(deftm terrain-height
-  "Get terrain surface height at world (wx, wz).
-  height-scale and base-offset are biome-specific parameters."
-  [height-perm :- (Array int), detail-perm :- (Array int),
-   wx :- Double, wz :- Double,
-   height-scale :- Double, base-offset :- Double] :- Long
-  (let [h (noise/fbm2d height-perm
-                       (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ)
-                       4 0.5 2.0)
-        detail (noise/fbm2d detail-perm
-                            (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0))
-                            2 0.6 2.0)]
-    (long (+ (double BASE-HEIGHT) base-offset (* h height-scale) (* detail 4.0)))))
-
 (deftm biome-index
   "Biome 0..10 from temperature/humidity/erosion/mushroom noise (cf valley.terrain/biome-at).
    0 desert 1 savanna 2 plains 3 forest 4 jungle 5 swamp 6 taiga 7 tundra 8 snowy-forest

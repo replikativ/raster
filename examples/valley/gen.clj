@@ -17,7 +17,6 @@
 (def HP (noise/make-perm 1337))
 (def DP (noise/make-perm 9001))
 (def CP (noise/make-perm 4242))
-(def HS 18.0) (def BO -4.0)
 ;; biome noise perms + per-biome height-scale/base-offset (must match kernels.clj)
 (def TP (noise/make-perm 2222))
 (def UP (noise/make-perm 3333))
@@ -56,10 +55,7 @@
             :uploads  [{:fn "upload-world!" :args '[blocks solid]
                         :set '[[WBLK blocks] [WSOL solid]]}]
             :kernels
-            [{:var #'valley.core/terrain-height :export "terrain_height" :fn "terrain-height"
-              :args '[x z]
-              :call [[:const 'HP] [:const 'DP] 'x 'z [:lit HS] [:lit BO]]}
-             {:var #'valley.core/has-cave? :export "has_cave" :fn "has-cave?"
+            [{:var #'valley.core/has-cave? :export "has_cave" :fn "has-cave?"
               :args '[x y z]
               :call [[:const 'CP] 'x 'y 'z]}
              {:var #'valley.core/surface-height-biome :export "surface_height_biome" :fn "surface-height-biome"
