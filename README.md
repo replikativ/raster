@@ -44,18 +44,25 @@ Then open one of the [interactive notebooks](notebooks/raster/) in your editor
 | [Linear Algebra](notebooks/raster/linear_algebra.clj) | Vec/Mat types, LU, Cholesky, SVD |
 | [Optimization](notebooks/raster/optimization.clj) | L-BFGS, Nelder-Mead, Newton's method |
 | [Deep Learning](notebooks/raster/deep_learning.clj) | MLP training with compiled AD |
+| [Agent-Based Modeling](notebooks/raster/abm_firms.clj) | Endogenous firm formation, GPU-compiled |
+| [Geometric Algebra + ODE](notebooks/raster/ga_ode_rotors.clj) | Rotors, precession |
 
 ### Game Examples
 
-Three games built on the Raster Vulkan engine — playable demos of typed dispatch,
-parallel primitives, and procedural generation:
+Playable demos of typed dispatch, parallel primitives, and procedural generation:
 
-| | |
-|---|---|
-| ![Asteroids](examples/asteroids/screenshot.png) | ![Valley](examples/valley/screenshot.png) |
-| **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm` dispatch. Add new shape types from the REPL during gameplay. | **[Valley](examples/valley/)** — voxel survival with procedural terrain, crafting, and mobs. Uses `raster.noise` for terrain generation. |
+![Asteroids](examples/asteroids/screenshot.png)
 
-There's also a [Doom-style renderer](examples/doom/) with WAD loading and BSP traversal.
+- **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm`
+  dispatch; add new shape types from the REPL during gameplay. Cross-platform from one
+  `.cljc` codebase: runs on the JVM (Vulkan) and in the browser (WebGPU, physics compiled
+  to WebAssembly).
+- **[Valley](examples/valley/)** — a streaming voxel world (biome terrain, caves, ore veins,
+  trees, day/night sky, skylight + glowstone block-light, water, passive mobs, mining).
+  Also cross-platform: the same kernels compile to JVM bytecode + Vulkan and to WebAssembly
+  + WebGPU.
+
+There's also a [Doom-style renderer](examples/doom/) (WAD loading + BSP traversal, WIP).
 
 See [examples/README.md](examples/README.md) for running instructions.
 
@@ -341,8 +348,9 @@ clojure -M:test
 # REPL
 clojure -M:nREPL
 
-# With Valhalla JDK 27
-source valhalla-env.sh
+# With Valhalla JDK 27 (point JAVA_HOME at your local Valhalla build)
+export JAVA_HOME=/path/to/valhalla-jdk/build/linux-x86_64-server-release/images/jdk
+export PATH="$JAVA_HOME/bin:$PATH"
 clojure -J--enable-preview \
         -J--add-exports=java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
         -J--enable-native-access=ALL-UNNAMED \

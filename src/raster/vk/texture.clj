@@ -261,7 +261,6 @@
         ;; Find max dimensions
         max-w (int (reduce max (map :width images)))
         max-h (int (reduce max (map :height images)))
-        _ (println "Creating texture array:" n "layers," max-w "x" max-h "max")
         layer-size (* max-w max-h 4)
         total-size (* layer-size n)
 
