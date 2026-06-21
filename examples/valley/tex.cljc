@@ -53,6 +53,19 @@
 (defn- iron-px    [x y] (ore-px x y 43 205 160 120))
 (defn- gold-px    [x y] (ore-px x y 45 230 200 70))
 (defn- diamond-px [x y] (ore-px x y 47 120 222 224))
+
+;; birch: pale bark with short dark lenticels; spruce: dark reddish-brown bark
+(defn- birch-side-px [x y]
+  (let [v (hash-byte x y 51)]
+    (if (and (zero? (m y 4)) (< (m (hash-byte x (quot y 4) 52) 10) 4))
+      [50 48 46 255]                                   ; dark lenticel dash
+      [(+ 205 (m v 25)) (+ 205 (m v 25)) (+ 195 (m v 20)) 255])))
+(defn- birch-top-px  [x y] (let [v (hash-byte x y 53)] [(+ 200 (m v 20)) (+ 195 (m v 18)) (+ 165 (m v 15)) 255]))
+(defn- birch-leaf-px [x y] (let [v (hash-byte x y 54)] [(+ 95 (m v 30)) (+ 165 (m v 35)) (+ 55 (m v 20)) 255]))
+(defn- spruce-side-px [x y] (let [v (hash-byte x y 55) s (if (zero? (m x 4)) -10 0)]
+                              [(+ 78 s (m v 18)) (+ 52 s (m v 12)) (+ 34 (m v 10)) 255]))
+(defn- spruce-top-px  [x y] (let [v (hash-byte x y 56)] [(+ 92 (m v 16)) (+ 62 (m v 12)) (+ 40 (m v 10)) 255]))
+(defn- spruce-leaf-px [x y] (let [v (hash-byte x y 57)] [(+ 28 (m v 18)) (+ 78 (m v 22)) (+ 52 (m v 18)) 255]))
 (defn- gravel-px [x y] (let [v (hash-byte x y 11)] [(+ 90 (m v 30)) (+ 85 (m v 25)) (+ 80 (m v 20)) 255]))
 ;; trees: oak-like log (bark sides + ring top) and mottled leaves
 (defn- log-side-px [x y]
@@ -108,13 +121,15 @@
    22 cow-body-px 23 cow-head-px 24 animal-leg-px 25 pig-body-px 26 pig-head-px
    27 pig-leg-px 28 chicken-body-px 29 chicken-leg-px
    30 log-side-px 31 log-top-px 32 leaves-px
-   33 heart-full-px 34 heart-empty-px 35 slot-px 36 crosshair-px 37 selector-px})
+   33 heart-full-px 34 heart-empty-px 35 slot-px 36 crosshair-px 37 selector-px
+   38 birch-side-px 39 birch-top-px 40 birch-leaf-px
+   41 spruce-side-px 42 spruce-top-px 43 spruce-leaf-px})
 
 ;; HUD layer ids (for valley.hud)
 (def ^:const HEART-FULL 33) (def ^:const HEART-EMPTY 34)
 (def ^:const SLOT 35) (def ^:const CROSSHAIR 36) (def ^:const SELECTOR 37)
 
-(def ^:const N-LAYERS 38)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 trees, 33..37 HUD
+(def ^:const N-LAYERS 44)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 oak, 33..37 HUD, 38..43 birch/spruce
 
 (defn atlas-pixels
   "Flat layer-major RGBA8 vector for all terrain texture layers (16×16 each)."
@@ -143,7 +158,11 @@
    13 [6 6 6 6 6 6]        ; coal ore
    14 [7 7 7 7 7 7]        ; iron ore
    15 [8 8 8 8 8 8]        ; gold ore
-   16 [9 9 9 9 9 9]})      ; diamond ore
+   16 [9 9 9 9 9 9]        ; diamond ore
+   17 [39 39 38 38 38 38]  ; birch log
+   18 [40 40 40 40 40 40]  ; birch leaves
+   19 [42 42 41 41 41 41]  ; spruce log
+   20 [43 43 43 43 43 43]})  ; spruce leaves
 
 (defn face-layer
   "Texture layer for block `id` on face `f` (0 top 1 bottom 2 north 3 south 4 east 5 west)."

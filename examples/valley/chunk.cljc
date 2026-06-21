@@ -22,8 +22,9 @@
 
 ;; block ids (cf valley.tex/block-faces): 0 air, 1 grass, 2 dirt, 3 stone, 4 sand,
 ;; 5 snowy-grass, 6 snow, 7 podzol, 8 sandstone, 9 mountain-stone,
-;; 10 water (transparent, non-solid), 11 log, 12 leaves,
-;; 13 coal-ore, 14 iron-ore, 15 gold-ore, 16 diamond-ore.
+;; 10 water (transparent, non-solid), 11 oak-log, 12 oak-leaves,
+;; 13 coal-ore, 14 iron-ore, 15 gold-ore, 16 diamond-ore,
+;; 17 birch-log, 18 birch-leaves, 19 spruce-log, 20 spruce-leaves.
 (def ^:const WATER 10)
 (def ^:const LOG 11)
 (def ^:const LEAVES 12)
@@ -31,7 +32,11 @@
 (def ^:const IRON 14)
 (def ^:const GOLD 15)
 (def ^:const DIAMOND 16)
-(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12 13 14 15 16])   ; everything except air + water
+(def ^:const BIRCH-LOG 17)
+(def ^:const BIRCH-LEAVES 18)
+(def ^:const SPRUCE-LOG 19)
+(def ^:const SPRUCE-LEAVES 20)
+(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12 13 14 15 16 17 18 19 20])  ; all but air + water
 (defn solid-table []
   (let [s (barray 62)]
     (doseq [i solid-ids] (aset s (int i) #?(:clj (byte 1) :cljs 1)))
@@ -115,6 +120,40 @@
   ^long [wx wz]
   (max 1 (min (dec COL-H) (+ TERRAIN-BASE (- (long (k/surface-height-biome wx wz)) TERRAIN-REF)))))
 
+(defn- disk!
+  "Place leaf `id` in a horizontal (2r+1)² disk at world y=ly centred (cx,cz), into air only;
+   the 4 far corners are skipped at r=2 to round the canopy. r=0 = a single block."
+  [put air? cx ly cz r id]
+  (let [r (long r)]
+    (doseq [dx (range (- r) (inc r)) dz (range (- r) (inc r))]
+      (when (and (not (and (= (iabs dx) r) (= (iabs dz) r) (= r 2)))
+                 (air? (+ (long cx) dx) (long ly) (+ (long cz) dz)))
+        (put (+ (long cx) dx) (long ly) (+ (long cz) dz) id)))))
+
+;; Tree species by biome (see gen-into!): 0 oak (rounded), 1 birch (tall+slim), 2 spruce
+;; (tall conical). Each canopy radius ≤ TREE-MARGIN so neighbour-rooted trees spill in
+;; identically across region seams. phash gives a deterministic per-column height jitter.
+(defn- place-tree!
+  [put air? sp wx wz h]
+  (let [hh (long h)]
+    (cond
+      (= (long sp) 0)                                   ; oak (unchanged from the original tree)
+      (let [th (+ 4 (mod (phash wx wz) 3)) top (+ hh th)]
+        (dotimes [t th] (put wx (+ hh t) wz LOG))
+        (disk! put air? wx (- top 3) wz 2 LEAVES) (disk! put air? wx (- top 2) wz 2 LEAVES)
+        (disk! put air? wx (- top 1) wz 1 LEAVES) (disk! put air? wx top       wz 1 LEAVES))
+      (= (long sp) 1)                                   ; birch
+      (let [th (+ 5 (mod (phash wx wz) 3)) top (+ hh th)]
+        (dotimes [t th] (put wx (+ hh t) wz BIRCH-LOG))
+        (disk! put air? wx (- top 2) wz 1 BIRCH-LEAVES) (disk! put air? wx (- top 1) wz 1 BIRCH-LEAVES)
+        (disk! put air? wx top wz 0 BIRCH-LEAVES))
+      :else                                             ; spruce (conical, narrowing upward)
+      (let [th (+ 6 (mod (phash wx wz) 4)) top (+ hh th)]
+        (dotimes [t th] (put wx (+ hh t) wz SPRUCE-LOG))
+        (disk! put air? wx (- top 5) wz 2 SPRUCE-LEAVES) (disk! put air? wx (- top 4) wz 2 SPRUCE-LEAVES)
+        (disk! put air? wx (- top 3) wz 1 SPRUCE-LEAVES) (disk! put air? wx (- top 2) wz 1 SPRUCE-LEAVES)
+        (disk! put air? wx (- top 1) wz 1 SPRUCE-LEAVES) (disk! put air? wx top wz 0 SPRUCE-LEAVES)))))
+
 (defn- gen-into!
   "Fill region [rx0,rx1)×[0,COL-H)×[rz0,rz1) of array b (dims AW×COL-H×AD, world origin ox,oz)
    with terrain+caves+water, then trees (roots scanned in a ±TREE-MARGIN ring so neighbour-rooted
@@ -145,23 +184,18 @@
                                 :else (let [o (ore-at wx wy wz h)] (if (pos? o) o 3))))))
         (when (< h SEA-LEVEL)
           (loop [wy h] (when (< wy SEA-LEVEL) (put wx wy wz WATER) (recur (inc wy)))))))
-    ;; trees: scan roots in the margin ring, x then z (matches global order), place spillover
+    ;; trees: scan roots in the margin ring, x then z (matches global order), place spillover.
+    ;; Species by biome: forest→birch, taiga/snowy-forest→spruce, other grassy biomes→oak.
     (doseq [wx (range (- rx0 TREE-MARGIN) (+ rx1 TREE-MARGIN))
             wz (range (- rz0 TREE-MARGIN) (+ rz1 TREE-MARGIN))]
-      (let [h (column-height wx wz) bi (long (k/biome-index (* wx 8) (* wz 8)))]
-        (when (and (>= h SEA-LEVEL) (= 1 (long (nth biome-surface bi)))
-                   (zero? (mod (phash wx wz) 37)) (< (+ h 7) COL-H))
-          (let [th (+ 4 (mod (phash wx wz) 3)) top (+ h th)]
-            (dotimes [t th] (put wx (+ h t) wz LOG))
-            (doseq [dy [-2 -1]] (let [ly (+ top dy -1)]
-                                  (doseq [dx [-2 -1 0 1 2] dz [-2 -1 0 1 2]]
-                                    (when (and (not (and (= (iabs dx) 2) (= (iabs dz) 2)))
-                                               (air? (+ wx dx) ly (+ wz dz)))
-                                      (put (+ wx dx) ly (+ wz dz) LEAVES)))))
-            (doseq [dy [0 1]] (let [ly (+ top dy -1)]
-                                (doseq [dx [-1 0 1] dz [-1 0 1]]
-                                  (when (air? (+ wx dx) ly (+ wz dz))
-                                    (put (+ wx dx) ly (+ wz dz) LEAVES)))))))))
+      (let [h  (column-height wx wz) bi (long (k/biome-index (* wx 8) (* wz 8)))
+            sp (cond (= bi 3) 1                                    ; forest → birch
+                     (or (= bi 6) (= bi 8)) 2                      ; taiga / snowy-forest → spruce
+                     (or (= bi 1) (= bi 2) (= bi 4) (= bi 5) (= bi 10)) 0   ; grassy → oak
+                     :else -1)]                                    ; desert/tundra/mountains → none
+        (when (and (>= sp 0) (>= h SEA-LEVEL)
+                   (zero? (mod (phash wx wz) 37)) (< (+ h 11) COL-H))
+          (place-tree! put air? sp wx wz h))))
     b))
 
 (defn- skylight-into!
