@@ -24,7 +24,7 @@
 ;; 5 snowy-grass, 6 snow, 7 podzol, 8 sandstone, 9 mountain-stone,
 ;; 10 water (transparent, non-solid), 11 oak-log, 12 oak-leaves,
 ;; 13 coal-ore, 14 iron-ore, 15 gold-ore, 16 diamond-ore,
-;; 17 birch-log, 18 birch-leaves, 19 spruce-log, 20 spruce-leaves.
+;; 17 birch-log, 18 birch-leaves, 19 spruce-log, 20 spruce-leaves, 21 glowstone (light source).
 (def ^:const WATER 10)
 (def ^:const LOG 11)
 (def ^:const LEAVES 12)
@@ -36,7 +36,9 @@
 (def ^:const BIRCH-LEAVES 18)
 (def ^:const SPRUCE-LOG 19)
 (def ^:const SPRUCE-LEAVES 20)
-(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12 13 14 15 16 17 18 19 20])  ; all but air + water
+(def ^:const GLOW 21)               ; glowstone — opaque solid block-light emitter
+(def ^:const EMIT 14)               ; block-light level emitted by GLOW (0..15)
+(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12 13 14 15 16 17 18 19 20 21])  ; all but air + water
 (defn solid-table []
   (let [s (barray 62)]
     (doseq [i solid-ids] (aset s (int i) #?(:clj (byte 1) :cljs 1)))
@@ -213,6 +215,44 @@
                 (do (aset #?(:clj ^ints light :cljs light) i #?(:clj (int 15) :cljs 15)) (recur (dec ly) true))
                 (recur (dec ly) false)))))))))
 
+(defn- blocklight!
+  "Recompute block-light (0..15) for the whole buffer b into blight via BFS from GLOW emitters
+   — light passes through non-opaque cells (air/water), decaying 1 per step. Order-independent
+   (max-combine), so a full recompute is always correct. Buffer dims AW×COL-H×AD; index layout
+   i = lx + lz·AW + ly·AW·AD. Cheap when emitters are sparse (the player's placed glowstone)."
+  [b blight AW AD]
+  (let [AW (long AW) AD (long AD) AWD (* AW AD) n (* AWD COL-H)
+        b #?(:clj ^ints b :cljs b) L #?(:clj ^ints blight :cljs blight)]
+    (loop [seed (transient []) i 0]                               ; one pass: clear + seed emitters
+      (if (< i n)
+        (if (= GLOW (long (aget b i)))
+          (do (aset L i #?(:clj (int EMIT) :cljs EMIT)) (recur (conj! seed i) (inc i)))
+          (do (aset L i #?(:clj (int 0) :cljs 0)) (recur seed (inc i))))
+        (let [q0 (persistent! seed)]
+          (loop [q q0 head 0]
+            (when (< head (count q))
+              (let [ci (long (nth q head)) nl (dec (long (aget L ci)))]
+                (if (< nl 1)
+                  (recur q (inc head))
+                  (let [lx (mod ci AW) t (quot ci AW) lz (mod t AD) ly (quot t AD)
+                        vis (fn [q nx nz ny]
+                              (if (and (>= nx 0) (< nx AW) (>= nz 0) (< nz AD) (>= ny 0) (< ny COL-H))
+                                (let [ni (+ nx (* nz AW) (* ny AWD))]
+                                  (if (and (not (opaque? (aget b ni))) (> nl (long (aget L ni))))
+                                    (do (aset L ni #?(:clj (int nl) :cljs nl)) (conj! q ni))
+                                    q))
+                                q))
+                        q (-> (transient q)
+                              (vis (inc lx) lz ly) (vis (dec lx) lz ly)
+                              (vis lx (inc lz) ly) (vis lx (dec lz) ly)
+                              (vis lx lz (inc ly)) (vis lx lz (dec ly))
+                              persistent!)]
+                    (recur q (inc head))))))))))))
+
+(defn relight-blocks!
+  "Recompute the stream's block-light channel in place (after a block edit). Returns the stream."
+  [s] (blocklight! (:blocks s) (:blight s) (:wx s) (:wz s)) s)
+
 (defn- region-minus
   "Rectangle difference R \\ O (O ⊆ R) as ≤4 disjoint rects [x0 z0 x1 z1] (left/right/top/bottom)."
   [rx0 rz0 rx1 rz1 ox0 oz0 ox1 oz1]
@@ -228,10 +268,11 @@
   [pcx pcz rg]
   (let [rg (long rg) AW (* (+ (* 2 rg) 1) CS)
         aox (* (- (long pcx) rg) CS) aoz (* (- (long pcz) rg) CS)
-        buf (iarray (* AW COL-H AW)) light (iarray (* AW COL-H AW))]
+        buf (iarray (* AW COL-H AW)) light (iarray (* AW COL-H AW)) blight (iarray (* AW COL-H AW))]
     (gen-into! buf AW AW aox aoz aox aoz (+ aox AW) (+ aoz AW))
     (skylight-into! buf light AW AW aox aoz aox aoz (+ aox AW) (+ aoz AW))
-    {:blocks buf :light light :wx AW :wy COL-H :wz AW :aox aox :aoz aoz
+    (blocklight! buf blight AW AW)
+    {:blocks buf :light light :blight blight :wx AW :wy COL-H :wz AW :aox aox :aoz aoz
      :rg rg :center [(long pcx) (long pcz)] :solid (solid-table)
      :scratch (iarray (* CS CS CS))}))
 
@@ -247,7 +288,7 @@
             naox (* (- pcx rg) CS) naoz (* (- pcz rg) CS)
             oaox (long (:aox s)) oaoz (long (:aoz s))
             ob #?(:clj ^ints (:blocks s) :cljs (:blocks s)) ol #?(:clj ^ints (:light s) :cljs (:light s))
-            nb (iarray (* AW COL-H AW)) nl (iarray (* AW COL-H AW))
+            nb (iarray (* AW COL-H AW)) nl (iarray (* AW COL-H AW)) nbl (iarray (* AW COL-H AW))
             ox0 (max naox oaox) oz0 (max naoz oaoz)
             ox1 (min (+ naox AW) (+ oaox AW)) oz1 (min (+ naoz AW) (+ oaoz AW))
             overlap? (and (< ox0 ox1) (< oz0 oz1))]
@@ -267,7 +308,10 @@
             (doseq [[sx0 sz0 sx1 sz1] (region-minus naox naoz (+ naox AW) (+ naoz AW) ox0 oz0 ox1 oz1)]
               (gen-into! nb AW AW naox naoz sx0 sz0 sx1 sz1)
               (skylight-into! nb nl AW AW naox naoz sx0 sz0 sx1 sz1))))
-        (assoc s :blocks nb :light nl :aox naox :aoz naoz :center [pcx pcz])))))
+        ;; block-light is a pure function of the new buffer's emitters → recompute whole-buffer
+        ;; (retained player-placed glowstone in the overlap re-floods identically)
+        (blocklight! nb nbl AW AW)
+        (assoc s :blocks nb :light nl :blight nbl :aox naox :aoz naoz :center [pcx pcz])))))
 
 ;; world-block/set-block! take WORLD coords; on a stream world they subtract the active-buffer
 ;; origin (:aox/:aoz, default 0 for the fixed demo world) → buffer-local index.
@@ -320,9 +364,7 @@
                 (aset scr (idx i j k) #?(:clj (int v) :cljs v)))))))))
   scratch)
 
-;; --- lighting (port of valley.lighting skylight + valley.mesher AO) ------------------
-(defn- pow* [a b] (#?(:clj Math/pow :cljs js/Math.pow) (double a) (double b)))
-
+;; --- lighting (skylight + block-light read-back + valley.mesher AO) ------------------
 (defn- light-at
   "Skylight at world cell (clamped to 0 outside)."
   [skylight x y z WX WY WZ]                ; >4 args ⇒ no primitive hints
@@ -351,10 +393,11 @@
   "Textured face mesh of blocks in [x0,x1)×[0,WY)×[z0,z1) — neighbours are read across the
    box boundary (from the full world) so seam culling + AO are correct between chunks.
    Vertex = pos3 uv2 layer shade light ao (valley.tex/STRIDE = 36). {:verts :indices}.
-   `skylight` is precomputed (global). The block array + dims are hoisted into a fast
-   primitive reader so the AO inner loop does no map lookups."
-  ([world skylight x0 z0 x1 z1] (mesh-region world skylight x0 z0 x1 z1 0 0))
-  ([world skylight x0 z0 x1 z1 pxo pzo]
+   `skylight` (binary 0/15) and `blight` (block-light 0..15) are precomputed; the face's light
+   float packs both as sky + 16·block (unpacked in the shader — skylight dims at night, block
+   light doesn't). The block array + dims are hoisted into a fast primitive reader."
+  ([world skylight blight x0 z0 x1 z1] (mesh-region world skylight blight x0 z0 x1 z1 0 0))
+  ([world skylight blight x0 z0 x1 z1 pxo pzo]
    (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world)) WXZ (* WX WZ)
          x0 (long x0) z0 (long z0) x1 (long x1) z1 (long z1) pxo (long pxo) pzo (long pzo)
          b   #?(:clj ^ints (:blocks world) :cljs (:blocks world))
@@ -386,7 +429,9 @@
                    (let [bf    (nth face->bf fi)
                          layer (double (tex/face-layer id bf))
                          shade (double (nth tex/face-shade bf))
-                         lit   (pow* (/ (double (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)) 15.0) 1.6)
+                         sky   (light-at skylight (+ x nx) (+ y ny) (+ z nz) WX WY WZ)   ; 0 or 15
+                         blk   (light-at blight   (+ x nx) (+ y ny) (+ z nz) WX WY WZ)   ; 0..15
+                         lit   (double (+ (long sky) (* 16 (long blk))))                 ; packed for the shader
                          base  @vc]
                      (dotimes [ci 4]
                        (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)
@@ -420,13 +465,13 @@
 ;; per-column GPU buffer capacity (verts). Avg surface column ≈ 8k; 32k is a safe ceiling.
 (def ^:const MAX-COLUMN-VERTS 32768)
 
-(defn edit-columns
-  "Set of column keys whose mesh must be rebuilt after a block edit at world (x,z): the
-   block's own column plus any horizontal neighbour column (an edge edit changes the
-   adjacent column's seam faces). 1–3 columns in practice."
+(defn relight-columns
+  "Column keys whose mesh must be rebuilt after a block edit at world (x,z): the 3×3 chunk
+   neighbourhood around the edit. Covers both the seam-face change of an immediate edit and the
+   spread of block-light (radius ≤ EMIT < CS, so one chunk in each direction suffices)."
   [x z]
-  (distinct (map (fn [[dx dz]] (chunk-key (+ (long x) dx) (+ (long z) dz)))
-                 [[0 0] [1 0] [-1 0] [0 1] [0 -1]])))
+  (let [[cx cz] (chunk-key x z)]
+    (for [dx [-1 0 1] dz [-1 0 1]] [(+ cx dx) (+ cz dz)])))
 
 (defn mesh-stream-column
   "Column (cx,cz) meshed from the active buffer `s` in ABSOLUTE world coords (so meshes never
@@ -434,7 +479,7 @@
   [s cx cz]
   (let [aox (long (:aox s)) aoz (long (:aoz s))
         bx0 (- (* (long cx) CS) aox) bz0 (- (* (long cz) CS) aoz)
-        mr (mesh-region s (:light s) bx0 bz0 (+ bx0 CS) (+ bz0 CS) aox aoz)]
+        mr (mesh-region s (:light s) (:blight s) bx0 bz0 (+ bx0 CS) (+ bz0 CS) aox aoz)]
     {:opaque (tris (:opaque mr) 9) :water (tris (:water mr) 3)}))
 
 (defn ring-cols

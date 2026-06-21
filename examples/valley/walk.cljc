@@ -30,7 +30,7 @@
      :vel (chunk/darray [0.0 0.0 0.0])
      :spawn [(+ wx 0.5) (+ (double top) 3.0) (+ wz 0.5)]
      :yaw 0.0 :pitch -0.2 :on-ground false
-     :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
+     :health 20 :max-health 20 :hotbar [1 2 3 8 11 21] :sel 0 :qe false}))
 
 (def ^:const VOID-Y -10.0)    ; below this → instant death (fell off the world)
 (def ^:const FALL-SAFE 13.0)  ; impact speed (blocks/s) you can survive unharmed

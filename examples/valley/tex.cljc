@@ -66,6 +66,8 @@
                               [(+ 78 s (m v 18)) (+ 52 s (m v 12)) (+ 34 (m v 10)) 255]))
 (defn- spruce-top-px  [x y] (let [v (hash-byte x y 56)] [(+ 92 (m v 16)) (+ 62 (m v 12)) (+ 40 (m v 10)) 255]))
 (defn- spruce-leaf-px [x y] (let [v (hash-byte x y 57)] [(+ 28 (m v 18)) (+ 78 (m v 22)) (+ 52 (m v 18)) 255]))
+;; glowstone: warm speckled emitter (the block-light source)
+(defn- glow-px [x y] (let [v (hash-byte x y 58)] [(+ 228 (m v 22)) (+ 200 (m v 35)) (+ 95 (m v 45)) 255]))
 (defn- gravel-px [x y] (let [v (hash-byte x y 11)] [(+ 90 (m v 30)) (+ 85 (m v 25)) (+ 80 (m v 20)) 255]))
 ;; trees: oak-like log (bark sides + ring top) and mottled leaves
 (defn- log-side-px [x y]
@@ -125,14 +127,14 @@
    33 heart-full-px 34 heart-empty-px 35 slot-px 36 crosshair-px 37 selector-px
    38 birch-side-px 39 birch-top-px 40 birch-leaf-px
    41 spruce-side-px 42 spruce-top-px 43 spruce-leaf-px
-   44 heart-half-px})
+   44 heart-half-px 45 glow-px})
 
 ;; HUD layer ids (for valley.hud)
 (def ^:const HEART-FULL 33) (def ^:const HEART-EMPTY 34)
 (def ^:const SLOT 35) (def ^:const CROSSHAIR 36) (def ^:const SELECTOR 37)
 (def ^:const HEART-HALF 44)
 
-(def ^:const N-LAYERS 45)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 oak, 33..37 HUD, 38..43 birch/spruce, 44 half-heart
+(def ^:const N-LAYERS 46)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 oak, 33..37 HUD, 38..43 birch/spruce, 44 half-heart, 45 glow
 
 (defn atlas-pixels
   "Flat layer-major RGBA8 vector for all terrain texture layers (16×16 each)."
@@ -165,7 +167,8 @@
    17 [39 39 38 38 38 38]  ; birch log
    18 [40 40 40 40 40 40]  ; birch leaves
    19 [42 42 41 41 41 41]  ; spruce log
-   20 [43 43 43 43 43 43]})  ; spruce leaves
+   20 [43 43 43 43 43 43]  ; spruce leaves
+   21 [45 45 45 45 45 45]})  ; glowstone
 
 (defn face-layer
   "Texture layer for block `id` on face `f` (0 top 1 bottom 2 north 3 south 4 east 5 west)."
@@ -178,23 +181,29 @@
 (def ^:const STRIDE 36)   ; pos3(12) + uv2(8) + layer(4) + shade(4) + light(4) + ao(4)
 
 ;; Textured terrain shader: array-sample at the face's layer modulated by the per-face
-;; directional shade, baked skylight (vLight) and ambient occlusion (vAo). The day/night
-;; level arrives in env.x (day ratio 0.05..1) with env.y ambient floor, so the same baked
-;; light dims smoothly into night. Distance fog (vDepth = clip-space w ≈ view distance) blends
-;; far terrain into fog.xyz (the sky horizon colour), hiding the streaming-ring edge. Fog
-;; distances (50..76 blocks) are literal — tied to the fixed render radius. One source → GLSL + WGSL.
+;; directional shade, ambient occlusion (vAo), and light. The light float packs two channels:
+;; skylight (low, 0..15) which dims with day/night via env.x, and block-light (high ×16, 0..15)
+;; from glowstone which does NOT dim — unpacked in the vertex shader, combined with max() so the
+;; brighter source wins. env.x = day ratio (0.05..1), env.y = ambient floor. Distance fog
+;; (vDepth = clip-space w ≈ view distance) blends far terrain into fog.xyz (sky horizon colour),
+;; hiding the streaming-ring edge; fog distances (50..76 blocks) are literal — tied to the fixed
+;; render radius. One source → GLSL + WGSL.
 (def shader
   '{:uniform        {:name "U" :fields [[:mvp :mat4] [:env :vec4] [:fog :vec4]]}  ; env=[day amb _ _] fog=[r g b _]
     :attributes     [[inPos vec3 0] [inUv vec2 1] [inLayer float 2] [inShade float 3]
                      [inLight float 4] [inAo float 5]]
-    :varyings       [[vUv vec2 0] [vLayer float 1] [vShade float 2] [vLight float 3] [vAo float 4] [vDepth float 5]]
+    :varyings       [[vUv vec2 0] [vLayer float 1] [vShade float 2] [vSky float 3] [vAo float 4]
+                     [vDepth float 5] [vBlock float 6]]
     :texture-arrays [[atlas 0]]
     :vertex         [(let cp vec4 (* mvp (vec4 inPos 1.0)))
                      (set-position cp)
+                     (let bn float (floor (/ inLight 16.0)))         ; block-light level 0..15
+                     (let sn float (- inLight (* bn 16.0)))          ; skylight level 0..15
                      (out vUv inUv) (out vLayer inLayer) (out vShade inShade)
-                     (out vLight inLight) (out vAo inAo) (out vDepth (swizzle cp w))]
+                     (out vSky (/ sn 15.0)) (out vBlock (/ bn 15.0)) (out vAo inAo)
+                     (out vDepth (swizzle cp w))]
     :fragment       [(let texel vec4 (sample-layer atlas vUv vLayer))
-                     (let lvl float (clamp (+ (swizzle env y) (* (swizzle env x) vLight)) 0.0 1.0))
+                     (let lvl float (clamp (max (+ (swizzle env y) (* (swizzle env x) vSky)) vBlock) 0.0 1.0))
                      (let lit float (* lvl vShade vAo))
                      (let fogf float (clamp (smoothstep 50.0 76.0 vDepth) 0.0 1.0))
                      (let rgb vec3 (mix (* (swizzle texel xyz) lit) (swizzle fog xyz) fogf))

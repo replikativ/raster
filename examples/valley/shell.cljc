@@ -79,7 +79,8 @@
                        (when (contains? input :fire)
                          (let [p (:pos pl)] (swap! mob-st swarm/cull-nearest! (aget p 0) (aget p 2))))
                        (when-let [[ex _ ez] (walk/apply-edits! @stream pl input)]
-                         (doseq [kk (chunk/edit-columns ex ez)] (when (@meshes kk) (mesh-one! kk))))
+                         (chunk/relight-blocks! @stream)                 ; glowstone place/break → re-flood block-light
+                         (doseq [kk (chunk/relight-columns ex ez)] (when (@meshes kk) (mesh-one! kk))))
                        (reset! player (walk/player-update @stream pl input dt))
                        @player)
              :render (fn [pl frame]
