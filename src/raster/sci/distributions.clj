@@ -56,10 +56,10 @@
         x (mn/abs x)
         t (mn// 1.0 (m/fma 0.3275911 x 1.0))
         y (mn/* t (m/fma t (m/fma t (m/fma t (m/fma t 1.061405429
-                                                 -1.453152027)
-                                        1.421413741)
-                               -0.284496736)
-                      0.254829592))
+                                                    -1.453152027)
+                                           1.421413741)
+                                  -0.284496736)
+                         0.254829592))
         result (mn/- 1.0 (mn/* y (m/exp (- (mn/* x x)))))]
     (mn/* sign result)))
 
@@ -76,7 +76,7 @@
           ln1my2 (m/log (mn/- 1.0 (mn/* y y)))
           b  (mn/+ (mn// 2.0 (mn/* mn/pi a)) (mn/* 0.5 ln1my2))
           x0 (mn/* (m/signum y)
-                (mn/sqrt (mn/- (mn/sqrt (mn/- (mn/* b b) (mn// ln1my2 a))) b)))]
+                   (mn/sqrt (mn/- (mn/sqrt (mn/- (mn/* b b) (mn// ln1my2 a))) b)))]
       ;; Newton-Raphson: x_{n+1} = x_n + (y - erf(x_n)) / (2/sqrt(pi) * exp(-x_n^2))
       (loop [x x0 iter 0]
         (if (>= iter 8)
@@ -93,7 +93,7 @@
   (if (< x 0.5)
     ;; Reflection formula: Gamma(x) = pi / (sin(pi*x) * Gamma(1-x))
     (mn/- (m/log (mn// mn/pi (m/sin (mn/* mn/pi x))))
-       (lgamma (mn/- 1.0 x)))
+          (lgamma (mn/- 1.0 x)))
     (let [x (mn/- x 1.0)
           coeffs (double-array [676.5203681218851
                                 -1259.1392167224028
@@ -365,11 +365,11 @@
 (deftm fit-normal [data :- (Array double)]
   (let [n (alength data)
         mu (mn// (reduce! [acc 0.0] [data] (mn/+ acc data))
-              (double n))
+                 (double n))
         sigma (mn/sqrt (mn// (reduce! [acc 0.0] [data]
-                                   (let [d (mn/- data mu)]
-                                     (mn/+ acc (mn/* d d))))
-                          (double n)))]
+                                      (let [d (mn/- data mu)]
+                                        (mn/+ acc (mn/* d d))))
+                             (double n)))]
     (->Normal mu sigma)))
 
 (deftm fit-exponential [data :- (Array double)]
@@ -427,32 +427,32 @@
                  (if (< (mn/abs v) fpmin) (mn// 1.0 fpmin) (mn// 1.0 v)))
             h0 d0]
         (mn/* (m/exp lnpfx)
-           (loop [m 1, c c0, d d0, h h0]
-             (if (>= m max-iter)
-               h
-               (let [dm (double m)
+              (loop [m 1, c c0, d d0, h h0]
+                (if (>= m max-iter)
+                  h
+                  (let [dm (double m)
                      ;; Even term: a_{2m} = m*(b-m)*x / ((qam+2m)*(a+2m))
-                     em (mn// (* dm (mn/- b dm) x)
-                           (mn/* (mn/+ qam (mn/* 2.0 dm)) (mn/+ a (mn/* 2.0 dm))))
-                     d1 (mn/+ 1.0 (mn/* em d))
-                     d1 (if (< (mn/abs d1) fpmin) fpmin d1)
-                     d1 (mn// 1.0 d1)
-                     c1 (mn/+ 1.0 (mn// em c))
-                     c1 (if (< (mn/abs c1) fpmin) fpmin c1)
-                     h (* h d1 c1)
+                        em (mn// (* dm (mn/- b dm) x)
+                                 (mn/* (mn/+ qam (mn/* 2.0 dm)) (mn/+ a (mn/* 2.0 dm))))
+                        d1 (mn/+ 1.0 (mn/* em d))
+                        d1 (if (< (mn/abs d1) fpmin) fpmin d1)
+                        d1 (mn// 1.0 d1)
+                        c1 (mn/+ 1.0 (mn// em c))
+                        c1 (if (< (mn/abs c1) fpmin) fpmin c1)
+                        h (* h d1 c1)
                      ;; Odd term: a_{2m+1} = -(a+m)*(qab+m)*x / ((a+2m)*(qap+2m))
-                     ep (mn// (- (* (mn/+ a dm) (mn/+ qab dm) x))
-                           (mn/* (mn/+ a (mn/* 2.0 dm)) (mn/+ qap (mn/* 2.0 dm))))
-                     d2 (mn/+ 1.0 (mn/* ep d1))
-                     d2 (if (< (mn/abs d2) fpmin) fpmin d2)
-                     d2 (mn// 1.0 d2)
-                     c2 (mn/+ 1.0 (mn// ep c1))
-                     c2 (if (< (mn/abs c2) fpmin) fpmin c2)
-                     del (mn/* d2 c2)
-                     h (mn/* h del)]
-                 (if (< (mn/abs (mn/- del 1.0)) eps)
-                   h
-                   (recur (inc m) c2 d2 h))))))))))
+                        ep (mn// (- (* (mn/+ a dm) (mn/+ qab dm) x))
+                                 (mn/* (mn/+ a (mn/* 2.0 dm)) (mn/+ qap (mn/* 2.0 dm))))
+                        d2 (mn/+ 1.0 (mn/* ep d1))
+                        d2 (if (< (mn/abs d2) fpmin) fpmin d2)
+                        d2 (mn// 1.0 d2)
+                        c2 (mn/+ 1.0 (mn// ep c1))
+                        c2 (if (< (mn/abs c2) fpmin) fpmin c2)
+                        del (mn/* d2 c2)
+                        h (mn/* h del)]
+                    (if (< (mn/abs (mn/- del 1.0)) eps)
+                      h
+                      (recur (inc m) c2 d2 h))))))))))
 
 ;; ================================================================
 ;; logpdf for new continuous distributions
@@ -477,8 +477,8 @@
     (let [lx (m/log x)
           z (mn// (mn/- lx (.mu d)) (.sigma d))]
       (mn/- (mn/- (mn/* -0.5 (mn/+ LOG_2PI (mn/* z z)))
-            (m/log (.sigma d)))
-         lx))
+                  (m/log (.sigma d)))
+            lx))
     mn/neg-inf))
 
 (deftm logpdf [d :- StudentT, x :- Double] :- Double
@@ -789,7 +789,7 @@
 
 (deftm logpdf [d :- Laplace, x :- Double] :- Double
   (mn/- (- (m/log (mn/* 2.0 (.b d))))
-     (mn// (mn/abs (mn/- x (.mu d))) (.b d))))
+        (mn// (mn/abs (mn/- x (.mu d))) (.b d))))
 
 (deftm cdf [d :- Laplace, x :- Double] :- Double
   (let [z (mn// (mn/- x (.mu d)) (.b d))]
@@ -889,10 +889,10 @@
     (if (and (>= k (long (mn/max 0.0 (mn/- n (mn/- N K)))))
              (<= k (long (mn/min n K))))
       (+ (mn/- (+ (lgamma (mn/+ K 1.0)) (lgamma (mn/+ (mn/- N K) 1.0))
-               (lgamma (mn/+ n 1.0)) (lgamma (mn/+ (mn/- N n) 1.0)))
-            (+ (lgamma (mn/+ N 1.0))
-               (lgamma (mn/+ fk 1.0)) (lgamma (mn/+ (mn/- K fk) 1.0))
-               (lgamma (mn/+ (mn/- n fk) 1.0)) (lgamma (+ (- N K n) fk 1.0)))))
+                  (lgamma (mn/+ n 1.0)) (lgamma (mn/+ (mn/- N n) 1.0)))
+               (+ (lgamma (mn/+ N 1.0))
+                  (lgamma (mn/+ fk 1.0)) (lgamma (mn/+ (mn/- K fk) 1.0))
+                  (lgamma (mn/+ (mn/- n fk) 1.0)) (lgamma (+ (- N K n) fk 1.0)))))
       mn/neg-inf)))
 
 (deftm pmf [d :- Hypergeometric, k :- Long] :- Double
@@ -904,7 +904,7 @@
 (deftm variance [d :- Hypergeometric] :- Double
   (let [N (double (.N d)) K (double (.K d)) n (double (.nn d))]
     (mn// (* n K (mn/- N K) (mn/- N n))
-       (* N N (mn/- N 1.0)))))
+          (* N N (mn/- N 1.0)))))
 
 ;; ================================================================
 ;; Dirichlet distribution

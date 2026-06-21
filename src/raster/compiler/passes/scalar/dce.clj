@@ -153,8 +153,8 @@
         binding-free (apply clojure.set/union #{}
                             (map #(free-syms (second %)) pairs))
         let-free (clojure.set/difference
-                   (clojure.set/union body-free binding-free)
-                   bound-syms)
+                  (clojure.set/union body-free binding-free)
+                  bound-syms)
         live (atom (clojure.set/union body-free let-free))
         _ (doseq [[sym expr] pairs]
             (when (or (root-pred sym)

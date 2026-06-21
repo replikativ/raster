@@ -373,17 +373,17 @@
                                   'clojure.core/double 'clojure.core/float} (first arr)))
               (second arr) arr))
           (go [e]
-            (cond
-              (some? (aget-form? e idx-sym))
-              (let [[arr base] (aget-form? e idx-sym)
-                    a (unwrap arr)]
-                [[(if (symbol? a) (symbol (name a)) a) base]])
-              (and (seq? e) (contains? #{'let 'let*} (first e)))
-              (let [[_ bindings & body] e]
-                (concat (mapcat (fn [[_ v]] (go v)) (partition 2 bindings))
-                        (mapcat go body)))
-              (seq? e) (mapcat go (rest e))
-              :else nil))]
+              (cond
+                (some? (aget-form? e idx-sym))
+                (let [[arr base] (aget-form? e idx-sym)
+                      a (unwrap arr)]
+                  [[(if (symbol? a) (symbol (name a)) a) base]])
+                (and (seq? e) (contains? #{'let 'let*} (first e)))
+                (let [[_ bindings & body] e]
+                  (concat (mapcat (fn [[_ v]] (go v)) (partition 2 bindings))
+                          (mapcat go body)))
+                (seq? e) (mapcat go (rest e))
+                :else nil))]
     (vec (distinct (go body-expr)))))
 
 (defn- collect-all-aget-arrays

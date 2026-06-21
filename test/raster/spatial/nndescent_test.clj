@@ -28,9 +28,9 @@
           {bi :idx}         (nnd/cosine-knn (aclone X) n dim k :threshold (inc n))
           finite (count (for [i (range (* n k)) :when (< (aget ^doubles ad i) 1.0e300)] i))
           recall (/ (double (reduce + (for [i (range n)]
-                              (count (set/intersection
-                                       (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))
-                                       (set (for [t (range k)] (aget ^ints bi (+ (* i k) t)))))))))
+                                        (count (set/intersection
+                                                (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))
+                                                (set (for [t (range k)] (aget ^ints bi (+ (* i k) t)))))))))
                     (* n k))]
       ;; every slot must be a real neighbor (not the 1e308 sentinel)
       (is (> finite (* 0.99 n k))
@@ -49,9 +49,9 @@
           bi (let [oi (int-array (* n k)) od (double-array (* n k))]
                (raster.knn/knn-brute! (aclone X) n dim k oi od) oi)
           recall (/ (double (reduce + (for [i (range n)]
-                              (count (set/intersection
-                                       (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))
-                                       (set (for [t (range k)] (aget ^ints bi (+ (* i k) t)))))))))
+                                        (count (set/intersection
+                                                (set (for [t (range k)] (aget ^ints ai (+ (* i k) t))))
+                                                (set (for [t (range k)] (aget ^ints bi (+ (* i k) t)))))))))
                     (* n k))]
       ;; euclidean distances must be non-negative and self at 0
       (is (= 0.0 (aget ^doubles ad 0)) "self distance should be 0")
