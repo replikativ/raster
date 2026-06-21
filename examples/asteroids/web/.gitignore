@@ -2,8 +2,10 @@
 /.shadow-cljs/
 /.cpcache/
 /public/js/
-/public/cube-js/
-/public/cubearray-js/
-/public/voxel-js/
-/public/valley-js/
 /public/valley-walk-js/
+# Generated build artifacts — produced from source by ../gen.clj (see .github/workflows/pages.yml
+# and the READMEs). Run gen.clj before `shadow-cljs watch/release` on a fresh checkout.
+/public/kernels.wasm
+/public/valley_kernels.wasm
+/src/asteroids/kernels.cljs
+/src/valley/kernels.cljs
