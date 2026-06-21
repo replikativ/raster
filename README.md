@@ -66,6 +66,33 @@ There's also a [Doom-style renderer](examples/doom/) (WAD loading + BSP traversa
 
 See [examples/README.md](examples/README.md) for running instructions.
 
+## Cross-platform: one codebase, JVM and the browser
+
+The two games above run from one Clojure(Script) source on two very different targets —
+desktop (JVM + Vulkan) and the browser (WebAssembly + WebGPU). What makes that work is
+that the two *performance-critical* layers compile to native code on **each** platform:
+
+- **Numerical kernels (`deftm`/`defvalue`) → JVM bytecode _and_ WebAssembly.** The terrain
+  noise, biome/cave generation, and AABB + batch physics are written once as typed
+  functions over primitive arrays and value types. `compile-aot` turns them into primitive
+  JVM bytecode (no boxing) on the desktop and into an **f64 WebAssembly module** (via
+  `raster.compiler.cljs-emit`) in the browser — so you don't rewrite the hot math in JS,
+  Rust or C for the web. The same `deftm` kernels run native on both. `defvalue` value types
+  (e.g. `Shape`, `Vec3`) stay unboxed and marshal across the wasm boundary as flat structs.
+- **Rendering (`raster.render`) → Vulkan _and_ WebGPU.** Both games draw against one small
+  renderer protocol, and one shader description emits both GLSL (Vulkan) and WGSL (WebGPU).
+  One renderer, two GPU APIs.
+
+The split is deliberate, and worth being clear about: **`deftm`/`defvalue` carry the
+numerics that must be fast everywhere; the orchestration** (streaming, meshing, the game
+loop) **is ordinary portable `.cljc`** — JavaScript in the browser, bytecode on the JVM,
+the same as any Clojure(Script). The wasm target is a numeric subset (flat memory + value
+types + control flow, compiled ahead of time), so what crosses to the browser is the
+kernel set, not the whole program; `deftm`'s runtime multiple dispatch and REPL
+redefinition stay JVM-only (ClojureScript has no `deftm` runtime). For a voxel game that
+boundary lands naturally — terrain and physics are the hot numerics, everything else is
+glue.
+
 ## Why Raster?
 
 Clojure is great for data-driven applications, but numerical computing has
