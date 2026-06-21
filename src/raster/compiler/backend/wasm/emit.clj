@@ -571,8 +571,24 @@
                 :else acc))]
     (reduce (fn [acc [arr _ v]] (go v (conj acc (get-in ctx [:elems arr :vt])))) #{} stores)))
 
+(defn- simd-plan-from-stores
+  "Shared SIMD store matcher (dotimes + loop* analyzers): each candidate form must be an
+   (aset arr i pure) store indexed exactly by isym, and all referenced arrays must share
+   one f64/f32 element type. Returns {:lane-vt :lanes :stores} or nil."
+  [ctx isym forms]
+  (let [stores (mapv (fn [x]
+                       (when (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))
+                                  (simd-index-ok? isym (nth x 2)) (simd-pure? isym (nth x 3)))
+                         [(nth x 1) (nth x 2) (nth x 3)]))
+                     forms)]
+    (when (and (seq forms) (every? some? stores))
+      (let [vts (simd-arr-vts ctx stores)]
+        (when (and (= 1 (count vts)) (#{:f64 :f32} (first vts)))
+          (let [lane-vt (first vts)]
+            {:lane-vt lane-vt :lanes (if (= lane-vt :f64) 2 4) :stores stores}))))))
+
 (defn- simd-vectorizable?
-  "Analyze a dotimes for SIMD. Returns {:lane-vt :lanes :stores :n :body} or nil.
+  "Analyze a dotimes for SIMD. Returns {:lane-vt :lanes :stores :n :body :isym} or nil.
    Every body form must be an (aset arr i pure) store; all arrays one f64/f32 type."
   [ctx node]
   (let [[_ [isym ncnt] & body] node
@@ -580,18 +596,9 @@
                        (cond (and (seq? x) (= 'do (first x))) (mapcat f (rest x))
                              (and (seq? x) (= 'let* (first x)) (empty? (second x))) (mapcat f (drop 2 x))
                              :else [x]))
-                     body)
-        stores (mapv (fn [x]
-                       (when (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))
-                                  (simd-index-ok? isym (nth x 2)) (simd-pure? isym (nth x 3)))
-                         [(nth x 1) (nth x 2) (nth x 3)]))
-                     flat)]
-    (when (and (seq flat) (every? some? stores))
-      (let [vts (simd-arr-vts ctx stores)]
-        (when (and (= 1 (count vts)) (#{:f64 :f32} (first vts)))
-          (let [lane-vt (first vts)]
-            {:lane-vt lane-vt :lanes (case lane-vt :f64 2 :f32 4)
-             :stores stores :n ncnt :body body :isym isym}))))))
+                     body)]
+    (when-let [plan (simd-plan-from-stores ctx isym flat)]
+      (assoc plan :n ncnt :body body :isym isym))))
 
 (declare emit-vexpr)
 
@@ -618,14 +625,14 @@
                 (into (emit-vexpr ctx lane-vt o2))
                 (into (e/v (keyword (str pfx "." suf)))))))))))
 
-(defn- emit-dotimes-simd
-  "Vectorized counted loop: v128 main loop (step = lanes) + scalar remainder.
+(defn- emit-simd-blocks
+  "The two blocks shared by both SIMD emitters: a v128 main loop (step = lanes) over the
+   vectorizable stores, then a scalar remainder loop (step 1) whose per-iteration body is
+   `srem-bytes`. `idx` is the pre-allocated counter local; `ctx'` has isym bound to it.
      i=0; block{ loop{ (i+lanes)>n → br1; <v128 stores>; i+=lanes; br0 }}
-          block{ loop{ i>=n → br1; <scalar stores>; i++; br0 }}"
-  [ctx node {:keys [lane-vt lanes stores n body isym]}]
-  (let [idx  (alloc! ctx :i32)
-        ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})
-        vmain (-> (e/local-get idx) (into (e/i32-const lanes)) (into (e/i :i32.add))
+          block{ loop{ i>=n → br1; <srem-bytes>;          i++;       br0 }}"
+  [ctx' idx lane-vt lanes stores n srem-bytes]
+  (let [vmain (-> (e/local-get idx) (into (e/i32-const lanes)) (into (e/i :i32.add))
                   (into (emit-val ctx' n)) (into (e/i :i32.gt_s)) (into (e/br-if 1))
                   (into (vec (mapcat (fn [[arr idx-node v]]
                                        (-> (addr ctx' arr idx-node)
@@ -635,12 +642,20 @@
                   (into (e/local-get idx)) (into (e/i32-const lanes)) (into (e/i :i32.add))
                   (into (e/local-set idx)) (into (e/br 0)))
         srem (-> (e/local-get idx) (into (emit-val ctx' n)) (into (e/i :i32.ge_s)) (into (e/br-if 1))
-                 (into (vec (mapcat #(emit-effect ctx' %) body)))
+                 (into srem-bytes)
                  (into (e/local-get idx)) (into (e/i32-const 1)) (into (e/i :i32.add))
                  (into (e/local-set idx)) (into (e/br 0)))]
     (-> (e/i32-const 0) (into (e/local-set idx))
         (into (e/block (e/loop* vmain)))
         (into (e/block (e/loop* srem))))))
+
+(defn- emit-dotimes-simd
+  "Vectorized counted dotimes → void (v128 main + scalar remainder over the whole body)."
+  [ctx node {:keys [lane-vt lanes stores n body isym]}]
+  (let [idx  (alloc! ctx :i32)
+        ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})]
+    (emit-simd-blocks ctx' idx lane-vt lanes stores n
+                      (vec (mapcat #(emit-effect ctx' %) body)))))
 
 (defn- counted-inc?
   "node increments i-sym by exactly 1 (inc / unchecked-inc-int / unchecked-inc)."
@@ -664,20 +679,11 @@
         (when (and zero? (symbol? isym)
                    (seq? cnd) (symbol? (first cnd)) (= "<" (name (first cnd))) (= isym (second cnd))
                    (seq? then) (= 'do (first then)))
-          (let [n      (nth cnd 2)
-                stores (mapv (fn [x]
-                               (when (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))
-                                          (simd-index-ok? isym (nth x 2)) (simd-pure? isym (nth x 3)))
-                                 [(nth x 1) (nth x 2) (nth x 3)]))
-                             (butlast (rest then)))
-                tail   (last then)]
-            (when (and (seq stores) (every? some? stores)
-                       (seq? tail) (= 'recur (first tail)) (counted-inc? isym (second tail)))
-              (let [vts (simd-arr-vts ctx stores)]
-                (when (and (= 1 (count vts)) (#{:f64 :f32} (first vts)))
-                  (let [lane-vt (first vts)]
-                    {:lane-vt lane-vt :lanes (if (= lane-vt :f64) 2 4)
-                     :stores stores :n n :isym isym :els els :then-body (vec (rest then))}))))))))))
+          (let [n    (nth cnd 2)
+                tail (last then)]
+            (when (and (seq? tail) (= 'recur (first tail)) (counted-inc? isym (second tail)))
+              (when-let [plan (simd-plan-from-stores ctx isym (butlast (rest then)))]
+                (assoc plan :n n :isym isym :els els :then-body (vec (rest then)))))))))))
 
 (defn- emit-loop-simd
   "Vectorized counted loop → [bytes ret-vt]. v128 main loop (step = lanes) + scalar
@@ -685,24 +691,10 @@
   [ctx node {:keys [lane-vt lanes stores n isym els then-body]}]
   (let [idx  (alloc! ctx :i32)
         ctx' (assoc-in ctx [:env isym] {:idx idx :vt :i32})
-        vmain (-> (e/local-get idx) (into (e/i32-const lanes)) (into (e/i :i32.add))
-                  (into (emit-val ctx' n)) (into (e/i :i32.gt_s)) (into (e/br-if 1))
-                  (into (vec (mapcat (fn [[arr idx-node v]]
-                                       (-> (addr ctx' arr idx-node)
-                                           (into (emit-vexpr ctx' lane-vt v))
-                                           (into (e/v128-store 0 0))))
-                                     stores)))
-                  (into (e/local-get idx)) (into (e/i32-const lanes)) (into (e/i :i32.add))
-                  (into (e/local-set idx)) (into (e/br 0)))
-        srem (-> (e/local-get idx) (into (emit-val ctx' n)) (into (e/i :i32.ge_s)) (into (e/br-if 1))
-                 (into (vec (mapcat #(emit-effect ctx' %) (butlast then-body))))  ; stores (drop recur)
-                 (into (e/local-get idx)) (into (e/i32-const 1)) (into (e/i :i32.add))
-                 (into (e/local-set idx)) (into (e/br 0)))]
-    [(-> (e/i32-const 0) (into (e/local-set idx))
-         (into (e/block (e/loop* vmain)))
-         (into (e/block (e/loop* srem)))
-         (into (emit-val ctx' els)))
-     (infer-vt ctx' els)]))
+        ;; scalar remainder runs the loop body's stores (drop the trailing recur)
+        blocks (emit-simd-blocks ctx' idx lane-vt lanes stores n
+                                 (vec (mapcat #(emit-effect ctx' %) (butlast then-body))))]
+    [(into blocks (emit-val ctx' els)) (infer-vt ctx' els)]))
 
 (defn- emit-dotimes
   "(dotimes [i n] body…) → a void counted loop. Emits:
