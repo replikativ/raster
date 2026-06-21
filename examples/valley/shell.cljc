@@ -21,7 +21,7 @@
 (def ^:const NMOBS 48)
 (def ^:const WATER-CAP 8192)   ; per-column water verts (surface faces only — small)
 
-(defn run!
+(defn start!
   "Run the streaming valley on renderer `rnd`. opts:
      :aspect    (fn [] aspect)   — viewport aspect (constant on JVM, live canvas in browser)
      :on-state  (fn [getters])   — optional; receives {:player :mobs :mob0} thunks (browser debug)"
@@ -80,7 +80,7 @@
                          (let [p (:pos pl)] (swap! mob-st swarm/cull-nearest! (aget p 0) (aget p 2))))
                        (when-let [[ex _ ez] (walk/apply-edits! @stream pl input)]
                          (doseq [kk (chunk/edit-columns ex ez)] (when (@meshes kk) (mesh-one! kk))))
-                       (reset! player (walk/grid-player-update @stream pl input dt))
+                       (reset! player (walk/player-update @stream pl input dt))
                        @player)
              :render (fn [pl frame]
                        (let [asp (aspect)]

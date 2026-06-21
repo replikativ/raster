@@ -10,4 +10,4 @@
 (defn -main [& _]
   (let [w 1024 h 768
         rnd (vkr/make-renderer :width w :height h :title "Valley — Streaming (raster.render)")]
-    (shell/run! rnd {:aspect (constantly (/ (double w) h))})))
+    (shell/start! rnd {:aspect (constantly (/ (double w) h))})))

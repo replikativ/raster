@@ -1,13 +1,11 @@
 (ns valley.walk
-  "Portable single-chunk walker (Phase 2b-A): a 16³ block chunk (valley.chunk) you
-   can walk on, with gravity + AABB collision driven by valley.kernels/integrate-physics!
-   (deftm→bytecode on the JVM, wasm in the browser — same kernel, same trajectory).
-
-   Camera, shader, atlas and draw path are reused from valley.slice; this ns adds
-   the chunk mesh, the player, and the keyboard control loop. The player position and
-   velocity live in double-arrays so the physics kernel mutates them in place — the
-   cljs facade marshals those arrays through wasm memory (see valley/gen.clj)."
-  (:require [valley.slice :as slice]
+  "Player layer for the streaming valley: spawn, raycast mining, fly mode, and the
+   per-frame physics update (gravity + AABB collision with 1-block step-up). The motion
+   itself runs in valley.kernels/integrate-physics! (deftm→bytecode on the JVM, wasm in
+   the browser — same kernel, same trajectory); this ns marshals the player position and
+   velocity (double-arrays, mutated in place) and stitches a player-centred 16³ window out
+   of the streaming world to feed the kernel. Camera helpers live in valley.cam."
+  (:require [valley.cam :as cam]
             [valley.chunk :as chunk]
             [valley.kernels :as k]))
 
@@ -21,80 +19,6 @@
 (def ^:const HEIGHT 1.7)  ; player AABB height
 (def ^:const MOVE 5.0)    ; blocks / second
 (def ^:const TURN 1.7)    ; radians / second
-
-(defn build-world
-  "The single chunk + its derived render mesh + collision tables. Returns everything
-   the shells need to mesh, render and simulate against one 16³ chunk."
-  []
-  (let [blocks (chunk/gen-chunk)
-        solid  (chunk/solid-table)
-        m      (chunk/mesh-chunk blocks)]
-    {:blocks blocks :solid solid
-     :verts (:verts m) :indices (:indices m)}))
-
-(defn player-init
-  "Spawn the player above the centre column so the first frames are a short fall
-   onto the surface — a visible proof the physics kernel runs identically."
-  [blocks]
-  (let [cx 8 cz 8
-        top (loop [y (dec chunk/CS)]
-              (cond (< y 0) 0
-                    (pos? (chunk/block-at blocks cx y cz)) (inc y)
-                    :else (recur (dec y))))]
-    {:pos (chunk/darray [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)])
-     :vel (chunk/darray [0.0 0.0 0.0])
-     :yaw 0.0 :pitch -0.2 :on-ground false}))
-
-(defn player-update
-  "Arrows look, WASD move (horizontal, yaw-relative). Gravity + collision come from
-   the physics kernel; pos/vel are mutated in place."
-  [world player input dt]
-  (let [{:keys [pos vel yaw pitch]} player
-        on?   (fn [a] (if (contains? input a) 1.0 0.0))
-        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))))
-        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down)))) (max -1.5) (min 1.5))
-        ;; XZ basis from yaw (matches slice/forward-vec's XZ components)
-        fx (sin yaw)  fz (- (cos yaw))
-        rx (cos yaw)  rz (sin yaw)
-        fwd (* MOVE dt (- (on? :w) (on? :s)))
-        str (* MOVE dt (- (on? :d) (on? :a)))
-        dx (+ (* fx fwd) (* rx str))
-        dz (+ (* fz fwd) (* rz str))
-        g  (k/integrate-physics! pos vel (:blocks world) (:solid world)
-                                 0 0 0 HALF-W HEIGHT dx dz dt)]
-    (assoc player :yaw yaw :pitch pitch :on-ground (= 1 g))))
-
-;; --- multi-chunk world walker (option C) -------------------------------------
-;; Same kernel, same marshaling; the only difference from single-chunk is that each
-;; frame we stitch a player-centred 16³ window from the world (chunk/stitch-window!)
-;; and call integrate-physics! against it at origin 0, translating the player position
-;; into and out of window-local coords around the call.
-
-(defn build-grid
-  "A cw×ch×cd-chunk world + its full render mesh + a reusable 16³ stitch scratch.
-   Real biome terrain (valley.kernels/surface-height-biome) — walkable because
-   integrate-physics! does 1-block step-up. gen-flat-world remains for a flat test plane."
-  [cw ch cd]
-  (let [world (chunk/gen-world cw ch cd)
-        m     (chunk/mesh-world world)]
-    (assoc world :verts (:verts m) :indices (:indices m)
-           :scratch (chunk/iarray (* chunk/CS chunk/CS chunk/CS)))))
-
-(defn grid-player-init
-  "Spawn above the world centre column for a short visible fall onto the terrain."
-  [world]
-  (let [cx (quot (long (:wx world)) 2)
-        cz (quot (long (:wz world)) 2)
-        top (loop [y (dec (long (:wy world)))]
-              (cond (< y 0) 0
-                    (pos? (chunk/world-block world cx y cz)) (inc y)
-                    :else (recur (dec y))))]
-    {:pos (chunk/darray [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)])
-     :vel (chunk/darray [0.0 0.0 0.0])
-     :spawn [(+ cx 0.5) (+ (double top) 3.0) (+ cz 0.5)]   ; respawn point
-     :yaw 0.0 :pitch -0.2 :on-ground false
-     ;; survival state: health (0..max), hotbar block ids + selected index, Q/E latch
-     :health 20 :max-health 20 :hotbar [1 2 3 8 11 12] :sel 0 :qe false}))
 
 (defn stream-player-init
   "Spawn above the streaming world's centre column (chunk :center) for a short visible fall."
@@ -157,10 +81,10 @@
               (chunk/set-block! world qx qy qz sel) [qx qy qz])))))))
 
 (def ^:const FLY-SPEED 14.0)   ; blocks/sec in fly mode (faster, for exploration)
-(declare grid-player-walk)
+(declare player-walk)
 
-(defn grid-player-update
-  "Player update against the (streaming) world. Walk mode = gravity + AABB collision via a
+(defn player-update
+  "Player update against the streaming world. Walk mode = gravity + AABB collision via a
    player-centred window; fly mode (toggle F) = free 3D flight along the view, no physics."
   [world player input dt]
   (let [{:keys [pos vel yaw pitch]} player
@@ -187,9 +111,9 @@
         (aset pos 2 (+ (aget pos 2) (* gz mv) (* (sin yaw) st)))
         (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
         (assoc player :yaw yaw :pitch pitch :on-ground false :fly true :fl fl? :sel sel :qe qe?))
-      (grid-player-walk world player input dt yaw pitch sel qe? fl?))))
+      (player-walk world player input dt yaw pitch sel qe? fl?))))
 
-(defn- grid-player-walk
+(defn- player-walk
   "Walk-mode body (gravity + collision via the window stitch)."
   [world player input dt yaw pitch sel qe? fl?]
   (let [{:keys [pos vel]} player
@@ -239,11 +163,11 @@
     {:add (vec (remove have want)) :remove (vec (remove want have))}))
 
 (defn player-cam
-  "Render camera built from the player: eye at feet + EYE, reusing slice/fly-mvp."
+  "Render camera built from the player: eye at feet + EYE, reusing cam/fly-mvp."
   [player]
   (let [p (:pos player)]
     {:pos [(aget p 0) (+ (aget p 1) EYE) (aget p 2)]
      :yaw (:yaw player) :pitch (:pitch player)}))
 
 (defn mvp [player aspect]
-  (slice/fly-mvp (player-cam player) aspect))
+  (cam/fly-mvp (player-cam player) aspect))

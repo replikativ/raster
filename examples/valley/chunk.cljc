@@ -34,27 +34,7 @@
 ;; opaque = occludes neighbour faces (air + water are see-through for the mesher)
 (defn opaque? [id] (and (pos? (long id)) (not= (long id) WATER)))
 
-(defn gen-chunk
-  "A self-contained 16³ chunk: per column the surface height is terrain-height
-   remapped into 4..13 (so the terrain fits inside one chunk), filled grass/dirt/
-   stone below. Returns the int block array."
-  []
-  (let [b (iarray (* CS CS CS))]
-    (dotimes [x CS]
-      (dotimes [z CS]
-        (let [h (+ 4 (mod (k/terrain-height x z) 10))]   ; 4..13
-          (dotimes [y CS]
-            (when (< y h)
-              (aset b (idx x y z)
-                    (cond (= y (dec h)) 1 (>= y (- h 3)) 2 :else 3)))))))
-    b))
-
-(defn block-at ^long [blocks ^long x ^long y ^long z]
-  (if (and (>= x 0) (< x CS) (>= y 0) (< y CS) (>= z 0) (< z CS))
-    (long (aget blocks (idx x y z)))
-    0))
-
-;; --- face mesh of the chunk (interior faces culled) --------------------------
+;; --- face mesh: per-face geometry + UVs (interior faces culled in mesh-region) ---
 (def ^:private faces
   [[[0 0 1]  [[0 0 1] [1 0 1] [1 1 1] [0 1 1]]]
    [[0 0 -1] [[1 0 0] [0 0 0] [0 1 0] [1 1 0]]]
@@ -64,12 +44,11 @@
    [[0 -1 0] [[0 0 0] [1 0 0] [1 0 1] [0 0 1]]]])
 (def ^:private face-uv [[0.0 0.0] [1.0 0.0] [1.0 1.0] [0.0 1.0]])
 
-;; --- multi-chunk world (option C): a flat block grid spanning many chunks --------
-;; The physics kernel only ever sees ONE 16³ chunk; for a world larger than that we
-;; stitch a player-centred 16³ window each frame (the tiny player AABB can never
-;; leave a centred window) and call the kernel against it at origin 0. This keeps the
-;; wasm kernel + marshaling identical to the single-chunk path — only the host stitch
-;; and a pos translation differ. World coords index a flat array: wx + wz*WX + wy*WX*WZ.
+;; --- streaming world buffer ------------------------------------------------------
+;; The physics kernel only ever sees ONE 16³ chunk; the player AABB is tiny, so each
+;; frame we stitch a player-centred 16³ window out of the active buffer (stitch-window!)
+;; and call the kernel against it at origin 0 — wasm kernel + marshaling stay identical
+;; to a single chunk. World coords index a flat array: wx + wz*WX + wy*WX*WZ.
 
 (defn world-idx [wx wy wz wx-dim wz-dim]   ; >4 args ⇒ no primitive hints (params or return)
   (+ (long wx) (* (long wz) (long wx-dim)) (* (long wy) (long wx-dim) (long wz-dim))))
@@ -154,29 +133,6 @@
                                     (put (+ wx dx) ly (+ wz dz) LEAVES)))))))))
     b))
 
-(defn- column-skylight
-  "Top-down skylight (0/15) for a CS×COL-H×CS column array (per-column, no cross-column bleed)."
-  [b]
-  (let [light #?(:clj ^ints (iarray (* CS COL-H CS)) :cljs (iarray (* CS COL-H CS)))]
-    (dotimes [lx CS]
-      (dotimes [lz CS]
-        (loop [ly (dec COL-H) lit true]
-          (when (>= ly 0)
-            (let [i (+ lx (* lz CS) (* ly CS CS))
-                  air (zero? (aget #?(:clj ^ints b :cljs b) i))]
-              (if (and lit air)
-                (do (aset light i #?(:clj (int 15) :cljs 15)) (recur (dec ly) true))
-                (recur (dec ly) false)))))))
-    light))
-
-(defn gen-column
-  "Deterministic CS×COL-H×CS column at chunk (cx,cz). {:blocks <int array> :light <int array>}."
-  [cx cz]
-  (let [x0 (* (long cx) CS) z0 (* (long cz) CS)
-        b  (iarray (* CS COL-H CS))]
-    (gen-into! b CS CS x0 z0 x0 z0 (+ x0 CS) (+ z0 CS))
-    {:blocks b :light (column-skylight b)}))
-
 (defn- skylight-into!
   "Top-down skylight (0/15) into the region [rx0,rx1)×[rz0,rz1) of light buffer (dims AW×COL-H×AD,
    origin ox,oz) from block buffer b. Per-column, no cross-column bleed."
@@ -248,75 +204,6 @@
               (skylight-into! nb nl AW AW naox naoz sx0 sz0 sx1 sz1))))
         (assoc s :blocks nb :light nl :aox naox :aoz naoz :center [pcx pcz])))))
 
-(defn gen-world
-  "A flat cw×ch×cd-chunk world generated from valley.kernels/terrain-height over
-   continuous world coords (so terrain flows across chunk seams). Caves carved by
-   has-cave?, lakes filled to sea level, oak-like trees scattered on grassy biomes.
-   Returns {:blocks :wx :wy :wz :solid}."
-  [^long cw ^long ch ^long cd]
-  (let [wx (* cw CS) wy (* ch CS) wz (* cd CS)
-        b  (iarray (* wx wy wz))
-        base 4
-        sea  (+ base 3)                       ; lakes fill low columns up to here
-        raw   (vec (for [x (range wx) z (range wz)] (long (k/surface-height-biome x z))))
-        biome (vec (for [x (range wx) z (range wz)] (long (k/biome-index (* x 8) (* z 8)))))
-        minh  (reduce min raw)
-        hs    (vec (for [ci (range (* wx wz))] (max base (min (dec wy) (+ base (- (nth raw ci) minh))))))
-        inb?  (fn [x y z] (and (>= x 0) (< x wx) (>= y 0) (< y wy) (>= z 0) (< z wz)))
-        put   (fn [x y z id] (when (inb? x y z) (aset b (world-idx x y z wx wz) (int id))))
-        airat? (fn [x y z] (or (not (inb? x y z))
-                               (zero? (aget #?(:clj ^ints b :cljs b) (world-idx x y z wx wz)))))]
-    ;; --- terrain + caves ---
-    (dotimes [x wx]
-      (dotimes [z wz]
-        (let [ci   (+ (* x wz) z)
-              h    (long (nth hs ci))
-              bi   (nth biome ci)
-              surf (nth biome-surface bi)
-              fill (nth biome-fill bi)]
-          (dotimes [y wy]
-            (when (and (< y h)
-                       (not (and (> y 1) (< y (- h 1)) (= 1 (long (k/has-cave? x y z))))))
-              (aset b (world-idx x y z wx wz)
-                    (int (cond (= y (dec h)) surf (>= y (- h 3)) fill :else 3)))))
-          ;; --- lakes: fill air above terrain up to sea level ---
-          (when (< h sea)
-            (loop [y h] (when (< y sea) (put x y z WATER) (recur (inc y))))))))
-    ;; --- trees: oak-like, only on dry grassy columns ---
-    (dotimes [x wx]
-      (dotimes [z wz]
-        (let [ci (+ (* x wz) z) h (long (nth hs ci)) bi (nth biome ci)]
-          (when (and (>= h sea) (= 1 (long (nth biome-surface bi)))   ; grass surface, above water
-                     (zero? (mod (phash x z) 37))
-                     (< (+ h 7) wy))
-            (let [th (+ 4 (mod (phash x z) 3))
-                  top (+ h th)]
-              (dotimes [t th] (put x (+ h t) z LOG))                  ; trunk
-              (doseq [dy [-2 -1]]                                     ; lower canopy 5×5 (skip far corners)
-                (let [ly (+ top dy -1)]
-                  (doseq [dx [-2 -1 0 1 2] dz [-2 -1 0 1 2]]
-                    (when (and (not (and (= (iabs dx) 2) (= (iabs dz) 2))) (airat? (+ x dx) ly (+ z dz)))
-                      (put (+ x dx) ly (+ z dz) LEAVES)))))
-              (doseq [dy [0 1]]                                       ; upper canopy 3×3
-                (let [ly (+ top dy -1)]
-                  (doseq [dx [-1 0 1] dz [-1 0 1]]
-                    (when (airat? (+ x dx) ly (+ z dz)) (put (+ x dx) ly (+ z dz) LEAVES))))))))))
-    {:blocks b :wx wx :wy wy :wz wz :solid (solid-table)}))
-
-(defn gen-flat-world
-  "A flat cw×ch×cd-chunk world: solid up to `surface` (grass top, dirt, stone),
-   walkable across all chunk seams without step-up. The walker milestone uses this;
-   gen-world (real terrain) becomes walkable once the physics gains 1-block step-up."
-  [cw ch cd surface]
-  (let [wx (* cw CS) wy (* ch CS) wz (* cd CS)
-        b  (iarray (* wx wy wz)) s (long surface)]
-    (dotimes [x wx]
-      (dotimes [z wz]
-        (dotimes [y (min s wy)]
-          (aset b (world-idx x y z wx wz)
-                (cond (= y (dec s)) 1 (>= y (- s 3)) 2 :else 3)))))
-    {:blocks b :wx wx :wy wy :wz wz :solid (solid-table)}))
-
 ;; world-block/set-block! take WORLD coords; on a stream world they subtract the active-buffer
 ;; origin (:aox/:aoz, default 0 for the fixed demo world) → buffer-local index.
 (defn world-block ^long [world ^long wx ^long wy ^long wz]
@@ -368,24 +255,6 @@
                 (aset scr (idx i j k) #?(:clj (int v) :cljs v)))))))))
   scratch)
 
-(defn mesh-chunk
-  "{:verts [floats] :indices [ints]} face mesh of the chunk."
-  [blocks]
-  (let [vb (volatile! (transient [])) ib (volatile! (transient [])) vc (volatile! 0)]
-    (doseq [x (range CS) y (range CS) z (range CS)]
-      (let [id (block-at blocks x y z)]
-        (when (pos? id)
-          (let [layer (double (dec id))]
-            (doseq [[[nx ny nz] corners] faces]
-              (when (zero? (block-at blocks (+ x nx) (+ y ny) (+ z nz)))
-                (let [base @vc]
-                  (dotimes [ci 4]
-                    (let [[ox oy oz] (nth corners ci) [u v] (nth face-uv ci)]
-                      (vswap! vb (fn [t] (reduce conj! t [(double (+ x ox)) (double (+ y oy)) (double (+ z oz)) u v layer])))))
-                  (vswap! ib (fn [t] (reduce conj! t [base (+ base 1) (+ base 2) base (+ base 2) (+ base 3)])))
-                  (vswap! vc + 4))))))))
-    {:verts (persistent! @vb) :indices (persistent! @ib)}))
-
 ;; --- lighting (port of valley.lighting skylight + valley.mesher AO) ------------------
 (defn- pow* [a b] (#?(:clj Math/pow :cljs js/Math.pow) (double a) (double b)))
 
@@ -396,36 +265,6 @@
     (if (and (>= x 0) (< x WX) (>= y 0) (< y WY) (>= z 0) (< z WZ))
       (long (aget #?(:clj ^ints skylight :cljs skylight) (world-idx x y z WX WZ)))
       0)))
-
-(defn compute-skylight
-  "Per-cell skylight 0..15: 15 in sky-open air, decaying under solids and bleeding
-   sideways (8 relaxation passes ≈ flood-fill for unit decay). Solids stay 0; a face reads
-   the light of the adjacent air cell. One-time at gen (cheap region recompute on edits)."
-  [world]
-  (let [WX (long (:wx world)) WY (long (:wy world)) WZ (long (:wz world))
-        b     #?(:clj ^ints (:blocks world)     :cljs (:blocks world))
-        light #?(:clj ^ints (iarray (* WX WY WZ)) :cljs (iarray (* WX WY WZ)))]
-    ;; top-down: full sun until the first solid in each column
-    (dotimes [x WX]
-      (dotimes [z WZ]
-        (loop [y (dec WY) lit true]
-          (when (>= y 0)
-            (let [i (world-idx x y z WX WZ) air (zero? (aget b i))]
-              (if (and lit air)
-                (do (aset light i #?(:clj (int 15) :cljs 15)) (recur (dec y) true))
-                (recur (dec y) false)))))))
-    ;; horizontal/under-overhang bleed
-    (dotimes [_ 8]
-      (dotimes [y WY] (dotimes [z WZ] (dotimes [x WX]
-                                        (let [i (world-idx x y z WX WZ)]
-                                          (when (zero? (aget b i))
-                                            (let [l (long (aget light i))
-                                                  n (max (light-at light (inc x) y z WX WY WZ) (light-at light (dec x) y z WX WY WZ)
-                                                         (light-at light x (inc y) z WX WY WZ) (light-at light x (dec y) z WX WY WZ)
-                                                         (light-at light x y (inc z) WX WY WZ) (light-at light x y (dec z) WX WY WZ))
-                                                  m (max l (dec (long n)))]
-                                              (when (> m l) (aset light i #?(:clj (int m) :cljs m))))))))))
-    light))
 
 ;; ambient-occlusion: 4 corner levels (0 darkest … 3 none) → brightness multiplier
 (def ^:private ao-mult [0.45 0.68 0.85 1.0])
@@ -494,11 +333,6 @@
      {:opaque {:verts (persistent! @vb)  :indices (persistent! @ib)}
       :water  {:verts (persistent! @wvb) :indices (persistent! @wib)}})))
 
-(defn mesh-world
-  "Whole-world opaque mesh (region covering all columns). 1-arg computes skylight; 2-arg reuses."
-  ([world] (mesh-world world (compute-skylight world)))
-  ([world skylight] (:opaque (mesh-region world skylight 0 0 (long (:wx world)) (long (:wz world))))))
-
 (defn tris
   "Expand an indexed mesh ({:verts :indices}, fpv floats/vertex) into a flat triangle-list
    vertex seq for the editable dynamic world mesh (re-uploaded on block edits — avoids
@@ -517,17 +351,6 @@
   "Chunk coord [cx cz] containing world column (x,z)."
   [x z] [(long (#?(:clj Math/floor :cljs js/Math.floor) (/ (double x) CS)))
          (long (#?(:clj Math/floor :cljs js/Math.floor) (/ (double z) CS)))])
-
-(defn chunk-coords
-  "All [cx cz] column-chunk coords spanning the world."
-  [world]
-  (for [cx (range (quot (long (:wx world)) CS)) cz (range (quot (long (:wz world)) CS))] [cx cz]))
-
-(defn mesh-column
-  "Flat triangle-list (9 floats/vert) for the column chunk at (cx,cz) (opaque only)."
-  [world skylight cx cz]
-  (let [x0 (* (long cx) CS) z0 (* (long cz) CS)]
-    (tris (:opaque (mesh-region world skylight x0 z0 (+ x0 CS) (+ z0 CS))) 9)))
 
 ;; per-column GPU buffer capacity (verts). Avg surface column ≈ 8k; 32k is a safe ceiling.
 (def ^:const MAX-COLUMN-VERTS 32768)

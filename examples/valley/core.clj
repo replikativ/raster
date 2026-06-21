@@ -5,8 +5,9 @@
   compile-aot can inline into single JVM methods. All functions
   take primitive types (Double, Long, arrays) — no Clojure maps.
 
-  The game layer (mobs.clj, hostile.clj, game.clj) extracts typed data
-  from Clojure maps, calls these kernels, and reassembles state.
+  The cross-platform game layer (valley.chunk/walk/swarm/shell) calls these
+  kernels directly on primitive arrays — same code on JVM (bytecode) and
+  browser (wasm, via valley.kernels + the generated shim).
 
   Domains:
     - Block queries (solid?, transparent? on raw arrays)

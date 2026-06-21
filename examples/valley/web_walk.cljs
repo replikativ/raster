@@ -14,7 +14,7 @@
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
                (let [canvas (:canvas rnd)]
-                 (shell/run! rnd
+                 (shell/start! rnd
                              {:aspect   (fn [] (/ (.-width canvas) (.-height canvas)))
                               :on-state (fn [g]
                                           (set! (.-__valley js/window)
