@@ -10,7 +10,7 @@
             [valley.kernels :as k]))
 
 (defn ^:export init []
-  (-> (k/init! "/valley_kernels.wasm")
+  (-> (k/init! "valley_kernels.wasm")     ; relative → works at site root (dev) and /raster/valley/ (Pages)
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
                (let [canvas (:canvas rnd)]

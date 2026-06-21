@@ -18,7 +18,7 @@
                (when over "    —  GAME OVER (space)")))))
 
 (defn ^:export init []
-  (-> (k/init! "/kernels.wasm")
+  (-> (k/init! "kernels.wasm")     ; relative → works at site root (dev) and /raster/asteroids/ (Pages)
       (.then (fn [_] (gpu/make-renderer (.getElementById js/document "game"))))
       (.then (fn [rnd]
                (let [pipeline (r/make-pipeline rnd scene/pipeline-spec)

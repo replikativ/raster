@@ -9,26 +9,11 @@
  :builds
  {:casteroids {:target     :browser
                :output-dir "public/js"
-               :asset-path "/js"
+               :asset-path "js"
                :modules    {:main {:init-fn asteroids.web-gpu/init}}}
-  ;; R4 validation: textured/depth cube (cube.scene .cljc, WebGPU backend)
-  :ccube {:target     :browser
-          :output-dir "public/cube-js"
-          :asset-path "/cube-js"
-          :modules    {:main {:init-fn cube.web-gpu/init}}}
-  ;; R5a validation: texture-array (block-atlas) cube
-  :ccubearray {:target     :browser
-               :output-dir "public/cubearray-js"
-               :asset-path "/cubearray-js"
-               :modules    {:main {:init-fn cube.web-array/init}}}
-  ;; R5b voxel slice: deftm terrain (wasm) + mesher + array-textured render
-  :cvoxel {:target     :browser
-           :output-dir "public/voxel-js"
-           :asset-path "/voxel-js"
-           :modules    {:main {:init-fn voxel.web/init}}}
   ;; valley: infinite cross-platform streaming voxel world (deftm kernels → wasm) +
   ;; WebGPU renderer; the SAME valley.shell (.cljc) runs on the JVM (vk_walk)
   :cvalley-walk {:target     :browser
                  :output-dir "public/valley-walk-js"
-                 :asset-path "/valley-walk-js"
+                 :asset-path "valley-walk-js"
                  :modules    {:main {:init-fn valley.web-walk/init}}}}}
