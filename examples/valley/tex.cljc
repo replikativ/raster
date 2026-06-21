@@ -106,6 +106,7 @@
     (<= (- (* a a a) (* fx fx fy fy fy)) 0.0)))
 (defn- heart-full-px  [x y] (if (heartf x y) [205 35 45 255] [0 0 0 0]))
 (defn- heart-empty-px [x y] (if (heartf x y) [60 60 66 220] [0 0 0 0]))
+(defn- heart-half-px  [x y] (if (heartf x y) (if (< x 8) [205 35 45 255] [60 60 66 220]) [0 0 0 0]))
 (defn- slot-px [x y] (if (or (<= x 0) (>= x 15) (<= y 0) (>= y 15)) [205 205 215 205] [38 38 46 150]))
 (defn- selector-px [x y] (if (or (<= x 1) (>= x 14) (<= y 1) (>= y 14)) [255 255 255 255] [0 0 0 0]))
 (defn- crosshair-px [x y]
@@ -123,13 +124,15 @@
    30 log-side-px 31 log-top-px 32 leaves-px
    33 heart-full-px 34 heart-empty-px 35 slot-px 36 crosshair-px 37 selector-px
    38 birch-side-px 39 birch-top-px 40 birch-leaf-px
-   41 spruce-side-px 42 spruce-top-px 43 spruce-leaf-px})
+   41 spruce-side-px 42 spruce-top-px 43 spruce-leaf-px
+   44 heart-half-px})
 
 ;; HUD layer ids (for valley.hud)
 (def ^:const HEART-FULL 33) (def ^:const HEART-EMPTY 34)
 (def ^:const SLOT 35) (def ^:const CROSSHAIR 36) (def ^:const SELECTOR 37)
+(def ^:const HEART-HALF 44)
 
-(def ^:const N-LAYERS 44)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 oak, 33..37 HUD, 38..43 birch/spruce
+(def ^:const N-LAYERS 45)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 oak, 33..37 HUD, 38..43 birch/spruce, 44 half-heart
 
 (defn atlas-pixels
   "Flat layer-major RGBA8 vector for all terrain texture layers (16×16 each)."

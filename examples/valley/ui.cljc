@@ -30,9 +30,10 @@
     (let [n (quot (long max-health) 2) s 0.026 sx (* 0.058 ax) y 0.80
           x0 (* (- (/ (dec n) 2.0)) sx)]
       (dotimes [i n]
-        (let [full (>= (long health) (* 2 (inc i)))
+        (let [lvl (- (long health) (* 2 i))            ; HP into heart i: >=2 full, 1 half, else empty
+              icon (cond (>= lvl 2) tex/HEART-FULL (= lvl 1) tex/HEART-HALF :else tex/HEART-EMPTY)
               cx (+ x0 (* i sx))]
-          (quad! out cx y (* s ax) s (if full tex/HEART-FULL tex/HEART-EMPTY)))))
+          (quad! out cx y (* s ax) s icon))))
     ;; hotbar (below hearts)
     (let [n (count hotbar) s 0.05 sx (* 0.112 ax) y 0.90
           x0 (* (- (/ (dec (max 1 n)) 2.0)) sx)]
