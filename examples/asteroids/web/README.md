@@ -28,14 +28,16 @@ the right physics per platform — the `.clj` `deftm` on the JVM, the generated 
 ## Play in the browser
 
 ```bash
+cd ../../.. && clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/asteroids/web/gen.clj  # once: generate the wasm kernels
+clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/valley/gen.clj                        # (and the valley demo's)
 cd examples/asteroids/web
 npm install                      # once — fetches shadow-cljs
 npx shadow-cljs watch casteroids # then open http://localhost:8080
 ```
 
-`↑` thrust · `← →` rotate · `space` fire. The prebuilt `public/kernels.wasm` and the
-generated `src/asteroids/kernels.cljs` are committed, so this works without a JVM
-build step.
+`↑` thrust · `← →` rotate · `space` fire. The wasm kernels + generated `kernels.cljs`
+are build artifacts (gitignored) — run `gen.clj` once on a fresh checkout (above) before
+`shadow-cljs`. The Pages deploy (`.github/workflows/pages.yml`) does this from source.
 
 For an optimized bundle: `npx shadow-cljs release casteroids`, then serve `public/`.
 

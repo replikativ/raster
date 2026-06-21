@@ -6,7 +6,7 @@
 ;;
 ;;   clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/asteroids/web/gen.clj
 ;;
-;; Outputs (committed so the playground builds without a JVM):
+;; Outputs (gitignored build artifacts — regenerated here / by the Pages CI from source):
 ;;   examples/asteroids/web/public/kernels.wasm
 ;;   examples/asteroids/web/src/asteroids/kernels.cljs
 (require '[raster.compiler.cljs-emit :as cljs-emit]
