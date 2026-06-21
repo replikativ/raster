@@ -30,7 +30,11 @@
 
 (defn- tag->vt
   "Scalar raster/annotation tag → wasm valtype. Arrays are i32 pointers; long/int
-   indices are i32 in v1 (32-bit linear memory)."
+   scalars are i32 in v1 — 32-bit linear memory, so indices/counters are exact, but a
+   genuine 64-bit `long` value would TRUNCATE. Kernels here use long only as an
+   index/counter (the dominant case); true i64 math needs a dedicated path (see the
+   'longs reject-guard in compile-fn). Out-of-range array indices are unchecked (C-like,
+   by design): an OOB index traps or hits adjacent memory."
   [tag]
   (cond
     (#{'double 'Double} tag) :f64
@@ -43,7 +47,7 @@
 ;; raster.compiler.backend.intrinsics — emit dispatches through ix/wasm-op.
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur?)
+(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur? emit-bindings)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -81,6 +85,29 @@
     (list 'let* [g test]
           (reduce (fn [els [k e]] (list 'if (list 'clojure.core/== g k) e els))
                   default (reverse clauses)))))
+
+(defn- const-if-taken
+  "For an `if` whose condition is a compile-time constant, which branch is statically
+   taken: :then (true / a keyword — e.g. a `cond`'s :else), :else (nil / false), or nil
+   (a real runtime condition). wasm has no keyword/nil truthiness, so these must fold."
+  [c]
+  (cond (or (true? c) (keyword? c)) :then
+        (or (nil? c) (false? c))    :else
+        :else nil))
+
+(defn- emit-bindings
+  "Lower a let* binding vector → [ctx' init-bytes]: each `[sym init]` either binds a
+   void effect form (no value — recorded as {:void true}, init emitted as an effect) or
+   allocates a typed local and emits `(local-set …)`. Shared by every position handler
+   (value / effect / then / result) so the binding lowering lives in one place."
+  [ctx binds]
+  (reduce (fn [[c acc] [s init]]
+            (if (void-effect-form? init)
+              [(assoc-in c [:env s] {:void true}) (into acc (emit-effect c init))]
+              (let [vt (infer-vt c init) idx (alloc! c vt)]
+                [(assoc-in c [:env s] {:idx idx :vt vt})
+                 (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
+          [ctx []] (partition 2 binds)))
 
 (defn- emit-val
   "Emit a value-producing expression → byte vector."
@@ -135,12 +162,12 @@
         ;; has no notion of a keyword/nil "condition".
         (= h 'if)
         (let [[c t e] A]
-          (cond
-            (or (true? c) (keyword? c)) (emit-val ctx t)
-            (or (nil? c) (false? c))    (emit-val ctx e)
-            :else (let [tv (infer-vt ctx t)
-                        vt (if (= tv :i32) (infer-vt ctx e) tv)]
-                    (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))))
+          (case (const-if-taken c)
+            :then (emit-val ctx t)
+            :else (emit-val ctx e)
+            (let [tv (infer-vt ctx t)
+                  vt (if (= tv :i32) (infer-vt ctx e) tv)]
+              (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))))
         ;; case* (macroexpanded) → lower to a let*+if-chain, emitted via normal path
         (= h 'case*)
         (emit-val ctx (synth-case* A))
@@ -185,14 +212,7 @@
         ;; let* / do in VALUE position (introduced by inlined deftm calls)
         (#{'let* 'let} h)
         (let [[binds & body] A
-              [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                          (if (void-effect-form? init)
-                                            [(assoc-in c [:env s] {:void true})
-                                             (into acc (emit-effect c init))]
-                                            (let [vt (infer-vt c init) idx (alloc! c vt)]
-                                              [(assoc-in c [:env s] {:idx idx :vt vt})
-                                               (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
-                                        [ctx []] (partition 2 binds))
+              [ctx' init-bytes] (emit-bindings ctx binds)
               tail (if (= 1 (count body)) (first body) (cons 'do body))]
           (into init-bytes (emit-val ctx' tail)))
         (= h 'do)
@@ -303,11 +323,11 @@
                               (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
           (= 'if h) (let [c (nth node 1)]               ; fold constant-truthy conditions
-                      (cond
-                        (or (true? c) (keyword? c)) (infer-vt ctx (nth node 2))
-                        (or (nil? c) (false? c))    (infer-vt ctx (nth node 3))
-                        :else (let [tv (infer-vt ctx (nth node 2))]
-                                (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))))
+                      (case (const-if-taken c)
+                        :then (infer-vt ctx (nth node 2))
+                        :else (infer-vt ctx (nth node 3))
+                        (let [tv (infer-vt ctx (nth node 2))]
+                          (if (= tv :i32) (infer-vt ctx (nth node 3)) tv))))
           (= 'case* h) (infer-vt ctx (second (first (vals (nth node 5))))) ; first clause's result
           (and (symbol? h) (#{"zero?" "pos?" "neg?"} (name h))) :i32   ; predicate → bool
           (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
@@ -338,20 +358,13 @@
       ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
       (#{'let* 'let} h)
       (let [[binds & body] A
-            [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                        (if (void-effect-form? init)
-                                          [(assoc-in c [:env s] {:void true}) (into acc (emit-effect c init))]
-                                          (let [vt (infer-vt c init) idx (alloc! c vt)]
-                                            [(assoc-in c [:env s] {:idx idx :vt vt})
-                                             (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
-                                      [ctx []] (partition 2 binds))]
+            [ctx' init-bytes] (emit-bindings ctx binds)]
         (into init-bytes (vec (mapcat #(emit-effect ctx' %) body))))
       (= h 'if)                                     ; (if c then [else]) in void position
       (let [[c t e] A]
-        (cond
-          (or (true? c) (keyword? c)) (emit-effect ctx t)
-          (or (nil? c) (false? c))    (if (some? e) (emit-effect ctx e) [])
-          :else
+        (case (const-if-taken c)
+          :then (emit-effect ctx t)
+          :else (if (some? e) (emit-effect ctx e) [])
           (-> (emit-val ctx c)
               (into [(e/op :if) e/empty-block])
               (into (emit-effect ctx t))
@@ -402,14 +415,7 @@
     ;; let*/let before the recur — bind locals, then recurse into the tail
     (and (seq? node) (#{'let* 'let} (first node)))
     (let [[binds & body] (rest node)
-          [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                      (if (void-effect-form? init)
-                                        [(assoc-in c [:env s] {:void true})
-                                         (into acc (emit-effect c init))]
-                                        (let [vt (infer-vt c init) idx (alloc! c vt)]
-                                          [(assoc-in c [:env s] {:idx idx :vt vt})
-                                           (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
-                                    [ctx []] (partition 2 binds))
+          [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))]
       (into init-bytes (emit-then ctx' tail loop-idxs loop-depth block-depth)))
     ;; if splitting into recur side + loop-result side. Each side either continues
@@ -723,15 +729,7 @@
 
     (and (seq? node) (#{'let* 'let} (first node)))
     (let [[_ binds & body] node
-          [ctx' init-bytes] (reduce (fn [[c acc] [s init]]
-                                      (if (void-effect-form? init)
-                                        [(assoc-in c [:env s] {:void true})
-                                         (into acc (emit-effect c init))]
-                                        (let [vt (infer-vt c init)
-                                              idx (alloc! c vt)]
-                                          [(assoc-in c [:env s] {:idx idx :vt vt})
-                                           (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
-                                    [ctx []] (partition 2 binds))
+          [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))
           [b ret] (emit-result ctx' tail)]
       [(into init-bytes b) ret])
@@ -758,6 +756,15 @@
    {:name :param-types :result-types :locals :body}. Result type is inferred
    from the IR (loop else-value / scalar body); nil = void (array-mutating)."
   [{:keys [name params ir simd? fn-index]}]
+  ;; G2 guard: 'longs (i64) array params are declared in array-tag->elem but not
+  ;; coherently supported — an aget loads i64 while scalar arithmetic runs at i32
+  ;; (tag->vt long→i32), and the encoder has no i64 div/rem. Reject loudly rather
+  ;; than emit a stack-type mismatch / wrong code. Use 'ints for index/count data.
+  (when-let [bad (some (fn [{:keys [sym tag]}] (when (= 'longs tag) sym)) params)]
+    (throw (ex-info (str "wasm backend (" name "): 'longs (i64) array param '" bad
+                         "' not supported — i64 arrays mix with i32 scalar arithmetic. "
+                         "Use 'ints, or extend the backend with a full i64 path first.")
+                    {:fn name :param bad})))
   (let [param-vts (mapv #(tag->vt (:tag %)) params)
         env0 (into {} (map-indexed (fn [idx {:keys [sym tag]}] [sym {:idx idx :vt (tag->vt tag)}]) params))
         elems (into {} (keep (fn [{:keys [sym tag]}] (when (array-tag? tag) [sym (array-tag->elem tag)])) params))
