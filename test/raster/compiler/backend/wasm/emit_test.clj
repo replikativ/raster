@@ -625,3 +625,32 @@
       (.apply (.export inst "cn") (long-array [0 n]))
       (doseq [i (range n)]
         (is (= (max 0.0 (nth xs i)) (.readDouble mem (* 8 i))) (str "clamp i=" i))))))
+
+;; ── Phase D additions ─────────────────────────────────────────────────────
+
+;; G2: 'longs (i64) array params are rejected loudly rather than silently miscompiled
+;; (an i64 load would mix with i32 scalar arithmetic). Use 'ints for index/count data.
+(deftm longs-sum-k [a :- (Array long), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i)) (clojure.core/+ acc (raster.arrays/aget a i)))
+      acc)))
+
+(deftest longs-array-param-rejected
+  (testing "G2: a (Array long) param is rejected with a clear message, not miscompiled"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"(?i)longs"
+                          (pl/compile-wasm #'longs-sum-k :name "ls")))))
+
+;; Math intrinsic execution (f64.sqrt) — terrain / noise / physics rely on sqrt.
+(deftm hypot-k [x :- Double, y :- Double] :- Double
+  (raster.math/sqrt (raster.numeric/+ (raster.numeric/* x x) (raster.numeric/* y y))))
+
+(deftest math-sqrt-kernel
+  (testing "Math intrinsic sqrt emits valid wasm and executes (f64.sqrt)"
+    (let [m    (pl/compile-wasm #'hypot-k :name "hyp")
+          inst (instantiate (:bytes m))
+          r    (.apply (.export inst "hyp")
+                       (long-array [(Double/doubleToRawLongBits 3.0)
+                                    (Double/doubleToRawLongBits 4.0)]))]
+      (is (= [:f64] (:result-types m)))
+      (is (< (Math/abs (- (Double/longBitsToDouble (aget r 0)) 5.0)) 1e-12)))))
