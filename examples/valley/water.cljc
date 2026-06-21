@@ -37,7 +37,11 @@
                  (let up float (clamp (+ (* (swizzle N y) 0.5) 0.5) 0.0 1.0))
                  (let refl vec3 (mix (swizzle botCol xyz) (swizzle topCol xyz) up))
                  (let body vec3 (vec3 0.04 0.12 0.19))
-                 (color (vec4 (mix body refl fres) (mix 0.78 0.95 fres)))]})
+                 ;; distance fog → blend toward the horizon colour (matches terrain; 50..76 blocks)
+                 (let dist float (length (- (swizzle cam xyz) vWorld)))
+                 (let fogf float (clamp (smoothstep 50.0 76.0 dist) 0.0 1.0))
+                 (color (vec4 (mix (mix body refl fres) (swizzle botCol xyz) fogf)
+                              (mix (mix 0.78 0.95 fres) 1.0 fogf)))]})
 
 (def pipeline-spec
   ;; depth test on (terrain in front occludes water) + write on; blended. Drawn after opaque,

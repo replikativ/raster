@@ -89,8 +89,10 @@
                          (r/bind-mesh! frame sky-mesh)
                          (r/draw-indexed! frame (:index-count sky-mesh) 0)
                          (r/bind-pipeline! frame pipeline)
-                         (r/set-uniform! frame pipeline
-                                         (into (walk/mvp pl asp) [(sky/day-light @gt) 0.18 0.0 0.0]))
+                         (let [[_ [br bg bb]] (sky/sky-colors @gt)]   ; horizon colour = fog colour
+                           (r/set-uniform! frame pipeline
+                                           (into (walk/mvp pl asp)
+                                                 [(sky/day-light @gt) 0.18 0.0 0.0  br bg bb 1.0])))
                          (r/bind-texture! frame pipeline tex)
                          (doseq [[_ m] @meshes]
                            (r/bind-mesh! frame m)

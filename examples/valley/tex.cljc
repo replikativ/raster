@@ -180,20 +180,25 @@
 ;; Textured terrain shader: array-sample at the face's layer modulated by the per-face
 ;; directional shade, baked skylight (vLight) and ambient occlusion (vAo). The day/night
 ;; level arrives in env.x (day ratio 0.05..1) with env.y ambient floor, so the same baked
-;; light dims smoothly into night. One source → GLSL + WGSL.
+;; light dims smoothly into night. Distance fog (vDepth = clip-space w ≈ view distance) blends
+;; far terrain into fog.xyz (the sky horizon colour), hiding the streaming-ring edge. Fog
+;; distances (50..76 blocks) are literal — tied to the fixed render radius. One source → GLSL + WGSL.
 (def shader
-  '{:uniform        {:name "U" :fields [[:mvp :mat4] [:env :vec4]]}   ; env = [dayRatio ambient _ _]
+  '{:uniform        {:name "U" :fields [[:mvp :mat4] [:env :vec4] [:fog :vec4]]}  ; env=[day amb _ _] fog=[r g b _]
     :attributes     [[inPos vec3 0] [inUv vec2 1] [inLayer float 2] [inShade float 3]
                      [inLight float 4] [inAo float 5]]
-    :varyings       [[vUv vec2 0] [vLayer float 1] [vShade float 2] [vLight float 3] [vAo float 4]]
+    :varyings       [[vUv vec2 0] [vLayer float 1] [vShade float 2] [vLight float 3] [vAo float 4] [vDepth float 5]]
     :texture-arrays [[atlas 0]]
-    :vertex         [(set-position (* mvp (vec4 inPos 1.0)))
+    :vertex         [(let cp vec4 (* mvp (vec4 inPos 1.0)))
+                     (set-position cp)
                      (out vUv inUv) (out vLayer inLayer) (out vShade inShade)
-                     (out vLight inLight) (out vAo inAo)]
+                     (out vLight inLight) (out vAo inAo) (out vDepth (swizzle cp w))]
     :fragment       [(let texel vec4 (sample-layer atlas vUv vLayer))
                      (let lvl float (clamp (+ (swizzle env y) (* (swizzle env x) vLight)) 0.0 1.0))
                      (let lit float (* lvl vShade vAo))
-                     (color (vec4 (* (swizzle texel xyz) lit) (swizzle texel w)))]})
+                     (let fogf float (clamp (smoothstep 50.0 76.0 vDepth) 0.0 1.0))
+                     (let rgb vec3 (mix (* (swizzle texel xyz) lit) (swizzle fog xyz) fogf))
+                     (color (vec4 rgb (swizzle texel w)))]})
 
 (def pipeline-spec
   {:shader shader :topology :triangles :depth? true :cull :none :blend? true

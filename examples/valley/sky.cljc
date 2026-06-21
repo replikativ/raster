@@ -118,8 +118,14 @@
                  (let star float (* (smoothstep 0.993 1.0 hsh)
                                     (clamp (- 1.0 (* (swizzle sun w) 1.3)) 0.0 1.0)
                                     (max 0.0 (swizzle d y))))
-                 (color (vec4 (+ (+ base (* (vec3 1.0 0.93 0.78) (+ disc glow)))
-                                 (vec3 star star star)) 1.0))]})
+                 ;; moon: a pale disc + soft glow at the anti-solar point, faded in by night
+                 (let md float (- 0.0 sd))
+                 (let moondisc float (smoothstep 0.9975 0.9991 md))
+                 (let moonglow float (* (pow (max md 0.0) 80.0) 0.12))
+                 (let nightf float (clamp (- 1.0 (swizzle sun w)) 0.0 1.0))
+                 (let moon3 vec3 (* (vec3 0.85 0.88 0.97) (* (+ moondisc moonglow) nightf)))
+                 (color (vec4 (+ (+ (+ base (* (vec3 1.0 0.93 0.78) (+ disc glow)))
+                                    (vec3 star star star)) moon3) 1.0))]})
 
 (def pipeline-spec
   {:shader shader :topology :triangles :depth? false :cull :none
