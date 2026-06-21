@@ -1,5 +1,7 @@
 # Valley — cross-platform voxel world
 
+![Valley](screenshot.png)
+
 A streaming voxel world that runs from **one `.cljc` codebase** on two backends:
 
 - **JVM** → Raster `deftm` kernels compiled to bytecode + a **Vulkan** renderer

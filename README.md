@@ -51,7 +51,9 @@ Then open one of the [interactive notebooks](notebooks/raster/) in your editor
 
 Playable demos of typed dispatch, parallel primitives, and procedural generation:
 
-![Asteroids](examples/asteroids/screenshot.png)
+| | |
+|---|---|
+| ![Asteroids](examples/asteroids/screenshot.png) | ![Valley](examples/valley/screenshot.png) |
 
 - **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm`
   dispatch; add new shape types from the REPL during gameplay. Cross-platform from one
