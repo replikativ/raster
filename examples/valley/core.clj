@@ -161,13 +161,15 @@
         my-x (if step-x? (+ new-my 1.0) new-my)
         try-mz (+ mz dz)
         coll-z (aabb-collides? blocks solid-arr new-mx my-x try-mz hw h cx cy cz)
-        step-z? (and on-ground? (pos? coll-z)
+        ;; only step up on Z if X did NOT already step this frame (my-x raised means X stepped).
+        ;; This caps total step-up to one block/frame AND keeps the final position collision-
+        ;; checked (clamping Y to +1 instead would place the entity in an unverified cell —
+        ;; that embeds it near floating blocks/overhangs → the jumping loop). No `not`/`false`
+        ;; (the wasm kernel emitter lacks them) — a numeric `<` on the already-resolved Y.
+        step-z? (and on-ground? (< my-x (+ new-my 0.5)) (pos? coll-z)
                      (< (aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h cx cy cz) 1))
         new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
-        my-step (if step-z? (+ my-x 1.0) my-x)
-        ;; cap total step-up to ONE block/frame: per-axis steps could otherwise stack to +2
-        ;; on a diagonal move into a corner (the "jumping at obstacles" bug).
-        my-final (if (> my-step (+ new-my 1.0)) (+ new-my 1.0) my-step)]
+        my-final (if step-z? (+ my-x 1.0) my-x)]
     ;; Write back
     (aset pos 0 new-mx)
     (aset pos 1 my-final)
@@ -246,12 +248,12 @@
             my-x (if step-x? (+ new-my 1.0) new-my)
             try-mz (+ mz dz)
             coll-z (world-aabb-collides? blocks solid-arr new-mx my-x try-mz hw h wxd wyd wzd)
-            step-z? (and on-ground? (pos? coll-z)
+            ;; Z step only if X didn't step (see integrate-physics!) — caps to 1 block/frame and
+            ;; keeps the final position collision-checked (avoids the embed/jumping loop).
+            step-z? (and on-ground? (< my-x (+ new-my 0.5)) (pos? coll-z)
                          (< (world-aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h wxd wyd wzd) 1))
             new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
-            my-step (if step-z? (+ my-x 1.0) my-x)
-            ;; cap total step-up to ONE block/frame (see integrate-physics!) — avoids diagonal +2
-            my-final (if (> my-step (+ new-my 1.0)) (+ new-my 1.0) my-step)]
+            my-final (if step-z? (+ my-x 1.0) my-x)]
         (aset positions b new-mx)
         (aset positions (+ b 1) my-final)
         (aset positions (+ b 2) new-mz)
