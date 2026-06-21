@@ -1,10 +1,10 @@
 (ns valley.chunk
-  "Portable single-chunk model for the valley walk slice (Phase 2b): a 16³ block
-   array generated from valley.kernels/terrain-height, a face mesh of it, and the
-   block-property table the physics kernels read. Cross-platform array helpers keep
-   the JVM (Java primitive arrays) and browser (typed arrays in wasm memory) on the
-   same code. The player physics (integrate-physics!) runs against this chunk via
-   the valley.kernels facade."
+  "Portable streaming voxel world: deterministic terrain/cave/water/tree/ore generation
+   (a pure function of world coords, via the valley.kernels noise facade), a moving
+   active-buffer ring (recenter = copy overlap + gen new edge strips), per-column face
+   meshing with skylight+AO in absolute world coords, and the block-property tables the
+   physics kernels read. Cross-platform array helpers keep the JVM (Java primitive arrays)
+   and the browser (typed arrays in wasm memory) on the same code."
   (:require [valley.kernels :as k]
             [valley.tex :as tex]))
 
@@ -22,11 +22,16 @@
 
 ;; block ids (cf valley.tex/block-faces): 0 air, 1 grass, 2 dirt, 3 stone, 4 sand,
 ;; 5 snowy-grass, 6 snow, 7 podzol, 8 sandstone, 9 mountain-stone,
-;; 10 water (transparent, non-solid), 11 log, 12 leaves.
+;; 10 water (transparent, non-solid), 11 log, 12 leaves,
+;; 13 coal-ore, 14 iron-ore, 15 gold-ore, 16 diamond-ore.
 (def ^:const WATER 10)
 (def ^:const LOG 11)
 (def ^:const LEAVES 12)
-(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12])   ; everything except air + water
+(def ^:const COAL 13)
+(def ^:const IRON 14)
+(def ^:const GOLD 15)
+(def ^:const DIAMOND 16)
+(def ^:private solid-ids [1 2 3 4 5 6 7 8 9 11 12 13 14 15 16])   ; everything except air + water
 (defn solid-table []
   (let [s (barray 62)]
     (doseq [i solid-ids] (aset s (int i) #?(:clj (byte 1) :cljs 1)))
@@ -65,6 +70,30 @@
 ;; deterministic placement hash (platform-stable: stays within JS safe-integer range)
 (defn- phash [x z]
   (mod (+ (* (+ (long x) 7) 374761393) (* (+ (long z) 13) 668265263)) 2147483647))
+
+(defn- phash3 [x y z]
+  (mod (+ (* (+ (long x) 7) 374761393) (* (+ (long y) 11) 1597334677)
+          (* (+ (long z) 13) 668265263)) 2147483647))
+
+;; Ores replace deep stone in small blobby veins. A coarse 2³ cell (>>1) decides the vein's
+;; presence + type (rarity ↑ with value); a per-cell hash thins it to ~5-block clumps; depth
+;; below the surface gates each type (diamond deepest). Deterministic → identical on reload.
+(defn- ore-at
+  "Ore block id (0 = plain stone) for deep-stone cell (wx,wy,wz) under surface height h."
+  ^long [wx wy wz h]
+  (let [d (- (long h) (long wy))]                       ; depth below surface
+    (if (< d 4)
+      0
+      (let [vein (mod (phash3 (bit-shift-right (long wx) 1)
+                              (bit-shift-right (long wy) 1)
+                              (bit-shift-right (long wz) 1)) 1000)
+            cell (phash3 wx wy wz)
+            ore  (cond (and (< vein 4)  (>= d 14)) DIAMOND
+                       (and (< vein 12) (>= d 11)) GOLD
+                       (and (< vein 45) (>= d 7))  IRON
+                       (< vein 120)                COAL
+                       :else 0)]
+        (if (and (pos? ore) (not= 0 (mod cell 3))) ore 0)))))   ; thin vein to ~2/3 of the blob
 
 ;; ============================================================================
 ;; Streaming world gen (Minetest-style: terrain is a PURE function of world (x,y,z) — no
@@ -111,7 +140,9 @@
         (dotimes [wy COL-H]
           (when (and (< wy h)
                      (not (and (> wy 1) (< wy (dec h)) (= 1 (long (k/has-cave? wx wy wz))))))
-            (put wx wy wz (cond (= wy (dec h)) surf (>= wy (- h 3)) fill :else 3))))
+            (put wx wy wz (cond (= wy (dec h)) surf
+                                (>= wy (- h 3)) fill
+                                :else (let [o (ore-at wx wy wz h)] (if (pos? o) o 3))))))
         (when (< h SEA-LEVEL)
           (loop [wy h] (when (< wy SEA-LEVEL) (put wx wy wz WATER) (recur (inc wy)))))))
     ;; trees: scan roots in the margin ring, x then z (matches global order), place spillover

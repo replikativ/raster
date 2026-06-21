@@ -42,6 +42,17 @@
 (defn- snowy-grass-top-px [x y] (let [v (hash-byte x y 20)] [(+ 235 (m v 15)) (+ 240 (m v 12)) 255 255]))
 (defn- snowy-grass-side-px [x y]
   (if (< y 3) (let [v (hash-byte x y 20)] [(+ 235 (m v 15)) (+ 240 (m v 12)) 255 255]) (dirt-px x y)))
+
+;; ore = stone base with clumped coloured speckles (2×2 blob test → speckles, not single px)
+(defn- ore-px [x y seed cr cg cb]
+  (if (< (m (hash-byte (quot x 2) (quot y 2) seed) 100) 28)
+    (let [w (hash-byte x y (inc seed)) j (- (m w 40) 20)]
+      [(max 0 (min 255 (+ cr j))) (max 0 (min 255 (+ cg j))) (max 0 (min 255 (+ cb j))) 255])
+    (stone-px x y)))
+(defn- coal-px    [x y] (ore-px x y 41 38 38 44))
+(defn- iron-px    [x y] (ore-px x y 43 205 160 120))
+(defn- gold-px    [x y] (ore-px x y 45 230 200 70))
+(defn- diamond-px [x y] (ore-px x y 47 120 222 224))
 (defn- gravel-px [x y] (let [v (hash-byte x y 11)] [(+ 90 (m v 30)) (+ 85 (m v 25)) (+ 80 (m v 20)) 255]))
 ;; trees: oak-like log (bark sides + ring top) and mottled leaves
 (defn- log-side-px [x y]
@@ -91,6 +102,7 @@
 ;; layer index -> pixel fn (matches the JVM atlas ordering for the terrain subset)
 (def ^:private layer-fns
   {0 stone-px 1 dirt-px 2 grass-top-px 3 grass-side-px 4 water-px 5 sand-px
+   6 coal-px 7 iron-px 8 gold-px 9 diamond-px
    12 gravel-px 13 snow-px 14 ice-px 15 clay-px 16 sandstone-side-px 17 sandstone-top-px
    19 podzol-top-px 20 snowy-grass-top-px 21 snowy-grass-side-px
    22 cow-body-px 23 cow-head-px 24 animal-leg-px 25 pig-body-px 26 pig-head-px
@@ -102,7 +114,7 @@
 (def ^:const HEART-FULL 33) (def ^:const HEART-EMPTY 34)
 (def ^:const SLOT 35) (def ^:const CROSSHAIR 36) (def ^:const SELECTOR 37)
 
-(def ^:const N-LAYERS 38)   ; 0..21 terrain, 22..29 mobs, 30..32 trees, 33..37 HUD
+(def ^:const N-LAYERS 38)   ; 0..21 terrain (6..9 ores), 22..29 mobs, 30..32 trees, 33..37 HUD
 
 (defn atlas-pixels
   "Flat layer-major RGBA8 vector for all terrain texture layers (16×16 each)."
@@ -127,7 +139,11 @@
    9 [0 0 0 0 0 0]        ; mountain stone
    10 [4 4 4 4 4 4]       ; water (transparent layer 4)
    11 [31 31 30 30 30 30] ; log: ring top/bottom, bark sides
-   12 [32 32 32 32 32 32]}) ; leaves
+   12 [32 32 32 32 32 32]  ; leaves
+   13 [6 6 6 6 6 6]        ; coal ore
+   14 [7 7 7 7 7 7]        ; iron ore
+   15 [8 8 8 8 8 8]        ; gold ore
+   16 [9 9 9 9 9 9]})      ; diamond ore
 
 (defn face-layer
   "Texture layer for block `id` on face `f` (0 top 1 bottom 2 north 3 south 4 east 5 west)."
