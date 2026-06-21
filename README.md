@@ -24,7 +24,12 @@ with full REPL interactivity, automatic differentiation, and GPU compilation.
 
 ## Try It
 
-The fastest way to see Raster in action:
+🎮 **Play the live demos — no install** (WebGPU, Chrome/Edge):
+**[Geometric Asteroids](https://replikativ.github.io/raster/asteroids/)** ·
+**[Valley](https://replikativ.github.io/raster/valley/)** — both run from one
+`.cljc` codebase with the numerical kernels compiled to WebAssembly.
+
+To explore the library itself:
 
 ```bash
 # Clone and start a REPL
@@ -53,7 +58,10 @@ Playable demos of typed dispatch, parallel primitives, and procedural generation
 
 | | |
 |---|---|
-| ![Asteroids](examples/asteroids/screenshot.png) | ![Valley](examples/valley/screenshot.png) |
+| [![Asteroids](examples/asteroids/screenshot.png)](https://replikativ.github.io/raster/asteroids/) | [![Valley](examples/valley/screenshot.png)](https://replikativ.github.io/raster/valley/) |
+
+▶ Play in the browser: **[Asteroids](https://replikativ.github.io/raster/asteroids/)** ·
+**[Valley](https://replikativ.github.io/raster/valley/)** (WebGPU — Chrome/Edge).
 
 - **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm`
   dispatch; add new shape types from the REPL during gameplay. Cross-platform from one
