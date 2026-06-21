@@ -10,12 +10,15 @@ work (terrain gen, physics, meshing math) is written once with `deftm` and compi
 to native code on each platform; the game logic, mesher and renderer are shared
 cross-platform Clojure(Script).
 
-Features: biome-aware procedural terrain, caves, lakes (animated Fresnel water),
-oak-like trees, top-down skylight + ambient occlusion, day/night sky with sun and
-rotating stars, infinite chunk streaming (render ring around the player), passive
-mobs (cow/pig/chicken/sheep), block mining/placing, a health/hotbar HUD, and a fly
-mode. (The legacy JVM-only survival game — inventory, crafting, farming, hostile
-mobs, hunger — lived here previously and remains in git history.)
+Features: biome-aware procedural terrain (11 biomes, per-biome height), caves, ore
+veins (coal/iron/gold/diamond), lakes (animated Fresnel water), trees by biome
+(oak / birch / spruce), skylight + ambient occlusion + a glowstone block-light
+channel (BFS flood, relit on edits), day/night sky with sun, moon and rotating
+stars, distance fog, infinite chunk streaming (render ring around the player),
+passive mobs (cow/pig/chicken/sheep), block mining/placing, a health/hotbar HUD
+(half-hearts), and a fly mode. (The legacy JVM-only survival game — inventory,
+crafting, farming, hostile mobs, hunger — lived here previously and remains in git
+history.)
 
 ## Running
 
