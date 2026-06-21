@@ -18,15 +18,32 @@
 (def ^:private call-head util/call-head)
 (def ^:private call-args util/call-args)
 
+(defn- value-ctor-call?
+  "True if body is a bare (->Type ...) constructor for a registered value type.
+   These tail-constructor bodies are inlinable: inline-one-pass substitutes the
+   args into the constructor and binds the result, which the soa-lower SROA pass
+   then scalar-replaces field-by-field. Without this, a value-type helper deftm
+   (e.g. (deftm cadd [a :- Cpx b :- Cpx] :- Cpx (->Cpx ...))) stays an opaque
+   .invk that soa-lower cannot explode."
+  [body]
+  (and (seq? body) (symbol? (first body))
+       (let [h (name (first body))]
+         (and (.startsWith h "->")
+              (contains? @types/soa-registry (symbol (subs h 2)))))))
+
 (defn- inlinable-body?
   "Check if a walked body form is suitable for inlining.
-   Only forms with decomposable structure (let*, loop, dotimes, do,
-   .invk, par) are inlinable. Bare function calls are not — they
-   need let* wrapping for the inliner to decompose."
+   Forms with decomposable structure (let*, loop, dotimes, do, .invk, par) are
+   inlinable, as are bare value-type constructor tails (see value-ctor-call?)
+   and branch forms (if / case*) whose whole body is a single value expression
+   the inliner substitutes into the call site (e.g. predicate/lookup helpers like
+   chunk-block, block-solid?). Other bare function calls are not — they need
+   let* wrapping for the inliner to decompose."
   [body]
   (and (seq? body)
-       (contains? #{:binding :scope :do :invk :par}
-                  (:kind (form/form-info body)))))
+       (or (contains? #{:binding :scope :do :invk :par :branch}
+                      (:kind (form/form-info body)))
+           (value-ctor-call? body))))
 
 (def ^:private prim-or-array-tags
   "Tags that are safe for inlining even when body has scoped forms.
@@ -34,6 +51,72 @@
    (.v, .partials) in the body that the bytecoder can't resolve after
    argument substitution."
   #{'double 'long 'float 'int 'doubles 'floats 'longs 'ints 'objects})
+
+(def ^:private arg-subst-skip-tags
+  "Param tags whose arguments are substituted DIRECTLY at an inline site, with no
+   typed-binding lift. Covers primitives and ALL primitive-array element types.
+   The lift exists only to carry type info for reference types (Dual/Complex/
+   records) through substitution; aliasing a primitive array additionally breaks
+   backends that key array metadata on the param symbol (the wasm emitter's
+   :elems). Single source of truth for both inline-deftm-calls and inline-invk."
+  #{'double 'long 'float 'int 'byte 'short 'char 'boolean
+    'doubles 'floats 'longs 'ints 'objects 'bytes 'shorts 'chars 'booleans})
+
+(def ^:dynamic *inlining*
+  "Set of recursion-keys for deftm callees currently being inlined (the inline
+   stack). A callee already on the stack is recursive — inlining it would not
+   terminate — so it is kept as a call instead. Handles self- and mutual
+   recursion. Backends that can't call (none currently) would need to reject."
+  #{})
+
+(def ^:dynamic *inline-size-limit*
+  "When set (a node-count budget), a resolved callee whose body exceeds it is kept
+   as a CALL instead of inlined — unless it is on a fusable path (contains a loop
+   or par form), which must inline so SOAC/SIMD fusion can see it. nil (the JVM /
+   GPU default) means inline regardless of size — those backends rely on full
+   inlining for fusion + their own splitter (split.clj). Bound from the wasm path
+   to a generous, V8-calibrated budget so deftm->function happens only for large
+   straight-line callees (current kernels are far below it)."
+  nil)
+
+(defn- body-node-count
+  "Structural size of a form: total seq/coll nodes + leaves. Cheap proxy for
+   emitted size, backend-independent (vs split.clj's JVM-byte estimator)."
+  [form]
+  (cond
+    (seq? form)    (reduce + 1 (map body-node-count form))
+    (vector? form) (reduce + 1 (map body-node-count form))
+    (map? form)    (reduce + 1 (map body-node-count (mapcat identity form)))
+    :else 1))
+
+(defn- fusable-body?
+  "True if the body contains a loop/dotimes or a raster.par form — the constructs
+   the SOAC/SIMD fusion + wasm vectorizer operate on. Such callees must be inlined
+   (not outlined) so fusion can see their bodies; only large STRAIGHT-LINE callees
+   are eligible to become calls."
+  [form]
+  (let [found (volatile! false)]
+    ((fn scan [x]
+       (when-not @found
+         (when (seq? x)
+           (let [h (first x)]
+             (when (and (symbol? h)
+                        (or (#{'loop 'loop* 'dotimes} h)
+                            (.startsWith (str h) "raster.par/")))
+               (vreset! found true)))
+           (doseq [c x] (scan c)))))
+     form)
+    @found))
+
+(defn recursion-key
+  "Stable identity of a callee for recursion detection — the base dispatch symbol,
+   independent of arity mangling and the -impl suffix. e.g.
+   ns/fact_m_long-impl → ns/fact."
+  [impl-sym]
+  (let [n (name impl-sym)
+        n (if (.endsWith ^String n "-impl") (subs n 0 (- (count n) 5)) n)
+        n (if-let [i (str/index-of n "_m_")] (subs n 0 i) n)]
+    (symbol (namespace impl-sym) n)))
 
 (def ^:private trivial-cast?
   "Cast/coercion calls that are cheap to duplicate — single arg, no allocation."
@@ -65,12 +148,19 @@
   (for value+grad/grad results stored in vars).
   :tags is the vector of deftm parameter type tags (e.g. ['doubles 'double ...])."
   [v]
-  (let [metadata (meta v)
+  (let [;; Materialize the walked body FIRST: ensure-walked-body! lazily walks the
+        ;; deftm and stamps deftm-params/deftm-tags/return-tag/typed-body onto the
+        ;; var. Reading (meta v) before this returns stale meta with no params, so
+        ;; a cold (never-JIT'd) callee like valley.core/chunk-block would fail the
+        ;; guard below even though its body is perfectly inlinable.
+        _ (when (instance? clojure.lang.Var v)
+            (try (rcore/ensure-walked-body! v) (catch Exception _ nil)))
+        metadata (meta v)
         ;; Also check the fn object's metadata (for value+grad results)
         val-metadata (when (instance? clojure.lang.Var v)
                        (try (meta @v) (catch Exception _ nil)))
         walked-body (or (:raster.core/deftm-walked-body-typed metadata)
-                        (rcore/ensure-walked-body! v)
+                        (:raster.core/deftm-walked-body metadata)
                         (:raster.core/deftm-walked-body-typed val-metadata)
                         (:raster.core/deftm-walked-body val-metadata))
         params (or (:raster.core/deftm-params metadata)
@@ -146,10 +236,10 @@
                                   (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
                                       (when (inf/try-parametric-specialize!
-                                              (symbol (namespace base-sym) (name base-sym)) arg-tags)
-                                          (let [new-methods (mapcat identity
-                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
-                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
+                                             (symbol (namespace base-sym) (name base-sym)) arg-tags)
+                                        (let [new-methods (mapcat identity
+                                                                  (vals @(:raster.core/dispatch-table (meta v))))]
+                                          (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
                                 ;; Single method fallback: safe when no other overloads exist
                                 ;; AND function is not parametric. Parametric functions
                                 ;; may need a different specialization that hasn't been
@@ -705,10 +795,10 @@
                                       method (or (when (seq arg-tags)
                                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                                        (when (inf/try-parametric-specialize!
-                                                               (symbol (namespace var-sym) (name var-sym)) arg-tags)
-                                                           (let [new-methods (mapcat val @dt)]
-                                                             (first (filter #(= (vec arg-tags) (vec (:tags %)))
-                                                                            new-methods))))))
+                                                              (symbol (namespace var-sym) (name var-sym)) arg-tags)
+                                                         (let [new-methods (mapcat val @dt)]
+                                                           (first (filter #(= (vec arg-tags) (vec (:tags %)))
+                                                                          new-methods))))))
                                            ;; Non-parametric single method: safe (no other overloads possible)
                                                  (when (and (= 1 (count all-methods)) (not has-parametric?))
                                                    (first all-methods)))
@@ -1037,8 +1127,7 @@
                  ;; 2. Non-trivial call expressions: prevents duplication when the param
                  ;;    appears multiple times in the callee body (e.g. inside par/pmap
                  ;;    where CSE can't extract the duplicate afterward)
-                                 skip-tags #{'double 'long 'float 'int
-                                             'doubles 'floats 'longs 'ints 'objects}
+                                 skip-tags arg-subst-skip-tags
                                  param-subst
                                  (into {}
                                        (map-indexed
@@ -1221,14 +1310,23 @@
    (cond
      (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
      (let [impl-sym (second form)
+           rkey (recursion-key impl-sym)
            has-rule? (and preserve-templates? (first (rt/resolve-template impl-sym)))
-           deftm-info (when-not has-rule? (try-resolve-deftm impl-sym))]
+           ;; recursive callee (already being inlined) → keep as a call, don't recurse
+           deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
+                        (try-resolve-deftm impl-sym))]
        (if deftm-info
          (let [{:keys [params walked-body]} deftm-info
                body-form (first walked-body)
-               safe? (safe-to-inline? deftm-info)]
-           (if (not safe?)
-             ;; Complex body -- keep as .invk, recurse into arguments only
+               safe? (safe-to-inline? deftm-info)
+               ;; size policy: large straight-line callees become calls (wasm path);
+               ;; fusable bodies (loop/par) always inline so fusion sees them.
+               within-budget? (or (nil? *inline-size-limit*)
+                                  (<= (body-node-count body-form) *inline-size-limit*)
+                                  (fusable-body? body-form))]
+           (if (or (not safe?) (not within-budget?))
+             ;; Complex body OR over the size budget -- keep as .invk (a call),
+             ;; recurse into arguments only.
              (let [args (drop 2 form)
                    new-args (map #(inline-invk % policy) args)]
                (util/make-invk impl-sym new-args (meta form)))
@@ -1236,8 +1334,7 @@
              (let [args (vec (drop 2 form))
                    {:keys [tags]} deftm-info
                    callee-params (mapv #(with-meta (if (symbol? %) % (symbol (name %))) nil) params)
-                   skip-tags #{'double 'long 'float 'int
-                               'doubles 'floats 'longs 'ints 'objects}
+                   skip-tags arg-subst-skip-tags
                    ;; ANF lifting + typed bindings — same logic as inline-one-pass
                    lifted-bindings (atom [])
                    param-subst
@@ -1265,7 +1362,10 @@
                                 [p a]))))
                          callee-params)
                    inlined (subst-syms param-subst body-form)
-                   result (inline-invk inlined policy)]
+                   ;; mark this callee as on the inline stack while re-processing its
+                   ;; body, so a recursive self-call inside stays a call (terminates)
+                   result (binding [*inlining* (conj *inlining* rkey)]
+                            (inline-invk inlined policy))]
                ;; Wrap in let* with lifted bindings if any were emitted
                (if (seq @lifted-bindings)
                  (list 'let* (vec @lifted-bindings) result)
@@ -1411,11 +1511,11 @@
                                              entries))
                               ;; No exact match — try parametric specialization for (All [T]) functions
                               (when (inf/try-parametric-specialize!
-                                      (symbol (namespace (first expr)) (name (first expr))) arg-tags)
-                                  (let [new-entries (get @dt-atom (count args))]
-                                    (first (filter (fn [e]
-                                                     (= (vec arg-tags) (vec (:tags e))))
-                                                   new-entries))))))]
+                                     (symbol (namespace (first expr)) (name (first expr))) arg-tags)
+                                (let [new-entries (get @dt-atom (count args))]
+                                  (first (filter (fn [e]
+                                                   (= (vec arg-tags) (vec (:tags e))))
+                                                 new-entries))))))]
               (when match
                 (let [mn (str (types/mangle (symbol (name (first expr))) (:tags match)))
                       ms (symbol (str (:mangled-ns match)) mn)
@@ -1436,8 +1536,13 @@
                                          (try (not (fn? @(resolve ms-impl)))
                                               (catch Exception _ false)))]
                       (if (and impl-v typed-iface (or primitive-ret? bc-compiled?))
-                        ;; Full devirtualization: .invk impl-sym with typed interface tag
-                        (util/make-invk (vary-meta ms-impl assoc :tag typed-iface) args (meta expr))
+                        ;; Full devirtualization: .invk impl-sym with typed interface tag.
+                        ;; Carry the semantic return type as :raster.type/tag on the node
+                        ;; (the walker does the same) so backends that read it — e.g. the
+                        ;; wasm emitter's element-type selection — don't default to i32.
+                        (util/make-invk (vary-meta ms-impl assoc :tag typed-iface) args
+                                        (cond-> (or (meta expr) {})
+                                          ret-tag (assoc :raster.type/tag ret-tag)))
                         ;; Mangled call — still resolved, just not .invk
                         (let [r (cons ms args)]
                           (if-let [m (meta expr)] (with-meta r m) r))))))))))))))

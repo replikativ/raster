@@ -1735,7 +1735,7 @@
   events: seq of ODEEvent records.
   Returns solution map with :event-log [{:t :event-idx :action} ...]."
   [alg prob dt events]
-  (let [{:keys [f u0 tspan]} prob
+  (let [f (:f prob) u0 (:u0 prob) tspan (:tspan prob)  ; value type — keyword access, not map destructuring
         [t0 tf] tspan
         t0 (double t0) tf (double tf) dt (double dt)
         n (alength u0)

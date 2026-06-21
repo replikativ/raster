@@ -216,19 +216,19 @@
       (let [field-sym (symbol (str "." name))
             ;; Get the array from the SoA object via reflection
             arr (clojure.lang.Reflector/invokeInstanceMethod soa-obj name (object-array 0))]
-        (with-mapped-buffer [bb allocator buffer]
+        (with-mapped-buffer [^java.nio.ByteBuffer bb allocator buffer]
           (case dtype
             :float  (let [^floats fa arr
-                          fb (.asFloatBuffer bb)]
+                          ^java.nio.FloatBuffer fb (.asFloatBuffer bb)]
                       (.put fb fa 0 (min n (alength fa))))
             :double (let [^doubles da arr
-                          db (.asDoubleBuffer bb)]
+                          ^java.nio.DoubleBuffer db (.asDoubleBuffer bb)]
                       (.put db da 0 (min n (alength da))))
             :int    (let [^ints ia arr
-                          ib (.asIntBuffer bb)]
+                          ^java.nio.IntBuffer ib (.asIntBuffer bb)]
                       (.put ib ia 0 (min n (alength ia))))
             :long   (let [^longs la arr
-                          lb (.asLongBuffer bb)]
+                          ^java.nio.LongBuffer lb (.asLongBuffer bb)]
                       (.put lb la 0 (min n (alength la))))))))))
 
 (defn copy-from-gpu!
@@ -239,17 +239,17 @@
   (let [n (long (:n gpu-soa))]
     (doseq [{:keys [name dtype buffer]} (:field-segs gpu-soa)]
       (let [arr (clojure.lang.Reflector/invokeInstanceMethod soa-obj name (object-array 0))]
-        (with-mapped-buffer [bb allocator buffer]
+        (with-mapped-buffer [^java.nio.ByteBuffer bb allocator buffer]
           (case dtype
             :float  (let [^floats fa arr
-                          fb (.asFloatBuffer bb)]
+                          ^java.nio.FloatBuffer fb (.asFloatBuffer bb)]
                       (.get fb fa 0 (min n (alength fa))))
             :double (let [^doubles da arr
-                          db (.asDoubleBuffer bb)]
+                          ^java.nio.DoubleBuffer db (.asDoubleBuffer bb)]
                       (.get db da 0 (min n (alength da))))
             :int    (let [^ints ia arr
-                          ib (.asIntBuffer bb)]
+                          ^java.nio.IntBuffer ib (.asIntBuffer bb)]
                       (.get ib ia 0 (min n (alength ia))))
             :long   (let [^longs la arr
-                          lb (.asLongBuffer bb)]
+                          ^java.nio.LongBuffer lb (.asLongBuffer bb)]
                       (.get lb la 0 (min n (alength la))))))))))

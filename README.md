@@ -44,20 +44,56 @@ Then open one of the [interactive notebooks](notebooks/raster/) in your editor
 | [Linear Algebra](notebooks/raster/linear_algebra.clj) | Vec/Mat types, LU, Cholesky, SVD |
 | [Optimization](notebooks/raster/optimization.clj) | L-BFGS, Nelder-Mead, Newton's method |
 | [Deep Learning](notebooks/raster/deep_learning.clj) | MLP training with compiled AD |
+| [Agent-Based Modeling](notebooks/raster/abm_firms.clj) | Endogenous firm formation, GPU-compiled |
+| [Geometric Algebra + ODE](notebooks/raster/ga_ode_rotors.clj) | Rotors, precession |
 
 ### Game Examples
 
-Three games built on the Raster Vulkan engine — playable demos of typed dispatch,
-parallel primitives, and procedural generation:
+Playable demos of typed dispatch, parallel primitives, and procedural generation:
 
 | | |
 |---|---|
 | ![Asteroids](examples/asteroids/screenshot.png) | ![Valley](examples/valley/screenshot.png) |
-| **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm` dispatch. Add new shape types from the REPL during gameplay. | **[Valley](examples/valley/)** — voxel survival with procedural terrain, crafting, and mobs. Uses `raster.noise` for terrain generation. |
 
-There's also a [Doom-style renderer](examples/doom/) with WAD loading and BSP traversal.
+- **[Geometric Asteroids](examples/asteroids/)** — polygon shapes via `defvalue` + `deftm`
+  dispatch; add new shape types from the REPL during gameplay. Cross-platform from one
+  `.cljc` codebase: runs on the JVM (Vulkan) and in the browser (WebGPU, physics compiled
+  to WebAssembly).
+- **[Valley](examples/valley/)** — a streaming voxel world (biome terrain, caves, ore veins,
+  trees, day/night sky, skylight + glowstone block-light, water, passive mobs, mining).
+  Also cross-platform: the same kernels compile to JVM bytecode + Vulkan and to WebAssembly
+  + WebGPU.
+
+There's also a [Doom-style renderer](examples/doom/) (WAD loading + BSP traversal, WIP).
 
 See [examples/README.md](examples/README.md) for running instructions.
+
+## Cross-platform: one codebase, JVM and the browser
+
+The two games above run from one Clojure(Script) source on two very different targets —
+desktop (JVM + Vulkan) and the browser (WebAssembly + WebGPU). What makes that work is
+that the two *performance-critical* layers compile to native code on **each** platform:
+
+- **Numerical kernels (`deftm`/`defvalue`) → JVM bytecode _and_ WebAssembly.** The terrain
+  noise, biome/cave generation, and AABB + batch physics are written once as typed
+  functions over primitive arrays and value types. `compile-aot` turns them into primitive
+  JVM bytecode (no boxing) on the desktop and into an **f64 WebAssembly module** (via
+  `raster.compiler.cljs-emit`) in the browser — so you don't rewrite the hot math in JS,
+  Rust or C for the web. The same `deftm` kernels run native on both. `defvalue` value types
+  (e.g. `Shape`, `Vec3`) stay unboxed and marshal across the wasm boundary as flat structs.
+- **Rendering (`raster.render`) → Vulkan _and_ WebGPU.** Both games draw against one small
+  renderer protocol, and one shader description emits both GLSL (Vulkan) and WGSL (WebGPU).
+  One renderer, two GPU APIs.
+
+The split is deliberate, and worth being clear about: **`deftm`/`defvalue` carry the
+numerics that must be fast everywhere; the orchestration** (streaming, meshing, the game
+loop) **is ordinary portable `.cljc`** — JavaScript in the browser, bytecode on the JVM,
+the same as any Clojure(Script). The wasm target is a numeric subset (flat memory + value
+types + control flow, compiled ahead of time), so what crosses to the browser is the
+kernel set, not the whole program; `deftm`'s runtime multiple dispatch and REPL
+redefinition stay JVM-only (ClojureScript has no `deftm` runtime). For a voxel game that
+boundary lands naturally — terrain and physics are the hot numerics, everything else is
+glue.
 
 ## Why Raster?
 
@@ -341,8 +377,9 @@ clojure -M:test
 # REPL
 clojure -M:nREPL
 
-# With Valhalla JDK 27
-source valhalla-env.sh
+# With Valhalla JDK 27 (point JAVA_HOME at your local Valhalla build)
+export JAVA_HOME=/path/to/valhalla-jdk/build/linux-x86_64-server-release/images/jdk
+export PATH="$JAVA_HOME/bin:$PATH"
 clojure -J--enable-preview \
         -J--add-exports=java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
         -J--enable-native-access=ALL-UNNAMED \

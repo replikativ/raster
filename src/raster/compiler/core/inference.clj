@@ -837,6 +837,51 @@
         ;; Unknown
         :else nil))))
 
+(declare infer-rewritten-tag)
+
+(defn- prim-class->tag
+  "Map a (boxed or primitive) numeric Class to a raster type tag, else nil."
+  [c]
+  (condp = c
+    Double/TYPE 'double Float/TYPE 'float Long/TYPE 'long Integer/TYPE 'int
+    java.lang.Double 'double java.lang.Float 'float java.lang.Long 'long java.lang.Integer 'int
+    nil))
+
+(defn static-method-return-tag
+  "Return tag of a Java static-method call (Class/method args…) via reflection,
+   resolving overloads by the args' inferred tags. nil if the class/method can't be
+   resolved or the overload stays ambiguous. This lets the inference type interop
+   like (Math/floor x) → double, so arithmetic over it devirtualizes AT WALK TIME
+   (and thus carries :raster.type/tag), rather than falling back to a later,
+   weaker-typed resolution. TC reflects the same return type into :tag; this is the
+   raster-side equivalent that feeds :raster.type/tag."
+  [head args type-env]
+  (when (and (symbol? head) (namespace head))
+    (when-let [cls (try (resolve (symbol (namespace head))) (catch Throwable _ nil))]
+      (when (class? cls)
+        (let [mn (name head)
+              n  (count args)
+              cand (filter (fn [^java.lang.reflect.Method m]
+                             (and (= mn (.getName m))
+                                  (java.lang.reflect.Modifier/isStatic (.getModifiers m))
+                                  (= n (.getParameterCount m))))
+                           (.getMethods cls))
+              rets (distinct (map (fn [^java.lang.reflect.Method m] (prim-class->tag (.getReturnType m))) cand))]
+          (cond
+            ;; unambiguous (e.g. floor, sqrt) — every overload returns the same prim
+            (and (= 1 (count rets)) (first rets)) (first rets)
+            ;; overloaded (e.g. abs, min, max) — pick by the args' inferred tags
+            (seq cand)
+            (let [atags (mapv (fn [a] (or (when (symbol? a) (type-env-tag type-env a))
+                                          (literal-tag a)
+                                          (when (seq? a) (infer-rewritten-tag a nil type-env))))
+                              args)]
+              (some (fn [^java.lang.reflect.Method m]
+                      (when (= atags (mapv prim-class->tag (.getParameterTypes m)))
+                        (prim-class->tag (.getReturnType m))))
+                    cand))
+            :else nil))))))
+
 (defn infer-rewritten-tag
   "Infer the return type tag of a rewritten expression.
   type-env: {sym → {:tag, :fn-info, :element}} (optional, for dispatched calls)"
@@ -874,11 +919,12 @@
               (if (>= (rank then-tag) (rank else-tag)) then-tag else-tag)
               :else (or (promote-tag then-tag else-tag) then-tag else-tag)))
 
-           ;; Devirtualized call
+           ;; Devirtualized call (a var) — or a Java static method (Class/method)
           (and (symbol? head) (not= '.invk head))
-          (when-let [v (resolve head)]
-            (or (:raster.core/return-tag (meta v))
-                (:tag (meta v))))
+          (or (when-let [v (try (resolve head) (catch Throwable _ nil))]
+                (or (:raster.core/return-tag (meta v))
+                    (:tag (meta v))))
+              (static-method-return-tag head (rest rewritten-form) type-env))
 
            ;; .invk call
           (and (= '.invk head) (symbol? (second rewritten-form)))

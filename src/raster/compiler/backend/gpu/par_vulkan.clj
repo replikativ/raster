@@ -1,6 +1,14 @@
 (ns raster.compiler.backend.gpu.par-vulkan
   "Vulkan compute backend for declarative parallel primitives.
 
+  ORPHAN: not yet dispatched from the pipeline and untested. Kept as
+  scaffolding for the case Vulkan compute uniquely serves — zero-copy
+  sharing of compute results with the graphics pipeline (an SSBO written
+  by a compute dispatch bound directly for rendering, no host roundtrip),
+  and as groundwork for the WebGPU compute backend (Track C). Pure compute
+  is covered by the OpenCL/Level-Zero backend. It shares the soa-lower SROA
+  pass with par_opencl so it cannot drift onto a separate SoA codegen path.
+
   Generates GLSL 450 compute shader source from par forms using
   the shared c-emit expression emitter. Shaders are compiled to
   SPIR-V via shaderc (raster.vk.shader) and dispatched through
@@ -23,6 +31,7 @@
     (generate-compute-map-void-kernel form :dtype :float)"
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.passes.scalar.soa-lower :as sl]
             [clojure.string :as str]))
 
 ;; ================================================================
@@ -101,8 +110,8 @@
         dtype (or dtype (get {'double :double 'float :float 'int :int 'long :long} cast :float))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         default-ctype (get glsl-type-map dtype "float")
-        ;; SoA expansion
-        soa-expansions (ce/collect-soa-expansions body)
+        ;; SoA expansion (shared body-tag detector)
+        soa-expansions (sl/collect-soa-env body)
         meta-types (ce/collect-array-types-from-meta body)
         array-syms (ce/collect-arrays-in-body body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
@@ -160,9 +169,19 @@
                                                        offset)]
                                          (+ aligned sz)))
                                      0 sizes))
-        ;; Body emission
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
-        all-arr-syms (set (map #(symbol (name %)) all-arr-params))
+        ;; SROA: scalar-replace value-type access so the GLSL emitter only sees
+        ;; per-field array ops (no struct typedef / SoA aget-aset).
+        lowered-body (sl/lower-body soa-expansions body)
+        adapted-body (ce/adapt-casts-for-dtype lowered-body dtype)
+        ;; Per-field array symbols introduced by lowering (e.g. particles_x),
+        ;; replacing the SoA base names in the array-sym tracking set.
+        soa-field-syms (set (mapcat (fn [s]
+                                      (let [info (get soa-expansions (symbol (name s)))]
+                                        (map (fn [{nm :name}]
+                                               (sl/field-arr-sym (symbol (name s)) nm))
+                                             (:fields info))))
+                                    soa-arr-params))
+        all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         ;; Detect if body is a loop (needs statement context in GLSL)
         body-is-loop? (and (seq? adapted-body) (= 'loop (first adapted-body)))
         ;; For loop bodies, extract the result variable name (first loop binding)
@@ -170,7 +189,6 @@
                           (ce/c-symbol (first (take-nth 2 (second adapted-body)))))
         body-str (binding [ce/*emit-config* ce/glsl-config
                            ce/*scalar-type* default-ctype
-                           ce/*soa-expansions* soa-expansions
                            ce/*idx-sym* idx]
                    ;; Both paths use emit-expr; for GLSL loops, emit-expr now
                    ;; returns inline declarations + while(true){} without outer braces
@@ -189,9 +207,6 @@
         helper-sources (binding [ce/*emit-config* ce/glsl-config
                                  ce/*scalar-type* default-ctype]
                          (str/join "\n" (map (comp :source ce/generate-c-helper) gpu-fns)))
-        ;; Struct typedefs
-        struct-typedefs (binding [ce/*emit-config* ce/glsl-config]
-                          (ce/emit-struct-typedefs soa-expansions))
         source (str "#version 450\n"
                     (when (= dtype :double)
                       "#extension GL_EXT_shader_explicit_arithmetic_types_float64 : require\n")
@@ -203,7 +218,6 @@
                     "\n"
                     "layout(local_size_x = " workgroup-size ") in;\n"
                     "\n"
-                    (when (seq struct-typedefs) (str struct-typedefs "\n\n"))
                     (when (seq helper-sources) (str helper-sources "\n"))
                     (when (seq helpers) (str helpers "\n"))
                     "void main() {\n"
@@ -244,8 +258,8 @@
         ;; Auto-collect array types from walker :tag metadata, merge with explicit
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
-        ;; SoA expansion
-        soa-expansions (ce/collect-soa-expansions body)
+        ;; SoA expansion (shared body-tag detector)
+        soa-expansions (sl/collect-soa-env body)
         array-syms (ce/collect-arrays-in-body body)
         written-syms (ce/collect-written-arrays body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
@@ -304,15 +318,21 @@
                                                        offset)]
                                          (+ aligned sz)))
                                      0 sizes))
-        ;; Struct typedefs
-        struct-typedefs (binding [ce/*emit-config* ce/glsl-config]
-                          (ce/emit-struct-typedefs soa-expansions))
-        ;; Body emission
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
-        all-arr-syms (set (map #(symbol (name %)) all-arr-params))
+        ;; SROA: scalar-replace value-type access so the GLSL emitter only sees
+        ;; per-field array ops (no struct typedef / SoA aget-aset).
+        lowered-body (sl/lower-body soa-expansions body)
+        adapted-body (ce/adapt-casts-for-dtype lowered-body dtype)
+        ;; Per-field array symbols introduced by lowering (e.g. particles_x),
+        ;; replacing the SoA base names in the array-sym tracking set.
+        soa-field-syms (set (mapcat (fn [s]
+                                      (let [info (get soa-expansions (symbol (name s)))]
+                                        (map (fn [{nm :name}]
+                                               (sl/field-arr-sym (symbol (name s)) nm))
+                                             (:fields info))))
+                                    soa-arr-params))
+        all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         body-str (binding [ce/*emit-config* ce/glsl-config
                            ce/*scalar-type* default-ctype
-                           ce/*soa-expansions* soa-expansions
                            ce/*idx-sym* idx]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         body-str (apply-ssbo-suffix body-str plain-arr-params soa-expansions soa-arr-params)
@@ -331,7 +351,6 @@
                     "\n"
                     "layout(local_size_x = " workgroup-size ") in;\n"
                     "\n"
-                    (when (seq struct-typedefs) (str struct-typedefs "\n\n"))
                     (when (seq helper-sources) (str helper-sources "\n"))
                     (when (seq helpers) (str helpers "\n"))
                     "void main() {\n"

@@ -28,6 +28,10 @@
             [raster.compiler.passes.scalar.rewalk :as rewalk]
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.backend.wasm.emit :as wasm-emit]
+            [raster.compiler.backend.intrinsics :as ix]
+            [raster.compiler.backend.gpu.wgsl :as wgsl-emit]
+            [raster.compiler.passes.scalar.soa-lower :as soa-lower]
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
@@ -48,6 +52,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.macroexpand :as mex]
             [raster.ad.purity :as purity]
             [raster.ad.reverse :as ad-reverse]
             [raster.compiler.core.util :as util]
@@ -865,6 +870,158 @@
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))
+
+(defn- wasm-kernel-spec
+  "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm
+   emitter: walker → forward-passes → soa-lower (value-type SoA → per-field arrays)."
+  [f-var dtype name wasm-simd?]
+  (let [resolved      (or (resolve-deftm-var f-var dtype) f-var)
+        walked-body   (get-walked-body f-var dtype)
+        active-params (clean-params (get-params f-var dtype))
+        param-env     (build-param-env f-var dtype)
+        source-ns     (let [m (meta resolved)]
+                        (or (when-let [s (:raster.core/deftm-source-ns m)]
+                              (try (the-ns s) (catch Exception _ nil)))
+                            (when (var? resolved) (.ns ^clojure.lang.Var resolved))))
+        opts (cond-> {:inline? true :simd? false :dtype dtype :active-params active-params}
+               param-env (assoc :param-env param-env)
+               source-ns (assoc :source-ns source-ns))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (list* 'do walked-body))
+        ;; wasm inline budget: keep large straight-line callees as wasm functions
+        ;; (deftm->function) rather than inlining. 1200 nodes is generous — above
+        ;; every current kernel (biggest straight-line callee perlin3d ≈ 368) and
+        ;; aligned with V8's ~1250-node wasm inline-eligibility, so only genuinely
+        ;; large callees outline; fusable (loop/par) callees always inline. JVM/GPU
+        ;; leave the limit nil (inline all + split.clj). See .internal notes.
+        form (binding [inline/*inline-size-limit* (or inline/*inline-size-limit* 1200)]
+               (run-passes raw-form forward-passes opts))
+        d-params (:raster.core/deftm-params (meta resolved))
+        d-tags   (:raster.core/deftm-tags (meta resolved))
+        return-tag (:raster.core/return-tag (meta resolved))
+        param-specs (mapv (fn [p t] {:sym (with-meta (if (symbol? p) p (symbol (name p))) nil)
+                                     :tag (symbol t)})
+                          d-params d-tags)
+        value-reg @raster.compiler.core.types/soa-registry
+        ;; scalar value-type kernel (value-type param or return) vs SoA-array kernel
+        value-fn? (or (some #(contains? value-reg (:tag %)) param-specs)
+                      (contains? value-reg return-tag))
+        {lowered-body :body lowered-params :params}
+        (if value-fn?
+          (soa-lower/lower-value-fn form param-specs return-tag)
+          (soa-lower/soa-lower form param-specs))
+        ;; Macroexpand at the last moment (mirrors the JVM bytecode backend): the
+        ;; walker leaves high-level forms (let/loop/case/cond/when/or/and) for the
+        ;; passes to match; the emitter only needs the ~12 special forms. Bind *ns*
+        ;; to the kernel's source ns so source-local macros resolve. Meta is
+        ;; preserved (:raster.type/tag, :raster.op/original).
+        ;; Keep `dotimes` un-expanded: the emitter's SIMD vectorizer matches its
+        ;; counted-loop shape directly (generic loop* expansion would defeat it).
+        wasm-skip-head? (fn [h] (= "dotimes" (clojure.core/name h)))
+        expanded-body (binding [*ns* (or source-ns *ns*)]
+                        (mex/resugar-interop
+                         (mex/macroexpand-all-preserving lowered-body wasm-skip-head?)))]
+    {:name (or name (str (:name (meta resolved))))
+     :params lowered-params :ir expanded-body :simd? wasm-simd?
+     ;; the ORIGINAL (pre-lowering) semantic signature — for the cljs marshaling
+     ;; codegen: which params/return are value types (and their field order).
+     :sig {:param-names (mapv :sym param-specs)   ; already plain symbols
+           :param-tags  (mapv :tag param-specs)
+           :return-tag  return-tag}}))
+
+(defn- intrinsic-invk?
+  "True if an .invk node calls a registered intrinsic (raster.numeric/Math/…) —
+   these are emitted inline by the wasm backend, never as a `call`."
+  [node]
+  (and (seq? node) (= '.invk (first node))
+       (let [op (:raster.op/original (meta node))]
+         (and (symbol? op) (ix/canonical op)))))
+
+(defn- discover-callees
+  "Set of impl-syms of non-intrinsic deftm callees that survive (un-inlined) in ir.
+   Each becomes a sibling wasm function invoked via `call` (recursion today;
+   size-driven outlining later)."
+  [ir]
+  (let [out (atom #{})]
+    (walk/postwalk
+     (fn [x]
+       (when (and (seq? x) (= '.invk (first x)) (not (intrinsic-invk? x)))
+         (swap! out conj (second x)))
+       x)
+     ir)
+    @out))
+
+(defn compile-wasm
+  "Compile a deftm var to a WebAssembly module (Track A — browser/WASI target).
+   Reuses compile-aot's front-half (walker → forward-passes) to produce the same
+   post-pass IR, then emits a .wasm via backend/wasm/emit instead of JVM bytecode.
+
+   Returns {:bytes byte[] :name str :param-types [valtype-kw...] :params [{:sym :tag}]}.
+   The exported fn takes the params in order; array params are (ptr) byte-offsets
+   into the exported `memory`, with element data the caller writes/reads through a
+   typed-array view (see cljs-sandbox for the cljs side).
+
+   v1: scalar, single-function, param-only kernels (no hoisted intermediate
+   buffers); `:simd? false` is forced (the JVM Vector-API SIMD lowering is
+   JVM-only — a wasm-SIMD128 path is a later increment)."
+  [f-var & {:keys [dtype name wasm-simd?] :or {dtype :double}}]
+  (let [root  (wasm-kernel-spec f-var dtype name wasm-simd?)
+        rv    (or (resolve-deftm-var f-var dtype) f-var)
+        root-rkey (symbol (str (.ns ^clojure.lang.Var rv)) (clojure.core/name (.sym ^clojure.lang.Var rv)))
+        ;; transitive discovery of non-inlined (non-intrinsic) deftm callees that
+        ;; survive in the IR — recursion guard keeps recursive calls, and (later)
+        ;; the outline pass will introduce others. Each becomes a sibling wasm fn.
+        result (loop [pending (vec (discover-callees (:ir root)))
+                      by-key  {}            ; callee impl-sym → kernel spec
+                      root-ck nil]          ; root's own :call-key if self-recursive
+                 (if (empty? pending)
+                   {:by-key by-key :root-ck root-ck}
+                   (let [impl (peek pending), more (pop pending)
+                         rkey (inline/recursion-key impl)]
+                     (cond
+                       (= rkey root-rkey)            ; self-call → resolves to the root fn
+                       (recur more by-key impl)
+                       (contains? by-key impl)       ; already compiled
+                       (recur more by-key root-ck)
+                       :else
+                       (let [cv   (resolve rkey)
+                             spec (assoc (wasm-kernel-spec cv dtype (str (clojure.core/name (inline/recursion-key impl))) wasm-simd?)
+                                         :call-key impl :export? false)]
+                         (recur (into more (discover-callees (:ir spec)))
+                                (assoc by-key impl spec) root-ck))))))
+        callees (vals (:by-key result))
+        root*   (cond-> (assoc root :export? true)
+                  (:root-ck result) (assoc :call-key (:root-ck result)))
+        module  (wasm-emit/compile-module (into [root*] callees))
+        entry   (first (:exports module))]
+    {:bytes (:bytes module)
+     :name (:name entry) :param-types (:param-types entry)
+     :result-types (:result-types entry) :sig (:sig root)}))
+
+(defn compile-wasm-module
+  "Compile several deftm vars into ONE wasm module that shares a single linear
+   memory — so a program's data lives in one buffer addressed by all the exported
+   kernels (vs compile-wasm's one-module-per-kernel). Each spec is either a var or
+   {:var v :name str :dtype kw :wasm-simd? bool}.
+   Returns {:bytes byte[] :exports [{:name :param-types :result-types :sig} …]}
+   where :sig is the original semantic signature (for cljs marshaling codegen)."
+  [specs]
+  (let [kspecs (mapv (fn [s]
+                       (let [s (if (map? s) s {:var s})]
+                         (wasm-kernel-spec (:var s) (or (:dtype s) :double) (:name s) (:wasm-simd? s))))
+                     specs)
+        sig-by-name (into {} (map (juxt :name :sig) kspecs))
+        module (wasm-emit/compile-module kspecs)]
+    (update module :exports
+            (fn [exs] (mapv #(assoc % :sig (sig-by-name (:name %))) exs)))))
+
+(defn compile-wgsl
+  "Compile a deftm var to a WGSL compute shader (Track C — WebGPU compute).
+   WebGPU has no f64, so the front-half runs at :float (f32) and the emitter
+   targets f32 storage buffers. Returns {:wgsl str :array-params :scalar-params
+   :n-sym :workgroup} — the host binds arrays as f32 storage buffers in order,
+   then a uniform struct (scalars + _n). v1: elementwise maps."
+  [f-var & {:keys [name]}]
+  (wgsl-emit/compile-kernel (wasm-kernel-spec f-var :float name false)))
 
 ;; ================================================================
 ;; Typed gradient helpers (ftm-based, primitive fast-path)

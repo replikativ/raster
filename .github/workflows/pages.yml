@@ -1,0 +1,155 @@
+name: Deploy Pages (notebooks + demos)
+
+# GitHub Pages allows one deployment per repo, so this single job assembles the whole
+# site: the Clay notebooks (rendered from source) plus the two browser demos (wasm
+# kernels generated from the deftm/defvalue source via gen.clj, then shadow-cljs release).
+# Nothing under public/*.wasm or the generated kernels.cljs is committed — it's all built
+# here from source.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'notebooks/**'
+      - 'src/**'
+      - 'examples/**'
+      - 'deps.edn'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: "pages"
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install OpenBLAS
+        run: sudo apt-get update && sudo apt-get install -y libopenblas-dev
+
+      - name: Set up Java 24
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '24'
+
+      - name: Install Clojure CLI
+        uses: DeLaGuardo/setup-clojure@12.5
+        with:
+          cli: 1.12.0.1488
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: examples/asteroids/web/package-lock.json
+
+      - name: Cache Maven dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.m2/repository
+            ~/.gitlibs
+          key: ${{ runner.os }}-maven-${{ hashFiles('**/deps.edn') }}
+          restore-keys: |
+            ${{ runner.os }}-maven-
+
+      - name: Download Clojure dependencies
+        run: clojure -P -M:dev
+
+      - name: Render Clay notebooks + landing page
+        env:
+          JVM_OPTS: "--add-modules=jdk.incubator.vector --enable-native-access=ALL-UNNAMED"
+        run: |
+          clojure -M:dev -e "
+          (require '[scicloj.clay.v2.api :as clay])
+
+          (def notebooks
+            [\"notebooks/raster/getting_started.clj\"
+             \"notebooks/raster/autodiff.clj\"
+             \"notebooks/raster/ode_solvers.clj\"
+             \"notebooks/raster/linear_algebra.clj\"
+             \"notebooks/raster/optimization.clj\"
+             \"notebooks/raster/deep_learning.clj\"
+             \"notebooks/raster/abm_firms.clj\"
+             \"notebooks/raster/ga_ode_rotors.clj\"])
+
+          (doseq [nb notebooks]
+            (println \"Rendering\" nb)
+            (clay/make! {:source-path nb
+                         :base-target-path \"_site\"
+                         :show false}))
+
+          (spit \"_site/index.html\"
+                (str \"<html><head><style>
+                       body { font-family: system-ui, sans-serif; max-width: 700px; margin: 40px auto; padding: 0 20px; }
+                       h1 { margin-bottom: 0.3em; } h2 { margin-top: 1.6em; }
+                       ul { line-height: 2; }
+                       a { color: #1a6; }
+                     </style></head><body>
+                     <h1>Raster</h1>
+                     <p>Interactive guides + browser demos, rendered from <a href='https://github.com/replikativ/raster'>source</a>.</p>
+                     <h2>Notebooks</h2>
+                     <ul>
+                       <li><a href='raster.getting_started.html'>Getting Started</a> — deftm, typed dispatch, value types</li>
+                       <li><a href='raster.autodiff.html'>Automatic Differentiation</a> — forward-mode, reverse-mode, value+grad</li>
+                       <li><a href='raster.ode_solvers.html'>ODE Solvers</a> — Lorenz attractor, adaptive solvers, events</li>
+                       <li><a href='raster.linear_algebra.html'>Linear Algebra</a> — Vec/Mat types, LU, Cholesky, SVD</li>
+                       <li><a href='raster.optimization.html'>Optimization</a> — L-BFGS, Nelder-Mead, Newton</li>
+                       <li><a href='raster.deep_learning.html'>Deep Learning</a> — MLP training with compiled AD</li>
+                       <li><a href='raster.abm_firms.html'>Agent-Based Modeling</a> — endogenous firm formation</li>
+                       <li><a href='raster.ga_ode_rotors.html'>Geometric Algebra + ODE</a> — rotors, precession</li>
+                     </ul>
+                     <h2>Browser demos (WebGPU — Chrome / Edge)</h2>
+                     <p>One <code>.cljc</code> codebase: numerical kernels compiled to WebAssembly, rendered with WebGPU.</p>
+                     <ul>
+                       <li><a href='asteroids/'>Geometric Asteroids</a> — typed dispatch + physics compiled to wasm</li>
+                       <li><a href='valley/'>Valley</a> — streaming voxel world (terrain, lighting, water, mobs)</li>
+                     </ul></body></html>\"))
+
+          (println \"Done.\")
+          (System/exit 0)
+          "
+
+      - name: Generate wasm kernels from source
+        run: |
+          clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/asteroids/web/gen.clj
+          clojure -Sdeps '{:paths ["src" "examples"]}' -M examples/valley/gen.clj
+
+      - name: Build browser demos (shadow-cljs release)
+        working-directory: examples/asteroids/web
+        run: |
+          npm ci
+          npx shadow-cljs release casteroids cvalley-walk
+
+      - name: Assemble demos into the site
+        run: |
+          web=examples/asteroids/web/public
+          mkdir -p _site/asteroids _site/valley
+          cp    "$web/index.html"          _site/asteroids/index.html
+          cp -r "$web/js"                  _site/asteroids/js
+          cp    "$web/kernels.wasm"        _site/asteroids/kernels.wasm
+          cp    "$web/valley-walk.html"    _site/valley/index.html
+          cp -r "$web/valley-walk-js"      _site/valley/valley-walk-js
+          cp    "$web/valley_kernels.wasm" _site/valley/valley_kernels.wasm
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v4
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+
+      - name: Deploy to GitHub Pages
+        uses: actions/deploy-pages@v4

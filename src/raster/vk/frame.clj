@@ -246,24 +246,24 @@
                     (try
                       (let [;; Wait: acquire-sem at color attachment output stage
                             ^VkSemaphoreSubmitInfo wait-info
-                            (doto (.get (VkSemaphoreSubmitInfo/calloc 1 stk) 0)
+                            (doto ^VkSemaphoreSubmitInfo (.get (VkSemaphoreSubmitInfo/calloc 1 stk) 0)
                               (.sType VK13/VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO)
                               (.semaphore acquire-sem)
                               (.stageMask VK13/VK_PIPELINE_STAGE_2_COLOR_ATTACHMENT_OUTPUT_BIT))
                         ;; Signal: submit-sem at all commands stage
                             ^VkSemaphoreSubmitInfo signal-info
-                            (doto (.get (VkSemaphoreSubmitInfo/calloc 1 stk) 0)
+                            (doto ^VkSemaphoreSubmitInfo (.get (VkSemaphoreSubmitInfo/calloc 1 stk) 0)
                               (.sType VK13/VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO)
                               (.semaphore submit-sem)
                               (.stageMask VK13/VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT))
                         ;; Command buffer wrapper
                             ^VkCommandBufferSubmitInfo cb-info
-                            (doto (.get (VkCommandBufferSubmitInfo/calloc 1 stk) 0)
+                            (doto ^VkCommandBufferSubmitInfo (.get (VkCommandBufferSubmitInfo/calloc 1 stk) 0)
                               (.sType VK13/VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO)
                               (.commandBuffer cb))
                         ;; Submit info 2
                             ^VkSubmitInfo2 si2
-                            (doto (.get (VkSubmitInfo2/calloc 1 stk) 0)
+                            (doto ^VkSubmitInfo2 (.get (VkSubmitInfo2/calloc 1 stk) 0)
                               (.sType VK13/VK_STRUCTURE_TYPE_SUBMIT_INFO_2)
                               (.pWaitSemaphoreInfos
                                (VkSemaphoreSubmitInfo/create (.address wait-info) 1))

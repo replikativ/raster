@@ -38,7 +38,7 @@
                 (throw (ex-info (str "Unknown shader stage: " stage)
                                 {:stage stage :valid (keys stage-map)})))
             result (Shaderc/shaderc_compile_into_spv
-                    compiler source kind filename "main" options)
+                    compiler source (int kind) ^String filename "main" (long options))
             status (Shaderc/shaderc_result_get_compilation_status result)]
         (when-not (= status Shaderc/shaderc_compilation_status_success)
           (let [msg (Shaderc/shaderc_result_get_error_message result)]

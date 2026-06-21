@@ -9,6 +9,7 @@
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.macroexpand :as mex]
             [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.split :as split])
   (:import (java.lang.classfile ClassFile ClassFile$ClassHierarchyResolverOption ClassFile$Option)
@@ -456,36 +457,15 @@
     ;; already the right type
     to-type))
 
-(defn- walk-preserving-meta
-  "Like clojure.walk/walk but preserves metadata on forms."
-  [inner outer form]
-  (let [m (meta form)
-        result (cond
-                 (list? form)    (outer (apply list (map inner form)))
-                 (seq? form)     (outer (doall (map inner form)))
-                 (vector? form)  (outer (mapv inner form))
-                 (map? form)     (outer (into (empty form)
-                                              (map (fn [[k v]] [(inner k) (inner v)]) form)))
-                 (set? form)     (outer (into (empty form) (map inner form)))
-                 :else           (outer form))]
-    (if (and m (instance? clojure.lang.IObj result))
-      (with-meta result (merge (meta result) m))
-      result)))
+;; Metadata-preserving walk + macroexpand live in the shared leaf ns
+;; raster.compiler.core.macroexpand (the wasm backend uses them too).
+(def ^:private walk-preserving-meta mex/walk-preserving-meta)
+(def ^:private macroexpand-all-preserving mex/macroexpand-all-preserving)
 
 (defn- postwalk-preserving
   "Like clojure.walk/postwalk but preserves metadata."
   [f form]
   (walk-preserving-meta (partial postwalk-preserving f) f form))
-
-(defn- macroexpand-all-preserving
-  "Like clojure.walk/macroexpand-all but preserves metadata on forms."
-  [form]
-  (let [expanded (if (seq? form) (macroexpand form) form)
-        m (meta form)
-        result (walk-preserving-meta macroexpand-all-preserving identity expanded)]
-    (if (and m (instance? clojure.lang.IObj result))
-      (with-meta result (merge (meta result) m))
-      result)))
 
 (defn desugar-invk
   "Process walker .invk forms for bytecode compilation.
@@ -2368,7 +2348,21 @@
         cls       (or (try (Class/forName cls-short) (catch Exception _ nil))
                       (when-let [resolved (ns-resolve src-ns (symbol cls-short))]
                         (when (class? resolved) resolved))
-                      (throw (ex-info (str "Cannot resolve class: " cls-short) {:symbol head})))
+                      ;; Not a class. If the "class" part is actually a Clojure
+                      ;; namespace, the head is a qualified var reference that didn't
+                      ;; resolve (a typo, a missing require, or a name that doesn't
+                      ;; exist) — it reached here only because the dispatcher treats
+                      ;; any unresolved ns/name as a static call. Fail with an
+                      ;; actionable operator-level message, not "Cannot resolve class".
+                      (throw (ex-info
+                              (if (find-ns (symbol cls-short))
+                                (str "Unresolved operator `" head "`: namespace `" cls-short
+                                     "` has no var `" meth-name "`. It is not a deftm, "
+                                     "intrinsic, or Java static method — check the name "
+                                     "(e.g. `raster.arrays/aset`, not `aset!`) or add a require.")
+                                (str "Cannot resolve operator `" head "`: `" cls-short
+                                     "` is neither a class nor a loaded namespace."))
+                              {:symbol head :class cls-short :method meth-name})))
         candidates (filterv #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
                                   (= (.getParameterCount ^java.lang.reflect.Method %) (count args)))
                             (.getMethods cls))
@@ -2987,48 +2981,48 @@
                 t2 (emit-form code a2 locals val-ctx)]
             (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
-                  (and (= t1 :int) (= t2 :int))
-                  (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
-                            ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
-                            "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
-                      true)
+              (and (= t1 :int) (= t2 :int))
+              (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
+                        ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
+                        "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
+                  true)
                   ;; Both long → LCMP + IFxx
-                  (and (= t1 :long) (= t2 :long))
-                  (do (.lcmp code)
-                      (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                            ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                            "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                      true)
+              (and (= t1 :long) (= t2 :long))
+              (do (.lcmp code)
+                  (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                        ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                        "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                  true)
                   ;; Both double → DCMPG + IFxx
-                  (and (= t1 :double) (= t2 :double))
-                  (do (.dcmpg code)
-                      (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                            ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                            "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                      true)
+              (and (= t1 :double) (= t2 :double))
+              (do (.dcmpg code)
+                  (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                        ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                        "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                  true)
                   ;; Mixed types → coerce both to double
-                  :else
-                  (let [;; t2 on top, t1 below. Store t2, coerce t1, reload+coerce t2
-                        tmp (let [s @(:next-slot ctx)]
-                              (case t2
-                                (:int :bool) (do (.istore code s) (swap! (:next-slot ctx) inc) s)
-                                :float  (do (.fstore code s) (swap! (:next-slot ctx) inc) s)
-                                :long   (do (.lstore code s) (swap! (:next-slot ctx) + 2) s)
-                                :double (do (.dstore code s) (swap! (:next-slot ctx) + 2) s)
+              :else
+              (let [;; t2 on top, t1 below. Store t2, coerce t1, reload+coerce t2
+                    tmp (let [s @(:next-slot ctx)]
+                          (case t2
+                            (:int :bool) (do (.istore code s) (swap! (:next-slot ctx) inc) s)
+                            :float  (do (.fstore code s) (swap! (:next-slot ctx) inc) s)
+                            :long   (do (.lstore code s) (swap! (:next-slot ctx) + 2) s)
+                            :double (do (.dstore code s) (swap! (:next-slot ctx) + 2) s)
                                 ;; :ref — store as Object, will coerce to double on reload
-                                (do (.astore code s) (swap! (:next-slot ctx) inc) s)))]
-                    (when (not= t1 :double) (emit-coerce code t1 :double))
-                    (case t2 (:int :bool) (do (.iload code tmp) (.i2d code))
-                          :long (do (.lload code tmp) (.l2d code))
-                          :float (do (.fload code tmp) (.f2d code))
-                          :double (.dload code tmp)
+                            (do (.astore code s) (swap! (:next-slot ctx) inc) s)))]
+                (when (not= t1 :double) (emit-coerce code t1 :double))
+                (case t2 (:int :bool) (do (.iload code tmp) (.i2d code))
+                      :long (do (.lload code tmp) (.l2d code))
+                      :float (do (.fload code tmp) (.f2d code))
+                      :double (.dload code tmp)
                              ;; :ref — reload Object, unbox to double
-                          (do (.aload code tmp) (emit-coerce code :ref :double)))
-                    (.dcmpg code)
-                    (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                          ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                          "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                    true))))
+                      (do (.aload code tmp) (emit-coerce code :ref :double)))
+                (.dcmpg code)
+                (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                      ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                      "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                true))))
         ;; Predicate must always produce a value (to branch on),
         ;; so strip :void-context from ctx.
         pred-type (when-not branch-folded?

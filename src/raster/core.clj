@@ -1155,7 +1155,27 @@
                                    annotations)
               tc-ann-form (vec (concat tc-param-types [:-> 'clojure.core.typed/Any]))]
           `(do
-             (defrecord ~name ~(vec hinted) ~@impls ~@rest-specs)
+             ;; deftype (not defrecord) — a value type is a struct, not a Map.
+             ;; This matches the Valhalla value-class path and avoids field/method
+             ;; collisions (a field `size`/`count` would otherwise resolve to the
+             ;; defrecord's java.util.Map .size()/.count). We regenerate the bits
+             ;; the glue actually uses: ILookup (:field access), value
+             ;; equals/hashCode (deftype defaults to identity), and print-method.
+             (deftype ~name ~(vec hinted)
+               ~@impls ~@rest-specs
+               clojure.lang.ILookup
+               (~'valAt [~'_ ~'k] (case ~'k ~@(mapcat (fn [p] [(keyword (clojure.core/name p)) p]) params) nil))
+               (~'valAt [~'_ ~'k ~'nf] (case ~'k ~@(mapcat (fn [p] [(keyword (clojure.core/name p)) p]) params) ~'nf))
+               Object
+               (~'equals [~'_ ~'other]
+                 (and (instance? ~name ~'other)
+                      ~@(map (fn [p] `(clojure.core/= ~p (. ~'other ~(symbol (str "-" (clojure.core/name p)))))) params)))
+               (~'hashCode [~'_] (clojure.core/hash [~@params])))
+             (defmethod print-method ~name [~'v ~'w]
+               (.write ^java.io.Writer ~'w
+                       (str "#" '~name
+                            (array-map ~@(mapcat (fn [p] [(keyword (clojure.core/name p))
+                                                          `(. ~'v ~(symbol (str "-" (clojure.core/name p))))]) params)))))
              (try (clojure.core.typed/-ann
                    ['~(ns-name *ns*) '~(symbol (str (ns-name *ns*)) (str factory-sym))
                     '~tc-ann-form {} nil nil])

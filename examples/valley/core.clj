@@ -5,8 +5,9 @@
   compile-aot can inline into single JVM methods. All functions
   take primitive types (Double, Long, arrays) — no Clojure maps.
 
-  The game layer (mobs.clj, hostile.clj, game.clj) extracts typed data
-  from Clojure maps, calls these kernels, and reassembles state.
+  The cross-platform game layer (valley.chunk/walk/swarm/shell) calls these
+  kernels directly on primitive arrays — same code on JVM (bytecode) and
+  browser (wasm, via valley.kernels + the generated shim).
 
   Domains:
     - Block queries (solid?, transparent? on raw arrays)
@@ -14,7 +15,9 @@
     - Geometry (distance, direction, rotation, ray intersection)
     - Terrain (biome classification, height sampling, cave detection)"
   (:require [raster.core :refer [deftm]]
-            [raster.noise :as noise]))
+            [raster.linalg.core :as lin :refer [->Vec2 ->Vec3 ->Vec4]]
+            [raster.noise :as noise])
+  (:import [raster.linalg.core Vec2 Vec3 Vec4]))
 
 ;; ================================================================
 ;; Constants — def ^:const inlined by the bytecode compiler
@@ -101,18 +104,18 @@
         by1 (long (Math/floor (+ y h -0.01)))]
     (loop [bx bx0]
       (if (> bx bx1) 0
-        (if (pos? (loop [bz bz0]
-                    (if (> bz bz1) 0
-                      (if (pos? (loop [by by0]
-                                  (if (> by by1) 0
-                                    (if (pos? (world-block-solid? blocks solid-arr
-                                                bx by bz cx cy cz))
-                                      1
-                                      (recur (+ by 1))))))
-                        1
-                        (recur (+ bz 1))))))
-          1
-          (recur (+ bx 1)))))))
+          (if (pos? (loop [bz bz0]
+                      (if (> bz bz1) 0
+                          (if (pos? (loop [by by0]
+                                      (if (> by by1) 0
+                                          (if (pos? (world-block-solid? blocks solid-arr
+                                                                        bx by bz cx cy cz))
+                                            1
+                                            (recur (+ by 1))))))
+                            1
+                            (recur (+ bz 1))))))
+            1
+            (recur (+ bx 1)))))))
 
 (deftm ground-check
   "Check if there's a solid block directly below feet.
@@ -148,19 +151,116 @@
         on-ground? (> ground-y -0.5)
         new-my (if (and on-ground? (< vy 0.0)) ground-y new-my)
         vy (if (and on-ground? (< vy 0.0)) 0.0 vy)
-        ;; Horizontal: try X then Z
+        ;; Horizontal with 1-block step-up: try X then Z; if a move is blocked by a
+        ;; single-block rise that has headroom above it, climb the step (grounded only).
+        ;; (aabb-collides? returns 1 when blocked, 0 when clear — `(< _ 1)` means clear.)
         try-mx (+ mx dx)
-        try-mz (+ mz dz)
         coll-x (aabb-collides? blocks solid-arr try-mx new-my mz hw h cx cy cz)
-        new-mx (if (pos? coll-x) mx try-mx)
-        coll-z (aabb-collides? blocks solid-arr new-mx new-my try-mz hw h cx cy cz)
-        new-mz (if (pos? coll-z) mz try-mz)]
+        step-x? (and on-ground? (pos? coll-x)
+                     (< (aabb-collides? blocks solid-arr try-mx (+ new-my 1.0) mz hw h cx cy cz) 1))
+        new-mx (if (pos? coll-x) (if step-x? try-mx mx) try-mx)
+        my-x (if step-x? (+ new-my 1.0) new-my)
+        try-mz (+ mz dz)
+        coll-z (aabb-collides? blocks solid-arr new-mx my-x try-mz hw h cx cy cz)
+        ;; only step up on Z if X did NOT already step this frame (my-x raised means X stepped).
+        ;; This caps total step-up to one block/frame AND keeps the final position collision-
+        ;; checked (clamping Y to +1 instead would place the entity in an unverified cell —
+        ;; that embeds it near floating blocks/overhangs → the jumping loop). No `not`/`false`
+        ;; (the wasm kernel emitter lacks them) — a numeric `<` on the already-resolved Y.
+        step-z? (and on-ground? (< my-x (+ new-my 0.5)) (pos? coll-z)
+                     (< (aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h cx cy cz) 1))
+        new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
+        my-final (if step-z? (+ my-x 1.0) my-x)]
     ;; Write back
     (aset pos 0 new-mx)
-    (aset pos 1 new-my)
+    (aset pos 1 my-final)
     (aset pos 2 new-mz)
     (aset vel 1 vy)
     (if on-ground? 1 0)))
+
+;; ================================================================
+;; Batch mob physics — one kernel over the whole SoA column (mobs phase).
+;; Operates directly on a RESIDENT full-world block array in world coords (no
+;; per-mob window stitch); positions/velocities are SoA triples indexed by row.
+;; ================================================================
+
+(deftm world-solid?
+  "Solidity of the world block at (wx,wy,wz); 0 if out of bounds."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   wx :- Long, wy :- Long, wz :- Long,
+   wxd :- Long, wyd :- Long, wzd :- Long] :- Long
+  (if (and (>= wx 0) (< wx wxd) (>= wy 0) (< wy wyd) (>= wz 0) (< wz wzd))
+    (block-solid? solid-arr (long (aget blocks (int (+ wx (* wz wxd) (* wy wxd wzd))))))
+    0))
+
+(deftm world-aabb-collides?
+  "AABB at (x,y,z) hw×h collides with a solid world block? y = feet."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   x :- Double, y :- Double, z :- Double, hw :- Double, h :- Double,
+   wxd :- Long, wyd :- Long, wzd :- Long] :- Long
+  (let [r (* hw 0.5)
+        bx0 (long (Math/floor (- x r))) bx1 (long (Math/floor (+ x r)))
+        bz0 (long (Math/floor (- z r))) bz1 (long (Math/floor (+ z r)))
+        by0 (long (Math/floor y)) by1 (long (Math/floor (+ y h -0.01)))]
+    (loop [bx bx0]
+      (if (> bx bx1) 0
+          (if (pos? (loop [bz bz0]
+                      (if (> bz bz1) 0
+                          (if (pos? (loop [by by0]
+                                      (if (> by by1) 0
+                                          (if (pos? (world-solid? blocks solid-arr bx by bz wxd wyd wzd))
+                                            1 (recur (+ by 1))))))
+                            1 (recur (+ bz 1))))))
+            1 (recur (+ bx 1)))))))
+
+(deftm world-ground-check
+  "Block-top Y if a solid block is directly below feet, else -1.0."
+  [blocks :- (Array int), solid-arr :- (Array byte),
+   x :- Double, y :- Double, z :- Double, wxd :- Long, wyd :- Long, wzd :- Long] :- Double
+  (let [foot-y (long (Math/floor (- y 0.01))) bx (long (Math/floor x)) bz (long (Math/floor z))]
+    (if (pos? (world-solid? blocks solid-arr bx foot-y bz wxd wyd wzd))
+      (double (+ foot-y 1)) -1.0)))
+
+(deftm integrate-physics-batch!
+  "Integrate N mobs in place against a resident world block array. positions/velocities
+   are SoA triples [x0 y0 z0 x1 y1 z1 …]; mob i drifts by (dxs[i],dzs[i]). Gravity +
+   AABB collision + 1-block step-up, identical to integrate-physics!. Returns N."
+  [positions :- (Array double), velocities :- (Array double),
+   dxs :- (Array double), dzs :- (Array double),
+   blocks :- (Array int), solid-arr :- (Array byte),
+   n :- Long, wxd :- Long, wyd :- Long, wzd :- Long,
+   hw :- Double, h :- Double, dt :- Double] :- Long
+  (loop [i 0]
+    (if (< i n)
+      (let [b (* i 3)
+            mx (aget positions b) my (aget positions (+ b 1)) mz (aget positions (+ b 2))
+            vy (- (aget velocities (+ b 1)) (* GRAVITY dt))
+            new-my (+ my (* vy dt))
+            ground-y (world-ground-check blocks solid-arr mx new-my mz wxd wyd wzd)
+            on-ground? (> ground-y -0.5)
+            new-my (if (and on-ground? (< vy 0.0)) ground-y new-my)
+            vy (if (and on-ground? (< vy 0.0)) 0.0 vy)
+            dx (aget dxs i) dz (aget dzs i)
+            try-mx (+ mx dx)
+            coll-x (world-aabb-collides? blocks solid-arr try-mx new-my mz hw h wxd wyd wzd)
+            step-x? (and on-ground? (pos? coll-x)
+                         (< (world-aabb-collides? blocks solid-arr try-mx (+ new-my 1.0) mz hw h wxd wyd wzd) 1))
+            new-mx (if (pos? coll-x) (if step-x? try-mx mx) try-mx)
+            my-x (if step-x? (+ new-my 1.0) new-my)
+            try-mz (+ mz dz)
+            coll-z (world-aabb-collides? blocks solid-arr new-mx my-x try-mz hw h wxd wyd wzd)
+            ;; Z step only if X didn't step (see integrate-physics!) — caps to 1 block/frame and
+            ;; keeps the final position collision-checked (avoids the embed/jumping loop).
+            step-z? (and on-ground? (< my-x (+ new-my 0.5)) (pos? coll-z)
+                         (< (world-aabb-collides? blocks solid-arr new-mx (+ my-x 1.0) try-mz hw h wxd wyd wzd) 1))
+            new-mz (if (pos? coll-z) (if step-z? try-mz mz) try-mz)
+            my-final (if step-z? (+ my-x 1.0) my-x)]
+        (aset positions b new-mx)
+        (aset positions (+ b 1) my-final)
+        (aset positions (+ b 2) new-mz)
+        (aset velocities (+ b 1) vy)
+        (recur (+ i 1)))
+      n)))
 
 ;; ================================================================
 ;; Geometry — distance, direction, rotation, ray intersection
@@ -180,18 +280,13 @@
     (Math/sqrt (+ (* dx dx) (* dy dy) (* dz dz)))))
 
 (deftm normalize-xz
-  "Normalize XZ direction. Returns [nx nz] as 2-element double array."
-  [dx :- Double, dz :- Double] :- (Array double)
+  "Normalize XZ direction. Returns a Vec2 (allocation-free value type — the wasm
+   backend lowers it to a multi-value return; the JVM scalarizes it)."
+  [dx :- Double, dz :- Double] :- Vec2
   (let [len (Math/sqrt (+ (* dx dx) (* dz dz)))]
-    (if (> len 0.001)
-      (let [out (double-array 2)]
-        (aset out 0 (/ dx len))
-        (aset out 1 (/ dz len))
-        out)
-      (let [out (double-array 2)]
-        (aset out 0 0.0)
-        (aset out 1 1.0)
-        out))))
+    ;; scalar `if` in each component keeps the constructor a single value-tail
+    (->Vec2 (if (> len 0.001) (/ dx len) 0.0)
+            (if (> len 0.001) (/ dz len) 1.0))))
 
 (deftm dir-toward-xz
   "Normalized XZ direction from (mx,mz) toward (tx,tz). Returns [dx dz] vector."
@@ -203,30 +298,26 @@
       [0.0 1.0])))
 
 (deftm rotate-x
-  "Rotate (x,y,z) around pivot (px,py,pz) by angle on X axis.
-  Returns [rx ry rz] as 3-element double array."
+  "Rotate (x,y,z) around pivot (px,py,pz) by angle on X axis. Returns a Vec3
+   (allocation-free value type — see normalize-xz)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double] :- (Array double)
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dy (- y py) dz (- z pz)
-        c (Math/cos angle) s (Math/sin angle)
-        out (double-array 3)]
-    (aset out 0 x)
-    (aset out 1 (+ py (- (* c dy) (* s dz))))
-    (aset out 2 (+ pz (+ (* s dy) (* c dz))))
-    out))
+        c (Math/cos angle) s (Math/sin angle)]
+    (->Vec3 x
+            (+ py (- (* c dy) (* s dz)))
+            (+ pz (+ (* s dy) (* c dz))))))
 
 (deftm rotate-y
-  "Rotate (x,y,z) around pivot (px,py,pz) by angle on Y axis.
-  Returns [rx ry rz] as 3-element double array."
+  "Rotate (x,y,z) around pivot (px,py,pz) by angle on Y axis. Returns a Vec3
+   (allocation-free value type — see normalize-xz)."
   [x :- Double, y :- Double, z :- Double,
-   px :- Double, py :- Double, pz :- Double, angle :- Double] :- (Array double)
+   px :- Double, py :- Double, pz :- Double, angle :- Double] :- Vec3
   (let [dx (- x px) dz (- z pz)
-        c (Math/cos angle) s (Math/sin angle)
-        out (double-array 3)]
-    (aset out 0 (+ px (+ (* c dx) (* s dz))))
-    (aset out 1 y)
-    (aset out 2 (+ pz (- (* c dz) (* s dx))))
-    out))
+        c (Math/cos angle) s (Math/sin angle)]
+    (->Vec3 (+ px (+ (* c dx) (* s dz)))
+            y
+            (+ pz (- (* c dz) (* s dx))))))
 
 (deftm ray-intersects-aabb?
   "Ray-AABB intersection test. Returns 1 if ray hits box, 0 if not.
@@ -255,55 +346,67 @@
 ;; ================================================================
 
 (deftm biome-climate
-  "Compute temperature and humidity at world (wx, wz).
-  Returns [temp humid erosion mushroom] as 4-element double array."
+  "Compute temperature and humidity at world (wx, wz). Returns a Vec4 of
+   [temp humid erosion mushroom] (allocation-free value type — see normalize-xz)."
   [temp-perm :- (Array int), humid-perm :- (Array int),
    detail-perm :- (Array int), mush-perm :- (Array int),
-   wx :- Double, wz :- Double] :- (Array double)
-  (let [out (double-array 4)
-        temp (+ 0.5 (* 0.5 (noise/fbm2d temp-perm
-                              (* wx BIOME-FREQ) (* wz BIOME-FREQ)
-                              3 0.5 2.0)))
+   wx :- Double, wz :- Double] :- Vec4
+  (let [temp (+ 0.5 (* 0.5 (noise/fbm2d temp-perm
+                                        (* wx BIOME-FREQ) (* wz BIOME-FREQ)
+                                        3 0.5 2.0)))
         humid (+ 0.5 (* 0.5 (noise/fbm2d humid-perm
-                               (* wx BIOME-FREQ) (* wz BIOME-FREQ)
-                               3 0.5 2.0)))
+                                         (* wx BIOME-FREQ) (* wz BIOME-FREQ)
+                                         3 0.5 2.0)))
         erosion (noise/fbm2d detail-perm
-                  (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0))
-                  2 0.5 2.0)
+                             (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0))
+                             2 0.5 2.0)
         mush (noise/perlin2d mush-perm
-               (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
-    (aset out 0 temp)
-    (aset out 1 humid)
-    (aset out 2 erosion)
-    (aset out 3 mush)
-    out))
+                             (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
+    (->Vec4 temp humid erosion mush)))
 
-(deftm terrain-height
-  "Get terrain surface height at world (wx, wz).
-  height-scale and base-offset are biome-specific parameters."
+(deftm biome-index
+  "Biome 0..10 from temperature/humidity/erosion/mushroom noise (cf valley.terrain/biome-at).
+   0 desert 1 savanna 2 plains 3 forest 4 jungle 5 swamp 6 taiga 7 tundra 8 snowy-forest
+   9 mountains 10 mushroom."
+  [temp-perm :- (Array int), humid-perm :- (Array int), detail-perm :- (Array int), mush-perm :- (Array int),
+   wx :- Double, wz :- Double] :- Long
+  (let [temp    (+ 0.5 (* 0.5 (noise/fbm2d temp-perm  (* wx BIOME-FREQ) (* wz BIOME-FREQ) 3 0.5 2.0)))
+        humid   (+ 0.5 (* 0.5 (noise/fbm2d humid-perm (* wx BIOME-FREQ) (* wz BIOME-FREQ) 3 0.5 2.0)))
+        erosion (noise/fbm2d detail-perm (* wx (/ 1.0 180.0)) (* wz (/ 1.0 180.0)) 2 0.5 2.0)
+        mush    (noise/perlin2d mush-perm (* wx (/ 1.0 400.0)) (* wz (/ 1.0 400.0)))]
+    (cond
+      (> erosion 0.6) 9
+      (> mush 0.85)   10
+      (> temp 0.65)   (cond (< humid 0.35) 0 (> humid 0.65) 4 :else 1)
+      (> temp 0.35)   (cond (< humid 0.3) 1 (> humid 0.7) 5 (> humid 0.5) 3 :else 2)
+      :else           (cond (> humid 0.45) 8 (> erosion 0.3) 6 :else 7))))
+
+(deftm surface-height-biome
+  "Biome-aware surface height (cf valley.terrain/surface-height). scales/offsets are
+   per-biome height-scale/base-offset indexed by biome-index."
   [height-perm :- (Array int), detail-perm :- (Array int),
-   wx :- Double, wz :- Double,
-   height-scale :- Double, base-offset :- Double] :- Long
-  (let [h (noise/fbm2d height-perm
-            (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ)
-            4 0.5 2.0)
-        detail (noise/fbm2d detail-perm
-                 (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0))
-                 2 0.6 2.0)]
-    (long (+ (double BASE-HEIGHT) base-offset (* h height-scale) (* detail 4.0)))))
+   temp-perm :- (Array int), humid-perm :- (Array int), mush-perm :- (Array int),
+   scales :- (Array double), offsets :- (Array double),
+   wx :- Double, wz :- Double] :- Long
+  (let [bi     (biome-index temp-perm humid-perm detail-perm mush-perm wx wz)
+        h      (noise/fbm2d height-perm (* wx TERRAIN-FREQ) (* wz TERRAIN-FREQ) 4 0.5 2.0)
+        detail (noise/fbm2d detail-perm (* wx (/ 1.0 20.0)) (* wz (/ 1.0 20.0)) 2 0.6 2.0)
+        scale  (aget scales (int bi))
+        offset (aget offsets (int bi))]
+    (long (+ (double BASE-HEIGHT) offset (* h scale) (* detail 4.0)))))
 
 (deftm has-cave?
   "Check if world position (wx,wy,wz) is carved out by cave noise."
   [cave-perm :- (Array int), wx :- Double, wy :- Double, wz :- Double] :- Long
   (let [v (noise/fbm3d cave-perm
-            (* wx CAVE-FREQ) (* wy CAVE-FREQ) (* wz CAVE-FREQ)
-            2 0.5 2.0)]
+                       (* wx CAVE-FREQ) (* wy CAVE-FREQ) (* wz CAVE-FREQ)
+                       2 0.5 2.0)]
     (if (> (Math/abs v) CAVE-THRESHOLD) 1 0)))
 
 (deftm has-lava-pool?
   "Check if position should have a lava pool (underground, noise-based)."
   [cave-perm :- (Array int), wx :- Double, wy :- Double, wz :- Double] :- Long
   (if (> wy 20.0) 0
-    (let [v (noise/perlin3d cave-perm
-              (* wx (/ 1.0 25.0)) (* wy (/ 1.0 15.0)) (* wz (/ 1.0 25.0)))]
-      (if (> v 0.7) 1 0))))
+      (let [v (noise/perlin3d cave-perm
+                              (* wx (/ 1.0 25.0)) (* wy (/ 1.0 15.0)) (* wz (/ 1.0 25.0)))]
+        (if (> v 0.7) 1 0))))

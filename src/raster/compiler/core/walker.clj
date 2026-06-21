@@ -297,8 +297,12 @@
     (and (seq? form) (#{'letfn 'letfn*} (first form)))
     :letfn
 
-    ;; case — walk test expr and result exprs but not dispatch constants
-    (and (seq? form) (#{'case 'case*} (first form)))
+    ;; case — walk test expr and result exprs but not dispatch constants.
+    ;; Match by name: `case` is a macro, so inlining/qualification can yield
+    ;; `clojure.core/case`; treating that as a generic call would walk (and
+    ;; type-tag) the dispatch constants, e.g. 0 → (long 0), which then breaks
+    ;; clojure.core/case macroexpansion downstream.
+    (and (seq? form) (symbol? (first form)) (#{"case" "case*"} (name (first form))))
     :case
 
     ;; new — walk constructor args but not class name

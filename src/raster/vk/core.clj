@@ -106,7 +106,7 @@
             props (VkQueueFamilyProperties/calloc n stack)
             _ (VK13/vkGetPhysicalDeviceQueueFamilyProperties pd p-count props)]
         (mapv (fn [i]
-                (let [p (.get props (int i))]
+                (let [^VkQueueFamilyProperties p (.get props (int i))]
                   {:index i
                    :queue-count (.queueCount p)
                    :flags (.queueFlags p)
@@ -277,10 +277,10 @@
             si (doto (VkSubmitInfo/calloc stack)
                  (.sType VK13/VK_STRUCTURE_TYPE_SUBMIT_INFO)
                  (.pCommandBuffers p-cb))
-            result (VK13/vkQueueSubmit queue si fence)]
+            result (VK13/vkQueueSubmit queue si (long fence))]
         (when-not (= result VK13/VK_SUCCESS)
           (throw (ex-info "Queue submit failed" {:result result})))
-        (VK13/vkWaitForFences device fence true Long/MAX_VALUE)
+        (VK13/vkWaitForFences device (long fence) true Long/MAX_VALUE)
         (VK13/vkDestroyFence device fence nil))
       (finally
         (MemoryStack/stackPop)))))
