@@ -1,4 +1,19 @@
 <!doctype html>
 <html lang="en"><head><meta charset="utf-8"><title>Valley walk — WebGPU (raster.render + wasm physics)</title>
-<style>html,body{margin:0;height:100%;background:#8cc0f5;overflow:hidden}canvas{display:block;margin:0 auto}</style>
-</head><body><canvas id="game" width="1024" height="768"></canvas><script src="valley-walk-js/main.js"></script></body></html>
+<style>
+  html,body{margin:0;height:100%;background:#8cc0f5;overflow:hidden;
+            font-family:system-ui,sans-serif}
+  canvas{display:block;margin:0 auto}
+  #controls{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);
+            padding:6px 14px;border-radius:8px;background:rgba(0,0,0,0.45);color:#eef;
+            font-size:13px;letter-spacing:.3px;white-space:nowrap;pointer-events:none}
+  #controls b{color:#fff;font-weight:600}
+</style>
+</head><body>
+<canvas id="game" width="1024" height="768"></canvas>
+<div id="controls">
+  <b>WASD</b> move · <b>mouse</b> look (click to capture) · <b>F</b> fly ·
+  <b>L/R click</b> mine/place · <b>Q/E</b> hotbar · <b>Space</b> cull mob
+</div>
+<script src="valley-walk-js/main.js"></script>
+</body></html>
