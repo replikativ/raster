@@ -18,6 +18,7 @@
             [raster.compiler.backend.jvm.bytecode :as bc]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.scalar.dce :as dce]
             [raster.runtime.hardware :as hw]
             [clojure.set]
             [clojure.walk]))
@@ -469,6 +470,38 @@
   ([form bound] (util/free-syms form bound)))
 
 ;; ================================================================
+;; Lambda hygiene: dead-binding cleanup + soundness backstop
+;; ================================================================
+
+(defn clean-dead-bindings
+  "Run the canonical dead-binding DCE on a SIMD lambda whose top form is a
+  let*/let. The params pre-flatten keeps leaf-alias copies (e.g. `[W flat_W]`)
+  while resolving accesses through to the flat symbol, leaving the alias dead;
+  because that dead `let` is nested inside the loop body, the top-level DCE
+  pass never reaches it (eliminate-dead-bindings is flat-let* only), so it
+  survives into the segmap/segred lambda. Scrub it here — before emit — using
+  the SAME pass, rather than re-implementing pruning in the backend. Pure SIMD
+  value-lambdas carry no effects, so dropping dead bindings is safe.
+  Non-let forms pass through unchanged."
+  [lambda]
+  (if (and (seq? lambda) (contains? #{'let 'let*} (first lambda)))
+    (:form (dce/eliminate-dead-bindings lambda))
+    lambda))
+
+(defn value-position-arrays
+  "Array symbols that appear in pure VALUE position in body (not solely as an
+  aget array-arg / load site). Soundness backstop: emit-simd's symbol branch
+  broadcasts an unrecognized symbol as a scalar (cast-fn + broadcast), which on
+  a primitive array casts [D→double and miscompiles. If any array reaches value
+  position (e.g. a dead alias that escaped clean-dead-bindings), the caller must
+  refuse to SIMDify and fall back to the scalar loop instead of emitting that
+  cast. Returns the offending set (empty = safe to vectorize)."
+  [body idx-sym]
+  (clojure.set/intersection
+   (collect-value-free-syms body idx-sym)
+   (collect-all-aget-arrays body)))
+
+;; ================================================================
 ;; SIMD body emission (expr → Vector API S-expr)
 ;; ================================================================
 
@@ -628,7 +661,9 @@
   [segmap out-sym cast & {:keys [store-offset]}]
   (let [idx (seg-idx segmap)
         bound (seg-bound segmap)
-        raw-body (:lambda segmap)
+        ;; Scrub dead leaf-alias bindings (from the params pre-flatten) before
+        ;; emit, so a bare array symbol never reaches emit-simd's scalar-broadcast.
+        raw-body (clean-dead-bindings (:lambda segmap))
         ;; Desugar .invk for the scalar tail (bytecode compiler needs standard calls)
         desugared-body (bc/desugar-invk raw-body)
         body (clojure.walk/postwalk
@@ -641,6 +676,9 @@
                                       {:segmap-sym out-sym :cast cast})))
         cast-fn cast]
     (when (and (simd-able? body idx)
+               ;; Soundness backstop: never broadcast an array symbol as a scalar.
+               ;; If one survives in value position, bail to the scalar loop.
+               (empty? (value-position-arrays body idx))
                ;; Guard: reject if the scalar tail body contains undevirtualized
                ;; dispatch calls — these generate invalid bytecode in SIMD helpers.
                ;; Better to fall back to the plain scalar expansion.
@@ -774,7 +812,8 @@
   (let [idx (seg-idx segred)
         bound (seg-bound segred)
         {:keys [acc init lambda]} (:reduce-op segred)
-        lambda (when lambda (normalize-invk lambda))
+        ;; Scrub dead leaf-alias bindings (params pre-flatten) before emit.
+        lambda (when lambda (normalize-invk (clean-dead-bindings lambda)))
         elem-type (or (:dtype segred)
                       (throw (ex-info "SegRed missing :dtype — type metadata lost in pipeline"
                                       {:acc acc :init init})))
@@ -816,7 +855,10 @@
                     elem-expr (if (and acc-pos (seq let-bindings))
                                 (list 'let* (vec (mapcat identity let-bindings)) elem-raw)
                                 elem-raw)]
-                (when (and acc-pos (simd-able? elem-expr idx))
+                (when (and acc-pos (simd-able? elem-expr idx)
+                           ;; Soundness backstop: bail if an array symbol would
+                           ;; be broadcast as a scalar (see value-position-arrays).
+                           (empty? (value-position-arrays elem-expr idx)))
                   (let [all-inputs (set (filter #(and (symbol? %) (not= '.invk %)) (:inputs segred)))
                         ;; Collect per-array base offsets from aget patterns
                         arr-offsets (collect-arrays elem-expr idx)
