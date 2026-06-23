@@ -36,7 +36,8 @@
             [raster.dl.diffusion :as diff]
             [raster.dl.loss :as loss]
             [raster.dl.array-ops :as array-ops]
-            [raster.params :as rp]))
+            [raster.params :as rp]
+            [raster.tree :as tree]))
 
 ;; ================================================================
 ;; Variable state constants
@@ -601,6 +602,48 @@
     h))
 
 ;; ================================================================
+;; TransformerBlock as a tree/scan-vec step (defmodel)
+;; ================================================================
+;; The per-layer fold step for `tree/scan-vec`. Takes the running hidden
+;; state `h` plus one layer's weight sub-tree (the SAME HMap shape as
+;; `layer-spec`) and the shared extras. scan-vec splices each layer element's
+;; leaves into this defmodel's --flat var (canonical key order, so the
+;; ordering aligns automatically with the outer HVec element spec).
+;;
+;; NOTE: this layer spec must stay identical to `layer-spec` below — they are
+;; declared in two places (this defmodel literal + weights-spec's HVec element).
+(rp/defmodel transformer-block-step
+  [h :- (Array double)
+   layer :- (Params (HMap :mandatory
+                          {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
+                           :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
+                           :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
+                           :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
+                           :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
+                           :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
+                           :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
+                           :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
+                           :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
+   temb :- (Array double)
+   src-edges :- (Array long) dst-edges :- (Array long)
+   n-vars :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
+  :- (Array double)
+  (let [h-res (resnet-block h temb
+                            (:res-W1 layer) (:res-b1 layer)
+                            (:res-W2 layer) (:res-b2 layer)
+                            (:res-Wt layer) (:res-bt layer)
+                            (:res-g1 layer) (:res-bn1 layer)
+                            (:res-g2 layer) (:res-bn2 layer)
+                            n-vars emb-dim)]
+    (graph-attention-multihead h-res
+                               (:attn-Wq layer) (:attn-bq layer)
+                               (:attn-Wk layer) (:attn-bk layer)
+                               (:attn-Wv layer) (:attn-bv layer)
+                               (:attn-g  layer) (:attn-b  layer)
+                               src-edges dst-edges
+                               n-vars n-edges emb-dim n-heads)))
+
+;; ================================================================
 ;; FlatEmbedder: embed variable values + space + position
 ;; ================================================================
 
@@ -950,48 +993,17 @@
                            layer-keys))
                    (range n-layers))}))
 
-(defn- emit-layer-bindings
-  "For each layer index, emit let-binding pairs that:
-   - alias the layer sub-tree
-   - run resnet-block
-   - run graph-attention-multihead
-  All accesses use HMap path access — pre-flatten resolves them to flat args."
-  [n-layers]
-  (mapcat
-   (fn [i]
-     (let [layer-sym (symbol (str "layer-" i))
-           h-in      (if (zero? i) 'h-init (symbol (str "h-" i)))
-           h-res     (symbol (str "h-" (inc i) "-res"))
-           h-out     (symbol (str "h-" (inc i)))]
-       [layer-sym `(~'clojure.core/nth (:layers ~'w) ~i)
-        h-res `(raster.dl.gsdm/resnet-block
-                 ~h-in ~'temb
-                 (:res-W1 ~layer-sym) (:res-b1 ~layer-sym)
-                 (:res-W2 ~layer-sym) (:res-b2 ~layer-sym)
-                 (:res-Wt ~layer-sym) (:res-bt ~layer-sym)
-                 (:res-g1 ~layer-sym) (:res-bn1 ~layer-sym)
-                 (:res-g2 ~layer-sym) (:res-bn2 ~layer-sym)
-                 ~'n-vars ~'emb-dim-val)
-        h-out `(raster.dl.gsdm/graph-attention-multihead
-                 ~h-res
-                 (:attn-Wq ~layer-sym) (:attn-bq ~layer-sym)
-                 (:attn-Wk ~layer-sym) (:attn-bk ~layer-sym)
-                 (:attn-Wv ~layer-sym) (:attn-bv ~layer-sym)
-                 (:attn-g  ~layer-sym) (:attn-b  ~layer-sym)
-                 ~'src-edges ~'dst-edges
-                 ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)]))
-   (range n-layers)))
-
 (defn gsdm-loss-body
-  "Generate the full GSDM loss body S-expression for given config.
+  "Generate the GSDM loss body S-expression. The layer stack is folded by
+  `tree/scan-vec` over `(:layers w)` — the compiler unrolls it from the HVec
+  length in the weights spec, so this body is INDEPENDENT of n-layers (it no
+  longer generates the per-layer chain by hand). Only emb-dim/n-heads/n-spaces
+  are baked as constants.
 
   The body assumes outer scope binds: w, values, spaces, target, states,
-  pos-emb, src-edges, dst-edges, t, n-vars, n-edges (the defmodel arg
-  vector). It uses (:k w) / (nth (:layers w) i) accesses; the pre-flatten
-  pass converts these to flat-arg references during compile."
-  [n-layers emb-dim n-heads n-spaces]
-  (let [last-h (symbol (str "h-" n-layers))]
-    `(~'let [~'emb-dim-val ~(long emb-dim)
+  pos-emb, src-edges, dst-edges, t, n-vars, n-edges (the defmodel arg vector)."
+  [emb-dim n-heads n-spaces]
+  `(~'let [~'emb-dim-val ~(long emb-dim)
            ~'n-heads-val ~(long n-heads)
            ~'n-spaces-val ~(long n-spaces)
            ~'n-states-val ~(long N-STATES)
@@ -1003,15 +1015,18 @@
            ~'temb (raster.dl.gsdm/timestep-mlp
                     ~'t (:temb-W1 ~'w) (:temb-b1 ~'w)
                     (:temb-W2 ~'w) (:temb-b2 ~'w) ~'emb-dim-val)
-           ~@(emit-layer-bindings n-layers)
+           ~'h-final (raster.tree/scan-vec raster.dl.gsdm/transformer-block-step
+                       ~'h-init (:layers ~'w)
+                       ~'temb ~'src-edges ~'dst-edges
+                       ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)
            ~'pred (raster.dl.gsdm/flat-unembed
-                    ~last-h
+                    ~'h-final
                     (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
                     (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
                     ~'n-vars ~'emb-dim-val)
            ~'loss (raster.dl.array-ops/masked-mse-loss
                     ~'pred ~'target ~'states ~'n-vars)]
-       ~'loss)))
+       ~'loss))
 
 (defn make-gsdm-loss
   "Eval a deftm for the given config and return its var. The var has
@@ -1021,7 +1036,7 @@
   [{:keys [n-layers emb-dim n-heads n-spaces]
     :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1}}]
   (let [w-spec (weights-spec n-layers)
-        body (gsdm-loss-body n-layers emb-dim n-heads n-spaces)
+        body (gsdm-loss-body emb-dim n-heads n-spaces)
         sym  (symbol (str "gsdm-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s"))
         form `(raster.core/deftm ~sym
                 [~'w :- ~w-spec
