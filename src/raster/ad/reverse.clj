@@ -2184,12 +2184,25 @@
 ;; S-expression level API (for testing without deftm)
 ;; ================================================================
 
+(declare hoist-nested-lets)
+
 (defn grad-expr
   "Transform a quoted S-expression for reverse-mode AD.
   Returns the transformed S-expression that evaluates to
-  [primal, pullback-fn]."
+  [primal, pullback-fn].
+
+  Recurses into user `deftm` calls that have no AD template by inlining them to
+  template-bearing primitives first (the Zygote 'recurse-into-IR unless a rule
+  exists' model), then hoists nested lets into flat ANF — mirroring the
+  var-driven path (`build-grad-walked-body`). Without this, a raw form
+  containing a user-deftm call throws \"No AD template\" instead of recursing,
+  because the differentiator core only knows template-bearing primitives. Ops
+  WITH a template stay symbolic for the transform."
   [form active-params]
-  (transform-body form (vec active-params)))
+  (let [lowered (binding [inline/*ad-transform-body-fn* transform-body]
+                  (inline/lower-to-ad-primitives form))
+        hoisted (hoist-nested-lets lowered)]
+    (transform-body hoisted (vec active-params))))
 
 (defn numerical-gradient
   "Compute gradient by finite differences (for testing).
