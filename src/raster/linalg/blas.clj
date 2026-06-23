@@ -192,42 +192,46 @@
   [A :- (Array double) B :- (Array double) C :- (Array double)
    m :- Long k :- Long n :- Long alpha :- Double beta :- Double]
   :- (Array double)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int k)
-                         (MemorySegment/ofArray B) (int n)
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  ;; Skip degenerate (empty) gemm — see the f32 dgemm-nt! note (MKL lda=0 guard).
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int k)
+                           (MemorySegment/ofArray B) (int n)
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 (deftm ^:no-inline dgemm-tn!
   [A :- (Array double) B :- (Array double) C :- (Array double)
    m :- Long k :- Long n :- Long alpha :- Double beta :- Double]
   :- (Array double)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int m)   ;; lda = m (A is [k,m])
-                         (MemorySegment/ofArray B) (int n)
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int m)   ;; lda = m (A is [k,m])
+                           (MemorySegment/ofArray B) (int n)
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 (deftm ^:no-inline dgemm-nt!
   [A :- (Array double) B :- (Array double) C :- (Array double)
    m :- Long k :- Long n :- Long alpha :- Double beta :- Double]
   :- (Array double)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int k)
-                         (MemorySegment/ofArray B) (int k)   ;; ldb = k (B is [n,k])
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int k)
+                           (MemorySegment/ofArray B) (int k)   ;; ldb = k (B is [n,k])
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 ;; ================================================================
@@ -258,42 +262,50 @@
   [A :- (Array float) B :- (Array float) C :- (Array float)
    m :- Long k :- Long n :- Long alpha :- Float beta :- Float]
   :- (Array float)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int k)
-                         (MemorySegment/ofArray B) (int n)
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int k)
+                           (MemorySegment/ofArray B) (int n)
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 (deftm ^:no-inline dgemm-tn!
   [A :- (Array float) B :- (Array float) C :- (Array float)
    m :- Long k :- Long n :- Long alpha :- Float beta :- Float]
   :- (Array float)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int m)
-                         (MemorySegment/ofArray B) (int n)
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_TRANS CBLAS_NO_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int m)
+                           (MemorySegment/ofArray B) (int n)
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 (deftm ^:no-inline dgemm-nt!
   [A :- (Array float) B :- (Array float) C :- (Array float)
    m :- Long k :- Long n :- Long alpha :- Float beta :- Float]
   :- (Array float)
-  (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-                        [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
-                         (int m) (int n) (int k)
-                         alpha
-                         (MemorySegment/ofArray A) (int k)
-                         (MemorySegment/ofArray B) (int k)
-                         beta
-                         (MemorySegment/ofArray C) (int n)])
+  ;; A degenerate (empty) gemm is a no-op; skip the FFI call. MKL rejects
+  ;; lda=0 (Parameter 9) while OpenBLAS tolerates it. The all-zero case comes
+  ;; from raster's parametric specialization invoking the freshly-compiled
+  ;; float `linear` impl with the triggering call's args (core.clj parametric-
+  ;; specialize!). Guarding here keeps both backends happy and is BLAS-correct.
+  (when (and (pos? m) (pos? n) (pos? k))
+    (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+                          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS
+                           (int m) (int n) (int k)
+                           alpha
+                           (MemorySegment/ofArray A) (int k)
+                           (MemorySegment/ofArray B) (int k)
+                           beta
+                           (MemorySegment/ofArray C) (int n)]))
   C)
 
 ;; ================================================================
