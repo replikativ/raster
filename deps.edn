@@ -2,14 +2,17 @@
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/data.json {:mvn/version "2.5.1"}
         org.typedclojure/typed.clj.checker {:git/url "https://github.com/whilo/typedclojure"
-                                            :git/sha "5c6412026dea6a7cd24e1eb4f1b3408b350f7f4f"
+                                            :git/sha "ea66226f7e998f88e779b6ec3bb7332049728438"
                                             :deps/root "typed/clj.checker"}
         org.replikativ/pattern {:mvn/version "1.0.449"}
         org.replikativ/beichte {:mvn/version "0.2.7"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
-                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}
+                      ;; Pure-JVM WebAssembly runtime — validates + executes the
+                      ;; emitted wasm in-process (Track A backend tests).
+                      com.dylibso.chicory/runtime {:mvn/version "1.5.1"}}
          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"
@@ -85,7 +88,7 @@
           :ns-default build}
   :valhalla {:extra-paths ["classes"]
              :jvm-opts ["-XX:ReservedCodeCacheSize=512m"
-                        "-Xmx12g"
+                        "-Xmx8g"
                         "--enable-preview"
                         "--add-exports" "java.base/jdk.internal.vm.annotation=ALL-UNNAMED"
                         "--add-exports" "java.base/jdk.internal.classfile.components=ALL-UNNAMED"

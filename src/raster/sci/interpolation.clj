@@ -60,16 +60,16 @@
   ;; Forward sweep
                                (loop [i 1]
                                  (when (< i n)
-                                   (let [m (/ (aget a (dec i)) (aget b (dec i)))]
-                                     (aset b i (- (aget b i) (* m (aget c (dec i)))))
-                                     (aset d i (- (aget d i) (* m (aget d (dec i))))))
+                                   (let [m (n// (aget a (dec i)) (aget b (dec i)))]
+                                     (aset b i (n/- (aget b i) (n/* m (aget c (dec i)))))
+                                     (aset d i (n/- (aget d i) (n/* m (aget d (dec i))))))
                                    (recur (inc i))))
   ;; Back substitution
-                               (aset d (dec n) (/ (aget d (dec n)) (aget b (dec n))))
+                               (aset d (dec n) (n// (aget d (dec n)) (aget b (dec n))))
                                (loop [i (- n 2)]
                                  (when (>= i 0)
-                                   (aset d i (/ (- (aget d i) (* (aget c i) (aget d (inc i))))
-                                                (aget b i)))
+                                   (aset d i (n// (n/- (aget d i) (n/* (aget c i) (aget d (inc i))))
+                                                  (aget b i)))
                                    (recur (dec i))))
                                d))
 
@@ -85,7 +85,7 @@
         ;; Compute intervals h_i = x_{i+1} - x_i
                                h (raster.arrays/alloc-like xs n-1)
                                _ (dotimes [i n-1]
-                                   (aset h i (- (aget xs (inc i)) (aget xs i))))
+                                   (aset h i (n/- (aget xs (inc i)) (aget xs i))))
         ;; Set up tridiagonal system for second derivatives (moments) M
                                nm (- n 2)
                                sub (raster.arrays/alloc-like xs (max 1 (dec nm)))
@@ -96,10 +96,10 @@
       ;; Only 3 points: nm=1, trivial
                              (let [M (raster.arrays/alloc-like xs n)
                                    _ (when (== nm 1)
-                                       (aset diag 0 (* 2.0 (+ (aget h 0) (aget h 1))))
-                                       (aset rhs 0 (* 6.0 (- (/ (- (aget ys 2) (aget ys 1)) (aget h 1))
-                                                             (/ (- (aget ys 1) (aget ys 0)) (aget h 0)))))
-                                       (aset M 1 (/ (aget rhs 0) (aget diag 0))))
+                                       (aset diag 0 (n/* 2.0 (n/+ (aget h 0) (aget h 1))))
+                                       (aset rhs 0 (n/* 6.0 (n/- (n// (n/- (aget ys 2) (aget ys 1)) (aget h 1))
+                                                                 (n// (n/- (aget ys 1) (aget ys 0)) (aget h 0)))))
+                                       (aset M 1 (n// (aget rhs 0) (aget diag 0))))
                                    cs (raster.arrays/alloc-like xs n)]
                                (dotimes [i n] (aset cs i (aget M i)))
                                (ftm [x :- Double] :- Double
@@ -118,9 +118,9 @@
                              (do
                                (dotimes [i nm]
                                  (let [j (inc i)]
-                                   (aset diag i (* 2.0 (+ (aget h (dec j)) (aget h j))))
-                                   (aset rhs i (* 6.0 (- (/ (- (aget ys (inc j)) (aget ys j)) (aget h j))
-                                                         (/ (- (aget ys j) (aget ys (dec j))) (aget h (dec j))))))))
+                                   (aset diag i (n/* 2.0 (n/+ (aget h (dec j)) (aget h j))))
+                                   (aset rhs i (n/* 6.0 (n/- (n// (n/- (aget ys (inc j)) (aget ys j)) (aget h j))
+                                                             (n// (n/- (aget ys j) (aget ys (dec j))) (aget h (dec j))))))))
                                (dotimes [i (dec nm)]
                                  (aset sub i (aget h (inc i)))
                                  (aset sup i (aget h (inc i))))
@@ -155,39 +155,39 @@
         ;; Compute slopes m_i = (y_{i+1} - y_i) / (x_{i+1} - x_i)
                                m (raster.arrays/alloc-like xs (+ n-1 4))  ;; padded: m[-2], m[-1], m[0]..m[n-2], m[n-1], m[n]
                                _ (dotimes [i n-1]
-                                   (aset m (+ i 2) (/ (- (aget ys (inc i)) (aget ys i))
-                                                      (- (aget xs (inc i)) (aget xs i)))))
+                                   (aset m (+ i 2) (n// (n/- (aget ys (inc i)) (aget ys i))
+                                                        (n/- (aget xs (inc i)) (aget xs i)))))
         ;; Pad ends
                                _ (let [m0 (aget m 2) m1 (aget m 3)]
-                                   (aset m 1 (- (* 2.0 m0) m1))
-                                   (aset m 0 (- (* 2.0 (aget m 1)) m0)))
+                                   (aset m 1 (n/- (n/* 2.0 m0) m1))
+                                   (aset m 0 (n/- (n/* 2.0 (aget m 1)) m0)))
                                _ (let [mn-2 (aget m (dec n)) mn-1 (aget m n)]
-                                   (aset m (inc n) (- (* 2.0 mn-1) mn-2))
-                                   (aset m (+ n 2) (- (* 2.0 (aget m (inc n))) mn-1)))
+                                   (aset m (inc n) (n/- (n/* 2.0 mn-1) mn-2))
+                                   (aset m (+ n 2) (n/- (n/* 2.0 (aget m (inc n))) mn-1)))
         ;; Compute Akima weights and slopes at each knot
                                slopes (raster.arrays/alloc-like xs n)
                                _ (dotimes [j n]
                                    (let [i (+ j 2)
-                                         t-im1 (n/abs (- (aget m (dec i)) (aget m (- i 2))))
-                                         t-ip1 (n/abs (- (aget m (inc i)) (aget m i)))
-                                         denom (+ t-ip1 t-im1)]
+                                         t-im1 (n/abs (n/- (aget m (dec i)) (aget m (- i 2))))
+                                         t-ip1 (n/abs (n/- (aget m (inc i)) (aget m i)))
+                                         denom (n/+ t-ip1 t-im1)]
                                      (aset slopes j
                                            (if (< denom 1e-30)
-                                             (* 0.5 (+ (aget m (dec i)) (aget m i)))
-                                             (/ (+ (* t-ip1 (aget m (dec i))) (* t-im1 (aget m i)))
-                                                denom)))))
+                                             (n/* 0.5 (n/+ (aget m (dec i)) (aget m i)))
+                                             (n// (n/+ (n/* t-ip1 (aget m (dec i))) (n/* t-im1 (aget m i)))
+                                                  denom)))))
         ;; Compute cubic polynomial coefficients per interval
                                b-arr (raster.arrays/alloc-like xs n-1)
                                c-arr (raster.arrays/alloc-like xs n-1)
                                d-arr (raster.arrays/alloc-like xs n-1)
                                _ (dotimes [i n-1]
-                                   (let [hi (- (aget xs (inc i)) (aget xs i))
+                                   (let [hi (n/- (aget xs (inc i)) (aget xs i))
                                          si (aget slopes i)
                                          si+1 (aget slopes (inc i))
-                                         mi (/ (- (aget ys (inc i)) (aget ys i)) hi)]
+                                         mi (n// (n/- (aget ys (inc i)) (aget ys i)) hi)]
                                      (aset b-arr i si)
-                                     (aset c-arr i (/ (- (* 3.0 mi) (* 2.0 si) si+1) hi))
-                                     (aset d-arr i (/ (+ si si+1 (* -2.0 mi)) (* hi hi)))))]
+                                     (aset c-arr i (n// (n/- (n/- (n/* 3.0 mi) (n/* 2.0 si)) si+1) hi))
+                                     (aset d-arr i (n// (n/+ (n/+ si si+1) (n/* -2.0 mi)) (n/* hi hi)))))]
                            (ftm [x :- Double] :- Double
                                 (let [i (find-interval xs x n)
                                       dx (n/- x (aget xs i))]
@@ -217,9 +217,9 @@
              h (raster.arrays/alloc-like xs n-1)
              delta (raster.arrays/alloc-like xs n-1)
              _ (dotimes [i n-1]
-                 (let [hi (- (aget xs (inc i)) (aget xs i))]
+                 (let [hi (n/- (aget xs (inc i)) (aget xs i))]
                    (aset h i hi)
-                   (aset delta i (/ (- (aget ys (inc i)) (aget ys i)) hi))))
+                   (aset delta i (n// (n/- (aget ys (inc i)) (aget ys i)) hi))))
         ;; Compute PCHIP derivatives at each knot
              d (raster.arrays/alloc-like xs n)
              _ (do
@@ -228,13 +228,13 @@
                    (when (< i n-1)
                      (let [d1 (aget delta (dec i))
                            d2 (aget delta i)]
-                       (if (or (<= (* d1 d2) 0.0))
+                       (if (or (<= (n/* d1 d2) 0.0))
                     ;; Different signs or zero: set derivative to zero
                          (aset d i 0.0)
                     ;; Weighted harmonic mean
-                         (let [w1 (+ (* 2.0 (aget h i)) (aget h (dec i)))
-                               w2 (+ (aget h i) (* 2.0 (aget h (dec i))))]
-                           (aset d i (/ (+ w1 w2) (+ (/ w1 d1) (/ w2 d2)))))))
+                         (let [w1 (n/+ (n/* 2.0 (aget h i)) (aget h (dec i)))
+                               w2 (n/+ (aget h i) (n/* 2.0 (aget h (dec i))))]
+                           (aset d i (n// (n/+ w1 w2) (n/+ (n// w1 d1) (n// w2 d2)))))))
                      (recur (inc i))))
             ;; Endpoint derivatives: one-sided shape-preserving
                  (let [d0 (aget delta 0)]
@@ -249,8 +249,8 @@
                        di (aget d i)
                        di+1 (aget d (inc i))
                        deli (aget delta i)]
-                   (aset c2 i (/ (- (* 3.0 deli) (* 2.0 di) di+1) hi))
-                   (aset c3 i (/ (+ di di+1 (* -2.0 deli)) (* hi hi)))))]
+                   (aset c2 i (n// (n/- (n/- (n/* 3.0 deli) (n/* 2.0 di)) di+1) hi))
+                   (aset c3 i (n// (n/+ (n/+ di di+1) (n/* -2.0 deli)) (n/* hi hi)))))]
          (ftm [x :- Double] :- Double
               (let [i (find-interval xs x n)
                     dx (n/- x (aget xs i))]

@@ -14,9 +14,9 @@
 (deftm pdot
   "Parametric dot product — instantiated per element type."
   (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- Double
-    (raster.par/reduce acc 0.0 i n
-      (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget a i)
-                                              (raster.arrays/aget b i))))))
+       (raster.par/reduce acc 0.0 i n
+                          (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget a i)
+                                                                  (raster.arrays/aget b i))))))
 
 (deftest parametric-float-wires-typed-dispatch
   (testing "float specialization wires into the typed dispatch object (not untyped fallback)"

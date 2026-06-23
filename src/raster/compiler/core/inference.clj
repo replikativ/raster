@@ -188,6 +188,52 @@
     (reduce merge {} (map collect-binding-types-from-ast form))
     :else nil))
 
+;; TC stamps each checked node's type under this key (= typed.cljc.checker.utils/expr-type).
+(def ^:private tc-expr-type-key :typed.cljc.checker.utils/expr-type)
+
+(defn- tcr->dispatch-tag
+  "TCResult / raw type / [Type FilterSet] → raster dispatch tag, or nil."
+  [tcr]
+  (let [t (cond
+            (vector? tcr) (first tcr)
+            :else (try (:t tcr) (catch Exception _ tcr)))]
+    (cond
+      (nil? t) nil
+      (symbol? t) (or (class-sym->dispatch-tag t) (get tc-alias->dispatch-tag t))
+      :else (tc-type->tag t))))
+
+(defn- collect-binding-types-from-checked-ast
+  "Walk a TC :checked-ast, collecting {binding-sym → dispatch-tag} from the
+   u/expr-type stamped on each :let / :loop binding node. This replaces reading
+   ::binding-types form metadata: let*/loop* and (via Option X) the core/let
+   extension all expose per-binding types directly on the binding AST nodes.
+
+   Keyed by the original (de-uniquified) symbol, since the walker looks tags up by
+   source name. A name may be bound in more than one scope with DIFFERENT types
+   (shadowing — e.g. a macro like `broadcast` reusing a binding name for its loop
+   element, scalar, over an outer array of the same name). Conflating those would
+   mis-tag the outer binding, so a symbol with conflicting tags across scopes is
+   dropped (left for the walker to infer per-scope); a symbol consistently typed
+   everywhere keeps its tag."
+  [ast]
+  (let [acc (atom {})]                       ; sym → set of observed tags
+    (letfn [(walk [x]
+              (when (map? x)
+                (when (#{:let :loop} (:op x))
+                  (doseq [b (:bindings x)]
+                    (let [sym (:form b)
+                          tag (when-let [tcr (get b tc-expr-type-key)]
+                                (tcr->dispatch-tag tcr))]
+                      (when (and tag (symbol? sym))
+                        (swap! acc update sym (fnil conj #{}) tag)))))
+                (doseq [k (:children x)]
+                  (let [v (get x k)]
+                    (if (vector? v) (doseq [c v] (walk c)) (walk v))))))]
+      (walk ast))
+    (into {} (keep (fn [[sym tags]]
+                     (when (= 1 (count tags)) [sym (first tags)]))
+                   @acc))))
+
 (defn- raster-ann->tc-type
   "Convert a Raster type annotation to a TypedClojure type form.
   (Fn [Double] Double) → [Double :-> Double]
@@ -239,15 +285,15 @@
                                       source-ns (the-ns source-ns))
                                     *ns*)]
                      (try (check-fn wrapped {:checked-ast true
-                                           :check-config {:check-form-eval :never}})
-                        (catch Throwable e1
+                                             :check-config {:check-form-eval :never}})
+                          (catch Throwable e1
                           ;; Fallback: retry without checked-ast if TC's internal
                           ;; compilation fails (e.g., primitive :tag on let bindings)
-                          (try (check-fn wrapped {})
-                               (catch Throwable e2
-                                 (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
-                                               (.getMessage e1) " → retry: " (.getMessage e2)))
-                                 nil)))))]
+                            (try (check-fn wrapped {})
+                                 (catch Throwable e2
+                                   (println (str "WARNING: TypedClojure check failed for `" fn-name "`: "
+                                                 (.getMessage e1) " → retry: " (.getMessage e2)))
+                                   nil)))))]
         (when result
           (when (and (seq (:type-errors result))
                      (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
@@ -270,10 +316,9 @@
                                                  (mapv name (types/extract-tags params annotations))
                                                  " may return: " type-strs
                                                  ". Consider adding :- RetType or fixing branches.")))
-                    ;; Extract per-binding types from checked AST
+                    ;; Extract per-binding types straight off the checked AST nodes
                       binding-tags (when-let [ast (:checked-ast result)]
-                                     (let [out-form (:out-form result)]
-                                       (collect-binding-types-from-ast out-form)))]
+                                     (collect-binding-types-from-checked-ast ast))]
                   {:ret-tag (when rng (tc-type->tag rng))
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
@@ -326,8 +371,8 @@
                         (try (check-fn wrapped {})
                              (catch Throwable _ nil))))]
       (when (and result (empty? (:type-errors result)))
-        (let [out-form (:out-form result)]
-          (collect-binding-types-from-ast out-form))))
+        (when-let [ast (:checked-ast result)]
+          (collect-binding-types-from-checked-ast ast))))
     (catch Throwable _ nil)))
 
 ;; ================================================================
@@ -732,6 +777,9 @@
       (when (symbol? arr-sym)
         (let [env-tag (type-env-tag type-env arr-sym)]
           (or (type-env-element type-env arr-sym)
+              ;; Element dispatch tag carried on the symbol (stamped at the binding
+              ;; site) — survives a re-walk whose env doesn't reach a captured var.
+              (:raster.type/element (meta arr-sym))
               (get types/primitive-array-element-types env-tag)
               (get types/primitive-array-element-types (:tag (meta arr-sym)))
               (get @types/soa-reverse-registry env-tag)))))))
@@ -789,6 +837,51 @@
         ;; Unknown
         :else nil))))
 
+(declare infer-rewritten-tag)
+
+(defn- prim-class->tag
+  "Map a (boxed or primitive) numeric Class to a raster type tag, else nil."
+  [c]
+  (condp = c
+    Double/TYPE 'double Float/TYPE 'float Long/TYPE 'long Integer/TYPE 'int
+    java.lang.Double 'double java.lang.Float 'float java.lang.Long 'long java.lang.Integer 'int
+    nil))
+
+(defn static-method-return-tag
+  "Return tag of a Java static-method call (Class/method args…) via reflection,
+   resolving overloads by the args' inferred tags. nil if the class/method can't be
+   resolved or the overload stays ambiguous. This lets the inference type interop
+   like (Math/floor x) → double, so arithmetic over it devirtualizes AT WALK TIME
+   (and thus carries :raster.type/tag), rather than falling back to a later,
+   weaker-typed resolution. TC reflects the same return type into :tag; this is the
+   raster-side equivalent that feeds :raster.type/tag."
+  [head args type-env]
+  (when (and (symbol? head) (namespace head))
+    (when-let [cls (try (resolve (symbol (namespace head))) (catch Throwable _ nil))]
+      (when (class? cls)
+        (let [mn (name head)
+              n  (count args)
+              cand (filter (fn [^java.lang.reflect.Method m]
+                             (and (= mn (.getName m))
+                                  (java.lang.reflect.Modifier/isStatic (.getModifiers m))
+                                  (= n (.getParameterCount m))))
+                           (.getMethods cls))
+              rets (distinct (map (fn [^java.lang.reflect.Method m] (prim-class->tag (.getReturnType m))) cand))]
+          (cond
+            ;; unambiguous (e.g. floor, sqrt) — every overload returns the same prim
+            (and (= 1 (count rets)) (first rets)) (first rets)
+            ;; overloaded (e.g. abs, min, max) — pick by the args' inferred tags
+            (seq cand)
+            (let [atags (mapv (fn [a] (or (when (symbol? a) (type-env-tag type-env a))
+                                          (literal-tag a)
+                                          (when (seq? a) (infer-rewritten-tag a nil type-env))))
+                              args)]
+              (some (fn [^java.lang.reflect.Method m]
+                      (when (= atags (mapv prim-class->tag (.getParameterTypes m)))
+                        (prim-class->tag (.getReturnType m))))
+                    cand))
+            :else nil))))))
+
 (defn infer-rewritten-tag
   "Infer the return type tag of a rewritten expression.
   type-env: {sym → {:tag, :fn-info, :element}} (optional, for dispatched calls)"
@@ -826,11 +919,12 @@
               (if (>= (rank then-tag) (rank else-tag)) then-tag else-tag)
               :else (or (promote-tag then-tag else-tag) then-tag else-tag)))
 
-           ;; Devirtualized call
+           ;; Devirtualized call (a var) — or a Java static method (Class/method)
           (and (symbol? head) (not= '.invk head))
-          (when-let [v (resolve head)]
-            (or (:raster.core/return-tag (meta v))
-                (:tag (meta v))))
+          (or (when-let [v (try (resolve head) (catch Throwable _ nil))]
+                (or (:raster.core/return-tag (meta v))
+                    (:tag (meta v))))
+              (static-method-return-tag head (rest rewritten-form) type-env))
 
            ;; .invk call
           (and (= '.invk head) (symbol? (second rewritten-form)))
@@ -1384,11 +1478,27 @@
                           (var? resolved)
                           (symbol (str (.name (.ns ^clojure.lang.Var resolved)))
                                   (str (.sym ^clojure.lang.Var resolved)))
+                          ;; Bare class name (e.g. (new Foo ...), (catch Foo e),
+                          ;; or a class in value position): qualify to its FQN so
+                          ;; the backend resolves it with no ns context.
+                          (class? resolved)
+                          (symbol (.getName ^Class resolved))
                           :else expr))
                       (and (namespace expr)
                            (try (the-ns (symbol (namespace expr))) true
                                 (catch Exception _ false)))
                       expr
+                      ;; Java static-call head `Class/method` where the namespace
+                      ;; part is a simple (imported) class name, not a loaded ns:
+                      ;; qualify Class to its FQN so the backend resolves it with no
+                      ;; ns context (e.g. MemorySegment/ofArray ->
+                      ;; java.lang.foreign.MemorySegment/ofArray when inlined out of
+                      ;; the ns that imported it).
+                      (and (namespace expr)
+                           (class? (try (ns-resolve source-ns (symbol (namespace expr)))
+                                        (catch Exception _ nil))))
+                      (symbol (.getName ^Class (ns-resolve source-ns (symbol (namespace expr))))
+                              (name expr))
                       :else
                       (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
                         (symbol (str (.name (.ns v))) (str (.sym v)))

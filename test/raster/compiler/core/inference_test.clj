@@ -115,6 +115,43 @@
 ;; trace-inference
 ;; ================================================================
 
+;; ================================================================
+;; tc-analyze-deftm-body — types are consumed ONLY from a clean check
+;; ================================================================
+
+(deftest tc-clean-body-yields-binding-tags-test
+  (testing "a body that type-checks cleanly exposes ret-tag + per-binding tags"
+    (let [r (inf/tc-analyze-deftm-body
+             'clean '[x] '[Double]
+             '[(let [y (clojure.core/+ x 1.0)
+                     z (clojure.core/* y 2.0)]
+                 z)]
+             *ns*)]
+      (is (= 'double (:ret-tag r)))
+      (is (= 'double (get (:binding-tags r) 'y)))
+      (is (= 'double (get (:binding-tags r) 'z))))))
+
+(deftest tc-delayed-error-discards-all-tags-test
+  ;; GUARD against re-relaxing the (empty? type-errors) gate. It is tempting to
+  ;; read partial per-binding types off the :checked-ast even when the body has a
+  ;; delayed type-error (to devirtualize the "well-typed" bindings of a kernel
+  ;; whose interop bits TC can't type). That is UNSOUND: under error recovery TC
+  ;; can assign a *concrete but wrong* type to a SIBLING binding (e.g. tag a
+  ;; double-array local as Long), which maps to a real dispatch tag and overrides
+  ;; the correct structural inference — emitting a bad cast (observed as
+  ;; ClassCastException in raster.linalg dgetrf!/sparse dot when this was tried).
+  ;; So any delayed error must discard the whole TC result; the walker then falls
+  ;; back to structural inference, which handles these bodies correctly.
+  (let [r (inf/tc-analyze-deftm-body
+           'mixed '[x o] '[Double nil]
+           '[(let [y (clojure.core/+ x 1.0)
+                   z (clojure.core/* y 2.0)
+                   w (.someUnknownMethod o)]
+               z)]
+           *ns*)]
+    (is (or (nil? r) (empty? (:binding-tags r)))
+        "delayed type-error => no TC binding tags are exposed (structural fallback)")))
+
 (deftest trace-inference-test
   (testing "trace-inference prints provenance when enabled"
     (let [output (with-out-str

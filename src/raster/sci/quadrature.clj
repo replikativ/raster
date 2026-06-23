@@ -9,11 +9,11 @@
     (quadgk (fn [x] (* x x)) 0.0 1.0)         ;=> [0.3333... ~0.0]
     (trapz (double-array [0 1 4 9]) 1.0)        ;=> 9.5
     (simps (fn [x] (m/sin x)) 0.0 n/pi)   ;=> ~2.0"
-  (:refer-clojure :exclude [aget aset alength aclone])
+  (:refer-clojure :exclude [aget aset alength aclone + - * /])
   (:require [raster.core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.math :as m]
-            [raster.numeric :as n]))
+            [raster.numeric :as n :refer [+ - * /]]))
 
 ;; ================================================================
 ;; Gauss-Kronrod 7-15 point rule

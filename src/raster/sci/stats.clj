@@ -12,11 +12,11 @@
      (t-test-1sample (double-array [1 2 3 4 5]) 5 0.0)
      (describe (double-array [1 2 3 4 5]) 5)
      (pearson (double-array [1 2 3]) (double-array [2 4 6]) 3)"
-  (:refer-clojure :exclude [aget aset alength aclone])
+  (:refer-clojure :exclude [aget aset alength aclone + - * /])
   (:require [raster.core :refer [deftm defvalue reduce!]]
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.math :as m]
-            [raster.numeric :as n]
+            [raster.numeric :as n :refer [+ - * /]]
             [raster.sci.special :refer [lgamma gammainc betainc]]))
 
 ;; ================================================================

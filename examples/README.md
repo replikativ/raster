@@ -22,31 +22,29 @@ Also: [Reaction-Diffusion](reaction_diffusion/) — Gray-Scott pattern formation
 
 ## Games
 
-Interactive games built on the `raster.vk` Vulkan engine.
+| Example | Description |
+|---------|------------|
+| [Asteroids](asteroids/) | Geometric Asteroids — polygon shapes via `defvalue`/`deftm`; cross-platform |
+| [Doom](doom/) | WAD renderer — BSP, sprites, HUD (WIP) |
+| [Valley](valley/) | Streaming voxel world — biome terrain, caves, ores, trees, lighting, water, mobs; cross-platform |
 
-| Example | Description | LOC |
-|---------|------------|-----|
-| [Asteroids](asteroids/) | Classic arcade — 2D sprites, audio, keyboard | 758 |
-| [Doom](doom/) | WAD renderer — BSP, sprites, monsters, HUD, music | 4,920 |
-| [Valley](valley/) | Voxel survival — procedural terrain, crafting, mobs | 7,226 |
+**Asteroids** and **Valley** are cross-platform: one `.cljc` codebase runs on the JVM
+(Vulkan + `deftm`→bytecode) and in the browser (WebGPU + `deftm`→WebAssembly). See
+[asteroids/web/README.md](asteroids/web/README.md) for the browser builds.
 
-All games use the `:vulkan` deps.edn alias for LWJGL dependencies.
-
-### Running Games
+### Running (JVM)
 
 ```bash
-source valhalla-env.sh
-clojure -J--enable-preview \
-  -J--add-exports=java.base/jdk.internal.vm.annotation=ALL-UNNAMED \
-  -J--enable-native-access=ALL-UNNAMED \
-  -Sdeps '{:paths ["src" "examples"]}' \
-  -M:vulkan -m <entry-point>
+clojure -Sdeps '{:paths ["src" "examples"]}' -M:vulkan -m <entry-point>
 ```
 
 Entry points:
-- Asteroids: `-m asteroids`
+- Asteroids (Vulkan): `-m asteroids.vk-main` — or `-m asteroids.jvm` for a no-native-deps Swing window
 - Doom: `-m doom.run`
-- Valley: `-m valley.game`
+- Valley (Vulkan): `-m valley.vk-walk`
+
+(The `:vulkan` alias pulls in the LWJGL dependencies. The Valhalla JDK is optional —
+needed only for the `Dual4` value-type fast paths, not for the games.)
 
 ### Architecture
 

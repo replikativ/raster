@@ -14,6 +14,7 @@
             [raster.runtime.hardware :as hw]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.passes.scalar.soa-lower :as sl]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [clojure.string :as str]
             [clojure.walk :as walk]))
@@ -115,8 +116,8 @@
         ;; Auto-collect array types from walker :tag metadata, merge with explicit
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
-        ;; SoA expansion: find symbols with SoA type tags
-        soa-expansions (ce/collect-soa-expansions body)
+        ;; SoA expansion: find symbols with SoA type tags (shared body-tag detector)
+        soa-expansions (sl/collect-soa-env body)
         array-syms (ce/collect-arrays-in-body body)
         written-syms (ce/collect-written-arrays body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
@@ -169,14 +170,21 @@
         all-params (str/join ", "
                              (remove empty?
                                      [plain-arr-param-str soa-arr-param-str scl-param-str "int _n_bound"]))
-        ;; Struct typedefs preamble
-        struct-typedefs (ce/emit-struct-typedefs soa-expansions)
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
-        ;; All array symbols (SoA base names included, for array-syms tracking)
-        all-arr-syms (set (map #(symbol (name %)) all-arr-params))
+        ;; SROA: scalar-replace value-type access so the body has only per-field
+        ;; plain array ops (no struct typedef / SoA aget-aset left for the C emitter).
+        lowered-body (sl/lower-body soa-expansions body)
+        adapted-body (ce/adapt-casts-for-dtype lowered-body dtype)
+        ;; Per-field array symbols introduced by lowering (e.g. os_re, os_im),
+        ;; replacing the SoA base names in the array-sym tracking set.
+        soa-field-syms (set (mapcat (fn [s]
+                                      (let [info (get soa-expansions (symbol (name s)))]
+                                        (map (fn [{nm :name}]
+                                               (sl/field-arr-sym (symbol (name s)) nm))
+                                             (:fields info))))
+                                    soa-arr-params))
+        all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* default-ctype
-                           ce/*soa-expansions*     soa-expansions]
+                           ce/*scalar-type* default-ctype]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         ;; Detect if body uses float atomic-add (needs CAS helper function)
         needs-float-atomic? (let [found (atom false)]
@@ -197,7 +205,6 @@
         helper-sources (str/join "\n" (map (comp :source ce/generate-c-helper) gpu-helpers))
         source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
-                    (when (seq struct-typedefs) (str struct-typedefs "\n"))
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
                     "__kernel void " kernel-name

@@ -153,6 +153,19 @@
 ;; SIMD-ability check
 ;; ================================================================
 
+;; --- Integer index/offset/bound/stride arithmetic constructors ----------------
+;; SIMD scaffolding (loop bounds, per-lane load offsets, strides, counters) is
+;; integer index arithmetic and MUST be emitted as clojure.core primitives
+;; (iadd/ladd/...), never bare symbols. These forms are synthesized AFTER the
+;; walker runs, so a bare `+` resolves to raster.numeric/+ in the kernel ns
+;; (which excludes clojure.core arithmetic); the bytecode emitter then compiles
+;; it as a reflective, boxing RT.var -> IFn.invoke call on every iteration. Per
+;; CLAUDE.md, integer index arithmetic stays clojure.core.
+(defn- ix+ [a b] (list 'clojure.core/+ a b))
+(defn- ix* [a b] (list 'clojure.core/* a b))
+(defn- ix<= [a b] (list 'clojure.core/<= a b))
+(defn- ix< [a b] (list 'clojure.core/< a b))
+
 (defn- expr-free-of?
   "True if expr does not contain sym anywhere in its tree."
   [expr sym]
@@ -194,11 +207,11 @@
         ;; (+ base (+ ... j ...)) — recurse into nested +
         (and (expr-free-of? a idx-sym) (seq? b))
         (when-let [inner-base (extract-affine-base b idx-sym)]
-          (list '+ a inner-base))
+          (ix+ a inner-base))
         ;; (+ (+ ... j ...) base) — recurse into nested +
         (and (expr-free-of? b idx-sym) (seq? a))
         (when-let [inner-base (extract-affine-base a idx-sym)]
-          (list '+ inner-base b))
+          (ix+ inner-base b))
         :else nil))))
 
 (defn aget-form?
@@ -344,6 +357,35 @@
     (apply merge {} (map #(collect-arrays % idx-sym) (rest body-expr)))
     :else {}))
 
+(defn collect-load-sites
+  "Distinct SIMD load sites in body, in first-seen order: a vector of
+  [arr-sym base] pairs where base is the affine base offset (nil for a direct
+  (aget arr j)). Unlike collect-arrays (keyed by array symbol, last-base-wins),
+  this distinguishes the SAME array read at DIFFERENT affine bases — e.g.
+  (aget data (+ ab d)) and (aget data (+ bb d)) yield two sites [data ab] and
+  [data bb], so each becomes its own vector load. Keying loads by site (not by
+  array symbol) is what makes row-a-minus-row-b style kernels vectorize
+  correctly instead of collapsing to (.sub v v) = 0."
+  [body-expr idx-sym]
+  (letfn [(unwrap [arr]
+            (if (and (seq? arr)
+                     (contains? #{'double 'float 'int 'long
+                                  'clojure.core/double 'clojure.core/float} (first arr)))
+              (second arr) arr))
+          (go [e]
+              (cond
+                (some? (aget-form? e idx-sym))
+                (let [[arr base] (aget-form? e idx-sym)
+                      a (unwrap arr)]
+                  [[(if (symbol? a) (symbol (name a)) a) base]])
+                (and (seq? e) (contains? #{'let 'let*} (first e)))
+                (let [[_ bindings & body] e]
+                  (concat (mapcat (fn [[_ v]] (go v)) (partition 2 bindings))
+                          (mapcat go body)))
+                (seq? e) (mapcat go (rest e))
+                :else nil))]
+    (vec (distinct (go body-expr)))))
+
 (defn- collect-all-aget-arrays
   "Collect ALL array symbols from aget patterns in body, regardless of index.
   Returns a set of symbols. Used to prevent outer-loop-indexed arrays from being
@@ -396,6 +438,30 @@
       (apply clojure.set/union #{} (map #(collect-free-syms % idx-sym) (rest body-expr))))
     :else #{}))
 
+(defn collect-value-free-syms
+  "Like collect-free-syms but only symbols used in VALUE position — does NOT
+  descend into an affine aget's index/offset expression. Used to avoid
+  broadcasting integer index bases (e.g. ab, bb in (aget data (+ ab d))) into
+  dead scalar vectors: those symbols are consumed as primitive offsets by the
+  load, never as vector values."
+  [body-expr idx-sym]
+  (cond
+    (and (symbol? body-expr) (not= body-expr idx-sym)) #{body-expr}
+    (and (seq? body-expr) (contains? #{'let 'let*} (first body-expr)))
+    (let [[_ bindings & body] body-expr
+          pairs (partition 2 bindings)
+          bound-syms (set (map first pairs))
+          binding-frees (apply clojure.set/union #{}
+                               (map (fn [[_ v]] (collect-value-free-syms v idx-sym)) pairs))
+          body-frees (apply clojure.set/union #{}
+                            (map #(collect-value-free-syms % idx-sym) body))]
+      (clojure.set/difference (clojure.set/union binding-frees body-frees) bound-syms))
+    (seq? body-expr)
+    (if (some? (aget-form? body-expr idx-sym))
+      #{}   ;; affine aget: the offset is an index, not a value — skip it
+      (apply clojure.set/union #{} (map #(collect-value-free-syms % idx-sym) (rest body-expr))))
+    :else #{}))
+
 (defn collect-free-syms-scoped
   "Collect free symbols from an S-expression tree, respecting bindings.
    For JIT isolation (wrap-in-fn). Delegates to util/free-syms."
@@ -431,12 +497,17 @@
           (list broadcast species-sym (list cast-fn expr)))
 
       (some? (aget-form? expr idx-sym))
-      (let [[arr-raw _offset] (aget-form? expr idx-sym)
+      (let [[arr-raw base] (aget-form? expr idx-sym)
             arr (if (and (seq? arr-raw)
                          (contains? #{'double 'float 'int 'long
                                       'clojure.core/double 'clojure.core/float} (first arr-raw)))
-                  (second arr-raw) arr-raw)]
-        (or (get vec-env (if (symbol? arr) (symbol (name arr)) arr))
+                  (second arr-raw) arr-raw)
+            arr-name (if (symbol? arr) (symbol (name arr)) arr)]
+        ;; Resolve to the vector for THIS load site [arr base]; a single array read
+        ;; at multiple bases has one vector per site (see collect-load-sites). Fall
+        ;; back to array-symbol keys only for legacy single-load callers.
+        (or (get vec-env [arr-name base])
+            (get vec-env arr-name)
             (get vec-env arr)))
 
       ;; Scalar array access: (aget arr non-idx-expr) — broadcast as scalar
@@ -543,15 +614,6 @@
                      (if (>= lanes 8) 8 4))
         (catch Exception _ 4))))
 
-(defn- make-arr-load-bindings
-  "Generate let-bindings to load SIMD vectors from arrays.
-  arr-vec-offsets: {arr-sym → [vec-sym, offset-expr]} where offset-expr
-  is the full combined offset (base + j + k*lanes) for fromArray."
-  [arr-vec-offsets species-sym from-array]
-  (vec (mapcat (fn [[_arr-sym [vec-sym offset-expr]]]
-                 [vec-sym (list from-array species-sym _arr-sym offset-expr)])
-               arr-vec-offsets)))
-
 ;; ================================================================
 ;; SegMap → SIMD
 ;; ================================================================
@@ -605,32 +667,38 @@
             ;; broadcast as scalars — emit-simd handles them in-place via the
             ;; "Scalar array access" branch: (broadcast species (cast (aget arr expr)))
             outer-arr-syms (clojure.set/difference (collect-all-aget-arrays body) arr-syms)
-            scalar-syms (into (set (filter #(and (symbol? %) (not= '.invk %)) (:scalars segmap)))
-                              (clojure.set/difference all-inputs arr-syms outer-arr-syms))
+            ;; keep only scalars used as VALUES (drop dead integer index bases)
+            scalar-syms (clojure.set/intersection
+                         (into (set (filter #(and (symbol? %) (not= '.invk %)) (:scalars segmap)))
+                               (clojure.set/difference all-inputs arr-syms outer-arr-syms))
+                         (collect-value-free-syms body idx))
             ;; Type tag for vector symbols — enables bytecode compiler to resolve methods
             vec-tag (case elem-type
                       :double 'jdk.incubator.vector.DoubleVector
                       :float  'jdk.incubator.vector.FloatVector)
             tag-vec (fn [sym] (vary-meta sym assoc :tag vec-tag))
-            arr-vec-syms (into {} (map (fn [s] [s (tag-vec (gensym (str "v_" (name s) "_")))]) arr-syms))
+            ;; Distinct load sites [arr base] — one vector load per site, so a single
+            ;; array read at two bases does NOT collapse to (.op v v) (see collect-load-sites).
+            load-sites (filterv (fn [[a _]] (contains? arr-syms a))
+                                (collect-load-sites body idx))
+            arr-vec-syms (into {} (map (fn [[arr _base :as site]]
+                                         [site (tag-vec (gensym (str "v_" (name arr) "_")))])
+                                       load-sites))
             scalar-vec-syms (into {} (map (fn [s] [(symbol (name s)) (tag-vec (gensym (str "sv_" (name s) "_")))])
                                           scalar-syms))
-            vec-env (merge (into {} (map (fn [[s vs]] [(symbol (name s)) vs]) arr-vec-syms))
-                           scalar-vec-syms)
+            vec-env (merge arr-vec-syms scalar-vec-syms)
             simd-result-sym (tag-vec (gensym "vr__"))
             simd-body-expr (let [e (emit-simd body idx vec-env species-sym elem-type)]
                              (if (seq? e) (with-meta (apply list e) {:tag vec-tag}) e))
-            ;; Build per-array offset loads: (fromArray species arr (+ base j))
-            arr-vec-offsets (into {} (map (fn [[a v]]
-                                            (let [base (get arr-offsets a)
-                                                  offset (if base (list '+ base j-sym) j-sym)]
-                                              [a [v offset]]))
-                                          arr-vec-syms))
-            arr-loads (make-arr-load-bindings arr-vec-offsets species-sym from-array)
+            ;; Build per-site offset loads: (fromArray species arr (+ base j))
+            arr-loads (vec (mapcat (fn [[[arr base] v]]
+                                     (let [offset (if base (ix+ base j-sym) j-sym)]
+                                       [v (list from-array species-sym arr offset)]))
+                                   arr-vec-syms))
             scalar-bcasts (vec (mapcat (fn [[s sv]] [sv (list broadcast species-sym (list cf s))])
                                        scalar-vec-syms))
             ;; Store index: j or (+ offset j) for offset par/map!
-            store-idx (fn [j] (if store-offset (list '+ store-offset j) j))
+            store-idx (fn [j] (if store-offset (ix+ store-offset j) j))
             ;; Scalar tail — uses desugared body (.invk → mangled fn calls)
             ;; so the bytecode compiler can handle it
             scalar-body (clojure.walk/postwalk (fn [f] (if (= f idx) j-sym f)) desugared-body)
@@ -640,12 +708,12 @@
             ;; SIMD loop + tail
             simd-loop
             (list 'loop* [j-sym '(int 0)]
-                  (list 'if (list '<= (list '+ j-sym lanes-sym) n-sym)
+                  (list 'if (ix<= (ix+ j-sym lanes-sym) n-sym)
                         (list 'let* (vec (concat arr-loads [simd-result-sym simd-body-expr]))
                               (list '.intoArray simd-result-sym out (store-idx j-sym))
-                              (list 'recur (list '+ j-sym lanes-sym)))
+                              (list 'recur (ix+ j-sym lanes-sym)))
                         (list 'loop* [j-sym j-sym]
-                              (list 'if (list '< j-sym n-sym)
+                              (list 'if (ix< j-sym n-sym)
                                     (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
                                     out))))]
         (when simd-body-expr
@@ -680,14 +748,14 @@
                    lanes-sym (list '.length species-sym)
                    n-sym (list 'int n)]
             (list 'loop* [j-sym '(int 0)]
-                  (list 'if (list '<= (list '+ j-sym lanes-sym) n-sym)
+                  (list 'if (ix<= (ix+ j-sym lanes-sym) n-sym)
                         ;; vgather: src[index[j..j+L)] → contiguous out[j..j+L)
                         (list 'let* [gv-sym (list from-array species-sym src 0 index j-sym)]
                               (list '.intoArray gv-sym out j-sym)
-                              (list 'recur (list '+ j-sym lanes-sym)))
+                              (list 'recur (ix+ j-sym lanes-sym)))
                         ;; scalar tail
                         (list 'loop* [j-sym j-sym]
-                              (list 'if (list '< j-sym n-sym)
+                              (list 'if (ix< j-sym n-sym)
                                     (list 'do
                                           (list 'clojure.core/aset out j-sym
                                                 (list 'clojure.core/aget src
@@ -757,9 +825,18 @@
                         outer-arr-syms (clojure.set/difference (collect-all-aget-arrays elem-expr)
                                                                (set (keys arr-offsets)))
                         arr-syms (clojure.set/difference all-inputs outer-arr-syms)
-                        scalar-syms (clojure.set/difference
-                                     (set (filter #(and (symbol? %) (not= '.invk %)) (:scalars segred)))
-                                     outer-arr-syms)
+                        ;; Distinct load sites [arr base] — one vector load per site, so a
+                        ;; single array read at two bases (row-a vs row-b) does NOT collapse.
+                        load-sites (filterv (fn [[a _]] (contains? arr-syms a))
+                                            (collect-load-sites elem-expr idx))
+                        ;; keep only scalars used as VALUES; integer index bases
+                        ;; (ab, bb) appear solely in aget offsets and must not be
+                        ;; broadcast into dead vectors.
+                        scalar-syms (clojure.set/intersection
+                                     (clojure.set/difference
+                                      (set (filter #(and (symbol? %) (not= '.invk %)) (:scalars segred)))
+                                      outer-arr-syms)
+                                     (collect-value-free-syms elem-expr idx))
                         vec-tag (case elem-type
                                   :double 'jdk.incubator.vector.DoubleVector
                                   :float  'jdk.incubator.vector.FloatVector)
@@ -771,15 +848,15 @@
                         j-sym (gensym "j__")
                         nacc (effective-n-accumulators elem-type)
                         vacc-syms (vec (for [k (range nacc)] (tag-vec (gensym (str "va" k "__")))))
+                        ;; one vec sym per [site, accumulator]; key by site [arr base]
                         arr-groups (vec (for [k (range nacc)]
-                                          (into {} (map (fn [s] [s (tag-vec (gensym (str "v" k "_" (name s) "_")))])
-                                                        arr-syms))))
+                                          (into {} (map (fn [[arr base :as site]]
+                                                          [site (tag-vec (gensym (str "v" k "_" (name arr) "_")))])
+                                                        load-sites))))
                         scalar-vec-syms (into {} (map (fn [s] [(symbol (name s)) (tag-vec (gensym (str "sv_" (name s) "_")))])
                                                       scalar-syms))
                         vec-envs (vec (for [k (range nacc)]
-                                        (merge (into {} (map (fn [[s vs]] [(symbol (name s)) vs])
-                                                             (nth arr-groups k)))
-                                               scalar-vec-syms)))
+                                        (merge (nth arr-groups k) scalar-vec-syms)))
                         simd-elems (vec (for [k (range nacc)]
                                           (let [e (emit-simd elem-expr idx (nth vec-envs k) species-sym elem-type)]
                                             (if (seq? e) (with-meta (apply list e) {:tag vec-tag}) e))))
@@ -800,25 +877,20 @@
                                                       (contains? #{'double 'float 'clojure.core/double 'clojure.core/float}
                                                                  (first arr0)))
                                                (second arr0) arr0)
-                                         k-offset (if (zero? k) j-sym (list '+ j-sym (list '* (int k) lanes-sym)))
-                                         off (if base (list '+ base k-offset) k-offset)]
+                                         k-offset (if (zero? k) j-sym (ix+ j-sym (ix* (int k) lanes-sym)))
+                                         off (if base (ix+ base k-offset) k-offset)]
                                      (with-meta (list from-array species-sym arr off) {:tag vec-tag})))
                         identity-val (reduce-identity op elem-type)
-                        ;; Build per-array, per-accumulator offset loads
-                        ;; For each arr, combine: base-offset + j + k*lanes
+                        ;; Build per-site, per-accumulator offset loads.
+                        ;; For each site [arr base], combine: base + j + k*lanes
                         chunk-loads
                         (vec (for [k (range nacc)]
                                (let [k-offset (if (zero? k) j-sym
-                                                  (list '+ j-sym (list '* (int k) lanes-sym)))
-                                     arr-vec-offsets
-                                     (into {} (map (fn [[a v]]
-                                                     (let [base (get arr-offsets a)
-                                                           offset (if base
-                                                                    (list '+ base k-offset)
-                                                                    k-offset)]
-                                                       [a [v offset]]))
-                                                   (nth arr-groups k)))]
-                                 (make-arr-load-bindings arr-vec-offsets species-sym from-array))))
+                                                  (ix+ j-sym (ix* (int k) lanes-sym)))]
+                                 (vec (mapcat (fn [[[arr base] v]]
+                                                (let [offset (if base (ix+ base k-offset) k-offset)]
+                                                  [v (list from-array species-sym arr offset)]))
+                                              (nth arr-groups k))))))
                         elem-syms (vec (for [k (range nacc)] (tag-vec (gensym (str "el" k "__")))))
                         inner-binds (if fuse-fma?
                                       []   ;; loads are inlined into the .fma below
@@ -826,7 +898,7 @@
                                                      (concat (nth chunk-loads k)
                                                              [(nth elem-syms k) (nth simd-elems k)]))
                                                    (range nacc))))
-                        recur-args (into [(list '+ j-sym stride-sym)]
+                        recur-args (into [(ix+ j-sym stride-sym)]
                                          (for [k (range nacc)]
                                            (if fuse-fma?
                                              ;; vacc_k = a[..]*b[..] + vacc_k, loads inline → memory-operand FMA
@@ -855,19 +927,24 @@
                                                     (mapcat (fn [vs] [vs vinit]) vacc-syms)))
                                 csym (gensym "vc__")]
                             (list 'loop* lbinds
-                                  (list 'if (list '<= (list '+ j-sym stride-sym) n-sym)
+                                  (list 'if (ix<= (ix+ j-sym stride-sym) n-sym)
                                         (list 'let* inner-binds (list* 'recur recur-args))
                                         (list 'let* [csym combine
-                                                     acc (list op (list cf init)
+                                                     ;; final scalar combine: monomorphic double/float
+                                                     ;; in the SIMD path → clojure.core primitive (no box)
+                                                     acc (list (cond (= op '+) 'clojure.core/+
+                                                                     (= op '*) 'clojure.core/*
+                                                                     :else op)
+                                                               (list cf init)
                                                                (list '.reduceLanes csym lanes-op))]
                                               (list 'loop* [j-sym j-sym acc acc]
-                                                    (list 'if (list '< j-sym n-sym)
+                                                    (list 'if (ix< j-sym n-sym)
                                                           (list 'recur (list 'inc j-sym) scalar-body)
                                                           acc)))))))]
                     (when (and (every? some? simd-elems) lanes-op)
                       (list 'let* [species-sym species-expr
                                    lanes-sym (list '.length species-sym)
-                                   stride-sym (list '* (int nacc) lanes-sym)
+                                   stride-sym (ix* (int nacc) lanes-sym)
                                    n-sym (list 'int bound)]
                             (if (seq scalar-bcasts)
                               (list 'let* (vec scalar-bcasts) (build-loop))

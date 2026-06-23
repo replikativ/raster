@@ -2,6 +2,29 @@
 
 All notable changes to Raster will be documented in this file.
 
+## Unreleased -- Cross-platform (browser / WebGPU / WebAssembly)
+
+Raster code now runs in the browser as well as the JVM, from one `.cljc` source.
+
+### Cross-platform compilation
+- **`deftm`/`defvalue` → WebAssembly** via `compile-aot` (`raster.compiler.cljs-emit`):
+  a kernel's whole call tree compiles to one shared-memory wasm module (cross-function
+  calls, recursion, value-type multi-value returns, control flow, SIMD128), with a
+  generated ClojureScript shim that marshals through wasm linear memory.
+- **wasm transcendental lowerings** (sin/cos/exp/log/pow) and `if`/`rem`/`mod`/`bit-and`/
+  `case*`/value-position `loop`/`recur`.
+
+### Rendering
+- **`raster.render`** — a small renderer protocol with **Vulkan** (JVM) and **WebGPU**
+  (browser) backends; one shader source (`raster.render.shader`) emits both GLSL and WGSL.
+
+### Examples
+- **Cross-platform Geometric Asteroids** — one `.cljc` game on JVM (Vulkan, `deftm` dispatch,
+  live REPL shape extension) and browser (WebGPU, physics compiled to wasm).
+- **Cross-platform streaming Valley** — an infinite voxel world (biome terrain, caves, ores,
+  trees, day/night sky, skylight + glowstone block-light, water, mobs, mining) sharing one
+  `.cljc` streaming runtime across JVM/Vulkan and browser/WebGPU+wasm.
+
 ## 0.1.x (2026-04-10) -- Initial Release
 
 Raster's first public release. Functional scientific computing for Clojure with

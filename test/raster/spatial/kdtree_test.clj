@@ -20,14 +20,14 @@
           kq (kd/knn-query (kd/build X n dim) k)
           ki (:idx kq) kdst (:dst kq)
           set-ok (count (filter (fn [i]
-                    (= (set (map #(aget ki (+ (* i k) %)) (range k)))
-                       (set (map #(aget bi (+ (* i k) %)) (range k))))) (range n)))
+                                  (= (set (map #(aget ki (+ (* i k) %)) (range k)))
+                                     (set (map #(aget bi (+ (* i k) %)) (range k))))) (range n)))
           ;; kdtree dst is squared; brute is euclidean
           dmax (reduce max 0.0
-                 (for [i (range n)]
-                   (let [ks (sort (map #(aget kdst (+ (* i k) %)) (range k)))
-                         bs (sort (map #(let [e (aget bd (+ (* i k) %))] (* e e)) (range k)))]
-                     (reduce max 0.0 (map (fn [a b] (Math/abs (- a b))) ks bs)))))]
+                       (for [i (range n)]
+                         (let [ks (sort (map #(aget kdst (+ (* i k) %)) (range k)))
+                               bs (sort (map #(let [e (aget bd (+ (* i k) %))] (* e e)) (range k)))]
+                           (reduce max 0.0 (map (fn [a b] (Math/abs (- a b))) ks bs)))))]
       (is (= n set-ok) "every row's neighbor set matches brute-force")
       (is (< dmax 1e-9) "squared distances match"))))
 
@@ -66,9 +66,9 @@
           _ (raster.knn/knn-brute-cosine! Xn n dim k bi bd)
           ni (:idx (raster.spatial.nndescent/nn-descent (double-array (seq X)) n dim k))
           recall (/ (reduce + (for [i (range n)]
-                     (count (clojure.set/intersection
-                              (set (for [t (range k)] (aget ni (+ (* i k) t))))
-                              (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
+                                (count (clojure.set/intersection
+                                        (set (for [t (range k)] (aget ni (+ (* i k) t))))
+                                        (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
                     (double (* n k)))]
       (is (> recall 0.9) (str "recall " recall " should exceed 0.9")))))
 
@@ -97,15 +97,15 @@
                   (let [oi (int-array (* n k))]
                     (dotimes [i n]
                       (let [ds (sort-by second
-                                 (map (fn [j] [j (raster.spatial.nndescent/byte-dist data i j dim mode)])
-                                      (range n)))]
+                                        (map (fn [j] [j (raster.spatial.nndescent/byte-dist data i j dim mode)])
+                                             (range n)))]
                         (dotimes [t k] (aset oi (+ (* i k) t) (int (first (nth ds t)))))))
                     oi))
           rec (fn [ni bi]
                 (/ (reduce + (for [i (range n)]
-                     (count (clojure.set/intersection
-                              (set (for [t (range k)] (aget ni (+ (* i k) t))))
-                              (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
+                               (count (clojure.set/intersection
+                                       (set (for [t (range k)] (aget ni (+ (* i k) t))))
+                                       (set (for [t (range k)] (aget bi (+ (* i k) t))))))))
                    (double (* n k))))]
       (doseq [mode [0 1]]                       ;; 0 = int8 (signed inner), 1 = uint8 (bit-Jaccard)
         (let [X (byte-blobs n dim 6 (+ 2 mode))

@@ -18,6 +18,7 @@
     VkPipelineDynamicStateCreateInfo
     VkPipelineLayoutCreateInfo
     VkPipelineRenderingCreateInfo
+    VkRenderingAttachmentInfo
     VkViewport VkRect2D VkOffset2D VkExtent2D
     VkVertexInputBindingDescription VkVertexInputAttributeDescription
     VkPushConstantRange]
@@ -265,7 +266,7 @@
         stack (MemoryStack/stackPush)]
     (try
       (let [color-att (doto (org.lwjgl.vulkan.VkRenderingAttachmentInfo/calloc 1 stack)
-                        (-> (.get 0)
+                        (-> ^VkRenderingAttachmentInfo (.get 0)
                             (.sType VK13/VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO)
                             (.imageView (long (:color-view attachments)))
                             (.imageLayout VK13/VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL)
@@ -288,7 +289,7 @@
         ;; Add depth attachment if provided
         (when-let [dv (:depth-view attachments)]
           (let [depth-att (doto (org.lwjgl.vulkan.VkRenderingAttachmentInfo/calloc 1 stack)
-                            (-> (.get 0)
+                            (-> ^VkRenderingAttachmentInfo (.get 0)
                                 (.sType VK13/VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO)
                                 (.imageView (long dv))
                                 (.imageLayout VK13/VK_IMAGE_LAYOUT_DEPTH_STENCIL_ATTACHMENT_OPTIMAL)
@@ -310,7 +311,7 @@
   (let [stack (MemoryStack/stackPush)]
     (try
       (let [vp (doto (VkViewport/calloc 1 stack)
-                 (-> (.get 0)
+                 (-> ^VkViewport (.get 0)
                      (.x (float 0))
                      (.y (float 0))
                      (.width (float w))

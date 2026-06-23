@@ -78,7 +78,6 @@
                  (find-system-font font-style)
                  (throw (ex-info "No suitable font found on this system"
                                  {:style font-style})))
-        _ (println "Font:" path)
         font-buf (read-font-file path)
         atlas-w (int atlas-size)
         atlas-h (int atlas-size)

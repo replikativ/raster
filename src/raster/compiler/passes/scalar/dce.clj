@@ -37,7 +37,7 @@
         #{buf-arg}
         (extract-mutation-targets buf-arg)))
 
-    ;; Array writes (aset / clojure.core/aset / raster.arrays/aset!) mutate their
+    ;; Array writes (aset / clojure.core/aset / raster.arrays/aset) mutate their
     ;; FIRST arg (the array). Without this, a `_`-bound array-fill loop whose value
     ;; is unused is wrongly eliminated as dead — leaving the array unwritten.
     (and (seq? expr)
@@ -153,8 +153,8 @@
         binding-free (apply clojure.set/union #{}
                             (map #(free-syms (second %)) pairs))
         let-free (clojure.set/difference
-                   (clojure.set/union body-free binding-free)
-                   bound-syms)
+                  (clojure.set/union body-free binding-free)
+                  bound-syms)
         live (atom (clojure.set/union body-free let-free))
         _ (doseq [[sym expr] pairs]
             (when (or (root-pred sym)

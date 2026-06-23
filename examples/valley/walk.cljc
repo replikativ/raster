@@ -1,0 +1,173 @@
+(ns valley.walk
+  "Player layer for the streaming valley: spawn, raycast mining, fly mode, and the
+   per-frame physics update (gravity + AABB collision with 1-block step-up). The motion
+   itself runs in valley.kernels/integrate-physics! (deftm→bytecode on the JVM, wasm in
+   the browser — same kernel, same trajectory); this ns marshals the player position and
+   velocity (double-arrays, mutated in place) and stitches a player-centred 16³ window out
+   of the streaming world to feed the kernel. Camera helpers live in valley.cam."
+  (:require [valley.cam :as cam]
+            [valley.chunk :as chunk]
+            [valley.kernels :as k]))
+
+(defn- cos [x] (#?(:clj Math/cos :cljs js/Math.cos) x))
+(defn- sin [x] (#?(:clj Math/sin :cljs js/Math.sin) x))
+(defn- ffloor [x] (long (#?(:clj Math/floor :cljs js/Math.floor) (double x))))
+(defn- fabs [x] (#?(:clj Math/abs :cljs js/Math.abs) (double x)))
+
+(def ^:const EYE 1.6)     ; eye height above feet
+(def ^:const HALF-W 0.3)  ; player AABB half-width
+(def ^:const HEIGHT 1.7)  ; player AABB height
+(def ^:const MOVE 5.0)    ; blocks / second
+(def ^:const TURN 1.7)    ; radians / second
+
+(defn stream-player-init
+  "Spawn above the streaming world's centre column (chunk :center) for a short visible fall."
+  [s]
+  (let [[cx cz] (:center s)
+        wx (+ (* (long cx) chunk/CS) 8) wz (+ (* (long cz) chunk/CS) 8)
+        top (chunk/column-height wx wz)]
+    {:pos (chunk/darray [(+ wx 0.5) (+ (double top) 3.0) (+ wz 0.5)])
+     :vel (chunk/darray [0.0 0.0 0.0])
+     :spawn [(+ wx 0.5) (+ (double top) 3.0) (+ wz 0.5)]
+     :yaw 0.0 :pitch -0.2 :on-ground false
+     :health 20 :max-health 20 :hotbar [1 2 3 8 11 21] :sel 0 :qe false}))
+
+(def ^:const VOID-Y -10.0)    ; below this → instant death (fell off the world)
+(def ^:const FALL-SAFE 13.0)  ; impact speed (blocks/s) you can survive unharmed
+(def ^:const FALL-SCALE 1.6)  ; health lost per (blocks/s) above FALL-SAFE
+
+(def ^:const REACH 6.0)   ; block interaction distance
+
+(defn- forward-vec [yaw pitch]
+  (let [cp (cos pitch)] [(* (sin yaw) cp) (sin pitch) (* (- (cos yaw)) cp)]))
+
+(defn raycast
+  "Amanatides–Woo voxel DDA from (ex,ey,ez) along (dx,dy,dz), up to `maxd` blocks. Returns
+   {:hit [x y z] :place [x y z]} for the first opaque block + the empty cell just before it
+   (placement target), or nil. Portable (no host types beyond Math floor/abs)."
+  [world ex ey ez dx dy dz maxd]
+  (let [big 1.0e9
+        sx (if (>= dx 0) 1 -1) sy (if (>= dy 0) 1 -1) sz (if (>= dz 0) 1 -1)
+        tdx (if (zero? dx) big (fabs (/ 1.0 dx)))
+        tdy (if (zero? dy) big (fabs (/ 1.0 dy)))
+        tdz (if (zero? dz) big (fabs (/ 1.0 dz)))
+        ix (ffloor ex) iy (ffloor ey) iz (ffloor ez)
+        bnd (fn [i e d s] (if (zero? d) big (/ (- (+ i (if (>= d 0) 1 0)) e) d)))]
+    (loop [vx ix vy iy vz iz
+           tmx (bnd ix ex dx sx) tmy (bnd iy ey dy sy) tmz (bnd iz ez dz sz)
+           px ix py iy pz iz]
+      (cond
+        (chunk/opaque? (chunk/world-block world vx vy vz)) {:hit [vx vy vz] :place [px py pz]}
+        (> (min tmx tmy tmz) maxd) nil
+        (and (<= tmx tmy) (<= tmx tmz)) (recur (+ vx sx) vy vz (+ tmx tdx) tmy tmz vx vy vz)
+        (<= tmy tmz)                    (recur vx (+ vy sy) vz tmx (+ tmy tdy) tmz vx vy vz)
+        :else                           (recur vx vy (+ vz sz) tmx tmy (+ tmz tdz) vx vy vz)))))
+
+(defn apply-edits!
+  "Break (mouse left) / place selected block (mouse right) under the crosshair, in place.
+   Returns the changed block coord [x y z] (→ shell re-meshes those columns), or nil. Reads
+   this frame's edge-triggered mouse buttons from input metadata (set by both backends)."
+  [world player input]
+  (let [b (:buttons (meta input))]
+    (when (and b (or (contains? b :left) (contains? b :right)))
+      (let [p (:pos player)
+            [dx dy dz] (forward-vec (:yaw player) (:pitch player))
+            r (raycast world (aget p 0) (+ (aget p 1) EYE) (aget p 2) dx dy dz REACH)]
+        (when r
+          (if (contains? b :left)
+            (let [[hx hy hz] (:hit r)] (chunk/set-block! world hx hy hz 0) [hx hy hz])
+            (let [[qx qy qz] (:place r)
+                  sel (nth (:hotbar player) (:sel player) chunk/LOG)]
+              (chunk/set-block! world qx qy qz sel) [qx qy qz])))))))
+
+(def ^:const FLY-SPEED 14.0)   ; blocks/sec in fly mode (faster, for exploration)
+(declare player-walk)
+
+(defn player-update
+  "Player update against the streaming world. Walk mode = gravity + AABB collision via a
+   player-centred window; fly mode (toggle F) = free 3D flight along the view, no physics."
+  [world player input dt]
+  (let [{:keys [pos vel yaw pitch]} player
+        on?   (fn [a] (if (contains? input a) 1.0 0.0))
+        [mdx mdy] (or (:mouse (meta input)) [0.0 0.0])   ; pointer-lock delta (px)
+        sens  0.0025
+        yaw   (+ yaw (* TURN dt (- (on? :left) (on? :right))) (* (- sens) mdx))
+        pitch (-> (+ pitch (* TURN dt (- (on? :up) (on? :down))) (* (- sens) mdy)) (max -1.5) (min 1.5))
+        ;; hotbar Q/E latch + fly F latch (one press = one toggle)
+        n   (count (:hotbar player))
+        qe? (or (contains? input :q) (contains? input :e))
+        sel (if (and qe? (not (:qe player)))
+              (mod (+ (long (:sel player)) (if (contains? input :e) 1 -1)) n)
+              (:sel player))
+        fl?  (contains? input :fly)
+        fly? (if (and fl? (not (:fl player))) (not (:fly player)) (boolean (:fly player)))]
+    (if fly?
+      ;; --- fly: move along the view direction (W/S), strafe (A/D); no gravity/collision ---
+      (let [[gx gy gz] (forward-vec yaw pitch)
+            mv (* FLY-SPEED dt (- (on? :w) (on? :s)))
+            st (* FLY-SPEED dt (- (on? :d) (on? :a)))]
+        (aset pos 0 (+ (aget pos 0) (* gx mv) (* (cos yaw) st)))
+        (aset pos 1 (+ (aget pos 1) (* gy mv)))
+        (aset pos 2 (+ (aget pos 2) (* gz mv) (* (sin yaw) st)))
+        (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
+        (assoc player :yaw yaw :pitch pitch :on-ground false :fly true :fl fl? :sel sel :qe qe?))
+      (player-walk world player input dt yaw pitch sel qe? fl?))))
+
+(defn- player-walk
+  "Walk-mode body (gravity + collision via the window stitch)."
+  [world player input dt yaw pitch sel qe? fl?]
+  (let [{:keys [pos vel]} player
+        on?   (fn [a] (if (contains? input a) 1.0 0.0))
+        fx (sin yaw)  fz (- (cos yaw))
+        rx (cos yaw)  rz (sin yaw)
+        fwd (* MOVE dt (- (on? :w) (on? :s)))
+        strf (* MOVE dt (- (on? :d) (on? :a)))
+        dx (+ (* fx fwd) (* rx strf))
+        dz (+ (* fz fwd) (* rz strf))
+        ;; window origin: centre the (tiny) player AABB in a 16³ window
+        wox (- (long #?(:clj (Math/floor (aget pos 0)) :cljs (js/Math.floor (aget pos 0)))) 8)
+        woy (- (long #?(:clj (Math/floor (aget pos 1)) :cljs (js/Math.floor (aget pos 1)))) 8)
+        woz (- (long #?(:clj (Math/floor (aget pos 2)) :cljs (js/Math.floor (aget pos 2)))) 8)
+        scratch (chunk/stitch-window! world (:scratch world) wox woy woz)]
+    ;; → window-local, step, → world (vel is a delta: translation-invariant)
+    (aset pos 0 (- (aget pos 0) wox)) (aset pos 1 (- (aget pos 1) woy)) (aset pos 2 (- (aget pos 2) woz))
+    (let [vy0 (aget vel 1)                                  ; downward speed entering the step
+          g (k/integrate-physics! pos vel scratch (:solid world)
+                                  0 0 0 HALF-W HEIGHT dx dz dt)]
+      (aset pos 0 (+ (aget pos 0) wox)) (aset pos 1 (+ (aget pos 1) woy)) (aset pos 2 (+ (aget pos 2) woz))
+      (let [on?     (= 1 g)
+            ;; fall damage on the landing frame; void death below the world
+            landed? (and on? (not (:on-ground player)))
+            fall    (max 0.0 (- (double vy0)))             ; impact speed (vy0 < 0 falling)
+            hp      (long (:health player))
+            hp'     (if (and landed? (> fall FALL-SAFE))
+                      (max 0 (- hp (long (#?(:clj Math/floor :cljs js/Math.floor)
+                                          (* (- fall FALL-SAFE) FALL-SCALE)))))
+                      hp)
+            void?   (< (aget pos 1) VOID-Y)
+            dead?   (or void? (<= hp' 0))]
+        (if dead?
+          (let [[sx sy sz] (:spawn player)]               ; respawn: reset pos/vel + full health
+            (aset pos 0 sx) (aset pos 1 sy) (aset pos 2 sz)
+            (aset vel 0 0.0) (aset vel 1 0.0) (aset vel 2 0.0)
+            (assoc player :yaw yaw :pitch pitch :on-ground false :fly false :fl fl?
+                   :health (:max-health player) :sel sel :qe qe?))
+          (assoc player :yaw yaw :pitch pitch :on-ground on? :fly false :fl fl?
+                 :health hp' :sel sel :qe qe?))))))
+
+(defn ring-update
+  "Mesh-ring bookkeeping for streaming: given the currently-loaded mesh keys (seq) and the
+   player chunk, return {:add [keys to mesh] :remove [keys to free]} for mesh radius R."
+  [loaded pcx pcz r]
+  (let [want (set (chunk/ring-cols pcx pcz r)) have (set loaded)]
+    {:add (vec (remove have want)) :remove (vec (remove want have))}))
+
+(defn player-cam
+  "Render camera built from the player: eye at feet + EYE, reusing cam/fly-mvp."
+  [player]
+  (let [p (:pos player)]
+    {:pos [(aget p 0) (+ (aget p 1) EYE) (aget p 2)]
+     :yaw (:yaw player) :pitch (:pitch player)}))
+
+(defn mvp [player aspect]
+  (cam/fly-mvp (player-cam player) aspect))

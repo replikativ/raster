@@ -6,8 +6,10 @@
   special forms + function calls.  Same approach as partial-cps/ioc.clj.
   This generalizes to arbitrary Clojure code in deftm bodies."
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.method-entry :as me]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.macroexpand :as mex]
             [raster.compiler.core.util :as util]
             [raster.compiler.backend.jvm.split :as split])
   (:import (java.lang.classfile ClassFile ClassFile$ClassHierarchyResolverOption ClassFile$Option)
@@ -455,36 +457,15 @@
     ;; already the right type
     to-type))
 
-(defn- walk-preserving-meta
-  "Like clojure.walk/walk but preserves metadata on forms."
-  [inner outer form]
-  (let [m (meta form)
-        result (cond
-                 (list? form)    (outer (apply list (map inner form)))
-                 (seq? form)     (outer (doall (map inner form)))
-                 (vector? form)  (outer (mapv inner form))
-                 (map? form)     (outer (into (empty form)
-                                              (map (fn [[k v]] [(inner k) (inner v)]) form)))
-                 (set? form)     (outer (into (empty form) (map inner form)))
-                 :else           (outer form))]
-    (if (and m (instance? clojure.lang.IObj result))
-      (with-meta result (merge (meta result) m))
-      result)))
+;; Metadata-preserving walk + macroexpand live in the shared leaf ns
+;; raster.compiler.core.macroexpand (the wasm backend uses them too).
+(def ^:private walk-preserving-meta mex/walk-preserving-meta)
+(def ^:private macroexpand-all-preserving mex/macroexpand-all-preserving)
 
 (defn- postwalk-preserving
   "Like clojure.walk/postwalk but preserves metadata."
   [f form]
   (walk-preserving-meta (partial postwalk-preserving f) f form))
-
-(defn- macroexpand-all-preserving
-  "Like clojure.walk/macroexpand-all but preserves metadata on forms."
-  [form]
-  (let [expanded (if (seq? form) (macroexpand form) form)
-        m (meta form)
-        result (walk-preserving-meta macroexpand-all-preserving identity expanded)]
-    (if (and m (instance? clojure.lang.IObj result))
-      (with-meta result (merge (meta result) m))
-      result)))
 
 (defn desugar-invk
   "Process walker .invk forms for bytecode compilation.
@@ -551,6 +532,7 @@
     (par/par-reduce-form? form)
     (try (par/expand-par-reduce form)
          (catch Throwable _ form))
+
     ;; Replace (dotimes [i n] body) with int-counted loop*
     (and (seq? form)
          (let [h (first form)]
@@ -571,6 +553,17 @@
     (vector? form)
     (with-meta (mapv pre-expand-par-forms form) (meta form))
     :else form))
+
+(defn- materialize-form
+  "Run the `materialize` pass on a single form: pure par/pmap (value-producing,
+  no output buffer — e.g. from `broadcast`) → alloc + par/map!. Used in the
+  lazy-JIT compile chain AFTER macroexpand-all, so it sees only plain-symbol
+  let* (the pass's input dialect) — running it earlier would rewrite a `let`
+  with destructuring to `let*` and orphan the destructured symbols. Keeps the
+  JIT path lowering pure par forms via the same pass compile-aot uses, so they
+  can't diverge (otherwise pure par/pmap leaks unlowered to the emitter)."
+  [form]
+  (:form (materialize/materialize-pass form nil)))
 
 ;; Forward declarations for mutual recursion
 (declare emit-form)
@@ -2318,6 +2311,33 @@
     (.invokestatic code class-desc "invoke" method-type)
     return-stack-type))
 
+;; Numeric widening ranks for overload selection (int < long < float < double).
+;; A boxed/unknown numeric arg (:ref/nil) ranks as double so we never pick a
+;; narrowing primitive overload for it.
+(def ^:private stack-numeric-rank {:int 1 :bool 1 :long 2 :float 3 :double 4 :ref 4 nil 4})
+
+(defn- class-numeric-rank [^Class c]
+  (condp identical? c
+    Integer/TYPE 1 Long/TYPE 2 Float/TYPE 3 Double/TYPE 4 nil))
+
+(defn- pick-widening-numeric-method
+  "From candidate overloads whose params are ALL numeric primitives, pick the
+  one that accepts every arg by widening (param rank >= arg rank) with the
+  tightest total fit. Prevents choosing a NARROWING overload (e.g.
+  Math.min(int,int) for [:double :ref] args) that would truncate the doubles to
+  0 — the static-call selector must never truncate an argument. Returns nil when
+  no candidate is all-numeric (caller falls back to ref/hint matching)."
+  [candidates arg-types]
+  (let [ranked (keep (fn [^java.lang.reflect.Method m]
+                       (let [pranks (mapv class-numeric-rank (.getParameterTypes m))]
+                         (when (and (every? some? pranks)
+                                    (every? true?
+                                            (map (fn [pr at] (>= (long pr) (long (get stack-numeric-rank at 4))))
+                                                 pranks arg-types)))
+                           [(reduce + pranks) m])))
+                     candidates)]
+    (when (seq ranked) (second (apply min-key first ranked)))))
+
 (defn- emit-java-static-call
   "Emit bytecode for Java static method calls (e.g. Math/sin, System/arraycopy).
   Resolves the class and method via reflection, disambiguates overloads by
@@ -2331,7 +2351,21 @@
         cls       (or (try (Class/forName cls-short) (catch Exception _ nil))
                       (when-let [resolved (ns-resolve src-ns (symbol cls-short))]
                         (when (class? resolved) resolved))
-                      (throw (ex-info (str "Cannot resolve class: " cls-short) {:symbol head})))
+                      ;; Not a class. If the "class" part is actually a Clojure
+                      ;; namespace, the head is a qualified var reference that didn't
+                      ;; resolve (a typo, a missing require, or a name that doesn't
+                      ;; exist) — it reached here only because the dispatcher treats
+                      ;; any unresolved ns/name as a static call. Fail with an
+                      ;; actionable operator-level message, not "Cannot resolve class".
+                      (throw (ex-info
+                              (if (find-ns (symbol cls-short))
+                                (str "Unresolved operator `" head "`: namespace `" cls-short
+                                     "` has no var `" meth-name "`. It is not a deftm, "
+                                     "intrinsic, or Java static method — check the name "
+                                     "(e.g. `raster.arrays/aset`, not `aset!`) or add a require.")
+                                (str "Cannot resolve operator `" head "`: `" cls-short
+                                     "` is neither a class nor a loaded namespace."))
+                              {:symbol head :class cls-short :method meth-name})))
         candidates (filterv #(and (= (.getName ^java.lang.reflect.Method %) meth-name)
                                   (= (.getParameterCount ^java.lang.reflect.Method %) (count args)))
                             (.getMethods cls))
@@ -2346,9 +2380,14 @@
                                                 (or (nil? at) (= at (class-type->stack pt))))
                                               (.getParameterTypes m) arg-types)))
                                candidates)
+        ;; Numeric widening: never pick a NARROWING primitive overload (it
+        ;; truncates an arg — e.g. Math.min(int,int) on doubles → 0). nil when
+        ;; the candidates aren't all-numeric (falls through to :hint matching).
+        widened (pick-widening-numeric-method candidates arg-types)
         method    (cond
                     (<= (count candidates) 1) (first candidates)
                     (= 1 (count stack-matched)) (first stack-matched)
+                    widened widened
                     ;; Ambiguous ref types — use :hint from locals for precise matching
                     :else
                     (let [hint-resolve
@@ -2949,48 +2988,48 @@
                 t2 (emit-form code a2 locals val-ctx)]
             (cond
                   ;; Both int → IF_ICMPxx (inverted for else branch)
-                  (and (= t1 :int) (= t2 :int))
-                  (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
-                            ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
-                            "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
-                      true)
+              (and (= t1 :int) (= t2 :int))
+              (do (case pn "<" (.if_icmpge code else-label) "<=" (.if_icmpgt code else-label)
+                        ">" (.if_icmple code else-label) ">=" (.if_icmplt code else-label)
+                        "==" (.if_icmpne code else-label) "not=" (.if_icmpeq code else-label))
+                  true)
                   ;; Both long → LCMP + IFxx
-                  (and (= t1 :long) (= t2 :long))
-                  (do (.lcmp code)
-                      (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                            ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                            "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                      true)
+              (and (= t1 :long) (= t2 :long))
+              (do (.lcmp code)
+                  (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                        ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                        "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                  true)
                   ;; Both double → DCMPG + IFxx
-                  (and (= t1 :double) (= t2 :double))
-                  (do (.dcmpg code)
-                      (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                            ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                            "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                      true)
+              (and (= t1 :double) (= t2 :double))
+              (do (.dcmpg code)
+                  (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                        ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                        "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                  true)
                   ;; Mixed types → coerce both to double
-                  :else
-                  (let [;; t2 on top, t1 below. Store t2, coerce t1, reload+coerce t2
-                        tmp (let [s @(:next-slot ctx)]
-                              (case t2
-                                (:int :bool) (do (.istore code s) (swap! (:next-slot ctx) inc) s)
-                                :float  (do (.fstore code s) (swap! (:next-slot ctx) inc) s)
-                                :long   (do (.lstore code s) (swap! (:next-slot ctx) + 2) s)
-                                :double (do (.dstore code s) (swap! (:next-slot ctx) + 2) s)
+              :else
+              (let [;; t2 on top, t1 below. Store t2, coerce t1, reload+coerce t2
+                    tmp (let [s @(:next-slot ctx)]
+                          (case t2
+                            (:int :bool) (do (.istore code s) (swap! (:next-slot ctx) inc) s)
+                            :float  (do (.fstore code s) (swap! (:next-slot ctx) inc) s)
+                            :long   (do (.lstore code s) (swap! (:next-slot ctx) + 2) s)
+                            :double (do (.dstore code s) (swap! (:next-slot ctx) + 2) s)
                                 ;; :ref — store as Object, will coerce to double on reload
-                                (do (.astore code s) (swap! (:next-slot ctx) inc) s)))]
-                    (when (not= t1 :double) (emit-coerce code t1 :double))
-                    (case t2 (:int :bool) (do (.iload code tmp) (.i2d code))
-                          :long (do (.lload code tmp) (.l2d code))
-                          :float (do (.fload code tmp) (.f2d code))
-                          :double (.dload code tmp)
+                            (do (.astore code s) (swap! (:next-slot ctx) inc) s)))]
+                (when (not= t1 :double) (emit-coerce code t1 :double))
+                (case t2 (:int :bool) (do (.iload code tmp) (.i2d code))
+                      :long (do (.lload code tmp) (.l2d code))
+                      :float (do (.fload code tmp) (.f2d code))
+                      :double (.dload code tmp)
                              ;; :ref — reload Object, unbox to double
-                          (do (.aload code tmp) (emit-coerce code :ref :double)))
-                    (.dcmpg code)
-                    (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
-                          ">" (.ifle code else-label) ">=" (.iflt code else-label)
-                          "==" (.ifne code else-label) "not=" (.ifeq code else-label))
-                    true))))
+                      (do (.aload code tmp) (emit-coerce code :ref :double)))
+                (.dcmpg code)
+                (case pn "<" (.ifge code else-label) "<=" (.ifgt code else-label)
+                      ">" (.ifle code else-label) ">=" (.iflt code else-label)
+                      "==" (.ifne code else-label) "not=" (.ifeq code else-label))
+                true))))
         ;; Predicate must always produce a value (to branch on),
         ;; so strip :void-context from ctx.
         pred-type (when-not branch-folded?
@@ -3071,12 +3110,22 @@
               (do (.aconst_null code)
                   (.labelBinding code end-label)
                   :ref)
-              ;; Different types or prediction was wrong — box else
+              ;; Prediction was wrong. The skip-box? path already committed the
+              ;; then-branch to an UNBOXED primitive (then-type); boxing else to
+              ;; :ref here would leave a 1-slot ref on the else path against a
+              ;; 1-or-2-slot primitive on the then path => branch-merge stack
+              ;; mismatch (the bug). Reconcile by COERCING else to then-type.
+              ;; When not skip-box?, then is already :ref, so box else to match.
               :else
-              (do (when (primitive? else-type)
-                    (emit-box-to-ref code else-type))
-                  (.labelBinding code end-label)
-                  (if skip-box? then-type :ref)))))))))
+              (if skip-box?
+                (do (when (not= else-type then-type)
+                      (emit-coerce code else-type then-type))
+                    (.labelBinding code end-label)
+                    then-type)
+                (do (when (primitive? else-type)
+                      (emit-box-to-ref code else-type))
+                    (.labelBinding code end-label)
+                    :ref)))))))))
 
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
@@ -3747,6 +3796,15 @@
     (.labelBinding code after-try)
     :ref))
 
+(defn- statically-diverges?
+  "True if a branch expression provably does not fall through to the merge —
+  it transfers control elsewhere (throw) or back-edges a loop (recur). Such
+  branches leave nothing on the operand stack and must be excluded from the
+  merge result-type vote."
+  [form]
+  (and (seq? form) (symbol? (first form))
+       (contains? #{"throw" "recur"} (name (first form)))))
+
 (defn- emit-case*
   "Emit bytecode for (case* ge shift mask default imap &rest)."
   [code args locals ctx]
@@ -3772,12 +3830,21 @@
       (.lookupswitch code default-label switch-cases)
       (let [branch-exprs (mapv (fn [[_ [_ result-expr]]] result-expr) sorted-entries)
             all-exprs (conj branch-exprs default-expr)
-            inferred-types (mapv #(infer-arg-stack-type % locals) all-exprs)
-            value-types (filterv some? inferred-types)
-            uniform-prim? (and (seq value-types)
-                               (apply = value-types)
-                               (primitive? (first value-types)))
-            result-type (if uniform-prim? (first value-types) :ref)]
+            ;; Only branches that actually reach the merge vote on the result type;
+            ;; statically-diverging branches (throw/recur) leave nothing on the stack.
+            ;; Require EVERY reaching branch to have a KNOWN, matching primitive type.
+            ;; If any is unknown (e.g. a loop, whose result infer-arg-stack-type can't
+            ;; predict), fall to :ref and box all primitive branch results so the
+            ;; operand stack is uniform at the merge. (Predicting > emitting would
+            ;; otherwise leave one branch primitive and another boxed → JVM verifier
+            ;; "stack size mismatch".)
+            value-exprs (remove statically-diverges? all-exprs)
+            inferred-types (mapv #(infer-arg-stack-type % locals) value-exprs)
+            uniform-prim? (and (seq inferred-types)
+                               (every? some? inferred-types)
+                               (apply = inferred-types)
+                               (primitive? (first inferred-types)))
+            result-type (if uniform-prim? (first inferred-types) :ref)]
         (doseq [[[_ [test-val result-expr]] label] (map vector sorted-entries case-labels)]
           (.labelBinding code label)
           (let [t (emit-form code result-expr locals ctx)]
@@ -3917,9 +3984,15 @@
   [code args locals ctx]
   (let [param-vec (first args)
         rest-args (rest args)
-        [_ret-type body] (if (= :- (first rest-args))
-                           [(second rest-args) (nnext rest-args)]
-                           [nil rest-args])
+        [_ret-type after] (if (= :- (first rest-args))
+                            [(second rest-args) (nnext rest-args)]
+                            [nil rest-args])
+        ;; Strip walker `:raster.walker/source-body <vec>` markers: bytecode emits
+        ;; the WALKED (devirtualized) body, never the raw source body (which is kept
+        ;; only for AD transparency and contains bare, unqualified deftm calls).
+        ;; Loop handles >1 marker if an ftm was walked more than once.
+        body (loop [a after]
+               (if (= :raster.walker/source-body (first a)) (recur (nnext a)) a))
         plain-params (vec (loop [items (seq param-vec) result []]
                             (if-not items
                               result
@@ -4481,7 +4554,7 @@
                                                             :next-slot        next-slot
                                                             :source-ns        source-ns}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)]
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
@@ -4556,7 +4629,7 @@
                                                             :source-ns  source-ns
                                                             :typed-sibling-methods typed-sibling-methods}
                                                        expanded-body (binding [*ns* source-ns]
-                                                                       (mapv (comp pre-expand-par-forms macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
+                                                                       (mapv (comp pre-expand-par-forms materialize-form macroexpand-all-preserving desugar-invk pre-expand-par-forms) walked-body))
                                                        ret-type (emit-body code expanded-body locals ctx)
                                                        target-st (:stack-type return-info)
                                                        ret-cd (:class-desc return-info)]

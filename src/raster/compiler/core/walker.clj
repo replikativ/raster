@@ -89,22 +89,34 @@
   "Stamp type metadata onto a symbol. Always sets :raster.type/tag (compiler
   canonical). Only sets Clojure :tag for non-primitive types (arrays, classes,
   interfaces) — Clojure rejects :tag on locals with primitive initializers.
-  Also sets :raster.type/fn-info for typed function interfaces.
+  Also sets :raster.type/fn-info for typed function interfaces, and
+  :raster.type/element for the element dispatch tag of Object[]/parametric arrays
+  so it travels on the AST (survives re-walks that don't re-bind a captured var).
   This is the ONLY place type metadata should be attached to symbols."
-  [sym tag]
-  (if tag
-    (let [;; Clojure :tag is safe for arrays and classes, not bare primitives
-          clj-hint (inf/compute-binding-hint tag sym)]
-      (cond-> (vary-meta sym assoc :raster.type/tag tag)
-        clj-hint (vary-meta assoc :tag clj-hint)
-        (types/fn-type-tag? tag)
-        (vary-meta assoc :raster.type/fn-info {:iface-name tag})))
-    sym))
+  ([sym tag] (stamp-type-meta sym tag nil))
+  ([sym tag element]
+   (if tag
+     (let [;; Clojure :tag is safe for arrays and classes, not bare primitives
+           clj-hint (inf/compute-binding-hint tag sym)]
+       (cond-> (vary-meta sym assoc :raster.type/tag tag)
+         clj-hint (vary-meta assoc :tag clj-hint)
+         (types/fn-type-tag? tag)
+         (vary-meta assoc :raster.type/fn-info {:iface-name tag})
+         element (vary-meta assoc :raster.type/element element)))
+     sym)))
 
 (defn ctx-get-tag
-  "Get the dispatch tag for a symbol."
+  "Get the dispatch tag for a symbol.
+
+  Reads the ctx type-env first (the per-walk cache), then falls back to a tag
+  carried on the symbol itself (`:raster.type/tag` metadata stamped at the
+  reference site by a prior walk). Carrying the type on the AST means a re-walk
+  over restructured code (PE/CSE/inline) keeps a binding's type even when the
+  re-derived ctx type-env doesn't reach into a nested scope (e.g. an ftm closure
+  capturing an outer var)."
   [ctx sym]
-  (get-in (:type-env ctx) [sym :tag]))
+  (or (get-in (:type-env ctx) [sym :tag])
+      (when (symbol? sym) (:raster.type/tag (meta sym)))))
 
 (defn ctx-get-fn-info
   "Get fn-info for a symbol."
@@ -112,9 +124,13 @@
   (get-in (:type-env ctx) [sym :fn-info]))
 
 (defn ctx-get-element
-  "Get element type for an Object[] symbol."
+  "Get the element dispatch tag for an Object[]/parametric symbol. Reads the ctx
+  type-env first, then a carried `:raster.type/element` on the symbol (stamped at
+  the binding site) so the element survives a re-walk that doesn't re-bind a
+  captured var — mirroring ctx-get-tag."
   [ctx sym]
-  (get-in (:type-env ctx) [sym :element]))
+  (or (get-in (:type-env ctx) [sym :element])
+      (when (symbol? sym) (:raster.type/element (meta sym)))))
 
 ;; ================================================================
 ;; Form Classification
@@ -281,8 +297,12 @@
     (and (seq? form) (#{'letfn 'letfn*} (first form)))
     :letfn
 
-    ;; case — walk test expr and result exprs but not dispatch constants
-    (and (seq? form) (#{'case 'case*} (first form)))
+    ;; case — walk test expr and result exprs but not dispatch constants.
+    ;; Match by name: `case` is a macro, so inlining/qualification can yield
+    ;; `clojure.core/case`; treating that as a generic call would walk (and
+    ;; type-tag) the dispatch constants, e.g. 0 → (long 0), which then breaks
+    ;; clojure.core/case macroexpansion downstream.
+    (and (seq? form) (symbol? (first form)) (#{"case" "case*"} (name (first form))))
     :case
 
     ;; new — walk constructor args but not class name
@@ -503,7 +523,7 @@
                                                 {:source-ns (:source-ns ctx)}))
                  elem-tag (inf/infer-element-tag init tag type-env)
                  hint (inf/compute-binding-hint tag sym)
-                 sym (stamp-type-meta sym (or hint tag))]
+                 sym (stamp-type-meta sym (or hint tag) elem-tag)]
              [(conj binds sym rewritten-init)
               (cond-> ctx
                 tag (ctx-assoc-type sym tag)
@@ -569,9 +589,17 @@
 (defmethod walk-form :ftm [form ctx]
   (let [[ftm-sym param-vec & body-args] form
         ;; Parse optional return type: (ftm [params] :- RetType body...)
-        [ret-type body] (if (= :- (first body-args))
+        [ret-type tail] (if (= :- (first body-args))
                           [(second body-args) (nnext body-args)]
                           [nil body-args])
+        ;; Idempotency: the pipeline walks ftms more than once (walk → inline →
+        ;; pe-rewalk). An already-walked ftm carries its raw body in a
+        ;; `:raster.walker/source-body <vec>` marker; preserve that original raw
+        ;; body and re-walk only the walked body. Re-wrapping would NEST a second
+        ;; source-body and double the (64KB-method-limit-sensitive) payload.
+        already-walked? (= :raster.walker/source-body (first tail))
+        src-body (if already-walked? (second tail) (vec tail))
+        body     (if already-walked? (nnext tail) tail)
         ;; Parse typed params: [a :- Double, b :- Long] → extract names + types
         {:keys [params annotations]} (types/parse-typed-params param-vec)
         ;; Add params to walker context with their type annotations
@@ -589,10 +617,10 @@
         ;; body uses raster.numeric dispatch (handles Dual) unlike walked .invk calls.
         result (if ret-type
                  (list* ftm-sym param-vec :- ret-type
-                        :raster.walker/source-body (vec body)
+                        :raster.walker/source-body src-body
                         walked-body)
                  (list* ftm-sym param-vec
-                        :raster.walker/source-body (vec body)
+                        :raster.walker/source-body src-body
                         walked-body))]
     result))
 

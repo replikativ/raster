@@ -9,11 +9,11 @@
     (require '[raster.sci.special :refer [lgamma gamma digamma erf besselj0]])
     (lgamma 5.0)       ;; => 3.178053830...
     (besselj0 1.0)     ;; => 0.765197686..."
-  (:refer-clojure :exclude [aget aset alength aclone])
+  (:refer-clojure :exclude [aget aset alength aclone + - * /])
   (:require [raster.core :refer [deftm]]
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.math :as m]
-            [raster.numeric :as n]))
+            [raster.numeric :as n :refer [+ - * /]]))
 
 ;; ================================================================
 ;; Constants

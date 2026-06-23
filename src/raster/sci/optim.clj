@@ -31,7 +31,7 @@
 (deftm dot
   "Compute the dot product of two arrays."
   (All [T] [a :- (Array T), b :- (Array T)] :- Double
-       (reduce! [acc 0.0] [a b] (+ acc (* a b)))))
+       (reduce! [acc 0.0] [a b] (n/+ acc (n/* a b)))))
 
 (deftm vec-norm
   "Compute the Euclidean norm of an array."
@@ -50,7 +50,7 @@
   "Write the negation of a into out, element-wise."
   (All [T] [out :- (Array T), a :- (Array T)] :- (Array T)
        (dotimes [i (alength out)]
-         (aset out i (- (aget a i))))
+         (aset out i (n/- (aget a i))))
        out))
 
 (deftm vec-step!
@@ -58,7 +58,7 @@
   (All [T] [x :- (Array T), alpha :- Double, d :- (Array T)]
        :- (Array T)
        (dotimes [i (alength x)]
-         (aset x i (+ (aget x i) (* alpha (aget d i)))))
+         (aset x i (n/+ (aget x i) (n/* alpha (aget d i)))))
        x))
 
 ;; ================================================================
@@ -75,11 +75,11 @@
              tmp (vec-copy x)]
          (dotimes [i n]
            (let [xi (aget x i)]
-             (aset tmp i (+ xi eps))
+             (aset tmp i (n/+ xi eps))
              (let [fp (f tmp)]
-               (aset tmp i (- xi eps))
+               (aset tmp i (n/- xi eps))
                (let [fm (f tmp)]
-                 (aset out i (/ (- fp fm) (* 2.0 eps)))
+                 (aset out i (n// (n/- fp fm) (n/* 2.0 eps)))
                  (aset tmp i xi)))))
          out)))
 
@@ -102,11 +102,11 @@
              alpha
              (do
                (dotimes [i n]
-                 (aset x-new i (+ (aget x i) (* alpha (aget d i)))))
+                 (aset x-new i (n/+ (aget x i) (n/* alpha (aget d i)))))
                (let [fx-new (f x-new)]
-                 (if (<= fx-new (+ fx (* c alpha grad-dot-d)))
+                 (if (<= fx-new (n/+ fx (n/* (n/* c alpha) grad-dot-d)))
                    alpha
-                   (recur (* rho alpha) (unchecked-add-int iter 1))))))))))
+                   (recur (n/* rho alpha) (unchecked-add-int iter 1))))))))))
 
 ;; ================================================================
 ;; Nelder-Mead (derivative-free simplex method)
@@ -124,8 +124,8 @@
              (when (not= idx best-idx)
                (let [v (aget simplex idx)]
                  (dotimes [k n]
-                   (aset v k (+ (aget xb k)
-                                (* 0.5 (- (aget v k) (aget xb k))))))
+                   (aset v k (n/+ (aget xb k)
+                                  (n/* 0.5 (n/- (aget v k) (aget xb k))))))
                  (aset fvals idx (f v)))))))))
 
 (deftm nm-sort-order!
@@ -155,9 +155,9 @@
            (when (not= idx worst-idx)
              (let [v (aget simplex idx)]
                (dotimes [k n]
-                 (aset centroid k (+ (aget centroid k) (aget v k))))))))
+                 (aset centroid k (n/+ (aget centroid k) (aget v k))))))))
        (dotimes [k n]
-         (aset centroid k (/ (aget centroid k) (double n))))
+         (aset centroid k (n// (aget centroid k) (double n))))
        centroid))
 
 (deftm nm-reflect!
@@ -165,8 +165,8 @@
   (All [T] [out :- (Array T), centroid :- (Array T),
             xw :- (Array T), coeff :- Double, n :- Long]
        (dotimes [k n]
-         (aset out k (+ (aget centroid k)
-                        (* coeff (- (aget centroid k) (aget xw k))))))
+         (aset out k (n/+ (aget centroid k)
+                          (n/* coeff (n/- (aget centroid k) (aget xw k))))))
        out))
 
 (deftm nm-expand!
@@ -174,8 +174,8 @@
   (All [T] [out :- (Array T), centroid :- (Array T),
             xr :- (Array T), gamma :- Double, n :- Long]
        (dotimes [k n]
-         (aset out k (+ (aget centroid k)
-                        (* gamma (- (aget xr k) (aget centroid k))))))
+         (aset out k (n/+ (aget centroid k)
+                          (n/* gamma (n/- (aget xr k) (aget centroid k))))))
        out))
 
 (deftm nm-contract-outside!
@@ -183,8 +183,8 @@
   (All [T] [out :- (Array T), centroid :- (Array T),
             xr :- (Array T), beta :- Double, n :- Long]
        (dotimes [k n]
-         (aset out k (+ (aget centroid k)
-                        (* beta (- (aget xr k) (aget centroid k))))))
+         (aset out k (n/+ (aget centroid k)
+                          (n/* beta (n/- (aget xr k) (aget centroid k))))))
        out))
 
 (deftm nm-contract-inside!
@@ -192,8 +192,8 @@
   (All [T] [out :- (Array T), centroid :- (Array T),
             xw :- (Array T), beta :- Double, n :- Long]
        (dotimes [k n]
-         (aset out k (+ (aget centroid k)
-                        (* beta (- (aget xw k) (aget centroid k))))))
+         (aset out k (n/+ (aget centroid k)
+                          (n/* beta (n/- (aget xw k) (aget centroid k))))))
        out))
 
 (deftm nelder-mead
@@ -215,8 +215,8 @@
          (dotimes [i n]
            (let [v  (vec-copy x0)
                  xi (aget x0 i)
-                 delta (if (== xi 0.0) 0.00025 (* 0.05 xi))]
-             (aset v i (+ xi delta))
+                 delta (if (== xi 0.0) 0.00025 (n/* 0.05 xi))]
+             (aset v i (n/+ xi delta))
              (aset simplex (inc i) v)
              (aset fvals (inc i) (f v))))
          (loop [iter (int 0)]
@@ -226,7 +226,7 @@
                  f-best    (aget fvals best-idx)
                  f-worst   (aget fvals worst-idx)
                  f-second  (aget fvals (aget order (dec n)))
-                 spread    (- f-worst f-best)]
+                 spread    (n/- f-worst f-best)]
              (if (or (>= iter maxiter) (< spread tol))
                {:minimizer (vec (aget simplex best-idx))
                 :minimum   f-best
@@ -340,18 +340,18 @@
                            si   (aget s-store idx)
                            yi   (aget y-store idx)
                            rhoi (aget rho-store idx)
-                           ai   (* rhoi (dot si q))]
+                           ai   (n/* rhoi (dot si q))]
                        (aset alpha-buf i ai)
                        (dotimes [j n]
-                         (aset q j (- (aget q j) (* ai (aget yi j)))))
+                         (aset q j (n/- (aget q j) (n/* ai (aget yi j)))))
                        (recur (dec i)))))
             ;; Scale by gamma
                  (when (> bound 0)
                    (let [last-idx (int (clojure.core/mod (dec k) m))
                          s-last (aget s-store last-idx)
                          y-last (aget y-store last-idx)
-                         gamma  (/ (dot s-last y-last) (dot y-last y-last))]
-                     (dotimes [j n] (aset q j (* gamma (aget q j))))))
+                         gamma  (n// (dot s-last y-last) (dot y-last y-last))]
+                     (dotimes [j n] (aset q j (n/* gamma (aget q j))))))
             ;; Second loop (forward)
                  (loop [i (int 0)]
                    (when (< i bound)
@@ -359,32 +359,32 @@
                            si   (aget s-store idx)
                            yi   (aget y-store idx)
                            rhoi (aget rho-store idx)
-                           beta (* rhoi (dot yi q))]
+                           beta (n/* rhoi (dot yi q))]
                        (dotimes [j n]
-                         (aset q j (+ (aget q j) (* (- (aget alpha-buf i) beta) (aget si j)))))
+                         (aset q j (n/+ (aget q j) (n/* (n/- (aget alpha-buf i) beta) (aget si j)))))
                        (recur (unchecked-add-int i 1)))))
             ;; d = -H*g, line search, update
                  (let [d (n/similar x0)
-                       _ (dotimes [j n] (aset d j (- (aget q j))))
+                       _ (dotimes [j n] (aset d j (n/- (aget q j))))
                        gd    (dot g d)
                        alpha (backtracking-linesearch f x d gd 1.0 1e-4 0.9 30)
                        _     (acopy! g 0 g-prev 0 n)
                        s-new (n/similar x0)]
                    (dotimes [j n]
-                     (let [step (* alpha (aget d j))]
+                     (let [step (n/* alpha (aget d j))]
                        (aset s-new j step)
-                       (aset x j (+ (aget x j) step))))
+                       (aset x j (n/+ (aget x j) step))))
                    (grad-fn x g)
                    (let [y-new (n/similar x0)]
                      (dotimes [j n]
-                       (aset y-new j (- (aget g j) (aget g-prev j))))
+                       (aset y-new j (n/- (aget g j) (aget g-prev j))))
                      (let [sy (dot s-new y-new)
                            stored? (> sy 1e-20)]
                        (when stored?
                          (let [idx (int (clojure.core/mod k m))]
                            (aset s-store idx s-new)
                            (aset y-store idx y-new)
-                           (aset rho-store idx (/ 1.0 sy))))
+                           (aset rho-store idx (n// 1.0 sy))))
                        (recur (unchecked-add-int iter 1)
                               (if stored?
                                 (unchecked-add-int k 1)
@@ -406,14 +406,14 @@
              tmp (vec-copy x)]
          (dotimes [i n]
            (let [xi (aget x i)]
-             (aset tmp i (+ xi eps))
+             (aset tmp i (n/+ xi eps))
              (finite-gradient! f tmp g1)
-             (aset tmp i (- xi eps))
+             (aset tmp i (n/- xi eps))
              (finite-gradient! f tmp g2)
              (aset tmp i xi)
              (let [row (aget H i)]
                (dotimes [j n]
-                 (aset row j (/ (- (aget g1 j) (aget g2 j)) (* 2.0 eps)))))))
+                 (aset row j (n// (n/- (aget g1 j) (aget g2 j)) (n/* 2.0 eps)))))))
          H)))
 
 (deftm solve-linear
@@ -427,7 +427,7 @@
            (let [row (double-array (inc n))
                  h-row (aget H i)]
              (dotimes [j n] (aset row j (aget h-row j)))
-             (aset row n (- (aget g i)))
+             (aset row n (n/- (aget g i)))
              (aset A i row)))
     ;; Forward elimination with partial pivoting
          (dotimes [k n]
@@ -445,12 +445,12 @@
              (when (> (n/abs akk) 1e-15)
                (loop [i (inc k)]
                  (when (< i n)
-                   (let [factor (/ (aget (aget A i) k) akk)]
+                   (let [factor (n// (aget (aget A i) k) akk)]
                      (loop [j k]
                        (when (<= j n)
                          (aset (aget A i) j
-                               (- (aget (aget A i) j)
-                                  (* factor (aget (aget A k) j))))
+                               (n/- (aget (aget A i) j)
+                                    (n/* factor (aget (aget A k) j))))
                          (recur (inc j)))))
                    (recur (inc i)))))))
     ;; Back substitution
@@ -459,9 +459,9 @@
              (when (>= i 0)
                (let [sum (loop [j (inc i) acc 0.0]
                            (if (>= j n) acc
-                               (recur (inc j) (+ acc (* (aget (aget A i) j) (aget d j))))))]
-                 (aset d i (/ (- (aget (aget A i) n) sum)
-                              (aget (aget A i) i))))
+                               (recur (inc j) (n/+ acc (n/* (aget (aget A i) j) (aget d j))))))]
+                 (aset d i (n// (n/- (aget (aget A i) n) sum)
+                                (aget (aget A i) i))))
                (recur (dec i))))
            d))))
 
@@ -494,7 +494,7 @@
                               (vec-negate! nd g)
                               nd)
                             d)
-                       gd (if (>= gd 0.0) (- (dot g g)) gd)
+                       gd (if (>= gd 0.0) (n/- (dot g g)) gd)
                        alpha (backtracking-linesearch f x d gd 1.0 1e-4 0.5 30)]
                    (vec-step! x alpha d)
                    (recur (unchecked-add-int iter 1))))))))))
@@ -537,7 +537,7 @@
   (All [T] [m :- (Array T), grads :- (Array T),
             beta1 :- Double] :- (Array T)
        (dotimes [i (alength m)]
-         (aset m i (+ (* beta1 (aget m i)) (* (- 1.0 beta1) (aget grads i)))))
+         (aset m i (n/+ (n/* beta1 (aget m i)) (n/* (n/- 1.0 beta1) (aget grads i)))))
        m))
 
 (deftm adam-update-v!
@@ -545,7 +545,7 @@
   (All [T] [v :- (Array T), grads :- (Array T),
             beta2 :- Double] :- (Array T)
        (dotimes [i (alength v)]
-         (aset v i (+ (* beta2 (aget v i)) (* (- 1.0 beta2) (* (aget grads i) (aget grads i))))))
+         (aset v i (n/+ (n/* beta2 (aget v i)) (n/* (n/- 1.0 beta2) (n/* (aget grads i) (aget grads i))))))
        v))
 
 (deftm adam-step!
@@ -553,11 +553,11 @@
   (All [T] [params :- (Array T), m :- (Array T),
             v :- (Array T), lr :- Double,
             beta1-t :- Double, beta2-t :- Double] :- (Array T)
-       (let [lr-corrected (/ lr (- 1.0 beta2-t))]
+       (let [lr-corrected (n// lr (n/- 1.0 beta2-t))]
          (dotimes [i (alength params)]
-           (aset params i (- (aget params i)
-                             (* lr-corrected (/ (/ (aget m i) (- 1.0 beta1-t))
-                                                (+ (n/sqrt (aget v i)) 1e-8))))))
+           (aset params i (n/- (aget params i)
+                               (n/* lr-corrected (n// (n// (aget m i) (n/- 1.0 beta1-t))
+                                                      (n/+ (n/sqrt (aget v i)) 1e-8))))))
          params)))
 
 (defvalue AdamState [m :- (Array double), v :- (Array double), t :- Long, beta1-t :- Double, beta2-t :- Double])
@@ -577,8 +577,8 @@
              t (.t state)
              beta1-t (.beta1-t state)
              beta2-t (.beta2-t state)
-             new-beta1-t (* beta1-t beta1)
-             new-beta2-t (* beta2-t beta2)]
+             new-beta1-t (n/* beta1-t beta1)
+             new-beta2-t (n/* beta2-t beta2)]
          (adam-update-m! m grads beta1)
          (adam-update-v! v grads beta2)
          (adam-step! params m v lr new-beta1-t new-beta2-t)
@@ -606,11 +606,11 @@
          (f x r0)
          (dotimes [j n]
            (let [xj (aget x j)]
-             (aset tmp j (+ xj eps))
+             (aset tmp j (n/+ xj eps))
              (f tmp r1)
              (aset tmp j xj)
              (dotimes [i m]
-               (aset J (+ (* i n) j) (/ (- (aget r1 i) (aget r0 i)) eps)))))
+               (aset J (+ (* i n) j) (n// (n/- (aget r1 i) (aget r0 i)) eps)))))
          J)))
 
 (deftm levenberg-marquardt
@@ -631,24 +631,24 @@
          (loop [iter (int 0)
                 lambda 1e-3]
            (let [cost (loop [i 0 s 0.0]
-                        (if (>= i m) s (recur (inc i) (+ s (* (aget r i) (aget r i))))))
+                        (if (>= i m) s (recur (inc i) (n/+ s (n/* (aget r i) (aget r i))))))
                  _ (compute-jacobian! f x J m n)
             ;; J^T * J and J^T * r
                  _ (dotimes [i n]
                      (dotimes [j n]
                        (let [s (loop [k 0 acc 0.0]
                                  (if (>= k m) acc
-                                     (recur (inc k) (+ acc (* (aget J (+ (* k n) i))
-                                                              (aget J (+ (* k n) j)))))))]
+                                     (recur (inc k) (n/+ acc (n/* (aget J (+ (* k n) i))
+                                                                  (aget J (+ (* k n) j)))))))]
                          (aset JtJ (+ (* i n) j) s)))
                      (let [s (loop [k 0 acc 0.0]
                                (if (>= k m) acc
-                                   (recur (inc k) (+ acc (* (aget J (+ (* k n) i))
-                                                            (aget r k))))))]
+                                   (recur (inc k) (n/+ acc (n/* (aget J (+ (* k n) i))
+                                                                (aget r k))))))]
                        (aset Jtr i s)))
             ;; Add lambda to diagonal (damping)
                  _ (dotimes [i n]
-                     (aset JtJ (+ (* i n) i) (+ (aget JtJ (+ (* i n) i)) lambda)))
+                     (aset JtJ (+ (* i n) i) (n/+ (aget JtJ (+ (* i n) i)) lambda)))
             ;; Solve (J^T J + lambda I) dx = -J^T r via Gaussian elimination
                  H-obj (object-array n)
                  _ (dotimes [i n]
@@ -661,23 +661,23 @@
              (let [dx-norm (vec-norm dx)]
                (if (or (>= iter maxiter) (< dx-norm tol))
                  {:minimizer (vec x)
-                  :minimum   (* 0.5 cost)
+                  :minimum   (n/* 0.5 cost)
                   :iterations (long iter)
                   :converged? (< dx-norm tol)}
             ;; Trial step
                  (do
-                   (dotimes [i n] (aset x-trial i (+ (aget x i) (aget dx i))))
+                   (dotimes [i n] (aset x-trial i (n/+ (aget x i) (aget dx i))))
                    (f x-trial r-trial)
                    (let [trial-cost (loop [i 0 s 0.0]
                                       (if (>= i m) s
-                                          (recur (inc i) (+ s (* (aget r-trial i) (aget r-trial i))))))]
+                                          (recur (inc i) (n/+ s (n/* (aget r-trial i) (aget r-trial i))))))]
                      (if (< trial-cost cost)
                   ;; Accept step, decrease lambda
                        (do (acopy! x-trial 0 x 0 n)
                            (acopy! r-trial 0 r 0 m)
-                           (recur (unchecked-add-int iter 1) (* lambda 0.1)))
+                           (recur (unchecked-add-int iter 1) (n/* lambda 0.1)))
                   ;; Reject step, increase lambda
-                       (recur (unchecked-add-int iter 1) (* lambda 10.0))))))))))))
+                       (recur (unchecked-add-int iter 1) (n/* lambda 10.0))))))))))))
 
 ;; ================================================================
 ;; Gauss-Newton
@@ -705,8 +705,8 @@
   (let [residual-fn (ftm [params :- (Array double), residuals :- (Array double)] :- (Array double)
                          (dotimes [i n-data]
                            (aset residuals i
-                                 (- (model params (aget xdata i))
-                                    (aget ydata i))))
+                                 (n/- (model params (aget xdata i))
+                                      (aget ydata i))))
                          residuals)]
     (levenberg-marquardt residual-fn p0 n-data n-params 1e-8 200)))
 
@@ -745,9 +745,9 @@
                (let [alpha (backtracking-linesearch f x
                                                     (let [d (n/similar x0)]
                                                       (vec-negate! d g) d)
-                                                    (- (dot g g)) 1.0 1e-4 0.5 30)]
+                                                    (n/- (dot g g)) 1.0 1e-4 0.5 30)]
                  (dotimes [i n]
-                   (aset x i (- (aget x i) (* alpha (aget g i)))))
+                   (aset x i (n/- (aget x i) (n/* alpha (aget g i)))))
                  (project-bounds! x lower upper n)
                  (recur (unchecked-add-int iter 1)))))))))
 
@@ -779,8 +779,8 @@
     (dotimes [i pop-size]
       (let [x (double-array n)]
         (dotimes [j n]
-          (aset x j (+ (aget lower j)
-                       (* (.nextDouble rng) (- (aget upper j) (aget lower j))))))
+          (aset x j (n/+ (aget lower j)
+                         (n/* (.nextDouble rng) (n/- (aget upper j) (aget lower j))))))
         (aset pop i x)
         (aset fitness i (f x))))
     (loop [iter (int 0)]
@@ -815,7 +815,7 @@
                 ;; Mutant + crossover
                 (dotimes [j n]
                   (if (or (== j j-rand) (< (.nextDouble rng) CR))
-                    (let [v (+ (aget xa j) (* F (- (aget xb j) (aget xc j))))
+                    (let [v (n/+ (aget xa j) (n/* F (n/- (aget xb j) (aget xc j))))
                           v (n/max (aget lower j) (n/min (aget upper j) v))]
                       (aset trial j v))
                     (aset trial j (aget xi j))))
