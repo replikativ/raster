@@ -250,10 +250,8 @@
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} full-type-env)
         ;; TC binding tags (eager for ftm, deferred for deftm)
         tc-binding-tags (when tc-eager?
-                          (try
-                            (:binding-tags (inf/tc-analyze-deftm-body
-                                            (or fn-label '<ftm>) params annotations body *ns*))
-                            (catch Throwable _ nil)))
+                          (inf/safe-tc-binding-tags
+                            (or fn-label '<ftm>) params annotations body *ns*))
         ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
@@ -310,10 +308,7 @@
   not at definition time. This gives TC-quality code in the JIT path."
   [source-body params tags annotations source-ns]
   (let [type-env (build-walker-type-env params annotations)
-        tc-binding-tags (try
-                          (:binding-tags (inf/tc-analyze-deftm-body
-                                          '<jit> params annotations source-body source-ns))
-                          (catch Throwable _ nil))
+        tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) source-body)))
@@ -1551,13 +1546,8 @@
         typed-iface-name (symbol (.getName ^Class (:iface-class iface-info)))
         ;; Run TC on the specialized body for binding type inference —
         ;; same as prepare-typed-body does for normal deftm
-        tc-binding-tags (try
-                          (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
-                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec source-ns)))
-                          (catch Throwable e
-                            (println (str "WARNING: TC analysis failed during parametric specialization of `"
-                                          fn-name "`: " (.getMessage e)))
-                            nil))
+        tc-binding-tags (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
+                          (inf/safe-tc-binding-tags fn-name params concrete-anns body-vec source-ns))
         ;; Walk the body — same as deftm macro does
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)

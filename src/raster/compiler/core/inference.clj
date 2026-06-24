@@ -249,6 +249,16 @@
       (vec (concat (map raster-ann->tc-type param-types) [:-> (raster-ann->tc-type ret-type)])))
     ann))
 
+(def ^:dynamic *tc-warn-on-error?*
+  "When true, surface every reason Typed Clojure failed to produce binding types
+  (an analysis exception, a TCError return type, or reported type-errors) instead
+  of silently falling back to the walker's structural inference. Off by default:
+  TC failure is non-fatal (devirtualization still proceeds via structural
+  heuristics, just less precisely), but enabling this makes the failures visible
+  for diagnosis — e.g. the source-ns resolution holes that silently discard all
+  binding types and regress devirtualization."
+  false)
+
 (defn tc-analyze-deftm-body
   "Analyze a deftm body once with Typed Clojure.
 
@@ -296,13 +306,19 @@
                                    nil)))))]
         (when result
           (when (and (seq (:type-errors result))
-                     (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
+                     (or *tc-warn-on-error?*
+                         (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref)))
             (binding [*out* *err*]
               (println (str "TC type errors in `" fn-name "` (may cause boxed dispatch): "
                             (str/join "; " (map #(-> % ex-data :message (or (str %)))
                                                 (:type-errors result)))))))
           (when (empty? (:type-errors result))
             (let [ret-type (:t (:ret result))]
+              (when (and *tc-warn-on-error?*
+                         (= "TCError" (some-> ret-type type .getSimpleName)))
+                (binding [*out* *err*]
+                  (println (str "[raster.tc] `" fn-name "` returned TCError — binding types "
+                                "discarded, structural fallback used (check source-ns resolution)."))))
               (when-not (= "TCError" (some-> ret-type type .getSimpleName))
                 (let [fn-int (first (:types ret-type))
                       f (first (:types fn-int))
@@ -322,8 +338,27 @@
                   {:ret-tag (when rng (tc-type->tag rng))
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
-    (catch Exception _
+    (catch Exception e
       ;; TC analysis failure — fall through to walker heuristics
+      (when *tc-warn-on-error?*
+        (binding [*out* *err*]
+          (println (str "[raster.tc] analysis threw for `" fn-name "` — falling back to "
+                        "structural inference: " (.getMessage e)))))
+      nil)))
+
+(defn safe-tc-binding-tags
+  "Run TC binding-type analysis, returning {sym → tag} or nil on failure. TC
+  failure is non-fatal (callers fall back to structural inference); set
+  *tc-warn-on-error?* to surface the cause. Single entry point so every call
+  site shares the same fallback + diagnostics policy."
+  [fn-name params annotations body source-ns]
+  (try
+    (:binding-tags (tc-analyze-deftm-body fn-name params annotations body source-ns))
+    (catch Throwable e
+      (when *tc-warn-on-error?*
+        (binding [*out* *err*]
+          (println (str "[raster.tc] binding-tag analysis failed for `" fn-name "`: "
+                        (.getMessage e)))))
       nil)))
 
 (defn- desugar-invk-for-tc
