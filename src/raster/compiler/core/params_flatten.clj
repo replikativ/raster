@@ -1079,6 +1079,87 @@
   [inst]
   (:descs (flatten-params inst)))
 
+;; --- value-class access rewrite (the .-field / aget analogue of the HMap
+;; (:k m) -> leaf-sym pre-flatten). After sub-forward inlining + scan-vec
+;; unroll, every param use is a concrete deep access chain; we rewrite each
+;; leaf chain to its canonical leaf symbol and bind those in a prologue, so the
+;; differentiable inner body is in terms of free leaf locals (exactly what
+;; container-vg-runtime expects).
+
+;; Structural block-array indexing uses clojure.core/aget (integer index into a
+;; (Array Parameters) field); leaf element reads use raster.arrays/aget — only
+;; the former is a value-class access step.
+(def ^:private struct-aget-syms '#{aget clojure.core/aget})
+
+(defn- lit-int
+  "Unwrap an integer literal, including walker-emitted (long N) / (int N)."
+  [x]
+  (cond
+    (integer? x) x
+    (and (seq? x) (= 2 (count x)) ('#{long int clojure.core/long clojure.core/int} (first x))
+         (integer? (second x)))
+    (second x)))
+
+(defn vc-extract-access-step
+  "Recognize one value-class access step. Returns [target step] or nil:
+  (.-field x) -> [x :field]; (clojure.core/aget x i-literal) -> [x i]."
+  [form]
+  (when (and (seq? form) (>= (count form) 2))
+    (let [op (first form)]
+      (cond
+        (and (symbol? op) (= 2 (count form)) (.startsWith (name op) ".-"))
+        [(second form) (keyword (subs (name op) 2))]
+
+        (and (contains? struct-aget-syms op) (= 3 (count form)) (lit-int (nth form 2)))
+        [(second form) (lit-int (nth form 2))]))))
+
+(defn vc-resolve-path
+  "Resolve form to [root path] when it is an access chain rooted at one of the
+  known value-class param roots (a set of symbols); else nil."
+  [form roots]
+  (cond
+    (and (symbol? form) (contains? roots form)) [form []]
+    :else (when-let [[target step] (vc-extract-access-step form)]
+            (when-let [[root path] (vc-resolve-path target roots)]
+              [root (conj path step)]))))
+
+(defn vc-access-expr-for-path
+  "Inverse of vc-resolve-path: build the deep .-field / aget access chain for a
+  leaf path under root."
+  [root path]
+  (reduce (fn [acc step]
+            (cond
+              (keyword? step) (list (symbol (str ".-" (name step))) acc)
+              (integer? step) (list 'clojure.core/aget acc step)
+              :else (throw (ex-info "Bad value-class path step" {:step step}))))
+          root path))
+
+(defn vc-prologue
+  "Given a root param symbol and a treedef (descs from params-treedef), return a
+  flat let*-style binding vector [leaf-sym access-expr ...] for every leaf."
+  [root descs]
+  (vec (mapcat (fn [{:keys [path]}]
+                 [(path->sym root path) (vc-access-expr-for-path root path)])
+               descs)))
+
+(defn vc-rewrite-body
+  "Replace every maximal value-class access chain rooted at a known param root
+  that resolves to a leaf path with that path's canonical leaf symbol. Non-leaf
+  (intermediate struct/array) chains are descended into, not replaced."
+  [body roots leaf-paths]
+  (let [leaf-set (set (map vec leaf-paths))]
+    (letfn [(rw [form]
+              (let [resolved (vc-resolve-path form roots)]
+                (if (and resolved (contains? leaf-set (vec (second resolved))))
+                  (path->sym (first resolved) (second resolved))
+                  (cond
+                    (seq? form)    (apply list (map rw form))
+                    (vector? form) (mapv rw form)
+                    (map? form)    (into (empty form)
+                                         (map (fn [[k v]] [(rw k) (rw v)]) form))
+                    :else form))))]
+      (rw body))))
+
 (defn unflatten-params
   "Rebuild a nested Parameters structure shaped like `template`, substituting
   leaves from `new-vals` in canonical order. Inverse of flatten-params: structure

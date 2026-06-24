@@ -425,6 +425,53 @@
               (recur (rest args) (rest flat-grads) (conj! out (first flat-grads))))
             (persistent! out)))))))
 
+;; ----------------------------------------------------------------------
+;; Nested Parameters value-class forward: runtime value+grad
+;;
+;; A nested forward is a deftm `(forward [p :- SomeParams, & data] ...)` whose
+;; body navigates a nested `defvalue :implements Parameters` struct via
+;; .-field / (clojure.core/aget blocks i) chains. value+grad-params reuses the
+;; flat-container AD: rewrite each leaf access chain in the walked body to a free
+;; leaf local (vc-rewrite-body), differentiate w.r.t. those locals (grad-expr),
+;; bind them from the struct in a prologue (vc-prologue), and assemble the flat
+;; gradients back into a same-shape Parameters struct (unflatten-params). The
+;; compiled inner fn is cached per nesting shape (canonical leaf paths).
+;; ----------------------------------------------------------------------
+
+(def ^:private params-vg-cache (atom {}))
+
+(defn value+grad-params
+  "Runtime value+grad for a nested-Parameters forward var. `forward-var` is a
+  deftm taking (p :- SomeParams, & data-args). Returns
+    (fn [p & data-args] -> [value grad-struct nil ...])
+  where grad-struct is a Parameters value-class of the SAME nested shape as p,
+  carrying one gradient leaf per param leaf in canonical (declaration) order;
+  data args get nil grads. The inner fn is cached per nesting shape (leaf paths)
+  — same block count reuses, different counts retrace."
+  [forward-var]
+  (let [resolve-dv @(requiring-resolve 'raster.ad.reverse/resolve-deftm-var)
+        ensure-wb  @(requiring-resolve 'raster.core/ensure-walked-body!)
+        grad-expr  @(requiring-resolve 'raster.ad.reverse/grad-expr)
+        resolved   (resolve-dv forward-var)
+        wb         (first (ensure-wb resolved))
+        deftm-params (vec (:raster.core/deftm-params (meta resolved)))
+        root-sym   (first deftm-params)]
+    (fn [p0 & data-args]
+      (let [descs (pf/params-treedef p0)
+            shape [forward-var (mapv :path descs)]
+            vgfn  (or (@params-vg-cache shape)
+                      (let [leaf-syms (mapv #(pf/path->sym root-sym (:path %)) descs)
+                            inner     (pf/vc-rewrite-body wb #{root-sym} (map :path descs))
+                            ad-inner  (grad-expr inner leaf-syms)
+                            prologue  (pf/vc-prologue root-sym descs)
+                            f (eval (list 'fn deftm-params (list 'let* prologue ad-inner)))]
+                        (swap! params-vg-cache assoc shape f)
+                        f))
+            [value pb] (apply vgfn p0 data-args)
+            pgrads     (pb 1.0)
+            grad-struct (pf/unflatten-params p0 pgrads)]
+        (into [value grad-struct] (repeat (count data-args) nil))))))
+
 (defn strip-leaf-wrappers
   "Walk a tree spec and remove Param/Frozen wrappers from every leaf,
   preserving HMap/HVec structure. Used to derive m/v specs from a weights
