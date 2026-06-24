@@ -472,6 +472,33 @@
             grad-struct (pf/unflatten-params p0 pgrads)]
         (into [value grad-struct] (repeat (count data-args) nil))))))
 
+(defn sgd-step
+  "One SGD update over a nested Parameters struct: leaf -= lr * grad_leaf, in
+  canonical leaf order. Array leaves are updated in place (the immutable
+  value-class keeps the same array references); scalar leaves are rebuilt.
+  Returns the (same-shape) params struct."
+  [params grad-struct lr]
+  (let [pv (:vals (pf/flatten-params params))
+        gv (:vals (pf/flatten-params grad-struct))
+        dbl (Class/forName "[D")
+        flt (Class/forName "[F")
+        new-vals (mapv (fn [p g]
+                         (cond
+                           (instance? dbl p)
+                           (do (dotimes [i (alength ^doubles p)]
+                                 (aset ^doubles p i
+                                       (- (aget ^doubles p i) (* lr (aget ^doubles g i)))))
+                               p)
+                           (instance? flt p)
+                           (do (dotimes [i (alength ^floats p)]
+                                 (aset ^floats p i
+                                       (float (- (aget ^floats p i) (* lr (aget ^floats g i))))))
+                               p)
+                           (number? p) (- (double p) (* lr (double g)))
+                           :else p))
+                       pv gv)]
+    (pf/unflatten-params params new-vals)))
+
 (defn strip-leaf-wrappers
   "Walk a tree spec and remove Param/Frozen wrappers from every leaf,
   preserving HMap/HVec structure. Used to derive m/v specs from a weights
