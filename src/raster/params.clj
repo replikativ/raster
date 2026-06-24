@@ -33,7 +33,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.params-flatten :as pf]
             [raster.compiler.pipeline :as pipeline]
-            [raster.dl.optim]))
+            [raster.dl.optim :as optim]))
 
 ;; ----------------------------------------------------------------------
 ;; Internal: parse a typed param vector
@@ -498,6 +498,57 @@
                            :else p))
                        pv gv)]
     (pf/unflatten-params params new-vals)))
+
+;; ----------------------------------------------------------------------
+;; Optimizer bridge for nested Parameters value-classes
+;;
+;; raster.dl.optim is leaf-array-centric: it operates on a flat {name -> array}
+;; map and mutates each array in place. A nested Parameters struct bridges to it
+;; by flatten-params -> {path-key -> leaf-array}; the grad-struct from
+;; value+grad-params flattens the same way (identical treedef -> identical keys).
+;; Because array leaves are mutated in place and the immutable value-class holds
+;; the same references, the struct reflects updates with no rebuild.
+;;
+;; Freezing is a path predicate: leaves whose path satisfies `frozen?` are
+;; excluded from the flat maps entirely — no optimizer state, never updated. This
+;; is the value-class analogue of the HMap path's Param/Frozen leaf wrappers, kept
+;; as a runtime concern so the params type stays fixed.
+;; ----------------------------------------------------------------------
+
+(defn- params-leaf-map
+  "Flat {path-key -> leaf-array} for a nested Parameters struct. `frozen?`
+  (or nil) is a predicate on the leaf path vector; matching leaves are excluded."
+  [p frozen?]
+  (let [{:keys [descs vals]} (pf/flatten-params p)]
+    (persistent!
+      (reduce (fn [acc [d v]]
+                (if (and frozen? (frozen? (:path d)))
+                  acc
+                  (assoc! acc (path-key (:path d)) v)))
+              (transient {})
+              (map vector descs vals)))))
+
+(defn make-params-optimizer
+  "Create an optimizer (`:sgd`/`:adam`/`:adamw`, schedules, grad clipping — see
+  raster.dl.optim/make-optimizer) for a nested `defvalue :implements Parameters`
+  struct. `opts` may include `:frozen?`, a predicate on a leaf path vector;
+  matching leaves are excluded from training (no state, never updated)."
+  [p opts]
+  (let [frozen? (:frozen? opts)]
+    (assoc (optim/make-optimizer (params-leaf-map p frozen?) opts)
+           ::frozen? frozen?)))
+
+(defn params-optimizer-step!
+  "Apply one optimizer step over a nested Parameters struct, mutating its leaf
+  arrays in place (so the struct reflects the update with no rebuild).
+  `grad-struct` is the same-shape gradient struct from value+grad-params; frozen
+  leaves are skipped. Returns p."
+  [p grad-struct state]
+  (let [frozen? (::frozen? state)]
+    (optim/optimizer-step! (params-leaf-map p frozen?)
+                           (params-leaf-map grad-struct frozen?)
+                           state)
+    p))
 
 (defn strip-leaf-wrappers
   "Walk a tree spec and remove Param/Frozen wrappers from every leaf,
