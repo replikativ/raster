@@ -2068,7 +2068,7 @@
 ;; Public API
 ;; ================================================================
 
-(defn- resolve-deftm-var
+(defn ^:no-doc resolve-deftm-var
   "Resolve a deftm dispatch var to its backing mangled var with walked body.
   Checks (in order):
   1. Direct metadata on f-var (mangled method vars, value+grad/grad results)

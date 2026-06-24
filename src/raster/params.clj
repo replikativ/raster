@@ -27,7 +27,8 @@
   treedef metadata so AD and the optimizer can dispatch at runtime."
   (:refer-clojure :exclude [compile])
   (:require [clojure.string :as str]
-            [raster.ad.reverse]      ; required so synthesized train-step bodies resolve
+            [raster.core]            ; deftm machinery: ensure-walked-body!, jit-walk-with-tc
+            [raster.ad.reverse]      ; AD: resolve-deftm-var, grad-expr, value+grad
             [raster.arrays]
             [raster.compiler.core.params :as params]
             [raster.compiler.core.types :as types]
@@ -337,9 +338,9 @@
   prologue. Returns (fn [container ...non-tree-args] -> [value pullback]) where
   pullback maps the output cotangent to a vector of Param-leaf gradients."
   [flat-var param-leaf-syms]
-  (let [resolve-dv @(requiring-resolve 'raster.ad.reverse/resolve-deftm-var)
-        ensure-wb  @(requiring-resolve 'raster.core/ensure-walked-body!)
-        grad-expr  @(requiring-resolve 'raster.ad.reverse/grad-expr)
+  (let [resolve-dv raster.ad.reverse/resolve-deftm-var
+        ensure-wb  raster.core/ensure-walked-body!
+        grad-expr  raster.ad.reverse/grad-expr
         resolved   (resolve-dv flat-var)
         wb         (first (ensure-wb resolved))
         _          (when-not (and (seq? wb) (#{'let* 'let} (first wb)))
@@ -397,7 +398,7 @@
 (defn- value+grad-positional
   [model-var m flat-var treedefs original-args]
   (let [;; Avoid hard-required dependency on ad.reverse at namespace load
-        vg           ((requiring-resolve 'raster.ad.reverse/value+grad) flat-var)]
+        vg           (raster.ad.reverse/value+grad flat-var)]
     (fn [& user-args]
       (let [;; Same flatten as the forward adapter
             flat (loop [args original-args, vals user-args, acc (transient [])]
@@ -449,10 +450,10 @@
   data args get nil grads. The inner fn is cached per nesting shape (leaf paths)
   — same block count reuses, different counts retrace."
   [forward-var]
-  (let [resolve-dv @(requiring-resolve 'raster.ad.reverse/resolve-deftm-var)
-        ensure-wb  @(requiring-resolve 'raster.core/ensure-walked-body!)
-        grad-expr  @(requiring-resolve 'raster.ad.reverse/grad-expr)
-        jit-walk   @(requiring-resolve 'raster.core/jit-walk-with-tc)
+  (let [resolve-dv raster.ad.reverse/resolve-deftm-var
+        ensure-wb  raster.core/ensure-walked-body!
+        grad-expr  raster.ad.reverse/grad-expr
+        jit-walk   raster.core/jit-walk-with-tc
         resolved   (resolve-dv forward-var)
         m          (meta resolved)
         deftm-params (vec (:raster.core/deftm-params m))

@@ -302,7 +302,7 @@
   silently falling back to the deftype impl."
   false)
 
-(defn- jit-walk-with-tc
+(clojure.core/defn ^:no-doc jit-walk-with-tc
   "Walk body with TC binding tags for JIT compilation.
   Julia model: type inference + devirtualization happens at first invocation,
   not at definition time. This gives TC-quality code in the JIT path."
