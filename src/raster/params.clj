@@ -73,7 +73,8 @@
 
 ;; Defined below (container generator + cache); declared here for use by the
 ;; container wrapper and containerize above them in file order.
-(declare container-class-cache gen-container-class! compile-flatten-wrapper-positional)
+(declare container-class-cache gen-container-class! compile-flatten-wrapper-positional
+         value+grad-positional alloc-zeros-like build-container)
 
 ;; ----------------------------------------------------------------------
 ;; Adapter: structured args -> flat args
@@ -328,6 +329,27 @@
                        descs vals)]
     (pf/unflatten-value spec new-vals)))
 
+(defn- container-vg-runtime
+  "Build the runtime value+grad for a single-container model. Splits the unpack
+  prologue (typed field accesses) from the inner body of the flat deftm's walked
+  body, differentiates the inner w.r.t. the Param leaf locals (now FREE — the AD
+  needs differentiation roots to be free, not let-bound), then re-adds the unpack
+  prologue. Returns (fn [container ...non-tree-args] -> [value pullback]) where
+  pullback maps the output cotangent to a vector of Param-leaf gradients."
+  [flat-var param-leaf-syms]
+  (let [resolve-dv @(requiring-resolve 'raster.ad.reverse/resolve-deftm-var)
+        ensure-wb  @(requiring-resolve 'raster.core/ensure-walked-body!)
+        grad-expr  @(requiring-resolve 'raster.ad.reverse/grad-expr)
+        resolved   (resolve-dv flat-var)
+        wb         (first (ensure-wb resolved))
+        _          (when-not (and (seq? wb) (#{'let* 'let} (first wb)))
+                     (throw (ex-info "container value+grad: flat body is not a (let* unpack inner)"
+                                     {:flat-var flat-var :body wb})))
+        [_ unpack inner] wb
+        flat-params (:raster.core/deftm-params (meta resolved))
+        ad-inner   (grad-expr inner (vec param-leaf-syms))]
+    (eval (list 'fn (vec flat-params) (list 'let* unpack ad-inner)))))
+
 (defn value+grad
   "Like raster.ad.reverse/value+grad but works on a defmodel var.
   Returns a function that takes the same structured args as the model and
@@ -341,7 +363,40 @@
         flat-var     (or (::flat-var m) (throw (ex-info "Not a defmodel var" {:var model-var})))
         treedefs     (::treedefs m)
         original-args (::original-args m)
-        ;; Avoid hard-required dependency on ad.reverse at namespace load
+        containers   (::containers m)]
+    (if (seq containers)
+      ;; Container path: differentiate the inner body w.r.t. the unpacked Param
+      ;; leaf locals (the leaf-positional AD doesn't apply — the flat deftm takes
+      ;; a value-class container, not positional leaves).
+      (let [[carg cmeta] (first containers)
+            td           (treedefs carg)
+            cinfo        (@container-class-cache (:class-sym cmeta))
+            leaves       (:leaves td)
+            param-leaves (filterv #(= :param (:kind %)) leaves)
+            vgfn         (container-vg-runtime flat-var (mapv :sym param-leaves))]
+        (when (> (count containers) 1)
+          (throw (ex-info "container value+grad: multiple container args not yet supported"
+                          {:containers (keys containers)})))
+        (fn [& user-args]
+          (let [tree-value (first user-args)
+                rest-args  (rest user-args)
+                container  (build-container cinfo (:spec td) tree-value)
+                [value pb] (apply vgfn container rest-args)
+                pgrads     (pb 1.0)                       ;; one per Param leaf (canonical order)
+                pgrad-map  (zipmap (map :sym param-leaves) pgrads)
+                in-vals    (pf/flatten-value (:spec td) tree-value)
+                ;; full per-leaf grad vector: Param → grad, else zero of same shape
+                full-grads (mapv (fn [{:keys [sym kind]} v]
+                                   (if (= kind :param) (pgrad-map sym) (alloc-zeros-like v)))
+                                 leaves in-vals)
+                grad-tree  (pf/unflatten-value (:spec td) full-grads)]
+            (into [value grad-tree] (repeat (count rest-args) nil)))))
+      ;; Positional path (unchanged)
+      (value+grad-positional model-var m flat-var treedefs original-args))))
+
+(defn- value+grad-positional
+  [model-var m flat-var treedefs original-args]
+  (let [;; Avoid hard-required dependency on ad.reverse at namespace load
         vg           ((requiring-resolve 'raster.ad.reverse/value+grad) flat-var)]
     (fn [& user-args]
       (let [;; Same flatten as the forward adapter
