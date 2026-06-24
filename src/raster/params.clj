@@ -495,6 +495,45 @@
       :spec       spec
       :optimizer  optimizer})))
 
+;; ----------------------------------------------------------------------
+;; Value-class container for tree params (replaces positional-arg splicing)
+;; ----------------------------------------------------------------------
+;; A tree arg's leaves are packed into ONE typed value-class container instead
+;; of N positional flat params — removing the JVM/Clojure ~200-arg ceiling.
+;; Each leaf becomes a TYPED field (double[]/float[]/long[]...), so access via
+;; (.-<leaf-sym> container) returns the original array type (no Object boxing,
+;; no checkcast). On Valhalla this is a real value class (defvalue); otherwise
+;; defvalue falls back to a defrecord. The container holds the leaf-array
+;; REFERENCES, so it is built once and reused across training steps (the
+;; optimizer mutates the arrays in place).
+
+(defonce ^:private container-class-cache (atom {}))
+
+(defn gen-container-class!
+  "Generate (once, cached by class-sym) a value-class container whose typed
+  fields are the canonical leaves of a tree arg. `leaves` are the treedef leaf
+  descriptors ({:sym :type ...}); `source-ns` is where the class + factory are
+  interned. Returns {:class-sym S :factory IFn :field-syms [...] :leaves ...}."
+  [class-sym leaves source-ns]
+  (or (@container-class-cache class-sym)
+      (let [field-vec (vec (mapcat (fn [{:keys [sym type]}] [sym :- type]) leaves))
+            form (list 'raster.core/defvalue class-sym field-vec)]
+        (binding [*ns* source-ns] (eval form))
+        (let [factory @(ns-resolve source-ns (symbol (str "->" class-sym)))
+              info {:class-sym class-sym
+                    :factory factory
+                    :field-syms (mapv :sym leaves)
+                    :leaves (vec leaves)}]
+          (swap! container-class-cache assoc class-sym info)
+          info))))
+
+(defn build-container
+  "Build a container instance from a runtime tree value, by flattening the
+  value to its canonical leaves and calling the generated factory. Leaf order
+  matches the value class' field order (both are the treedef canonical order)."
+  [{:keys [factory]} spec value]
+  (apply factory (pf/flatten-value spec value)))
+
 (defn model-treedef
   "Look up the treedef for a defmodel var's first tree arg.
   If multiple tree args, returns the first; for arg-name access use
