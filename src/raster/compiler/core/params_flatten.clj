@@ -1115,28 +1115,18 @@
 
 (defn vc-resolve-path
   "Resolve form to [root path] when it is an access chain rooted at one of the
-  known value-class param roots (a set of symbols); else nil. `valid-path?`
-  (default: always) bounds extension to paths that stay within the param tree —
-  so a (clojure.core/aget leaf j) element read past a leaf array does NOT extend
-  the path (it is left for the body to keep as an element read)."
-  ([form roots] (vc-resolve-path form roots (constantly true)))
-  ([form roots valid-path?]
-   (cond
-     (and (symbol? form) (contains? roots form)) [form []]
-     :else (when-let [[target step] (vc-extract-access-step form)]
-             (when-let [[root path] (vc-resolve-path target roots valid-path?)]
-               (let [new-path (conj path step)]
-                 (when (valid-path? new-path)
-                   [root new-path])))))))
-
-(defn- prefix-closure
-  "All path prefixes (including [] and each full path) of the given leaf paths."
-  [leaf-paths]
-  (into #{[]}
-        (mapcat (fn [p]
-                  (let [v (vec p)]
-                    (map #(subvec v 0 %) (range 1 (inc (count v))))))
-                leaf-paths)))
+  known value-class param roots (a set of symbols); else nil. Resolution is
+  greedy, but a (clojure.core/aget leaf j) element read past a leaf array needs
+  no special handling: leaf paths are terminal — flatten-params never emits a
+  leaf that is a prefix of another leaf — so an over-extended path can never
+  equal a leaf path, and vc-rewrite-body simply descends and rewrites the inner
+  leaf access (the index j is left intact as an element read)."
+  [form roots]
+  (cond
+    (and (symbol? form) (contains? roots form)) [form []]
+    :else (when-let [[target step] (vc-extract-access-step form)]
+            (when-let [[root path] (vc-resolve-path target roots)]
+              [root (conj path step)]))))
 
 (defn vc-access-expr-for-path
   "Inverse of vc-resolve-path: build the deep .-field / aget access chain for a
@@ -1162,11 +1152,9 @@
   that resolves to a leaf path with that path's canonical leaf symbol. Non-leaf
   (intermediate struct/array) chains are descended into, not replaced."
   [body roots leaf-paths]
-  (let [leaf-set (set (map vec leaf-paths))
-        closure  (prefix-closure leaf-paths)
-        valid?   (fn [p] (contains? closure (vec p)))]
+  (let [leaf-set (set (map vec leaf-paths))]
     (letfn [(rw [form]
-              (let [resolved (vc-resolve-path form roots valid?)]
+              (let [resolved (vc-resolve-path form roots)]
                 (if (and resolved (contains? leaf-set (vec (second resolved))))
                   (path->sym (first resolved) (second resolved))
                   (cond
