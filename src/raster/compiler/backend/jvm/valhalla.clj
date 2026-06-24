@@ -99,9 +99,15 @@
               kw-desc (ClassDesc/of "clojure.lang" "Keyword")
               ilookup-desc (ClassDesc/of "clojure.lang" "ILookup")
               tag->desc (fn [tag]
-                          (if-let [d (type-tag->descriptor tag)]
-                            (ClassDesc/ofDescriptor d)
-                            obj-desc))
+                          (cond
+                            ;; value-class / array-of-value-class field: tag is a
+                            ;; ClassDesc — use it directly (typed reference field,
+                            ;; for nested Parameters value-classes). The rest of
+                            ;; the generator already handles reference fields
+                            ;; (default aload, 1 slot, no box).
+                            (instance? java.lang.constant.ClassDesc tag) tag
+                            (type-tag->descriptor tag) (ClassDesc/ofDescriptor (type-tag->descriptor tag))
+                            :else obj-desc))
                ;; Box a primitive on the stack: emits invokestatic Type.valueOf(prim)
               emit-box (fn [code tag]
                          (when-let [box-cls (tag->box-class-name tag)]
