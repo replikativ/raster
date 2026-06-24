@@ -170,8 +170,15 @@
   once and reuses it across calls (the optimizer mutates leaf arrays in place)."
   1000000000)
 
-(defn- container-class-sym [fn-name arg]
-  (symbol (str (name fn-name) "__" (name arg) "__C")))
+(defn- container-class-sym
+  "Name the container class by a hash of its leaf signature (syms + types), so
+  the same shape dedups, a DIFFERENT shape gets a DIFFERENT class, and
+  redefining a model with a changed spec is safe (no stale cached class — value
+  classes can't be redefined in place once loaded)."
+  [fn-name arg leaves]
+  (let [sig (mapv (juxt :sym :type) leaves)]
+    (symbol (str (name fn-name) "__" (name arg) "__C"
+                 (Integer/toUnsignedString (hash sig) 36)))))
 
 (defn containerize
   "If any tree arg's leaf count ≥ *container-min-leaves*, rebuild the flat
@@ -190,7 +197,7 @@
                      (fn [p ann]
                        (if (tree? p)
                          (let [td (treedefs p)
-                               csym (container-class-sym fn-name p)]
+                               csym (container-class-sym fn-name p (:leaves td))]
                            (gen-container-class! csym (:leaves td) source-ns)
                            {:param p :ann csym
                             :unpacks (mapcat (fn [{:keys [sym]}]
