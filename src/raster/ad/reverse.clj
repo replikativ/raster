@@ -2658,6 +2658,70 @@
 
     :else form))
 
+(defn- alpha-convert
+  "Alpha-conversion: return `form` with every let/let*/loop/dotimes/fn*-bound
+  variable renamed to a fresh gensym, references updated, nested scopes respected
+  (a bound var removed from the env inside its own scope so outer renames don't
+  leak in). This is the missing dual of the capture-avoiding subst-syms (which
+  *preserves* bindings): we use it to make a form's local names unique before it
+  is spliced alongside structurally identical siblings (unrolled fold iterations)."
+  ([form] (alpha-convert {} form))
+  ([env form]
+   (cond
+     (symbol? form) (get env form form)
+
+     (seq? form)
+     (let [head (first form)]
+       (cond
+         (= 'quote head) form
+
+         (contains? #{'let 'let*} head)
+         (let [[_ binds & body] form
+               [new-binds env'] (reduce (fn [[bs e] [v init]]
+                                          (let [init' (alpha-convert e init)
+                                                g (gensym (str (name v) "_"))]
+                                            [(conj bs g init') (assoc e v g)]))
+                                        [[] env] (partition 2 binds))]
+           (apply list head new-binds (map (partial alpha-convert env') body)))
+
+         (contains? #{'loop 'loop*} head)
+         (let [[_ binds & body] form
+               pairs (partition 2 binds)
+               inits (mapv (fn [[_ init]] (alpha-convert env init)) pairs)
+               [vars env'] (reduce (fn [[vs e] [v _]]
+                                     (let [g (gensym (str (name v) "_"))]
+                                       [(conj vs g) (assoc e v g)]))
+                                   [[] env] pairs)]
+           (apply list head (vec (interleave vars inits))
+                  (map (partial alpha-convert env') body)))
+
+         (= 'dotimes head)
+         (let [[_ [v bound] & body] form
+               g (gensym (str (name v) "_"))
+               env' (assoc env v g)]
+           (apply list head [g (alpha-convert env bound)]
+                  (map (partial alpha-convert env') body)))
+
+         (contains? #{'fn 'fn*} head)
+         ;; (fn* name? [params] body...) | (fn* name? ([params] body...)+)
+         (let [parts (rest form)
+               [nm parts] (if (symbol? (first parts)) [[(first parts)] (rest parts)] [[] parts])
+               arities (if (vector? (first parts)) (list parts) parts)
+               conv-arity (fn [[params & body]]
+                            (let [[ps env'] (reduce (fn [[ps e] p]
+                                                      (if (= '& p) [(conj ps p) e]
+                                                          (let [g (gensym (str (name p) "_"))]
+                                                            [(conj ps g) (assoc e p g)])))
+                                                    [[] env] params)]
+                              (apply list ps (map (partial alpha-convert env') body))))]
+           (apply list head (concat nm (map conv-arity arities))))
+
+         :else (apply list (map (partial alpha-convert env) form))))
+
+     (vector? form) (mapv (partial alpha-convert env) form)
+     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
+     :else form)))
+
 (defn- hoist-nested-lets
   "Hoist let expressions out of call arguments into a wrapping let*.
   Transforms: (f (let [a e1] a) (let [b e2] b)) → (let* [a e1 b e2] (f a b))
@@ -2666,13 +2730,31 @@
   (cond
     (not (seq? form)) form
 
-    ;; Already a let/let* — hoist in bindings and body
+    ;; Already a let/let* — hoist in bindings and body. A binding whose init is
+    ;; itself a let (e.g. acc ← (let [...] array-result), as an unrolled fold
+    ;; accumulator produces) must be FLATTENED into this let*: splice the inner
+    ;; bindings, then bind the sym to the inner let's result. Otherwise the
+    ;; nested-let-bound value is mis-typed by the AD (the flat-ANF invariant the
+    ;; AD requires covers binding inits, not just call args).
     (and (seq? form) (contains? #{'let 'let*} (first form)))
     (let [[let-sym bindings & body] form
-          hoisted-bindings (mapv (fn [[sym expr]] [sym (hoist-nested-lets expr)])
-                                 (partition 2 bindings))
+          flat-bindings
+          (reduce (fn [acc [sym expr]]
+                    (let [he (hoist-nested-lets expr)]
+                      (if (and (seq? he) (contains? #{'let 'let*} (first he)))
+                        ;; HYGIENE: alpha-convert the inner let (fresh bound names,
+                        ;; scope-respecting) BEFORE splicing it into this let*.
+                        ;; Without this, sibling flattened lets (e.g. repeated
+                        ;; unrolled fold iterations, which reuse the same local
+                        ;; names) collide and the reverse AD conflates them —
+                        ;; wrong gradients.
+                        (let [[_ inner-binds & inner-body] (alpha-convert he)]
+                          (-> acc (into (vec inner-binds)) (conj sym (last inner-body))))
+                        (conj acc sym he))))
+                  []
+                  (partition 2 bindings))
           hoisted-body (map hoist-nested-lets body)]
-      (apply list let-sym (vec (mapcat identity hoisted-bindings)) hoisted-body))
+      (apply list let-sym flat-bindings hoisted-body))
 
     ;; Scope-introducing forms — recurse but don't hoist across scope boundaries
     (and (seq? form) (contains? #{'if 'loop 'loop* 'fn* 'do 'when 'recur 'dotimes} (first form)))
