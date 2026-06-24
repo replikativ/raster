@@ -1196,6 +1196,63 @@
                   :else form)))]
       (rw body {}))))
 
+(defn- field-by-name [inst fname]
+  (let [^java.lang.reflect.Field f (.getDeclaredField (class inst) fname)]
+    (.setAccessible f true)
+    (.get f inst)))
+
+(defn nav-path
+  "Navigate a nested Parameters instance along a path (field keywords + array
+  indices) to the value at that path. (nav-path m [:blocks 0 :attn :W]) etc."
+  [inst path]
+  (reduce (fn [v step]
+            (cond
+              (keyword? step) (field-by-name v (name step))
+              (integer? step) (java.lang.reflect.Array/get v step)
+              :else (throw (ex-info "bad nav step" {:step step}))))
+          inst path))
+
+;; --- trace-time block-fold unroll ---
+;; (vc-fold [acc blk] init blocks-expr body) folds `body` over each element of
+;; the value-class array `blocks-expr`, threading `acc` from `init`. The block
+;; count is a runtime property, so the fold is unrolled at trace time (when
+;; value+grad-params / compile-aot see a concrete instance) into the flat
+;; per-block let* idiom that vc-rewrite-body + grad-expr already handle — the
+;; JAX "trace per shape" model.
+
+(def ^:private vc-fold-syms '#{vc-fold raster.params/vc-fold})
+
+(defn vc-fold-form? [f]
+  (and (seq? f) (contains? vc-fold-syms (first f))))
+
+(defn has-vc-fold? [body]
+  (boolean (some vc-fold-form? (tree-seq seqable? seq body))))
+
+(defn- subst-syms-tree [smap form]
+  (walk/postwalk (fn [x] (if (symbol? x) (get smap x x) x)) form))
+
+(defn unroll-vc-folds
+  "Expand every (vc-fold [acc blk] init blocks-expr body) in `body` into a flat
+  let* of N per-block applications, where N = (count-fn blocks-expr). acc/blk are
+  alpha-renamed per iteration; bottom-up so nested folds unroll inside-out."
+  [body count-fn]
+  (walk/postwalk
+    (fn [form]
+      (if (vc-fold-form? form)
+        (let [[_ [acc blk] init blocks fold-body] form
+              n     (long (count-fn blocks))
+              accs  (vec (repeatedly (inc n) #(gensym (str (name acc) "_"))))
+              binds (into [(accs 0) init]
+                          (mapcat (fn [i]
+                                    (let [blki (gensym (str (name blk) "_"))]
+                                      [blki (list 'clojure.core/aget blocks i)
+                                       (accs (inc i))
+                                       (subst-syms-tree {acc (accs i) blk blki} fold-body)]))
+                                  (range n)))]
+          (list 'let* binds (accs n)))
+        form))
+    body))
+
 (defn unflatten-params
   "Rebuild a nested Parameters structure shaped like `template`, substituting
   leaves from `new-vals` in canonical order. Inverse of flatten-params: structure

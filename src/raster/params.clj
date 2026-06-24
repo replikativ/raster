@@ -452,15 +452,31 @@
   (let [resolve-dv @(requiring-resolve 'raster.ad.reverse/resolve-deftm-var)
         ensure-wb  @(requiring-resolve 'raster.core/ensure-walked-body!)
         grad-expr  @(requiring-resolve 'raster.ad.reverse/grad-expr)
+        jit-walk   @(requiring-resolve 'raster.core/jit-walk-with-tc)
         resolved   (resolve-dv forward-var)
-        wb         (first (ensure-wb resolved))
-        deftm-params (vec (:raster.core/deftm-params (meta resolved)))
-        root-sym   (first deftm-params)]
+        m          (meta resolved)
+        deftm-params (vec (:raster.core/deftm-params m))
+        tags       (:raster.core/deftm-tags m)
+        annotations (:raster.core/deftm-annotations m)
+        source-body (:raster.core/deftm-source-body m)
+        source-ns  (or (try (the-ns (:raster.core/deftm-source-ns m)) (catch Throwable _ nil)) *ns*)
+        root-sym   (first deftm-params)
+        ;; A vc-fold has runtime depth, so its host body is walked per shape
+        ;; (trace-time unroll). Without a fold we reuse the single pre-walked body.
+        fold?      (pf/has-vc-fold? source-body)
+        pre-wb     (when-not fold? (first (ensure-wb resolved)))]
     (fn [p0 & data-args]
       (let [descs (pf/params-treedef p0)
             shape [forward-var (mapv :path descs)]
             vgfn  (or (@params-vg-cache shape)
-                      (let [leaf-syms (mapv #(pf/path->sym root-sym (:path %)) descs)
+                      (let [wb (if fold?
+                                 (let [count-fn (fn [blocks-expr]
+                                                  (let [[_ path] (pf/vc-resolve-path blocks-expr #{root-sym})]
+                                                    (alength (pf/nav-path p0 path))))
+                                       unrolled (mapv #(pf/unroll-vc-folds % count-fn) source-body)]
+                                   (first (jit-walk unrolled deftm-params tags annotations source-ns)))
+                                 pre-wb)
+                            leaf-syms (mapv #(pf/path->sym root-sym (:path %)) descs)
                             inner     (pf/vc-rewrite-body wb #{root-sym} (map :path descs))
                             ad-inner  (grad-expr inner leaf-syms)
                             prologue  (pf/vc-prologue root-sym descs)
