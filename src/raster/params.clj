@@ -71,20 +71,59 @@
         [params anns] (parse-typed-params param-vec)]
     {:params params :anns anns :ret ret :body (vec body)}))
 
+;; Defined below (container generator + cache); declared here for use by the
+;; container wrapper and containerize above them in file order.
+(declare container-class-cache gen-container-class! compile-flatten-wrapper-positional)
+
 ;; ----------------------------------------------------------------------
 ;; Adapter: structured args -> flat args
 ;; ----------------------------------------------------------------------
+
+(defn- container-wrapper
+  "Wrapper for the container form: each container arg is built once-per-call by
+  flattening the runtime tree value and calling the value-class factory (one
+  arg to inner-fn, no positional splice — so no arg-count limit). Non-container
+  tree args are still spliced; plain args pass through. Validates tree shape."
+  [inner-fn original-args treedefs containers]
+  (let [arg-plan
+        (mapv (fn [arg]
+                (if-let [{:keys [class-sym spec]} (get containers arg)]
+                  (let [factory (:factory (@container-class-cache class-sym))]
+                    {:kind :container :factory factory :spec spec})
+                  (if-let [td (get treedefs arg)]
+                    {:kind :splice :spec (:spec td)}
+                    {:kind :plain})))
+              original-args)]
+    (fn [& user-args]
+      (apply inner-fn
+             (mapcat (fn [{:keys [kind factory spec]} v]
+                       (case kind
+                         :container (do (pf/assert-tree-shape! spec v)
+                                        (pf/assert-no-identity-collisions! spec v)
+                                        [(apply factory (pf/flatten-value spec v))])
+                         :splice    (do (pf/assert-tree-shape! spec v)
+                                        (pf/flatten-value spec v))
+                         :plain     [v]))
+                     arg-plan user-args)))))
 
 (defn- compile-flatten-wrapper
   "Build a *fixed-arity* wrapper around inner-fn that splices each tree arg
   into per-leaf positional args via the callee's treedef. Generated via eval
   once per defmodel / compile-aot call — eliminates the per-call rest-args
   seq, transient loop, spec walk, and apply that the older runtime adapter
-  performed.
+  performed. When `containers` is non-empty, builds value-class containers
+  instead of positional splicing (container-wrapper).
 
   Validates that:
     - the runtime tree shape matches the spec (HVec lengths, HMap keys);
     - no two leaves of the same tree share JVM identity (naked weight tying)."
+  ([inner-fn original-args treedefs] (compile-flatten-wrapper inner-fn original-args treedefs nil))
+  ([inner-fn original-args treedefs containers]
+   (if (seq containers)
+     (container-wrapper inner-fn original-args treedefs containers)
+     (compile-flatten-wrapper-positional inner-fn original-args treedefs))))
+
+(defn- compile-flatten-wrapper-positional
   [inner-fn original-args treedefs]
   (let [user-syms (mapv (fn [arg] (gensym (str (name arg) "_"))) original-args)
         validations
@@ -119,6 +158,54 @@
     (builder inner-fn)))
 
 ;; ----------------------------------------------------------------------
+;; Containerization: tree args → typed value-class container + unpack prologue
+;; ----------------------------------------------------------------------
+
+(def ^:dynamic *container-min-leaves*
+  "When a defmodel tree arg has at least this many leaves, the flat deftm takes
+  ONE typed value-class container for that arg (built via gen-container-class!)
+  instead of N positional leaf params — removing the JVM/Clojure ~200-arg
+  ceiling. Default is high so existing models keep the positional path; lower it
+  (or bind it) to exercise the container path. The wrapper builds the container
+  once and reuses it across calls (the optimizer mutates leaf arrays in place)."
+  1000000000)
+
+(defn- container-class-sym [fn-name arg]
+  (symbol (str (name fn-name) "__" (name arg) "__C")))
+
+(defn containerize
+  "If any tree arg's leaf count ≥ *container-min-leaves*, rebuild the flat
+  signature so every tree arg becomes one typed value-class container param +
+  a typed-field-unpack `let*` prologue (leaf syms + body rewrite unchanged).
+  Generates the container class(es) as a side effect. Returns
+  {:params :annotations :body :containers {arg {:class-sym :spec}}} or nil to
+  keep the positional form. `rewritten-body` is prepare-deftm's flat body."
+  [fn-name original-params original-anns rewritten-body treedefs source-ns]
+  (let [tree? (fn [p] (get treedefs p))
+        cross? (some (fn [p] (when-let [td (treedefs p)]
+                               (>= (count (:leaves td)) *container-min-leaves*)))
+                     original-params)]
+    (when cross?
+      (let [per-arg (mapv
+                     (fn [p ann]
+                       (if (tree? p)
+                         (let [td (treedefs p)
+                               csym (container-class-sym fn-name p)]
+                           (gen-container-class! csym (:leaves td) source-ns)
+                           {:param p :ann csym
+                            :unpacks (mapcat (fn [{:keys [sym]}]
+                                               [sym (list (symbol (str ".-" sym)) p)])
+                                             (:leaves td))
+                            :container [p {:class-sym csym :spec (:spec td)}]})
+                         {:param p :ann ann :unpacks []}))
+                     original-params original-anns)
+            unpacks (vec (mapcat :unpacks per-arg))]
+        {:params      (mapv :param per-arg)
+         :annotations (mapv :ann per-arg)
+         :body        (list 'let* unpacks rewritten-body)
+         :containers  (into {} (keep :container per-arg))}))))
+
+;; ----------------------------------------------------------------------
 ;; defmodel macro
 ;; ----------------------------------------------------------------------
 
@@ -136,10 +223,16 @@
         prepared (pf/prepare-deftm params anns (if (= 1 (count body))
                                                  (first body)
                                                  (cons 'do body)))
-        flat-params (:params prepared)
-        flat-anns   (:annotations prepared)
-        flat-body   (:body prepared)
         treedefs    (:treedefs prepared)
+        ;; Containerize tree args when they cross the leaf threshold (generates
+        ;; the value-class container(s) now, at macroexpand). Otherwise keep the
+        ;; positional flat form. The leaf syms + body rewrite are identical
+        ;; either way — only the flat deftm's arg representation differs.
+        cont        (containerize fn-name params anns (:body prepared) treedefs *ns*)
+        flat-params (:params (or cont prepared))
+        flat-anns   (:annotations (or cont prepared))
+        flat-body   (:body (or cont prepared))
+        containers  (:containers cont)
         flat-name   (symbol (str fn-name "--flat"))
         flat-param-vec (vec (mapcat (fn [p ann]
                                       (if ann [p :- ann] [p]))
@@ -157,13 +250,15 @@
                 ::original-args  (list 'quote params)})
          (#'compile-flatten-wrapper @(var ~flat-name)
                                  '~params
-                                 '~treedefs))
+                                 '~treedefs
+                                 '~containers))
        (alter-meta! (var ~fn-name) assoc
                     ::treedefs '~treedefs
                     ::flat-var (var ~flat-name)
                     ::original-args '~params
                     ::arg-annotations '~anns
-                    ::ret-type '~ret)
+                    ::ret-type '~ret
+                    ::containers '~containers)
        (var ~fn-name))))
 
 ;; ----------------------------------------------------------------------
@@ -178,7 +273,8 @@
   (let [m (meta model-var)]
     (if-let [flat-var (::flat-var m)]
       (let [compiled-flat (apply pipeline/compile-aot flat-var opts)]
-        (compile-flatten-wrapper compiled-flat (::original-args m) (::treedefs m)))
+        (compile-flatten-wrapper compiled-flat (::original-args m) (::treedefs m)
+                                 (::containers m)))
       (apply pipeline/compile-aot model-var opts))))
 
 ;; ----------------------------------------------------------------------
