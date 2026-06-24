@@ -10,7 +10,8 @@
             [clojure.string :as str]
             [clojure.walk :as walk]
             [raster.compiler.core.params :as params]
-            [raster.compiler.core.types :as types]))
+            [raster.compiler.core.types :as types]
+            [raster.compiler.ir.form :as form]))
 
 ;; ----------------------------------------------------------------------
 ;; Spec inspection
@@ -1120,13 +1121,19 @@
   no special handling: leaf paths are terminal — flatten-params never emits a
   leaf that is a prefix of another leaf — so an over-extended path can never
   equal a leaf path, and vc-rewrite-body simply descends and rewrites the inner
-  leaf access (the index j is left intact as an element read)."
-  [form roots]
-  (cond
-    (and (symbol? form) (contains? roots form)) [form []]
-    :else (when-let [[target step] (vc-extract-access-step form)]
-            (when-let [[root path] (vc-resolve-path target roots)]
-              [root (conj path step)]))))
+  leaf access (the index j is left intact as an element read).
+
+  `aliases` maps a let-bound symbol to the [root path-prefix] of the sub-struct it
+  was bound to (e.g. `b` ← `(clojure.core/aget (.-blocks p) 0)` gives
+  b → [p [:blocks 0]]), so chains rooted at an intermediate struct local resolve."
+  ([form roots] (vc-resolve-path form roots {}))
+  ([form roots aliases]
+   (cond
+     (and (symbol? form) (contains? roots form)) [form []]
+     (and (symbol? form) (contains? aliases form)) (get aliases form)
+     :else (when-let [[target step] (vc-extract-access-step form)]
+             (when-let [[root path] (vc-resolve-path target roots aliases)]
+               [root (conj path step)])))))
 
 (defn vc-access-expr-for-path
   "Inverse of vc-resolve-path: build the deep .-field / aget access chain for a
@@ -1150,20 +1157,44 @@
 (defn vc-rewrite-body
   "Replace every maximal value-class access chain rooted at a known param root
   that resolves to a leaf path with that path's canonical leaf symbol. Non-leaf
-  (intermediate struct/array) chains are descended into, not replaced."
+  (intermediate struct/array) chains are descended into, not replaced.
+
+  Threads an alias environment through let/let* binding forms: a binding whose
+  init resolves to a NON-leaf sub-struct path (e.g. `b ← (aget (.-blocks p) i)`)
+  records `b → [root path]`, so later chains rooted at `b` resolve into the tree.
+  This handles the natural per-block fold idiom (bind the block, access its
+  fields) that both hand-written code and scan-vec/inline output produce."
   [body roots leaf-paths]
-  (let [leaf-set (set (map vec leaf-paths))]
-    (letfn [(rw [form]
-              (let [resolved (vc-resolve-path form roots)]
-                (if (and resolved (contains? leaf-set (vec (second resolved))))
+  (let [leaf-set (set (map vec leaf-paths))
+        leaf? (fn [r] (and r (contains? leaf-set (vec (second r)))))]
+    (letfn [(rw [form aliases]
+              (let [resolved (vc-resolve-path form roots aliases)]
+                (cond
+                  ;; leaf access chain → canonical leaf symbol
+                  (leaf? resolved)
                   (path->sym (first resolved) (second resolved))
-                  (cond
-                    (seq? form)    (apply list (map rw form))
-                    (vector? form) (mapv rw form)
-                    (map? form)    (into (empty form)
-                                         (map (fn [[k v]] [(rw k) (rw v)]) form))
-                    :else form))))]
-      (rw body))))
+
+                  ;; let/let* — process bindings left-to-right, accumulating
+                  ;; sub-struct aliases, then rewrite the body under them
+                  (and (seq? form) (form/binding-form? form))
+                  (let [[lsym bvec & bodyforms] form
+                        [binds aliases']
+                        (reduce
+                          (fn [[bs al] [s init]]
+                            (let [init' (rw init al)
+                                  ir    (vc-resolve-path init roots al)
+                                  al'   (if (and ir (not (leaf? ir))) (assoc al s ir) al)]
+                              [(conj bs s init') al']))
+                          [[] aliases]
+                          (partition 2 bvec))]
+                    (apply list lsym binds (map #(rw % aliases') bodyforms)))
+
+                  (seq? form)    (apply list (map #(rw % aliases) form))
+                  (vector? form) (mapv #(rw % aliases) form)
+                  (map? form)    (into (empty form)
+                                       (map (fn [[k v]] [(rw k aliases) (rw v aliases)]) form))
+                  :else form)))]
+      (rw body {}))))
 
 (defn unflatten-params
   "Rebuild a nested Parameters structure shaped like `template`, substituting
