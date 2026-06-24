@@ -997,6 +997,116 @@
     (mapv (fn [v] [:leaf (some-> v class .getName)]) leaves)))
 
 ;; ----------------------------------------------------------------------
+;; Type-directed flattening over nested Parameters value-classes
+;;
+;; Params can be authored as nested `defvalue … :implements Parameters`
+;; value-classes — each module a small typed struct, composed via value-class
+;; fields and (Array SubParams). Flattening is instance-driven: array fields
+;; carry their depth only at runtime, so the canonical leaf order (the treedef)
+;; is read off the params instance. Both flatten and unflatten walk fields in
+;; declaration order, which is exactly the value-class constructor's parameter
+;; order — so reconstruction is a single reflective ctor (also bypasses the
+;; >20-param factory limit and works for any field types).
+;; ----------------------------------------------------------------------
+
+(def ^:private parameters-iface
+  (delay (try (Class/forName "raster.core.Parameters") (catch Throwable _ nil))))
+
+(defn parameters-class?
+  "True iff Class c is a Parameters value-class (a nested-params module)."
+  [c]
+  (boolean (when-let [^Class p @parameters-iface]
+             (and (class? c) (.isAssignableFrom p ^Class c)))))
+
+(defn- vc-instance? [v]
+  (and (some? v) (parameters-class? (class v))))
+
+(defn- params-array? [v]
+  (and (some? v)
+       (let [^Class c (class v)]
+         (and (.isArray c) (parameters-class? (.getComponentType c))))))
+
+(defn- vc-fields
+  "Instance fields of a value-class, in declaration (= ctor param) order."
+  [^Class c]
+  (->> (.getDeclaredFields c)
+       (remove #(java.lang.reflect.Modifier/isStatic
+                  (.getModifiers ^java.lang.reflect.Field %)))
+       vec))
+
+(defn- field-get [^java.lang.reflect.Field f obj]
+  (.setAccessible f true)
+  (.get f obj))
+
+(defn- vc-construct
+  "Reconstruct a value-class of Class c from field values in declaration order,
+  via its sole declared constructor."
+  [^Class c args]
+  (let [^java.lang.reflect.Constructor ctor (first (.getDeclaredConstructors c))]
+    (.setAccessible ctor true)
+    (.newInstance ctor (object-array args))))
+
+(defn flatten-params
+  "Walk a nested Parameters value-class instance depth-first. Returns
+  {:descs [{:path :type :kind}] :vals [leaf …]} in canonical (declaration)
+  order — the type-directed analogue of flatten-spec + flatten-value.
+
+  Recursion: a Parameters-typed field descends into the sub-struct
+  (path += field keyword); an (Array Parameters) field descends per element
+  (path += index); every other field (typically a primitive array) is a leaf.
+  Leaves are :param by default (freezing is a path-level optimizer concern)."
+  [inst]
+  (let [descs (transient []) vals (transient [])]
+    (letfn [(walk [v path]
+              (cond
+                (vc-instance? v)
+                (doseq [^java.lang.reflect.Field f (vc-fields (class v))]
+                  (walk (field-get f v) (conj path (keyword (.getName f)))))
+
+                (params-array? v)
+                (dotimes [i (java.lang.reflect.Array/getLength v)]
+                  (walk (java.lang.reflect.Array/get v i) (conj path i)))
+
+                :else
+                (do (conj! descs {:path path :type (some-> v class) :kind :param})
+                    (conj! vals v))))]
+      (walk inst []))
+    {:descs (persistent! descs) :vals (persistent! vals)}))
+
+(defn params-treedef
+  "Canonical leaf descriptors of a nested Parameters instance — the single source
+  of leaf order for AD grad assembly and the optimizer."
+  [inst]
+  (:descs (flatten-params inst)))
+
+(defn unflatten-params
+  "Rebuild a nested Parameters structure shaped like `template`, substituting
+  leaves from `new-vals` in canonical order. Inverse of flatten-params: structure
+  (sub-struct classes, array lengths) comes from the template, leaf payloads from
+  new-vals. Returns a fresh top-level value-class."
+  [template new-vals]
+  (let [i (volatile! 0)]
+    (letfn [(rebuild [v]
+              (cond
+                (vc-instance? v)
+                (vc-construct (class v)
+                              (mapv (fn [^java.lang.reflect.Field f]
+                                      (rebuild (field-get f v)))
+                                    (vc-fields (class v))))
+
+                (params-array? v)
+                (let [n (java.lang.reflect.Array/getLength v)
+                      out (make-array (.getComponentType ^Class (class v)) n)]
+                  (dotimes [k n]
+                    (java.lang.reflect.Array/set
+                      out k (rebuild (java.lang.reflect.Array/get v k))))
+                  out)
+
+                :else
+                (let [x (nth new-vals @i)] (vswap! i inc) x)))]
+      (rebuild template))))
+
+;; ----------------------------------------------------------------------
 ;; Top-level: prepare deftm args
 ;; ----------------------------------------------------------------------
 
