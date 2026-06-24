@@ -101,11 +101,13 @@
               tag->desc (fn [tag]
                           (cond
                             ;; value-class / array-of-value-class field: tag is a
-                            ;; ClassDesc — use it directly (typed reference field,
-                            ;; for nested Parameters value-classes). The rest of
-                            ;; the generator already handles reference fields
+                            ;; ClassDesc, or a JVM descriptor STRING ("Lpkg/Name;",
+                            ;; "[Lpkg/Name;") — embeddable from the defvalue macro.
+                            ;; A typed reference field (nested Parameters); the rest
+                            ;; of the generator handles reference fields already
                             ;; (default aload, 1 slot, no box).
                             (instance? java.lang.constant.ClassDesc tag) tag
+                            (string? tag) (ClassDesc/ofDescriptor tag)
                             (type-tag->descriptor tag) (ClassDesc/ofDescriptor (type-tag->descriptor tag))
                             :else obj-desc))
                ;; Box a primitive on the stack: emits invokestatic Type.valueOf(prim)

@@ -993,6 +993,42 @@
             (swap! parametric-class-cache assoc fqn cls)
             cls))))
 
+;; Marker interface for parameter container value-classes (the composable unit
+;; for nested model params). Only fields whose type :implements Parameters get
+;; typed-value-class field treatment in defvalue — so GA/Dual/etc. value classes
+;; (GradedAlgebra, …) are unaffected.
+(defabstract Parameters)
+
+(defn- implements-parameters?
+  [^Class cls]
+  (try (.isAssignableFrom (Class/forName "raster.core.Parameters") cls)
+       (catch Throwable _ false)))
+
+(defn- value-class-field-tag
+  "If a defvalue field annotation names a (loaded) value-class that implements
+  Parameters — bare `Name` or `(Array Name)` — return a JVM descriptor string so
+  the generated value class has a TYPED field (a nested Parameters value-class or
+  an array of them) instead of Object. Other types (boxed primitives, GA/Dual
+  value classes, unknown tags) return nil (caller falls back to annotation->tag)."
+  [ann]
+  (let [boxed '#{Double Float Long Integer Short Byte Character Boolean
+                 java.lang.Double java.lang.Float java.lang.Long java.lang.Integer
+                 java.lang.Short java.lang.Byte java.lang.Character java.lang.Boolean}
+        vc   (fn [sym]
+               (when (and (symbol? sym) (not (boxed sym)))
+                 (let [r (try (resolve sym) (catch Exception _ nil))]
+                   (when (and (class? r) (not (.isPrimitive ^Class r))
+                              (implements-parameters? r)) r))))
+        ;; JVM field descriptor string (embeddable in the macro's output; the
+        ;; generator's tag->desc resolves a descriptor string to a ClassDesc).
+        desc (fn [^Class c] (str "L" (.replace (.getName c) "." "/") ";"))]
+    (cond
+      (and (sequential? ann) (= 'Array (first ann)) (vc (second ann)))
+      (str "[" (desc (vc (second ann))))
+      (vc ann)
+      (desc (vc ann))
+      :else nil)))
+
 (defmacro defvalue
   "Define a value type with :- Type annotations. On Valhalla JDK, generates
   real value class bytecode for stack allocation and array flattening. Falls
@@ -1042,11 +1078,17 @@
                                   :let [tag (types/annotation->tag ann p)]
                                   :when (not= tag 'Object)]
                               [(clojure.core/name p) tag]))
-          ;; Build field specs for Valhalla value class generation
+          ;; Build field specs for Valhalla value class generation. Value-class
+          ;; fields (nested Parameters) resolve to a ClassDesc tag so the field
+          ;; is typed (not Object).
           field-specs (mapv (fn [p ann]
                               {:name (clojure.core/name p)
-                               :tag (if ann (types/annotation->tag ann p) 'Object)})
+                               :tag (or (value-class-field-tag ann)
+                                        (if ann (types/annotation->tag ann p) 'Object))})
                             params annotations)
+          ;; A value class with any value-class-typed field is not SoA-eligible
+          ;; (SoA needs primitive-array fields only).
+          has-value-class-field? (boolean (some value-class-field-tag annotations))
           ;; Build hinted params for defrecord fallback (Double→^double, etc.)
           hinted (types/build-record-hinted-params params annotations)
           ;; Parse :implements from opts
@@ -1065,7 +1107,8 @@
                   :else (throw (ex-info "defvalue :implements must be a symbol or vector of symbols"
                                         {:implements implements})))
           ;; SoA companion generation
-          soa-eligible (inf/soa-eligible? field-types)
+          soa-eligible (and (not has-value-class-field?)
+                            (inf/soa-eligible? field-types))
           flat-field-info (when soa-eligible
                             (vec (mapcat (fn [[p ann]]
                                            (when ann
