@@ -208,6 +208,157 @@
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
 
+(defn- init-active?
+  "Decide whether a binding init carries gradient (is active), given the current
+  `activity` map {sym -> bool}. Shared by the AD binding engine and all reverse
+  orchestrators (gen-reverse-let / gen-reverse-loop-with-let / reify-pullback)."
+  [init-expr activity]
+  (cond
+    ;; Literal: never active (a symbol alias is active iff its source is)
+    (trivial-expr? init-expr)
+    (if (symbol? init-expr) (get activity init-expr false) false)
+
+    (seq? init-expr)
+    (let [head (first init-expr)]
+      (cond
+        ;; Comparison: returns a boolean, never active
+        (comparison-op? head) false
+
+        ;; If: active iff a branch symbol is active
+        (= 'if head)
+        (let [[_ _test then else] init-expr]
+          (boolean (or (and (symbol? then) (get activity then false))
+                       (and (symbol? else) (get activity else false)))))
+
+        ;; Par forms: active iff any free var in the body is active
+        (= 'raster.par/map! head)
+        (let [[_ _out _idx _bound _cast body] init-expr]
+          (boolean (some #(get activity % false) (free-syms-excluding body #{_idx}))))
+
+        (= 'raster.par/reduce head)
+        (let [[_ _acc _init _idx _bound body] init-expr]
+          (boolean (some #(get activity % false) (free-syms-excluding body #{_idx _acc}))))
+
+        ;; Loop: active iff any init or body references an active symbol
+        (contains? #{'loop 'loop*} head)
+        (let [[_ bindings-vec & body-forms] init-expr
+              pairs (partition 2 bindings-vec)
+              loop-vars (set (map first pairs))
+              init-free (reduce into #{} (map #(free-syms-excluding % #{}) (map second pairs)))
+              body-free (reduce into #{} (map #(free-syms-excluding % loop-vars) body-forms))]
+          (boolean (some #(get activity % false) (into init-free body-free))))
+
+        ;; Normal call / .invk: active iff any arg is active
+        :else
+        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
+          (boolean (some #(and (symbol? %) (get activity % false)) args)))))
+
+    :else false))
+
+;; ================================================================
+;; Forward-pass record creation — one multimethod, kind-dispatched
+;; (mirrors form/scope-info's :kind dispatch). A new differentiable SOAC is one
+;; new `ad-form-kind` clause + one `ad-record` defmethod — the engine is untouched.
+;; ================================================================
+
+(defn- ad-form-kind
+  "Classify a binding init into a reverse-record kind. The three array SOACs are
+  recognized BEFORE the activity gate (they manage their own activity via the
+  active-set); everything else is gated on `active?`."
+  [init-expr active?]
+  (cond
+    (and (seq? init-expr) (= 'raster.par/map!   (first init-expr))) :par-map
+    (and (seq? init-expr) (= 'raster.par/reduce (first init-expr))) :par-reduce
+    (and (seq? init-expr) (= 'dotimes           (first init-expr))) :dotimes
+    (not active?)                                                   :inactive
+    (and (seq? init-expr) (= 'if (first init-expr)))                :if
+    (symbol? init-expr)                                             :alias
+    (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
+    (seq? init-expr)                                                :call
+    :else                                                          :inactive))
+
+(defmulti ^:private ad-record
+  "Create the reverse-pass record for one binding. Returns
+   {:record <map-or-nil> :fwd-patch <fn-or-nil>}, where :fwd-patch (when present)
+   is applied to the forward-binding vector via swap! (the SOACs rewrite their own
+   forward binding to extract a pullback tape)."
+  (fn [kind _sym _init-expr _activity] kind))
+
+(defmethod ad-record :inactive [_ _sym _init _activity] {:record nil})
+
+(defmethod ad-record :alias [_ sym init-expr _activity]
+  {:record {:type :alias :sym sym :source init-expr}})
+
+(defmethod ad-record :if [_ sym init-expr _activity]
+  (let [[_ branch-expr then-expr else-expr] init-expr]
+    {:record {:type :if :sym sym :branch branch-expr :then then-expr :else else-expr}}))
+
+(defmethod ad-record :loop [_ sym _init-expr _activity]
+  (throw (ex-info
+          (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
+               "Use `par/reduce` for differentiable reductions, or wrap "
+               "the loop in a deftm with an AD template.")
+          {:sym sym :form-head 'loop})))
+
+(defmethod ad-record :par-map [_ sym init-expr activity]
+  (let [active-set (vec (keys (filter val activity)))
+        pm-info (assoc (gen-reverse-par-map init-expr active-set) :sym sym)
+        tape-sym (:tape-sym pm-info)]
+    {:record pm-info
+     :fwd-patch (fn [bs]
+                  (let [without-last (vec (drop-last 2 bs))]
+                    (vec (concat without-last [tape-sym (:forward-code pm-info) sym nil]))))}))
+
+(defmethod ad-record :par-reduce [_ sym init-expr activity]
+  (let [active-set (vec (keys (filter val activity)))
+        pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)
+        tape-sym (:tape-sym pr-info)
+        pair-sym (:result-pair-sym pr-info)]
+    {:record pr-info
+     :fwd-patch (fn [bs]
+                  (let [without-last (vec (drop-last 2 bs))]
+                    (vec (concat without-last
+                                 [pair-sym (:forward-code pr-info)
+                                  tape-sym (list 'aget pair-sym 0)
+                                  sym (list 'aget pair-sym 1)]))))}))
+
+(defmethod ad-record :dotimes [_ sym init-expr activity]
+  (let [active-set (vec (keys (filter val activity)))
+        dt-info (assoc (gen-reverse-dotimes init-expr active-set) :sym sym)
+        tape-sym (:tape-sym dt-info)]
+    {:record dt-info
+     :fwd-patch (fn [bs]
+                  (let [without-last (vec (drop-last 2 bs))]
+                    (vec (concat without-last [tape-sym (:forward-code dt-info) sym nil]))))}))
+
+(defmethod ad-record :call [_ sym init-expr activity]
+  (let [head (first init-expr)
+        [op args invk?] (if (= '.invk head)
+                          [(second init-expr) (vec (nnext init-expr)) true]
+                          [head (vec (rest init-expr)) false])
+        resolved (or (tmpl/resolve-template op)
+                     (auto-make-deftm-rule op))
+        has-active-args? (some #(and (symbol? %) (get activity % false)) args)]
+    (when (and (not resolved) has-active-args?)
+      (throw (ex-info (str "No AD template for `" op
+                           "` which has active (differentiable) inputs. "
+                           "Register an AD template or mark inputs as constant.")
+                      {:op op :args args :sym sym
+                       :active (filterv #(and (symbol? %) (get activity % false)) args)})))
+    {:record
+     (when resolved
+       (let [[_ base-op] resolved
+             arg-tags (let [n (name (if invk? op head))
+                            idx (.indexOf ^String n "_m_")]
+                        (when (pos? idx)
+                          (let [tag-str (subs n (clojure.core/+ idx 3))
+                                tag-str (if (.endsWith ^String tag-str "-impl")
+                                          (subs tag-str 0 (clojure.core/- (count tag-str) 5))
+                                          tag-str)]
+                            (mapv symbol (.split ^String tag-str "_")))))]
+         {:type :call :sym sym :base-op base-op :args args :arg-tags arg-tags
+          :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))
+
 (defn- gen-reverse-let
   "Generate reverse-mode AD code for a let* form.
 
@@ -231,186 +382,15 @@
             ;; Add forward binding (qualify arithmetic for Dual compatibility)
             (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
 
-            (let [init-active?
-                  (cond
-                    ;; Literal: never active
-                    (trivial-expr? init-expr)
-                    (if (symbol? init-expr)
-                      (get @sym-activity init-expr false)
-                      false)
+            (let [active? (init-active? init-expr @sym-activity)]
 
-                    ;; Function call or special form
-                    (seq? init-expr)
-                    (let [head (first init-expr)]
-                      (cond
-                        ;; Comparison: not active (returns boolean)
-                        (comparison-op? head)
-                        false
+              (swap! sym-activity assoc sym active?)
 
-                        ;; If expression: active if either branch sym is active
-                        (= 'if head)
-                        (let [[_ _test then else] init-expr]
-                          (boolean
-                           (or (and (symbol? then) (get @sym-activity then false))
-                               (and (symbol? else) (get @sym-activity else false))
-                               ;; Non-symbol branch (number literal): not active by itself
-                               )))
-
-                        ;; Par forms: active if any free variable in body is active
-                        (= 'raster.par/map! head)
-                        (let [[_ _out _idx _bound _cast body] init-expr
-                              free (free-syms-excluding body #{_idx})]
-                          (boolean (some #(get @sym-activity % false) free)))
-
-                        (= 'raster.par/reduce head)
-                        (let [[_ _acc _init _idx _bound body] init-expr
-                              free (free-syms-excluding body #{_idx _acc})]
-                          (boolean (some #(get @sym-activity % false) free)))
-
-                        ;; Loop: active if any init or body references active symbols
-                        ;; (walked body is closed-core: loop -> loop*)
-                        (contains? #{'loop 'loop*} head)
-                        (let [[_ bindings-vec & body-forms] init-expr
-                              pairs (partition 2 bindings-vec)
-                              loop-vars (set (map first pairs))
-                              init-exprs (map second pairs)
-                              ;; Check init expressions for active symbols
-                              init-free (reduce into #{} (map #(free-syms-excluding % #{}) init-exprs))
-                              ;; Check body for active symbols (excluding loop vars)
-                              body-free (reduce into #{} (map #(free-syms-excluding % loop-vars) body-forms))]
-                          (boolean (some #(get @sym-activity % false)
-                                         (into init-free body-free))))
-
-                        ;; Normal call: active if any arg is active
-                        :else
-                        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
-                          (boolean
-                           (some #(and (symbol? %) (get @sym-activity % false))
-                                 args)))))
-
-                    :else false)]
-
-              (swap! sym-activity assoc sym init-active?)
-
-              ;; Record for reverse pass
-              (cond
-                ;; Par map: (raster.par/map! out idx bound cast body)
-                (and (seq? init-expr) (= 'raster.par/map! (first init-expr)))
-                (let [active-set (vec (keys (filter val @sym-activity)))
-                      pm-info (assoc (gen-reverse-par-map init-expr active-set) :sym sym)]
-                  ;; Replace the forward binding with tape-augmented forward
-                  (swap! fwd-bindings
-                         (fn [bs]
-                           (let [without-last (vec (drop-last 2 bs))
-                                 tape-sym (:tape-sym pm-info)]
-                             (vec (concat without-last
-                                          [tape-sym (:forward-code pm-info)
-                                           sym nil])))))
-                  (swap! records conj pm-info))
-
-                ;; Par reduce: (raster.par/reduce acc init idx bound body)
-                (and (seq? init-expr) (= 'raster.par/reduce (first init-expr)))
-                (let [active-set (vec (keys (filter val @sym-activity)))
-                      pr-info (assoc (gen-reverse-par-reduce init-expr active-set) :sym sym)]
-                  ;; Replace the forward binding:
-                  ;; forward-code returns [tape, reduce-result] packed in object-array
-                  ;; We need to extract both the tape and the actual reduce result
-                  (swap! fwd-bindings
-                         (fn [bs]
-                           (let [without-last (vec (drop-last 2 bs))
-                                 tape-sym (:tape-sym pr-info)
-                                 pair-sym (:result-pair-sym pr-info)]
-                             (vec (concat without-last
-                                          [pair-sym (:forward-code pr-info)
-                                           tape-sym (list 'aget pair-sym 0)
-                                           sym (list 'aget pair-sym 1)])))))
-                  (swap! records conj pr-info))
-
-                ;; Dotimes with array mutation: native AD support
-                (and (seq? init-expr) (= 'dotimes (first init-expr)))
-                (let [active-set (vec (keys (filter val @sym-activity)))
-                      dt-info (assoc (gen-reverse-dotimes init-expr active-set) :sym sym)]
-                  ;; Replace the forward binding with tape-augmented forward
-                  (swap! fwd-bindings
-                         (fn [bs]
-                           (let [without-last (vec (drop-last 2 bs))
-                                 tape-sym (:tape-sym dt-info)]
-                             (vec (concat without-last
-                                          [tape-sym (:forward-code dt-info)
-                                           sym nil])))))
-                  (swap! records conj dt-info))
-
-                ;; Regular active bindings
-                init-active?
-                (cond
-                  ;; If expression: conditional adjoint routing
-                  (and (seq? init-expr) (= 'if (first init-expr)))
-                  (let [[_ branch-expr then-expr else-expr] init-expr]
-                    (swap! records conj
-                           {:type :if
-                            :sym sym
-                            :branch branch-expr
-                            :then then-expr
-                            :else else-expr}))
-
-                  ;; Symbol alias: pass-through
-                  (symbol? init-expr)
-                  (swap! records conj
-                         {:type :alias
-                          :sym sym
-                          :source init-expr})
-
-                  ;; Loop: cannot differentiate through raw loop/recur
-                  ;; (walked body is closed-core: loop -> loop*)
-                  (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr)))
-                  (throw (ex-info
-                          (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
-                               "Use `par/reduce` for differentiable reductions, or wrap "
-                               "the loop in a deftm with an AD template.")
-                          {:sym sym :form-head 'loop}))
-
-                  ;; Function call: use AD rule from unified template registry
-                  (seq? init-expr)
-                  (let [head (first init-expr)
-                        [op args invk?] (if (= '.invk head)
-                                          [(second init-expr) (vec (nnext init-expr)) true]
-                                          [head (vec (rest init-expr)) false])
-                        resolved (or (tmpl/resolve-template op)
-                                     (auto-make-deftm-rule op))
-                        ;; Check for missing AD rule on differentiable operation
-                        has-active-args? (some #(and (symbol? %)
-                                                     (get @sym-activity % false))
-                                               args)]
-                    (when (and (not resolved) has-active-args?)
-                      (throw (ex-info (str "No AD template for `" op
-                                           "` which has active (differentiable) inputs. "
-                                           "Register an AD template or mark inputs as constant.")
-                                      {:op op :args args :sym sym
-                                       :active (filterv #(and (symbol? %)
-                                                              (get @sym-activity % false))
-                                                        args)})))
-                    (when resolved
-                      (let [[_ base-op] resolved
-                            ;; Extract arg types from mangled name (works for both .invk and direct calls)
-                            arg-tags (let [n (name (if invk? op head))
-                                           idx (.indexOf ^String n "_m_")]
-                                       (when (pos? idx)
-                                         (let [tag-str (subs n (clojure.core/+ idx 3))
-                                               ;; Remove -impl suffix if present
-                                               tag-str (if (.endsWith ^String tag-str "-impl")
-                                                         (subs tag-str 0 (clojure.core/- (count tag-str) 5))
-                                                         tag-str)]
-                                           (mapv symbol (.split ^String tag-str "_")))))]
-                        (swap! records conj
-                               {:type :call
-                                :sym sym
-                                :base-op base-op
-                                :args args
-                                :arg-tags arg-tags
-                                :active-args
-                                (set (filter #(and (symbol? %)
-                                                   (get @sym-activity % false))
-                                             args))}))))))))
+              ;; Record for reverse pass — one dispatch (see ad-record above)
+              (let [{:keys [record fwd-patch]}
+                    (ad-record (ad-form-kind init-expr active?) sym init-expr @sym-activity)]
+                (when fwd-patch (swap! fwd-bindings fwd-patch))
+                (when record (swap! records conj record)))))
 
         ;; === Phase 2: Reverse pass ===
         dy-sym 'dy__rad
