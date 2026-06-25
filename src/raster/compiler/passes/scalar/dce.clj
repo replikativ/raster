@@ -146,7 +146,7 @@
   (and (seq? init) (symbol? (first init)) (>= (count init) 2)
        (symbol? (second init))
        (not (contains? bound-syms (second init)))
-       (or (.startsWith (name (first init)) ".-")
+       (or (.startsWith (name (first init)) ".")                  ; .field / .-field / (. obj field) — value-class field access (any interop form)
            (contains? '#{aget clojure.core/aget raster.arrays/aget} (first init)))))
 
 (defn eliminate-dead-bindings

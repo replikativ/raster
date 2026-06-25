@@ -745,6 +745,62 @@
             ~@(map second (partition 2 opt-bindings))
             ~'loss)))
 
+(defn- leaf->arr-tag
+  "Array dispatch tag (doubles/floats/longs/ints) for a leaf's `:type`, or nil."
+  [l]
+  (let [t (:type l)]
+    (when (and (sequential? t) (= 'Array (first t)))
+      (case (second t) double 'doubles, float 'floats, long 'longs, int 'ints, nil))))
+
+(defn- gen-train-step-body-container
+  "Synthesize the train-step body for the VALUE-CLASS CONTAINER parameter model.
+  w/m/v arrive as ONE typed `defvalue` container each (a field per leaf), so the
+  compiled method takes 3 args instead of 3N positional leaf params — dodging the
+  JVM 255-arg method limit (good up to 254 leaves; beyond that nest containers or
+  use a flat buffer). Each leaf is read with a TYPED field access `(.leaf v)`
+  (direct unboxed array fetch, no checkcast) — OUTSIDE the differentiated region,
+  so no AD is needed for it. value+grad runs on the unchanged POSITIONAL loss
+  (no container↔container bridging), then per-Param clip+optimizer steps mutate
+  the leaf arrays in place (kept alive by the DCE alias-liveness fix). The same
+  container is an SoA the GPU backend explodes into per-field array kernel args."
+  [loss-flat-var loss-args weights-arg leaves optimizer]
+  (let [data-args (vec (remove #(= % weights-arg) loss-args))
+        fld   (fn [cont l] (list (symbol (str "." (:sym l))) cont))
+        ;; Unpack ALL leaves from w-cont (typed field access; canonical order =
+        ;; loss-flat positional arg order). Bind each to its leaf sym.
+        w-syms  (mapv :sym leaves)
+        unpacks (vec (mapcat (fn [l] [(:sym l) (fld 'w-cont l)]) leaves))
+        vg-call `((raster.ad.reverse/value+grad
+                   (var ~(symbol (str (.ns ^clojure.lang.Var loss-flat-var))
+                                 (str (.sym ^clojure.lang.Var loss-flat-var)))))
+                  ~@w-syms ~@data-args)
+        ;; Per-Param leaf: grad d__i (tagged so f32/f64 dispatch is correct),
+        ;; clip, optimizer step in place; m/v read from their containers by field.
+        param-pairs (keep-indexed (fn [i l] (when (= :param (:kind l)) [i l])) leaves)
+        d-sym  (fn [i l] (let [t (leaf->arr-tag l) s (symbol (str "d__" i))]
+                           (if t (with-meta s {:tag t}) s)))
+        grad-binds (vec (mapcat (fn [[i l]] [(d-sym i l) `(clojure.core/nth ~'__vg-out ~(inc i))])
+                                param-pairs))
+        clip-effs  (map (fn [[i l]] `(raster.dl.optim/clip-grad-norm!
+                                      ~(d-sym i l) (raster.arrays/alength ~(:sym l)) ~'max-grad-norm))
+                        param-pairs)
+        opt-effs   (case optimizer
+                     :adam (map (fn [[i l]] `(raster.dl.optim/adam-step!
+                                              ~(:sym l) ~(d-sym i l) ~(fld 'm-cont l) ~(fld 'v-cont l)
+                                              (raster.arrays/alength ~(:sym l))
+                                              ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t))
+                                param-pairs)
+                     :sgd  (map (fn [[i l]] `(raster.dl.optim/sgd-step!
+                                              ~(:sym l) ~(d-sym i l) (raster.arrays/alength ~(:sym l)) ~'lr))
+                                param-pairs))]
+    `(~'let [~@unpacks
+             ~'__vg-out ~vg-call
+             ~'loss (clojure.core/nth ~'__vg-out 0)
+             ~@grad-binds]
+            ~@clip-effs
+            ~@opt-effs
+            ~'loss)))
+
 (defn- ensure-train-step-deps! []
   ;; The synthesized train-step body uses fully-qualified raster.dl.optim and
   ;; raster.arrays calls; the eval'd defmodel needs these namespaces loaded.
@@ -795,15 +851,22 @@
          ;; var is compiled under both :adam and :sgd (compile-aot otherwise
          ;; sees two same-name dispatch entries with different arities).
          train-name    (symbol (str (.sym loss-var) "--train-step-" (name optimizer)))
-         body          (gen-train-step-body flat-var original-args w-arg leaves w-td optimizer)
-         ;; HMap/HVec arg types are recognized directly by prepare-deftm — no
-         ;; Params wrapper needed. The (:k w) accesses pre-flatten into flat
-         ;; positional symbols at compile time.
+         ;; CONTAINER model: generate a typed `defvalue` (one field per leaf) and
+         ;; take w/m/v as ONE container arg each — 3 args, not 3N positional leaf
+         ;; params — so no JVM 255-arg wall (good up to 254 leaves; beyond that
+         ;; nest containers or use a flat buffer). Field access is typed; value+grad
+         ;; runs on the positional loss; the user-facing train-fn builds the
+         ;; containers from the param TREES (call contract unchanged). The same
+         ;; container is a GPU-explodable SoA (per-field array kernel args).
+         target-ns     (.ns ^clojure.lang.Var loss-var)
+         cont-sym      (container-class-sym train-name w-arg leaves)
+         _             (gen-container-class! cont-sym leaves target-ns)
+         body          (gen-train-step-body-container flat-var original-args w-arg leaves optimizer)
          param-vec     (vec (concat
-                             [w-arg :- spec]
+                             ['w-cont :- cont-sym]
                              (when (= optimizer :adam)
-                               ['m :- m-spec
-                                'v :- m-spec])
+                               ['m-cont :- cont-sym
+                                'v-cont :- cont-sym])
                              (mapcat (fn [[a ann]] [a :- ann]) non-tree)
                              ['max-grad-norm :- 'Double
                               'lr            :- 'Double]
@@ -812,13 +875,19 @@
                                 'beta2  :- 'Double
                                 'eps    :- 'Double
                                 'adam-t :- 'Long])))
-         form          `(raster.params/defmodel ~train-name ~param-vec :- ~'Double
+         form          `(raster.core/deftm ~train-name ~param-vec :- ~'Double
                           ~body)
-         target-ns     (.ns ^clojure.lang.Var loss-var)
          train-var     (binding [*ns* target-ns]
                          (eval form)
                          (find-var (symbol (str (.name target-ns)) (str train-name))))
-         train-fn      (compile-aot train-var)]
+         compiled      (pipeline/compile-aot train-var)
+         cinfo         (@container-class-cache cont-sym)
+         mk            (fn [s tree] (build-container cinfo s tree))
+         train-fn      (case optimizer
+                         :adam (fn [w m v & rest-args]
+                                 (apply compiled (mk spec w) (mk m-spec m) (mk m-spec v) rest-args))
+                         :sgd  (fn [w & rest-args]
+                                 (apply compiled (mk spec w) rest-args)))]
      {:train-fn   train-fn
       :init-state (case optimizer
                     :adam (fn [weights] (init-adam-state spec weights))

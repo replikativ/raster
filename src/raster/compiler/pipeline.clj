@@ -851,7 +851,14 @@
                              form (run-passes raw-form forward-passes opts)
                              hoist-opts (cond-> {:dtype effective-dtype}
                                           param-env (assoc :param-env param-env)
-                                          return-tag (assoc :return-tag return-tag))
+                                          return-tag (assoc :return-tag return-tag)
+                                          ;; Thread the deftm's defining namespace so the bytecode
+                                          ;; backend can resolve source-ns-local classes — e.g. a
+                                          ;; value-class param container, whose `(.leaf container)`
+                                          ;; field access must resolve the container's class. Without
+                                          ;; it the backend falls back to *ns* and fails with
+                                          ;; "Cannot resolve class for (. container leaf)".
+                                          source-ns (assoc :source-ns source-ns))
                              result (if (form/binding-form? form)
                                       (closure/hoist-and-compile form active-params active-params
                                                                  hoist-opts)
