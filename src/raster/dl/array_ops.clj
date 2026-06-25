@@ -279,57 +279,6 @@
                                                     [d-src nil nil nil nil])))})
 
 ;; ================================================================
-;; param-slice: leaf-view of a flat parameter buffer.
-;; out[i] = buf[offset+i] for i∈[0,len).  The single flatten boundary of the
-;; ParamBuffer model — a model's leaves are param-slices of one theta buffer at
-;; compile-time-constant offsets, so the compiled fn takes ONE param arg, not N.
-;; Forward is a copy (JVM primitive arrays can't be zero-copy sub-views); on the
-;; GPU backend it lowers to an offset read. Adjoint scatters the leaf gradient
-;; back into a buf-sized buffer at [offset, offset+len); AD sums these across all
-;; leaves (disjoint ranges → full d_theta; tied weights → correct += overlap).
-;; ================================================================
-
-(deftm param-slice
-  "Read buf[offset, offset+len) as a fresh array — one leaf of a flat param buffer."
-  [buf :- (Array double) offset :- Long len :- Long]
-  :- (Array double)
-  (let [out (double-array len)]
-    (dotimes [i len]
-      (aset out i (aget buf (+ offset (int i)))))
-    out))
-
-(deftm unslice-add
-  "Adjoint of param-slice: a buffer of size n, zero except [offset, offset+len)
-  = d-leaf. (Named -add because AD SUMS these per-arg across all leaf slices.)"
-  [d-leaf :- (Array double) n :- Long offset :- Long len :- Long]
-  :- (Array double)
-  (let [out (double-array n)]
-    (dotimes [i len]
-      (aset out (+ offset (int i)) (aget d-leaf i)))
-    out))
-
-(tmpl/merge-into-template! 'raster.dl.array-ops/param-slice
-                           {:pullback-factory (fn [_result buf offset len]
-                                                (fn [dy]
-                                                  [(unslice-add dy (alength ^doubles buf) offset len)
-                                                   nil nil]))})
-
-;; Symbolic AD template (used by the value+grad source transform — the
-;; pullback-factory alone only serves the runtime closure path). d_buf scatters
-;; the leaf adjoint back into a buf-sized buffer at [offset, offset+len).
-(tmpl/merge-into-template! 'raster.dl.array-ops/param-slice
-                           {:params '[buf offset len] :result nil :adjoint 'dy
-                            :grads-fn
-                            (fn [ctx [buf offset len] _result-sym adjoint-sym gensym-fn]
-                              (let [d-buf (gensym-fn "d_buf")]
-                                [(update ctx :bindings into
-                                         [d-buf (list 'raster.dl.array-ops/unslice-add
-                                                      adjoint-sym
-                                                      (list 'raster.arrays/alength buf)
-                                                      offset len)])
-                                 [d-buf nil nil]]))})
-
-;; ================================================================
 ;; indexed-dot: batched indexed dot product (multi-head aware)
 ;; out[e*n-slices+s] = Σ_{d=0}^{slice-dim-1} A[idx-a[e]*total-dim+s*slice-dim+d]
 ;;                                           * B[idx-b[e]*total-dim+s*slice-dim+d]

@@ -72,8 +72,7 @@
         [params anns] (parse-typed-params param-vec)]
     {:params params :anns anns :ret ret :body (vec body)}))
 
-;; Defined below (container generator + cache); declared here for use by the
-;; container wrapper and containerize above them in file order.
+;; Defined below; declared here for use by functions above them in file order.
 (declare container-class-cache gen-container-class! compile-flatten-wrapper-positional
          value+grad-positional alloc-zeros-like build-container)
 
@@ -100,49 +99,18 @@
 ;; Adapter: structured args -> flat args
 ;; ----------------------------------------------------------------------
 
-(defn- container-wrapper
-  "Wrapper for the container form: each container arg is built once-per-call by
-  flattening the runtime tree value and calling the value-class factory (one
-  arg to inner-fn, no positional splice — so no arg-count limit). Non-container
-  tree args are still spliced; plain args pass through. Validates tree shape."
-  [inner-fn original-args treedefs containers]
-  (let [arg-plan
-        (mapv (fn [arg]
-                (if-let [{:keys [class-sym spec]} (get containers arg)]
-                  (let [factory (:factory (@container-class-cache class-sym))]
-                    {:kind :container :factory factory :spec spec})
-                  (if-let [td (get treedefs arg)]
-                    {:kind :splice :spec (:spec td)}
-                    {:kind :plain})))
-              original-args)]
-    (fn [& user-args]
-      (apply inner-fn
-             (mapcat (fn [{:keys [kind factory spec]} v]
-                       (case kind
-                         :container (do (pf/assert-tree-shape! spec v)
-                                        (pf/assert-no-identity-collisions! spec v)
-                                        [(apply factory (pf/flatten-value spec v))])
-                         :splice    (do (pf/assert-tree-shape! spec v)
-                                        (pf/flatten-value spec v))
-                         :plain     [v]))
-                     arg-plan user-args)))))
-
 (defn- compile-flatten-wrapper
   "Build a *fixed-arity* wrapper around inner-fn that splices each tree arg
   into per-leaf positional args via the callee's treedef. Generated via eval
   once per defmodel / compile-aot call — eliminates the per-call rest-args
   seq, transient loop, spec walk, and apply that the older runtime adapter
-  performed. When `containers` is non-empty, builds value-class containers
-  instead of positional splicing (container-wrapper).
+  performed.
 
   Validates that:
     - the runtime tree shape matches the spec (HVec lengths, HMap keys);
     - no two leaves of the same tree share JVM identity (naked weight tying)."
-  ([inner-fn original-args treedefs] (compile-flatten-wrapper inner-fn original-args treedefs nil))
-  ([inner-fn original-args treedefs containers]
-   (if (seq containers)
-     (container-wrapper inner-fn original-args treedefs containers)
-     (compile-flatten-wrapper-positional inner-fn original-args treedefs))))
+  [inner-fn original-args treedefs]
+  (compile-flatten-wrapper-positional inner-fn original-args treedefs))
 
 (defn- compile-flatten-wrapper-positional
   [inner-fn original-args treedefs]
@@ -179,17 +147,14 @@
     (builder inner-fn)))
 
 ;; ----------------------------------------------------------------------
-;; Containerization: tree args → typed value-class container + unpack prologue
+;; Value-class container for a param bundle (used by compile-train-step)
 ;; ----------------------------------------------------------------------
-
-(def ^:dynamic *container-min-leaves*
-  "When a defmodel tree arg has at least this many leaves, the flat deftm takes
-  ONE typed value-class container for that arg (built via gen-container-class!)
-  instead of N positional leaf params — removing the JVM/Clojure ~200-arg
-  ceiling. Default is high so existing models keep the positional path; lower it
-  (or bind it) to exercise the container path. The wrapper builds the container
-  once and reuses it across calls (the optimizer mutates leaf arrays in place)."
-  1000000000)
+;; A param tree's leaves are packed into ONE typed `defvalue` (a field per leaf),
+;; so the compiled train step takes one container arg per role (w/m/v) instead of
+;; N positional leaf params — dodging the JVM 255-arg method limit (≤254 leaves).
+;; The container is also a GPU-explodable SoA. The loss itself stays POSITIONAL
+;; (it is inlined via value+grad, so its N leaf params become locals, no wall);
+;; only the top-level train step uses a container.
 
 (defn- container-class-sym
   "Name the container class by a hash of its leaf signature (syms + types), so
@@ -200,38 +165,6 @@
   (let [sig (mapv (juxt :sym :type) leaves)]
     (symbol (str (name fn-name) "__" (name arg) "__C"
                  (Integer/toUnsignedString (hash sig) 36)))))
-
-(defn containerize
-  "If any tree arg's leaf count ≥ *container-min-leaves*, rebuild the flat
-  signature so every tree arg becomes one typed value-class container param +
-  a typed-field-unpack `let*` prologue (leaf syms + body rewrite unchanged).
-  Generates the container class(es) as a side effect. Returns
-  {:params :annotations :body :containers {arg {:class-sym :spec}}} or nil to
-  keep the positional form. `rewritten-body` is prepare-deftm's flat body."
-  [fn-name original-params original-anns rewritten-body treedefs source-ns]
-  (let [tree? (fn [p] (get treedefs p))
-        cross? (some (fn [p] (when-let [td (treedefs p)]
-                               (>= (count (:leaves td)) *container-min-leaves*)))
-                     original-params)]
-    (when cross?
-      (let [per-arg (mapv
-                     (fn [p ann]
-                       (if (tree? p)
-                         (let [td (treedefs p)
-                               csym (container-class-sym fn-name p (:leaves td))]
-                           (gen-container-class! csym (:leaves td) source-ns)
-                           {:param p :ann csym
-                            :unpacks (mapcat (fn [{:keys [sym]}]
-                                               [sym (list (symbol (str ".-" sym)) p)])
-                                             (:leaves td))
-                            :container [p {:class-sym csym :spec (:spec td)}]})
-                         {:param p :ann ann :unpacks []}))
-                     original-params original-anns)
-            unpacks (vec (mapcat :unpacks per-arg))]
-        {:params      (mapv :param per-arg)
-         :annotations (mapv :ann per-arg)
-         :body        (list 'let* unpacks rewritten-body)
-         :containers  (into {} (keep :container per-arg))}))))
 
 ;; ----------------------------------------------------------------------
 ;; defmodel macro
@@ -252,15 +185,13 @@
                                                  (first body)
                                                  (cons 'do body)))
         treedefs    (:treedefs prepared)
-        ;; Containerize tree args when they cross the leaf threshold (generates
-        ;; the value-class container(s) now, at macroexpand). Otherwise keep the
-        ;; positional flat form. The leaf syms + body rewrite are identical
-        ;; either way — only the flat deftm's arg representation differs.
-        cont        (containerize fn-name params anns (:body prepared) treedefs *ns*)
-        flat-params (:params (or cont prepared))
-        flat-anns   (:annotations (or cont prepared))
-        flat-body   (:body (or cont prepared))
-        containers  (:containers cont)
+        ;; The loss stays POSITIONAL — its leaf params are flattened by
+        ;; prepare-deftm. (Containerization happens only at the top-level train
+        ;; step, in compile-train-step, where the leaves would otherwise overflow
+        ;; the JVM arg limit.)
+        flat-params (:params prepared)
+        flat-anns   (:annotations prepared)
+        flat-body   (:body prepared)
         flat-name   (symbol (str fn-name "--flat"))
         flat-param-vec (vec (mapcat (fn [p ann]
                                       (if ann [p :- ann] [p]))
@@ -274,8 +205,7 @@
                            {:treedefs       treedefs
                             :original-args  params
                             :arg-annotations anns
-                            :ret-type       ret
-                            :containers     containers})]
+                            :ret-type       ret})]
     `(do
        ;; Inner flat-arg deftm — what the compiler sees
        (raster.core/deftm ~flat-name ~flat-param-vec
@@ -289,15 +219,13 @@
                  {::flat-var (list 'var flat-name)})
            (#'compile-flatten-wrapper @(var ~flat-name)
                                       (:original-args mm#)
-                                      (:treedefs mm#)
-                                      (:containers mm#)))
+                                      (:treedefs mm#)))
          (alter-meta! (var ~fn-name) assoc
                       ::treedefs       (:treedefs mm#)
                       ::flat-var       (var ~flat-name)
                       ::original-args  (:original-args mm#)
                       ::arg-annotations (:arg-annotations mm#)
-                      ::ret-type       (:ret-type mm#)
-                      ::containers     (:containers mm#)))
+                      ::ret-type       (:ret-type mm#)))
        (var ~fn-name))))
 
 ;; ----------------------------------------------------------------------
@@ -312,8 +240,7 @@
   (let [m (meta model-var)]
     (if-let [flat-var (::flat-var m)]
       (let [compiled-flat (apply pipeline/compile-aot flat-var opts)]
-        (compile-flatten-wrapper compiled-flat (::original-args m) (::treedefs m)
-                                 (::containers m)))
+        (compile-flatten-wrapper compiled-flat (::original-args m) (::treedefs m)))
       (apply pipeline/compile-aot model-var opts))))
 
 ;; ----------------------------------------------------------------------
@@ -362,27 +289,6 @@
                        descs vals)]
     (pf/unflatten-value spec new-vals)))
 
-(defn- container-vg-runtime
-  "Build the runtime value+grad for a single-container model. Splits the unpack
-  prologue (typed field accesses) from the inner body of the flat deftm's walked
-  body, differentiates the inner w.r.t. the Param leaf locals (now FREE — the AD
-  needs differentiation roots to be free, not let-bound), then re-adds the unpack
-  prologue. Returns (fn [container ...non-tree-args] -> [value pullback]) where
-  pullback maps the output cotangent to a vector of Param-leaf gradients."
-  [flat-var param-leaf-syms]
-  (let [resolve-dv raster.ad.reverse/resolve-deftm-var
-        ensure-wb  raster.core/ensure-walked-body!
-        grad-expr  raster.ad.reverse/grad-expr
-        resolved   (resolve-dv flat-var)
-        wb         (first (ensure-wb resolved))
-        _          (when-not (and (seq? wb) (#{'let* 'let} (first wb)))
-                     (throw (ex-info "container value+grad: flat body is not a (let* unpack inner)"
-                                     {:flat-var flat-var :body wb})))
-        [_ unpack inner] wb
-        flat-params (:raster.core/deftm-params (meta resolved))
-        ad-inner   (grad-expr inner (vec param-leaf-syms))]
-    (eval (list 'fn (vec flat-params) (list 'let* unpack ad-inner)))))
-
 (defn value+grad
   "Like raster.ad.reverse/value+grad but works on a defmodel var.
   Returns a function that takes the same structured args as the model and
@@ -395,37 +301,8 @@
   (let [m            (meta model-var)
         flat-var     (or (::flat-var m) (throw (ex-info "Not a defmodel var" {:var model-var})))
         treedefs     (::treedefs m)
-        original-args (::original-args m)
-        containers   (::containers m)]
-    (if (seq containers)
-      ;; Container path: differentiate the inner body w.r.t. the unpacked Param
-      ;; leaf locals (the leaf-positional AD doesn't apply — the flat deftm takes
-      ;; a value-class container, not positional leaves).
-      (let [[carg cmeta] (first containers)
-            td           (treedefs carg)
-            cinfo        (@container-class-cache (:class-sym cmeta))
-            leaves       (:leaves td)
-            param-leaves (filterv #(= :param (:kind %)) leaves)
-            vgfn         (container-vg-runtime flat-var (mapv :sym param-leaves))]
-        (when (> (count containers) 1)
-          (throw (ex-info "container value+grad: multiple container args not yet supported"
-                          {:containers (keys containers)})))
-        (fn [& user-args]
-          (let [tree-value (first user-args)
-                rest-args  (rest user-args)
-                container  (build-container cinfo (:spec td) tree-value)
-                [value pb] (apply vgfn container rest-args)
-                pgrads     (pb 1.0)                       ;; one per Param leaf (canonical order)
-                pgrad-map  (zipmap (map :sym param-leaves) pgrads)
-                in-vals    (pf/flatten-value (:spec td) tree-value)
-                ;; full per-leaf grad vector: Param → grad, else zero of same shape
-                full-grads (mapv (fn [{:keys [sym kind]} v]
-                                   (if (= kind :param) (pgrad-map sym) (alloc-zeros-like v)))
-                                 leaves in-vals)
-                grad-tree  (pf/unflatten-value (:spec td) full-grads)]
-            (into [value grad-tree] (repeat (count rest-args) nil)))))
-      ;; Positional path (unchanged)
-      (value+grad-positional model-var m flat-var treedefs original-args))))
+        original-args (::original-args m)]
+    (value+grad-positional model-var m flat-var treedefs original-args)))
 
 (defn- value+grad-positional
   [model-var m flat-var treedefs original-args]

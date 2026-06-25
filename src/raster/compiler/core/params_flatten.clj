@@ -1084,8 +1084,8 @@
 ;; (:k m) -> leaf-sym pre-flatten). After sub-forward inlining + scan-vec
 ;; unroll, every param use is a concrete deep access chain; we rewrite each
 ;; leaf chain to its canonical leaf symbol and bind those in a prologue, so the
-;; differentiable inner body is in terms of free leaf locals (exactly what
-;; container-vg-runtime expects).
+;; differentiable inner body is in terms of free leaf locals (the value-class AD
+;; path).
 
 ;; Structural block-array indexing uses clojure.core/aget (integer index into a
 ;; (Array Parameters) field); leaf element reads use raster.arrays/aget — only
