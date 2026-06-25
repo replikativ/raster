@@ -108,8 +108,8 @@
     (not (seq? expr)) false
     ;; aset is void
     (op/aset-op? (first expr)) true
-    ;; loop/if: check the else/return branch
-    (= 'loop (first expr))
+    ;; loop/if: check the else/return branch (closed core: loop -> loop*)
+    (contains? #{'loop 'loop*} (first expr))
     (let [body (last expr)]
       (if (and (seq? body) (= 'if (first body)))
         (expr-returns-void? (last body))  ;; check else branch

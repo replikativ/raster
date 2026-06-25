@@ -187,7 +187,7 @@
                             (fn [_result _src rows row-stride col-offset n-cols]
                               (fn [d-out]
                                 (let [d-src (scatter-strided-2d
-                                              d-out rows row-stride col-offset n-cols)]
+                                             d-out rows row-stride col-offset n-cols)]
                                   [d-src nil nil nil nil])))})
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/slice-strided-2d
@@ -207,7 +207,7 @@
                             (fn [_result _packed rows row-stride col-offset n-cols]
                               (fn [d-out]
                                 (let [d-packed (slice-strided-2d
-                                                 d-out rows row-stride col-offset n-cols)]
+                                                d-out rows row-stride col-offset n-cols)]
                                   [d-packed nil nil nil nil])))})
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d

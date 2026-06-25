@@ -1536,7 +1536,14 @@
                               (name expr))
                       :else
                       (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
-                        (symbol (str (.name (.ns v))) (str (.sym v)))
+                        (cond
+                          ;; var: qualify to ns/sym
+                          (var? v) (symbol (str (.name (.ns ^clojure.lang.Var v)))
+                                           (str (.sym ^clojure.lang.Var v)))
+                          ;; bare class name (e.g. macroexpand canonicalized (X. a)
+                          ;; -> (new X a), exposing X): qualify to its FQN
+                          (class? v) (symbol (.getName ^Class v))
+                          :else expr)
                         expr))
                     (seq? expr)
                     (let [h (first expr)]

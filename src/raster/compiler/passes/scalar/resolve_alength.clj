@@ -110,29 +110,24 @@
         size
         expr))
 
-    ;; Recurse into sub-expressions (but not into special forms that bind)
-    (seq? expr)
-    (let [head (first expr)]
-      (cond
-        ;; Don't recurse into nested let*/loop — they have their own scope
-        ;; (But alength inside them referencing outer hoistable bufs IS valid)
-        (contains? #{:binding :scope} (:kind (form/form-info expr)))
-        (let [[lsym bindings & body] expr
-              pairs (partition 2 bindings)
-              new-pairs (mapcat (fn [[sym init]]
-                                  [sym (resolve-alength-in-expr init size-map)])
-                                pairs)
-              new-body (map #(resolve-alength-in-expr % size-map) body)]
-          (let [r (list* lsym (vec new-pairs) new-body)]
-            (if-let [m (meta expr)] (with-meta r m) r)))
+    ;; quote is opaque — never resolve inside quoted data
+    (and (seq? expr) (= 'quote (first expr))) expr
 
-        ;; if, do, etc. — recurse into all positions
-        :else
-        (let [r (map #(if (seq? %)
-                        (resolve-alength-in-expr % size-map)
-                        %)
-                     expr)]
-          (if-let [m (meta expr)] (with-meta (apply list r) m) (apply list r)))))
+    (seq? expr)
+    ;; A nested binder (let*/loop*/dotimes/fn*/par/...) that SHADOWS a size-map
+    ;; name must have that name removed from the map for its inits+body — else
+    ;; `(alength shadowed-buf)` inside wrongly resolves to the OUTER alloc size.
+    ;; Outer exprs (e.g. a dotimes bound) still see the full map.
+    (if-let [{:keys [scopes outer rebuild]} (form/scope-info expr)]
+      (rebuild (mapv (fn [{:keys [binders inits body]}]
+                       (let [m (apply dissoc size-map (filter symbol? binders))]
+                         {:binders binders
+                          :inits (mapv #(resolve-alength-in-expr % m) inits)
+                          :body  (mapv #(resolve-alength-in-expr % m) body)}))
+                     scopes)
+               (mapv #(resolve-alength-in-expr % size-map) outer))
+      ;; non-binder seq — recurse into all children
+      (util/remake-from expr (map #(resolve-alength-in-expr % size-map) expr)))
 
     :else expr))
 

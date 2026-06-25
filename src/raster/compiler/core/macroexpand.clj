@@ -35,16 +35,50 @@
    shape instead of the generic `loop*` expansion."
   ([form] (macroexpand-all-preserving form (constantly false)))
   ([form skip-head?]
-   (let [expanded (if (and (seq? form)
-                           (not (and (symbol? (first form)) (skip-head? (first form)))))
-                    (macroexpand form)
-                    form)
-         m (meta form)
-         result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
-                                      identity expanded)]
-     (if (and m (instance? clojure.lang.IObj result))
-       (with-meta result (merge (meta result) m))
-       result))))
+   ;; `quote` is opaque: its body is code-as-data, not code. The walker classifies
+   ;; (quote ...) as a :leaf and never descends; we must match that contract here, or
+   ;; macroexpand would rewrite macros/classes sitting in head position INSIDE quoted
+   ;; data (e.g. '(let [a 1] a) -> '(let* [a 1] a)), silently corrupting it.
+   (if (and (seq? form) (= 'quote (first form)))
+     form
+     (let [expanded (if (and (seq? form)
+                             (not (and (symbol? (first form)) (skip-head? (first form)))))
+                      (macroexpand form)
+                      form)
+           m (meta form)
+           result (walk-preserving-meta #(macroexpand-all-preserving % skip-head?)
+                                        identity expanded)]
+       (if (and m (instance? clojure.lang.IObj result))
+         (with-meta result (merge (meta result) m))
+         result)))))
+
+(defn core-skip-head?
+  "Heads PRESERVED by macroexpand-core (not expanded at top level; children still
+  expanded): interop forms (`.method`/`.-field`/`.invk`, head starts with `.`),
+  the `dotimes` counted-loop primitive (the SIMD/loop-lift matchers key on it),
+  `ftm` closures, and every `raster.par/*` SOAC primitive — these last are MACROS
+  that would otherwise expand to scalar loops, destroying the structured form the
+  fusion/segop/SIMD/GPU passes consume. Everything else in the macro zoo
+  (when/and/or/cond/-> and let/loop/case/fn) expands to the closed core."
+  [h]
+  (and (symbol? h)
+       (or (.startsWith (name h) ".")
+           (= 'dotimes h)
+           (= 'ftm h)
+           ;; raster.par or raster.par.* — NOT raster.params (startsWith would
+           ;; wrongly match the params ns and preserve its defmodel macro).
+           (let [ns (namespace h)]
+             (and ns (or (= ns "raster.par") (.startsWith ^String ns "raster.par.")))))))
+
+(defn macroexpand-core
+  "Macroexpand the open-ended macro zoo to a CLOSED CORE — `let*`/`loop*`/`fn*`/
+  `if`/`do`/`case*`/`try`/`recur` + special forms — while PRESERVING the SOAC
+  primitives (`raster.par/*`), `dotimes`, `ftm`, and interop. Run right after the
+  walker so every downstream pass and the AD see a closed, scope-tractable IR
+  (the finite binding-form set the scope foundation depends on). MUST run with
+  `*ns*` bound to the source ns so user macros resolve."
+  [form]
+  (macroexpand-all-preserving form core-skip-head?))
 
 (defn resugar-interop
   "Re-sugar canonical `(. obj method args...)` interop forms back into the

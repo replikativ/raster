@@ -55,9 +55,9 @@
   (let [vg ((raster.ad.reverse/value+grad #'small-loss--flat) (:W w) (:b w) x y batch d)
         loss (clojure.core/nth vg 0)
         grads (raster.tree/flat-view vg
-                                      :spec '(HMap :mandatory {:W (Param (Array double))
-                                                                :b (Param (Array double))})
-                                      :starting-at 1)]
+                                     :spec '(HMap :mandatory {:W (Param (Array double))
+                                                              :b (Param (Array double))})
+                                     :starting-at 1)]
     (raster.tree/walk! :param adam-leaf-step! [w grads m v] lr beta1 beta2 eps t)
     loss))
 

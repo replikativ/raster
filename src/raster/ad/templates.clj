@@ -17,7 +17,8 @@
      :grads   [expr1 ...]  ;; gradient expressions, one per param
      :grads-fn (optional)  ;; (fn [ctx params result-sym adjoint-sym gensym-fn]
                            ;;   -> [updated-ctx [grad-sym ...]]) for flat bindings}"
-  (:require [raster.compiler.support.mangled :as mangled]))
+  (:require [raster.compiler.support.mangled :as mangled]
+            [raster.compiler.core.util :as util]))
 
 ;; ================================================================
 ;; Template registry
@@ -115,88 +116,11 @@
 ;; Template instantiation
 ;; ================================================================
 
-(defn- smap-captures?
-  "Check if any value in smap equals the given scope variable symbol."
-  [smap scope-var]
-  (some #(= scope-var %) (vals smap)))
-
-(defn- alpha-rename-scope-var
-  "When a scope variable collides with a substitution target value,
-   alpha-rename it. Returns [new-var updated-smap]."
-  [smap scope-var]
-  (if (smap-captures? smap scope-var)
-    (let [fresh (with-meta (gensym (str (name scope-var) "_α_"))
-                  (meta scope-var))
-          inner-smap (assoc (dissoc smap scope-var) scope-var fresh)]
-      [fresh inner-smap])
-    [scope-var (dissoc smap scope-var)]))
-
-(defn- subst-syms
-  "Recursively substitute symbols in expr according to smap.
-   Scope-aware: alpha-renames bound variables that collide with
-   substitution target values to prevent variable capture."
-  [smap expr]
-  (if (empty? smap)
-    expr
-    (cond
-      (symbol? expr) (get smap expr expr)
-
-      (seq? expr)
-      (let [head (first expr)]
-        (cond
-          ;; dotimes: (dotimes [var bound] body...)
-          (= 'dotimes head)
-          (let [[_ [var bound] & body] expr
-                new-bound (subst-syms smap bound)
-                [new-var inner-smap] (alpha-rename-scope-var smap var)]
-            (with-meta
-              (apply list 'dotimes [new-var new-bound]
-                     (map (partial subst-syms inner-smap) body))
-              (meta expr)))
-
-          ;; loop/loop*
-          (contains? #{'loop 'loop*} head)
-          (let [[_ bindings-vec & body] expr
-                pairs (partition 2 bindings-vec)
-                new-inits (map (fn [[_ init]] (subst-syms smap init)) pairs)
-                loop-vars (map first pairs)
-                [renamed-vars inner-smap]
-                (reduce (fn [[vars sm] v]
-                          (let [[new-v sm'] (alpha-rename-scope-var sm v)]
-                            [(conj vars new-v) sm']))
-                        [[] smap]
-                        loop-vars)
-                new-bindings (vec (mapcat vector renamed-vars new-inits))]
-            (with-meta
-              (apply list head new-bindings
-                     (map (partial subst-syms inner-smap) body))
-              (meta expr)))
-
-          ;; let/let*
-          (contains? #{'let 'let*} head)
-          (let [[_ bindings-vec & body] expr
-                pairs (partition 2 bindings-vec)
-                [new-pairs final-smap]
-                (reduce (fn [[acc sm] [v init]]
-                          (let [substed-init (subst-syms sm init)
-                                [new-v sm'] (alpha-rename-scope-var sm v)]
-                            [(conj acc [new-v substed-init]) sm']))
-                        [[] smap]
-                        pairs)
-                new-bindings (vec (mapcat identity new-pairs))]
-            (with-meta
-              (apply list head new-bindings
-                     (map (partial subst-syms final-smap) body))
-              (meta expr)))
-
-          ;; Default: recurse into all children
-          :else
-          (with-meta (apply list (map (partial subst-syms smap) expr))
-            (meta expr))))
-
-      (vector? expr) (mapv (partial subst-syms smap) expr)
-      (map? expr) (into {} (map (fn [[k v]] [(subst-syms smap k) (subst-syms smap v)])) expr)
-      :else expr)))
+;; Gradient-template substitution uses the unified capture-avoiding
+;; `util/subst-syms` (generic over form/scope-info). Template :grads are
+;; hand-written gradient S-exprs with no closures/par binders, and the smap
+;; values are plain symbols (param→actual, result→sym, adjoint→sym), so this is
+;; a strict superset of the old hand-rolled let*/loop*/dotimes substitutor.
 
 (defn- compile-grads-to-fn
   "Compile static :grads data into a :grads-fn closure.
@@ -209,7 +133,7 @@
           smap (merge param-subst result-subst adj-subst)
           grad-bindings (mapv (fn [i grad-expr]
                                 (let [grad-sym (gensym-fn (str "dg_" (name (nth params i))))
-                                      substituted (subst-syms smap grad-expr)]
+                                      substituted (util/subst-syms smap grad-expr)]
                                   [grad-sym substituted]))
                               (range) grads)]
       [(reduce (fn [c [sym expr]] (update c :bindings into [sym expr]))

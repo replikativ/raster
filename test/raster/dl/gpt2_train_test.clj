@@ -85,12 +85,12 @@
         h-ln1      (nn/layer-norm h-init (:ln1-w (:layer w)) (:ln1-b (:layer w))
                                   seq-len d-model 1e-5)
         h-attn     (attn/causal-multi-head-attention
-                     h-ln1
-                     (:wq (:layer w)) (:bq (:layer w))
-                     (:wk (:layer w)) (:bk (:layer w))
-                     (:wv (:layer w)) (:bv (:layer w))
-                     (:wo (:layer w)) (:bo (:layer w))
-                     seq-len d-model n-head)
+                    h-ln1
+                    (:wq (:layer w)) (:bq (:layer w))
+                    (:wk (:layer w)) (:bk (:layer w))
+                    (:wv (:layer w)) (:bv (:layer w))
+                    (:wo (:layer w)) (:bo (:layer w))
+                    seq-len d-model n-head)
         h-after-a  (ops/array-add h-init h-attn n)
         h-ln2      (nn/layer-norm h-after-a (:ln2-w (:layer w)) (:ln2-b (:layer w))
                                   seq-len d-model 1e-5)
@@ -190,8 +190,8 @@
           pi (pos-ids seq-len)
           vg-fn (ad/value+grad #'tiny-gpt2-loss--flat)
           flat (raster.compiler.core.params-flatten/flatten-value
-                 (-> #'tiny-gpt2-loss meta :raster.params/treedefs (get 'w) :spec)
-                 w)
+                (-> #'tiny-gpt2-loss meta :raster.params/treedefs (get 'w) :spec)
+                w)
           out  (apply vg-fn (concat flat [tk pi tg seq-len d-model n-head vocab-size max-pos]))
           loss (nth out 0)
           grads (rest out)]

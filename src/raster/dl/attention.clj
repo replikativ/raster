@@ -256,7 +256,7 @@
                             (fn [_result Q K V seq-len dk dv]
                               (fn [d-out]
                                 (let [bundle (causal-scaled-dot-product-attn-backward
-                                               d-out Q K V seq-len dk dv)]
+                                              d-out Q K V seq-len dk dv)]
                                   [(aget bundle 0) (aget bundle 1) (aget bundle 2)
                                    nil nil nil])))})
 
@@ -297,7 +297,7 @@
                                                K   (nn/linear x Wk bk seq-len d-model d-model)
                                                V   (nn/linear x Wv bv seq-len d-model d-model)
                                                attn-out (causal-scaled-dot-product-attn
-                                                          Q K V seq-len d-model d-model)]
+                                                         Q K V seq-len d-model d-model)]
                                            (nn/linear attn-out Wo bo seq-len d-model d-model))))
 
 ;; ================================================================
@@ -334,9 +334,9 @@
               Kh (ops/slice-strided-2d K seq-len d-model col-off dk)
               Vh (ops/slice-strided-2d V seq-len d-model col-off dk)
               head-out (causal-scaled-dot-product-attn
-                         Qh Kh Vh seq-len dk dk)
+                        Qh Kh Vh seq-len dk dk)
               out-h (ops/scatter-strided-2d
-                      head-out seq-len d-model col-off dk)]
+                     head-out seq-len d-model col-off dk)]
           (recur (inc h) (ops/array-add acc out-h n)))
         (nn/linear acc Wo bo seq-len d-model d-model)))))
 

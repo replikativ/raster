@@ -34,7 +34,11 @@
             (clojure.core/nth v idx)))))))
 
 (defn- subst-syms-in
-  "Substitute symbols in expr using smap."
+  "Scope-BLIND symbol substitution. Intentionally NOT the capture-avoiding
+   `util/subst-syms`: cse-let runs only on a FLAT `let*` with gensym-unique
+   binding names (the pipeline guarantees ANF flatness before CSE), so there is
+   no shadowing and blind substitution is both correct and faster. Do NOT use
+   this on nested/un-flattened forms — use `util/subst-syms` there."
   [smap expr]
   (cond
     (symbol? expr) (get smap expr expr)

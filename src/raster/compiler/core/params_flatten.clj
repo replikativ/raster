@@ -85,38 +85,38 @@
                   (when-not (and (zero? (mod (count tail) 2))
                                  (every? keyword? (take-nth 2 tail)))
                     (throw (ex-info
-                             (str "Malformed HMap spec — expected (HMap {...}) "
-                                  "or (HMap :mandatory {...} ...). Got: "
-                                  (pr-str s))
-                             {:spec s})))
+                            (str "Malformed HMap spec — expected (HMap {...}) "
+                                 "or (HMap :mandatory {...} ...). Got: "
+                                 (pr-str s))
+                            {:spec s})))
                   (let [opts (apply hash-map tail)]
                     (when (contains? opts :optional)
                       (throw (ex-info
-                               (str "Params HMap spec must not declare :optional "
-                                    "keys (canonical leaf ordering requires a "
-                                    "closed shape). Got: " (pr-str s))
-                               {:spec s :forbidden :optional})))
+                              (str "Params HMap spec must not declare :optional "
+                                   "keys (canonical leaf ordering requires a "
+                                   "closed shape). Got: " (pr-str s))
+                              {:spec s :forbidden :optional})))
                     (when (contains? opts :absent-keys)
                       (throw (ex-info
-                               (str "Params HMap spec must not declare "
-                                    ":absent-keys. Got: " (pr-str s))
-                               {:spec s :forbidden :absent-keys})))
+                              (str "Params HMap spec must not declare "
+                                   ":absent-keys. Got: " (pr-str s))
+                              {:spec s :forbidden :absent-keys})))
                     (when (and (contains? opts :complete?)
                                (not (true? (:complete? opts))))
                       (throw (ex-info
-                               (str "Params HMap spec requires :complete? true "
-                                    "(closed map). Got: " (pr-str s))
-                               {:spec s :forbidden :complete?-false})))
+                              (str "Params HMap spec requires :complete? true "
+                                   "(closed map). Got: " (pr-str s))
+                              {:spec s :forbidden :complete?-false})))
                     (let [unknown (clojure.set/difference
-                                    (set (keys opts))
-                                    #{:mandatory :complete?})]
+                                   (set (keys opts))
+                                   #{:mandatory :complete?})]
                       (when (seq unknown)
                         (throw (ex-info
-                                 (str "Params HMap spec has unsupported options "
-                                      (vec unknown)
-                                      ". Supported: :mandatory, :complete? true. "
-                                      "Got: " (pr-str s))
-                                 {:spec s :unknown unknown}))))))
+                                (str "Params HMap spec has unsupported options "
+                                     (vec unknown)
+                                     ". Supported: :mandatory, :complete? true. "
+                                     "Got: " (pr-str s))
+                                {:spec s :unknown unknown}))))))
                 (doseq [[_ child] (hmap-mandatory s)]
                   (walk child)))
 
@@ -124,9 +124,9 @@
               (let [tail (rest s)]
                 (when-not (and (= 1 (count tail)) (vector? (first tail)))
                   (throw (ex-info
-                           (str "Params HVec spec must be (HVec [T0 T1 ...]). "
-                                "Got: " (pr-str s))
-                           {:spec s})))
+                          (str "Params HVec spec must be (HVec [T0 T1 ...]). "
+                               "Got: " (pr-str s))
+                          {:spec s})))
                 (doseq [child (hvec-elems s)]
                   (walk child)))
 
@@ -309,7 +309,7 @@
   (let [[_ source & opts] form
         opt-map (apply hash-map opts)
         unknown-opts (clojure.set/difference (set (keys opt-map))
-                                              #{:spec :spec-of :starting-at})
+                                             #{:spec :spec-of :starting-at})
         _ (when (seq unknown-opts)
             (throw (ex-info (str "flat-view: unknown options " (vec unknown-opts)
                                  ". Recognized: :spec, :spec-of, :starting-at.")
@@ -429,16 +429,16 @@
               ;; expressions, leaving non-tree args untouched.
               spliced-args
               (vec
-                (mapcat
-                  (fn [arg-form callee-arg-name]
-                    (if-let [td (get treedefs callee-arg-name)]
-                      (let [leaves (:leaves td)]
-                        (mapv (fn [{:keys [path]}]
-                                (access-expr-for-path arg-form path))
-                              leaves))
-                      [arg-form]))
-                  normalized-args
-                  original-args))
+               (mapcat
+                (fn [arg-form callee-arg-name]
+                  (if-let [td (get treedefs callee-arg-name)]
+                    (let [leaves (:leaves td)]
+                      (mapv (fn [{:keys [path]}]
+                              (access-expr-for-path arg-form path))
+                            leaves))
+                    [arg-form]))
+                normalized-args
+                original-args))
               flat-fn-sym (symbol (str (.name (.ns flat-var)))
                                   (str (.sym flat-var)))
               call (cons flat-fn-sym spliced-args)]
@@ -517,23 +517,23 @@
           arities (callee-arities f-form)]
       (when (and arities (not (contains? arities expected-arity)))
         (throw (ex-info
-                 (str "tree/walk!: f `" (pr-str f-form) "` has arity "
-                      (if (= 1 (count arities))
-                        (str (first arities))
-                        (str "in " (sort arities)))
-                      ", but walk! emits per-leaf calls with arity "
-                      expected-arity " ("
-                      (count tree-args-vec) " tree arg"
-                      (when (not= 1 (count tree-args-vec)) "s")
-                      " + " (count extras) " extra"
-                      (when (not= 1 (count extras)) "s")
-                      "). Make sure f's signature matches "
-                      "(f leaf1 ... leafN extra1 ... extraK).")
-                 {:f f-form
-                  :expected expected-arity
-                  :callee-arities arities
-                  :tree-args (count tree-args-vec)
-                  :extras (count extras)})))
+                (str "tree/walk!: f `" (pr-str f-form) "` has arity "
+                     (if (= 1 (count arities))
+                       (str (first arities))
+                       (str "in " (sort arities)))
+                     ", but walk! emits per-leaf calls with arity "
+                     expected-arity " ("
+                     (count tree-args-vec) " tree arg"
+                     (when (not= 1 (count tree-args-vec)) "s")
+                     " + " (count extras) " extra"
+                     (when (not= 1 (count extras)) "s")
+                     "). Make sure f's signature matches "
+                     "(f leaf1 ... leafN extra1 ... extraK).")
+                {:f f-form
+                 :expected expected-arity
+                 :callee-arities arities
+                 :tree-args (count tree-args-vec)
+                 :extras (count extras)})))
       (when (empty? matching)
         (binding [*out* *err*]
           (println (format "WARN: tree/walk! :%s found no matching leaves for spec %s"
@@ -545,13 +545,13 @@
       ;; effectful metadata). The marker is detected by the let-body walker
       ;; in rewrite-body and spliced; downstream sees a normal multi-body let.
       (let [calls (mapv
-                    (fn [{:keys [path]}]
-                      (apply list f-form
-                             (concat (mapv (fn [arg-form]
-                                             (access-expr-for-path arg-form path))
-                                           tree-args-vec)
-                                     extras)))
-                    matching)]
+                   (fn [{:keys [path]}]
+                     (apply list f-form
+                            (concat (mapv (fn [arg-form]
+                                            (access-expr-for-path arg-form path))
+                                          tree-args-vec)
+                                    extras)))
+                   matching)]
         (cons ::splice-statements calls)))))
 
 (defn splice-statements?
@@ -640,25 +640,25 @@
         acc-names (mapv #(symbol (str "scan_acc__" %)) (range (inc n)))
         bindings
         (vec
-          (cons (first acc-names)    ;; init binding
-                (cons init
-                      (mapcat
-                        (fn [i elt-spec]
-                          (let [prev (nth acc-names i)
-                                this (nth acc-names (inc i))
-                                call (if splice?
-                                       (apply list flat-fn-sym prev
-                                              (concat
-                                                (map (fn [{:keys [path]}]
-                                                       (access-expr-for-path
-                                                         xs-form (into [i] path)))
-                                                     elt-leaves)
-                                                extras))
-                                       (let [elt (reconstruct-at-path xs-form [i] elt-spec)]
-                                         (apply list f-form prev elt extras)))]
-                            [this call]))
-                        (range n)
-                        elems))))]
+         (cons (first acc-names)    ;; init binding
+               (cons init
+                     (mapcat
+                      (fn [i elt-spec]
+                        (let [prev (nth acc-names i)
+                              this (nth acc-names (inc i))
+                              call (if splice?
+                                     (apply list flat-fn-sym prev
+                                            (concat
+                                             (map (fn [{:keys [path]}]
+                                                    (access-expr-for-path
+                                                     xs-form (into [i] path)))
+                                                  elt-leaves)
+                                             extras))
+                                     (let [elt (reconstruct-at-path xs-form [i] elt-spec)]
+                                       (apply list f-form prev elt extras)))]
+                          [this call]))
+                      (range n)
+                      elems))))]
     (list 'let* bindings (last acc-names))))
 
 ;; ----------------------------------------------------------------------
@@ -772,15 +772,15 @@
                   (let [r (resolve-path form env)]
                     (when (and r (leaf-spec? (:spec r)))
                       r))
-                (let [r (resolve-path form env)]
-                  (cond
+                  (let [r (resolve-path form env)]
+                    (cond
                     ;; flat-view leaf: emit (nth flat-source flat-idx)
-                    (:flat-view r)
-                    (list 'clojure.core/nth (:flat-source r) (:flat-idx r))
+                      (:flat-view r)
+                      (list 'clojure.core/nth (:flat-source r) (:flat-idx r))
                     ;; structured-view leaf: emit a flat positional arg sym
-                    :else
-                    (do (record-leaf! r)
-                        (path->sym (:root r) (:path r)))))
+                      :else
+                      (do (record-leaf! r)
+                          (path->sym (:root r) (:path r)))))
 
                 ;; let / let* / loop / loop*
                 ;; Splice ::splice-statements forms returned by walk!/scan-vec
@@ -788,27 +788,27 @@
                 ;; statement-position forms — matching the proven
                 ;; compile-gsdm-train-fn pattern that survives through the
                 ;; pipeline (lifted to _eff_NN bindings by normalize-let-body).
-                (bound-form? form)
-                (let [[op bindings & body-forms] form
-                      [new-bindings new-env]
-                      (update-let-env bindings env walk record-leaf!)
-                      walked-body (map #(walk % new-env) body-forms)
-                      spliced-body (mapcat (fn [f]
-                                             (if (splice-statements? f)
-                                               (rest f)
-                                               [f]))
-                                           walked-body)]
-                  (apply list op (vec new-bindings) spliced-body))
+                  (bound-form? form)
+                  (let [[op bindings & body-forms] form
+                        [new-bindings new-env]
+                        (update-let-env bindings env walk record-leaf!)
+                        walked-body (map #(walk % new-env) body-forms)
+                        spliced-body (mapcat (fn [f]
+                                               (if (splice-statements? f)
+                                                 (rest f)
+                                                 [f]))
+                                             walked-body)]
+                    (apply list op (vec new-bindings) spliced-body))
 
                 ;; Generic seq: recurse
-                (seq? form)
-                (apply list (map #(walk % env) form))
+                  (seq? form)
+                  (apply list (map #(walk % env) form))
 
-                (vector? form)
-                (mapv #(walk % env) form)
+                  (vector? form)
+                  (mapv #(walk % env) form)
 
-                (map? form)
-                (into (empty form) (map (fn [[k v]] [(walk k env) (walk v env)])) form)
+                  (map? form)
+                  (into (empty form) (map (fn [[k v]] [(walk k env) (walk v env)])) form)
 
                   (set? form)
                   (into (empty form) (map #(walk % env)) form)
@@ -877,15 +877,15 @@
       (walk spec value [])
       (when-let [[a b] @result]
         (throw (ex-info
-                 (str "Tree leaves at " (pr-str a) " and " (pr-str b)
-                      " share JVM identity (same object at two positions). "
-                      "Naked weight sharing causes incorrect gradients — each "
-                      "position gets its own gradient buffer; contributions "
-                      "from different paths don't accumulate. Use one "
-                      "canonical tree position and reference it from "
-                      "multiple places in the model body, or wrap with `Tied` "
-                      "(not yet implemented).")
-                 {:path-a a :path-b b}))))))
+                (str "Tree leaves at " (pr-str a) " and " (pr-str b)
+                     " share JVM identity (same object at two positions). "
+                     "Naked weight sharing causes incorrect gradients — each "
+                     "position gets its own gradient buffer; contributions "
+                     "from different paths don't accumulate. Use one "
+                     "canonical tree position and reference it from "
+                     "multiple places in the model body, or wrap with `Tied` "
+                     "(not yet implemented).")
+                {:path-a a :path-b b}))))))
 
 (defn assert-tree-shape!
   "Walk a runtime tree value matching spec; throw if the runtime shape doesn't
@@ -908,23 +908,23 @@
                     extra     (clojure.set/difference (or keys-val #{}) keys-spec)]
                 (when-not (map? v)
                   (throw (ex-info
-                           (str "Tree shape mismatch at " (pr-str path)
-                                ": spec declares an HMap but runtime value is "
-                                (pr-str (class v)))
-                           {:path path :spec s :value v :expected :map})))
+                          (str "Tree shape mismatch at " (pr-str path)
+                               ": spec declares an HMap but runtime value is "
+                               (pr-str (class v)))
+                          {:path path :spec s :value v :expected :map})))
                 (when (seq missing)
                   (throw (ex-info
-                           (str "Tree shape mismatch at " (pr-str path)
-                                ": missing HMap keys " (pr-str missing))
-                           {:path path :spec s :missing-keys missing})))
+                          (str "Tree shape mismatch at " (pr-str path)
+                               ": missing HMap keys " (pr-str missing))
+                          {:path path :spec s :missing-keys missing})))
                 (when (seq extra)
                   (throw (ex-info
-                           (str "Tree shape mismatch at " (pr-str path)
-                                ": runtime tree has extra HMap keys "
-                                (pr-str extra) " not declared in the spec. "
-                                "If you want these to flow through, declare "
-                                "them in the model spec.")
-                           {:path path :spec s :extra-keys extra})))
+                          (str "Tree shape mismatch at " (pr-str path)
+                               ": runtime tree has extra HMap keys "
+                               (pr-str extra) " not declared in the spec. "
+                               "If you want these to flow through, declare "
+                               "them in the model spec.")
+                          {:path path :spec s :extra-keys extra})))
                 (doseq [[k sub-spec] (hmap-mandatory s)]
                   (walk sub-spec (get v k) (conj path k))))
 
@@ -934,19 +934,19 @@
                     val-n  (when (sequential? v) (count v))]
                 (when-not (sequential? v)
                   (throw (ex-info
-                           (str "Tree shape mismatch at " (pr-str path)
-                                ": spec declares an HVec but runtime value is "
-                                (pr-str (class v)))
-                           {:path path :spec s :value v :expected :sequential})))
+                          (str "Tree shape mismatch at " (pr-str path)
+                               ": spec declares an HVec but runtime value is "
+                               (pr-str (class v)))
+                          {:path path :spec s :value v :expected :sequential})))
                 (when (not= spec-n val-n)
                   (throw (ex-info
-                           (str "Tree shape mismatch at " (pr-str path)
-                                ": spec declares HVec of length " spec-n
-                                " but runtime value has length " val-n ". "
-                                "Variable-length HVec is not supported — the "
-                                "compiled kernel is monomorphic in shape.")
-                           {:path path :spec s
-                            :expected-length spec-n :actual-length val-n})))
+                          (str "Tree shape mismatch at " (pr-str path)
+                               ": spec declares HVec of length " spec-n
+                               " but runtime value has length " val-n ". "
+                               "Variable-length HVec is not supported — the "
+                               "compiled kernel is monomorphic in shape.")
+                          {:path path :spec s
+                           :expected-length spec-n :actual-length val-n})))
                 (doseq [[i sub-spec] (map-indexed vector elems)]
                   (walk sub-spec (nth v i) (conj path i))))
 
@@ -1032,7 +1032,7 @@
   [^Class c]
   (->> (.getDeclaredFields c)
        (remove #(java.lang.reflect.Modifier/isStatic
-                  (.getModifiers ^java.lang.reflect.Field %)))
+                 (.getModifiers ^java.lang.reflect.Field %)))
        vec))
 
 (defn- field-get [^java.lang.reflect.Field f obj]
@@ -1180,13 +1180,13 @@
                   (let [[lsym bvec & bodyforms] form
                         [binds aliases']
                         (reduce
-                          (fn [[bs al] [s init]]
-                            (let [init' (rw init al)
-                                  ir    (vc-resolve-path init roots al)
-                                  al'   (if (and ir (not (leaf? ir))) (assoc al s ir) al)]
-                              [(conj bs s init') al']))
-                          [[] aliases]
-                          (partition 2 bvec))]
+                         (fn [[bs al] [s init]]
+                           (let [init' (rw init al)
+                                 ir    (vc-resolve-path init roots al)
+                                 al'   (if (and ir (not (leaf? ir))) (assoc al s ir) al)]
+                             [(conj bs s init') al']))
+                         [[] aliases]
+                         (partition 2 bvec))]
                     (apply list lsym binds (map #(rw % aliases') bodyforms)))
 
                   (seq? form)    (apply list (map #(rw % aliases) form))
@@ -1237,21 +1237,21 @@
   alpha-renamed per iteration; bottom-up so nested folds unroll inside-out."
   [body count-fn]
   (walk/postwalk
-    (fn [form]
-      (if (vc-fold-form? form)
-        (let [[_ [acc blk] init blocks fold-body] form
-              n     (long (count-fn blocks))
-              accs  (vec (repeatedly (inc n) #(gensym (str (name acc) "_"))))
-              binds (into [(accs 0) init]
-                          (mapcat (fn [i]
-                                    (let [blki (gensym (str (name blk) "_"))]
-                                      [blki (list 'clojure.core/aget blocks i)
-                                       (accs (inc i))
-                                       (subst-syms-tree {acc (accs i) blk blki} fold-body)]))
-                                  (range n)))]
-          (list 'let* binds (accs n)))
-        form))
-    body))
+   (fn [form]
+     (if (vc-fold-form? form)
+       (let [[_ [acc blk] init blocks fold-body] form
+             n     (long (count-fn blocks))
+             accs  (vec (repeatedly (inc n) #(gensym (str (name acc) "_"))))
+             binds (into [(accs 0) init]
+                         (mapcat (fn [i]
+                                   (let [blki (gensym (str (name blk) "_"))]
+                                     [blki (list 'clojure.core/aget blocks i)
+                                      (accs (inc i))
+                                      (subst-syms-tree {acc (accs i) blk blki} fold-body)]))
+                                 (range n)))]
+         (list 'let* binds (accs n)))
+       form))
+   body))
 
 (defn unflatten-params
   "Rebuild a nested Parameters structure shaped like `template`, substituting
@@ -1273,7 +1273,7 @@
                       out (make-array (.getComponentType ^Class (class v)) n)]
                   (dotimes [k n]
                     (java.lang.reflect.Array/set
-                      out k (rebuild (java.lang.reflect.Array/get v k))))
+                     out k (rebuild (java.lang.reflect.Array/get v k))))
                   out)
 
                 :else

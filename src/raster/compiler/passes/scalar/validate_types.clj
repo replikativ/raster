@@ -40,15 +40,15 @@
   [form]
   (let [out (atom [])]
     (walk/postwalk
-      (fn [f]
-        (when (and (seq? f)
-                   (or (par/par-map-form? f)
-                       (par/par-reduce-form? f)))
-          (when-not (:raster.type/elem-type (meta f))
-            (swap! out conj {:form-head (first f)
-                             :out (when (>= (count f) 2) (second f))})))
-        f)
-      form)
+     (fn [f]
+       (when (and (seq? f)
+                  (or (par/par-map-form? f)
+                      (par/par-reduce-form? f)))
+         (when-not (:raster.type/elem-type (meta f))
+           (swap! out conj {:form-head (first f)
+                            :out (when (>= (count f) 2) (second f))})))
+       f)
+     form)
     @out))
 
 (defn report-violations!

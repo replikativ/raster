@@ -411,7 +411,7 @@
                                          " cast=" (:cast par-info)
                                          " from-meta=" (:elem-type par-info)
                                          " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
-                                                          (:tag (meta (:out par-info)))))))
+                                                         (:tag (meta (:out par-info)))))))
                             (let [soac (raster.compiler.ir.soac/par-form->soac
                                         (:out par-info) form (swap! segop-id-counter inc))
                                   segops (raster.compiler.passes.parallel.soac-lower/lower-soac

@@ -4658,9 +4658,9 @@
             (let [safe-name (clojure.string/replace class-name "." "_")
                   path (str dir "/" safe-name ".class")]
               (java.nio.file.Files/write
-                (java.nio.file.Paths/get path (into-array String []))
-                bytes
-                (into-array java.nio.file.OpenOption []))
+               (java.nio.file.Paths/get path (into-array String []))
+               bytes
+               (into-array java.nio.file.OpenOption []))
               (binding [*out* *err*]
                 (println "[dump-class]" class-name "->" path))))
         loader (compilation-loader)
@@ -5175,49 +5175,49 @@
                       ;; For >20 params: AFn.applyToHelper caps at 20, so we
                       ;; emit a custom body that builds an Object[N] from the
                       ;; seq and invokes compute_static reflectively.
-                            (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
-                                  iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
-                                  reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
-                                  obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
-                                  apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
-                                  reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
-                                  small? (<= (count param-cds) 20)
-                                  load-int (fn [code n]
-                                             (cond (<= -128 n 127) (.bipush code (int n))
-                                                   (<= -32768 n 32767) (.sipush code (int n))
-                                                   :else (.ldc code (int n))))]
-                              (.withMethodBody cb "applyTo"
-                                               (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd]))
-                                               (int 0x0001)
-                                               (reify java.util.function.Consumer
-                                                 (accept [_ code]
-                                                   (if small?
-                                                     (do (.aload code 0)
-                                                         (.aload code 1)
-                                                         (.invokestatic code afn-cd "applyToHelper" apply-mt)
-                                                         (.areturn code))
-                                                     (let [n (count param-cds)]
-                                                       (load-int code n)
-                                                       (.anewarray code obj-cd)
-                                                       (.astore code 2)
+                          (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
+                                iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
+                                reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
+                                obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
+                                apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
+                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
+                                small? (<= (count param-cds) 20)
+                                load-int (fn [code n]
+                                           (cond (<= -128 n 127) (.bipush code (int n))
+                                                 (<= -32768 n 32767) (.sipush code (int n))
+                                                 :else (.ldc code (int n))))]
+                            (.withMethodBody cb "applyTo"
+                                             (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd]))
+                                             (int 0x0001)
+                                             (reify java.util.function.Consumer
+                                               (accept [_ code]
+                                                 (if small?
+                                                   (do (.aload code 0)
                                                        (.aload code 1)
-                                                       (.astore code 3)
-                                                       (dotimes [i n]
-                                                         (.aload code 2)
-                                                         (load-int code i)
-                                                         (.aload code 3)
-                                                         (.invokeinterface code iseq-cd "first"
-                                                                           (MethodTypeDesc/of obj-cd no-cd))
-                                                         (.aastore code)
-                                                         (.aload code 3)
-                                                         (.invokeinterface code iseq-cd "next"
-                                                                           (MethodTypeDesc/of iseq-cd no-cd))
-                                                         (.astore code 3))
-                                                       (.ldc code class-name)
-                                                       (.ldc code "compute_static")
+                                                       (.invokestatic code afn-cd "applyToHelper" apply-mt)
+                                                       (.areturn code))
+                                                   (let [n (count param-cds)]
+                                                     (load-int code n)
+                                                     (.anewarray code obj-cd)
+                                                     (.astore code 2)
+                                                     (.aload code 1)
+                                                     (.astore code 3)
+                                                     (dotimes [i n]
                                                        (.aload code 2)
-                                                       (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
-                                                       (.areturn code))))))))))
+                                                       (load-int code i)
+                                                       (.aload code 3)
+                                                       (.invokeinterface code iseq-cd "first"
+                                                                         (MethodTypeDesc/of obj-cd no-cd))
+                                                       (.aastore code)
+                                                       (.aload code 3)
+                                                       (.invokeinterface code iseq-cd "next"
+                                                                         (MethodTypeDesc/of iseq-cd no-cd))
+                                                       (.astore code 3))
+                                                     (.ldc code class-name)
+                                                     (.ldc code "compute_static")
+                                                     (.aload code 2)
+                                                     (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
+                                                     (.areturn code))))))))))
         loader (compilation-loader)
         wrapper-class (.defineClass loader wrapper-name bytes nil)]
     (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))

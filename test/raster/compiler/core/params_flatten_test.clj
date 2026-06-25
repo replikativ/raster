@@ -25,47 +25,47 @@
   (testing "Recurses into nested HMap/HVec children"
     (is (= '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W Long})])})
            (pf/validate-tree-spec!
-             '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W Long})])}))))))
+            '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W Long})])}))))))
 
 (deftest validate-tree-spec-rejects-optional-keys
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":optional"
-        (pf/validate-tree-spec!
-          '(HMap :mandatory {:a Long} :optional {:b Long})))))
+                        (pf/validate-tree-spec!
+                         '(HMap :mandatory {:a Long} :optional {:b Long})))))
 
 (deftest validate-tree-spec-rejects-complete-false
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":complete\? true"
-        (pf/validate-tree-spec!
-          '(HMap :mandatory {:a Long} :complete? false)))))
+                        (pf/validate-tree-spec!
+                         '(HMap :mandatory {:a Long} :complete? false)))))
 
 (deftest validate-tree-spec-rejects-absent-keys
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #":absent-keys"
-        (pf/validate-tree-spec!
-          '(HMap :mandatory {:a Long} :absent-keys #{:b})))))
+                        (pf/validate-tree-spec!
+                         '(HMap :mandatory {:a Long} :absent-keys #{:b})))))
 
 (deftest validate-tree-spec-rejects-unknown-options
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported options"
-        (pf/validate-tree-spec!
-          '(HMap :mandatory {:a Long} :weird-opt 42)))))
+                        (pf/validate-tree-spec!
+                         '(HMap :mandatory {:a Long} :weird-opt 42)))))
 
 (deftest validate-tree-spec-rejects-malformed-hvec
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"HVec"
-        (pf/validate-tree-spec! '(HVec))))
+                        (pf/validate-tree-spec! '(HVec))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"HVec"
-        (pf/validate-tree-spec! '(HVec [Long] :something-else)))))
+                        (pf/validate-tree-spec! '(HVec [Long] :something-else)))))
 
 (deftest validate-tree-spec-rejects-nested-bad-shape
   (testing "Nested HMap with :optional fails — recursion catches it"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #":optional"
-          (pf/validate-tree-spec!
-            '(HMap :mandatory {:layers (HVec [(HMap :optional {:W Long})])}))))))
+                          (pf/validate-tree-spec!
+                           '(HMap :mandatory {:layers (HVec [(HMap :optional {:W Long})])}))))))
 
 (deftest prepare-deftm-rejects-bad-spec
   (testing "prepare-deftm wraps validation error with the offending arg name"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"arg `w`.*:optional"
-          (pf/prepare-deftm
-            '[w]
-            '[(Params (HMap :mandatory {:a Long} :optional {:b Long}))]
-            '(use w))))))
+                          (pf/prepare-deftm
+                           '[w]
+                           '[(Params (HMap :mandatory {:a Long} :optional {:b Long}))]
+                           '(use w))))))
 
 ;; ----------------------------------------------------------------------
 ;; Identity-collision detection (weight tying — Phase 1: error on collision)
@@ -85,8 +85,8 @@
                                   :W2 (Param (Array double))})
           value {:W1 shared :W2 shared}]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
-            #":W1.*:W2"
-            (pf/assert-no-identity-collisions! spec value))))))
+                            #":W1.*:W2"
+                            (pf/assert-no-identity-collisions! spec value))))))
 
 (deftest assert-no-identity-collisions-detects-cross-subtree-share
   (testing "Same array instance in different sub-trees is detected"
@@ -95,18 +95,18 @@
                                   :dec (HMap :mandatory {:W (Param (Array double))})})
           value {:enc {:W shared} :dec {:W shared}}]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
-            #"share JVM identity"
-            (pf/assert-no-identity-collisions! spec value))))))
+                            #"share JVM identity"
+                            (pf/assert-no-identity-collisions! spec value))))))
 
 (deftest assert-no-identity-collisions-detects-share-in-hvec
   (testing "Same array at two HVec positions is detected"
     (let [shared (double-array [1])
           spec '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W (Param (Array double))})
-                                                  (HMap :mandatory {:W (Param (Array double))})])})
+                                                 (HMap :mandatory {:W (Param (Array double))})])})
           value {:layers [{:W shared} {:W shared}]}]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
-            #":layers 0 :W.*:layers 1 :W"
-            (pf/assert-no-identity-collisions! spec value))))))
+                            #":layers 0 :W.*:layers 1 :W"
+                            (pf/assert-no-identity-collisions! spec value))))))
 
 (deftest assert-no-identity-collisions-allows-equal-but-distinct-arrays
   (testing "Two arrays with equal contents but distinct identity are fine"
@@ -133,8 +133,8 @@
       (is (= [[:a] [:b]] (mapv :path leaves)))))
   (testing "HVec leaves emit in index order, sub-HMaps recurse"
     (let [leaves (pf/flatten-spec
-                   '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W (Param Long)})
-                                                     (HMap :mandatory {:W (Param Long)})])}))]
+                  '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:W (Param Long)})
+                                                    (HMap :mandatory {:W (Param Long)})])}))]
       (is (= [[:layers 0 :W] [:layers 1 :W]] (mapv :path leaves)))))
   (testing "Wrapper kind is preserved on leaves"
     (let [leaves (pf/flatten-spec '(HMap :mandatory {:p (Param Double)
@@ -183,10 +183,10 @@
                                                     :Wk (Param (Array double))})])})}}
         {:keys [body leaves]}
         (pf/rewrite-body
-          '(let [layer (nth (:layers w) 0)
-                 h     (attn x (:Wq layer) (:Wk layer))]
-             h)
-          env)]
+         '(let [layer (nth (:layers w) 0)
+                h     (attn x (:Wq layer) (:Wk layer))]
+            h)
+         env)]
     (let [flat-syms (->> body flatten (filter symbol?) set)]
       (is (contains? flat-syms 'w__layers__0__Wq) "Wq access resolved via alias")
       (is (contains? flat-syms 'w__layers__0__Wk) "Wk access resolved via alias"))
@@ -195,14 +195,14 @@
 
 (deftest prepare-deftm-flat-mlp
   (let [result (pf/prepare-deftm
-                 '[w x]
-                 '[(Params (HMap :mandatory {:W1 (Param (Array double))
-                                             :b1 (Param (Array double))
-                                             :W2 (Param (Array double))
-                                             :b2 (Param (Array double))}))
-                   (Array double)]
-                 '(let [h (linear x (:W1 w) (:b1 w))]
-                    (linear h (:W2 w) (:b2 w))))]
+                '[w x]
+                '[(Params (HMap :mandatory {:W1 (Param (Array double))
+                                            :b1 (Param (Array double))
+                                            :W2 (Param (Array double))
+                                            :b2 (Param (Array double))}))
+                  (Array double)]
+                '(let [h (linear x (:W1 w) (:b1 w))]
+                   (linear h (:W2 w) (:b2 w))))]
     (testing "Tree arg expanded to flat positional args in canonical order"
       (is (= '[w__W1 w__W2 w__b1 w__b2 x] (:params result))))
     (testing "Flat annotations preserve Param wrapper, x untouched"
@@ -224,9 +224,9 @@
 
 (deftest prepare-deftm-non-tree-args-untouched
   (let [result (pf/prepare-deftm
-                 '[a b]
-                 '[(Array double) Long]
-                 '(some-fn a b))]
+                '[a b]
+                '[(Array double) Long]
+                '(some-fn a b))]
     (is (= '[a b] (:params result)))
     (is (= '[(Array double) Long] (:annotations result)))
     (is (= '(some-fn a b) (:body result)))
@@ -283,12 +283,12 @@
   (testing "Sub-tree alias bindings are dropped from the let — no dangling tree-arg refs"
     (let [{:keys [body]}
           (pf/rewrite-body
-            '(let [layer (nth (:layers w) 0)
-                   h     (use (:Wq layer))]
-               h)
-            '{w {:root w :path []
-                 :spec (HMap :mandatory
-                             {:layers (HVec [(HMap :mandatory {:Wq (Param (Array double))})])})}})]
+           '(let [layer (nth (:layers w) 0)
+                  h     (use (:Wq layer))]
+              h)
+           '{w {:root w :path []
+                :spec (HMap :mandatory
+                            {:layers (HVec [(HMap :mandatory {:Wq (Param (Array double))})])})}})]
       ;; The 'layer' binding should be gone; only 'h' remains.
       (let [bindings (second body)]
         (is (= 1 (/ (count bindings) 2)))
@@ -300,11 +300,11 @@
 (deftest tree-arg-as-value-errors
   (testing "Passing the tree arg as a value (e.g. (some-fn w)) is rejected"
     (is (thrown-with-msg?
-          clojure.lang.ExceptionInfo #"referenced as a value"
-          (pf/prepare-deftm
-            '[w]
-            '[(Params (HMap :mandatory {:W (Param (Array double))}))]
-            '(some-fn w))))))
+         clojure.lang.ExceptionInfo #"referenced as a value"
+         (pf/prepare-deftm
+          '[w]
+          '[(Params (HMap :mandatory {:W (Param (Array double))}))]
+          '(some-fn w))))))
 
 (deftest flat-view-detection
   (testing "flat-view-form? recognizes both qualified and unqualified"
@@ -322,7 +322,7 @@
       (is (nil? (pf/path->flat-idx spec [:nonexistent])))))
   (testing "Nested HMap+HVec paths"
     (let [spec '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:Wq (Param Long)})
-                                                  (HMap :mandatory {:Wq (Param Long)})])})]
+                                                 (HMap :mandatory {:Wq (Param Long)})])})]
       (is (= 0 (pf/path->flat-idx spec [:layers 0 :Wq])))
       (is (= 1 (pf/path->flat-idx spec [:layers 1 :Wq]))))))
 
@@ -330,11 +330,11 @@
   (testing "Path access on a flat-view binding emits (nth flat-source flat-idx)"
     (let [spec '(HMap :mandatory {:W (Param (Array double)) :b (Param (Array double))})
           {:keys [body]} (pf/rewrite-body
-                           `(~'let [~'grads (~'flat-view ~'vg :spec ~spec :starting-at 1)
-                                    ~'x (~'use (:W ~'grads))
-                                    ~'y (~'use (:b ~'grads))]
-                              [~'x ~'y])
-                           {})]
+                          `(~'let [~'grads (~'flat-view ~'vg :spec ~spec :starting-at 1)
+                                   ~'x (~'use (:W ~'grads))
+                                   ~'y (~'use (:b ~'grads))]
+                                  [~'x ~'y])
+                          {})]
       ;; :W is sorted-first → flat-idx 0 → starting-at 1 = nth idx 1
       ;; :b is sorted-second → flat-idx 1 → starting-at 1 = nth idx 2
       (let [bindings (second body)]
@@ -345,16 +345,16 @@
 (deftest rewrite-flat-view-nested-path
   (testing "Nested path access through a flat-view resolves correctly"
     (let [spec '(HMap :mandatory {:layers (HVec [(HMap :mandatory {:Wq (Param (Array double))
-                                                                    :Wk (Param (Array double))})])
+                                                                   :Wk (Param (Array double))})])
                                   :embed (Param (Array double))})
           {:keys [body]} (pf/rewrite-body
-                           `(~'let [~'grads (~'flat-view ~'vg :spec ~spec)
-                                    ~'layer0 (~'nth (:layers ~'grads) 0)
-                                    ~'Wq (:Wq ~'layer0)
-                                    ~'Wk (:Wk ~'layer0)
-                                    ~'emb (:embed ~'grads)]
-                              [~'Wq ~'Wk ~'emb])
-                           {})]
+                          `(~'let [~'grads (~'flat-view ~'vg :spec ~spec)
+                                   ~'layer0 (~'nth (:layers ~'grads) 0)
+                                   ~'Wq (:Wq ~'layer0)
+                                   ~'Wk (:Wk ~'layer0)
+                                   ~'emb (:embed ~'grads)]
+                                  [~'Wq ~'Wk ~'emb])
+                          {})]
       ;; sorted leaves: [:embed], [:layers 0 :Wk], [:layers 0 :Wq]
       ;; flat indices  :  0,         1,             2
       (let [nth-calls (atom [])]
@@ -375,13 +375,13 @@
 (deftest walk-expansion-emits-per-leaf-calls
   (testing "Filters by kind, emits a splice-statements marker with per-leaf calls"
     (let [spec '(HMap :mandatory {:W (Param (Array double))
-                                   :b (Param (Array double))
-                                   :ln (Frozen (Array double))})
+                                  :b (Param (Array double))
+                                  :ln (Frozen (Array double))})
           env {'w {:root 'w :path [] :spec spec}
                'g {:root 'g :path [] :spec spec}}
           {:keys [body]} (pf/rewrite-body
-                           '(walk! :param adam-step! [w g] lr eps)
-                           env)]
+                          '(walk! :param adam-step! [w g] lr eps)
+                          env)]
       ;; The expansion is a splice marker — its rest contains the per-leaf
       ;; calls. When this appears at let-body position, the let-handler
       ;; splices its contents into the parent body.
@@ -393,15 +393,15 @@
 (deftest walk-expansion-spliced-into-let-body
   (testing "walk! used as a let-body form is spliced as statement-position effects"
     (let [spec '(HMap :mandatory {:W (Param (Array double))
-                                   :b (Param (Array double))})
+                                  :b (Param (Array double))})
           env {'w {:root 'w :path [] :spec spec}
                'm {:root 'm :path [] :spec spec}}
           {:keys [body]} (pf/rewrite-body
-                           (list 'let
-                                 ['grads (list 'flat-view 'vg :spec spec :starting-at 1)]
-                                 (list 'walk! :param 'step! ['w 'grads 'm])
-                                 'loss)
-                           env)]
+                          (list 'let
+                                ['grads (list 'flat-view 'vg :spec spec :starting-at 1)]
+                                (list 'walk! :param 'step! ['w 'grads 'm])
+                                'loss)
+                          env)]
       ;; body is (let [grads vg] (step! w__W (nth vg 1) m__W) (step! w__b (nth vg 2) m__b) loss)
       ;; The walk! statement-position form has been spliced to two calls.
       (let [body-forms (drop 2 body)]   ;; skip 'let and bindings vec
@@ -447,35 +447,35 @@
       (fn []
         ;; Define a fake callee with original-args of length 4 (acc-style 4-arg)
         (fake-callee-var!
-          'ariy-step!
-          '[w g lr eps]
-          {})    ;; no treedefs — just a deftm-shaped arglist
+         'ariy-step!
+         '[w g lr eps]
+         {})    ;; no treedefs — just a deftm-shaped arglist
         (let [spec '(HMap :mandatory {:W (Param (Array double))
                                       :b (Param (Array double))})
               env {'w {:root 'w :path [] :spec spec}
                    'g {:root 'g :path [] :spec spec}}]
           ;; Caller emits (ariy-step! w-leaf g-leaf lr) → arity 3, not 4
           (is (thrown-with-msg? clojure.lang.ExceptionInfo
-                #"arity 4.*arity 3"
-                (pf/rewrite-body
-                  '(walk! :param ariy-step! [w g] lr)
-                  env))))))))
+                                #"arity 4.*arity 3"
+                                (pf/rewrite-body
+                                 '(walk! :param ariy-step! [w g] lr)
+                                 env))))))))
 
 (deftest walk-arity-match-passes
   (testing "Matching arity passes through cleanly"
     (with-fake-callees ['ariy-ok-step!]
       (fn []
         (fake-callee-var!
-          'ariy-ok-step!
-          '[w g lr eps]
-          {})
+         'ariy-ok-step!
+         '[w g lr eps]
+         {})
         (let [spec '(HMap :mandatory {:W (Param (Array double))})
               env {'w {:root 'w :path [] :spec spec}
                    'g {:root 'g :path [] :spec spec}}
               {:keys [body]}
               (pf/rewrite-body
-                '(walk! :param ariy-ok-step! [w g] lr eps)
-                env)]
+               '(walk! :param ariy-ok-step! [w g] lr eps)
+               env)]
           ;; No throw — body is a splice-statements form
           (is (pf/splice-statements? body)))))))
 
@@ -486,8 +486,8 @@
           ;; 'no-such-fn doesn't resolve → arities is nil → check is skipped
           {:keys [body]}
           (pf/rewrite-body
-            '(walk! :param no-such-fn [w])
-            env)]
+           '(walk! :param no-such-fn [w])
+           env)]
       (is (pf/splice-statements? body)))))
 
 (deftest scan-vec-form-detection
@@ -502,8 +502,8 @@
                           {:layers (list 'HVec [layer-spec layer-spec])})
           env {'w {:root 'w :path [] :spec w-spec}}
           {:keys [body]} (pf/rewrite-body
-                           (list 'scan-vec 'block 'h-init (list :layers 'w))
-                           env)]
+                          (list 'scan-vec 'block 'h-init (list :layers 'w))
+                          env)]
       (is (= 'let* (first body)))
       ;; Bindings: scan_acc__0, h-init, scan_acc__1, (block ...), scan_acc__2, (block ...)
       ;; = 6 entries for 2 layers
@@ -525,8 +525,8 @@
     (let [w-spec '(HMap :mandatory {:rows (HVec [(Array double) (Array double)])})
           env {'w {:root 'w :path [] :spec w-spec}}
           {:keys [body]} (pf/rewrite-body
-                           (list 'scan-vec 'sum 'init (list :rows 'w))
-                           env)
+                          (list 'scan-vec 'sum 'init (list :rows 'w))
+                          env)
           bindings (second body)
           call-1 (nth bindings 3)]
       ;; For leaf elements, the element passes through as a direct path access
@@ -538,20 +538,20 @@
     (with-fake-callees ['scan-block]
       (fn []
         (fake-callee-var!
-          'scan-block
-          '[acc layer batch]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))
-                                           :b (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
-                            {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
+         'scan-block
+         '[acc layer batch]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))
+                                          :b (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
+                           {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
         (let [layer-spec '(HMap :mandatory {:W (Param (Array double))
                                             :b (Param (Array double))})
               w-spec    (list 'HMap :mandatory
                               {:layers (list 'HVec [layer-spec layer-spec])})
               env {'w {:root 'w :path [] :spec w-spec}}
               {:keys [body]} (pf/rewrite-body
-                               (list 'scan-vec 'scan-block 'h-init (list :layers 'w) 'batch)
-                               env)
+                              (list 'scan-vec 'scan-block 'h-init (list :layers 'w) 'batch)
+                              env)
               ns-name (str (.name *ns*))
               flat-sym (symbol ns-name "scan-block--flat")
               bindings (second body)
@@ -580,8 +580,8 @@
                         {:layers (HVec [(HMap :mandatory {:W (Param (Array double))})])})
           env {'w {:root 'w :path [] :spec w-spec}}
           {:keys [body]} (pf/rewrite-body
-                           (list 'scan-vec 'plain-fn 'h-init (list :layers 'w))
-                           env)
+                          (list 'scan-vec 'plain-fn 'h-init (list :layers 'w))
+                          env)
           bindings (second body)
           call-1 (nth bindings 3)]
       ;; Fallback path emits a map literal as the elt arg
@@ -590,10 +590,10 @@
 
 (deftest prepare-deftm-frozen-tracked
   (let [result (pf/prepare-deftm
-                 '[w]
-                 '[(Params (HMap :mandatory {:trainable (Param (Array double))
-                                             :fixed     (Frozen (Array double))}))]
-                 '(plus (:trainable w) (:fixed w)))]
+                '[w]
+                '[(Params (HMap :mandatory {:trainable (Param (Array double))
+                                            :fixed     (Frozen (Array double))}))]
+                '(plus (:trainable w) (:fixed w)))]
     (is (= '[w__fixed w__trainable] (:params result)))
     (is (= '[(Frozen (Array double)) (Param (Array double))] (:annotations result))
         "Wrapper kinds are preserved per-leaf in annotations")
@@ -615,15 +615,15 @@
     (with-fake-callees ['inner-block]
       (fn []
         (fake-callee-var!
-          'inner-block
-          '[layer x batch d]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))
-                                           :b (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
-                            {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
+         'inner-block
+         '[layer x batch d]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))
+                                          :b (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
+                           {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
         (let [spliced (pf/splice-cross-deftm-call
-                        '(inner-block (:l w) x batch d)
-                        {})
+                       '(inner-block (:l w) x batch d)
+                       {})
               ns-name (str (.name *ns*))]
           (is (= (list (symbol ns-name "inner-block--flat")
                        '(:W (:l w))
@@ -637,13 +637,13 @@
     (with-fake-callees ['mixed-callee]
       (fn []
         (fake-callee-var!
-          'mixed-callee
-          '[scalar w other]
-          '{w {:spec (HMap :mandatory {:W (Param (Array double))})
-               :leaves [{:path [:W] :sym w__W :kind :param :type (Array double)}]}})
+         'mixed-callee
+         '[scalar w other]
+         '{w {:spec (HMap :mandatory {:W (Param (Array double))})
+              :leaves [{:path [:W] :sym w__W :kind :param :type (Array double)}]}})
         (let [spliced (pf/splice-cross-deftm-call
-                        '(mixed-callee 42 (:layer x) other-sym)
-                        {})
+                       '(mixed-callee 42 (:layer x) other-sym)
+                       {})
               ns-name (str (.name *ns*))]
           (is (= (list (symbol ns-name "mixed-callee--flat")
                        42
@@ -662,33 +662,33 @@
     (with-fake-callees ['arity-callee]
       (fn []
         (fake-callee-var!
-          'arity-callee
-          '[layer x]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}]}})
+         'arity-callee
+         '[layer x]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}]}})
         ;; Wrong arity — returns nil, falls through to generic seq walk
         (is (nil? (pf/splice-cross-deftm-call
-                    '(arity-callee (:l w) x extra-arg)
-                    {})))))))
+                   '(arity-callee (:l w) x extra-arg)
+                   {})))))))
 
 (deftest cross-deftm-splice-via-prepare-deftm
   (testing "prepare-deftm rewrites a cross-deftm call to use the callee's flat-var"
     (with-fake-callees ['composite-block]
       (fn []
         (fake-callee-var!
-          'composite-block
-          '[layer x batch d]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))
-                                           :b (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
-                            {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
+         'composite-block
+         '[layer x batch d]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))
+                                          :b (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
+                           {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
         (let [{:keys [body params]}
               (pf/prepare-deftm
-                '[w x batch d]
-                '[(Params (HMap :mandatory {:l (HMap :mandatory {:W (Param (Array double))
-                                                                  :b (Param (Array double))})}))
-                  (Array double) Long Long]
-                '(composite-block (:l w) x batch d))
+               '[w x batch d]
+               '[(Params (HMap :mandatory {:l (HMap :mandatory {:W (Param (Array double))
+                                                                :b (Param (Array double))})}))
+                 (Array double) Long Long]
+               '(composite-block (:l w) x batch d))
               ns-name (str (.name *ns*))]
           (is (= '[w__l__W w__l__b x batch d] params)
               "Outer tree arg gets flattened into positional args")
@@ -702,15 +702,15 @@
     (with-fake-callees ['side-effect-callee]
       (fn []
         (fake-callee-var!
-          'side-effect-callee
-          '[layer x]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))
-                                           :b (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
-                            {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
+         'side-effect-callee
+         '[layer x]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))
+                                          :b (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}
+                           {:path [:b] :sym layer__b :kind :param :type (Array double)}]}})
         (let [spliced (pf/splice-cross-deftm-call
-                        '(side-effect-callee (some-side-effect arg) x)
-                        {})
+                       '(side-effect-callee (some-side-effect arg) x)
+                       {})
               ns-name (str (.name *ns*))]
           (is (and (seq? spliced) (= 'let* (first spliced)))
               "Result wraps the call in a let* so the unsafe arg is evaluated once")
@@ -732,17 +732,17 @@
     (with-fake-callees ['alias-block]
       (fn []
         (fake-callee-var!
-          'alias-block
-          '[layer x]
-          '{layer {:spec (HMap :mandatory {:W (Param (Array double))})
-                   :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}]}})
+         'alias-block
+         '[layer x]
+         '{layer {:spec (HMap :mandatory {:W (Param (Array double))})
+                  :leaves [{:path [:W] :sym layer__W :kind :param :type (Array double)}]}})
         (let [{:keys [body]}
               (pf/prepare-deftm
-                '[w x]
-                '[(Params (HMap :mandatory {:l (HMap :mandatory {:W (Param (Array double))})}))
-                  (Array double)]
-                '(let [layer (:l w)]
-                   (alias-block layer x)))
+               '[w x]
+               '[(Params (HMap :mandatory {:l (HMap :mandatory {:W (Param (Array double))})}))
+                 (Array double)]
+               '(let [layer (:l w)]
+                  (alias-block layer x)))
               ns-name (str (.name *ns*))]
           ;; Sub-tree binding 'layer' is dropped by update-let-env (recorded in
           ;; env), the call site is spliced, leaf access resolves via env.

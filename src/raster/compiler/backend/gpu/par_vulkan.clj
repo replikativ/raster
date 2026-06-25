@@ -183,7 +183,7 @@
                                     soa-arr-params))
         all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         ;; Detect if body is a loop (needs statement context in GLSL)
-        body-is-loop? (and (seq? adapted-body) (= 'loop (first adapted-body)))
+        body-is-loop? (and (seq? adapted-body) (contains? #{'loop 'loop*} (first adapted-body)))
         ;; For loop bodies, extract the result variable name (first loop binding)
         loop-result-var (when body-is-loop?
                           (ce/c-symbol (first (take-nth 2 (second adapted-body)))))

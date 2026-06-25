@@ -134,9 +134,9 @@
                (let [td (get treedefs arg)]
                  `(do
                     (raster.compiler.core.params-flatten/assert-tree-shape!
-                      '~(:spec td) ~sym)
+                     '~(:spec td) ~sym)
                     (raster.compiler.core.params-flatten/assert-no-identity-collisions!
-                      '~(:spec td) ~sym)))))
+                     '~(:spec td) ~sym)))))
         flat-args (vec (mapcat (fn [arg sym]
                                  (if-let [td (get treedefs arg)]
                                    (mapv (fn [{:keys [path]}]
@@ -258,9 +258,9 @@
                 ::flat-var       (list 'var flat-name)
                 ::original-args  (list 'quote params)})
          (#'compile-flatten-wrapper @(var ~flat-name)
-                                 '~params
-                                 '~treedefs
-                                 '~containers))
+                                    '~params
+                                    '~treedefs
+                                    '~containers))
        (alter-meta! (var ~fn-name) assoc
                     ::treedefs '~treedefs
                     ::flat-var (var ~flat-name)
@@ -291,10 +291,12 @@
 ;; ----------------------------------------------------------------------
 
 (defn- path-key
-  "Stable keyword key for a leaf path. (path-key [:layers 0 :Wq]) => :layers/0/Wq.
-  Uses '/' as separator since '__' could collide with the wrapper sym names."
+  "Stable keyword key for a leaf path. (path-key [:layers 0 :Wq]) => :layers.0.Wq.
+  Uses '.' as separator: '/' would make a multi-slash keyword that violates the
+  keyword spec (≤1 slash) and that rewrite-clj/cljfmt can't parse, while '__'
+  could collide with the wrapper sym names."
   [path]
-  (keyword (str/join "/"
+  (keyword (str/join "."
                      (map (fn [p] (if (keyword? p) (name p) (str p)))
                           path))))
 
@@ -538,12 +540,12 @@
   [p frozen?]
   (let [{:keys [descs vals]} (pf/flatten-params p)]
     (persistent!
-      (reduce (fn [acc [d v]]
-                (if (and frozen? (frozen? (:path d)))
-                  acc
-                  (assoc! acc (path-key (:path d)) v)))
-              (transient {})
-              (map vector descs vals)))))
+     (reduce (fn [acc [d v]]
+               (if (and frozen? (frozen? (:path d)))
+                 acc
+                 (assoc! acc (path-key (:path d)) v)))
+             (transient {})
+             (map vector descs vals)))))
 
 (defn make-params-optimizer
   "Create an optimizer (`:sgd`/`:adam`/`:adamw`, schedules, grad clipping — see
@@ -639,8 +641,8 @@
         ;; The flat call to value+grad expects: tree leaves first (canonical
         ;; order), then non-tree args in declared order.
         flat-call-args (concat
-                         (map (fn [{:keys [path]}] (access-expr weights-arg path)) leaves)
-                         (filter (fn [a] (not= a weights-arg)) loss-args))
+                        (map (fn [{:keys [path]}] (access-expr weights-arg path)) leaves)
+                        (filter (fn [a] (not= a weights-arg)) loss-args))
         vg-call `((raster.ad.reverse/value+grad (var ~(symbol (str (.ns loss-flat-var))
                                                               (str (.sym loss-flat-var)))))
                   ~@flat-call-args)
@@ -680,7 +682,7 @@
                              w-acc (access-expr weights-arg (:path l))]
                          [(symbol (str "effect-clip-" i))
                           `(raster.dl.optim/clip-grad-norm!
-                             ~d (raster.arrays/alength ~w-acc) ~'max-grad-norm)]))
+                            ~d (raster.arrays/alength ~w-acc) ~'max-grad-norm)]))
                      param-leaf-pairs))
         opt-bindings
         (case optimizer
@@ -692,9 +694,9 @@
                                v-acc (access-expr 'v (:path l))]
                            [(symbol (str "effect-step-" i))
                             `(raster.dl.optim/adam-step!
-                               ~w-acc ~d ~m-acc ~v-acc
-                               (raster.arrays/alength ~w-acc)
-                               ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t)]))
+                              ~w-acc ~d ~m-acc ~v-acc
+                              (raster.arrays/alength ~w-acc)
+                              ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t)]))
                        param-leaf-pairs))
           :sgd
           (vec (mapcat (fn [[i l]]
@@ -702,16 +704,16 @@
                                w-acc (access-expr weights-arg (:path l))]
                            [(symbol (str "effect-step-" i))
                             `(raster.dl.optim/sgd-step!
-                               ~w-acc ~d (raster.arrays/alength ~w-acc) ~'lr)]))
+                              ~w-acc ~d (raster.arrays/alength ~w-acc) ~'lr)]))
                        param-leaf-pairs))
           (throw (ex-info "Unknown optimizer (expected :adam or :sgd)"
                           {:optimizer optimizer})))]
     `(~'let [~'__vg-out ~vg-call
              ~'loss (clojure.core/nth ~'__vg-out 0)
              ~@grad-bindings]
-        ~@(map second (partition 2 clip-bindings))
-        ~@(map second (partition 2 opt-bindings))
-        ~'loss)))
+            ~@(map second (partition 2 clip-bindings))
+            ~@(map second (partition 2 opt-bindings))
+            ~'loss)))
 
 (defn- ensure-train-step-deps! []
   ;; The synthesized train-step body uses fully-qualified raster.dl.optim and
@@ -768,18 +770,18 @@
          ;; Params wrapper needed. The (:k w) accesses pre-flatten into flat
          ;; positional symbols at compile time.
          param-vec     (vec (concat
-                              [w-arg :- spec]
-                              (when (= optimizer :adam)
-                                ['m :- m-spec
-                                 'v :- m-spec])
-                              (mapcat (fn [[a ann]] [a :- ann]) non-tree)
-                              ['max-grad-norm :- 'Double
-                               'lr            :- 'Double]
-                              (when (= optimizer :adam)
-                                ['beta1  :- 'Double
-                                 'beta2  :- 'Double
-                                 'eps    :- 'Double
-                                 'adam-t :- 'Long])))
+                             [w-arg :- spec]
+                             (when (= optimizer :adam)
+                               ['m :- m-spec
+                                'v :- m-spec])
+                             (mapcat (fn [[a ann]] [a :- ann]) non-tree)
+                             ['max-grad-norm :- 'Double
+                              'lr            :- 'Double]
+                             (when (= optimizer :adam)
+                               ['beta1  :- 'Double
+                                'beta2  :- 'Double
+                                'eps    :- 'Double
+                                'adam-t :- 'Long])))
          form          `(raster.params/defmodel ~train-name ~param-vec :- ~'Double
                           ~body)
          target-ns     (.ns ^clojure.lang.Var loss-var)

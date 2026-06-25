@@ -830,7 +830,6 @@
                     (:unembed-Wu2 weights) (:unembed-bu2 weights)
                     n-vars emb-dim))))
 
-
 ;; ================================================================
 ;; DDPM sampling (inference)
 ;; ================================================================
@@ -934,7 +933,6 @@
       ;; Scatter back to full-size array
       (unmarginalize-values result orig-indices n-vars))))
 
-
 ;; ================================================================
 ;; Tree-based defmodel API (params/compile-train-step compatible)
 ;;
@@ -1008,25 +1006,25 @@
            ~'n-spaces-val ~(long n-spaces)
            ~'n-states-val ~(long N-STATES)
            ~'h-init (raster.dl.gsdm/flat-embed
-                      ~'values (:embed-space ~'w) ~'spaces
-                      (:embed-state ~'w) ~'states ~'pos-emb
-                      (:embed-We ~'w) (:embed-be ~'w)
-                      ~'n-vars ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
+                     ~'values (:embed-space ~'w) ~'spaces
+                     (:embed-state ~'w) ~'states ~'pos-emb
+                     (:embed-We ~'w) (:embed-be ~'w)
+                     ~'n-vars ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
            ~'temb (raster.dl.gsdm/timestep-mlp
-                    ~'t (:temb-W1 ~'w) (:temb-b1 ~'w)
-                    (:temb-W2 ~'w) (:temb-b2 ~'w) ~'emb-dim-val)
+                   ~'t (:temb-W1 ~'w) (:temb-b1 ~'w)
+                   (:temb-W2 ~'w) (:temb-b2 ~'w) ~'emb-dim-val)
            ~'h-final (raster.tree/scan-vec raster.dl.gsdm/transformer-block-step
-                       ~'h-init (:layers ~'w)
-                       ~'temb ~'src-edges ~'dst-edges
-                       ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)
+                                           ~'h-init (:layers ~'w)
+                                           ~'temb ~'src-edges ~'dst-edges
+                                           ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)
            ~'pred (raster.dl.gsdm/flat-unembed
-                    ~'h-final
-                    (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
-                    (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
-                    ~'n-vars ~'emb-dim-val)
+                   ~'h-final
+                   (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
+                   (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
+                   ~'n-vars ~'emb-dim-val)
            ~'loss (raster.dl.array-ops/masked-mse-loss
-                    ~'pred ~'target ~'states ~'n-vars)]
-       ~'loss))
+                   ~'pred ~'target ~'states ~'n-vars)]
+          ~'loss))
 
 (defn make-gsdm-loss
   "Eval a deftm for the given config and return its var. The var has

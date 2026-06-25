@@ -114,8 +114,8 @@
         leaf-descs-sym (gensym "leaves__")
         ld-sym (gensym "ld__")]
     `(let [~spec-sym (or (some-> ~first-pt meta :raster.tree/spec)
-                          (throw (ex-info "tree/walk!: cannot determine spec at runtime; use inside a defmodel body or attach :raster.tree/spec metadata"
-                                          {:value ~first-pt})))
+                         (throw (ex-info "tree/walk!: cannot determine spec at runtime; use inside a defmodel body or attach :raster.tree/spec metadata"
+                                         {:value ~first-pt})))
            ~leaf-descs-sym (raster.tree/leaves ~spec-sym)]
        (doseq [~ld-sym ~leaf-descs-sym
                :when (or (= ~kind :any) (= (:kind ~ld-sym) ~kind))]
@@ -125,7 +125,7 @@
                                    (if (keyword? step#) (get v# step#) (nth v# step#)))
                                  ~pt path#))
                       tree-args)
-            ~@extras))))))
+               ~@extras))))))
 
 (defmacro scan-vec
   "Sequential fold over a known-length HVec sub-tree. Compile-time unrolled

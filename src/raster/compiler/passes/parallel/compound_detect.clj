@@ -158,7 +158,8 @@
        ;; Not a method call (.invk, .foo)
        (not (.startsWith (name sym) "."))
        ;; Not a special form or common operator
-       (not (contains? #{'let 'let* 'do 'if 'when 'dotimes 'loop 'recur
+       (not (contains? #{'let 'let* 'do 'if 'when 'dotimes 'loop 'loop* 'recur
+                         'fn 'fn* 'case 'case* 'quote 'new 'throw 'try
                          'double 'float 'long 'int 'byte 'short 'char 'boolean
                          '+ '- '* '/ 'nil 'true 'false} sym))))
 

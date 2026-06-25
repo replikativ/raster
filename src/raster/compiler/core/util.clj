@@ -18,137 +18,67 @@
         (vector? e) (apply set/union #{} (map free-syms-flat e))
         :else       #{}))
 
+(defn- free-leaf?
+  "True if a bare symbol is a free local-variable reference: unqualified, not
+   bound, not a method call (.foo), and not a clojure.core var (cast intrinsics
+   like double/long/int appear bare in walked IR but are never local vars)."
+  [e bound]
+  (and (symbol? e)
+       (not (namespace e))
+       (not (contains? bound e))
+       (not (.startsWith (name e) "."))
+       (not (when-let [v (try (ns-resolve 'clojure.core e) (catch Exception _ nil))]
+              (var? v)))))
+
 (defn free-syms
   "Collect unqualified free symbols from a (possibly nested) S-expression,
-   correctly respecting lexical scoping from all binding forms.
+   correctly respecting lexical scoping from EVERY closed-core binding form.
 
-   Uses form/form-info for form classification — adding a new binding form
-   to form.clj is sufficient; no changes needed here.
-
-   Handles: let/let*, loop/loop*, dotimes, fn/fn*, letfn*, try/catch."
+   Generic over `form/scope-info` — the single source of binder knowledge.
+   Adding a new binding form to form.clj's scope-info is sufficient; no change
+   here. Handles: let*, loop*, dotimes, fn*, ftm, letfn* (recursive), reify*,
+   try/catch, and all raster.par/* variants. `quote` is opaque (its body is
+   code-as-data, never scanned)."
   ([e] (free-syms e #{}))
   ([e bound]
    (cond
-     ;; Symbol: free if unqualified, not bound, not a method call (.foo),
-     ;; and not a clojure.core var (cast intrinsics like double, long, int
-     ;; appear bare in walked IR but are never local variables)
-     (symbol? e)
-     (let [n (name e)]
-       (if (and (not (namespace e))
-                (not (contains? bound e))
-                (not (.startsWith n "."))
-                (not (when-let [v (try (ns-resolve 'clojure.core e) (catch Exception _ nil))]
-                       (var? v))))
-         #{e}
-         #{}))
+     (symbol? e) (if (free-leaf? e bound) #{e} #{})
 
-     ;; Sequence forms — dispatch on kind
+     ;; quote is opaque — its contents are data, not code
+     (and (seq? e) (= 'quote (first e))) #{}
+
      (seq? e)
-     (let [info (form/form-info e)
-           kind (:kind info)]
-       (case kind
-         ;; let/let* — thread bindings sequentially
-         :binding
-         (let [[_ bindings & body] e
-               pairs (partition 2 bindings)
-               [bound' binding-frees]
-               (reduce (fn [[b frees] [sym init]]
-                         [(conj b sym)
-                          (set/union frees (free-syms init b))])
-                       [bound #{}] pairs)
-               body-frees (apply set/union #{} (map #(free-syms % bound') body))]
-           (set/union binding-frees body-frees))
+     (if-let [{:keys [scopes outer sequential? rec?]} (form/scope-info e)]
+       (let [outer-free (apply set/union #{} (map #(free-syms % bound) outer))
+             scope-free
+             (apply set/union #{}
+                    (for [{:keys [binders inits body]} scopes]
+                      (let [bset (set (filter symbol? binders))]
+                        (if sequential?
+                          ;; let*/loop*: init_k sees bound + prior binders
+                          (let [[bound' ifree]
+                                (reduce (fn [[b fr] [sym init]]
+                                          [(conj b sym) (set/union fr (free-syms init b))])
+                                        [bound #{}] (map vector binders inits))
+                                bfree (apply set/union #{} (map #(free-syms % bound') body))]
+                            (set/union ifree bfree))
+                          ;; fn*/letfn*/par/catch/dotimes: inits see bound (or
+                          ;; bound+binders if :rec?), body sees bound+binders
+                          (let [init-bound (if rec? (into bound bset) bound)
+                                ifree (apply set/union #{} (map #(free-syms % init-bound) inits))
+                                body-bound (into bound bset)
+                                bfree (apply set/union #{} (map #(free-syms % body-bound) body))]
+                            (set/union ifree bfree))))))]
+         (set/union outer-free scope-free))
+       ;; non-binder seq: :call head is a value ref (local fn); else head is
+       ;; syntax (.invk/if/do/special/par-without-scope) — skip it
+       (if (= :call (:kind (form/form-info e)))
+         (apply set/union #{} (map #(free-syms % bound) e))
+         (apply set/union #{} (map #(free-syms % bound) (rest e)))))
 
-         ;; loop/loop*/dotimes — thread bindings, scope covers body
-         :scope
-         (let [head (first e)]
-           (if (= 'dotimes head)
-             (let [[_ [sym bound-expr] & body] e
-                   bound' (conj bound sym)]
-               (set/union (free-syms bound-expr bound)
-                          (apply set/union #{} (map #(free-syms % bound') body))))
-             ;; loop/loop*
-             (let [[_ bindings & body] e
-                   pairs (partition 2 bindings)
-                   [bound' binding-frees]
-                   (reduce (fn [[b frees] [sym init]]
-                             [(conj b sym)
-                              (set/union frees (free-syms init b))])
-                           [bound #{}] pairs)
-                   body-frees (apply set/union #{} (map #(free-syms % bound') body))]
-               (set/union binding-frees body-frees))))
-
-         ;; fn/fn*/ftm — params are local to each arity
-         :lambda
-         (let [arities (if (vector? (second e))
-                         [(rest e)]
-                         (rest e))]
-           (apply set/union #{}
-                  (for [arity arities]
-                    (let [params (first arity)
-                          fn-bound (into bound (filter symbol? params))
-                          ;; A walked ftm arity is, after the param vector:
-                          ;;   [:- <ret>]?  :raster.walker/source-body <raw-vec>  <walked-body...>
-                          ;; The `:- <ret>` is type syntax (not a value), and the
-                          ;; source-body payload is the deliberately-unqualified raw
-                          ;; body kept for AD transparency. Neither is real code to
-                          ;; scan for captures — the walked-body alone is fully
-                          ;; qualified (.invk + ns-qualified calls). Scanning the
-                          ;; raw payload/annotations leaks type heads (`Array`) and
-                          ;; unqualified callees as bogus free vars.
-                          ;; Strip leading `:- <ret>` and any `:raster.walker/
-                          ;; source-body <vec>` pairs (an ftm may be walked more
-                          ;; than once, nesting multiple source-body markers).
-                          after (loop [a (rest arity)]
-                                  (cond
-                                    (= :- (first a)) (recur (drop 2 a))
-                                    (= :raster.walker/source-body (first a)) (recur (drop 2 a))
-                                    :else a))]
-                      (apply set/union #{} (map #(free-syms % fn-bound) after))))))
-
-         ;; try/catch/finally — catch binds exception variable
-         :special
-         (if (= 'try (first e))
-           (apply set/union #{}
-                  (for [sub (rest e)]
-                    (if (and (seq? sub) (= 'catch (first sub)))
-                      (let [[_ _ex-type ex-sym & catch-body] sub
-                            catch-bound (conj bound ex-sym)]
-                        (apply set/union #{} (map #(free-syms % catch-bound) catch-body)))
-                      (free-syms sub bound))))
-           ;; recur, throw, new — just recurse into args
-           (apply set/union #{} (map #(free-syms % bound) (rest e))))
-
-         ;; par forms — use par-scope-info for unified scope decomposition
-         :par
-         (if-let [{:keys [scoped-syms inner-exprs outer-exprs]} (par/par-scope-info e)]
-           (let [scoped-set (set (filter symbol? scoped-syms))
-                 body-bound (into bound scoped-set)
-                 outer-frees (apply set/union #{}
-                                    (map #(free-syms % bound) outer-exprs))
-                 inner-frees (apply set/union #{}
-                                    (map #(free-syms % body-bound) inner-exprs))]
-             (set/union outer-frees inner-frees))
-           ;; No scope info (scatter!, rng-fill!, etc.) — recurse into all args
-           (apply set/union #{} (map #(free-syms % bound) (rest e))))
-
-         ;; do, branch, invk, var-ref — head is syntax, not a value reference.
-         ;; Recurse into subforms, skip head.
-         (:do :branch :invk :var-ref)
-         (apply set/union #{} (map #(free-syms % bound) (rest e)))
-
-         ;; :call — head IS a value reference when it's a bare unqualified symbol
-         ;; (e.g. (f k1 u t) where f is a local holding a function value).
-         ;; Qualified heads (clojure.core/+, Math/pow) are var/class references,
-         ;; not local variables — they're excluded by the (namespace head) check
-         ;; in the symbol handler. So we simply walk ALL subforms including head.
-         ;; :call
-         (apply set/union #{} (map #(free-syms % bound) e))))
-
-     ;; Vectors — recurse
      (vector? e) (apply set/union #{} (map #(free-syms % bound) e))
-
-     ;; Literals — no free symbols
+     (map? e)    (apply set/union #{} (map #(free-syms % bound) (apply concat e)))
+     (set? e)    (apply set/union #{} (map #(free-syms % bound) e))
      :else #{})))
 
 (defn free-syms-excluding
@@ -156,6 +86,138 @@
    Scope-aware — uses free-syms internally."
   [operator-syms e]
   (set/difference (free-syms e) operator-syms))
+
+;; ================================================================
+;; Capture-avoiding substitution & alpha-conversion (generic over scope-info)
+;; ================================================================
+
+(defn- smap-value-frees
+  "Free symbols appearing across all smap values — the names that would be
+   captured if a scope binder shadowed them."
+  [smap]
+  (apply set/union #{} (map free-syms (vals smap))))
+
+(defn- fresh-like
+  "A fresh gensym carrying sym's metadata, suffixed _α_ for traceability."
+  [sym]
+  (with-meta (gensym (str (name sym) "_α_")) (meta sym)))
+
+(declare subst-syms remake-from)
+
+(defn- subst-scope
+  "Apply capture-avoiding substitution to one scope map. KEY capture: a binder
+   that is an smap key is rebound → stop substituting it within. VALUE capture:
+   a binder free in some smap value → alpha-rename it so substituted values keep
+   referring to the OUTER binding. `leaf-fn` is the symbol-substitution policy
+   (see subst-syms)."
+  [smap {:keys [binders inits body aux]} sequential? rec? leaf-fn]
+  (if sequential?
+    ;; let*/loop*: thread — init_k sees bound + prior binders
+    (let [[sm binders' inits']
+          (reduce (fn [[sm bs is] [b i]]
+                    (let [i'   (subst-syms sm i leaf-fn)
+                          cap? (and (symbol? b) (contains? (smap-value-frees sm) b))
+                          [b' sm'] (if cap?
+                                     (let [f (fresh-like b)] [f (assoc (dissoc sm b) b f)])
+                                     [b (if (symbol? b) (dissoc sm b) sm)])]
+                      [sm' (conj bs b') (conj is i')]))
+                  [smap [] []] (map vector binders inits))]
+      {:binders binders' :inits inits' :body (mapv #(subst-syms sm % leaf-fn) body)})
+    ;; fn*/letfn*/par/catch/dotimes: all binders enter scope at once
+    (let [vfrees (smap-value-frees smap)
+          [binders' rename]
+          (reduce (fn [[bs rn] b]
+                    (if (and (symbol? b) (contains? vfrees b))
+                      (let [f (fresh-like b)] [(conj bs f) (assoc rn b f)])
+                      [(conj bs b) rn]))
+                  [[] {}] binders)
+          inner (merge (apply dissoc smap (filter symbol? binders)) rename)]
+      {:binders binders'
+       ;; only :rec? forms (letfn*) let inits see the binders; others' inits
+       ;; (none, in the closed core) would see the outer smap
+       :inits (mapv #(subst-syms (if rec? inner smap) % leaf-fn) inits)
+       :body  (mapv #(subst-syms inner % leaf-fn) body)
+       ;; :aux (ftm source-body) shares the arity scope — rename it CONSISTENTLY
+       ;; with the body so the raw AD payload never desyncs from the walked code.
+       :aux  (some->> aux (mapv #(subst-syms inner % leaf-fn)))})))
+
+(defn subst-syms
+  "Capture-avoiding substitution of free symbol occurrences per
+   smap {old-sym → replacement-expr}, over a closed-core S-expression.
+
+   Generic over form/scope-info — handles EVERY binder uniformly (let*/loop*/
+   dotimes/fn*/ftm/letfn*/reify*/catch and all raster.par/* variants), avoiding
+   both KEY capture (binder rebinds an smap key) and VALUE capture (binder
+   shadows a name free in an smap value). `quote` is opaque.
+
+   `leaf-fn` (optional) is the symbol-substitution policy `(fn [smap sym] -> expr)`;
+   default is plain `(get smap sym sym)`. Pass a custom leaf to preserve use-site
+   metadata onto the replacement (the inliner does this for type-tag propagation)."
+  ([smap expr] (subst-syms smap expr (fn [sm e] (get sm e e))))
+  ([smap expr leaf-fn]
+   (if (empty? smap)
+     expr
+     (cond
+       (symbol? expr) (leaf-fn smap expr)
+
+       (and (seq? expr) (= 'quote (first expr))) expr
+
+       (seq? expr)
+       (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info expr)]
+         (rebuild (mapv #(subst-scope smap % sequential? rec? leaf-fn) scopes)
+                  (mapv #(subst-syms smap % leaf-fn) outer))
+         (remake-from expr (map #(subst-syms smap % leaf-fn) expr)))
+
+       (vector? expr) (mapv #(subst-syms smap % leaf-fn) expr)
+       (map? expr) (into (empty expr) (map (fn [[k v]] [(subst-syms smap k leaf-fn) (subst-syms smap v leaf-fn)]) expr))
+       (set? expr) (into (empty expr) (map #(subst-syms smap % leaf-fn) expr))
+       :else expr))))
+
+(declare alpha-convert)
+
+(defn- alpha-scope
+  "Alpha-rename one scope's binders to fresh names, threading env correctly:
+   sequential inits see prior binders; :rec? inits see all binders; otherwise
+   inits see only the enclosing env."
+  [env {:keys [binders inits body aux]} sequential? rec?]
+  (if sequential?
+    (let [[env' binders' inits']
+          (reduce (fn [[env bs is] [b i]]
+                    (let [i' (alpha-convert env i)            ;; init sees prior binders
+                          [b' env'] (if (symbol? b)
+                                      (let [f (fresh-like b)] [f (assoc env b f)])
+                                      [b env])]
+                      [env' (conj bs b') (conj is i')]))
+                  [env [] []] (map vector binders inits))]
+      {:binders binders' :inits inits' :body (mapv #(alpha-convert env' %) body)})
+    (let [pairs (mapv (fn [b] [b (if (symbol? b) (fresh-like b) b)]) binders)
+          env'  (into env (filter (comp symbol? first) pairs))
+          binders' (mapv second pairs)]
+      {:binders binders'
+       :inits (mapv #(alpha-convert (if rec? env' env) %) inits)
+       :body  (mapv #(alpha-convert env' %) body)
+       ;; ftm source-body (:aux) shares the arity scope — rename consistently
+       :aux  (some->> aux (mapv #(alpha-convert env' %)))})))
+
+(defn alpha-convert
+  "Alpha-rename EVERY bound variable in a closed-core form to a fresh gensym,
+   consistently rewriting references through env. Generic over form/scope-info.
+   Use to make hygienic copies of a body (e.g. unrolled fold iterations) so two
+   copies don't conflate their loop indices / accumulators. `quote` is opaque."
+  ([form] (alpha-convert {} form))
+  ([env form]
+   (cond
+     (symbol? form) (get env form form)
+     (and (seq? form) (= 'quote (first form))) form
+     (seq? form)
+     (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
+       (rebuild (mapv #(alpha-scope env % sequential? rec?) scopes)
+                (mapv #(alpha-convert env %) outer))
+       (remake-from form (map #(alpha-convert env %) form)))
+     (vector? form) (mapv #(alpha-convert env %) form)
+     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
+     (set? form) (into (empty form) (map #(alpha-convert env %) form))
+     :else form)))
 
 (defn remake
   "Construct a new list form preserving metadata from orig.

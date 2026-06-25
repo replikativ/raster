@@ -251,7 +251,7 @@
         ;; TC binding tags (eager for ftm, deferred for deftm)
         tc-binding-tags (when tc-eager?
                           (inf/safe-tc-binding-tags
-                            (or fn-label '<ftm>) params annotations body *ns*))
+                           (or fn-label '<ftm>) params annotations body *ns*))
         ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
@@ -311,6 +311,7 @@
         tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+    ;; walk-body closes the core (macroexpand-core) at its single canonical point.
     (mapv #(walker/walk-body % walk-opts) source-body)))
 
 (def ^:dynamic *jit-simd?*
@@ -517,8 +518,12 @@
                 clean-params (mapv #(if (symbol? %) (with-meta % nil) %) params)
                 flat-env (into {} (map (fn [p t] [(with-meta p nil) t]) params tags))
                 type-env (reduce-kv (fn [m s t] (assoc m s {:tag t})) {} flat-env)
-                ctx (walker/make-ctx {:type-env type-env :source-ns *ns*})
-                walked (try (walker/walk-forms (vec body) ctx)
+                ;; Walk through walk-body (not raw walk-forms) so each body form is
+                ;; closed to the core (let*/loop*/case*...) like every other walked
+                ;; body — keeps ::deftm-walked-body consumers (inline/op_descriptor/
+                ;; bytecode/GPU) on the same closed-core invariant.
+                walked (try (mapv #(walker/walk-body % {:type-env type-env :source-ns *ns*})
+                                  (vec body))
                             (catch Exception _e nil))]
             [params body tags clean-params walked]))]
     ;; Build the defn form + metadata attachment

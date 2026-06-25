@@ -17,7 +17,7 @@
 ;; --------------------------------------------------------------------------
 (core/deftm affine-block
   [bw :- (HMap :mandatory {:W (Param (Array double))
-                            :b (Param (Array double))})
+                           :b (Param (Array double))})
    x  :- (Array double)
    d  :- Long]
   :- (Array double)
@@ -38,9 +38,9 @@
 (core/deftm two-block-net
   [w :- (HMap :mandatory
               {:layers (HVec [(HMap :mandatory {:W (Param (Array double))
-                                                 :b (Param (Array double))})
+                                                :b (Param (Array double))})
                               (HMap :mandatory {:W (Param (Array double))
-                                                 :b (Param (Array double))})])})
+                                                :b (Param (Array double))})])})
    x :- (Array double)
    d :- Long]
   :- (Array double)

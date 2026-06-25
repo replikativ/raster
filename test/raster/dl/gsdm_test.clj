@@ -354,7 +354,6 @@
       (is (= 3 (alength pred)))
       (is (arr-finite? pred)))))
 
-
 ;; ================================================================
 ;; GPU kernel codegen tests
 ;; ================================================================
@@ -427,8 +426,6 @@
         (dotimes [i n]
           (is (< (Math/abs (- (aget output i) (aget input i)))
                  (max 0.01 (* 0.002 (Math/abs (aget input i)))))))))))
-
-
 
 ;; ================================================================
 ;; Tree-based defmodel + compile-train-step (new params API)

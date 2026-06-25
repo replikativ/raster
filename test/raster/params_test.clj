@@ -18,7 +18,7 @@
       (dotimes [j n-in]
         (let [cur (double (clojure.core/aget out i))
               wij (double (clojure.core/aget (:W w)
-                                              (clojure.core/+ (clojure.core/* i n-in) j)))
+                                             (clojure.core/+ (clojure.core/* i n-in) j)))
               xj  (double (clojure.core/aget x j))]
           (clojure.core/aset out i (clojure.core/+ cur (clojure.core/* wij xj))))))
     out))
@@ -78,9 +78,9 @@
         v     {:layers [{:Wq (double-array [1])}
                         {:Wq (double-array [2])}]}
         train (rp/trainable-leaves spec v)]
-    (is (= #{:layers/0/Wq :layers/1/Wq} (set (keys train))))
-    (is (= [1.0] (vec (:layers/0/Wq train))))
-    (is (= [2.0] (vec (:layers/1/Wq train))))))
+    (is (= #{:layers.0.Wq :layers.1.Wq} (set (keys train))))
+    (is (= [1.0] (vec (:layers.0.Wq train))))
+    (is (= [2.0] (vec (:layers.1.Wq train))))))
 
 (deftest adam-update-via-trainable-leaves-skips-frozen
   (let [spec  '(HMap :mandatory {:W  (Param (Array double))

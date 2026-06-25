@@ -14,7 +14,8 @@
   - Extensible: new form types can be added via defmethod"
   (:require [clojure.string :as str]
             [raster.compiler.core.types :as types]
-            [raster.compiler.core.inference :as inf]))
+            [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.macroexpand :as mex]))
 
 (defn- warn-boxed-dispatch?
   "Check if *warn-on-boxed-dispatch* is bound and true."
@@ -1277,5 +1278,15 @@
   [form {:keys [type-env source-ns tc-binding-tags]}]
   (let [ctx (make-ctx {:type-env (or type-env {})
                        :source-ns (or source-ns *ns*)
-                       :tc-binding-tags tc-binding-tags})]
-    (walk form ctx)))
+                       :tc-binding-tags tc-binding-tags})
+        walked (walk form ctx)]
+    ;; Close the core: after type-directed walking (typed macros already expanded
+    ;; to SOAC primitives), macroexpand the remaining macro zoo
+    ;; (when/and/or/cond/-> + let/loop/case/fn/user-macros) to let*/loop*/fn*/if/
+    ;; do/case*, preserving SOAC primitives + dotimes + ftm + interop. This is the
+    ;; SINGLE canonical point that guarantees every walked body — lazy-JIT,
+    ;; compile-aot, specialize, ftm, defn*, AD — is a finite, scope-tractable IR.
+    ;; *ns* bound to source-ns so user macros resolve.
+    (binding [*ns* (or (when source-ns (try (the-ns source-ns) (catch Throwable _ nil)))
+                       *ns*)]
+      (mex/macroexpand-core walked))))

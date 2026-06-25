@@ -350,6 +350,21 @@
         (= head 'var)
         form
 
+        ;; Any remaining binder form (par/* , letfn*, reify*) — PE outer exprs with
+        ;; the full env, but PE each scope's inits/body with the scope's binders
+        ;; REMOVED from const-env. Otherwise an outer constant captures a
+        ;; scope-local binder (e.g. a par loop index i: const-env {i 99} would
+        ;; rewrite the loop body's i to 99 — silent miscompile).
+        (form/scope-info form)
+        (let [{:keys [scopes outer rebuild]} (form/scope-info form)]
+          (rebuild (mapv (fn [{:keys [binders inits body]}]
+                           (let [env' (apply dissoc const-env (filter symbol? binders))]
+                             {:binders binders
+                              :inits (mapv #(pe-pass % env') inits)
+                              :body  (mapv #(pe-pass % env') body)}))
+                         scopes)
+                   (mapv #(pe-pass % const-env) outer)))
+
         ;; General call — PE args, then try constant folding
         :else
         (let [pe-children (map #(pe-pass % const-env) form)

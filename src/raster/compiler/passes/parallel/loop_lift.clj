@@ -194,7 +194,7 @@
   [form]
   (when (seq? form)
     (cond
-      (= 'loop (first form))
+      (contains? #{'loop 'loop*} (first form))
       (when-let [{:keys [acc-sym acc-init index-sym then-branch else-expr update-expr bound-expr]} (patterns/match-reduce-loop form)]
         (when (and
                ;; (1) no dropped effects: the consequent is a DIRECT recur, not a
@@ -241,7 +241,7 @@
   [form]
   (when (seq? form)
     (cond
-      (= 'loop (first form))
+      (contains? #{'loop 'loop*} (first form))
       (when-let [{:keys [out-sym else-expr acc-sym acc-init index-sym bound-expr cast-fn acc-next-expr]} (patterns/match-scan-loop form)]
         (when (= out-sym else-expr)
           {:out else-expr

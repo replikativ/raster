@@ -19,6 +19,7 @@
              :refer [def-dialect def-derived valid? validate]]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.core.util :as util]
             [clojure.set :as set]))
 
 ;; ================================================================
@@ -38,16 +39,16 @@
         ?num ?sym ?kw ?str ?bool
         nil
 
-    ;; Let binding (the main structural form)
+    ;; Let binding (the main structural form). CLOSED CORE: only let* — the
+    ;; macro `let` is eliminated by walk-body's macroexpand-core and rejected by
+    ;; invariant I4 (raster.compiler.ir.invariants/non-closed-core).
         (let* [(?:* ?sym ?e)] ?e:body)
-        (let  [(?:* ?sym ?e)] ?e:body)
 
     ;; Control flow
         (if ?e:test ?e:then ?e:else)
         (do (?:+ e))
 
-    ;; Loops
-        (loop [(?:* ?sym ?e)] ?e:body)
+    ;; Loops — closed core: only loop* (macro `loop` rejected by I4)
         (loop* [(?:* ?sym ?e)] ?e:body)
         (recur (?:+ e))
         (dotimes [?sym ?e:bound] ?e:body)
@@ -73,9 +74,11 @@
         (clojure.core/long-array ?e)
         (clojure.core/int-array ?e)
 
-    ;; Parallel forms
-        (broadcast ?e:fn ?e:n)
-        (reduce! ?e:fn ?e:init ?e:coll)
+    ;; Parallel SOAC primitives (raster.par/*) and other calls are accepted by
+    ;; the catch-all below; their internal scope structure is checked via
+    ;; ir/par.par-scope-info, not enumerated here. (The former `broadcast` and
+    ;; `reduce!` patterns were stale: broadcast is a typed macro the walker
+    ;; lowers to raster.par/map at walk time, and reduce! is not an IR form.)
 
     ;; Java interop
         (new ?sym (?:* e))
@@ -125,7 +128,6 @@
         (let* [(?:* ?sym ?e)] ?e:body)
         (if ?e:test ?e:then ?e:else)
         (do (?:+ e))
-        (loop [(?:* ?sym ?e)] ?e:body)
         (loop* [(?:* ?sym ?e)] ?e:body)
         (recur (?:+ e))
         (dotimes [?sym ?e:bound] ?e:body)
@@ -171,10 +173,7 @@
 
 (def-derived Flattened Walked
   (Expr [e]
-    ;; Remove parallel forms (expanded before AD)
-        - (broadcast ?e:fn ?e:n)
-        - (reduce! ?e:fn ?e:init ?e:coll)
-
+    ;; (broadcast/reduce! were already removed from the Walked parent.)
     ;; Add AD-qualified ops that survive flattening
         + (raster.numeric/+ (?:* e))
         + (raster.numeric/- (?:* e))
@@ -345,93 +344,12 @@
 ;; Use-before-def validation for let* binding ordering
 ;; ================================================================
 
-(defn- collect-free-syms
-  "Collect free (unbound) symbols from an S-expression.
-  Handles let*, loop*, fn*, if, do, quote, try/catch, .invk, dotimes."
-  [expr bound]
-  (cond
-    (symbol? expr) (if (or (contains? bound expr)
-                           (namespace expr))    ;; qualified syms are resolved externally
-                     #{}
-                     #{expr})
-    (not (sequential? expr)) #{}
-    :else
-    (let [head (first expr)]
-      (cond
-        (#{'let 'let*} head)
-        (let [pairs (partition 2 (second expr))
-              [init-fvs new-bound]
-              (reduce (fn [[fvs b] [sym init]]
-                        [(set/union fvs (collect-free-syms init b)) (conj b sym)])
-                      [#{} bound] pairs)]
-          (reduce set/union init-fvs
-                  (map #(collect-free-syms % new-bound) (nnext expr))))
-
-        ;; loop/loop*: init expressions are sequential (like let*), but ALL
-        ;; loop bindings are in scope for the body (and recur).
-        (#{'loop 'loop*} head)
-        (let [pairs (partition 2 (second expr))
-              ;; Init expressions: sequential scoping (like let*)
-              [init-fvs new-bound]
-              (reduce (fn [[fvs b] [sym init]]
-                        [(set/union fvs (collect-free-syms init b)) (conj b sym)])
-                      [#{} bound] pairs)]
-          ;; Body: all loop vars in scope
-          (reduce set/union init-fvs
-                  (map #(collect-free-syms % new-bound) (nnext expr))))
-
-        (#{'fn 'fn*} head)
-        (let [arities (if (vector? (second expr)) (list (rest expr)) (rest expr))]
-          (reduce set/union #{}
-                  (map (fn [arity]
-                         (let [params (first arity)
-                               param-set (if (vector? params) (set params) #{})]
-                           (reduce set/union #{}
-                                   (map #(collect-free-syms % (set/union bound param-set))
-                                        (rest arity)))))
-                       arities)))
-
-        (= head 'if) (let [[_ t th el] expr]
-                       (set/union (collect-free-syms t bound)
-                                  (collect-free-syms th bound)
-                                  (if el (collect-free-syms el bound) #{})))
-        (= head 'do) (reduce set/union #{} (map #(collect-free-syms % bound) (rest expr)))
-        (= head 'quote) #{}
-        (= head 'dotimes)
-        (let [[_ [sym bound-expr] & body] expr]
-          (set/union (collect-free-syms bound-expr bound)
-                     (reduce set/union #{}
-                             (map #(collect-free-syms % (conj bound sym)) body))))
-        (#{'new 'throw 'recur} head)
-        (reduce set/union #{} (map #(collect-free-syms % bound) (rest expr)))
-        (= head '.invk) (reduce set/union #{} (map #(collect-free-syms % bound) (rest expr)))
-        (= head '.) (let [[_ target _method & args] expr]
-                      (set/union (collect-free-syms target bound)
-                                 (reduce set/union #{} (map #(collect-free-syms % bound) args))))
-        (= head 'try)
-        (reduce set/union #{}
-                (map (fn [c]
-                       (if (and (sequential? c) (= 'catch (first c)))
-                         (let [[_ _cls sym & body] c]
-                           (reduce set/union #{} (map #(collect-free-syms % (conj bound sym)) body)))
-                         (collect-free-syms c bound)))
-                     (rest expr)))
-        ;; par forms — use par-scope-info for scope-aware handling
-        (and (symbol? head)
-             (some? (namespace head))
-             (.startsWith ^String (namespace head) "raster.par"))
-        (if-let [{:keys [scoped-syms inner-exprs outer-exprs]} (par/par-scope-info expr)]
-          (let [scoped-set (set (filter symbol? scoped-syms))
-                body-bound (set/union bound scoped-set)
-                outer-frees (reduce set/union #{}
-                                    (map #(collect-free-syms % bound) outer-exprs))
-                inner-frees (reduce set/union #{}
-                                    (map #(collect-free-syms % body-bound) inner-exprs))]
-            (set/union outer-frees inner-frees))
-          ;; No scope info (scatter!, rng-fill!, etc.) — recurse into all args
-          (reduce set/union #{} (map #(collect-free-syms % bound) (rest expr))))
-
-        :else (reduce set/union #{} (map #(collect-free-syms % bound) expr))))))
+;; Free-variable collection for forward-ref validation uses the unified,
+;; scope-aware `util/free-syms` (single source of binder knowledge — handles
+;; every closed-core binder incl. letfn*/reify*, treats quote opaque). The
+;; former private `collect-free-syms` was a divergent duplicate with different
+;; leaf semantics (qualified-only exclusion); it could not change forward-ref
+;; results on valid IR — binding names are gensym locals, never core vars.
 
 (defn find-forward-refs
   "Find forward references in a let* form: bindings whose init expressions
@@ -449,7 +367,7 @@
               result
               (let [[sym init] (nth pairs i)
                     ;; Collect free syms in init (respecting inner scopes)
-                    free (collect-free-syms init bound)
+                    free (util/free-syms init bound)
                     ;; Find any that are defined later in this let*
                     forward (filter (fn [s]
                                       (let [pos (get sym-positions s)]

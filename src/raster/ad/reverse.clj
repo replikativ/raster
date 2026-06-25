@@ -29,6 +29,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.core.util :as util]
             [raster.core :as rcore]
             [raster.arrays :as arrays]))
 
@@ -266,7 +267,8 @@
                           (boolean (some #(get @sym-activity % false) free)))
 
                         ;; Loop: active if any init or body references active symbols
-                        (= 'loop head)
+                        ;; (walked body is closed-core: loop -> loop*)
+                        (contains? #{'loop 'loop*} head)
                         (let [[_ bindings-vec & body-forms] init-expr
                               pairs (partition 2 bindings-vec)
                               loop-vars (set (map first pairs))
@@ -358,7 +360,8 @@
                           :source init-expr})
 
                   ;; Loop: cannot differentiate through raw loop/recur
-                  (and (seq? init-expr) (= 'loop (first init-expr)))
+                  ;; (walked body is closed-core: loop -> loop*)
+                  (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr)))
                   (throw (ex-info
                           (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
                                "Use `par/reduce` for differentiable reductions, or wrap "
@@ -773,7 +776,7 @@
                                                  [sym (:init-sym entry)])
                                                [sym init]))
                                            raw-bindings))
-            new-loop-form (list* 'loop new-loop-bindings (drop 2 loop-form))]
+            new-loop-form (list* 'loop* new-loop-bindings (drop 2 loop-form))]
         (gen-reverse-loop-with-let let-bindings new-loop-form active-params))
       (gen-reverse-loop* loop-form active-params))))
 
@@ -878,7 +881,7 @@
         ;; OUTER scope so both forward and backward code can reference it
         ;; without shadowing — the inline alpha-rename sees one binding.
         forward-loop-form
-        (cons 'loop (cons loop-init-bindings (list fwd-loop-body)))
+        (cons 'loop* (cons loop-init-bindings (list fwd-loop-body)))
 
         ;; === Backward loop ===
         ;; Maintains per-loop-var adjoints (d_lv_i) and per-param adjoints (d_p_k).
@@ -1039,7 +1042,7 @@
         ;; Backward loop returns all adjoints: [d_lv_0..N-1 d_p_0..M-1]
         backward-return (vec (concat d-lv-syms d-param-syms))
 
-        backward-loop (list 'loop backward-init
+        backward-loop (list 'loop* backward-init
                             (list 'if backward-test
                                   backward-body
                                   backward-return))
@@ -1521,7 +1524,7 @@
         bwd-return (vec (concat d-read-arr-syms d-scalar-syms))
 
         backward-loop
-        (list 'loop bwd-loop-init
+        (list 'loop* bwd-loop-init
               (list 'if (list 'clojure.core/>= j-sym 0)
                     bwd-loop-body
                     bwd-return))
@@ -1844,7 +1847,7 @@
           (let [pair-arr-sym (ad-gensym "pair")]
             (list 'let* [tape-sym (list 'object-array bound-expr)
                          reduce-result-sym
-                         (list 'loop [fwd-idx-sym 0 acc-sym init-expr]
+                         (list 'loop* [fwd-idx-sym 0 acc-sym init-expr]
                                (list 'if (list 'clojure.core/< fwd-idx-sym bound-expr)
                                      (list 'recur (list 'clojure.core/+ fwd-idx-sym 1) fwd-loop-body)
                                      acc-sym))
@@ -1938,7 +1941,7 @@
 
         backward-loop
         (list 'let* [n-bwd-sym bound-expr]
-              (list 'loop bwd-loop-init
+              (list 'loop* bwd-loop-init
                     (list 'if (list 'clojure.core/>= j-sym 0)
                           bwd-loop-body
                           bwd-return)))
@@ -2131,9 +2134,9 @@
               tags (or (:raster.core/deftm-tags m)
                        (vec (repeat (count params) 'double)))
               diff-active-params (vec (keep-indexed
-                                        (fn [i p]
-                                          (when (differentiable-tag? (nth tags i nil)) p))
-                                        all-params))
+                                       (fn [i p]
+                                         (when (differentiable-tag? (nth tags i nil)) p))
+                                       all-params))
               transformed (transform-body (first walked-body) diff-active-params)
               ;; transformed is (let* bindings [primal pullback-fn])
               ;; The pullback returns gradients for diff-active-params only;
@@ -2658,69 +2661,12 @@
 
     :else form))
 
-(defn- alpha-convert
-  "Alpha-conversion: return `form` with every let/let*/loop/dotimes/fn*-bound
-  variable renamed to a fresh gensym, references updated, nested scopes respected
-  (a bound var removed from the env inside its own scope so outer renames don't
-  leak in). This is the missing dual of the capture-avoiding subst-syms (which
-  *preserves* bindings): we use it to make a form's local names unique before it
-  is spliced alongside structurally identical siblings (unrolled fold iterations)."
-  ([form] (alpha-convert {} form))
-  ([env form]
-   (cond
-     (symbol? form) (get env form form)
-
-     (seq? form)
-     (let [head (first form)]
-       (cond
-         (= 'quote head) form
-
-         (contains? #{'let 'let*} head)
-         (let [[_ binds & body] form
-               [new-binds env'] (reduce (fn [[bs e] [v init]]
-                                          (let [init' (alpha-convert e init)
-                                                g (gensym (str (name v) "_"))]
-                                            [(conj bs g init') (assoc e v g)]))
-                                        [[] env] (partition 2 binds))]
-           (apply list head new-binds (map (partial alpha-convert env') body)))
-
-         (contains? #{'loop 'loop*} head)
-         (let [[_ binds & body] form
-               pairs (partition 2 binds)
-               inits (mapv (fn [[_ init]] (alpha-convert env init)) pairs)
-               [vars env'] (reduce (fn [[vs e] [v _]]
-                                     (let [g (gensym (str (name v) "_"))]
-                                       [(conj vs g) (assoc e v g)]))
-                                   [[] env] pairs)]
-           (apply list head (vec (interleave vars inits))
-                  (map (partial alpha-convert env') body)))
-
-         (= 'dotimes head)
-         (let [[_ [v bound] & body] form
-               g (gensym (str (name v) "_"))
-               env' (assoc env v g)]
-           (apply list head [g (alpha-convert env bound)]
-                  (map (partial alpha-convert env') body)))
-
-         (contains? #{'fn 'fn*} head)
-         ;; (fn* name? [params] body...) | (fn* name? ([params] body...)+)
-         (let [parts (rest form)
-               [nm parts] (if (symbol? (first parts)) [[(first parts)] (rest parts)] [[] parts])
-               arities (if (vector? (first parts)) (list parts) parts)
-               conv-arity (fn [[params & body]]
-                            (let [[ps env'] (reduce (fn [[ps e] p]
-                                                      (if (= '& p) [(conj ps p) e]
-                                                          (let [g (gensym (str (name p) "_"))]
-                                                            [(conj ps g) (assoc e p g)])))
-                                                    [[] env] params)]
-                              (apply list ps (map (partial alpha-convert env') body))))]
-           (apply list head (concat nm (map conv-arity arities))))
-
-         :else (apply list (map (partial alpha-convert env) form))))
-
-     (vector? form) (mapv (partial alpha-convert env) form)
-     (map? form) (into (empty form) (map (fn [[k v]] [(alpha-convert env k) (alpha-convert env v)]) form))
-     :else form)))
+;; alpha-conversion (hygienic rename of every bound var before splicing a form
+;; alongside structurally identical siblings — unrolled fold iterations) is the
+;; unified `util/alpha-convert`, generic over form/scope-info. Unlike the former
+;; private copy (let*/loop*/dotimes/fn* only), it ALSO freshens binders nested in
+;; par/ftm/letfn*/reify*/catch bodies — closing the sibling-conflation hole the
+;; old version silently passed through.
 
 (defn- hoist-nested-lets
   "Hoist let expressions out of call arguments into a wrapping let*.
@@ -2748,7 +2694,7 @@
                         ;; unrolled fold iterations, which reuse the same local
                         ;; names) collide and the reverse AD conflates them —
                         ;; wrong gradients.
-                        (let [[_ inner-binds & inner-body] (alpha-convert he)]
+                        (let [[_ inner-binds & inner-body] (util/alpha-convert he)]
                           (-> acc (into (vec inner-binds)) (conj sym (last inner-body))))
                         (conj acc sym he))))
                   []
@@ -2828,19 +2774,18 @@
                 (let [;; The loop's "value" gets bound to loop-sym, then
                       ;; post-pairs and body run with that binding visible.
                       cont-bindings (vec (concat
-                                           [loop-sym result-branch]
-                                           (mapcat identity post-pairs)))
+                                          [loop-sym result-branch]
+                                          (mapcat identity post-pairs)))
                       cont (apply list 'let* cont-bindings body-exprs)
                       new-loop-body (if recur-in-then?
                                       (list 'if test-expr recur-branch cont)
                                       (list 'if test-expr cont recur-branch))
-                      new-loop-form (apply list 'loop loop-bindings [new-loop-body])]
+                      new-loop-form (apply list 'loop* loop-bindings [new-loop-body])]
                   (if (seq pre-pairs)
                     (apply list let-sym
                            (vec (mapcat identity pre-pairs))
                            [new-loop-form])
                     new-loop-form))))))))))
-
 
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
@@ -2856,22 +2801,22 @@
                         (throw (ex-info "No walked body on var" {:var f-var})))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
         all-params (vec (map-indexed
-                          (fn [i p]
-                            (let [tag (nth tags i nil)
-                                  base (if (symbol? p) p (symbol (name p)))]
-                              (if tag
-                                (with-meta base {:raster.type/tag tag})
-                                (with-meta base nil))))
-                          params))
+                         (fn [i p]
+                           (let [tag (nth tags i nil)
+                                 base (if (symbol? p) p (symbol (name p)))]
+                             (if tag
+                               (with-meta base {:raster.type/tag tag})
+                               (with-meta base nil))))
+                         params))
         ;; Only differentiable-tag params seed activity analysis. Non-diff
         ;; params (Long/longs scalars, indices, etc.) are constants for AD —
         ;; expressions involving only them stay inactive and don't need AD
         ;; rules. Their grad slots are still emitted in the output vector
         ;; (via all-params) so positional consumers don't shift.
         diff-active-params (vec (keep-indexed
-                                  (fn [i p]
-                                    (when (differentiable-tag? (nth tags i nil)) p))
-                                  all-params))
+                                 (fn [i p]
+                                   (when (differentiable-tag? (nth tags i nil)) p))
+                                 all-params))
         source-ns (or (:ns m) *ns*)
         ;; Infer dtype from parameter tags for correct AD seed type
         dtype (if (some #{'floats 'float} tags) :float :double)

@@ -40,7 +40,8 @@
                        (when (and (symbol? last-expr) (contains? env last-expr))
                          (get env last-expr)))
 
-                     (and (seq? expr) (#{'clojure.core/let 'let} (first expr)))
+                     ;; nested binding form (closed-core: let -> let*)
+                     (and (seq? expr) (#{'clojure.core/let 'let 'let*} (first expr)))
                      (let [body (last expr)]
                        (when (and (symbol? body) (contains? env body))
                          (get env body)))

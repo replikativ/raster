@@ -459,7 +459,7 @@
                               val)]
                 ;; Detect loop RHS in GLSL (needs statement hoisting)
                (if (and (not (supports-stmt-expr?))
-                        (seq? val-subst) (= 'loop (first val-subst)))
+                        (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst)))
                   ;; Hoist loop: emit as statements, alias sym → first loop var
                  (let [loop-var (first (take-nth 2 (second val-subst)))
                        loop-c-name (c-symbol loop-var)
@@ -501,7 +501,7 @@
            body-stmts " }"))
 
     ;; loop in statement context -> while loop (no ({ }) wrapper)
-    (and (seq? expr) (= 'loop (first expr)))
+    (and (seq? expr) (contains? #{'loop 'loop*} (first expr)))
     (let [[_ bindings & body] expr
           pairs (partition 2 bindings)
           var-names (map first pairs)
@@ -851,7 +851,7 @@
          (str "/* when */ 0")))
 
      ;; loop/recur -> while loop
-     (and (seq? expr) (= 'loop (first expr)))
+     (and (seq? expr) (contains? #{'loop 'loop*} (first expr)))
      (let [[_ bindings & body] expr
            pairs (partition 2 bindings)
            var-names (map first pairs)
@@ -1268,7 +1268,8 @@
                   (not (contains? #{'aget 'aset 'alength 'let 'let* 'do
                                     'clojure.core/aget 'clojure.core/aset
                                     'clojure.core/alength
-                                    'if 'when 'cond 'case 'loop 'recur
+                                    'if 'when 'cond 'case 'case* 'loop 'loop* 'recur
+                                    'fn 'fn* 'quote 'new 'throw 'try
                                     'double 'float 'long 'int
                                     'Math/sin 'Math/cos 'Math/exp 'Math/log
                                     'Math/sqrt 'Math/abs 'Math/pow 'Math/max
