@@ -1042,156 +1042,37 @@
   pullback returns adjoints for those values, which then chain
   backward through the let bindings."
   [let-bindings loop-form active-params]
-  (let [;; ANF-normalize the let bindings
-        anf-bindings (anf-normalize-bindings let-bindings)
-        ;; Track which let-bound symbols are active
-        sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
-        fwd-bindings (atom [])
-        records (atom [])
-
-        _ (doseq [[sym init-expr] (partition 2 anf-bindings)]
-            (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
-            (let [init-active?
-                  (cond
-                    (trivial-expr? init-expr)
-                    (if (symbol? init-expr)
-                      (get @sym-activity init-expr false)
-                      false)
-                    (seq? init-expr)
-                    (let [head (first init-expr)]
-                      (cond
-                        (comparison-op? head) false
-                        :else
-                        (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
-                          (boolean
-                           (some #(and (symbol? %) (get @sym-activity % false))
-                                 args)))))
-                    :else false)]
-              (swap! sym-activity assoc sym init-active?)
-              (when init-active?
-                (cond
-                  (symbol? init-expr)
-                  (swap! records conj {:type :alias :sym sym :source init-expr})
-                  (seq? init-expr)
-                  (let [head (first init-expr)
-                        [op args] (if (= '.invk head)
-                                    [(second init-expr) (vec (nnext init-expr))]
-                                    [head (vec (rest init-expr))])
-                        resolved (or (tmpl/resolve-template op)
-                                     (auto-make-deftm-rule op))]
-                    (when resolved
-                      (let [[_ base-op] resolved]
-                        (swap! records conj
-                               {:type :call :sym sym :base-op base-op
-                                :args args
-                                :active-args (set (filter #(and (symbol? %)
-                                                                (get @sym-activity % false))
-                                                          args))}))))))))
-
-        ;; All symbols that are active after let bindings
-        ;; These are available to the loop
-        let-active-syms (filterv #(get @sym-activity % false)
-                                 (map first (partition 2 anf-bindings)))
-
-        ;; Extended active params for the loop: original params + active let bindings
+  (let [anf-bindings (anf-normalize-bindings let-bindings)
+        ;; PURE forward pass — now handles par/dotimes/if (the capability the old
+        ;; hand-rolled copy lacked). This is what lets an array-valued INTERMEDIATE
+        ;; produced in the let-prefix (e.g. a broadcast) and consumed by the loop
+        ;; differentiate: its par/map! backward is now generated here.
+        {:keys [activity fwd-bindings records]} (forward-pass anf-bindings active-params)
+        let-active-syms (filterv #(get activity % false) (map first (partition 2 anf-bindings)))
+        ;; Extended active set the loop sees: original params + active let-syms.
         loop-active (vec (distinct (concat active-params let-active-syms)))
-
-        ;; Transform the loop with extended active params
         loop-transform (gen-reverse-loop loop-form loop-active)
-        ;; loop-transform returns [loop-result, pullback-fn]
-        ;; where pullback returns adjoints for loop-active
-
-        ;; Now we need to chain: loop pullback gives us adjoints for
-        ;; let-bound symbols; we reverse through let bindings to get
-        ;; adjoints for the original active-params
-
-        ;; Generate reverse pass for let bindings
         dy-sym 'dy__rad
         loop-vpb-sym (ad-gensym "lvpb")
         loop-val-sym (ad-gensym "lval")
-        loop-pb-sym (ad-gensym "lpb")
+        loop-pb-sym  (ad-gensym "lpb")
         loop-grads-sym (ad-gensym "lgrads")
-
-        ;; After calling loop pullback, we have adjoints for loop-active
-        ;; Map them to adj-env for reverse pass through let bindings
-        adj-env (atom {})
-        _ (doseq [[i sym] (map-indexed vector loop-active)]
-            (swap! adj-env assoc sym [(list 'nth loop-grads-sym i)]))
-
-        rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
-        _ (doseq [record (reverse @records)]
-            (let [{:keys [type sym]} record
-                  adj-contribs (get @adj-env sym)
-                  adj-sym (ad-gensym (str "d_" (name sym))
-                                     (:raster.type/tag (meta sym)))
-                  adj-expr (cond
-                             (nil? adj-contribs) nil
-                             (= 1 (count adj-contribs)) (first adj-contribs)
-                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                           adj-contribs))]
-              (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
-              (when adj-contribs
-                (case type
-                  :call
-                  (let [{:keys [base-op args active-args]} record
-                        [template _] (tmpl/resolve-template base-op)
-                        has-template? (and template
-                                           (or (:grads template) (:grads-fn template)))]
-                    (if has-template?
-                      ;; Template path: use ctx-aware instantiation for flat bindings
-                      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
-                                                 template args sym adj-sym @rev-ctx)]
-                        (reset! rev-ctx new-ctx)
-                        (doseq [[i grad-sym] (map-indexed vector grad-syms)]
-                          (when (and (some? grad-sym)  ;; nil = no gradient for this arg
-                                     (< i (count args))
-                                     (symbol? (nth args i))
-                                     (contains? active-args (nth args i)))
-                            (swap! adj-env update (nth args i)
-                                   (fnil conj []) grad-sym))))
-                      ;; Closure fallback
-                      (let [pb-r (ad-gensym "pb")
-                            gr-r (ad-gensym "grads")]
-                        (swap! rev-ctx #(update % :bindings into
-                                                [pb-r (list* (list 'raster.ad.templates/get-pullback-factory
-                                                                   (list 'quote base-op))
-                                                             sym args)
-                                                 gr-r (list pb-r adj-sym)]))
-                        (doseq [[i arg] (map-indexed vector args)]
-                          (when (and (symbol? arg) (contains? active-args arg))
-                            (swap! adj-env update arg
-                                   (fnil conj []) (list 'nth gr-r i)))))))
-                  :alias
-                  (let [{:keys [source]} record]
-                    (when (get @sym-activity source false)
-                      (swap! adj-env update source (fnil conj []) adj-sym)))
-                  nil))))
-
-        ;; Collect param adjoints
-        param-adj-syms (atom [])
-        _ (doseq [p active-params
-                  :let [contribs (get @adj-env p)
-                        adj-sym (ad-gensym (str "d_" (name p))
-                                           (:raster.type/tag (meta p)))
-                        adj-expr (cond
-                                   (nil? contribs) 0.0
-                                   (= 1 (count contribs)) (first contribs)
-                                   :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                                 contribs))]]
-            (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
-            (swap! param-adj-syms conj adj-sym))]
-
-    ;; Assemble: let bindings (forward) + loop + pullback composition
-    (list 'let* (vec (concat @fwd-bindings
+        ;; Seed the let-prefix reverse pass with the loop pullback's adjoints
+        ;; (bound at pullback-call time as `loop-grads-sym`).
+        seed-adj-env (into {} (map-indexed (fn [i s] [s [(list 'nth loop-grads-sym i)]])
+                                           loop-active))
+        {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
+        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
+    ;; Assemble: forward let-prefix + loop + composed pullback.
+    (list 'let* (vec (concat fwd-bindings
                              [loop-vpb-sym loop-transform
                               loop-val-sym (list 'nth loop-vpb-sym 0)
-                              loop-pb-sym (list 'nth loop-vpb-sym 1)]))
+                              loop-pb-sym  (list 'nth loop-vpb-sym 1)]))
           (vector loop-val-sym
                   (list 'fn* [dy-sym]
-                        (list 'let* (vec (concat
-                                          [loop-grads-sym (list loop-pb-sym dy-sym)]
-                                          (:bindings @rev-ctx)))
-                              (vec @param-adj-syms)))))))
+                        (list 'let* (vec (concat [loop-grads-sym (list loop-pb-sym dy-sym)]
+                                                 (:bindings rev-ctx)))
+                              (vec param-adj-syms)))))))
 
 ;; ================================================================
 ;; Dotimes reverse-mode AD (array mutation patterns)
