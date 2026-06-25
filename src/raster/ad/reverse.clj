@@ -359,265 +359,222 @@
          {:type :call :sym sym :base-op base-op :args args :arg-tags arg-tags
           :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))
 
+;; ================================================================
+;; The reverse-AD binding ENGINE — pure, no mutable state.
+;; Three phases, each a `reduce` threading an immutable accumulator:
+;;   forward-pass : bindings  -> {:activity :fwd-bindings :records}
+;;   reverse-pass : records   -> {:adj-env :rev-ctx}      (emit-backward per record)
+;;   collect-param-adjoints   -> {:rev-ctx :param-adj-syms}
+;; gen-reverse-let / gen-reverse-loop-with-let / reify-pullback all call
+;; `process-bindings`; only their final output ASSEMBLY differs.
+;; ================================================================
+
+(defn- sum-contribs
+  "Combine a seq of adjoint contribution exprs: empty → `default`, one → itself,
+  many → folded with grad-acc."
+  [contribs default]
+  (cond (empty? contribs)      default
+        (= 1 (count contribs)) (first contribs)
+        :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b)) contribs)))
+
+(defn- forward-pass
+  "Phase 1 (pure): thread {:activity :fwd-bindings :records} across the bindings."
+  [norm-bindings active-params]
+  (reduce
+   (fn [{:keys [activity fwd-bindings records]} [sym init-expr]]
+     (let [active?  (init-active? init-expr activity)
+           activity (assoc activity sym active?)
+           fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
+           {:keys [record fwd-patch]} (ad-record (ad-form-kind init-expr active?)
+                                                 sym init-expr activity)]
+       {:activity activity
+        :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
+        :records (if record (conj records record) records)}))
+   {:activity (into {} (map (fn [p] [p true]) active-params))
+    :fwd-bindings [] :records []}
+   (partition 2 norm-bindings)))
+
+(defn- array-zero-of-shape
+  "Form for a zero adjoint array shaped like `arr-sym` (doubles/floats), else 0.0."
+  [arr-sym]
+  (case (:raster.type/tag (meta arr-sym))
+    doubles (list 'double-array (list 'raster.arrays/alength arr-sym))
+    floats  (list 'float-array  (list 'raster.arrays/alength arr-sym))
+    0.0))
+
+(defn- wire-read-adjoints
+  "Append the per-read-array and per-scalar gradient syms into adj-env (the SOAC
+  backward shadow arrays / reduce accumulators flow back to their source syms)."
+  [adj-env read-arrs d-read-arr-syms active-free d-scalar-syms]
+  (as-> adj-env ae
+    (reduce (fn [ae [arr d]] (update ae arr (fnil conj []) d)) ae (map vector read-arrs d-read-arr-syms))
+    (reduce (fn [ae [p d]]   (update ae p   (fnil conj []) d)) ae (map vector active-free d-scalar-syms))))
+
+(defn- bindings-into
+  "Append a flat [sym init ...] vector onto a rev-ctx's :bindings (pure)."
+  [rev-ctx kvs]
+  (update rev-ctx :bindings into kvs))
+
+(defmulti ^:private emit-backward
+  "Reverse-pass per-record emission (PURE): returns the updated
+  {:adj-env :rev-ctx}. `adj-sym` is this record's gensym'd adjoint (nil for the
+  array SOACs, which carry their own d_out/d_acc syms in the record)."
+  (fn [record _adj-sym _activity _state] (:type record)))
+
+(defmethod emit-backward :call
+  [{:keys [sym base-op args active-args]} adj-sym _activity {:keys [adj-env rev-ctx]}]
+  (let [[template _] (tmpl/resolve-template base-op)
+        has-template? (and template (or (:grads template) (:grads-fn template)))]
+    (if has-template?
+      ;; Template path: ctx-aware instantiation (already pure — returns new ctx).
+      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx template args sym adj-sym rev-ctx)]
+        {:rev-ctx new-ctx
+         :adj-env (reduce (fn [ae [i grad-sym]]
+                            (if (and (some? grad-sym) (< i (count args))
+                                     (symbol? (nth args i)) (contains? active-args (nth args i)))
+                              (update ae (nth args i) (fnil conj []) grad-sym)
+                              ae))
+                          adj-env (map-indexed vector grad-syms))})
+      ;; Closure fallback — nil pullback entries propagate as nil.
+      (let [pb-sym (ad-gensym "pb") grads-sym (ad-gensym "grads")]
+        {:rev-ctx (bindings-into rev-ctx
+                                 [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
+                                                      (list 'quote base-op)) sym args)
+                                  grads-sym (list pb-sym adj-sym)])
+         :adj-env (reduce (fn [ae [i arg]]
+                            (if (and (symbol? arg) (contains? active-args arg))
+                              (update ae arg (fnil conj []) (list 'nth grads-sym i))
+                              ae))
+                          adj-env (map-indexed vector args))}))))
+
+(defmethod emit-backward :if
+  [{:keys [sym branch then else]} adj-sym activity {:keys [adj-env rev-ctx]}]
+  ;; Route the adjoint to the taken branch; the other branch gets a SHAPE-matched
+  ;; zero (a scalar 0.0 where an array is expected crashes array-add-backward).
+  (let [zero (array-zero-of-shape sym)
+        adj-env (cond-> adj-env
+                  (and (symbol? then) (get activity then false))
+                  (update then (fnil conj []) (list 'if branch adj-sym zero))
+                  (and else (symbol? else) (get activity else false))
+                  (update else (fnil conj []) (list 'if branch zero adj-sym)))]
+    {:adj-env adj-env :rev-ctx rev-ctx}))
+
+(defmethod emit-backward :alias
+  [{:keys [source]} adj-sym activity {:keys [adj-env rev-ctx]}]
+  {:adj-env (cond-> adj-env
+              (get activity source false) (update source (fnil conj []) adj-sym))
+   :rev-ctx rev-ctx})
+
+(defmethod emit-backward :par-map
+  [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms active-free
+           shadow-allocs backward-maps backward-reduces d-out-sym]}
+   _adj-sym _activity {:keys [adj-env rev-ctx]}]
+  (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+        ;; d_out = adjoint of the result array (consumer contributions) or a
+        ;; shape-matched zero.
+        rev-ctx (if-let [out-arr (first written-arrs)]
+                  (bindings-into rev-ctx [d-out-sym (sum-contribs (get adj-env out-arr)
+                                                                  (array-zero-of-shape out-arr))])
+                  rev-ctx)
+        rev-ctx (reduce bindings-into rev-ctx backward-maps)
+        rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
+    {:rev-ctx rev-ctx
+     :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
+
+(defmethod emit-backward :par-reduce
+  [{:keys [sym read-arrs d-read-arr-syms d-scalar-syms active-free
+           shadow-allocs backward-maps backward-reduces d-acc-sym]}
+   _adj-sym _activity {:keys [adj-env rev-ctx]}]
+  (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+        ;; par/reduce returns a SCALAR — 0.0 default is correct for the empty case.
+        rev-ctx (bindings-into rev-ctx [d-acc-sym (sum-contribs (get adj-env sym) 0.0)])
+        rev-ctx (reduce bindings-into rev-ctx backward-maps)
+        rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
+    {:rev-ctx rev-ctx
+     :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
+
+(defmethod emit-backward :dotimes
+  [{:keys [written-arrs read-arrs active-free shadow-allocs backward-loop
+           d-out-sym n-bwd-sym bound-expr]}
+   _adj-sym _activity {:keys [adj-env rev-ctx]}]
+  (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+        rev-ctx (if-let [out-arr (first written-arrs)]
+                  (bindings-into rev-ctx [d-out-sym (sum-contribs (get adj-env out-arr)
+                                                                  (array-zero-of-shape out-arr))])
+                  rev-ctx)
+        rev-ctx (bindings-into rev-ctx [n-bwd-sym bound-expr])
+        bwd-result-sym (ad-gensym "dt_bwd")
+        rev-ctx (bindings-into rev-ctx [bwd-result-sym backward-loop])
+        ;; backward-loop returns [d_read_arr_0 ... d_scalar_0 ...]
+        n-reads (count read-arrs)
+        adj-env (reduce (fn [ae [i arr]] (update ae arr (fnil conj []) (list 'nth bwd-result-sym i)))
+                        adj-env (map-indexed vector read-arrs))
+        adj-env (reduce (fn [ae [i p]] (update ae p (fnil conj [])
+                                               (list 'nth bwd-result-sym (clojure.core/+ n-reads i))))
+                        adj-env (map-indexed vector active-free))]
+    {:adj-env adj-env :rev-ctx rev-ctx}))
+
+(defn- reverse-pass
+  "Phase 2 (pure): thread {:adj-env :rev-ctx} backward across records, seeded by
+  `seed-adj-env` (gen-reverse-let seeds {body-sym [dy]}; loop-with-let seeds the
+  loop pullback's grads)."
+  [records activity seed-adj-env]
+  (reduce
+   (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
+     (let [array-type? (contains? #{:dotimes :par-map :par-reduce} type)
+           adj-contribs (when-not array-type? (get adj-env sym))
+           adj-sym (when-not array-type?
+                     (ad-gensym (str "d_" (name sym)) (:raster.type/tag (meta sym))))
+           rev-ctx (if adj-sym
+                     (bindings-into rev-ctx [adj-sym (sum-contribs adj-contribs nil)])
+                     rev-ctx)]
+       (if (or array-type? adj-contribs)
+         (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
+         {:adj-env adj-env :rev-ctx rev-ctx})))
+   {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym)}
+   (reverse records)))
+
+(defn- collect-param-adjoints
+  "Phase 3 (pure): bind a d_<param> for each active param (shape-matched zero when
+  no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}."
+  [active-params adj-env rev-ctx]
+  (reduce
+   (fn [{:keys [rev-ctx param-adj-syms]} p]
+     (let [tag (:raster.type/tag (meta p))
+           default (case tag
+                     doubles (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
+                     floats  (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
+                     0.0)
+           adj-sym (ad-gensym (str "d_" (name p)) tag)]
+       {:rev-ctx (bindings-into rev-ctx [adj-sym (sum-contribs (get adj-env p) default)])
+        :param-adj-syms (conj param-adj-syms adj-sym)}))
+   {:rev-ctx rev-ctx :param-adj-syms []}
+   active-params))
+
+(defn- process-bindings
+  "The shared engine: run Phases 1-3 over a NORMALIZED binding vector and return
+  the raw pieces. Pure — no atoms. Wrappers assemble their own output shape.
+  opts: {:seed-adj-env <map sym->[adj-expr]>}."
+  [norm-bindings active-params {:keys [seed-adj-env]}]
+  (let [{:keys [activity fwd-bindings records]} (forward-pass norm-bindings active-params)
+        {:keys [adj-env rev-ctx]} (reverse-pass records activity seed-adj-env)
+        {:keys [rev-ctx param-adj-syms]} (collect-param-adjoints active-params adj-env rev-ctx)]
+    {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
+     :rev-ctx rev-ctx :param-adj-syms param-adj-syms}))
+
 (defn- gen-reverse-let
-  "Generate reverse-mode AD code for a let* form.
-
-  The form is first normalized (if-branches lifted, body reduced to symbol),
-  then processed in 4 phases:
-  1. Forward pass: process bindings, track activity, record ops
-  2. Reverse pass: walk ops backwards, accumulate adjoints
-  3. Collect parameter adjoints
-  4. Assemble output: [primal, pullback-fn]"
+  "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
+  assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
-  (let [;; === Phase 0: Normalize ===
-        [norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
-
-        ;; === Phase 1: Forward pass ===
-        sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
-        fwd-bindings (atom [])
-        ;; Records: [{:type :call/:if/:alias, ...} ...]
-        records (atom [])
-
-        _ (doseq [[sym init-expr] (partition 2 norm-bindings)]
-            ;; Add forward binding (qualify arithmetic for Dual compatibility)
-            (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
-
-            (let [active? (init-active? init-expr @sym-activity)]
-
-              (swap! sym-activity assoc sym active?)
-
-              ;; Record for reverse pass — one dispatch (see ad-record above)
-              (let [{:keys [record fwd-patch]}
-                    (ad-record (ad-form-kind init-expr active?) sym init-expr @sym-activity)]
-                (when fwd-patch (swap! fwd-bindings fwd-patch))
-                (when record (swap! records conj record)))))
-
-        ;; === Phase 2: Reverse pass ===
+  (let [[norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
         dy-sym 'dy__rad
-        adj-env (atom {body-sym [dy-sym]}) ;; seed: d(body) = dy
-        rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
-
-        _ (doseq [record (reverse @records)]
-            (let [{:keys [type sym]} record
-                  ;; Sum all adjoint contributions for this symbol
-                  ;; (dotimes/par-map/par-reduce handle their own adjoints — skip generic summation)
-                  array-type? (contains? #{:dotimes :par-map :par-reduce} type)
-                  adj-contribs (when-not array-type? (get @adj-env sym))
-                  ;; Gradient carries same type as forward variable
-                  adj-sym (when-not array-type?
-                            (ad-gensym (str "d_" (name sym))
-                                       (:raster.type/tag (meta sym))))
-                  adj-expr (cond
-                             (nil? adj-contribs) nil
-                             (= 1 (count adj-contribs)) (first adj-contribs)
-                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                           adj-contribs))
-                  _ (when adj-sym
-                      (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr])))]
-
-              ;; Skip pullback/template propagation when no gradient flows here
-              (when (or array-type? adj-contribs)
-                (case type
-                  ;; Function call: use rrule template or closure pullback
-                  :call
-                  (let [{:keys [base-op args active-args arg-tags]} record
-                        [template _] (tmpl/resolve-template base-op)
-                        ;; Only use template path when actual grad rules exist
-                        ;; (not closure-only entries which lack :grads/:grads-fn)
-                        has-template? (and template
-                                           (or (:grads template) (:grads-fn template)))]
-                    (if has-template?
-                      ;; Template path: use ctx-aware instantiation for flat bindings.
-                      ;; Backward calls are emitted as unmangled qualified symbols
-                      ;; (e.g. raster.nn/dense-backward-dW). Type resolution happens:
-                      ;; - AOT: walker's try-resolve-call mangles based on type-env
-                      ;; - Interpreted: runtime dispatch + parametric specialization
-                      (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
-                                                 template args sym adj-sym @rev-ctx)]
-                        (reset! rev-ctx new-ctx)
-                        (doseq [[i grad-sym] (map-indexed vector grad-syms)]
-                          (when (and (some? grad-sym)  ;; nil = no gradient for this arg
-                                     (< i (count args))
-                                     (symbol? (nth args i))
-                                     (contains? active-args (nth args i)))
-                            (swap! adj-env update (nth args i)
-                                   (fnil conj []) grad-sym))))
-                      ;; Closure fallback — nil entries from pullback propagate as nil
-                      (let [pb-sym (ad-gensym "pb")
-                            grads-sym (ad-gensym "grads")]
-                        (swap! rev-ctx #(update % :bindings into
-                                                [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
-                                                                     (list 'quote base-op))
-                                                               sym args)
-                                                 grads-sym (list pb-sym adj-sym)]))
-                        (doseq [[i arg] (map-indexed vector args)]
-                          (when (and (symbol? arg) (contains? active-args arg))
-                            (swap! adj-env update arg
-                                   (fnil conj []) (list 'nth grads-sym i)))))))
-
-                  ;; If: route adjoint conditionally to the taken branch.
-                  ;; The inactive branch needs a zero of the SAME shape as
-                  ;; adj-sym — for array adjoints, a scalar 0.0 would crash
-                  ;; downstream array-add-backward etc. with a type mismatch.
-                  :if
-                  (let [{:keys [branch then else]} record
-                        zero-of-shape
-                        (case (:raster.type/tag (meta sym))
-                          doubles (list 'double-array (list 'raster.arrays/alength adj-sym))
-                          floats  (list 'float-array  (list 'raster.arrays/alength adj-sym))
-                          ;; Scalar fallback (also covers nil tag)
-                          0.0)]
-                    (when (and (symbol? then) (get @sym-activity then false))
-                      (swap! adj-env update then
-                             (fnil conj []) (list 'if branch adj-sym zero-of-shape)))
-                    (when (and else (symbol? else) (get @sym-activity else false))
-                      (swap! adj-env update else
-                             (fnil conj []) (list 'if branch zero-of-shape adj-sym))))
-
-                  ;; Alias: pass adjoint through
-                  :alias
-                  (let [{:keys [source]} record]
-                    (when (get @sym-activity source false)
-                      (swap! adj-env update source
-                             (fnil conj []) adj-sym)))
-
-                ;; Par map: backward via par/map! for arrays, par/reduce for scalars
-                  :par-map
-                  (let [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms
-                                active-free shadow-allocs backward-maps backward-reduces
-                                tape-sym d-out-sym bound-expr]} record]
-                  ;; 1. Allocate shadow arrays for read arrays
-                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_out to the adjoint of the first written array.
-                  ;; If no contributions, the adjoint is a zero of the SAME shape
-                  ;; as the forward result — for arrays that's a zero array (a
-                  ;; scalar 0.0 here would crash downstream array-add-backward
-                  ;; et al. with a Double/Long type mismatch).
-                    (when-let [out-arr (first written-arrs)]
-                      (let [d-out-contribs (get @adj-env out-arr)
-                            zero-of-shape (case (:raster.type/tag (meta out-arr))
-                                            doubles (list 'double-array (list 'raster.arrays/alength out-arr))
-                                            floats  (list 'float-array  (list 'raster.arrays/alength out-arr))
-                                            0.0)]
-                        (swap! rev-ctx #(update % :bindings into
-                                                [d-out-sym (cond
-                                                             (and d-out-contribs (= 1 (count d-out-contribs)))
-                                                             (first d-out-contribs)
-                                                             d-out-contribs (first d-out-contribs)
-                                                             :else zero-of-shape)]))))
-                  ;; 3. Emit par/map! for array gradients
-                    (doseq [bwd-map backward-maps]
-                      (swap! rev-ctx #(update % :bindings into bwd-map)))
-                  ;; 4. Emit par/reduce for scalar gradients
-                    (doseq [bwd-reduce backward-reduces]
-                      (swap! rev-ctx #(update % :bindings into bwd-reduce)))
-                  ;; 5. Wire adjoints
-                    (doseq [[arr d-sym] (map vector read-arrs d-read-arr-syms)]
-                      (swap! adj-env update arr (fnil conj []) d-sym))
-                    (doseq [[p d-sym] (map vector active-free d-scalar-syms)]
-                      (swap! adj-env update p (fnil conj []) d-sym)))
-
-                ;; Par reduce: backward via par/map! (adjoint of sum is broadcast)
-                  :par-reduce
-                  (let [{:keys [read-arrs d-read-arr-syms d-scalar-syms
-                                active-free shadow-allocs backward-maps backward-reduces
-                                tape-sym d-acc-sym bound-expr]} record]
-                  ;; 1. Allocate shadow arrays for read arrays
-                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_acc to the adjoint of the reduce result. par/reduce
-                  ;; returns a SCALAR — 0.0 default is correct for the empty case.
-                    (let [d-acc-contribs (get @adj-env sym)]
-                      (swap! rev-ctx #(update % :bindings into
-                                              [d-acc-sym (if (and d-acc-contribs (= 1 (count d-acc-contribs)))
-                                                           (first d-acc-contribs)
-                                                           (or (first d-acc-contribs) 0.0))])))
-                  ;; 3. Emit par/map! for array gradients
-                    (doseq [bwd-map backward-maps]
-                      (swap! rev-ctx #(update % :bindings into bwd-map)))
-                  ;; 4. Emit par/reduce for scalar gradients
-                    (doseq [bwd-reduce backward-reduces]
-                      (swap! rev-ctx #(update % :bindings into bwd-reduce)))
-                  ;; 5. Wire adjoints
-                    (doseq [[arr d-sym] (map vector read-arrs d-read-arr-syms)]
-                      (swap! adj-env update arr (fnil conj []) d-sym))
-                    (doseq [[p d-sym] (map vector active-free d-scalar-syms)]
-                      (swap! adj-env update p (fnil conj []) d-sym)))
-
-                ;; Dotimes: generate backward loop through tape
-                  :dotimes
-                  (let [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms
-                                active-free shadow-allocs backward-loop tape-sym
-                                d-out-sym n-bwd-sym bound-expr]} record]
-                  ;; 1. Allocate shadow arrays for read arrays
-                    (swap! rev-ctx #(update % :bindings into (vec shadow-allocs)))
-                  ;; 2. Bind d_out to the adjoint of the first written array.
-                  ;; Same shape rule as the par-map case above — array adjoints
-                  ;; need a typed zero array, not a scalar 0.0.
-                    (when-let [out-arr (first written-arrs)]
-                      (let [d-out-contribs (get @adj-env out-arr)
-                            zero-of-shape (case (:raster.type/tag (meta out-arr))
-                                            doubles (list 'double-array (list 'raster.arrays/alength out-arr))
-                                            floats  (list 'float-array  (list 'raster.arrays/alength out-arr))
-                                            0.0)]
-                        (swap! rev-ctx #(update % :bindings into
-                                                [d-out-sym (cond
-                                                             (and d-out-contribs (= 1 (count d-out-contribs)))
-                                                             (first d-out-contribs)
-                                                             d-out-contribs (first d-out-contribs)
-                                                             :else zero-of-shape)]))))
-                  ;; 3. Bind n_bwd to the bound expression
-                    (swap! rev-ctx #(update % :bindings into [n-bwd-sym bound-expr]))
-                  ;; 4. Run the backward loop
-                    (let [bwd-result-sym (ad-gensym "dt_bwd")]
-                      (swap! rev-ctx #(update % :bindings into [bwd-result-sym backward-loop]))
-                    ;; 5. Distribute results to adj-env
-                    ;; backward-loop returns [d_read_arr_0 ... d_scalar_0 ...]
-                      (doseq [[i arr] (map-indexed vector read-arrs)]
-                        (swap! adj-env update arr
-                               (fnil conj []) (list 'nth bwd-result-sym i)))
-                      (doseq [[i p] (map-indexed vector active-free)]
-                        (swap! adj-env update p
-                               (fnil conj [])
-                               (list 'nth bwd-result-sym (clojure.core/+ (count read-arrs) i)))))))))) ;; close (when (or array-type? adj-contribs) ...)
-
-        ;; === Phase 3: Collect parameter adjoints ===
-        param-adj-syms (atom [])
-
-        _ (doseq [p active-params]
-            (let [tag (:raster.type/tag (meta p))
-                  contribs (get @adj-env p)
-                  adj-sym (ad-gensym (str "d_" (name p)) tag)
-                  ;; No contributions → zero of the SAME shape/type as the
-                  ;; param. For arrays, a scalar 0.0 would crash downstream
-                  ;; array primitives if it ever gets read as an adjoint.
-                  ;; (Yes, in the per-iteration AD this is rarely consumed,
-                  ;; but the result-pullback's compound branch consumes
-                  ;; param adjoints by index for backward-loop seeding —
-                  ;; see gen-reverse-loop's result-seed machinery.)
-                  no-contrib-default
-                  (case tag
-                    doubles (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
-                    floats  (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
-                    0.0)
-                  adj-expr (cond
-                             (nil? contribs) no-contrib-default
-                             (= 1 (count contribs)) (first contribs)
-                             :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                           contribs))]
-              (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
-              (swap! param-adj-syms conj adj-sym)))
-
-        ;; === Phase 4: Assemble ===
-        pullback-body
-        (list 'let* (vec (:bindings @rev-ctx))
-              (vec @param-adj-syms))
-        pullback-fn (list 'fn* [dy-sym] pullback-body)
-
-        result-sym (ad-gensym "result")
-        augmented-bindings (vec (concat @fwd-bindings
-                                        [result-sym body-sym]))]
-    (list 'let* augmented-bindings
-          (vector result-sym pullback-fn))))
+        {:keys [fwd-bindings rev-ctx param-adj-syms]}
+        (process-bindings norm-bindings active-params {:seed-adj-env {body-sym [dy-sym]}})
+        pullback-body (list 'let* (vec (:bindings rev-ctx)) (vec param-adj-syms))
+        pullback-fn   (list 'fn* [dy-sym] pullback-body)
+        result-sym    (ad-gensym "result")
+        augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
+    (list 'let* augmented-bindings (vector result-sym pullback-fn))))
 
 ;; ================================================================
 ;; Loop/recur reverse-mode AD
