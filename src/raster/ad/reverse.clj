@@ -2119,149 +2119,14 @@
     (let [[bindings body-exprs] (extract-let-parts form)
           [norm-bindings body-sym] (normalize-for-ad bindings body-exprs)
 
-          ;; === Phase 1: Forward pass (same as gen-reverse-let) ===
-          sym-activity (atom (into {} (map (fn [p] [p true]) active-params)))
-          fwd-bindings (atom [])
-          records (atom [])
-
-          _ (doseq [[sym init-expr] (partition 2 norm-bindings)]
-              (swap! fwd-bindings conj sym (qualify-fwd-expr init-expr))
-              (let [init-active?
-                    (cond
-                      (trivial-expr? init-expr)
-                      (if (symbol? init-expr)
-                        (get @sym-activity init-expr false)
-                        false)
-
-                      (seq? init-expr)
-                      (let [head (first init-expr)]
-                        (cond
-                          (comparison-op? head) false
-
-                          (= 'if head)
-                          (let [[_ _test then else] init-expr]
-                            (boolean
-                             (or (and (symbol? then) (get @sym-activity then false))
-                                 (and (symbol? else) (get @sym-activity else false)))))
-
-                          :else
-                          (let [args (if (= '.invk head) (nnext init-expr) (rest init-expr))]
-                            (boolean
-                             (some #(and (symbol? %) (get @sym-activity % false))
-                                   args)))))
-
-                      :else false)]
-
-                (swap! sym-activity assoc sym init-active?)
-
-                (when init-active?
-                  (cond
-                    (and (seq? init-expr) (= 'if (first init-expr)))
-                    (let [[_ branch-expr then-expr else-expr] init-expr]
-                      (swap! records conj
-                             {:type :if :sym sym
-                              :branch branch-expr :then then-expr :else else-expr}))
-
-                    (symbol? init-expr)
-                    (swap! records conj {:type :alias :sym sym :source init-expr})
-
-                    (seq? init-expr)
-                    (let [head (first init-expr)
-                          [op args] (if (= '.invk head)
-                                      [(second init-expr) (vec (nnext init-expr))]
-                                      [head (vec (rest init-expr))])
-                          resolved (or (tmpl/resolve-template op)
-                                       (auto-make-deftm-rule op))]
-                      (when resolved
-                        (let [[_ base-op] resolved]
-                          (swap! records conj
-                                 {:type :call :sym sym
-                                  :base-op base-op
-                                  :args args
-                                  :active-args
-                                  (set (filter #(and (symbol? %)
-                                                     (get @sym-activity % false))
-                                               args))}))))))))
-
-          ;; === Phase 2: Reverse pass (same as gen-reverse-let) ===
+          ;; === Phases 1-3: the shared pure engine (no atoms) ===
           dy-sym 'dy__rad
-          adj-env (atom {body-sym [dy-sym]})
-          rev-ctx (atom (bind-ctx/make-ctx ad-gensym))
-
-          _ (doseq [record (reverse @records)]
-              (let [{:keys [type sym]} record
-                    adj-contribs (get @adj-env sym)
-                    adj-sym (ad-gensym (str "d_" (name sym))
-                                       (:raster.type/tag (meta sym)))
-                    adj-expr (cond
-                               (nil? adj-contribs) nil
-                               (= 1 (count adj-contribs)) (first adj-contribs)
-                               :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                             adj-contribs))
-                    _ (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))]
-
-                (when adj-contribs
-                  (case type
-                    :call
-                    (let [{:keys [base-op args active-args]} record
-                          [template _] (tmpl/resolve-template base-op)
-                          has-template? (and template
-                                             (or (:grads template) (:grads-fn template)))]
-                      (if has-template?
-                        (let [[new-ctx grad-syms] (tmpl/instantiate-template-ctx
-                                                   template args sym adj-sym @rev-ctx)]
-                          (reset! rev-ctx new-ctx)
-                          (doseq [[i grad-sym] (map-indexed vector grad-syms)]
-                            (when (and (< i (count args))
-                                       (symbol? (nth args i))
-                                       (contains? active-args (nth args i)))
-                              (swap! adj-env update (nth args i)
-                                     (fnil conj []) grad-sym))))
-                        (let [pb-sym (ad-gensym "pb")
-                              grads-sym (ad-gensym "grads")]
-                          (swap! rev-ctx #(update % :bindings into
-                                                  [pb-sym (list* (list 'raster.ad.templates/get-pullback-factory
-                                                                       (list 'quote base-op))
-                                                                 sym args)
-                                                   grads-sym (list pb-sym adj-sym)]))
-                          (doseq [[i arg] (map-indexed vector args)]
-                            (when (and (symbol? arg) (contains? active-args arg))
-                              (swap! adj-env update arg
-                                     (fnil conj []) (list 'nth grads-sym i)))))))
-
-                    :if
-                    (let [{:keys [branch then else]} record]
-                      (when (and (symbol? then) (get @sym-activity then false))
-                        (swap! adj-env update then
-                               (fnil conj []) (list 'if branch adj-sym nil)))
-                      (when (and else (symbol? else) (get @sym-activity else false))
-                        (swap! adj-env update else
-                               (fnil conj []) (list 'if branch nil adj-sym))))
-
-                    :alias
-                    (let [{:keys [source]} record]
-                      (when (get @sym-activity source false)
-                        (swap! adj-env update source
-                               (fnil conj []) adj-sym)))))))
-
-          ;; === Phase 3: Collect parameter adjoints ===
-          param-adj-syms (atom [])
-
-          _ (doseq [p active-params]
-              (let [contribs (get @adj-env p)
-                    adj-sym (ad-gensym (str "d_" (name p))
-                                       (:raster.type/tag (meta p)))
-                    adj-expr (cond
-                               (nil? contribs) 0.0
-                               (= 1 (count contribs)) (first contribs)
-                               :else (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b))
-                                             contribs))]
-                (swap! rev-ctx #(update % :bindings into [adj-sym adj-expr]))
-                (swap! param-adj-syms conj adj-sym)))
+          {:keys [fwd-bindings rev-ctx param-adj-syms]}
+          (process-bindings norm-bindings active-params {:seed-adj-env {body-sym [dy-sym]}})
 
           ;; === Phase 4: Reify pullback ===
-          rev-bindings (vec (:bindings @rev-ctx))
-          pullback-body (list 'let* rev-bindings (vec @param-adj-syms))
+          rev-bindings (vec (:bindings rev-ctx))
+          pullback-body (list 'let* rev-bindings (vec param-adj-syms))
 
           ;; Determine captured variables:
           ;; Free symbols in the reverse bindings that are NOT:
@@ -2270,25 +2135,25 @@
           ;; - the active params (these flow separately)
           rev-bound (collect-bound-syms rev-bindings)
           rev-free  (collect-free-syms rev-bindings)
-          fwd-bound (collect-bound-syms (vec @fwd-bindings))
+          fwd-bound (collect-bound-syms (vec fwd-bindings))
           ;; Captured = free in reverse bindings ∩ bound in forward bindings
           captured  (clojure.set/intersection rev-free fwd-bound)
           ;; Maintain deterministic order: use forward binding order
-          captured-ordered (filterv captured (take-nth 2 @fwd-bindings))
+          captured-ordered (filterv captured (take-nth 2 fwd-bindings))
 
           ;; Pullback params: [dy, captured1, captured2, ...]
           pullback-params (vec (cons dy-sym captured-ordered))
 
           ;; Standard output for backward compatibility
           result-sym (ad-gensym "result")
-          augmented-bindings (vec (concat @fwd-bindings [result-sym body-sym]))]
+          augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
 
       {:primal-form     (list 'let* augmented-bindings result-sym)
        :pullback-form   pullback-body
        :pullback-params pullback-params
        :active-params   (vec active-params)
        :captured-syms   captured-ordered
-       :fwd-bindings    (vec @fwd-bindings)
+       :fwd-bindings    (vec fwd-bindings)
        :result-sym      result-sym
        :body-sym        body-sym
        ;; Standard [primal, pullback] for backward compat
