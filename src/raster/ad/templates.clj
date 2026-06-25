@@ -235,7 +235,10 @@
    'raster.numeric/sqrt 'Math/sqrt, 'raster.numeric/pow  'Math/pow,
    'raster.math/tan     'Math/tan,  'raster.numeric/abs  'Math/abs,
    'raster.math/asin    'Math/asin, 'raster.math/acos    'Math/acos,
-   'raster.math/atan    'Math/atan, 'raster.math/atan2   'Math/atan2})
+   'raster.math/atan    'Math/atan, 'raster.math/atan2   'Math/atan2,
+   ;; raster.arrays/aget is the polymorphic-dispatch spelling of the array read;
+   ;; it differentiates exactly like clojure.core/aget (scatter dy into arr[i]).
+   'raster.arrays/aget  'clojure.core/aget})
 
 ;; ================================================================
 ;; Mangled name resolution
