@@ -303,11 +303,16 @@
 (defmethod ad-record :par-map [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
         pm-info (assoc (gen-reverse-par-map init-expr active-set) :sym sym)
-        tape-sym (:tape-sym pm-info)]
+        tape-sym (:tape-sym pm-info)
+        ;; Bind the result sym to the OUTPUT BUFFER (the forward-code populated it),
+        ;; NOT nil — so a downstream consumer (`(aget y i)` / `(alength y)`) sees the
+        ;; actual array. The result is then an alias of the buffer; its adjoint
+        ;; (adj-env[sym]) is combined with adj-env[out-arr] in the backward.
+        out-buf (first (:written-arrs pm-info))]
     {:record pm-info
      :fwd-patch (fn [bs]
                   (let [without-last (vec (drop-last 2 bs))]
-                    (vec (concat without-last [tape-sym (:forward-code pm-info) sym nil]))))}))
+                    (vec (concat without-last [tape-sym (:forward-code pm-info) sym out-buf]))))}))
 
 (defmethod ad-record :par-reduce [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
@@ -325,11 +330,14 @@
 (defmethod ad-record :dotimes [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
         dt-info (assoc (gen-reverse-dotimes init-expr active-set) :sym sym)
-        tape-sym (:tape-sym dt-info)]
+        tape-sym (:tape-sym dt-info)
+        ;; Bind the result sym to the output buffer (populated by forward-code),
+        ;; not nil — so a downstream consumer sees the array (see :par-map).
+        out-buf (first (:written-arrs dt-info))]
     {:record dt-info
      :fwd-patch (fn [bs]
                   (let [without-last (vec (drop-last 2 bs))]
-                    (vec (concat without-last [tape-sym (:forward-code dt-info) sym nil]))))}))
+                    (vec (concat without-last [tape-sym (:forward-code dt-info) sym out-buf]))))}))
 
 (defmethod ad-record :call [_ sym init-expr activity]
   (let [head (first init-expr)
@@ -466,15 +474,19 @@
    :rev-ctx rev-ctx})
 
 (defmethod emit-backward :par-map
-  [{:keys [written-arrs read-arrs d-read-arr-syms d-scalar-syms active-free
+  [{:keys [sym written-arrs read-arrs d-read-arr-syms d-scalar-syms active-free
            shadow-allocs backward-maps backward-reduces d-out-sym]}
    _adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
-        ;; d_out = adjoint of the result array (consumer contributions) or a
-        ;; shape-matched zero.
+        ;; d_out = adjoint of the result array. The result sym `y` aliases the
+        ;; output buffer, so a downstream consumer (`(aget y i)`) scatters into
+        ;; adj-env[sym]; a direct buffer write lands in adj-env[out-arr]. SUM both
+        ;; (grad-acc element-wise) — dropping either disconnects the gradient.
         rev-ctx (if-let [out-arr (first written-arrs)]
-                  (bindings-into rev-ctx [d-out-sym (sum-contribs (get adj-env out-arr)
-                                                                  (array-zero-of-shape out-arr))])
+                  (bindings-into rev-ctx
+                                 [d-out-sym (sum-contribs (concat (get adj-env sym)
+                                                                  (get adj-env out-arr))
+                                                          (array-zero-of-shape out-arr))])
                   rev-ctx)
         rev-ctx (reduce bindings-into rev-ctx backward-maps)
         rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
@@ -494,13 +506,17 @@
      :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
 
 (defmethod emit-backward :dotimes
-  [{:keys [written-arrs read-arrs active-free shadow-allocs backward-loop
+  [{:keys [sym written-arrs read-arrs active-free shadow-allocs backward-loop
            d-out-sym n-bwd-sym bound-expr]}
    _adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+        ;; result sym aliases the buffer — sum consumer (adj-env[sym]) and direct
+        ;; buffer (adj-env[out-arr]) contributions (see :par-map).
         rev-ctx (if-let [out-arr (first written-arrs)]
-                  (bindings-into rev-ctx [d-out-sym (sum-contribs (get adj-env out-arr)
-                                                                  (array-zero-of-shape out-arr))])
+                  (bindings-into rev-ctx
+                                 [d-out-sym (sum-contribs (concat (get adj-env sym)
+                                                                  (get adj-env out-arr))
+                                                          (array-zero-of-shape out-arr))])
                   rev-ctx)
         rev-ctx (bindings-into rev-ctx [n-bwd-sym bound-expr])
         bwd-result-sym (ad-gensym "dt_bwd")
@@ -2581,13 +2597,20 @@
   positional-arg limit) still work. The unpacking lets are trivially
   eliminated by the JVM JIT for the common ≤20-param case."
   [walked-body params]
-  (if (<= (count params) 20)
-    (eval (list 'fn (vec params) (first walked-body)))
-    (let [args-sym (gensym "args__")
-          unpack (vec (mapcat (fn [p i] [p `(nth ~args-sym ~i)])
-                              params (range)))]
-      (eval (list 'fn ['& args-sym]
-                  (list 'let unpack (first walked-body)))))))
+  ;; The body is eval'd WITHOUT type hints, so `clojure.core/alength` on an
+  ;; untyped INTERMEDIATE array (e.g. a broadcast result `y`) reflects ambiguously
+  ;; ("more than one matching method: alength"). Rewrite to the polymorphic
+  ;; `raster.arrays/alength`, which dispatches on the runtime array type — no
+  ;; reflection, and params (already typed) keep working.
+  (let [body (walk/postwalk-replace {'clojure.core/alength 'raster.arrays/alength}
+                                    (first walked-body))]
+    (if (<= (count params) 20)
+      (eval (list 'fn (vec params) body))
+      (let [args-sym (gensym "args__")
+            unpack (vec (mapcat (fn [p i] [p `(nth ~args-sym ~i)])
+                                params (range)))]
+        (eval (list 'fn ['& args-sym]
+                    (list 'let unpack body)))))))
 
 (defn ^clojure.lang.IFn value+grad
   "Composable value+gradient operator.
