@@ -1,26 +1,21 @@
 (ns raster.dl.gpt2-train
   "Trainable-shape GPT-2 forward+loss using HMap-typed weights.
 
-  STATUS:
-  - Forward (compile-aot) WORKS end-to-end at tiny GPT-2 scale and produces
-    sensible loss values.
-  - Training (compile-train-step) is BLOCKED on a compile-aot AD-pipeline
-    type-inference bug: AD-generated grad symbols leak through helper-method
-    splits as Object rather than primitive arrays, and the bytecode emit pass
-    fails to resolve them ('Unresolved symbol in bytecode emit: d_out__N').
-    Reproduces with as little as
-      (gpt2-embeddings → layer-norm → linear → cross-entropy-loss)
-    in a defmodel body. Same primitives work outside this composition. The
-    issue is in raster's AD/compile-aot pipeline interaction with parametric
-    deftms in loss bodies, not in the tree machinery — GSDM trains via
-    compile-train-step at the same scale (1735 µs/step at 2-layer 8-dim).
+  STATUS (updated 2026-06-24): the prior \"training is BLOCKED\" note is STALE.
+  The full attention transformer (embeddings → layer-norm → causal-multi-head
+  attention → residual → layer-norm → MLP/gelu → residual → final-LN → tied
+  unembed → cross-entropy) trains end-to-end via `defmodel` +
+  `raster.params/compile-train-step`. See test/raster/dl/gpt2_train_test.clj:
+  `tiny-gpt2-loss` composes attention/LN/gelu over a single Params tree and
+  `tiny-gpt2-compile-aot-train-step-converges` drives 10 fused Adam steps with
+  strictly decreasing loss. Three confidence layers (lazy forward, lazy
+  value+grad, fused compile-aot train step) all pass.
 
-  This file demonstrates the WORKING forward path. The inline-block emitter
-  uses MLP-only blocks (no attention) since the standard gpt2-block also has
-  the head-split AD shuffles. A causal-scaled-dot-product-attn pullback was
-  added in raster.dl.attention as the lower-level template needed for an
-  AD-friendly attention; closing the train-step gap requires diagnosing the
-  helper-split type-inference issue in the compile-aot pipeline."
+  This file keeps a hand-written inline-block FORWARD emitter as a lower-level
+  demonstration; for trainable models prefer the `defmodel` + compile-train-step
+  path shown in the test. (A residual goes through array-ops/array-add, which
+  carries an explicit AD rrule; raw broadcast→reduce residuals also differentiate
+  now — see raster.ad.reverse array-intermediate handling.)"
   (:require [raster.params :as rp]
             [raster.dl.gpt2 :as gpt2]
             [raster.dl.nn :as nn]

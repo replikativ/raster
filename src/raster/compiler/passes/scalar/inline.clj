@@ -1426,6 +1426,15 @@
                    val)))
              (catch Exception _ nil))
         expr)
+    ;; Vectors in value position (e.g. a binding init `[result pullback-fn]`,
+    ;; where the pullback is a (fn* ...) closure carrying gelu's `c` constant):
+    ;; recurse element-wise so dispatch resolution and constant folding reach
+    ;; inside. Binding vectors of let*/loop*/dotimes/par are destructured by
+    ;; their own branches above and never reach here; a vector arriving here is
+    ;; always a data/value vector, so element-wise mapping is sound.
+    (vector? expr)
+    (let [r (mapv #(resolve-dispatch-walk % env) expr)]
+      (if-let [m (meta expr)] (with-meta r m) r))
     (not (seq? expr)) expr
     ;; Loop/loop*: propagate init types for loop vars into body
     (contains? #{'loop 'loop*} (first expr))

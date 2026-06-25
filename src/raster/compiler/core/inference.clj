@@ -1588,15 +1588,42 @@
 ;; Late-pipeline type inference (moved from inline.clj to break cycle)
 ;; ================================================================
 
+(defn- var-ref-tag
+  "Type tag for a QUALIFIED symbol that resolves to a constant Var — taken from
+  the var's declared `:tag` (e.g. `(def ^{:tag 'double} pi ...)`) or, for a
+  `:const` var, its numeric value's class. Returns nil for functions, generic
+  dispatch vars, classes, and untagged non-const vars.
+
+  This is the robust path for typing references to numeric constants like
+  `raster.numeric/pi`: it does not depend on the (context-sensitive) constant
+  fold firing — the declared tag alone lets dispatch on the reference
+  devirtualize. Only consulted as a fallback after env + symbol metadata miss."
+  [sym]
+  (try
+    (when-let [v (resolve sym)]
+      (when (and (var? v) (not (:raster.core/generic-function (meta v))))
+        (let [m (meta v)
+              t (:tag m)]
+          (cond
+            (contains? '#{double float long int} t) t
+            (:const m) (condp instance? @v
+                         Double 'double
+                         Float  'float
+                         Long   'long
+                         Integer 'int
+                         nil)))))
+    (catch Throwable _ nil)))
+
 (defn infer-arg-tag
   "Infer the type tag of an expression in the late pipeline.
-   Priority: env lookup → :tag metadata → structural analysis.
+   Priority: env lookup → :tag metadata → resolved-var tag → structural analysis.
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
     (symbol? expr) (or (get env expr)
                        (:raster.type/tag (meta expr))
-                       (:tag (meta expr)))
+                       (:tag (meta expr))
+                       (when (namespace expr) (var-ref-tag expr)))
     (number? expr) (condp instance? expr
                      Double 'double
                      Float 'float
