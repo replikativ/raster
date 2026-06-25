@@ -1187,8 +1187,19 @@
                                                           `(mapv (fn [[p# n#]] (java.lang.constant.ClassDesc/of p# n#)) '~iface-descs)
                                                           []))
                (import '~(symbol class-name))
-               (defn ~factory-sym ~factory-params
-                 (new ~name ~@factory-params))
+               ~(if (<= (count factory-params) 20)
+                  `(defn ~factory-sym ~factory-params
+                     (new ~name ~@factory-params))
+                  ;; Clojure caps fns at 20 positional params; for wide value
+                  ;; classes (e.g. a containerized model with >20 leaf fields)
+                  ;; take varargs and nth-destructure. The JVM `new` (constructor
+                  ;; invoke) itself permits up to 255 args, so the value class is
+                  ;; still built positionally. Callers use (apply factory …).
+                  (let [args-sym (gensym "args__")]
+                    `(defn ~factory-sym [~'& ~args-sym]
+                       (let [~@(mapcat (fn [p i] [p (list 'nth args-sym i)])
+                                       factory-params (range))]
+                         (new ~name ~@factory-params)))))
                (try (clojure.core.typed/-ann
                      ['~(ns-name *ns*) '~(symbol (str (ns-name *ns*)) (str factory-sym))
                       '~tc-ann-form {} nil nil])

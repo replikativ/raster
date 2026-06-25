@@ -78,6 +78,25 @@
          value+grad-positional alloc-zeros-like build-container)
 
 ;; ----------------------------------------------------------------------
+;; Model-metadata registry (avoids the 64KB-method limit)
+;; ----------------------------------------------------------------------
+;; A defmodel's structured metadata (treedefs, original-args, annotations,
+;; containers) can be very large for big models (e.g. a 3-layer/16-dim GSDM has
+;; 66 flat leaves). Splicing it as a quoted LITERAL into the expansion makes
+;; stock Clojure compile a giant constructor method that overflows the JVM 64KB
+;; per-method bytecode limit (it surfaces as "Method code too large!" when
+;; compiling the synthesized `(alter-meta! ...)` form). Mirroring deftm's
+;; walked-body-registry approach, we store the blob in a runtime atom at
+;; macro-expansion time and look it up by a string key — so NO large literal is
+;; ever compiled into a method.
+(defonce ^:private model-meta-registry (atom {}))
+
+(defn model-meta-for
+  "Retrieve stored defmodel metadata by registry key (set at macroexpansion)."
+  [key]
+  (get @model-meta-registry key))
+
+;; ----------------------------------------------------------------------
 ;; Adapter: structured args -> flat args
 ;; ----------------------------------------------------------------------
 
@@ -245,29 +264,40 @@
         flat-name   (symbol (str fn-name "--flat"))
         flat-param-vec (vec (mapcat (fn [p ann]
                                       (if ann [p :- ann] [p]))
-                                    flat-params flat-anns))]
+                                    flat-params flat-anns))
+        ;; Stash the (potentially huge) structured metadata in the runtime
+        ;; registry at macro-expansion time so the emitted code only references
+        ;; it by a small string key — never compiling it as an inline literal,
+        ;; which would overflow the JVM 64KB per-method limit for large models.
+        reg-key     (str *ns* "/" fn-name)
+        _           (swap! model-meta-registry assoc reg-key
+                           {:treedefs       treedefs
+                            :original-args  params
+                            :arg-annotations anns
+                            :ret-type       ret
+                            :containers     containers})]
     `(do
        ;; Inner flat-arg deftm — what the compiler sees
        (raster.core/deftm ~flat-name ~flat-param-vec
          ~@(when ret [:- ret])
          ~flat-body)
 
-       ;; User-facing var: wraps the flat deftm with a flatten-shim
-       (def ~(with-meta fn-name
-               {::treedefs       (list 'quote treedefs)
-                ::flat-var       (list 'var flat-name)
-                ::original-args  (list 'quote params)})
-         (#'compile-flatten-wrapper @(var ~flat-name)
-                                    '~params
-                                    '~treedefs
-                                    '~containers))
-       (alter-meta! (var ~fn-name) assoc
-                    ::treedefs '~treedefs
-                    ::flat-var (var ~flat-name)
-                    ::original-args '~params
-                    ::arg-annotations '~anns
-                    ::ret-type '~ret
-                    ::containers '~containers)
+       ;; User-facing var: wraps the flat deftm with a flatten-shim. The big
+       ;; structured args are pulled from the registry at runtime (no literals).
+       (let [mm# (model-meta-for ~reg-key)]
+         (def ~(with-meta fn-name
+                 {::flat-var (list 'var flat-name)})
+           (#'compile-flatten-wrapper @(var ~flat-name)
+                                      (:original-args mm#)
+                                      (:treedefs mm#)
+                                      (:containers mm#)))
+         (alter-meta! (var ~fn-name) assoc
+                      ::treedefs       (:treedefs mm#)
+                      ::flat-var       (var ~flat-name)
+                      ::original-args  (:original-args mm#)
+                      ::arg-annotations (:arg-annotations mm#)
+                      ::ret-type       (:ret-type mm#)
+                      ::containers     (:containers mm#)))
        (var ~fn-name))))
 
 ;; ----------------------------------------------------------------------
