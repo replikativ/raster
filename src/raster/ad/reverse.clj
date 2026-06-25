@@ -29,6 +29,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.passes.scalar.inline :as inline]
+            [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.util :as util]
             [raster.core :as rcore]
             [raster.arrays :as arrays]))
@@ -1558,35 +1559,66 @@
 
 (defn- analyze-par-map-body
   "Analyze a par/map! body for aget references and free scalars.
-  Returns {:agets [{:arr sym :idx idx-sym} ...], :free-scalars [sym ...],
-           :scalar-bindings [[sym init] ...], :body-result expr}."
+  Returns {:agets [{:sym :arr :idx} ...], :scalar-bindings [[sym init] ...],
+           :body-result expr, :free-syms #{...}}.
+
+  Two sources of aget reads — both routed to the SCATTER (per-element array grad)
+  path, following Futhark's vjpMap: a free var read at the map index gets a
+  per-element scattered adjoint, NOT a scalar reduce:
+   (1) let*-bound agets `[a (aget arr i)]` (explicit ANF), and
+   (2) INLINE agets `(aget arr i)` sitting directly in the body result /
+       scalar-binding inits — the shape `broadcast`/elementwise bodies produce.
+       Each distinct inline `(aget arr <map-idx>)` is lifted to a synthetic aget
+       binding (fresh sym) and the body rewritten to reference it, so it joins the
+       array-input scatter machinery instead of being mistaken for a free scalar
+       (which would reduce → `No promotion rule for + with Double and double[]`).
+  Only agets indexed BY THE MAP INDEX scatter; other indexing stays inline."
   [body-expr idx-sym]
   (let [agets (atom [])
         scalar-bindings (atom [])
         ;; Extract let* bindings if present
-        [bindings body-result]
+        [bindings body-result0]
         (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
           [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
           [[] body-expr])]
-    ;; Scan bindings for aget patterns
+    ;; (1) let*-bound agets
     (doseq [[sym init] bindings]
       (if (and (seq? init)
                (op/aget-op? (first init)))
         (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
         (swap! scalar-bindings conj [sym init])))
-    (let [aget-syms (set (map :sym @agets))
-          bound-syms (set (cons idx-sym (concat (map first @scalar-bindings) aget-syms)))
-          free-syms (free-syms-excluding body-result bound-syms)
-          ;; Also collect free syms from scalar binding inits
-          all-free (reduce into free-syms
-                           (map (fn [[_ init]]
-                                  (free-syms-excluding init bound-syms))
-                                @scalar-bindings))]
-      {:agets @agets
-       :scalar-bindings @scalar-bindings
-       :body-result body-result
-       ;; Remove arrays that are aget'd (they're inputs, not scalars)
-       :free-syms (disj all-free idx-sym)})))
+    ;; (2) lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup by
+    ;; array — idx is fixed = the map index — so a repeated read shares one sym)
+    (let [seen (atom {})
+          lift (fn lift [form]
+                 (cond
+                   (and (seq? form) (op/aget-op? (first form))
+                        (= 3 (count form)) (= idx-sym (nth form 2)))
+                   (let [arr (nth form 1)
+                         k (if (symbol? arr) arr form)]
+                     (or (get @seen k)
+                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
+                           (swap! seen assoc k s)
+                           (swap! agets conj {:sym s :arr arr :idx idx-sym})
+                           s)))
+                   (seq? form) (apply list (map lift form))
+                   (vector? form) (mapv lift form)
+                   :else form))
+          body-result (lift body-result0)
+          scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
+      (let [aget-syms (set (map :sym @agets))
+            bound-syms (set (cons idx-sym (concat (map first scalar-bindings*) aget-syms)))
+            free-syms (free-syms-excluding body-result bound-syms)
+            ;; Also collect free syms from scalar binding inits
+            all-free (reduce into free-syms
+                             (map (fn [[_ init]]
+                                    (free-syms-excluding init bound-syms))
+                                  scalar-bindings*))]
+        {:agets @agets
+         :scalar-bindings scalar-bindings*
+         :body-result body-result
+         ;; Remove arrays that are aget'd (they're inputs, not scalars)
+         :free-syms (disj all-free idx-sym)}))))
 
 (defn- gen-reverse-par-map
   "Generate reverse-mode AD code for a raster.par/map! form.
@@ -2204,7 +2236,11 @@
   [form active-params]
   (let [lowered (binding [inline/*ad-transform-body-fn* transform-body]
                   (inline/lower-to-ad-primitives form))
-        hoisted (hoist-nested-lets lowered)]
+        ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
+        ;; so the AD sees the mutating, value-producing form it can differentiate
+        ;; (the pure pmap has no reverse rule).
+        materialized (:form (materialize/materialize-pass lowered nil))
+        hoisted (hoist-nested-lets materialized)]
     (transform-body hoisted (vec active-params))))
 
 (defn numerical-gradient
@@ -2823,8 +2859,11 @@
         ;; Lower: inline compound deftm ops into primitives before AD
         lowered (binding [inline/*ad-transform-body-fn* transform-body]
                   (inline/lower-to-ad-primitives (first walked-body)))
+        ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
+        ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
+        materialized (:form (materialize/materialize-pass lowered nil))
         ;; Hoist nested lets out of call args into flat ANF for AD
-        hoisted (hoist-nested-lets lowered)
+        hoisted (hoist-nested-lets materialized)
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
         ad-form (transform-body hoisted diff-active-params)
