@@ -494,15 +494,19 @@
              h (nn/silu h n)
         ;; Linear 1 (per-node: [n-nodes, emb-dim] × [emb-dim, emb-dim])
              h (nn/linear h W1 b1 n-nodes emb-dim emb-dim)
-        ;; Timestep injection: h = h + broadcast(SiLU(linear(temb)))
-             temb-proj (nn/silu temb emb-dim)
-             temb-proj (nn/linear temb-proj Wt bt 1 emb-dim emb-dim)
-        ;; Broadcast temb-proj to all nodes
-             h (array-ops/broadcast-add h temb-proj n-nodes emb-dim)
+        ;; GN2 MUST precede the timestep injection: GroupNorm normalizes each
+        ;; channel across nodes, and temb-proj is broadcast equally to every node
+        ;; (constant along the normalized axis), so injecting BEFORE GN2 lets the
+        ;; norm subtract it straight back out — making the model completely
+        ;; time-blind. Inject AFTER the norm so the conditioning survives.
         ;; GN2: transpose → group-norm → transpose back
              h-t (nn/transpose-2d h n-nodes emb-dim)
              h-t (nn/group-norm h-t gamma2 beta2 1 emb-dim n-nodes num-groups 1e-5)
              h (nn/transpose-2d h-t emb-dim n-nodes)
+        ;; Timestep injection AFTER the norm: h = h + broadcast(SiLU(linear(temb)))
+             temb-proj (nn/silu temb emb-dim)
+             temb-proj (nn/linear temb-proj Wt bt 1 emb-dim emb-dim)
+             h (array-ops/broadcast-add h temb-proj n-nodes emb-dim)
         ;; SiLU
              h (nn/silu h n)
         ;; Linear 2
