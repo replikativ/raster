@@ -3127,6 +3127,25 @@
                     (.labelBinding code end-label)
                     :ref)))))))))
 
+(def ^:private primitive-tags
+  '#{double float long int short byte char boolean})
+
+(defn- known-primitive-arg?
+  "Ground-truth check (NO expression inference): is this interop argument
+   definitely a JVM primitive? Only a numeric/boolean/char literal or a symbol
+   carrying a primitive :tag / primitive local stack-type qualifies. Used by the
+   overload-selection safety net to distinguish a legitimate primitive argument
+   from a reference one — without re-deriving types by walking the expression."
+  [arg locals]
+  (boolean
+   (or (and (number? arg) (not (ratio? arg)))
+       (char? arg)
+       (instance? Boolean arg)
+       (and (symbol? arg)
+            (or (contains? primitive-tags (:tag (meta arg)))
+                (contains? #{:double :float :long :int :bool}
+                           (:type (get locals arg))))))))
+
 (defn- emit-dot-handler
   "Emit bytecode for (. obj method args...) — instance method or field access.
   Handles two paths:
@@ -3330,36 +3349,72 @@
               ;; When multiple overloads match, use arg :tag metadata and
               ;; local :hint to pick the right one (e.g. max(Vector) vs max(double)).
                 non-bridge (vec (remove #(.isBridge ^java.lang.reflect.Method %) candidates))
-                method (or
-                       ;; Try arg-tag-guided selection when ambiguous
-                        (when (> (count non-bridge) 1)
-                          (let [arg-tags (mapv (fn [arg]
-                                                 (cond
-                                                   (symbol? arg)
-                                                   (or (:tag (meta arg))
-                                                       (:hint (get locals arg)))
-                                                   (seq? arg) (:tag (meta arg))
-                                                   :else nil))
-                                               method-args)
-                               ;; Resolve arg classes from tags
-                                arg-classes (mapv (fn [tag]
-                                                    (when (and tag (pos? (count (str tag))))
-                                                      (try (Class/forName (str tag))
-                                                           (catch Exception _
-                                                             (try (when-let [r (ns-resolve src-ns (symbol (str tag)))]
-                                                                    (when (class? r) r))
-                                                                  (catch Exception _ nil))))))
-                                                  arg-tags)]
-                            (when (some some? arg-classes)
-                              (first (filter (fn [^java.lang.reflect.Method m]
-                                               (let [pts (.getParameterTypes m)]
-                                                 (every? true?
-                                                         (map (fn [^Class pt ^Class ac]
-                                                                (or (nil? ac) (.isAssignableFrom pt ac)))
-                                                              pts arg-classes))))
-                                             non-bridge)))))
-                        (first non-bridge)
-                        (first candidates))]
+                ;; Arg-tag-guided selection: when overloads are ambiguous, use the
+                ;; carried :tag metadata / local :hint to pick the right one
+                ;; (e.g. DoubleVector.add(Vector) vs add(double)).
+                arg-guided
+                (when (> (count non-bridge) 1)
+                  (let [arg-tags (mapv (fn [arg]
+                                         (cond
+                                           (symbol? arg)
+                                           (or (:tag (meta arg))
+                                               (:hint (get locals arg)))
+                                           (seq? arg) (:tag (meta arg))
+                                           :else nil))
+                                       method-args)
+                       ;; Resolve arg classes from tags
+                        arg-classes (mapv (fn [tag]
+                                            (when (and tag (pos? (count (str tag))))
+                                              (try (Class/forName (str tag))
+                                                   (catch Exception _
+                                                     (try (when-let [r (ns-resolve src-ns (symbol (str tag)))]
+                                                            (when (class? r) r))
+                                                          (catch Exception _ nil))))))
+                                          arg-tags)]
+                    (when (some some? arg-classes)
+                      (first (filter (fn [^java.lang.reflect.Method m]
+                                       (let [pts (.getParameterTypes m)]
+                                         (every? true?
+                                                 (map (fn [^Class pt ^Class ac]
+                                                        (or (nil? ac) (.isAssignableFrom pt ac)))
+                                                      pts arg-classes))))
+                                     non-bridge)))))
+                method (or arg-guided
+                           (first non-bridge)
+                           (first candidates))
+                ;; Safety net (no inference): when arg-tag metadata could NOT
+                ;; disambiguate and the fallback `(first non-bridge)` lands on a
+                ;; PRIMITIVE-param overload while another overload takes a REFERENCE
+                ;; at that position, picking it would coerce the argument to a
+                ;; primitive via Number — a silent miscompile if the argument is
+                ;; actually a reference (the DoubleVector.add(double) CCE class).
+                ;; Refuse to guess: fail loudly unless the argument is provably a
+                ;; primitive from ground truth (a numeric literal or a primitively
+                ;; tagged/hinted symbol). getMethods order is unspecified, so the
+                ;; fallback must never be trusted for this ambiguity.
+                _ (when (and method (not arg-guided) (> (count non-bridge) 1))
+                    (let [pts (.getParameterTypes ^java.lang.reflect.Method method)
+                          margs (vec method-args)]
+                      (dotimes [i (count pts)]
+                        (let [^Class pt (nth pts i)
+                              arg (nth margs i)]
+                          (when (and (.isPrimitive pt)
+                                     (not (known-primitive-arg? arg locals))
+                                     (some (fn [^java.lang.reflect.Method m]
+                                             (not (.isPrimitive ^Class (aget (.getParameterTypes m) i))))
+                                           non-bridge))
+                            (throw (ex-info
+                                    (str "Ambiguous interop overload for " (.getName cls) "." meth-str
+                                         ": fallback would coerce a non-primitive argument (position " i
+                                         ") to primitive `" (.getSimpleName pt) "`, but another overload"
+                                         " takes a reference there. Carry a :tag on this argument so"
+                                         " overload selection is unambiguous. Candidates: "
+                                         (mapv (fn [^java.lang.reflect.Method m]
+                                                 (mapv (fn [^Class c] (.getSimpleName c))
+                                                       (.getParameterTypes m)))
+                                               non-bridge))
+                                    {:class (.getName cls) :method meth-str :arg-index i
+                                     :arg arg}))))))) ]
             (if method
             ;; Method call — invokeinterface/invokevirtual.
             ;; For IFn__ .invk on LOCAL vars (Fn-typed params like `f`),
