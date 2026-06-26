@@ -93,7 +93,11 @@
                    pairs)
         new-bindings (vec (mapcat identity new-pairs))
         new-body (map materialize-expr body)]
-    (list* 'let* new-bindings new-body)))
+    ;; Preserve the original form's metadata (e.g. ^DoubleVector type tags the
+    ;; bytecoder relies on for interop overload selection). Rebuilding via list*
+    ;; without this drops the tag, which silently miscompiles a fused vector
+    ;; subexpression passed as a method argument (wrong primitive overload).
+    (with-meta (list* 'let* new-bindings new-body) (meta form))))
 
 (defn materialize-pass
   "Top-level pass: convert all pure par/map forms to alloc + par/map!.
