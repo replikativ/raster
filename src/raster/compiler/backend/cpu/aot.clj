@@ -20,7 +20,9 @@
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.cpu.codegen :as cpu]
-            [raster.compiler.backend.intrinsics :as intrinsics]))
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.ir.form :as form]
+            [raster.compiler.passes.scalar.peephole :as peephole]))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -54,19 +56,20 @@
 (def ^:private array-ctors '#{clojure.core/double-array clojure.core/float-array
                               clojure.core/long-array clojure.core/int-array})
 
-(def ^:private alength-impls
-  "Devirtualized alength impl symbols (any element type)."
-  #{'raster.arrays/alength_m_doubles-impl
-    'raster.arrays/alength_m_floats-impl
-    'raster.arrays/alength_m_longs-impl
-    'raster.arrays/alength_m_ints-impl})
+(defn- semantic-op
+  "The walker-stamped semantic op of a call form (:raster.op/original on a
+  devirtualized .invk). Falls back to the impl symbol for .invk, else the head.
+  Lets passes match ops by MEANING instead of pattern-matching mangled impl names."
+  [form]
+  (when (seq? form)
+    (or (:raster.op/original (meta form))
+        (if (= '.invk (first form)) (second form) (first form)))))
 
 (defn- alength-call?
-  "Match (.invk raster.arrays/alength_*-impl arr) or (clojure.core/alength arr)."
+  "Match an alength call (raster.arrays/alength devirtualized, or clojure.core/alength)
+  by its semantic op."
   [form]
-  (and (seq? form)
-       (or (and (= '.invk (first form)) (contains? alength-impls (second form)))
-           (= 'clojure.core/alength (first form)))))
+  (contains? #{'raster.arrays/alength 'clojure.core/alength} (semantic-op form)))
 
 (defn- alength-arg [form]
   (if (= '.invk (first form)) (nth form 2) (second form)))
@@ -118,23 +121,19 @@
 ;; Host function emission.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private zeros-like-impls
-  #{'raster.arrays/zeros-like_m_doubles_long-impl
-    'raster.arrays/zeros-like_m_floats_long-impl})
-
 (defn- buffer-alloc?
-  "A binding init that allocates an array buffer: (double-array <size>) or
-  (.invk raster.arrays/zeros-like_* arr size). Both yield a zero-filled buffer
-  (Java arrays are zero-initialized, so the wrapper needs no extra fill)."
+  "A binding init that allocates an array buffer: a core array-ctor (double-array …)
+  or raster.arrays/zeros-like (matched by semantic op, not impl name). Both yield a
+  zero-filled buffer (Java arrays are zero-initialized — no extra fill needed)."
   [init]
   (and (seq? init)
-       (or (contains? array-ctors (first init))
-           (and (= '.invk (first init)) (contains? zeros-like-impls (second init))))))
+       (let [op (semantic-op init)]
+         (or (contains? array-ctors op) (= 'raster.arrays/zeros-like op)))))
 
 (defn- buffer-size
   "The size expression of a buffer-alloc init."
   [init]
-  (if (contains? array-ctors (first init))
+  (if (contains? array-ctors (semantic-op init))
     (second init)        ; (double-array <size>)
     (last init)))        ; (.invk zeros-like arr <size>)
 
@@ -175,12 +174,11 @@
       (cond
         (= 'int op)  (long (resolve-int-expr (second expr) env))
         (= 'long op) (long (resolve-int-expr (second expr) env))
-        ;; arithmetic — classify the operator via the shared intrinsics registry
-        ;; (handles both devirtualized .invk impl symbols and bare/qualified core
-        ;; ops) instead of an ad-hoc name regex.
+        ;; arithmetic — classify by the SEMANTIC op (:raster.op/original metadata,
+        ;; falling back to the head/impl symbol) via the shared intrinsics registry.
         :else
-        (let [[opsym args] (if (= '.invk op) [(second expr) (nnext expr)] [op (rest expr)])
-              k (intrinsics/canonical opsym)
+        (let [args (if (= '.invk op) (nnext expr) (rest expr))
+              k (intrinsics/canonical (semantic-op expr))
               as (map #(resolve-int-expr % env) args)]
           (case k
             :+   (apply + as)
@@ -286,36 +284,21 @@
 
 (def ^:private array-tags '#{doubles floats longs ints})
 
-(defn- returned-sym
-  "The symbol an init expression ultimately evaluates to — follows
-  let*/loop*/do/if to the value leaf. Used to map a compute binding to the buffer
-  its loop writes & returns (for multi-buffer result tracking)."
-  [expr]
-  (cond
-    (symbol? expr) expr
-    (not (seq? expr)) nil
-    (contains? #{'let* 'let} (first expr)) (returned-sym (last expr))
-    (contains? #{'loop* 'loop} (first expr)) (returned-sym (nth expr 2 nil)) ; loop body
-    (= 'do (first expr)) (returned-sym (last expr))
-    (= 'if (first expr)) (or (returned-sym (nth expr 3 nil))   ; base/else first
-                             (returned-sym (nth expr 2 nil)))
-    :else nil))
-
 (defn result-buffer-index
   "Which buffer the function returns: trace the let* body result through the
-  compute-binding aliases (sym -> buffer its init returns) to a buffer symbol.
+  compute-binding aliases (sym -> the symbol its init returns) to a buffer symbol.
   Returns the index into `buffers`, defaulting to the last buffer."
   [stripped buffers]
   (let [[_ binds & body] stripped
         buf-syms (mapv first buffers)
         buf-set (set buf-syms)
         aliases (into {} (for [[sym init] (partition 2 binds)]
-                           [sym (returned-sym init)]))
+                           [sym (form/tail-symbol init)]))
         resolve (fn resolve [s seen]
                   (cond (buf-set s) s
                         (or (nil? s) (contains? seen s)) nil
                         :else (resolve (get aliases s) (conj seen s))))
-        result-sym (resolve (returned-sym (last body)) #{})]
+        result-sym (resolve (form/tail-symbol (last body)) #{})]
     (or (when result-sym (.indexOf buf-syms result-sym))
         (dec (count buffers)))))
 
@@ -331,6 +314,10 @@
   (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
+        ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
+        ;; r = (let* [..writes buf..] buf) from inlining residual-add, where r feeds a
+        ;; later norm's reduction). Shared with the AD peephole — no bespoke aliasing.
+        stripped (peephole/copy-propagate-let stripped)
         array-params  (vec (filter #(contains? array-tags (get param-env %)) params))
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
                              [p (ctype (get param-env p) "int")]))

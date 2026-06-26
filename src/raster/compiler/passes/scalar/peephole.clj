@@ -29,40 +29,59 @@
   [pairs]
   (vec (remove (fn [[_s e]] (nil? e)) pairs)))
 
+(defn- subst-aliases
+  "Substitute known aliases (alias-map sym -> target) throughout an expression."
+  [alias-map e]
+  (if (and (seq? e) (seq alias-map))
+    (clojure.walk/postwalk
+     (fn [x] (if (and (symbol? x) (contains? alias-map x)) (get alias-map x) x)) e)
+    e))
+
 (defn- inline-aliases
-  "Resolve trivial alias bindings (sym = other-sym) by substituting
-  the alias target throughout subsequent bindings, then nil out the
-  alias binding (it's dead after substitution).
-  This is needed because AD generates alias chains like:
-    dg_W__8 = (some-op ...)
-    d_W2__19 = dg_W__8          ;; alias
-    _ = (update-op! neg_lr d_W2__19 W2)
-  Without inlining, peephole can't see that d_W2__19 IS dg_W__8.
+  "Copy-propagation over flat let* bindings. Resolves two alias shapes by recording
+  sym -> target and substituting the target downstream:
+   - DIRECT symbol alias (sym = other-sym, non-effectful) — nil the binding (dead).
+   - EFFECTFUL alias whose init's tail position is a symbol (e.g. AD chains, or
+     r = (let* [..writes b..] b) from inlining a buffer-producing op) — KEEP the
+     binding for its writes; DCE removes it later if it turns out dead+pure.
+  This lets peephole/DCE see that d_W2__19 IS dg_W__8, and that r IS b.
   Returns {:pairs updated-pairs :aliases alias-map}."
   [pairs]
   (let [n (count pairs)]
-    (loop [i 0
-           result pairs
-           alias-map {}]
+    (loop [i 0 result pairs alias-map {}]
       (if (>= i n)
         {:pairs result :aliases alias-map}
-        (let [[sym init] (nth result i)]
-          (if (and (symbol? init) (not (:raster.effect/effectful (meta sym))))
-            ;; This is an alias: sym = init (or transitively resolved)
-            ;; Nil it out — all downstream uses are substituted
-            ;; But preserve effectful bindings
-            (let [resolved (get alias-map init init)
-                  new-map (assoc alias-map sym resolved)]
-              (recur (inc i) (assoc result i [sym nil]) new-map))
-            ;; Not an alias — substitute any known aliases in the expression
-            (let [substituted (if (and (seq? init) (seq alias-map))
-                                (clojure.walk/postwalk
-                                 (fn [x] (if (and (symbol? x) (contains? alias-map x))
-                                           (get alias-map x)
-                                           x))
-                                 init)
-                                init)]
-              (recur (inc i) (assoc result i [sym substituted]) alias-map))))))))
+        (let [[sym init] (nth result i)
+              init* (subst-aliases alias-map init)
+              tail (form/tail-symbol init*)]
+          (cond
+            ;; direct symbol alias — record + nil out (dead after substitution)
+            (and (symbol? init*) (not (:raster.effect/effectful (meta sym))))
+            (recur (inc i) (assoc result i [sym nil])
+                   (assoc alias-map sym (get alias-map init* init*)))
+
+            ;; effectful binding whose tail is a (different) symbol — record the alias
+            ;; for downstream substitution but KEEP the binding for its effects.
+            (and (symbol? tail) (not= tail sym) (not (symbol? init*)))
+            (recur (inc i) (assoc result i [sym init*])
+                   (assoc alias-map sym (get alias-map tail tail)))
+
+            :else
+            (recur (inc i) (assoc result i [sym init*]) alias-map)))))))
+
+(defn copy-propagate-let
+  "Copy-propagation on a (let* [bindings] body...) form: resolve alias bindings (see
+  inline-aliases) by substituting their target throughout subsequent bindings AND the
+  body, dropping nil'd (dead pure) alias bindings. Returns the rewritten let* (or the
+  form unchanged if not a let*). The single, shared copy-prop — backends should use
+  this rather than re-deriving aliasing."
+  [form]
+  (if-not (and (seq? form) (contains? #{'let* 'let} (first form)))
+    form
+    (let [[hd binds & body] form
+          {:keys [pairs aliases]} (inline-aliases (bindings->pairs binds))]
+      (cons hd (cons (pairs->bindings (remove-nil-bindings pairs))
+                     (map #(subst-aliases aliases %) body))))))
 
 ;; ================================================================
 ;; Peephole pattern registry

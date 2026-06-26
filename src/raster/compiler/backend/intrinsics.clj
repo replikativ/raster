@@ -170,18 +170,30 @@
 ;; the c-emit consumption shape {:kind :infix|:fn|:floored-mod :op str}, or nil
 ;; (→ caller falls back to a generated helper call). glsl? picks GLSL fn names.
 ;; ---------------------------------------------------------------------------
+(defn- desc->c-shape
+  "Descriptor map → the c-emit consumption shape {:kind :infix/:fn/:floored-mod :op}."
+  [d glsl?]
+  (when d
+    (let [c (:c d)]
+      (cond
+        (= :floored-mod c) {:kind :floored-mod}
+        (string? c)        {:kind :infix :op c}
+        (and (map? c) (:fn c)) {:kind :fn :op (if (and glsl? (:glsl c)) (:glsl c) (:fn c))}
+        :else nil))))
+
+(defn op->c-lowering
+  "C lowering for a SEMANTIC op (symbol/keyword, e.g. raster.numeric/* or :*) — the
+  clean metadata-driven path, read from a form's :raster.op/original. nil if not an
+  intrinsic."
+  [op glsl?]
+  (desc->c-shape (descriptor op) glsl?))
+
 (defn c-lowering
+  "C lowering from a MANGLED devirtualized impl name — the fallback when no
+  :raster.op/original metadata is present. Prefer op->c-lowering."
   [mangled-name glsl?]
   (when-let [i (str/index-of mangled-name "_m_")]
-    ;; The prefix before `_m_` is either a mangled operator prefix (e.g. `_star_`,
-    ;; resolved via mangled-prefix->key) or a function name (e.g. `sqrt`, resolved
-    ;; via name->key in `descriptor`). `descriptor` on a bare string only consults
-    ;; name->key, so operator prefixes must be mapped to their canonical key first.
+    ;; prefix before `_m_` is an operator prefix (_star_, via mangled-prefix->key) or a
+    ;; function name (sqrt, via name->key in descriptor).
     (let [prefix (subs mangled-name 0 i)]
-      (when-let [d (descriptor (or (mangled-prefix->key prefix) prefix))]
-      (let [c (:c d)]
-        (cond
-          (= :floored-mod c) {:kind :floored-mod}
-          (string? c)        {:kind :infix :op c}
-          (and (map? c) (:fn c)) {:kind :fn :op (if (and glsl? (:glsl c)) (:glsl c) (:fn c))}
-          :else nil))))))
+      (desc->c-shape (descriptor (or (mangled-prefix->key prefix) prefix)) glsl?))))
