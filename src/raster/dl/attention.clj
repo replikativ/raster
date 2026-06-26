@@ -190,6 +190,73 @@
                                                        a))))))))
                                    out)))
 
+;; --- RoPE at an absolute position offset (KV-cache decode) ---
+;; Like rope, but positions run pos-offset .. pos-offset+seq-1. Decode passes
+;; seq-len 1 and pos-offset = the new token's absolute position.
+(deftm rope-pos (All [T] [x :- (Array T) seq-len :- Long heads :- Long
+                          head-dim :- Long theta :- Double pos-offset :- Long]
+                     :- (Array T)
+                     (let [out (alloc-like x (* seq-len (* heads head-dim)))
+                           half (quot head-dim 2)
+                           ln-theta (m/log theta)]
+                       (dotimes [p seq-len]
+                         (dotimes [h heads]
+                           (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))
+                                 pos (+ pos-offset p)]
+                             (dotimes [i half]
+                               (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                     ang (* (double pos) freq)
+                                     c (m/cos ang) s (m/sin ang)
+                                     x0 (aget x (+ base i))
+                                     x1 (aget x (+ (+ base i) half))]
+                                 (aset out (+ base i) (- (* x0 c) (* x1 s)))
+                                 (aset out (+ (+ base i) half) (+ (* x1 c) (* x0 s))))))))
+                       out)))
+
+;; --- Single-query attention over a KV cache (decode step) ---
+;; q:[1, n_q, hd], k/v:[>=cache_len, n_kv, hd] (the cache; only first cache_len
+;; positions are read). The single query attends ALL cache_len keys (all causal).
+;; Returns [n_q*hd]. MQA/GQA via n_kv<n_q.
+(deftm gqa-decode-attention (All [T]
+                                 [q :- (Array T) k :- (Array T) v :- (Array T)
+                                  cache-len :- Long n-q :- Long n-kv :- Long
+                                  head-dim :- Long scale :- Double] :- (Array T)
+                                 (let [out (alloc-like q (* n-q head-dim))
+                                       group (quot n-q n-kv)
+                                       neg-inf (n/neg-inf-val (aget q 0))]
+                                   (dotimes [hq n-q]
+                                     (let [hkv (quot hq group)
+                                           qb (* hq (int head-dim))
+                                           sc (alloc-like q cache-len)
+                                           _ (dotimes [j cache-len]
+                                               (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
+                                                     dot (loop [d 0 acc 0.0]
+                                                           (if (< d head-dim)
+                                                             (recur (inc d)
+                                                                    (+ acc (* (aget q (+ qb d))
+                                                                              (aget k (+ kb d)))))
+                                                             acc))]
+                                                 (aset sc j (* dot scale))))
+                                           mx (loop [j 0 mm neg-inf]
+                                                (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
+                                           sum (loop [j 0 s 0.0]
+                                                 (if (< j cache-len)
+                                                   (let [e (m/exp (- (aget sc j) mx))]
+                                                     (aset sc j e) (recur (inc j) (+ s e)))
+                                                   s))
+                                           inv (/ 1.0 sum)
+                                           ob (* hq (int head-dim))]
+                                       (dotimes [d head-dim]
+                                         (aset out (+ ob d)
+                                               (loop [j 0 a 0.0]
+                                                 (if (< j cache-len)
+                                                   (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
+                                                     (recur (inc j)
+                                                            (+ a (* (* (aget sc j) inv)
+                                                                    (aget v (+ kvb d))))))
+                                                   a))))))
+                                   out)))
+
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
                                             seq-len :- Long dk :- Long dv :- Long]
