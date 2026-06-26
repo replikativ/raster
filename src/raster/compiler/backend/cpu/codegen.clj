@@ -81,7 +81,7 @@
       (let [c (str base ".c")]
         (spit c src)
         (let [r (-> (ProcessBuilder. ^java.util.List
-                                     (concat [cc] cflags [c "-o" so] link-libs))
+                     (concat [cc] cflags [c "-o" so] link-libs))
                     (.redirectErrorStream true) (.start))
               out (slurp (.getInputStream r))]
           (when-not (zero? (.waitFor r))
@@ -89,13 +89,22 @@
     so))
 
 (def ^:private linker (Linker/nativeLinker))
+
+(def ^:private scalar-layout
+  {:int ValueLayout/JAVA_INT :long ValueLayout/JAVA_LONG
+   :float ValueLayout/JAVA_FLOAT :double ValueLayout/JAVA_DOUBLE})
+
 (defn load-kernel
-  "Load a void(addr*, ..., int) kernel from a compiled .so. `n-ptrs` = number of
-  pointer args (arrays); trailing args are JAVA_INT scalars (default 1, the `n`)."
+  "Load a void(addr*, ..., scalars) kernel from a compiled .so. `n-ptrs` = number of
+  leading pointer args (arrays). `scalars` describes the trailing scalar args (in
+  order, after the arrays): either a COUNT (all JAVA_INT, the common counter case)
+  or a VECTOR of type keywords (:int/:long/:float/:double) when types are mixed
+  (e.g. a double `eps`). Pointers must precede scalars in the call."
   ([so name n-ptrs] (load-kernel so name n-ptrs 1))
-  ([so name n-ptrs n-ints]
-   (let [lib (SymbolLookup/libraryLookup ^String so (Arena/global))
-         layouts (concat (repeat n-ptrs ValueLayout/ADDRESS) (repeat n-ints ValueLayout/JAVA_INT))
+  ([so name n-ptrs scalars]
+   (let [stypes (if (number? scalars) (vec (repeat scalars :int)) (vec scalars))
+         lib (SymbolLookup/libraryLookup ^String so (Arena/global))
+         layouts (concat (repeat n-ptrs ValueLayout/ADDRESS) (map scalar-layout stypes))
          fd (FunctionDescriptor/ofVoid (into-array MemoryLayout layouts))
          mh (.downcallHandle linker (.orElseThrow (.find lib name)) fd
                              (into-array Linker$Option [(Linker$Option/critical true)]))]
@@ -103,10 +112,14 @@
        ;; Hint mh as MethodHandle (matches the BLAS bindings) so invokeWithArguments
        ;; isn't a reflective call. Per-call cost is dominated by critical(true)
        ;; heap-pinning of the array segments; amortized in the monolithic
-       ;; one-call-per-compiled-fn model.
-       (.invokeWithArguments ^java.lang.invoke.MethodHandle mh
-                             (object-array (map (fn [a] (if (number? a) (int a)
-                                                            (MemorySegment/ofArray a))) args)))))))
+       ;; one-call-per-compiled-fn model. Arrays first (pinned segments), then
+       ;; scalars marshalled to their declared primitive type.
+       (let [ptr-args (map #(MemorySegment/ofArray %) (take n-ptrs args))
+             scal-args (map (fn [t v] (case t :int (int v) :long (long v)
+                                            :float (float v) :double (double v)))
+                            stypes (drop n-ptrs args))]
+         (.invokeWithArguments ^java.lang.invoke.MethodHandle mh
+                               (object-array (concat ptr-args scal-args))))))))
 
 (defn compile-elementwise
   "Convenience: emit + compile + load an element-wise kernel. Returns a fn

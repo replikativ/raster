@@ -78,6 +78,43 @@
           (is (= (seq rq) (seq cq)) "int8 quantized output bit-exact")
           (is (= (seq rs) (seq cs)) "double per-block scales bit-exact"))))))
 
+;; ---- composed deftms must fuse into ONE C function (the rms-norm ∘ quant case) ----
+
+(deftm rmsnorm-k [x :- (Array double) w :- (Array double) n :- Long eps :- Double] :- (Array double)
+  (let [out (clojure.core/double-array n)
+        ms (loop [i 0 s 0.0] (if (clojure.core/< i n)
+                               (recur (clojure.core/inc i) (rn/+ s (rn/* (ra/aget x i) (ra/aget x i))))
+                               (rn// s (double n))))
+        inv (rn// 1.0 (rn/sqrt (rn/+ ms eps)))]
+    (dotimes [i n] (ra/aset out i (rn/* (rn/* (ra/aget x i) inv) (ra/aget w i))))
+    out))
+
+;; reuse quant-k (above) as the quantizer; compose: normalize then block-quantize.
+(deftm norm-quant-k [x :- (Array double) w :- (Array double) n :- Long nblk :- Long eps :- Double]
+  (quant-k (rmsnorm-k x w n eps) nblk))
+
+(deftest cpu-c-composed-deftms-fuse
+  (when (clang-available?)
+    (testing "rms-norm ∘ quant fuses into ONE C function; double eps param; tag-typed locals"
+      (let [n 64 nblk 2 eps 1.0e-6
+            x (double-array (map #(clojure.core/- (/ (double %) 9.0) 3.0) (range n)))
+            w (double-array (repeat n 1.3))
+            [rq rs] (norm-quant-k x w n nblk eps)
+            cfn (aot/compile-aot-c #'norm-quant-k :double)
+            src (:c-source (meta cfn))
+            [cq cs] (cfn x w n nblk eps)]
+        (is (= 1 (count (re-seq (re-pattern "void ") src)))
+            "the composition is a single fused C function, not two")
+        (is (clojure.string/includes? src "double eps")
+            "the Double scalar param is declared double, not int")
+        (is (= (seq rs) (seq cs)) "per-block scales bit-exact")
+        ;; q is within 1 ULP of the reference: -ffast-math reassociation in the
+        ;; reduction can shift a value across a rounding boundary (inference-grade,
+        ;; same as llama.cpp), so allow an off-by-one, never more.
+        (is (every? #(<= (Math/abs (- (int (first %)) (int (second %)))) 1)
+                    (map vector rq cq))
+            "int8 output within 1 ULP of the lazy-JIT reference")))))
+
 (deftest cpu-c-round-half-up
   (when (clang-available?)
     (testing "Math/round is half-up (floor(x+0.5)): negative .5 matches Java, not C round()"
