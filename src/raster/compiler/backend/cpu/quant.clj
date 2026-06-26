@@ -39,22 +39,29 @@
             (aset wq (+ (* b 16) k) (unchecked-byte (bit-or q0 (bit-shift-left q1 4))))))))
     {:wq wq :ws ws}))
 
+(defn- quantize-act-blocks!
+  "Quantize the 32-element blocks [r0, r0+cnt) of activation x into xq/xs/xsum
+  (per-block symmetric int8, d=max/127, with the per-block sum for the -8 fold).
+  Blocks are independent — this is the parallel work unit."
+  [^floats x ^bytes xq ^floats xs ^ints xsum r0 cnt]
+  (dotimes [i (long cnt)]
+    (let [r (+ (long r0) i) base (* r 32)
+          mx (loop [j 0 a 0.0] (if (< j 32) (recur (inc j) (max a (Math/abs (aget x (+ base j))))) a))
+          d (/ mx 127.0) id (if (zero? d) 0.0 (/ 1.0 d))]
+      (aset xs r (float d))
+      (aset xsum r (int (loop [k 0 s 0]
+                          (if (< k 32)
+                            (let [q (max -127 (min 127 (Math/round (* (aget x (+ base k)) id))))]
+                              (aset xq (+ base k) (unchecked-byte q)) (recur (inc k) (+ s (int q))))
+                            s)))))))
+
 (defn quantize-act-i8
   "f32 activation row(s) [M*in] → {:xq byte[M*in] :xs float[M*nb] :xsum int[M*nb]}
   per-block (32) symmetric int8, d=max/127, with per-block sum for the -8 correction."
   [^floats x M in]
   (let [nb (quot in 32)
         xq (byte-array (alength x)) xs (float-array (* M nb)) xsum (int-array (* M nb))]
-    (dotimes [r (* M nb)]
-      (let [base (* r 32)
-            mx (loop [j 0 a 0.0] (if (< j 32) (recur (inc j) (max a (Math/abs (aget x (+ base j))))) a))
-            d (/ mx 127.0) id (if (zero? d) 0.0 (/ 1.0 d))]
-        (aset xs r (float d))
-        (aset xsum r (int (loop [k 0 s 0]
-                            (if (< k 32)
-                              (let [q (max -127 (min 127 (Math/round (* (aget x (+ base k)) id))))]
-                                (aset xq (+ base k) (unchecked-byte q)) (recur (inc k) (+ s (int q))))
-                              s))))))
+    (quantize-act-blocks! x xq xs xsum 0 (* M nb))
     {:xq xq :xs xs :xsum xsum}))
 
 ;; ---- FORMAT DESCRIPTORS (data) ----
@@ -303,6 +310,33 @@
           (.runSlice t 0 (int n))  ; main = worker 0
           (let [need (dec (long n))]
             (while (< (.get arrive) need) (Thread/onSpinWait)))))))
+
+(defn run-par-fn!
+  "Public pooling entry for consumers (e.g. the decode loop's attention): runs
+  (f wid n) on every worker of the persistent pool, f writing a disjoint slice.
+  Serial at 1 thread."
+  [f]
+  (if (== 1 (int pool-threads))
+    (f 0 1)
+    (run-par! (reify IParTask (runSlice [_ wid n] (f wid n))))))
+
+(defn quantize-act-i8-par
+  "Pooled M=1 quantize-act-i8: the nb blocks are independent, so split them across
+  the SAME persistent pool the matmul uses — the otherwise-idle workers do the
+  quantization instead of spinning. Falls back to serial at 1 thread."
+  [^floats x in]
+  (let [nb (quot (int in) 32)
+        xq (byte-array (int in)) xs (float-array nb) xsum (int-array nb)]
+    (if (== 1 (int pool-threads))
+      (quantize-act-blocks! x xq xs xsum 0 nb)
+      (run-par!
+       (reify IParTask
+         (runSlice [_ wid n]
+           (let [chunk (quot (+ nb (dec (int n))) (int n))
+                 r0 (* (int wid) chunk)
+                 cnt (max 0 (min chunk (- nb r0)))]
+             (when (pos? cnt) (quantize-act-blocks! x xq xs xsum r0 cnt)))))))
+    {:xq xq :xs xs :xsum xsum}))
 
 (defn- matmul-slice-task
   "An IParTask: worker wid of n streams its disjoint output-row-group slice of one
