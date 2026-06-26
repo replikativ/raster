@@ -53,7 +53,18 @@
 ;; Form normalization for C emission.
 ;; ---------------------------------------------------------------------------
 
+;; element-keyword -> C type, and the maps from a deftm tag / array ctor to it.
+(def ^:private elem->ctype
+  {:double "double" :float "float" :long "long" :int "int" :byte "int8_t"})
+(def ^:private tag->elem
+  '{doubles :double double :double floats :float float :float longs :long long :long
+    ints :int int :int bytes :byte byte :byte})
+(def ^:private ctor->elem
+  '{clojure.core/double-array :double clojure.core/float-array :float
+    clojure.core/long-array :long clojure.core/int-array :int clojure.core/byte-array :byte})
+
 (def ^:private array-ctors '#{clojure.core/double-array clojure.core/float-array
+                              clojure.core/byte-array
                               clojure.core/long-array clojure.core/int-array})
 
 (defn- semantic-op
@@ -113,6 +124,15 @@
              (and (seq? f) (= 'dotimes (first f)))
              (desugar-dotimes f)
 
+             ;; devirtualized explicit array ops -> clojure.core forms (matched by
+             ;; SEMANTIC op, not impl name) so c-emit's aget/aset handlers fire and
+             ;; the element type follows the array's :raster.type/tag (e.g. int8 out).
+             (and (seq? f) (= '.invk (first f)) (= 'raster.arrays/aget (semantic-op f)))
+             (apply list 'clojure.core/aget (nnext f))
+
+             (and (seq? f) (= '.invk (first f)) (= 'raster.arrays/aset (semantic-op f)))
+             (apply list 'clojure.core/aset (nnext f))
+
              :else f))
          form)]
     {:form rewritten :length-syms @length-syms}))
@@ -137,18 +157,26 @@
     (second init)        ; (double-array <size>)
     (last init)))        ; (.invk zeros-like arr <size>)
 
+(defn- buffer-elem-type
+  "Element keyword of a buffer-alloc init: from the array ctor (double-array → :double,
+  byte-array → :byte) or, for zeros-like, the walker-stamped :raster.type/tag."
+  [init]
+  (or (ctor->elem (semantic-op init))
+      (tag->elem (:raster.type/tag (meta init)))
+      :double))
+
 (defn split-let
   "Split the outermost let* into buffer-alloc bindings and a stripped let* whose
   bindings are only the compute bindings (buffers become free vars = params).
   emit-stmt's let* handler then routes loop-valued bindings correctly (the bare
   loop* path mis-emits the loop's exit value).
-  Returns {:buffers [[sym size-expr]...] :stripped <let*-without-allocs>}."
+  Returns {:buffers [[sym size-expr elem-type]...] :stripped <let*-without-allocs>}."
   [form]
   (assert (and (seq? form) (= 'let* (first form))) (str "expected let*, got " (when (seq? form) (first form))))
   (let [[_ bindings & body] form
         pairs (partition 2 bindings)
         buffers (vec (for [[sym init] pairs :when (buffer-alloc? init)]
-                       [sym (buffer-size init)]))
+                       [sym (buffer-size init) (buffer-elem-type init)]))
         ;; scalar bindings (simple int/arith, not buffers or loops) — needed to
         ;; resolve buffer sizes that reference them (e.g. arg_n = (* n 1)).
         scalar-bindings (vec (for [[sym init] pairs
@@ -262,18 +290,19 @@
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
   [kernel-name dtype array-params scalar-params buffers length-syms stripped]
-  (let [ct (ctype dtype "double")
-        array-syms (set (concat array-params (map first buffers)))
-        ;; param order: input arrays, output buffers, scalar params, array lengths
+  (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
+        array-syms (set (concat (map first array-params) (map first buffers)))
+        ;; param order: input arrays, output buffers, scalar params, array lengths —
+        ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
-                    (map #(str "const " ct "* restrict " (ce/c-symbol %)) array-params)
-                    (map #(str ct "* restrict " (ce/c-symbol (first %))) buffers)
+                    (map (fn [[s c]] (str "const " c "* restrict " (ce/c-symbol s))) array-params)
+                    (map (fn [[s _ elem]] (str (elem->ctype elem "double") "* restrict " (ce/c-symbol s))) buffers)
                     (map (fn [[s t]] (str t " " (ce/c-symbol s))) scalar-params)
                     (map (fn [[_ ls]] (str "int " (ce/c-symbol ls))) (sort-by (comp str val) length-syms)))
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct]
                  (emit-host-stmt stripped array-syms ct))]
-    (str "#include <math.h>\n#include <stdbool.h>\n"
+    (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
          body-c
          "\n}\n")))
@@ -282,7 +311,7 @@
 ;; End-to-end: deftm var -> Panama-loaded native fn.
 ;; ---------------------------------------------------------------------------
 
-(def ^:private array-tags '#{doubles floats longs ints})
+(def ^:private array-tags '#{doubles floats longs ints bytes})
 
 (defn result-buffer-index
   "Which buffer the function returns: trace the let* body result through the
@@ -302,9 +331,9 @@
     (or (when result-sym (.indexOf buf-syms result-sym))
         (dec (count buffers)))))
 
-(defn- alloc-array [dtype n]
-  (case dtype :double (double-array n) :float (float-array n)
-        :long (long-array n) :int (int-array n)))
+(defn- alloc-array [elem n]
+  (case elem :double (double-array n) :float (float-array n)
+        :long (long-array n) :int (int-array n) :byte (byte-array n)))
 
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
@@ -318,7 +347,9 @@
         ;; r = (let* [..writes buf..] buf) from inlining residual-add, where r feeds a
         ;; later norm's reduction). Shared with the AD peephole — no bespoke aliasing.
         stripped (peephole/copy-propagate-let stripped)
-        array-params  (vec (filter #(contains? array-tags (get param-env %)) params))
+        ;; input array params as [sym ctype] (per-element type), scalars as [sym ctype]
+        array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
+                             [p (elem->ctype (tag->elem (get param-env p)) "double")]))
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
                              [p (ctype (get param-env p) "int")]))
         ;; stable length-sym order shared by signature + call site
@@ -346,9 +377,9 @@
               c @cache
               buf-arrs (if (and c (= (:sizes c) sizes))
                          (:bufs c)
-                         (let [b (mapv #(alloc-array dtype %) sizes)]
+                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) buffers sizes)]
                            (vreset! cache {:sizes sizes :bufs b}) b))
-              in-arrs  (map base-env array-params)
+              in-arrs  (map (comp base-env first) array-params)
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
               lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
           (apply native (concat in-arrs buf-arrs scalars lengths))

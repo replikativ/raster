@@ -207,12 +207,12 @@
 
 (def tag->ctype
   "Map walker :tag metadata to C type strings."
-  {'ints "int" 'floats "float" 'doubles "double" 'longs "long"
-   'int "int" 'float "float" 'double "double" 'long "long"})
+  {'ints "int" 'floats "float" 'doubles "double" 'longs "long" 'bytes "int8_t"
+   'int "int" 'float "float" 'double "double" 'long "long" 'byte "int8_t"})
 
 (def element-tag->c
   "Map primitive element-tag to C type string."
-  {'double "double" 'float "float" 'long "long" 'int "int"})
+  {'double "double" 'float "float" 'long "long" 'int "int" 'byte "int8_t"})
 
 ;; ================================================================
 ;; Symbol mangling

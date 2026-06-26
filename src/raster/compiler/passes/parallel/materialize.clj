@@ -17,13 +17,15 @@
   {:float  'clojure.core/float-array
    :double 'clojure.core/double-array
    :long   'clojure.core/long-array
-   :int    'clojure.core/int-array})
+   :int    'clojure.core/int-array
+   :byte   'clojure.core/byte-array})
 
 (def ^:private elem-type->array-tag
   {:float  'floats
    :double 'doubles
    :long   'longs
-   :int    'ints})
+   :int    'ints
+   :byte   'bytes})
 
 (defn- materialize-pure-map
   "Convert a pure par/map form into [alloc-binding effect-binding]: the binding
