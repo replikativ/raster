@@ -1035,8 +1035,12 @@
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
-           :infix (str "(" (str/join (str " " (:op c-op) " ")
-                                     (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
+           :infix (let [es (map #(emit-expr % idx-sym array-syms opencl-idx) args)]
+                    (if (= 1 (count es))
+                      ;; unary operator (e.g. negation `_minus__m_double`) — prefix
+                      ;; the operator; a str/join over one arg would drop it entirely.
+                      (str "(" (:op c-op) (first es) ")")
+                      (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
            :fn    (str (:op c-op) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
@@ -1060,8 +1064,12 @@
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
-           :infix (str "(" (str/join (str " " (:op c-op) " ")
-                                     (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
+           :infix (let [es (map #(emit-expr % idx-sym array-syms opencl-idx) args)]
+                    (if (= 1 (count es))
+                      ;; unary operator (e.g. negation `_minus__m_double`) — prefix
+                      ;; the operator; a str/join over one arg would drop it entirely.
+                      (str "(" (:op c-op) (first es) ")")
+                      (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
            :fn    (str (:op c-op) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
