@@ -341,19 +341,26 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count buffers))
                                 (+ (count scalar-params) (count len-order)))
-        result-idx (result-buffer-index stripped buffers)]
+        result-idx (result-buffer-index stripped buffers)
+        ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
+        ;; backend uses) — keyed by the resolved size signature, so repeated
+        ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
+        ;; returned buffer is overwritten on the next call.
+        cache (volatile! nil)]
     (with-meta
       (fn [& args]
         (let [base-env (zipmap params args)
-              ;; size-resolution env: params, array lengths, then derived scalars
               len-env (reduce (fn [m [arr ls]] (assoc m ls (count (get base-env arr))))
                               base-env len-order)
               env (reduce (fn [m [sym init]] (assoc m sym (resolve-int-expr init m)))
                           len-env scalar-bindings)
+              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) buffers)
+              c @cache
+              buf-arrs (if (and c (= (:sizes c) sizes))
+                         (:bufs c)
+                         (let [b (mapv #(alloc-array dtype %) sizes)]
+                           (vreset! cache {:sizes sizes :bufs b}) b))
               in-arrs  (map base-env array-params)
-              buf-arrs (mapv (fn [[_ size-expr]]
-                               (alloc-array dtype (long (resolve-int-expr size-expr env))))
-                             buffers)
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
               lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
           (apply native (concat in-arrs buf-arrs scalars lengths))
