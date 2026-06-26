@@ -253,38 +253,83 @@
   (decode GEMV) is implemented; :tile-gemm and GPU variants extend this map."
   {:stream-gemv {:repack repack-stream :emit emit-qmatmul-stream :n-ptrs 6 :n-ints 4}})
 
-;; DAEMON pool (so it never blocks JVM exit, unlike Executors' default non-daemon).
-;; Decode matmuls are MEMORY-bandwidth bound; threading aggregates bandwidth across
-;; cores. Only worthwhile for BIG matmuls (lm_head): small ones are fork-overhead bound.
-(defonce ^:private daemon-pool
-  (delay (java.util.concurrent.Executors/newFixedThreadPool
-          (.availableProcessors (Runtime/getRuntime))
-          (reify java.util.concurrent.ThreadFactory
-            (newThread [_ r] (doto (Thread. ^Runnable r) (.setDaemon true)))))))
+;; ---- persistent spin-barrier pool (the ggml model, in the JVM) -----------------
+;; Decode issues ~127 tiny matmuls/token. Forking an Executor per call (invokeAll)
+;; or entering an OpenMP region per call costs more than the work — measured WORSE
+;; than serial. llama.cpp instead keeps a PERSISTENT thread team that spins on an
+;; atomic between ops; kickoff is one atomic store, sync is a spin-barrier. We do the
+;; same: N-1 workers spin on `gen`; each matmul posts a task + bumps `gen`, every
+;; worker runs its output-row slice via a concurrent critical() call (these scale
+;; ~3.16x/4t over shared heap arrays — verified), then a spin-barrier on `arrive`.
+(definterface IParTask (^void runSlice [^int wid ^int n]))
 
-(def ^:private thread-min-out 4096) ;; below this, fork overhead > the work; run serial
+(def ^:private pool-threads
+  (max 1 (or (some-> (System/getenv "RASTER_DECODE_THREADS") Integer/parseInt) 1)))
+
+(defonce ^:private the-pool
+  (delay
+    (let [n     pool-threads
+          gen   (java.util.concurrent.atomic.AtomicLong. 0)
+          arrive (java.util.concurrent.atomic.AtomicLong. 0)
+          task  (java.util.concurrent.atomic.AtomicReference.)]
+      (dotimes [w (dec n)]
+        (let [wid (inc w)]
+          (doto (Thread.
+                 (fn []
+                   (let [g (long-array 1)]
+                     (loop []
+                       (let [cur (.get gen)]
+                         (if (== cur (aget g 0))
+                           (do (Thread/onSpinWait) (recur))
+                           (do (aset g 0 cur)
+                               (.runSlice ^IParTask (.get task) wid n)
+                               (.incrementAndGet arrive)
+                               (recur))))))))
+            (.setDaemon true) (.setName (str "raster-decode-" wid)) (.start))))
+      {:gen gen :arrive arrive :task task :n n})))
+
+(defn run-par!
+  "Run `t` across the persistent pool: worker i of n runs (.runSlice t i n). The
+  caller is worker 0; it busy-waits on the spin-barrier until the n-1 workers finish."
+  [^IParTask t]
+  (let [{:keys [^java.util.concurrent.atomic.AtomicLong gen
+                ^java.util.concurrent.atomic.AtomicLong arrive
+                ^java.util.concurrent.atomic.AtomicReference task n]} @the-pool]
+    (if (== 1 (int n))
+      (.runSlice t 0 1)
+      (do (.set arrive 0)
+          (.set task t)            ; volatile store, visible before the gen bump
+          (.incrementAndGet gen)   ; full fence — releases the spinning workers
+          (.runSlice t 0 (int n))  ; main = worker 0
+          (let [need (dec (long n))]
+            (while (< (.get arrive) need) (Thread/onSpinWait)))))))
+
+(defn- matmul-slice-task
+  "An IParTask: worker wid of n streams its disjoint output-row-group slice of one
+  :stream-gemv into the shared y (groups are NC=8 cols; o_start/o_count in cols)."
+  ^IParTask [k xq xs xsum wqi wsi y in out]
+  (let [ng (quot (int out) 8)]
+    (reify IParTask
+      (runSlice [_ wid n]
+        (let [chunk (quot (+ ng (dec (int n))) (int n))
+              g0 (* (int wid) chunk)
+              cnt (max 0 (min chunk (- ng g0)))]
+          (when (pos? cnt)
+            (k xq xs xsum wqi wsi y in out (* g0 8) (* cnt 8))))))))
 
 (defn compile-qmatmul-stream
   "Compile the :stream-gemv decode kernel. Returns a fn (xq xs xsum wqi wsi y in out)
-  over a repack-stream weight. With n-threads>1, BIG matmuls (out>=4096, e.g. lm_head)
-  split their output-column groups across a daemon pool — each thread streams a disjoint
-  weight slice into a disjoint y slice (no shared writes), aggregating memory bandwidth."
+  over a repack-stream weight. Each call splits its output-row groups across the
+  persistent spin-barrier pool (RASTER_DECODE_THREADS, default 1) — every worker
+  streams a disjoint weight slice into a disjoint y slice via a concurrent critical
+  call, synchronized by a spin-barrier. The n-threads arg is kept for API symmetry."
   ([name format mac] (compile-qmatmul-stream name format mac 1))
-  ([name format mac n-threads]
+  ([name format mac _n-threads]
    (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul-stream name format mac)) name 6 4)]
-     (if (<= n-threads 1)
-       (fn [xq xs xsum wqi wsi y in out] (k xq xs xsum wqi wsi y in out 0 out))
-       (let [p @daemon-pool]
-         (fn [xq xs xsum wqi wsi y in out]
-           (if (< (int out) thread-min-out)
-             (k xq xs xsum wqi wsi y in out 0 out)
-             (let [ng (quot (int out) 8) chunk-g (quot (+ ng (dec (int n-threads))) (int n-threads))
-                   tasks (for [t (range n-threads)
-                               :let [g0 (* t chunk-g 8) cnt (min (* chunk-g 8) (- (int out) g0))]
-                               :when (pos? cnt)]
-                           (reify java.util.concurrent.Callable
-                             (call [_] (k xq xs xsum wqi wsi y in out g0 cnt) nil)))]
-               (doseq [f (.invokeAll p tasks)] (.get f))))))))))
+     (fn [xq xs xsum wqi wsi y in out]
+       (if (== 1 (int pool-threads))
+         (k xq xs xsum wqi wsi y in out 0 out)
+         (run-par! (matmul-slice-task k xq xs xsum wqi wsi y in out)))))))
 
 ;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
 ;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
