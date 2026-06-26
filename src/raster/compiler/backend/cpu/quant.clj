@@ -17,6 +17,46 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.cpu.codegen :as cpu]))
 
+;; ---- encode side: quantizers matching the q4-0 kernel (interleaved pack) ----
+(defn quantize-weight-q4
+  "f32 weight (len % 32 = 0) → {:wq byte[len/2] :ws float[len/32]}, interleaved
+  Q4_0 pack (byte k of a block holds w[k] low / w[k+16] high), symmetric d=max/-8."
+  [^floats w]
+  (let [len (alength w) nb (quot len 32)
+        wq (byte-array (quot len 2)) ws (float-array nb)]
+    (dotimes [b nb]
+      (let [base (* b 32)
+            mx (loop [j 0 a 0.0 v 0.0]
+                 (if (< j 32)
+                   (let [x (aget w (+ base j)) ax (Math/abs x)]
+                     (if (> ax a) (recur (inc j) ax x) (recur (inc j) a v)))
+                   v))
+            d (/ mx -8.0) id (if (zero? d) 0.0 (/ 1.0 d))]
+        (aset ws b (float d))
+        (dotimes [k 16]
+          (let [q0 (max 0 (min 15 (+ (Math/round (* (aget w (+ base k)) id)) 8)))
+                q1 (max 0 (min 15 (+ (Math/round (* (aget w (+ base k 16)) id)) 8)))]
+            (aset wq (+ (* b 16) k) (unchecked-byte (bit-or q0 (bit-shift-left q1 4))))))))
+    {:wq wq :ws ws}))
+
+(defn quantize-act-i8
+  "f32 activation row(s) [M*in] → {:xq byte[M*in] :xs float[M*nb] :xsum int[M*nb]}
+  per-block (32) symmetric int8, d=max/127, with per-block sum for the -8 correction."
+  [^floats x M in]
+  (let [nb (quot in 32)
+        xq (byte-array (alength x)) xs (float-array (* M nb)) xsum (int-array (* M nb))]
+    (dotimes [r (* M nb)]
+      (let [base (* r 32)
+            mx (loop [j 0 a 0.0] (if (< j 32) (recur (inc j) (max a (Math/abs (aget x (+ base j))))) a))
+            d (/ mx 127.0) id (if (zero? d) 0.0 (/ 1.0 d))]
+        (aset xs r (float d))
+        (aset xsum r (int (loop [k 0 s 0]
+                            (if (< k 32)
+                              (let [q (max -127 (min 127 (Math/round (* (aget x (+ base k)) id))))]
+                                (aset xq (+ base k) (unchecked-byte q)) (recur (inc k) (+ s (int q))))
+                              s))))))
+    {:xq xq :xs xs :xsum xsum}))
+
 ;; ---- FORMAT DESCRIPTORS (data) ----
 (def q4-0
   "Symmetric 4-bit, block 32, two nibbles/byte, interleaved (lo=w[0..15],
