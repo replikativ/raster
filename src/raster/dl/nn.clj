@@ -411,6 +411,10 @@
                          h (broadcast [g u] (* g u))]
                      (linear-nb h down-w rows d-ff d-model))))
 
+;; Elementwise residual add: out = a + b (parametric; for transformer residuals).
+(deftm residual-add (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
+                         (broadcast [a b] (+ a b))))
+
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
 (deftm group-norm (All [T] [x :- (Array T) gamma :- (Array T)
