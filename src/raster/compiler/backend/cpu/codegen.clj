@@ -62,16 +62,26 @@
 (def ^:private cache-dir (let [d (io/file (System/getProperty "java.io.tmpdir") "raster-cpu-kernels")]
                            (.mkdirs d) (.getAbsolutePath d)))
 
+(def ^:private cflags
+  "clang flags. -ffast-math + -fveclib=libmvec let the LLVM vectorizer reassociate
+  reductions AND call glibc's vector transcendentals (e.g. _ZGVdN4v_exp) — the
+  equivalent of the JVM Vector API's lanewise EXP. Without these, exp/log loops stay
+  scalar (libm) and lose to the JVM. Inference-grade precision (matches llama.cpp)."
+  ["-O3" "-march=native" "-funroll-loops" "-ffast-math" "-fveclib=libmvec"
+   "-shared" "-fPIC"])
+
+(def ^:private link-libs ["-lmvec" "-lm"])
+
 (defn compile-source!
-  "Compile C source to a cached .so (-O3 -march=native -shared -fPIC). Returns path."
+  "Compile C source to a cached .so. Returns path."
   [^String src]
   (let [base (str cache-dir "/k_" (sha src))
         so (str base ".so")]
     (when-not (.exists (io/file so))
       (let [c (str base ".c")]
         (spit c src)
-        (let [r (-> (ProcessBuilder. [cc "-O3" "-march=native" "-funroll-loops"
-                                      "-shared" "-fPIC" c "-o" so])
+        (let [r (-> (ProcessBuilder. ^java.util.List
+                                     (concat [cc] cflags [c "-o" so] link-libs))
                     (.redirectErrorStream true) (.start))
               out (slurp (.getInputStream r))]
           (when-not (zero? (.waitFor r))
