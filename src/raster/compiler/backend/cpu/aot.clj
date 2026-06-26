@@ -19,7 +19,8 @@
   (:require [clojure.walk :as walk]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.gpu.c-emit :as ce]
-            [raster.compiler.backend.cpu.codegen :as cpu]))
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.intrinsics :as intrinsics]))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -174,19 +175,19 @@
       (cond
         (= 'int op)  (long (resolve-int-expr (second expr) env))
         (= 'long op) (long (resolve-int-expr (second expr) env))
-        (= '.invk op)
-        (let [nm (name (second expr))
-              as (map #(resolve-int-expr % env) (nnext expr))
-              [a b] as]
-          (cond (re-find #"_star_" nm)  (* a b)
-                (re-find #"_plus_" nm)  (+ a b)
-                (re-find #"_minus_" nm) (if (= 2 (count as)) (- a b) (- a))
-                (re-find #"_div_" nm)   (quot a b)
-                :else a))
-        (#{'* 'clojure.core/*} op) (apply * (map #(resolve-int-expr % env) (rest expr)))
-        (#{'+ 'clojure.core/+} op) (apply + (map #(resolve-int-expr % env) (rest expr)))
-        (#{'- 'clojure.core/-} op) (apply - (map #(resolve-int-expr % env) (rest expr)))
-        :else (throw (ex-info (str "resolve-int-expr: unhandled " (pr-str expr)) {:expr expr}))))
+        ;; arithmetic — classify the operator via the shared intrinsics registry
+        ;; (handles both devirtualized .invk impl symbols and bare/qualified core
+        ;; ops) instead of an ad-hoc name regex.
+        :else
+        (let [[opsym args] (if (= '.invk op) [(second expr) (nnext expr)] [op (rest expr)])
+              k (intrinsics/canonical opsym)
+              as (map #(resolve-int-expr % env) args)]
+          (case k
+            :+   (apply + as)
+            :-   (if (= 1 (count as)) (- (first as)) (apply - as))
+            :*   (apply * as)
+            :div (apply quot as)
+            (throw (ex-info (str "resolve-int-expr: unhandled op " (pr-str expr)) {:expr expr}))))))
     :else (throw (ex-info (str "resolve-int-expr: unhandled " (pr-str expr)) {:expr expr}))))
 
 (def ^:private ctype {:double "double" :float "float" :long "long" :int "int"})
