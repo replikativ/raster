@@ -98,3 +98,40 @@
                       a))]
           (aset y (clojure.core/+ (clojure.core/* m out-dim) o) acc))))
     y))
+
+;; Fast CPU kernel (primitive Clojure, no boxing). The deftm above boxes on byte[]
+;; reads + mixed int/float math (~1900x slower than BLAS); this hand-primitive
+;; version is ~156x faster and is what the CPU quantized forward uses. The deftm
+;; is kept for GPU lowering (where the body becomes a kernel). Same math/layout.
+(defn dequant-matmul-q4-fast
+  "y[M,out] = x[M,in] @ dequant(W[out,in])^T, primitive (clojure.core math, ^bytes/
+  ^floats, double accumulation). qs/ds from quantize-q4. Drop-in fast path."
+  [^floats x ^bytes qs ^floats ds M in out]
+  (let [M (long M) in (long in) out (long out)
+        y (float-array (clojure.core/* M out))
+        nblk (quot in 32)]
+    (dotimes [m M]
+      (let [xrow (clojure.core/* m in)]
+        (dotimes [o out]
+          (let [rb0 (quot (clojure.core/* o in) 32)
+                ob (clojure.core/* o in)
+                acc (loop [blk 0 a 0.0]
+                      (if (clojure.core/< blk nblk)
+                        (let [d (double (clojure.core/aget ds (clojure.core/+ rb0 blk)))
+                              i0 (clojure.core/* blk 32)
+                              byte0 (clojure.core/+ (quot ob 2) (quot i0 2))
+                              xa (clojure.core/+ xrow i0)
+                              ba (loop [k 0 s 0.0]
+                                   (if (clojure.core/< k 16)
+                                     (let [bv (clojure.core/bit-and (clojure.core/int (clojure.core/aget qs (clojure.core/+ byte0 k))) 0xFF)
+                                           q0 (clojure.core/- (clojure.core/bit-and bv 0xF) 8)
+                                           q1 (clojure.core/- (clojure.core/unsigned-bit-shift-right bv 4) 8)
+                                           x0 (double (clojure.core/aget x (clojure.core/+ xa (clojure.core/* 2 k))))
+                                           x1 (double (clojure.core/aget x (clojure.core/+ xa (clojure.core/+ (clojure.core/* 2 k) 1))))]
+                                       (recur (clojure.core/inc k)
+                                              (clojure.core/+ s (clojure.core/+ (clojure.core/* x0 q0) (clojure.core/* x1 q1)))))
+                                     s))]
+                          (recur (clojure.core/inc blk) (clojure.core/+ a (clojure.core/* d ba))))
+                        a))]
+            (clojure.core/aset y (clojure.core/+ (clojure.core/* m out) o) (float acc))))))
+    y))
