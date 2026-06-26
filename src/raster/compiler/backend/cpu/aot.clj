@@ -252,30 +252,41 @@
           then (nth ifbody 2)
           do-stmts (butlast (rest then))
           step (second (last then))]
-      (str "for (int " (ce/c-symbol iv) " = " (emit-expr* init array-syms) "; "
-           (emit-expr* test array-syms) "; "
-           (ce/c-symbol iv) " = " (emit-expr* step array-syms) ") {\n    "
-           (clojure.string/join "\n    " (map #(ce/emit-stmt % nil array-syms "idx") do-stmts))
-           "\n  }"))
+      ;; iv is the int counter declared by this for-loop — visible to the body so
+      ;; index math derived from it (and the test/step) types as int.
+      (binding [ce/*int-vars* (conj ce/*int-vars* iv)]
+        (str "for (int " (ce/c-symbol iv) " = " (emit-expr* init array-syms) "; "
+             (emit-expr* test array-syms) "; "
+             (ce/c-symbol iv) " = " (emit-expr* step array-syms) ") {\n    "
+             (clojure.string/join "\n    " (map #(ce/emit-stmt % nil array-syms "idx") do-stmts))
+             "\n  }")))
 
     (and (seq? form) (= 'let* (first form)))
-    (let [[_ binds & body] form]
-      (str (clojure.string/join
-            "\n  "
-            (for [[sym init] (partition 2 binds)]
-              (if (or (map-loop? init)
-                      (and (seq? init) (#{'let* 'loop*} (first init))))
+    (let [[_ binds & body] form
+          pairs (partition 2 binds)
+          loop-init? (fn [init] (or (map-loop? init)
+                                    (and (seq? init) (#{'let* 'loop*} (first init)))))
+          ;; outer scalar bindings are declared `int` (ct-int) — seed them so loops
+          ;; that index off them type correctly.
+          scalar-syms (for [[sym init] pairs :when (not (loop-init? init))] sym)]
+      (binding [ce/*int-vars* (into ce/*int-vars* scalar-syms)]
+        (str (clojure.string/join
+              "\n  "
+              (for [[sym init] pairs]
+                (if (loop-init? init)
                 ;; buffer-writing loop / nested compute — emit for side effects,
                 ;; the binding sym (a result buffer) is discarded.
-                (emit-host-stmt init array-syms ct)
+                  (emit-host-stmt init array-syms ct)
                 ;; scalar binding (e.g. n = (int len_x)) — declare it.
-                (str ct-int " " (ce/c-symbol sym) " = " (emit-expr* init array-syms) ";"))))
-           "\n  "
-           ;; body: emit non-symbol forms (drop the trailing result sym)
-           (clojure.string/join
-            "\n  "
-            (for [b body :when (not (symbol? b))]
-              (emit-host-stmt b array-syms ct)))))
+                  (str ct-int " " (ce/c-symbol sym) " = " (emit-expr* init array-syms) ";"))))
+             "\n  "
+           ;; body: emit statement forms only. The function is void; the trailing
+           ;; result value (a buffer symbol, or a vector [q scales] of them for a
+           ;; multi-output kernel) is data for the host wrapper, NOT a C statement.
+             (clojure.string/join
+              "\n  "
+              (for [b body :when (not (or (symbol? b) (vector? b)))]
+                (emit-host-stmt b array-syms ct))))))
 
     :else (ce/emit-stmt form nil array-syms "idx")))
 
@@ -299,8 +310,12 @@
                     (map (fn [[s _ elem]] (str (elem->ctype elem "double") "* restrict " (ce/c-symbol s))) buffers)
                     (map (fn [[s t]] (str t " " (ce/c-symbol s))) scalar-params)
                     (map (fn [[_ ls]] (str "int " (ce/c-symbol ls))) (sort-by (comp str val) length-syms)))
+        ;; scalar params and array-length params are all int — seed them so index
+        ;; arithmetic bound to a name (base = b*n) types as int, not *scalar-type*.
+        int-seed (set (concat (map first scalar-params) (vals length-syms)))
         body-c (binding [ce/*emit-config* cpu/cpu-config
-                         ce/*scalar-type* ct]
+                         ce/*scalar-type* ct
+                         ce/*int-vars* int-seed]
                  (emit-host-stmt stripped array-syms ct))]
     (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
@@ -313,23 +328,32 @@
 
 (def ^:private array-tags '#{doubles floats longs ints bytes})
 
-(defn result-buffer-index
-  "Which buffer the function returns: trace the let* body result through the
-  compute-binding aliases (sym -> the symbol its init returns) to a buffer symbol.
-  Returns the index into `buffers`, defaulting to the last buffer."
+(defn result-buffers
+  "Which buffer(s) the function returns, and in what shape. Inspects the stripped
+  let* body tail: a bare symbol returns ONE buffer (the common case); a vector
+  literal [a b ...] returns SEVERAL (the fused multi-output kernel, e.g. [q scales]
+  from norm+blockquant). Each returned position is traced through the compute-binding
+  aliases (sym -> the symbol its init returns) to a buffer symbol.
+  Returns {:shape :scalar|:vector :indices [i ...]} (indices into `buffers`,
+  defaulting to the last buffer when a position can't be resolved)."
   [stripped buffers]
   (let [[_ binds & body] stripped
         buf-syms (mapv first buffers)
         buf-set (set buf-syms)
         aliases (into {} (for [[sym init] (partition 2 binds)]
                            [sym (form/tail-symbol init)]))
-        resolve (fn resolve [s seen]
-                  (cond (buf-set s) s
-                        (or (nil? s) (contains? seen s)) nil
-                        :else (resolve (get aliases s) (conj seen s))))
-        result-sym (resolve (form/tail-symbol (last body)) #{})]
-    (or (when result-sym (.indexOf buf-syms result-sym))
-        (dec (count buffers)))))
+        resolve-buf (fn resolve-buf [s seen]
+                      (cond (buf-set s) s
+                            (or (nil? s) (contains? seen s)) nil
+                            :else (recur (get aliases s) (conj seen s))))
+        idx-of (fn [x]
+                 (let [s (if (symbol? x) x (form/tail-symbol x))
+                       b (resolve-buf s #{})]
+                   (or (when b (.indexOf buf-syms b)) (dec (count buffers)))))
+        tail (last body)]
+    (if (vector? tail)
+      {:shape :vector :indices (mapv idx-of tail)}
+      {:shape :scalar :indices [(idx-of tail)]})))
 
 (defn- alloc-array [elem n]
   (case elem :double (double-array n) :float (float-array n)
@@ -360,7 +384,7 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count buffers))
                                 (+ (count scalar-params) (count len-order)))
-        result-idx (result-buffer-index stripped buffers)
+        {result-shape :shape result-indices :indices} (result-buffers stripped buffers)
         ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
         ;; backend uses) — keyed by the resolved size signature, so repeated
         ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
@@ -383,5 +407,7 @@
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
               lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
           (apply native (concat in-arrs buf-arrs scalars lengths))
-          (nth buf-arrs result-idx)))
+          (case result-shape
+            :vector (mapv #(nth buf-arrs %) result-indices)
+            (nth buf-arrs (first result-indices)))))
       {:c-source src :kernel-name kernel-name})))
