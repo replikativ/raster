@@ -259,29 +259,33 @@
 
 (deftm gqa-decode-attention-heads! (All [T]
                                         [q :- (Array T) k :- (Array T) v :- (Array T) out :- (Array T)
-                                         cache-len :- Long h0 :- Long h-cnt :- Long group :- Long
-                                         n-kv :- Long head-dim :- Long scale :- Double] :- Long
+                                         cache-len :- Long kv-start :- Long h0 :- Long h-cnt :- Long
+                                         group :- Long n-kv :- Long head-dim :- Long scale :- Double] :- Long
                                         ;; Like gqa-decode-attention but computes only heads [h0, h0+h-cnt)
-                                        ;; into a CALLER-provided `out` — so the decode loop can split the
-                                        ;; (independent) heads across the persistent pool. Returns 0.
-                                        (let [neg-inf (n/neg-inf-val (aget q 0))]
+                                        ;; into a CALLER-provided `out` (so the decode loop can split heads
+                                        ;; across the pool), and attends only KV positions [kv-start, cache-len)
+                                        ;; — kv-start>0 implements sliding-window attention. Returns 0.
+                                        (let [neg-inf (n/neg-inf-val (aget q 0))
+                                              j0 (long kv-start)]
                                           (dotimes [hi h-cnt]
                                             (let [hq (clojure.core/+ (long h0) hi)
                                                   hkv (quot hq group)
                                                   qb (* hq (int head-dim))
                                                   sc (alloc-like q cache-len)
-                                                  _ (dotimes [j cache-len]
-                                                      (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
-                                                            dot (loop [d 0 acc 0.0]
-                                                                  (if (< d head-dim)
-                                                                    (recur (inc d)
-                                                                           (+ acc (* (aget q (+ qb d))
-                                                                                     (aget k (+ kb d)))))
-                                                                    acc))]
-                                                        (aset sc j (* dot scale))))
-                                                  mx (loop [j 0 mm neg-inf]
+                                                  _ (loop [j j0]
+                                                      (when (< j cache-len)
+                                                        (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
+                                                              dot (loop [d 0 acc 0.0]
+                                                                    (if (< d head-dim)
+                                                                      (recur (inc d)
+                                                                             (+ acc (* (aget q (+ qb d))
+                                                                                       (aget k (+ kb d)))))
+                                                                      acc))]
+                                                          (aset sc j (* dot scale)))
+                                                        (recur (inc j))))
+                                                  mx (loop [j j0 mm neg-inf]
                                                        (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
-                                                  sum (loop [j 0 s 0.0]
+                                                  sum (loop [j j0 s 0.0]
                                                         (if (< j cache-len)
                                                           (let [e (m/exp (- (aget sc j) mx))]
                                                             (aset sc j e) (recur (inc j) (+ s e)))
@@ -290,7 +294,7 @@
                                                   ob (* hq (int head-dim))]
                                               (dotimes [d head-dim]
                                                 (aset out (+ ob d)
-                                                      (loop [j 0 a 0.0]
+                                                      (loop [j j0 a 0.0]
                                                         (if (< j cache-len)
                                                           (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
                                                             (recur (inc j)
