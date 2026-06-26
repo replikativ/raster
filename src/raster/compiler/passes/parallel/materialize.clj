@@ -26,9 +26,11 @@
    :int    'ints})
 
 (defn- materialize-pure-map
-  "Convert a pure par/map form to an [alloc-binding map!-binding] pair.
-  Returns [[out-sym alloc-expr] [result-sym map!-expr]] where result-sym
-  is the original let-binding symbol."
+  "Convert a pure par/map form into [alloc-binding effect-binding]: the binding
+  symbol ITSELF becomes the buffer (allocated), and the par/map! writes it in place
+  as an effect. This avoids introducing a redundant alias (sym = a fresh out-buffer)
+  that every backend would then have to copy-propagate away.
+  Returns [[result-sym alloc-expr] [effect-sym map!-expr]]."
   [sym form]
   (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info form)
         ;; Derive elem-type from cast-fn if metadata doesn't carry it
@@ -47,15 +49,16 @@
         array-tag (or (get elem-type->array-tag elem-type)
                       (throw (ex-info (str "materialize: no array-tag for elem-type " elem-type)
                                       {:elem-type elem-type})))
-        out-sym (with-meta (gensym "out__")
+        ;; the binding symbol IS the buffer (no separate out-sym alias)
+        buf-sym (with-meta sym
                   {:tag array-tag
                    :raster.type/tag array-tag
                    :raster.buffer/hoistable true})
         map!-form (with-meta
-                    (list 'raster.par/map! out-sym idx bound cast body)
+                    (list 'raster.par/map! sym idx bound cast body)
                     (meta form))]
-    [[out-sym (list alloc-fn bound)]
-     [sym map!-form]]))
+    [[buf-sym (list alloc-fn bound)]
+     [(gensym "_mapeff_") map!-form]]))
 
 (defn- materialize-expr
   "Recursively materialize pure par/map forms in an expression.
@@ -64,9 +67,10 @@
   (cond
     (par/par-map-pure-form? expr)
     (let [result-sym (gensym "result__")
-          [[out-sym alloc-expr] [_ map!-form]] (materialize-pure-map result-sym expr)]
-      (list 'let* [out-sym alloc-expr
-                   result-sym map!-form]
+          ;; buf-sym IS result-sym now (the buffer); eff-sym is the in-place map! write
+          [[buf-sym alloc-expr] [eff-sym map!-form]] (materialize-pure-map result-sym expr)]
+      (list 'let* [buf-sym alloc-expr
+                   eff-sym map!-form]
             result-sym))
 
     (and (seq? expr) (= 'let* (first expr)))
@@ -86,9 +90,9 @@
         new-pairs (mapcat
                    (fn [[sym init]]
                      (if (par/par-map-pure-form? init)
-                       (let [[[out-sym alloc-expr] [sym' map!-form]]
-                             (materialize-pure-map sym init)]
-                         [[out-sym alloc-expr] [sym' map!-form]])
+                       ;; [sym alloc] (sym IS the buffer) + [eff map!-into-sym]
+                       (let [[buf-pair eff-pair] (materialize-pure-map sym init)]
+                         [buf-pair eff-pair])
                        [[sym (materialize-expr init)]]))
                    pairs)
         new-bindings (vec (mapcat identity new-pairs))
