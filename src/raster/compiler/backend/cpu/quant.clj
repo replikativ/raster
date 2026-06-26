@@ -86,3 +86,34 @@
   [name format mac]
   (let [src (emit-qmatmul name format mac)]
     (cpu/load-kernel (cpu/compile-source! src) name 6 3)))
+
+;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
+;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
+;; scalar int8 MAC (SIMT supplies the parallelism — `dot()`/DPAS via
+;; cl_khr_integer_dot_product / cl_intel_subgroup_matrix_multiply_accumulate is
+;; the peak follow-on, the GPU analogue of maddubs). Same data descriptor drives
+;; the unpack; only the scaffold (work-item vs host loop) and MAC spelling differ.
+(defn emit-qmatmul-opencl
+  "Emit the OpenCL kernel for FORMAT. Compiles for the Arc (ocloc -device lnl)."
+  [name {:keys [block zero-point weight-bits]}]
+  (assert (= weight-bits 4) "opencl unpack described for 4-bit")
+  (str "__kernel void " name "(__global const char* xq, __global const float* xs,\n"
+       "    __global const int* xsum, __global const uchar* wq,\n"
+       "    __global const float* ws, __global float* y, int in_, int out_) {\n"
+       "  int o = get_global_id(0); if (o >= out_) return;\n"
+       "  int nb = in_/" block ";\n"
+       "  __global const uchar* wrow = wq + (long)o*in_/2;\n"
+       "  __global const float* wsr = ws + (long)o*nb;\n"
+       "  float acc = 0.f, corr = 0.f;\n"
+       "  for (int b = 0; b < nb; b++) {\n"
+       "    __global const uchar* wb = wrow + b*16;\n"
+       "    __global const char* xb = xq + b*32;\n"
+       "    int s = 0;\n"
+       "    for (int k = 0; k < 16; k++) {\n"
+       "      s += (int)xb[k]    * (((int)(wb[k] & 0xF)) - " zero-point ");\n"
+       "      s += (int)xb[k+16] * (((int)(wb[k] >> 4)) - " zero-point ");\n"
+       "    }\n"
+       "    float scale = xs[b]*wsr[b]; acc += scale*s; corr += scale*xsum[b];\n"
+       "  }\n"
+       "  y[o] = acc - " zero-point ".f*corr;\n"
+       "}\n"))
