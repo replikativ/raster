@@ -70,11 +70,24 @@
 (defn- alength-arg [form]
   (if (= '.invk (first form)) (nth form 2) (second form)))
 
+(defn- desugar-dotimes
+  "(dotimes [iv bound] body...) -> (loop* [iv (int 0)] (if (< iv bound)
+     (do body... (recur (+ iv 1))) iv)). Base is the induction var (harmless;
+   the loop is side-effecting). Lets the shared emit-stmt / our map-loop matcher
+   treat it as a counted loop."
+  [form]
+  (let [[_ binds & body] form
+        iv (first binds) bound (second binds)]
+    (list 'loop* [iv (list 'int 0)]
+          (list 'if (list 'clojure.core/< iv bound)
+                (concat (list 'do) body (list (list 'recur (list 'clojure.core/+ iv 1))))
+                iv))))
+
 (defn normalize-for-c
   "Rewrite IR idioms the bare emitter doesn't yet lower to C:
+   - (dotimes [i bound] ...)  -> counted loop* (see desugar-dotimes)
    - (alength arr)            -> a per-array length symbol  len_<arr>
    - (unchecked-inc-int x)    -> (clojure.core/+ x 1)
-   - (unchecked-inc x)        -> (clojure.core/+ x 1)
    Returns {:form rewritten :length-syms {arr len-sym}}."
   [form]
   (let [length-syms (atom {})
@@ -93,6 +106,9 @@
                               'unchecked-inc-int 'unchecked-inc} (first f)))
              (list 'clojure.core/+ (second f) 1)
 
+             (and (seq? f) (= 'dotimes (first f)))
+             (desugar-dotimes f)
+
              :else f))
          form)]
     {:form rewritten :length-syms @length-syms}))
@@ -101,10 +117,25 @@
 ;; Host function emission.
 ;; ---------------------------------------------------------------------------
 
+(def ^:private zeros-like-impls
+  #{'raster.arrays/zeros-like_m_doubles_long-impl
+    'raster.arrays/zeros-like_m_floats_long-impl})
+
 (defn- buffer-alloc?
-  "A binding init that allocates an array buffer: (double-array <size>) etc."
+  "A binding init that allocates an array buffer: (double-array <size>) or
+  (.invk raster.arrays/zeros-like_* arr size). Both yield a zero-filled buffer
+  (Java arrays are zero-initialized, so the wrapper needs no extra fill)."
   [init]
-  (and (seq? init) (contains? array-ctors (first init))))
+  (and (seq? init)
+       (or (contains? array-ctors (first init))
+           (and (= '.invk (first init)) (contains? zeros-like-impls (second init))))))
+
+(defn- buffer-size
+  "The size expression of a buffer-alloc init."
+  [init]
+  (if (contains? array-ctors (first init))
+    (second init)        ; (double-array <size>)
+    (last init)))        ; (.invk zeros-like arr <size>)
 
 (defn split-let
   "Split the outermost let* into buffer-alloc bindings and a stripped let* whose
@@ -117,10 +148,46 @@
   (let [[_ bindings & body] form
         pairs (partition 2 bindings)
         buffers (vec (for [[sym init] pairs :when (buffer-alloc? init)]
-                       [sym (second init)]))
+                       [sym (buffer-size init)]))
+        ;; scalar bindings (simple int/arith, not buffers or loops) — needed to
+        ;; resolve buffer sizes that reference them (e.g. arg_n = (* n 1)).
+        scalar-bindings (vec (for [[sym init] pairs
+                                   :when (not (buffer-alloc? init))
+                                   :when (not (and (seq? init)
+                                                   (#{'loop* 'loop 'dotimes 'let* 'let} (first init))))]
+                               [sym init]))
         kept (vec (mapcat (fn [[s init]] (if (buffer-alloc? init) [] [s init])) pairs))]
     {:buffers buffers
+     :scalar-bindings scalar-bindings
      :stripped (cons 'let* (cons kept body))}))
+
+(defn resolve-int-expr
+  "Evaluate an integer IR expression (buffer size, offset) to a number given an
+  env of {sym value}. Handles devirtualized .invk long/int arith, (int x), and
+  clojure core +/-/* — enough for buffer-size and length expressions."
+  [expr env]
+  (cond
+    (number? expr) expr
+    (symbol? expr) (get env expr)
+    (seq? expr)
+    (let [op (first expr)]
+      (cond
+        (= 'int op)  (long (resolve-int-expr (second expr) env))
+        (= 'long op) (long (resolve-int-expr (second expr) env))
+        (= '.invk op)
+        (let [nm (name (second expr))
+              as (map #(resolve-int-expr % env) (nnext expr))
+              [a b] as]
+          (cond (re-find #"_star_" nm)  (* a b)
+                (re-find #"_plus_" nm)  (+ a b)
+                (re-find #"_minus_" nm) (if (= 2 (count as)) (- a b) (- a))
+                (re-find #"_div_" nm)   (quot a b)
+                :else a))
+        (#{'* 'clojure.core/*} op) (apply * (map #(resolve-int-expr % env) (rest expr)))
+        (#{'+ 'clojure.core/+} op) (apply + (map #(resolve-int-expr % env) (rest expr)))
+        (#{'- 'clojure.core/-} op) (apply - (map #(resolve-int-expr % env) (rest expr)))
+        :else (throw (ex-info (str "resolve-int-expr: unhandled " (pr-str expr)) {:expr expr}))))
+    :else (throw (ex-info (str "resolve-int-expr: unhandled " (pr-str expr)) {:expr expr}))))
 
 (def ^:private ctype {:double "double" :float "float" :long "long" :int "int"})
 
@@ -229,7 +296,7 @@
   [f-var dtype]
   (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype)
         {nform :form length-syms :length-syms} (normalize-for-c form)
-        {:keys [buffers stripped]} (split-let nform)
+        {:keys [buffers scalar-bindings stripped]} (split-let nform)
         array-params  (vec (filter #(contains? array-tags (get param-env %)) params))
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
                              [p (ctype (get param-env p) "int")]))
@@ -245,17 +312,18 @@
         result-idx 0]
     (with-meta
       (fn [& args]
-        (let [env (zipmap params args)
-              ;; lengths of each aliased input array
-              env' (reduce (fn [m [arr ls]] (assoc m ls (count (get env arr)))) env len-order)
-              in-arrs  (map env array-params)
+        (let [base-env (zipmap params args)
+              ;; size-resolution env: params, array lengths, then derived scalars
+              len-env (reduce (fn [m [arr ls]] (assoc m ls (count (get base-env arr))))
+                              base-env len-order)
+              env (reduce (fn [m [sym init]] (assoc m sym (resolve-int-expr init m)))
+                          len-env scalar-bindings)
+              in-arrs  (map base-env array-params)
               buf-arrs (mapv (fn [[_ size-expr]]
-                               (alloc-array dtype
-                                 (long (if (symbol? size-expr) (get env' size-expr)
-                                           (eval `(let [~@(mapcat (fn [[k v]] [k v]) env')] ~size-expr))))))
+                               (alloc-array dtype (long (resolve-int-expr size-expr env))))
                              buffers)
-              scalars  (map (fn [[p _]] (get env p)) scalar-params)
-              lengths  (map (fn [[_ ls]] (get env' ls)) len-order)]
+              scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
+              lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
           (apply native (concat in-arrs buf-arrs scalars lengths))
           (nth buf-arrs result-idx)))
       {:c-source src :kernel-name kernel-name})))
