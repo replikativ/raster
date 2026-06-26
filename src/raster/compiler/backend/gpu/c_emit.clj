@@ -78,6 +78,13 @@
 
 (def ^:dynamic *scalar-type* "double")
 
+(def ^:dynamic *loop-result-var*
+  "When a loop is emitted as a statement-expression value (reduction), the C
+  name of the properly-typed result variable its terminal value is assigned to.
+  nil in statement context, where the loop's value is discarded and the terminal
+  falls back to the first loop var (legacy behavior)."
+  nil)
+
 (def ^:dynamic *idx-sym*
   "The par loop index symbol (always uint/int). Used by infer-c-type."
   nil)
@@ -280,6 +287,13 @@
     (and (seq? expr)
          (contains? #{'unchecked-add-int 'unchecked-subtract-int
                       'unchecked-multiply-int} (first expr)))
+    "int"
+
+    ;; Devirtualized integer arithmetic: (.invk X_m_long_long-impl ...) /
+    ;; X_m_int_int / X_m_long — index & counter math. The mangled name encodes
+    ;; integer operands, so the result is an integer (array subscripts, offsets).
+    (and (seq? expr) (= '.invk (first expr)) (symbol? (second expr))
+         (re-find #"_m_(long|int)(_(long|int))?(-impl)?$" (name (second expr))))
     "int"
 
     (and (seq? expr)
@@ -572,6 +586,22 @@
     :else
     (str result-var " = " (emit-expr expr idx-sym array-syms opencl-idx) ";")))
 
+(defn- loop-terminal-expr
+  "Find a loop body's terminal (non-recur) value expression — the value the loop
+  evaluates to when it exits. Walks if/when/do/let to the first value leaf; nil
+  if the body only recurs or ends in a void op."
+  [form]
+  (cond
+    (not (seq? form)) form
+    (= 'recur (first form)) nil
+    (= 'if (first form))   (or (loop-terminal-expr (nth form 2 nil))
+                               (loop-terminal-expr (nth form 3 nil)))
+    (= 'when (first form)) (loop-terminal-expr (last form))
+    (= 'do (first form))   (loop-terminal-expr (last form))
+    (contains? #{'let 'let*} (first form)) (loop-terminal-expr (last form))
+    (void-form? form) nil
+    :else form))
+
 (defn- emit-loop-body
   "Emit the body of a loop as C while-body statements."
   [body var-names idx-sym array-syms opencl-idx]
@@ -655,9 +685,10 @@
     (void-form? expr)
     (str (emit-stmt expr idx-sym array-syms opencl-idx) " break;")
 
-    ;; Terminal expression -> assign to first var and break
+    ;; Terminal expression -> assign to the typed result var (reduction value)
+    ;; or, in statement context, the first loop var (value discarded).
     :else
-    (str (c-symbol (first var-names)) " = "
+    (str (or *loop-result-var* (c-symbol (first var-names))) " = "
          (emit-expr expr idx-sym array-syms opencl-idx) "; break;")))
 
 (defn emit-expr
@@ -862,13 +893,19 @@
                                   (str typ " " (c-symbol sym) " = "
                                        (emit-expr init idx-sym array-syms opencl-idx) ";"))
                                 var-names var-types var-inits))
-           result-var (c-symbol (first var-names))
-           loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+           terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
        (if (supports-stmt-expr?)
-         (str "({ " decls " while (1) { " loop-body " } " result-var "; })")
-         ;; GLSL: no statement-expressions; emit inline declarations + while
-         ;; Result is in the first loop variable after break.
-         (str decls " while (true) { " loop-body " }")))
+         ;; Reduction result: a dedicated var typed from the loop's terminal
+         ;; value, not the first loop var (usually the int counter — assigning a
+         ;; double accumulator into it would truncate).
+         (let [result-var (str (c-symbol (first var-names)) "_res")
+               result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
+               loop-body (binding [*loop-result-var* result-var]
+                           (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+           (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
+         ;; GLSL: no statement-expressions; result stays in the first loop var.
+         (let [loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+           (str decls " while (true) { " loop-body " }"))))
 
      ;; case -> switch
      (and (seq? expr) (= 'case (first expr)))
