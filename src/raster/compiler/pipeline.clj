@@ -772,6 +772,8 @@
 ;; Pipeline: forward-only (buffer fusion, no AD)
 ;; ================================================================
 
+(declare compile-aot-jvm)
+
 (defn compile-aot
   "Compile a deftm var into an optimized forward function with buffer fusion.
 
@@ -789,7 +791,22 @@
     :inline?         - inline deftm calls (default true)
     :simd?           - apply SIMD optimization to parallel forms (default true)
     :dtype           - numeric dtype (:double or :float, selects overload)
-    :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)"
+    :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)
+    :target          - :c routes to the native CPU-C backend (one fused C function
+                       per deftm via Panama FFM, no per-op JVM dispatch). Bypasses
+                       the bytecode/GPU path."
+  [f-var & {:keys [inline? simd? dtype target-device target]
+            :or {inline? true simd? true}}]
+  (if (= target :c)
+    ;; Native CPU-C backend: emit the whole fused body as one C function (no
+    ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
+    ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
+     f-var (or dtype :double))
+    (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
+                     :target-device target-device)))
+
+(defn- compile-aot-jvm
+  "JVM/GPU compile-aot: bytecode (SIMD) or GPU (target-device) backend."
   [f-var & {:keys [inline? simd? dtype target-device]
             :or {inline? true simd? true}}]
   (let [;; Use the classloader that defined the target function's defrecord types.

@@ -285,6 +285,39 @@
 
 (def ^:private array-tags '#{doubles floats longs ints})
 
+(defn- returned-sym
+  "The symbol an init expression ultimately evaluates to — follows
+  let*/loop*/do/if to the value leaf. Used to map a compute binding to the buffer
+  its loop writes & returns (for multi-buffer result tracking)."
+  [expr]
+  (cond
+    (symbol? expr) expr
+    (not (seq? expr)) nil
+    (contains? #{'let* 'let} (first expr)) (returned-sym (last expr))
+    (contains? #{'loop* 'loop} (first expr)) (returned-sym (nth expr 2 nil)) ; loop body
+    (= 'do (first expr)) (returned-sym (last expr))
+    (= 'if (first expr)) (or (returned-sym (nth expr 3 nil))   ; base/else first
+                             (returned-sym (nth expr 2 nil)))
+    :else nil))
+
+(defn result-buffer-index
+  "Which buffer the function returns: trace the let* body result through the
+  compute-binding aliases (sym -> buffer its init returns) to a buffer symbol.
+  Returns the index into `buffers`, defaulting to the last buffer."
+  [stripped buffers]
+  (let [[_ binds & body] stripped
+        buf-syms (mapv first buffers)
+        buf-set (set buf-syms)
+        aliases (into {} (for [[sym init] (partition 2 binds)]
+                           [sym (returned-sym init)]))
+        resolve (fn resolve [s seen]
+                  (cond (buf-set s) s
+                        (or (nil? s) (contains? seen s)) nil
+                        :else (resolve (get aliases s) (conj seen s))))
+        result-sym (resolve (returned-sym (last body)) #{})]
+    (or (when result-sym (.indexOf buf-syms result-sym))
+        (dec (count buffers)))))
+
 (defn- alloc-array [dtype n]
   (case dtype :double (double-array n) :float (float-array n)
         :long (long-array n) :int (int-array n)))
@@ -308,8 +341,7 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count buffers))
                                 (+ (count scalar-params) (count len-order)))
-        ;; result buffer = the (single) output buffer for now
-        result-idx 0]
+        result-idx (result-buffer-index stripped buffers)]
     (with-meta
       (fn [& args]
         (let [base-env (zipmap params args)
