@@ -217,9 +217,10 @@
   (let [zp (str zero-point)]
     (str "#include <stdint.h>\n" i8dot-helper
          "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
-         "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out) {\n"
-         "  int nb = in/32; const __m256i _m4 = _mm256_set1_epi8(0x0F);\n"
-         "  for (int g = 0; g + 8 <= out; g += 8) {\n"
+         "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out,\n"
+         "    int o_start, int o_count) {\n"
+         "  int nb = in/32; const __m256i _m4 = _mm256_set1_epi8(0x0F); int oend = o_start + o_count;\n"
+         "  for (int g = o_start; g + 8 <= oend; g += 8) {\n"
          "    long gi = g/8;\n"
          "    const uint8_t* restrict wg = wqi + gi*(long)nb*128;\n"
          "    const float* restrict sg = wsi + gi*(long)nb*8;\n"
@@ -250,14 +251,40 @@
 (def schedules
   "schedule-key → {:repack :emit :n-ptrs :n-ints}. Only the memory-bound :stream-gemv
   (decode GEMV) is implemented; :tile-gemm and GPU variants extend this map."
-  {:stream-gemv {:repack repack-stream :emit emit-qmatmul-stream :n-ptrs 6 :n-ints 2}})
+  {:stream-gemv {:repack repack-stream :emit emit-qmatmul-stream :n-ptrs 6 :n-ints 4}})
+
+;; DAEMON pool (so it never blocks JVM exit, unlike Executors' default non-daemon).
+;; Decode matmuls are MEMORY-bandwidth bound; threading aggregates bandwidth across
+;; cores. Only worthwhile for BIG matmuls (lm_head): small ones are fork-overhead bound.
+(defonce ^:private daemon-pool
+  (delay (java.util.concurrent.Executors/newFixedThreadPool
+          (.availableProcessors (Runtime/getRuntime))
+          (reify java.util.concurrent.ThreadFactory
+            (newThread [_ r] (doto (Thread. ^Runnable r) (.setDaemon true)))))))
+
+(def ^:private thread-min-out 4096) ;; below this, fork overhead > the work; run serial
 
 (defn compile-qmatmul-stream
   "Compile the :stream-gemv decode kernel. Returns a fn (xq xs xsum wqi wsi y in out)
-  over a repack-stream weight."
-  [name format mac]
-  (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul-stream name format mac)) name 6 2)]
-    (fn [xq xs xsum wqi wsi y in out] (k xq xs xsum wqi wsi y in out))))
+  over a repack-stream weight. With n-threads>1, BIG matmuls (out>=4096, e.g. lm_head)
+  split their output-column groups across a daemon pool — each thread streams a disjoint
+  weight slice into a disjoint y slice (no shared writes), aggregating memory bandwidth."
+  ([name format mac] (compile-qmatmul-stream name format mac 1))
+  ([name format mac n-threads]
+   (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul-stream name format mac)) name 6 4)]
+     (if (<= n-threads 1)
+       (fn [xq xs xsum wqi wsi y in out] (k xq xs xsum wqi wsi y in out 0 out))
+       (let [p @daemon-pool]
+         (fn [xq xs xsum wqi wsi y in out]
+           (if (< (int out) thread-min-out)
+             (k xq xs xsum wqi wsi y in out 0 out)
+             (let [ng (quot (int out) 8) chunk-g (quot (+ ng (dec (int n-threads))) (int n-threads))
+                   tasks (for [t (range n-threads)
+                               :let [g0 (* t chunk-g 8) cnt (min (* chunk-g 8) (- (int out) g0))]
+                               :when (pos? cnt)]
+                           (reify java.util.concurrent.Callable
+                             (call [_] (k xq xs xsum wqi wsi y in out g0 cnt) nil)))]
+               (doseq [f (.invokeAll p tasks)] (.get f))))))))))
 
 ;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
 ;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
