@@ -64,68 +64,94 @@
   {:name "q4_0" :block 32 :weight-bits 4 :pack :nibble-interleaved
    :zero-point 8 :symmetric true :act-type :i8})
 
-;; ---- unpack snippet generated FROM the descriptor (32 unsigned weights -> wqv) ----
-(defn- emit-unpack [{:keys [weight-bits pack]}]
-  (case [weight-bits pack]
-    [4 :nibble-interleaved]
-    (str "      __m128i w  = _mm_loadu_si128((const __m128i*)(wrow + b*16));\n"
-         "      __m128i lo = _mm_and_si128(w, _mm_set1_epi8(0x0F));\n"
-         "      __m128i hi = _mm_and_si128(_mm_srli_epi16(w, 4), _mm_set1_epi8(0x0F));\n"
-         "      __m256i wqv = _mm256_set_m128i(hi, lo);\n")
-    (throw (ex-info "unpack not described for format" {:weight-bits weight-bits :pack pack}))))
+;; ---- per-ISA pieces of the widening-i8-dot primitive (the one seam) ----
+;; :maddubs = AVX2 maddubs(u8 weight, s8 act). Other ISAs (:vnni dpbusd, NEON
+;; :dotprod vdotq, :scalar) are added as more entries — same descriptor, same
+;; schedule, different MAC spelling.
+(def ^:private mac-includes {:maddubs "#include <immintrin.h>\n"})
+(def ^:private mac-consts
+  {:maddubs "  const __m256i _ones = _mm256_set1_epi16(1), _m4 = _mm256_set1_epi8(0x0F);\n"})
 
-;; ---- widening-i8-dot PRIMITIVE: per-ISA lowerings (the one seam) ----
-(def ^:private mac-lowerings
-  {;; AVX2: maddubs(u8 weight, s8 act) -> int16 pairwise -> int32 (8 lanes)
-   :maddubs {:includes "#include <immintrin.h>\n"
-             :consts   "  const __m256i _ones = _mm256_set1_epi16(1);\n"
-             :dot      "      __m256i xv = _mm256_loadu_si256((const __m256i*)(xrow + b*32));\n"
-                       ;; result: __m256i s32 (8 int32 partials of Σ wq*x)
-             :accum    (str "      __m256i s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(wqv, xv), _ones);\n"
-                            "      float scale = xsr[b]*wsr[b];\n"
-                            "      facc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(s32), _mm256_set1_ps(scale), facc);\n")
-             :acc-decl "    __m256 facc = _mm256_setzero_ps();\n"
-             :reduce   (str "    __m128 v = _mm_add_ps(_mm256_castps256_ps128(facc), _mm256_extractf128_ps(facc,1));\n"
-                            "    v = _mm_hadd_ps(v, v); v = _mm_hadd_ps(v, v);\n"
-                            "    float dot = _mm_cvtss_f32(v);\n")}})
+(defn- emit-row
+  "Emit one output row's contribution for the v5 schedule: unpack the weight block
+  (from the FORMAT descriptor), widening-i8-dot with the shared activation `xv`,
+  FMA the scaled int32 partials into accumulator `facc-i`, accrue the zero-point
+  correction `corr-i`. i = row offset within the register block."
+  [{:keys [weight-bits pack]} mac i]
+  (assert (and (= weight-bits 4) (= pack :nibble-interleaved) (= mac :maddubs)))
+  (let [w (str "w" i) s (str "s" i) f (str "f" i) c (str "c" i)]
+    (str "        { __m128i _wl = _mm_loadu_si128((const __m128i*)(" w " + b*16));\n"
+         "          __m256i _wq = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(_wl,4), _wl), _m4);\n"
+         "          __m256i _s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(_wq, _xv), _ones);\n"
+         "          float _sc = _xsb*" s "[b]; " f " = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_s32), _mm256_set1_ps(_sc), " f ");\n"
+         "          " c " += _sc*_xsm; }\n")))
 
-;; ---- compose the full kernel from FORMAT descriptor + MAC primitive ----
+;; ---- compose the v5 (4-row register-blocked) kernel from descriptor + primitive ----
+(def ^:private BR 4) ;; register block: 4 output rows = 4 independent FMA chains
 (defn emit-qmatmul
-  "Emit a quantized matmul C kernel for FORMAT (a descriptor) and MAC (a primitive
-  lowering key). Signature:
-    void NAME(const int8_t* xq, const float* xs, const int* xsum,
-              const uint8_t* wq, const float* ws, float* y, int M, int in, int out)"
+  "Emit the v5 quantized matmul C kernel for FORMAT + MAC. Register-blocks BR output
+  rows (independent accumulators hide FMA latency) + loads the activation block once
+  per BR rows. Signature: void NAME(xq,xs,xsum,wq,ws,y,M,in,out,o_start,o_count)."
   [name format mac]
-  (let [{:keys [block zero-point]} format
-        m (mac-lowerings mac)]
-    (str "#include <stdint.h>\n" (:includes m)
+  (let [{:keys [block zero-point]} format zp (str zero-point ".f")
+        rows (range BR)]
+    (str "#include <stdint.h>\n" (mac-includes mac)
+         "static inline float _hsum8(__m256 v){__m128 x=_mm_add_ps(_mm256_castps256_ps128(v),_mm256_extractf128_ps(v,1));x=_mm_hadd_ps(x,x);x=_mm_hadd_ps(x,x);return _mm_cvtss_f32(x);}\n"
          "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
-         "    const uint8_t* wq, const float* ws, float* y, int M, int in, int out) {\n"
-         "  int nb = in/" block ";\n" (:consts m)
+         "    const uint8_t* wq, const float* ws, float* y, int M, int in, int out,\n"
+         "    int o_start, int o_count) {\n"
+         "  int nb = in/" block ";\n" (mac-consts mac)
          "  for (int mm = 0; mm < M; mm++) {\n"
-         "    const int8_t* xrow0 = xq + (long)mm*in;\n"
+         "    const int8_t* xr = xq + (long)mm*in;\n"
          "    const float* xsr = xs + (long)mm*nb; const int* xsm = xsum + (long)mm*nb;\n"
-         "    for (int o = 0; o < out; o++) {\n"
-         (:acc-decl m)
-         "      float corr = 0.f;\n"
-         "      const uint8_t* wrow = wq + (long)o*in/2; const float* wsr = ws + (long)o*nb;\n"
-         "      const int8_t* xrow = xrow0;\n"
+         "    int oend = o_start + o_count, o = o_start;\n"
+         ;; --- main: BR rows at a time ---
+         "    for (; o + " BR " <= oend; o += " BR ") {\n"
+         (apply str (for [i rows] (str "      __m256 f" i "=_mm256_setzero_ps(); float c" i "=0;\n")))
+         (apply str (for [i rows] (str "      const uint8_t* w" i "=wq+(long)(o+" i ")*in/2; const float* s" i "=ws+(long)(o+" i ")*nb;\n")))
          "      for (int b = 0; b < nb; b++) {\n"
-         (emit-unpack format)
-         (:dot m)
-         (:accum m)
-         "        corr += xsr[b]*wsr[b]*xsm[b];\n"
+         "        __m256i _xv = _mm256_loadu_si256((const __m256i*)(xr + b*32));\n"
+         "        float _xsb = xsr[b]; int _xsm = xsm[b];\n"
+         (apply str (for [i rows] (emit-row format mac i)))
          "      }\n"
-         (:reduce m)
-         "      y[(long)mm*out + o] = dot - " zero-point ".f*corr;\n"
+         (apply str (for [i rows] (str "      y[(long)mm*out+o+" i "] = _hsum8(f" i ") - " zp "*c" i ";\n")))
+         "    }\n"
+         ;; --- tail: remaining (<BR) rows, one at a time ---
+         "    for (; o < oend; o++) {\n"
+         "      __m256 f0=_mm256_setzero_ps(); float c0=0;\n"
+         "      const uint8_t* w0=wq+(long)o*in/2; const float* s0=ws+(long)o*nb;\n"
+         "      for (int b = 0; b < nb; b++) {\n"
+         "        __m256i _xv = _mm256_loadu_si256((const __m256i*)(xr + b*32)); float _xsb=xsr[b]; int _xsm=xsm[b];\n"
+         (emit-row format mac 0)
+         "      }\n"
+         "      y[(long)mm*out+o] = _hsum8(f0) - " zp "*c0;\n"
          "    }\n  }\n}\n")))
 
+(defonce ^:private pool
+  (delay (java.util.concurrent.Executors/newFixedThreadPool
+          (.availableProcessors (Runtime/getRuntime)))))
+
 (defn compile-qmatmul
-  "Emit + compile + load a quantized matmul. Returns a fn
-  (xq xs xsum wq ws y M in out) calling the native kernel."
-  [name format mac]
-  (let [src (emit-qmatmul name format mac)]
-    (cpu/load-kernel (cpu/compile-source! src) name 6 3)))
+  "Emit + compile + load a quantized matmul. Returns a fn (xq xs xsum wq ws y M in
+  out). With n-threads>1, big matmuls (out>=1024) are split over output-row ranges
+  across a JVM thread pool — each native call writes a disjoint y slice (no OpenMP
+  dep; raster scales where memory-bound llama.cpp saturates)."
+  ([name format mac] (compile-qmatmul name format mac 1))
+  ([name format mac n-threads]
+   (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul name format mac)) name 6 5)]
+     (if (<= n-threads 1)
+       (fn [xq xs xsum wq ws y M in out] (k xq xs xsum wq ws y M in out 0 out))
+       (let [p @pool]
+         (fn [xq xs xsum wq ws y M in out]
+           (if (< (int out) 1024)
+             (k xq xs xsum wq ws y M in out 0 out)
+             (let [chunk (quot (+ (int out) (dec n-threads)) n-threads)
+                   tasks (for [t (range n-threads)
+                               :let [o0 (* t chunk) cnt (min chunk (- (int out) o0))]
+                               :when (pos? cnt)]
+                           (reify java.util.concurrent.Callable
+                             (call [_] (k xq xs xsum wq ws y M in out o0 cnt) nil)))]
+               (doseq [f (.invokeAll p tasks)] (.get f))))))))))
 
 ;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
 ;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
