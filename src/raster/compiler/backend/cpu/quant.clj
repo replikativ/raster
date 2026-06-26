@@ -65,12 +65,26 @@
    :zero-point 8 :symmetric true :act-type :i8})
 
 ;; ---- per-ISA pieces of the widening-i8-dot primitive (the one seam) ----
-;; :maddubs = AVX2 maddubs(u8 weight, s8 act). Other ISAs (:vnni dpbusd, NEON
-;; :dotprod vdotq, :scalar) are added as more entries — same descriptor, same
-;; schedule, different MAC spelling.
-(def ^:private mac-includes {:maddubs "#include <immintrin.h>\n"})
+;; :maddubs names the x86 SIMD lowering, but the emitted `_i8dot` is a PORTABLE
+;; macro cascade: under -march=native the host's best int8-MAC is selected at
+;; compile time — AVX-VNNI `dpbusd` (1 instr) where available, baseline AVX2
+;; `maddubs+madd` otherwise. No runtime CPUID needed for the JIT-on-host model.
+;; (Other ISAs — NEON sdot, SVE — are added as more #elif arms; same descriptor,
+;; same schedule, different MAC spelling. A shipped fat binary would multi-version.)
+(def ^:private i8dot-helper
+  (str "#include <immintrin.h>\n"
+       "// widening int8 dot: sum_4(u8 w * s8 x) -> 8x int32. Host-selected MAC.\n"
+       "static inline __m256i _i8dot(__m256i wu8, __m256i xs8){\n"
+       "#if defined(__AVX512VNNI__) && defined(__AVX512VL__)\n"
+       "  return _mm256_dpbusd_epi32(_mm256_setzero_si256(), wu8, xs8);\n"
+       "#elif defined(__AVXVNNI__)\n"
+       "  return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wu8, xs8);\n"
+       "#else\n"
+       "  return _mm256_madd_epi16(_mm256_maddubs_epi16(wu8, xs8), _mm256_set1_epi16(1));\n"
+       "#endif\n}\n"))
+(def ^:private mac-includes {:maddubs i8dot-helper})
 (def ^:private mac-consts
-  {:maddubs "  const __m256i _ones = _mm256_set1_epi16(1), _m4 = _mm256_set1_epi8(0x0F);\n"})
+  {:maddubs "  const __m256i _m4 = _mm256_set1_epi8(0x0F);\n"})
 
 (defn- emit-row
   "Emit one output row's contribution for the v5 schedule: unpack the weight block
@@ -82,7 +96,7 @@
   (let [w (str "w" i) s (str "s" i) f (str "f" i) c (str "c" i)]
     (str "        { __m128i _wl = _mm_loadu_si128((const __m128i*)(" w " + b*16));\n"
          "          __m256i _wq = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(_wl,4), _wl), _m4);\n"
-         "          __m256i _s32 = _mm256_madd_epi16(_mm256_maddubs_epi16(_wq, _xv), _ones);\n"
+         "          __m256i _s32 = _i8dot(_wq, _xv);\n"
          "          float _sc = _xsb*" s "[b]; " f " = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_s32), _mm256_set1_ps(_sc), " f ");\n"
          "          " c " += _sc*_xsm; }\n")))
 
