@@ -485,7 +485,13 @@
        (let [n (* n-nodes emb-dim)
         ;; GroupNorm needs channel-first layout [emb-dim, n-nodes] (PyTorch: b d 1 n)
         ;; Our data is node-major [n-nodes, emb-dim] — transpose around GN calls
-             num-groups (n/max 1 (n/min 32 emb-dim))
+        ;; GroupNorm groups: match the original (torch GroupNorm num_groups=32 at
+        ;; emb_dim 64-128 → 2-4 channels/group). The KEY invariant is ≥2 channels
+        ;; per group: with 1 channel/group GroupNorm degenerates to per-channel
+        ;; (Instance)Norm and exactly cancels the per-channel temb shift, making the
+        ;; model time-blind. (quot emb-dim 2) keeps ≥2 ch/group at any emb-dim and
+        ;; equals 32 groups at emb-dim≥64, matching the reference net.
+             num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
         ;; GN1: transpose → group-norm → transpose back
              h-t (nn/transpose-2d x n-nodes emb-dim)
              h-t (nn/group-norm h-t gamma1 beta1 1 emb-dim n-nodes num-groups 1e-5)
@@ -494,19 +500,19 @@
              h (nn/silu h n)
         ;; Linear 1 (per-node: [n-nodes, emb-dim] × [emb-dim, emb-dim])
              h (nn/linear h W1 b1 n-nodes emb-dim emb-dim)
-        ;; GN2 MUST precede the timestep injection: GroupNorm normalizes each
-        ;; channel across nodes, and temb-proj is broadcast equally to every node
-        ;; (constant along the normalized axis), so injecting BEFORE GN2 lets the
-        ;; norm subtract it straight back out — making the model completely
-        ;; time-blind. Inject AFTER the norm so the conditioning survives.
+        ;; Timestep injection (matches the reference ResnetBlock: h = h +
+        ;; temb_proj(SiLU(temb)), BEFORE norm2). temb-proj is broadcast equally to
+        ;; every node, so it is a per-channel constant along the normalized axis.
+        ;; This survives GN2 because num-groups gives ≥2 channels/group: GroupNorm
+        ;; removes only the per-group mean, leaving the inter-channel temb variation
+        ;; intact (with 1 ch/group it would be fully cancelled — see num-groups).
+             temb-proj (nn/silu temb emb-dim)
+             temb-proj (nn/linear temb-proj Wt bt 1 emb-dim emb-dim)
+             h (array-ops/broadcast-add h temb-proj n-nodes emb-dim)
         ;; GN2: transpose → group-norm → transpose back
              h-t (nn/transpose-2d h n-nodes emb-dim)
              h-t (nn/group-norm h-t gamma2 beta2 1 emb-dim n-nodes num-groups 1e-5)
              h (nn/transpose-2d h-t emb-dim n-nodes)
-        ;; Timestep injection AFTER the norm: h = h + broadcast(SiLU(linear(temb)))
-             temb-proj (nn/silu temb emb-dim)
-             temb-proj (nn/linear temb-proj Wt bt 1 emb-dim emb-dim)
-             h (array-ops/broadcast-add h temb-proj n-nodes emb-dim)
         ;; SiLU
              h (nn/silu h n)
         ;; Linear 2
@@ -543,7 +549,7 @@
             src-edges :- (Array long) dst-edges :- (Array long)
             n-nodes :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
        :- (Array T)
-       (let [num-groups (n/max 1 (n/min 32 emb-dim))
+       (let [num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
              dk (quot emb-dim n-heads)
         ;; Pre-attention GroupNorm (channel-first layout for cross-node normalization)
              h-t (nn/transpose-2d h n-nodes emb-dim)
