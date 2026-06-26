@@ -73,15 +73,17 @@
 ;; same schedule, different MAC spelling. A shipped fat binary would multi-version.)
 (def ^:private i8dot-helper
   (str "#include <immintrin.h>\n"
-       "// widening int8 dot: sum_4(u8 w * s8 x) -> 8x int32. Host-selected MAC.\n"
-       "static inline __m256i _i8dot(__m256i wu8, __m256i xs8){\n"
+       "// widening int8 dot, ACCUMULATING: acc += sum_4(u8 w * s8 x) per int32 lane.\n"
+       "// Host-selected MAC via -march=native macros (no runtime CPUID).\n"
+       "static inline __m256i _i8dot_acc(__m256i acc, __m256i wu8, __m256i xs8){\n"
        "#if defined(__AVX512VNNI__) && defined(__AVX512VL__)\n"
-       "  return _mm256_dpbusd_epi32(_mm256_setzero_si256(), wu8, xs8);\n"
+       "  return _mm256_dpbusd_epi32(acc, wu8, xs8);\n"
        "#elif defined(__AVXVNNI__)\n"
-       "  return _mm256_dpbusd_avx_epi32(_mm256_setzero_si256(), wu8, xs8);\n"
+       "  return _mm256_dpbusd_avx_epi32(acc, wu8, xs8);\n"
        "#else\n"
-       "  return _mm256_madd_epi16(_mm256_maddubs_epi16(wu8, xs8), _mm256_set1_epi16(1));\n"
-       "#endif\n}\n"))
+       "  return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(wu8, xs8), _mm256_set1_epi16(1)));\n"
+       "#endif\n}\n"
+       "static inline __m256i _i8dot(__m256i wu8, __m256i xs8){ return _i8dot_acc(_mm256_setzero_si256(), wu8, xs8); }\n"))
 (def ^:private mac-includes {:maddubs i8dot-helper})
 (def ^:private mac-consts
   {:maddubs "  const __m256i _m4 = _mm256_set1_epi8(0x0F);\n"})
@@ -166,6 +168,96 @@
                            (reify java.util.concurrent.Callable
                              (call [_] (k xq xs xsum wq ws y M in out o0 cnt) nil)))]
                (doseq [f (.invokeAll p tasks)] (.get f))))))))))
+
+;; ============================================================================
+;; SCHEDULES — regime-appropriate kernel strategies (schedule-as-data).
+;; A schedule names a {layout, kernel, parallelization} strategy chosen by the
+;; roofline regime. We measured the decode GEMV to be MEMORY-bandwidth bound (84MB
+;; lm_head streamed at 9.6/11.2 GB/s = 86% of the single-core memory ceiling), so
+;; its optimal schedule is to STREAM the compressed weights contiguously — there is
+;; nothing for a compute schedule to do. The :stream-gemv schedule below is that.
+;; Compute-bound :tile-gemm (prefill M>1, register-block tile) and GPU variants slot
+;; into the same {descriptor × primitive × schedule} skeleton as more entries.
+;; ============================================================================
+(def ^:private NC 8) ;; column tile = AVX2 f32 lane count (16 for AVX-512, 4 for NEON)
+
+(defn repack-stream
+  "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv layout, where output
+  column i lands in accumulator lane i (no shuffles, no final permute). Per (group of
+  NC cols, block, input-group of 4 elems), byte j (0..15) packs col(j/4) elem(j%4) in
+  the low nibble and col(4+j/4) elem(j%4) in the high nibble — so a [lo|hi] unpack
+  yields the dpbusd operand directly. wsi = NC column scales per (group, block). out
+  must be a multiple of NC (caller pads). nb = in/32. One-time weight-load cost."
+  [^bytes wq ^floats ws out in]
+  (let [nb (quot in 32) ng (quot out NC) half (quot in 2)
+        wqi (byte-array (* ng nb 128)) wsi (float-array (* ng nb NC))
+        ;; nibble of (output row, block b, element e in 0..31) from interleaved Q4_0
+        src-nib (fn [row b e]
+                  (let [bv (bit-and (aget wq (+ (* row half) (* b 16) (if (< e 16) e (- e 16)))) 0xFF)]
+                    (if (< e 16) (bit-and bv 0xF) (bit-shift-right bv 4))))]
+    (dotimes [gi ng]
+      (dotimes [b nb]
+        (dotimes [ig 8]
+          (dotimes [j 16]
+            (let [base (+ (* gi NC) (quot j 4)) e (+ (* ig 4) (mod j 4))
+                  nlo (src-nib base b e) nhi (src-nib (+ base 4) b e)]
+              (aset wqi (+ (* gi nb 128) (* b 128) (* ig 16) j)
+                    (unchecked-byte (bit-or nlo (bit-shift-left nhi 4)))))))
+        (dotimes [r NC]
+          (aset wsi (+ (* gi nb NC) (* b NC) r) (aget ws (+ (* (+ (* gi NC) r) nb) b))))))
+    {:wqi wqi :wsi wsi}))
+
+(defn emit-qmatmul-stream
+  "Emit the :stream-gemv decode kernel over a repack-stream weight. One contiguous
+  weight stream; per block an int32 lane-packed accumulator (8 dpbusd, no shuffle/
+  blend), the -ZP fold via the activation block-sum, one fmadd of (col×act scale).
+  Column i → lane i, so the store needs no permute. Signature:
+  void NAME(xq,xs,xsum,wqi,wsi,y,in,out)."
+  [name {:keys [zero-point]} mac]
+  (let [zp (str zero-point)]
+    (str "#include <stdint.h>\n" i8dot-helper
+         "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
+         "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out) {\n"
+         "  int nb = in/32; const __m256i _m4 = _mm256_set1_epi8(0x0F);\n"
+         "  for (int g = 0; g + 8 <= out; g += 8) {\n"
+         "    long gi = g/8;\n"
+         "    const uint8_t* restrict wg = wqi + gi*(long)nb*128;\n"
+         "    const float* restrict sg = wsi + gi*(long)nb*8;\n"
+         "    __m256 acc = _mm256_setzero_ps();\n"
+         "    for (int b = 0; b < nb; b++) {\n"
+         "      const uint8_t* wb = wg + b*128; const int8_t* xb = xq + b*32;\n"
+         "      __m256i ia = _mm256_setzero_si256();\n"
+         "      for (int ig = 0; ig < 8; ig++) {\n"
+         "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*16));\n"
+         "        __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _m4);\n"
+         "        __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*4));\n"
+         "        ia = _i8dot_acc(ia, nib, ab);\n"
+         "      }\n"
+         "      ia = _mm256_sub_epi32(ia, _mm256_set1_epi32(" zp " * xsum[b]));\n"
+         "      __m256 cs = _mm256_loadu_ps(sg + b*8);\n"
+         "      acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_mul_ps(cs, _mm256_set1_ps(xs[b])), acc);\n"
+         "    }\n"
+         "    _mm256_storeu_ps(y + g, acc);\n"
+         "  }\n}\n")))
+
+(defn classify-regime
+  "Roofline regime classifier (stub). Quant matmul reuses each weight ~M times: decode
+  (M=1) is memory-bound → :stream-gemv. Prefill (M>1) is compute-bound → :tile-gemm
+  (register-block tile, not yet implemented). The default schedule per op lives here."
+  [M]
+  (if (<= (long M) 1) :stream-gemv :stream-gemv))
+
+(def schedules
+  "schedule-key → {:repack :emit :n-ptrs :n-ints}. Only the memory-bound :stream-gemv
+  (decode GEMV) is implemented; :tile-gemm and GPU variants extend this map."
+  {:stream-gemv {:repack repack-stream :emit emit-qmatmul-stream :n-ptrs 6 :n-ints 2}})
+
+(defn compile-qmatmul-stream
+  "Compile the :stream-gemv decode kernel. Returns a fn (xq xs xsum wqi wsi y in out)
+  over a repack-stream weight."
+  [name format mac]
+  (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul-stream name format mac)) name 6 2)]
+    (fn [xq xs xsum wqi wsi y in out] (k xq xs xsum wqi wsi y in out))))
 
 ;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
 ;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
