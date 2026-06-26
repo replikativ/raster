@@ -56,6 +56,9 @@
 ;; element-keyword -> C type, and the maps from a deftm tag / array ctor to it.
 (def ^:private elem->ctype
   {:double "double" :float "float" :long "long" :int "int" :byte "int8_t"})
+;; C scalar type -> Panama FFM marshalling keyword (int8_t scalars pass as int).
+(def ^:private ctype->ffm
+  {"double" :double "float" :float "long" :long "int" :int "int8_t" :int})
 (def ^:private tag->elem
   '{doubles :double double :double floats :float float :float longs :long long :long
     ints :int int :int bytes :byte byte :byte})
@@ -218,9 +221,6 @@
 
 (def ^:private ctype {:double "double" :float "float" :long "long" :int "int"})
 
-;; scalar induction/length vars are ints
-(def ^:private ct-int "int")
-
 (defn- map-loop?
   "Canonical counted map loop: single induction var, body is an `if` whose then
   branch ends in `recur` and whose else (the loop's exit value) is a buffer/sym
@@ -264,21 +264,32 @@
     (and (seq? form) (= 'let* (first form)))
     (let [[_ binds & body] form
           pairs (partition 2 binds)
-          loop-init? (fn [init] (or (map-loop? init)
-                                    (and (seq? init) (#{'let* 'loop*} (first init)))))
-          ;; outer scalar bindings are declared `int` (ct-int) — seed them so loops
-          ;; that index off them type correctly.
-          scalar-syms (for [[sym init] pairs :when (not (loop-init? init))] sym)]
-      (binding [ce/*int-vars* (into ce/*int-vars* scalar-syms)]
+          ;; A binding is emitted FOR SIDE EFFECTS (sym discarded) when it writes a
+          ;; pre-allocated buffer: a counted map-loop, or nested compute whose tail
+          ;; is a buffer symbol. Everything else is a VALUE binding (scalar or
+          ;; reduction) and gets a typed C declaration.
+          buffer-loop? (fn [init] (or (map-loop? init)
+                                      (let [t (form/tail-symbol init)]
+                                        (boolean (and t (contains? array-syms t))))))
+          ;; Type each value binding from the TC-stamped :raster.type/tag (via
+          ;; ce/decl-type — metadata-first), NEVER a hardcoded type. Only the
+          ;; genuinely-integer ones seed *int-vars* (the fallback for bare
+          ;; clojure.core index math; value types already come from tags).
+          int-syms (for [[sym init] pairs
+                         :when (not (buffer-loop? init))
+                         :when (contains? #{"int" "uint" "long"}
+                                          (binding [ce/*scalar-type* ct] (ce/decl-type init)))]
+                     sym)]
+      (binding [ce/*int-vars* (into ce/*int-vars* int-syms)]
         (str (clojure.string/join
               "\n  "
               (for [[sym init] pairs]
-                (if (loop-init? init)
-                ;; buffer-writing loop / nested compute — emit for side effects,
-                ;; the binding sym (a result buffer) is discarded.
+                (if (buffer-loop? init)
+                  ;; buffer-writing loop / nested compute — emit for side effects.
                   (emit-host-stmt init array-syms ct)
-                ;; scalar binding (e.g. n = (int len_x)) — declare it.
-                  (str ct-int " " (ce/c-symbol sym) " = " (emit-expr* init array-syms) ";"))))
+                  ;; value binding (scalar or reduction) — declare with its tag type.
+                  (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
+                       (emit-expr* init array-syms) ";"))))
              "\n  "
            ;; body: emit statement forms only. The function is void; the trailing
            ;; result value (a buffer symbol, or a vector [q scales] of them for a
@@ -310,9 +321,11 @@
                     (map (fn [[s _ elem]] (str (elem->ctype elem "double") "* restrict " (ce/c-symbol s))) buffers)
                     (map (fn [[s t]] (str t " " (ce/c-symbol s))) scalar-params)
                     (map (fn [[_ ls]] (str "int " (ce/c-symbol ls))) (sort-by (comp str val) length-syms)))
-        ;; scalar params and array-length params are all int — seed them so index
-        ;; arithmetic bound to a name (base = b*n) types as int, not *scalar-type*.
-        int-seed (set (concat (map first scalar-params) (vals length-syms)))
+        ;; integer scalar params (not double eps) and array lengths seed the index-var
+        ;; scope so index arithmetic bound to a name (base = b*n) types as int.
+        int-seed (set (concat (map first (filter (fn [[_ c]] (contains? #{"int" "long"} c))
+                                                 scalar-params))
+                              (vals length-syms)))
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct
                          ce/*int-vars* int-seed]
@@ -374,16 +387,21 @@
         ;; input array params as [sym ctype] (per-element type), scalars as [sym ctype]
         array-params  (vec (for [p params :when (contains? array-tags (get param-env p))]
                              [p (elem->ctype (tag->elem (get param-env p)) "double")]))
+        ;; scalar params typed from their tag (double eps, long n, ...), not all int.
         scalar-params (vec (for [p params :when (not (contains? array-tags (get param-env p)))]
-                             [p (ctype (get param-env p) "int")]))
+                             [p (elem->ctype (tag->elem (get param-env p)) "int")]))
         ;; stable length-sym order shared by signature + call site
         len-order (vec (sort-by (comp str val) length-syms))
+        ;; FFM marshalling types for the trailing scalars: scalar-param types then
+        ;; the (always-int) array lengths — must match the emitted C signature.
+        scalar-ffm (vec (concat (map (fn [[_ c]] (ctype->ffm c "int")) scalar-params)
+                                (repeat (count len-order) :int)))
         kernel-name (str "aot_" (ce/c-symbol (:name (meta f-var))) "_" (name dtype))
         src (emit-c-fn kernel-name dtype array-params scalar-params buffers length-syms stripped)
         so  (cpu/compile-source! src)
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count buffers))
-                                (+ (count scalar-params) (count len-order)))
+                                scalar-ffm)
         {result-shape :shape result-indices :indices} (result-buffers stripped buffers)
         ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
         ;; backend uses) — keyed by the resolved size signature, so repeated
@@ -395,7 +413,13 @@
         (let [base-env (zipmap params args)
               len-env (reduce (fn [m [arr ls]] (assoc m ls (count (get base-env arr))))
                               base-env len-order)
-              env (reduce (fn [m [sym init]] (assoc m sym (resolve-int-expr init m)))
+              ;; scalar-bindings are candidate buffer-size contributors. Only the
+              ;; integer index/size expressions resolve here; value computations that
+              ;; happen to be non-loop scalars (e.g. inv = 1/sqrt(ms+eps)) are not
+              ;; size-relevant and are skipped — buffer sizes never reference them.
+              env (reduce (fn [m [sym init]]
+                            (if-let [v (try (resolve-int-expr init m) (catch Exception _ nil))]
+                              (assoc m sym v) m))
                           len-env scalar-bindings)
               sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) buffers)
               c @cache
