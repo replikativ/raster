@@ -270,10 +270,19 @@
 ;; ================================================================
 
 (defn infer-c-type
-  "Infer the C type of an expression from walker :tag metadata on symbols,
-  primitive casts, and aget on typed arrays. Falls back to *scalar-type*."
+  "Infer the C type of an expression. Prefers the walker-stamped :raster.type/tag
+  result-type metadata (the single source of truth — no mangled-name parsing); falls
+  back to structural inference (casts, aget element type, comparisons) then
+  *scalar-type*."
   [expr]
-  (cond
+  (or
+   ;; Metadata-first: the walker stamps every typed form (incl. devirtualized .invk
+   ;; arithmetic) with its result element type. Use it directly instead of parsing
+   ;; impl names or re-deriving from operand structure.
+   (when (instance? clojure.lang.IObj expr)
+     (when-let [t (:raster.type/tag (meta expr))]
+       (get tag->ctype t)))
+   (cond
     (and (seq? expr) (= 2 (count expr))
          (contains? #{'int 'float 'double 'long} (first expr)))
     (get tag->ctype (first expr) *scalar-type*)
@@ -287,13 +296,6 @@
     (and (seq? expr)
          (contains? #{'unchecked-add-int 'unchecked-subtract-int
                       'unchecked-multiply-int} (first expr)))
-    "int"
-
-    ;; Devirtualized integer arithmetic: (.invk X_m_long_long-impl ...) /
-    ;; X_m_int_int / X_m_long — index & counter math. The mangled name encodes
-    ;; integer operands, so the result is an integer (array subscripts, offsets).
-    (and (seq? expr) (= '.invk (first expr)) (symbol? (second expr))
-         (re-find #"_m_(long|int)(_(long|int))?(-impl)?$" (name (second expr))))
     "int"
 
     (and (seq? expr)
@@ -329,7 +331,7 @@
     (let [types (map infer-c-type (rest expr))]
       (if (some #(= "uint" %) types) "uint" "int"))
 
-    :else *scalar-type*))
+    :else *scalar-type*)))
 
 ;; ================================================================
 ;; Side effect detection
@@ -1083,7 +1085,11 @@
      (let [resolved-var (resolve-gpu-inlinable-var (second expr))
            var-name (str (:name (meta resolved-var)))
            args (nnext expr)
-           c-op (mangled-name->c-op var-name)]
+           ;; Metadata-first: the walker stamps the .invk form with its semantic op
+           ;; (:raster.op/original). Use it directly; fall back to mangled-name parsing.
+           c-op (or (when-let [op (:raster.op/original (meta expr))]
+                      (intrinsics/op->c-lowering op (= :glsl (:cast-style *emit-config*))))
+                    (mangled-name->c-op var-name))]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
