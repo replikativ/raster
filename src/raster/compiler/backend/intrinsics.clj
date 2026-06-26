@@ -173,10 +173,15 @@
 (defn c-lowering
   [mangled-name glsl?]
   (when-let [i (str/index-of mangled-name "_m_")]
-    (when-let [d (descriptor (subs mangled-name 0 i))]
+    ;; The prefix before `_m_` is either a mangled operator prefix (e.g. `_star_`,
+    ;; resolved via mangled-prefix->key) or a function name (e.g. `sqrt`, resolved
+    ;; via name->key in `descriptor`). `descriptor` on a bare string only consults
+    ;; name->key, so operator prefixes must be mapped to their canonical key first.
+    (let [prefix (subs mangled-name 0 i)]
+      (when-let [d (descriptor (or (mangled-prefix->key prefix) prefix))]
       (let [c (:c d)]
         (cond
           (= :floored-mod c) {:kind :floored-mod}
           (string? c)        {:kind :infix :op c}
           (and (map? c) (:fn c)) {:kind :fn :op (if (and glsl? (:glsl c)) (:glsl c) (:fn c))}
-          :else nil)))))
+          :else nil))))))
