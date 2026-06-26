@@ -90,8 +90,13 @@
          mh (.downcallHandle linker (.orElseThrow (.find lib name)) fd
                              (into-array Linker$Option [(Linker$Option/critical true)]))]
      (fn [& args]
-       (.invokeWithArguments mh (object-array (map (fn [a] (if (number? a) (int a)
-                                                               (MemorySegment/ofArray a))) args)))))))
+       ;; Hint mh as MethodHandle (matches the BLAS bindings) so invokeWithArguments
+       ;; isn't a reflective call. Per-call cost is dominated by critical(true)
+       ;; heap-pinning of the array segments; amortized in the monolithic
+       ;; one-call-per-compiled-fn model.
+       (.invokeWithArguments ^java.lang.invoke.MethodHandle mh
+                             (object-array (map (fn [a] (if (number? a) (int a)
+                                                            (MemorySegment/ofArray a))) args)))))))
 
 (defn compile-elementwise
   "Convenience: emit + compile + load an element-wise kernel. Returns a fn
