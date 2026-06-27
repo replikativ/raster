@@ -26,9 +26,10 @@
   optimisation, once the primitive vectorises."
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as ra]
-            [raster.compiler.backend.cpu.quant :as cq]))
+            [raster.compiler.backend.cpu.quant :as cq]
+            [raster.compiler.core.op-descriptor :as descriptor]))
 
-(deftm wi8-dot-q4
+(deftm ^:no-inline wi8-dot-q4
   "The int8-MAC seam over ONE Q4_0 block: unsigned-nibble x signed-int8 dot. Reads 16
   packed weight bytes at wq[woff..] (32 nibbles, lo=elem k, hi=elem k+16) and 32 int8
   activations at xq[xoff..], returns the raw int32 dot (the caller folds the zero-point
@@ -42,6 +43,25 @@
                (+ s (* (long (ra/aget xq (+ xoff k))) (bit-and bv 0xF))
                     (* (long (ra/aget xq (+ xoff k 16))) (bit-shift-right bv 4)))))
       s)))
+
+;; The ISA seam: wi8-dot-q4's optimal C lowering is the AVX2 maddubs block-dot (the
+;; widening unsigned-nibble x signed-int8 MAC), not its translated scalar body. Registered
+;; as a :c-helper override the CPU-C AOT backend emits for the ^:no-inline call. (Halide
+;; treats this as a one-row intrinsic table; here it's one registered op helper. The
+;; surrounding loop/accumulate is still the composable GEMV — see qmatmul-q4-composable.)
+(descriptor/register-c-helper! 'raster.dl.qlinear-composable/wi8-dot-q4
+  {:includes "#include <immintrin.h>\n"
+   :gen (fn [c-name]
+          (str "static inline long " c-name
+               "(const signed char* wq, long woff, const signed char* xq, long xoff) {\n"
+               "  __m128i raw = _mm_loadu_si128((const __m128i*)(wq + woff));\n"
+               "  __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _mm256_set1_epi8(0x0F));\n"
+               "  __m256i xv = _mm256_loadu_si256((const __m256i*)(xq + xoff));\n"
+               "  __m256i p = _mm256_maddubs_epi16(nib, xv);\n"
+               "  __m256i s = _mm256_madd_epi16(p, _mm256_set1_epi16(1));\n"
+               "  __m128i lo = _mm_add_epi32(_mm256_castsi256_si128(s), _mm256_extracti128_si256(s,1));\n"
+               "  lo = _mm_hadd_epi32(lo, lo); lo = _mm_hadd_epi32(lo, lo);\n"
+               "  return (long)_mm_cvtsi128_si32(lo);\n}\n"))})
 
 (deftm qmatmul-q4-composable
   "Composable Q4_0 GEMV: y[o] = sum_b (xs[b]*ws[o,b]) * (wi8-dot-q4(o,b) - 8*xsum[b]).
