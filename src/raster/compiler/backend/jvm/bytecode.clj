@@ -11,6 +11,7 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.macroexpand :as mex]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.backend.jvm.split :as split])
   (:import (java.lang.classfile ClassFile ClassFile$ClassHierarchyResolverOption ClassFile$Option)
            (java.lang.classfile.attribute SourceFileAttribute)
@@ -4309,16 +4310,10 @@
 ;; ================================================================
 
 (defn- no-inline-deftm?
-  "Check if a deftm var or its dispatch parent has ^:no-inline."
+  "Check if a deftm var or its dispatch parent has ^:no-inline.
+  Delegates to the single source of truth (dispatch/no-inline?)."
   [v]
-  (or (:no-inline (meta v))
-      ;; Check the dispatch var (base name before _m_)
-      (let [vname (str (:name (meta v)))]
-        (when-let [idx (clojure.string/index-of vname "_m_")]
-          (let [dispatch-name (subs vname 0 idx)
-                dispatch-var (ns-resolve (:ns (meta v)) (symbol dispatch-name))]
-            (when dispatch-var
-              (:no-inline (meta dispatch-var))))))))
+  (dispatch/no-inline? v))
 
 (defn- scan-deftm-refs
   "Walk forms to find all referenced deftm vars.
