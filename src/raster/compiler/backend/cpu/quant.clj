@@ -273,27 +273,43 @@
 (def ^:private pool-threads
   (max 1 (or (some-> (System/getenv "RASTER_DECODE_THREADS") Integer/parseInt) 1)))
 
+;; Workers spin-poll for new work this many iterations, THEN park (sleep). During
+;; active decode, dispatches arrive faster than this window, so workers stay spinning
+;; (low latency); when decode stops/idle they park — no idle core-burn, and robust
+;; under contention (a busy machine doesn't get 4 cores pinned by a dormant pool).
+(def ^:private spin-limit 100000)
+
 (defonce ^:private the-pool
   (delay
     (let [n     pool-threads
           gen   (java.util.concurrent.atomic.AtomicLong. 0)
           arrive (java.util.concurrent.atomic.AtomicLong. 0)
-          task  (java.util.concurrent.atomic.AtomicReference.)]
+          task  (java.util.concurrent.atomic.AtomicReference.)
+          threads (object-array (dec n))]   ;; worker handles, for unpark
       (dotimes [w (dec n)]
-        (let [wid (inc w)]
-          (doto (Thread.
-                 (fn []
-                   (let [g (long-array 1)]
-                     (loop []
-                       (let [cur (.get gen)]
-                         (if (== cur (aget g 0))
-                           (do (Thread/onSpinWait) (recur))
-                           (do (aset g 0 cur)
-                               (.runSlice ^IParTask (.get task) wid n)
-                               (.incrementAndGet arrive)
-                               (recur))))))))
-            (.setDaemon true) (.setName (str "raster-decode-" wid)) (.start))))
-      {:gen gen :arrive arrive :task task :n n})))
+        (let [wid (inc w)
+              th (Thread.
+                  (fn []
+                    (let [g (long-array 1)]
+                      (loop []
+                        (let [cur (.get gen)]
+                          (if (== cur (aget g 0))
+                            ;; no work: spin a bounded window, then park until unparked.
+                            ;; park()/unpark() permits make this lost-wakeup-safe (an
+                            ;; unpark before park returns immediately).
+                            (do (loop [s 0]
+                                  (when (and (< s spin-limit) (== (.get gen) (aget g 0)))
+                                    (Thread/onSpinWait) (recur (inc s))))
+                                (when (== (.get gen) (aget g 0))
+                                  (java.util.concurrent.locks.LockSupport/park))
+                                (recur))
+                            (do (aset g 0 cur)
+                                (.runSlice ^IParTask (.get task) wid n)
+                                (.incrementAndGet arrive)
+                                (recur))))))))]
+          (aset threads w th)
+          (doto th (.setDaemon true) (.setName (str "raster-decode-" wid)) (.start))))
+      {:gen gen :arrive arrive :task task :n n :threads threads})))
 
 (defn run-par!
   "Run `t` across the persistent pool: worker i of n runs (.runSlice t i n). The
@@ -301,12 +317,15 @@
   [^IParTask t]
   (let [{:keys [^java.util.concurrent.atomic.AtomicLong gen
                 ^java.util.concurrent.atomic.AtomicLong arrive
-                ^java.util.concurrent.atomic.AtomicReference task n]} @the-pool]
+                ^java.util.concurrent.atomic.AtomicReference task n
+                ^objects threads]} @the-pool]
     (if (== 1 (int n))
       (.runSlice t 0 1)
       (do (.set arrive 0)
           (.set task t)            ; volatile store, visible before the gen bump
           (.incrementAndGet gen)   ; full fence — releases the spinning workers
+          (dotimes [w (dec (int n))]   ; wake any parked workers
+            (java.util.concurrent.locks.LockSupport/unpark (aget threads w)))
           (.runSlice t 0 (int n))  ; main = worker 0
           (let [need (dec (long n))]
             (while (< (.get arrive) need) (Thread/onSpinWait)))))))
