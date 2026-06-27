@@ -258,17 +258,23 @@
 
 (defn register-placement!
   "Register the device-placement profile for an op — the MLX-style per-op compute
-  tag. `profile` is :jvm | :cpu-quant | :gpu : it names WHICH compute profile lowers
-  this op, not where its data lives (data never moves; the profile selects the
-  lowering/runtime). The compute-profile seam reads this to route an op to the JVM
-  bytecode backend, the CPU int8-MAC kernel, or the GPU (OpenCL/Level-Zero) backend.
-  A descriptor facet (not a separate registry) so it composes with buffer/effects/AD."
+  tag. `profile` is a device TYPE / compute class — :jvm | :cpu-quant | :gpu — NOT a
+  concrete device instance. It names WHICH class of lowering runs the op (JVM bytecode,
+  the CPU int8-MAC kernel, or a GPU backend), not where its data lives (data never
+  moves; the profile selects the lowering).
+
+  Concrete device SELECTION is orthogonal and lives at the runtime/session layer: a
+  :gpu op binds to a specific physical device (:ze:0, :ze:1, :ocl:0, :cuda:0 — there
+  can be several, e.g. multiple GPUs) when a session places it. Same op, one profile,
+  any concrete device of that class. A descriptor facet (not a separate registry) so
+  it composes with buffer/effects/AD."
   [op-sym profile]
   (register-op-descriptor! op-sym {:placement {:profile profile}}))
 
 (defn get-placement
-  "The compute-profile tag for op-sym (:jvm/:cpu-quant/:gpu), or nil. Resolves
-  mangled/devirtualized names so passes can query with a clean semantic-op symbol."
+  "The compute-profile (device-type) tag for op-sym (:jvm/:cpu-quant/:gpu), or nil —
+  NOT a concrete device id (that is a session-layer binding). Resolves mangled/
+  devirtualized names so passes can query with a clean semantic-op symbol."
   [op-sym]
   (when-let [[descriptor _] (resolve-op-descriptor op-sym)]
     (get-in descriptor [:placement :profile])))
