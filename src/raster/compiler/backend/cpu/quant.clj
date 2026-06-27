@@ -202,34 +202,45 @@
   (layout/repack stream-gemv-layout wq ws out in))
 
 (defn emit-qmatmul-stream
-  "Emit the :stream-gemv decode kernel over a repack-stream weight. One contiguous
-  weight stream; per block an int32 lane-packed accumulator (8 dpbusd, no shuffle/
-  blend), the -ZP fold via the activation block-sum, one fmadd of (col×act scale).
-  Column i → lane i, so the store needs no permute. Signature:
-  void NAME(xq,xs,xsum,wqi,wsi,y,in,out)."
+  "Emit the :stream-gemv decode kernel — the descriptor-driven SCHEDULE for the Q4
+  interleaved layout. The structure (column tile NC, bytes/input-group, input-groups,
+  k-group, block) is sourced from the layout descriptor (`stream-gemv-layout`), so the
+  kernel's gather provably matches `repack-stream`'s scatter — both read ONE descriptor,
+  no drifting convention. Register-resident: per block an int32 lane-packed accumulator
+  (NC dpbusd, no shuffle/blend), the -ZP fold via the activation block-sum, one fmadd of
+  (col×act scale). Column i → lane i, so the store needs no permute. NC=8 is the AVX2
+  path (the f32 lane count); AVX-512 (NC=16) / NEON (NC=4) are intrinsic-family variants
+  keyed off the same descriptor. Signature: void NAME(xq,xs,xsum,wqi,wsi,y,in,out)."
   [name {:keys [zero-point]} mac]
-  (let [zp (str zero-point)]
+  (let [{:keys [tile block bytes-per-igroup igroups k-group]} stream-gemv-layout
+        nc tile
+        bpi bytes-per-igroup
+        blk (* igroups bpi)        ;; bytes per (group, block) = 128 for NC=8
+        zp (str zero-point)]
+    (assert (= nc 8)
+            (str "emit-qmatmul-stream: only NC=8 (AVX2 __m256) implemented; NC=" nc
+                 " (AVX-512/NEON) is an intrinsic-family variant — TODO"))
     (str "#include <stdint.h>\n" i8dot-helper
          "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
          "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out,\n"
          "    int o_start, int o_count) {\n"
-         "  int nb = in/32; const __m256i _m4 = _mm256_set1_epi8(0x0F); int oend = o_start + o_count;\n"
-         "  for (int g = o_start; g + 8 <= oend; g += 8) {\n"
-         "    long gi = g/8;\n"
-         "    const uint8_t* restrict wg = wqi + gi*(long)nb*128;\n"
-         "    const float* restrict sg = wsi + gi*(long)nb*8;\n"
+         "  int nb = in/" block "; const __m256i _m4 = _mm256_set1_epi8(0x0F); int oend = o_start + o_count;\n"
+         "  for (int g = o_start; g + " nc " <= oend; g += " nc ") {\n"
+         "    long gi = g/" nc ";\n"
+         "    const uint8_t* restrict wg = wqi + gi*(long)nb*" blk ";\n"
+         "    const float* restrict sg = wsi + gi*(long)nb*" nc ";\n"
          "    __m256 acc = _mm256_setzero_ps();\n"
          "    for (int b = 0; b < nb; b++) {\n"
-         "      const uint8_t* wb = wg + b*128; const int8_t* xb = xq + b*32;\n"
+         "      const uint8_t* wb = wg + b*" blk "; const int8_t* xb = xq + b*" block ";\n"
          "      __m256i ia = _mm256_setzero_si256();\n"
-         "      for (int ig = 0; ig < 8; ig++) {\n"
-         "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*16));\n"
+         "      for (int ig = 0; ig < " igroups "; ig++) {\n"
+         "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*" bpi "));\n"
          "        __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _m4);\n"
-         "        __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*4));\n"
+         "        __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*" k-group "));\n"
          "        ia = _i8dot_acc(ia, nib, ab);\n"
          "      }\n"
          "      ia = _mm256_sub_epi32(ia, _mm256_set1_epi32(" zp " * xsum[b]));\n"
-         "      __m256 cs = _mm256_loadu_ps(sg + b*8);\n"
+         "      __m256 cs = _mm256_loadu_ps(sg + b*" nc ");\n"
          "      acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_mul_ps(cs, _mm256_set1_ps(xs[b])), acc);\n"
          "    }\n"
          "    _mm256_storeu_ps(y + g, acc);\n"
