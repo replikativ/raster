@@ -158,6 +158,8 @@
          'clojure.core/bit-xor "^"
          'bit-shift-left "<<"
          'clojure.core/bit-shift-left "<<"
+         'bit-shift-right ">>"
+         'clojure.core/bit-shift-right ">>"
          'unsigned-bit-shift-right ">>"
          'clojure.core/unsigned-bit-shift-right ">>"
          '< "<"
@@ -1048,12 +1050,13 @@
             " " (get op-map op (name op)) " "
             (emit-expr b idx-sym array-syms opencl-idx) ")"))
 
-     ;; Bitwise ops: bit-and, bit-or, bit-xor, bit-shift-left, unsigned-bit-shift-right
+     ;; Bitwise ops: bit-and, bit-or, bit-xor, bit-shift-left/right, unsigned-bit-shift-right
      (and (seq? expr) (= 3 (count expr))
           (contains? #{'bit-and 'clojure.core/bit-and
                        'bit-or 'clojure.core/bit-or
                        'bit-xor 'clojure.core/bit-xor
                        'bit-shift-left 'clojure.core/bit-shift-left
+                       'bit-shift-right 'clojure.core/bit-shift-right
                        'unsigned-bit-shift-right 'clojure.core/unsigned-bit-shift-right}
                      (first expr)))
      (let [[op a b] expr
