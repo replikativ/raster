@@ -18,27 +18,62 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.backend.cpu.codegen :as cpu]))
 
-;; ---- encode side: quantizers matching the q4-0 kernel (interleaved pack) ----
-(defn quantize-weight-q4
-  "f32 weight (len % 32 = 0) → {:wq byte[len/2] :ws float[len/32]}, interleaved
-  Q4_0 pack (byte k of a block holds w[k] low / w[k+16] high), symmetric d=max/-8."
-  [^floats w]
-  (let [len (alength w) nb (quot len 32)
-        wq (byte-array (quot len 2)) ws (float-array nb)]
+;; ---- FORMAT DESCRIPTORS (data) — one row per quant level ----
+;; The unifying trick: encode weights UNSIGNED with a zero-point (q in [0,2^bits),
+;; zp = 2^(bits-1)), so the kernel's u8*s8 dpbusd + (-zp*Σact) fold reconstructs
+;; dot = d_w*d_x*(dpbusd(q_w,q_x) - zp*Σact) for ANY bit width — 4-bit and 8-bit
+;; share one MAC core (only the unpack: nibble vs byte). The legacy _0 family is a
+;; clean parametric {bits, pack}; K-quants (Q4_K…) need per-format unpack/scale-decode.
+(def q4-0
+  "Symmetric 4-bit, block 32, two nibbles/byte interleaved (lo=w[k], hi=w[k+16]),
+  zero-point 8. (= GGUF Q4_0 quant level.)"
+  {:name "q4_0" :block 32 :weight-bits 4 :pack :nibble-interleaved
+   :zero-point 8 :symmetric true :act-type :i8})
+
+(def q8-0
+  "Symmetric 8-bit, block 32, one unsigned byte/weight, zero-point 128. raster's
+  dpbusd-compatible 8-bit (unsigned-offset, not GGUF's signed Q8_0 — functionally
+  equivalent, same accuracy). The clean parametric proof: same kernel as q4-0 modulo
+  byte-direct unpack."
+  {:name "q8_0" :block 32 :weight-bits 8 :pack :byte-direct
+   :zero-point 128 :symmetric true :act-type :i8})
+
+;; ---- encode side: ONE parametric quantizer (Q4_0 is the default data row) ----
+(defn quantize-weight
+  "f32 weight (len % block = 0) → {:wq byte[] :ws float[]}: unsigned-offset symmetric
+  quantization parameterized by the FORMAT (weight-bits, zero-point, pack). Per block,
+  d = max/(-zp); the unsigned weight q = clamp(round(w/d)+zp, 0, 2^bits-1). :nibble-
+  interleaved packs two weights/byte (w[k] low, w[k+half] high); :byte-direct one/byte.
+  The bit width changes only the pack + range; the dpbusd kernel core is shared."
+  [^floats w {:keys [block weight-bits zero-point pack]}]
+  (let [len (alength w) blk (long block) nb (quot len blk) half (quot blk 2)
+        zp (long zero-point) qmax (dec (bit-shift-left 1 (long weight-bits)))
+        ws (float-array nb)
+        wq (byte-array (if (= pack :nibble-interleaved) (quot len 2) len))]
     (dotimes [b nb]
-      (let [base (* b 32)
+      (let [base (* b blk)
             mx (loop [j 0 a 0.0 v 0.0]
-                 (if (< j 32)
+                 (if (< j blk)
                    (let [x (aget w (+ base j)) ax (Math/abs x)]
                      (if (> ax a) (recur (inc j) ax x) (recur (inc j) a v)))
                    v))
-            d (/ mx -8.0) id (if (zero? d) 0.0 (/ 1.0 d))]
+            d (/ mx (double (- zp))) id (if (zero? d) 0.0 (/ 1.0 d))
+            q (fn [x] (max 0 (min qmax (+ (Math/round (* (double x) id)) zp))))]
         (aset ws b (float d))
-        (dotimes [k 16]
-          (let [q0 (max 0 (min 15 (+ (Math/round (* (aget w (+ base k)) id)) 8)))
-                q1 (max 0 (min 15 (+ (Math/round (* (aget w (+ base k 16)) id)) 8)))]
-            (aset wq (+ (* b 16) k) (unchecked-byte (bit-or q0 (bit-shift-left q1 4))))))))
+        (if (= pack :nibble-interleaved)
+          (dotimes [k half]
+            (aset wq (+ (* b half) k)
+                  (unchecked-byte (bit-or (q (aget w (+ base k)))
+                                          (bit-shift-left (q (aget w (+ base k half))) 4)))))
+          (dotimes [k blk]
+            (aset wq (+ base k) (unchecked-byte (q (aget w (+ base k)))))))))
     {:wq wq :ws ws}))
+
+(defn quantize-weight-q4
+  "f32 weight → Q4_0 {:wq byte[len/2] :ws float[len/32]}. Thin wrapper over the
+  parametric quantize-weight with the q4-0 format."
+  [^floats w]
+  (quantize-weight w q4-0))
 
 (defn- quantize-act-blocks!
   "Quantize the 32-element blocks [r0, r0+cnt) of activation x into xq/xs/xsum
@@ -64,13 +99,6 @@
         xq (byte-array (alength x)) xs (float-array (* M nb)) xsum (int-array (* M nb))]
     (quantize-act-blocks! x xq xs xsum 0 (* M nb))
     {:xq xq :xs xs :xsum xsum}))
-
-;; ---- FORMAT DESCRIPTORS (data) ----
-(def q4-0
-  "Symmetric 4-bit, block 32, two nibbles/byte, interleaved (lo=w[0..15],
-  hi=w[16..31]), zero-point 8. (= GGUF Q4_0 quant level.)"
-  {:name "q4_0" :block 32 :weight-bits 4 :pack :nibble-interleaved
-   :zero-point 8 :symmetric true :act-type :i8})
 
 ;; ---- per-ISA pieces of the widening-i8-dot primitive (the one seam) ----
 ;; :maddubs names the x86 SIMD lowering, but the emitted `_i8dot` is a PORTABLE
