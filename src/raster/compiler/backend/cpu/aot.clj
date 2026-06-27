@@ -301,6 +301,20 @@
 
     :else (ce/emit-stmt form nil array-syms "idx")))
 
+(defn- written-array-syms
+  "Array symbols that are aset targets in `form` — i.e. in-place output params written
+  by the body. Such params must be emitted non-const (unlike read-only input arrays)."
+  [form]
+  (let [acc (atom #{})]
+    (walk/postwalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)) (= "aset" (name (first x)))
+                  (>= (count x) 2) (symbol? (second x)))
+         (swap! acc conj (second x)))
+       x)
+     form)
+    @acc))
+
 (defn emit-c-fn
   "Emit a C host function for a fused, normalized scalar form.
    - kernel-name  : C function name
@@ -314,10 +328,13 @@
   [kernel-name dtype array-params scalar-params buffers length-syms stripped]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
         array-syms (set (concat (map first array-params) (map first buffers)))
+        ;; array params that the body writes (aset target) are in-place OUTPUT params —
+        ;; emit them non-const; read-only input arrays stay const.
+        written (written-array-syms stripped)
         ;; param order: input arrays, output buffers, scalar params, array lengths —
         ;; each array gets ITS OWN element type (e.g. float in, int8_t out for quant).
         param-strs (concat
-                    (map (fn [[s c]] (str "const " c "* restrict " (ce/c-symbol s))) array-params)
+                    (map (fn [[s c]] (str (when-not (written s) "const ") c "* restrict " (ce/c-symbol s))) array-params)
                     (map (fn [[s _ elem]] (str (elem->ctype elem "double") "* restrict " (ce/c-symbol s))) buffers)
                     (map (fn [[s t]] (str t " " (ce/c-symbol s))) scalar-params)
                     (map (fn [[_ ls]] (str "int " (ce/c-symbol ls))) (sort-by (comp str val) length-syms)))
@@ -347,26 +364,27 @@
   literal [a b ...] returns SEVERAL (the fused multi-output kernel, e.g. [q scales]
   from norm+blockquant). Each returned position is traced through the compute-binding
   aliases (sym -> the symbol its init returns) to a buffer symbol.
-  Returns {:shape :scalar|:vector :indices [i ...]} (indices into `buffers`,
-  defaulting to the last buffer when a position can't be resolved)."
+  Returns {:shape :scalar|:vector :syms [sym ...]} where each sym is the buffer-or-param
+  symbol the result position resolves to (an allocated buffer, or an in-place OUTPUT
+  param the body wrote and returned). The wrapper looks each up in the buffers or the
+  passed args."
   [stripped buffers]
   (let [[_ binds & body] stripped
-        buf-syms (mapv first buffers)
-        buf-set (set buf-syms)
+        buf-set (set (map first buffers))
         aliases (into {} (for [[sym init] (partition 2 binds)]
                            [sym (form/tail-symbol init)]))
-        resolve-buf (fn resolve-buf [s seen]
+        ;; resolve to a buffer sym, else follow aliases to the underlying sym (a param
+        ;; for in-place kernels). Stop on a buffer, a cycle, or a non-aliased leaf.
+        resolve-sym (fn resolve-sym [s seen]
                       (cond (buf-set s) s
-                            (or (nil? s) (contains? seen s)) nil
-                            :else (recur (get aliases s) (conj seen s))))
-        idx-of (fn [x]
-                 (let [s (if (symbol? x) x (form/tail-symbol x))
-                       b (resolve-buf s #{})]
-                   (or (when b (.indexOf buf-syms b)) (dec (count buffers)))))
+                            (or (nil? s) (contains? seen s)) s
+                            (contains? aliases s) (recur (get aliases s) (conj seen s))
+                            :else s))
+        sym-of (fn [x] (resolve-sym (if (symbol? x) x (form/tail-symbol x)) #{}))
         tail (last body)]
     (if (vector? tail)
-      {:shape :vector :indices (mapv idx-of tail)}
-      {:shape :scalar :indices [(idx-of tail)]})))
+      {:shape :vector :syms (mapv sym-of tail)}
+      {:shape :scalar :syms [(sym-of tail)]})))
 
 (defn- alloc-array [elem n]
   (case elem :double (double-array n) :float (float-array n)
@@ -402,7 +420,8 @@
         native (cpu/load-kernel so kernel-name
                                 (+ (count array-params) (count buffers))
                                 scalar-ffm)
-        {result-shape :shape result-indices :indices} (result-buffers stripped buffers)
+        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
+        buf-syms (mapv first buffers)
         ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
         ;; backend uses) — keyed by the resolved size signature, so repeated
         ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
@@ -431,7 +450,9 @@
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
               lengths  (map (fn [[_ ls]] (get env ls)) len-order)]
           (apply native (concat in-arrs buf-arrs scalars lengths))
-          (case result-shape
-            :vector (mapv #(nth buf-arrs %) result-indices)
-            (nth buf-arrs (first result-indices)))))
+          ;; result may be an allocated buffer OR an in-place output param (passed in)
+          (let [sym->arr (merge (zipmap buf-syms buf-arrs) base-env)]
+            (case result-shape
+              :vector (mapv sym->arr result-syms)
+              (sym->arr (first result-syms))))))
       {:c-source src :kernel-name kernel-name})))

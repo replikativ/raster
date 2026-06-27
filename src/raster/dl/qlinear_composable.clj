@@ -25,7 +25,8 @@
   scalar reference). The permute-free interleaved layout (repack-stream) is a later
   optimisation, once the primitive vectorises."
   (:require [raster.core :refer [deftm]]
-            [raster.arrays :as ra]))
+            [raster.arrays :as ra]
+            [raster.compiler.backend.cpu.quant :as cq]))
 
 (deftm wi8-dot-q4
   "The int8-MAC seam over ONE Q4_0 block: unsigned-nibble x signed-int8 dot. Reads 16
@@ -62,3 +63,48 @@
                     a))]
         (ra/aset y o (float acc))))
     y))
+
+(deftm qmatmul-q4-composable!
+  "Sliceable in-place Q4_0 GEMV: same compute as qmatmul-q4-composable, but writes y[o]
+  for o in [o-start, o-start+o-count) into a SHARED pre-allocated y. Disjoint row slices
+  -> the persistent spin-pool drives them concurrently (the threading the hand kernel gets,
+  composably — NOT OpenMP-per-call, which is measured worse than serial for tiny decode
+  matmuls). Compile via compile-aot :target :c, then pool-drive with make-composable-c-gemv."
+  [xq :- (Array byte), xs :- (Array float), xsum :- (Array int),
+   wq :- (Array byte), ws :- (Array float), y :- (Array float),
+   in :- Long, out :- Long, o-start :- Long, o-count :- Long] :- (Array float)
+  (let [nb (quot (long in) 32)
+        half (quot (long in) 2)]
+    (dotimes [oi (long o-count)]
+      (let [o (+ (long o-start) oi)
+            wrow (* o half)
+            wsrow (* o nb)
+            acc (loop [b 0 a 0.0]
+                  (if (< b nb)
+                    (let [dot (wi8-dot-q4 wq (+ wrow (* (long b) 16)) xq (* (long b) 32))
+                          folded (- dot (* 8 (long (ra/aget xsum b))))
+                          scale (* (double (ra/aget xs b)) (double (ra/aget ws (+ wsrow b))))]
+                      (recur (inc b) (+ a (* scale (double folded)))))
+                    a))]
+        (ra/aset y o (float acc))))
+    y))
+
+(defn make-composable-c-gemv
+  "Compile qmatmul-q4-composable! to one C slice-kernel (compile-aot :target :c) once, and
+  return a driver (fn [xq xs xsum wq ws in out] -> y) that allocates y and pool-drives the
+  C kernel over disjoint output-row slices via the persistent spin-pool — the same threading
+  model as the handwritten kernel, from composable deftm source. defn: device/runtime glue."
+  []
+  (let [cfn ((requiring-resolve 'raster.compiler.pipeline/compile-aot)
+             #'qmatmul-q4-composable! :target :c)]
+    (fn [xq xs xsum wq ws in out]
+      (let [out (long out)
+            y (float-array out)]
+        (cq/run-par-fn!
+         (fn [wid n]
+           (let [chunk (quot (+ out (dec (long n))) (long n))
+                 o0 (* (long wid) chunk)
+                 cnt (max 0 (min chunk (- out o0)))]
+             (when (pos? cnt)
+               (cfn xq xs xsum wq ws y in out o0 cnt)))))
+        y))))
