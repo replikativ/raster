@@ -19,7 +19,7 @@
 
 (deftest descriptor-derives-avx2-tile
   (testing "NC for AVX2 = 8, the hand kernel's hard-coded column tile"
-    (let [l (layout/q4-stream-layout avx2)]
+    (let [l (layout/quant-stream-layout avx2)]
       (is (= :q4-col-interleaved (:kind l)))
       (is (= 8 (:tile l)))
       (is (= 4 (:half l)))
@@ -30,7 +30,7 @@
   (testing "descriptor-driven repack == hand repack-stream byte-for-byte (NC=8)"
     (doseq [[out in] [[1024 640] [640 2048] [16 64] [6912 1152]]]
       (let [[wq ws] (rand-weights out in (+ out in))
-            l (layout/q4-stream-layout avx2)
+            l (layout/quant-stream-layout avx2)
             a (layout/repack l wq ws out in)
             b (quant/repack-stream wq ws out in)]
         (is (java.util.Arrays/equals ^bytes (:wqi a) ^bytes (:wqi b))
@@ -40,7 +40,7 @@
 
 (deftest generalizes-to-avx512-tile
   (testing "NC=16 descriptor yields a self-consistent larger interleave"
-    (let [l (layout/q4-stream-layout {:vector-bits 512})]
+    (let [l (layout/quant-stream-layout {:vector-bits 512})]
       (is (= 16 (:tile l)))
       (is (= 8 (:half l)))
       (is (= 32 (:bytes-per-igroup l)))   ; (16/2)*4

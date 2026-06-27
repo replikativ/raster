@@ -24,28 +24,40 @@
 ;; Layout descriptor — derived from (instruction, dtype, hardware)
 ;; ---------------------------------------------------------------------------
 
-(defn q4-stream-layout
-  "The weight layout the Q4_0 stream-gemv dpbusd kernel requires, derived from the
-  hardware descriptor. The dpbusd tile puts NC output columns in the lanes and
-  reduces over the input axis; the weights must therefore be column-interleaved by
-  NC with the Q4 nibbles split lo/hi (columns [0,NC/2) -> low nibble, [NC/2,NC) ->
-  high nibble) and grouped k-group=4 elements per dpbusd step.
+(def q4-format
+  "The layout-relevant fields of the Q4_0 quant format (a subset of the full format
+   descriptor in cpu.quant): 4-bit weights, 32-element blocks, two columns per byte via
+   lo/hi nibble. Other formats (8-bit direct, 5-bit, ...) are sibling maps."
+  {:block 32 :weight-bits 4 :pack :nibble-interleaved})
 
-  Returns {:kind :tile :block :k-group :bits :half :bytes-per-igroup :igroups}.
-  `out` must be a multiple of `:tile` (caller pads)."
-  ([] (q4-stream-layout hw/*descriptor*))
-  ([desc]
+(defn quant-stream-layout
+  "The weight layout a quantized stream-gemv dpbusd kernel requires, DERIVED from the
+  hardware descriptor + the quant FORMAT (block, weight-bits, pack) — not hard-coded to
+  Q4. The dpbusd tile puts NC output columns in the lanes and reduces over the input
+  axis, so the weights are column-interleaved by NC. The PACK parameterizes precision:
+  :nibble-interleaved (4-bit) packs two columns per byte (columns [0,NC/2) -> low nibble,
+  [NC/2,NC) -> high nibble), so the structure (half, bytes-per-igroup) follows from the
+  bit width. NC (= f32 lanes) is the column tile; k-group (=4) is the dpbusd int8 4-way
+  lane-step. 8-bit/5-bit add a :pack branch.
+
+  Returns {:kind :tile :block :k-group :bits :pack :half :bytes-per-igroup :igroups}."
+  ([desc] (quant-stream-layout desc q4-format))
+  ([desc {:keys [block weight-bits pack] :or {block 32 weight-bits 4 pack :nibble-interleaved}}]
+   (assert (= pack :nibble-interleaved)
+           (str "quant-stream-layout: only :nibble-interleaved (4-bit) implemented; pack="
+                pack " is a future packing variant (8-bit direct, 5-bit, ...)"))
    (let [nc (hw/column-tile desc)            ;; output-column tile = f32 lanes
-         block 32                            ;; Q4_0 block size
-         k-group 4]                          ;; elements per dpbusd lane-step
+         k-group 4                           ;; dpbusd int8 4-way lane-step
+         half (quot nc 2)]                   ;; columns sharing a byte via lo/hi nibble (4-bit)
      {:kind            :q4-col-interleaved
       :tile            nc
       :block           block
       :k-group         k-group
-      :bits            4
-      :half            (quot nc 2)           ;; columns sharing a byte via lo/hi nibble
+      :bits            weight-bits
+      :pack            pack
+      :half            half
       :igroups         (quot block k-group)  ;; dpbusd steps per block (8 for block 32)
-      :bytes-per-igroup (* (quot nc 2) k-group)})))
+      :bytes-per-igroup (* half k-group)})))
 
 ;; ---------------------------------------------------------------------------
 ;; The layout function — physical byte index for a (group, block, igroup, byte)
