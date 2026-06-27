@@ -214,12 +214,8 @@
            base-sym (if (.endsWith ^String name-str "-impl")
                       (symbol (namespace sym) (subs name-str 0 (- (count name-str) 5)))
                       sym)
-           dispatch-no-inline?
-           (let [base-name (name base-sym)]
-             (when-let [idx (str/index-of base-name "_m_")]
-               (let [dispatch-sym (symbol (namespace base-sym) (subs base-name 0 idx))]
-                 (when-let [dispatch-var (try (resolve dispatch-sym) (catch Exception _ nil))]
-                   (:no-inline (meta dispatch-var))))))]
+           ;; Single source of truth for inline opacity (direct + `_m_` parent).
+           dispatch-no-inline? (dispatch/no-inline? base-sym)]
        (when-not dispatch-no-inline?
          (when-let [v (try (resolve base-sym) (catch Exception _ nil))]
            (when-not (:no-inline (meta v))
