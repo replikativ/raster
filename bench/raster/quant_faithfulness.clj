@@ -1,4 +1,4 @@
-(ns raster.bench.quant-faithfulness
+(ns raster.quant-faithfulness
   "Differential FAITHFULNESS harness for the quantized matmul.
 
   The hard gate for moving the quantized GEMV from a hand-written string emitter into
@@ -47,10 +47,23 @@
         W (qg/upload-weight! :ze:0 wq ws in out)]
     (fn [x] (qg/qlinear-i8-gpu W x))))
 
+(defn cand-cpu-composable
+  "The composable-IR Q4 GEMV (raster.dl.qlinear-composable), lowered via compile-aot
+  :target :c and pool-driven over output-row slices — the candidate we are closing to
+  hand-kernel parity. Row-major weight (no repack-stream); activation int8-quantized per
+  call. Measures the composable path vs the hand kernel to localize the residual gap."
+  [wf in out]
+  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
+        drive ((requiring-resolve 'raster.dl.qlinear-composable/make-composable-c-gemv))]
+    (fn [x]
+      (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
+        (drive xq xs xsum wq ws in out)))))
+
 (def candidates
   "name -> candidate prep fn. Composable par-form lowerings register here."
-  {:cpu-hand cand-cpu-hand
-   :gpu      cand-gpu})
+  {:cpu-hand       cand-cpu-hand
+   :cpu-composable cand-cpu-composable
+   :gpu            cand-gpu})
 
 ;; ---- correctness oracle: independent scalar dequant-dot (double) ----
 
