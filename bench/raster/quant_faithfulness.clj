@@ -59,10 +59,24 @@
       (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
         (drive xq xs xsum wq ws in out)))))
 
+(defn cand-cpu-x8
+  "The TILED tile-tensorize composable GEMV (raster.dl.qlinear-composable/qmatmul-q4-x8!
+  via compile-aot :target :c, pool-driven over column-group slices). Interleaved repack
+  layout; the wi8-dot-q4-x8 dpbusd tile is the one kernel call, the GEMV composable. The
+  candidate that should close the 8-column-lane gap to the hand kernel."
+  [wf in out]
+  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
+        {:keys [wqi wsi]} (cq/repack-stream wq ws out in)
+        drive ((requiring-resolve 'raster.dl.qlinear-composable/make-x8-c-gemv))]
+    (fn [x]
+      (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
+        (drive xq xs xsum wqi wsi in out)))))
+
 (def candidates
   "name -> candidate prep fn. Composable par-form lowerings register here."
   {:cpu-hand       cand-cpu-hand
    :cpu-composable cand-cpu-composable
+   :cpu-x8         cand-cpu-x8
    :gpu            cand-gpu})
 
 ;; ---- correctness oracle: independent scalar dequant-dot (double) ----

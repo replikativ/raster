@@ -92,6 +92,35 @@
                "  lo = _mm_hadd_epi32(lo, lo); lo = _mm_hadd_epi32(lo, lo);\n"
                "  return (long)_mm_cvtsi128_si32(lo);\n}\n"))})
 
+;; The TILE's optimal C lowering: 8 dpbusd into a PERSISTENT __m256i accumulator over
+;; the block's 8 input-groups (no per-block hsum — the gap the measurement localized),
+;; then store 8 int32 column dots. Column L -> lane L (the interleaved layout puts it
+;; there). Under -march=native the cascade picks vpdpbusd (AVX-VNNI) or maddubs+madd.
+;; This is the irreducible intrinsic; the GEMV's scale/fold/accumulate stays composable.
+(descriptor/register-c-helper! 'raster.dl.qlinear-composable/wi8-dot-q4-x8
+  {:includes "#include <immintrin.h>\n"
+   :gen (fn [c-name]
+          (str "static inline int* " c-name
+               "(const signed char* wqi, long woff, const signed char* xq, long xoff, int* out) {\n"
+               "  const unsigned char* wb = (const unsigned char*)(wqi + woff);\n"
+               "  const signed char* xb = xq + xoff;\n"
+               "  __m256i ia = _mm256_setzero_si256();\n"
+               "  const __m256i m4 = _mm256_set1_epi8(0x0F);\n"
+               "  for (int ig = 0; ig < 8; ig++) {\n"
+               "    __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*16));\n"
+               "    __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), m4);\n"
+               "    __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*4));\n"
+               "#if defined(__AVX512VNNI__) && defined(__AVX512VL__)\n"
+               "    ia = _mm256_dpbusd_epi32(ia, nib, ab);\n"
+               "#elif defined(__AVXVNNI__)\n"
+               "    ia = _mm256_dpbusd_avx_epi32(ia, nib, ab);\n"
+               "#else\n"
+               "    ia = _mm256_add_epi32(ia, _mm256_madd_epi16(_mm256_maddubs_epi16(nib, ab), _mm256_set1_epi16(1)));\n"
+               "#endif\n"
+               "  }\n"
+               "  _mm256_storeu_si256((__m256i*)out, ia);\n"
+               "  return out;\n}\n"))})
+
 (deftm qmatmul-q4-composable
   "Composable Q4_0 GEMV: y[o] = sum_b (xs[b]*ws[o,b]) * (wi8-dot-q4(o,b) - 8*xsum[b]).
   Activation pre-quantized (xq int8, xs scale, xsum block-sum). Row-major weight."
@@ -156,4 +185,64 @@
                  cnt (max 0 (min chunk (- out o0)))]
              (when (pos? cnt)
                (cfn xq xs xsum wq ws y in out o0 cnt)))))
+        y))))
+
+;; ---------------------------------------------------------------------------
+;; Tiled GEMV — the 8-column-in-lanes structure the measurement showed is the gap.
+;; ---------------------------------------------------------------------------
+
+;; The tile call WRITES out8 (arg 4) and is read after — declare the mutation so DCE
+;; keeps the call and the effects analysis sequences it correctly (mirrors qlinear-i8!).
+(descriptor/register-op-descriptor! 'raster.dl.qlinear-composable/wi8-dot-q4-x8
+  {:effects {:pure? false :mutating? true}})
+(descriptor/register-buffer-write! 'raster.dl.qlinear-composable/wi8-dot-q4-x8 :overwrite 4)
+
+(deftm qmatmul-q4-x8!
+  "Tiled composable Q4_0 GEMV over the INTERLEAVED (repack-stream) layout: processes 8
+  output columns per group via the wi8-dot-q4-x8 dpbusd tile (column L -> lane L), folds
+  the per-block zero-point + scale, accumulates 8 floats, stores 8 — the hand kernel's
+  structure with only the dpbusd tile as a kernel call, the rest composable IR. Sliceable
+  over GROUPS [g-start, g-start+g-count) of 8 columns; pool-driven like the hand kernel."
+  [xq :- (Array byte), xs :- (Array float), xsum :- (Array int),
+   wqi :- (Array byte), wsi :- (Array float), y :- (Array float),
+   in :- Long, out :- Long, g-start :- Long, g-count :- Long] :- (Array float)
+  (let [nb (quot (long in) 32)
+        out8 (int-array 8)
+        acc8 (float-array 8)]
+    (dotimes [gi (long g-count)]
+      (let [g (+ (long g-start) gi)
+            wbase (* g nb 128)
+            sbase (* g nb 8)]
+        (dotimes [L 8] (ra/aset acc8 L (float 0.0)))
+        (dotimes [b (long nb)]
+          ;; fill out8 with the 8 column dots (side-effecting tile; mutation registered)
+          (wi8-dot-q4-x8 wqi (+ wbase (* (long b) 128)) xq (* (long b) 32) out8)
+          (let [xsb (double (ra/aget xs b))
+                fold (* 8 (long (ra/aget xsum b)))]
+            (dotimes [L 8]
+              (let [folded (- (long (ra/aget out8 L)) fold)
+                    scale (* xsb (double (ra/aget wsi (+ sbase (* (long b) 8) L))))]
+                (ra/aset acc8 L (float (+ (double (ra/aget acc8 L)) (* scale (double folded)))))))))
+        (dotimes [L 8] (ra/aset y (+ (* g 8) L) (ra/aget acc8 L)))))
+    y))
+
+(defn make-x8-c-gemv
+  "Compile qmatmul-q4-x8! to one C slice-kernel (compile-aot :target :c) once; return a
+  driver (fn [xq xs xsum wqi wsi in out] -> y) that pool-drives it over disjoint COLUMN-
+  GROUP slices. Weight must be the interleaved repack-stream layout (wqi/wsi). The tile-
+  tensorize candidate measured against the hand kernel. defn: device/runtime glue."
+  []
+  (let [cfn ((requiring-resolve 'raster.compiler.pipeline/compile-aot)
+             #'qmatmul-q4-x8! :target :c)]
+    (fn [xq xs xsum wqi wsi in out]
+      (let [out (long out)
+            ng (quot out 8)
+            y (float-array out)]
+        (cq/run-par-fn!
+         (fn [wid n]
+           (let [chunk (quot (+ ng (dec (long n))) (long n))
+                 g0 (* (long wid) chunk)
+                 cnt (max 0 (min chunk (- ng g0)))]
+             (when (pos? cnt)
+               (cfn xq xs xsum wqi wsi y in out g0 cnt)))))
         y))))
