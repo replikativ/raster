@@ -191,7 +191,8 @@
 ;; required weight layout is DERIVED from that ISA target via core.layout (not a second
 ;; hand-written interleave). When the kernel is parameterized to AVX-512/NEON the target
 ;; descriptor follows the chosen ISA and NC with it.
-(def ^:private stream-gemv-layout (layout/q4-stream-layout {:vector-bits 256})) ; NC=8
+(def ^:private stream-gemv-layout
+  (layout/quant-stream-layout {:vector-bits 256} q4-0)) ; AVX2 NC=8, format-derived
 
 (defn repack-stream
   "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv interleaved layout,
