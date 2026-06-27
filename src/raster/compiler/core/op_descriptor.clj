@@ -256,6 +256,23 @@
 (defn get-device-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:device :rule]))
 
+(defn register-placement!
+  "Register the device-placement profile for an op — the MLX-style per-op compute
+  tag. `profile` is :jvm | :cpu-quant | :gpu : it names WHICH compute profile lowers
+  this op, not where its data lives (data never moves; the profile selects the
+  lowering/runtime). The compute-profile seam reads this to route an op to the JVM
+  bytecode backend, the CPU int8-MAC kernel, or the GPU (OpenCL/Level-Zero) backend.
+  A descriptor facet (not a separate registry) so it composes with buffer/effects/AD."
+  [op-sym profile]
+  (register-op-descriptor! op-sym {:placement {:profile profile}}))
+
+(defn get-placement
+  "The compute-profile tag for op-sym (:jvm/:cpu-quant/:gpu), or nil. Resolves
+  mangled/devirtualized names so passes can query with a clean semantic-op symbol."
+  [op-sym]
+  (when-let [[descriptor _] (resolve-op-descriptor op-sym)]
+    (get-in descriptor [:placement :profile])))
+
 (defn get-dim-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:shape :dim-rule]))
 
