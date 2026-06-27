@@ -15,6 +15,7 @@
   The emitter assembles these → the same optimal C llama.cpp hand-writes per
   format×ISA, from one descriptor + one primitive."
   (:require [clojure.string :as str]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.backend.cpu.codegen :as cpu]))
 
 ;; ---- encode side: quantizers matching the q4-0 kernel (interleaved pack) ----
@@ -186,33 +187,19 @@
 ;; Compute-bound :tile-gemm (prefill M>1, register-block tile) and GPU variants slot
 ;; into the same {descriptor × primitive × schedule} skeleton as more entries.
 ;; ============================================================================
-(def ^:private NC 8) ;; column tile = AVX2 f32 lane count (16 for AVX-512, 4 for NEON)
+;; The stream-gemv dpbusd kernel (emit-qmatmul-stream) is AVX2 — NC=8 f32 lanes. Its
+;; required weight layout is DERIVED from that ISA target via core.layout (not a second
+;; hand-written interleave). When the kernel is parameterized to AVX-512/NEON the target
+;; descriptor follows the chosen ISA and NC with it.
+(def ^:private stream-gemv-layout (layout/q4-stream-layout {:vector-bits 256})) ; NC=8
 
 (defn repack-stream
-  "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv layout, where output
-  column i lands in accumulator lane i (no shuffles, no final permute). Per (group of
-  NC cols, block, input-group of 4 elems), byte j (0..15) packs col(j/4) elem(j%4) in
-  the low nibble and col(4+j/4) elem(j%4) in the high nibble — so a [lo|hi] unpack
-  yields the dpbusd operand directly. wsi = NC column scales per (group, block). out
-  must be a multiple of NC (caller pads). nb = in/32. One-time weight-load cost."
+  "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv interleaved layout,
+  where output column i lands in accumulator lane i (no shuffles, no permute). Single
+  source: delegates to the descriptor-driven core.layout/repack, which the kernel's
+  gather (emit-qmatmul-stream) mirrors. out must be a multiple of NC=8. One-time cost."
   [^bytes wq ^floats ws out in]
-  (let [nb (quot in 32) ng (quot out NC) half (quot in 2)
-        wqi (byte-array (* ng nb 128)) wsi (float-array (* ng nb NC))
-        ;; nibble of (output row, block b, element e in 0..31) from interleaved Q4_0
-        src-nib (fn [row b e]
-                  (let [bv (bit-and (aget wq (+ (* row half) (* b 16) (if (< e 16) e (- e 16)))) 0xFF)]
-                    (if (< e 16) (bit-and bv 0xF) (bit-shift-right bv 4))))]
-    (dotimes [gi ng]
-      (dotimes [b nb]
-        (dotimes [ig 8]
-          (dotimes [j 16]
-            (let [base (+ (* gi NC) (quot j 4)) e (+ (* ig 4) (mod j 4))
-                  nlo (src-nib base b e) nhi (src-nib (+ base 4) b e)]
-              (aset wqi (+ (* gi nb 128) (* b 128) (* ig 16) j)
-                    (unchecked-byte (bit-or nlo (bit-shift-left nhi 4)))))))
-        (dotimes [r NC]
-          (aset wsi (+ (* gi nb NC) (* b NC) r) (aget ws (+ (* (+ (* gi NC) r) nb) b))))))
-    {:wqi wqi :wsi wsi}))
+  (layout/repack stream-gemv-layout wq ws out in))
 
 (defn emit-qmatmul-stream
   "Emit the :stream-gemv decode kernel over a repack-stream weight. One contiguous
