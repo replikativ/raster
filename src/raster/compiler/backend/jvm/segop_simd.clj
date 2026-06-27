@@ -19,7 +19,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.scalar.dce :as dce]
-            [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as hw]
             [clojure.set]
             [clojure.walk]))
 
@@ -641,10 +641,12 @@
 ;; ================================================================
 
 (defn- effective-n-accumulators
+  "SIMD-reduction accumulator count — now derived from the hardware descriptor via the
+  single policy (core.hardware/reduction-accumulators), not a local lanes check, so the
+  JVM reducer and the planner agree on the register-blocking facet."
   ([] (effective-n-accumulators :double))
   ([elem-type]
-   (try (hw/init!) (let [lanes (int (hw/simd-lanes :cpu:0 (or elem-type :double)))]
-                     (if (>= lanes 8) 8 4))
+   (try (hw/reduction-accumulators (hw/active-descriptor) (or elem-type :double))
         (catch Exception _ 4))))
 
 ;; ================================================================

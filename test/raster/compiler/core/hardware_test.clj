@@ -41,6 +41,14 @@
     ;; GEMM reusing each weight 64x -> AI 64 > 40 -> compute-bound
     (is (= :compute-bound (hw/roofline-regime avx2 {:flops 64000 :bytes 1000})))))
 
+(deftest reduction-accumulators-test
+  (testing "the centralized SIMD-reduction accumulator policy (≥8 lanes → 8, else 4)"
+    (is (= 4 (hw/reduction-accumulators avx2 :double)))    ; 256/64 = 4 lanes
+    (is (= 8 (hw/reduction-accumulators avx2 :float)))     ; 256/32 = 8 lanes
+    (is (= 8 (hw/reduction-accumulators avx512 :double)))  ; 512/64 = 8 lanes
+    (is (= 8 (hw/reduction-accumulators avx512 :float)))   ; 512/32 = 16 -> 8
+    (is (= 4 (hw/reduction-accumulators neon :float)))))   ; 128/32 = 4 lanes
+
 (deftest reduce-intrinsic-test
   (testing "native dot-reduce availability selects the leaf instruction"
     (is (= :dpbusd (hw/reduce-intrinsic avx2)))
