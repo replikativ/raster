@@ -1138,11 +1138,13 @@
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
                           (str "((" ea " % " eb " + " eb ") % " eb ")")))
-         ;; Non-arithmetic deftm helper -> C helper invocation
-         (let [c-name (str "gpufn_" (c-symbol sym))]
-           (str c-name "("
-                (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args))
-                ")"))))
+         ;; Non-arithmetic deftm helper -> C helper invocation. Array-sym args are passed
+         ;; as the bare pointer (the helper takes a pointer + offset), not element access.
+         (let [c-name (str "gpufn_" (c-symbol sym))
+               emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
+                                  (c-symbol a)
+                                  (emit-expr a idx-sym array-syms opencl-idx)))]
+           (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
 
      ;; .invk typed dispatch on deftm helper -> check for devirtualized arithmetic
      (and (seq? expr) (= '.invk (first expr))
@@ -1171,13 +1173,14 @@
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
                           (str "((" ea " % " eb " + " eb ") % " eb ")")))
-         ;; Non-arithmetic deftm helper -> C helper invocation
+         ;; Non-arithmetic deftm helper -> C helper invocation (array-sym args as bare ptr).
          (let [base-sym (symbol (str (.-ns ^clojure.lang.Var resolved-var))
                                 (str (:name (meta resolved-var))))
-               c-name (str "gpufn_" (c-symbol base-sym))]
-           (str c-name "("
-                (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args))
-                ")"))))
+               c-name (str "gpufn_" (c-symbol base-sym))
+               emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
+                                  (c-symbol a)
+                                  (emit-expr a idx-sym array-syms opencl-idx)))]
+           (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
 
      ;; deftm inlining: try to inline before generic function fallback
      (and (seq? expr) (symbol? (first expr)))

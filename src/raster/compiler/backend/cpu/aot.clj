@@ -21,6 +21,7 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.cpu.codegen :as cpu]
             [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.peephole :as peephole]))
 
@@ -315,6 +316,30 @@
      form)
     @acc))
 
+(defn- helper-c-defs
+  "C function definitions for any ^:no-inline deftm helpers called in `stripped` (these
+  stay as calls instead of being inlined). Reuses the GPU helper machinery to translate a
+  helper's scalar body to a static C function. An op may register a hand-written C OVERRIDE
+  via the :c-helper op-descriptor facet ({:includes <str> :gen (fn [c-name] -> def-str)}) —
+  used for the int8-MAC seam (maddubs) instead of the scalar body. Returns [includes defs]."
+  [stripped]
+  (let [helpers (ce/collect-gpu-fn-calls stripped)]
+    (if (empty? helpers)
+      ["" ""]
+      (let [entries (for [h helpers]
+                      ;; generate-c-helper returns {:c-name :source}; its c-name matches
+                      ;; the call site exactly (shared invariant). Use that c-name; take
+                      ;; the body from the :c-helper override when registered, else its source.
+                      (let [gen (ce/generate-c-helper h)
+                            ;; resolve-op-descriptor strips the _m_ type-mangle so the
+                            ;; override registered under the base op name is found.
+                            ov (:c-helper (first (descriptor/resolve-op-descriptor (:sym h))))]
+                        (if ov
+                          {:inc (:includes ov "") :def ((:gen ov) (:c-name gen))}
+                          {:inc "" :def (:source gen)})))]
+        [(clojure.string/join "" (distinct (keep (comp not-empty :inc) entries)))
+         (clojure.string/join "\n" (map :def entries))]))))
+
 (defn emit-c-fn
   "Emit a C host function for a fused, normalized scalar form.
    - kernel-name  : C function name
@@ -346,8 +371,13 @@
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct
                          ce/*int-vars* int-seed]
-                 (emit-host-stmt stripped array-syms ct))]
+                 (emit-host-stmt stripped array-syms ct))
+        ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
+        ;; which lowers to a maddubs helper via its :c-helper override).
+        [helper-incs helper-defs] (helper-c-defs stripped)]
     (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
+         helper-incs
+         (when (seq helper-defs) (str helper-defs "\n"))
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
          body-c
          "\n}\n")))

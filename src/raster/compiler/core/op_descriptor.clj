@@ -256,6 +256,15 @@
 (defn get-device-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:device :rule]))
 
+(defn register-c-helper!
+  "Register a hand-written C implementation for an op (the :c-helper facet) — used by the
+  CPU-C AOT backend for a ^:no-inline op whose optimal lowering is a hardware intrinsic
+  (e.g. the int8-MAC seam -> maddubs/dpbusd) rather than its translated scalar body.
+  `entry` is {:includes <C #include lines> :gen (fn [c-name] -> full C function string)}.
+  The op keeps its portable deftm body (JVM + correctness); the C backend uses this instead."
+  [op-sym entry]
+  (register-op-descriptor! op-sym {:c-helper entry}))
+
 (defn register-placement!
   "Register the device-placement profile for an op — the MLX-style per-op compute
   tag. `profile` is a device TYPE / compute class — :jvm | :cpu-quant | :gpu — NOT a
