@@ -287,6 +287,18 @@
 ;; Type inference
 ;; ================================================================
 
+;; quot/rem/mod + bitwise ops produce integers (over integer operands). Without these
+;; in the structural fallback they default to *scalar-type* (double), which silently
+;; widens integer counters/indices and — critically — the Q4 nibble unpack (bit-and/
+;; shift) INSIDE the int8-MAC loop, injecting int<->double conversions that block the
+;; C compiler from lowering the loop to VNNI/maddubs. (Matches the +/-/* clause below.)
+(def ^:private integer-result-ops
+  '#{quot rem mod clojure.core/quot clojure.core/rem clojure.core/mod
+     bit-and bit-or bit-xor bit-shift-left bit-shift-right unsigned-bit-shift-right
+     clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
+     clojure.core/bit-shift-left clojure.core/bit-shift-right
+     clojure.core/unsigned-bit-shift-right})
+
 (defn infer-c-type
   "Infer the C type of an expression. Prefers the walker-stamped :raster.type/tag
   result-type metadata (the single source of truth — no mangled-name parsing); falls
@@ -357,6 +369,14 @@
        (cond (some #(= "long" %) types) "long"
              (some #(= "uint" %) types) "uint"
              :else "int"))
+
+    ;; quot/rem/mod + bitwise over integer operands stay integer (widen to long).
+     (and (seq? expr)
+          (contains? integer-result-ops (first expr))
+          (let [types (map infer-c-type (rest expr))]
+            (every? #(contains? #{"int" "uint" "long"} %) types)))
+     (let [types (map infer-c-type (rest expr))]
+       (if (some #(= "long" %) types) "long" "int"))
 
      :else *scalar-type*)))
 
