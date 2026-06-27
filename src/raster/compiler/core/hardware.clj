@@ -23,13 +23,14 @@
   All derivations are pure functions of (descriptor, problem) — no search, no
   autotuner. `*descriptor*` is the active target; defaults to the detected host.
 
-  ONE record across backends (no duplicate hardware tables). The GPU runtimes
-  (raster.gpu.ze-runtime / ocl-runtime) already query raw per-device capabilities
-  for runtime DISPATCH (:simd-width, :integrated?, :total-eus, :max-work-group-size,
-  :global-mem-bytes). That extraction stays single-sourced there; a GPU target
-  descriptor is PROJECTED from it via `from-gpu-device-info` rather than re-queried.
-  So the planner consumes one descriptor shape for :cpu and :gpu; the runtime owns
-  the FFI queries. (Full unification of the two records is a later merge.)")
+  ONE detection source (no duplicate hardware tables). raster.runtime.hardware is the
+  established device registry — it auto-detects CPU (Vector-API SIMD width, cache sizes,
+  cores) and GPU (Level-Zero/OpenCL caps, subgroup size, EUs, bandwidth) and exposes a
+  catalogue for cross-compilation. THIS namespace does NOT re-detect: `descriptor-for`
+  PROJECTS a runtime.hardware device into the planner's descriptor shape and adds the
+  compiler's analytic fields; the derivations below operate on that. So the runtime owns
+  the probing; the compiler owns the schedule math, over one record for :cpu and :gpu."
+  (:require [raster.runtime.hardware :as rt]))
 
 ;; ---------------------------------------------------------------------------
 ;; Element widths — bytes per scalar of a raster dtype keyword.
@@ -49,60 +50,56 @@
 ;; Host detection
 ;; ---------------------------------------------------------------------------
 
-(defn detect-vector-bits
-  "Probe the running JVM's preferred SIMD width in bits via the Vector API's
-   preferred f32 species length (4 lanes -> AVX2/256, 8 -> AVX-512/512, 2 -> NEON/
-   wasm 128). Returns nil if the incubator module is unavailable."
-  []
-  (try
-    (let [lanes (.length ^jdk.incubator.vector.VectorSpecies
-                         (jdk.incubator.vector.FloatVector/SPECIES_PREFERRED))]
-      (* (int lanes) 32))
-    (catch Throwable _ nil)))
+(defn descriptor-for
+  "Project a runtime.hardware device into the planner's HardwareDescriptor — the SINGLE
+   detection source (runtime.hardware owns the probing; this adds the compiler's analytic
+   fields). CPU and GPU via one path (subsumes the old from-gpu-device-info). The
+   register count follows the width (AVX-512 -> 32 zmm, else 16 ymm; GPU is GRF-backed);
+   native int-dot-reduce is x86 vpdpbusd / GPU dp4a; LLC comes from the detected L3 (or
+   GPU global mem); balance uses Halide-style defaults."
+  [device-id]
+  (let [caps   (:capabilities (rt/device device-id))
+        gpu?   (not= (rt/device-type device-id) :cpu)
+        flanes (long (if gpu? (rt/subgroup-size device-id)
+                         (rt/simd-lanes device-id :float)))   ;; f32 lanes / subgroup
+        vbits  (* flanes 32)]
+    (cond-> {:device-type (if gpu? :gpu :cpu)
+             :device-id   device-id
+             :vector-bits vbits
+             :has-native-dot-reduce
+             (if gpu? true
+                 (let [a (str (:arch caps))]
+                   (boolean (or (.contains a "amd64") (.contains a "x86")))))
+             :num-vector-registers (if gpu? 128 (if (>= vbits 512) 32 16))
+             :llc-bytes   (or (:cache-l3 caps)
+                              (when gpu? (:global-memory-bytes caps))
+                              (* 16 1024 1024))
+             :balance     (if gpu? 60 40)}
+      gpu? (assoc :integrated? (boolean (:integrated? caps))))))
 
 (defn host-descriptor
-  "The descriptor for the running host. Vector width is probed; the register count
-   follows the width (AVX-512 -> 32 zmm, else 16 ymm); native int-dot-reduce is
-   assumed on x86-64 (the -march=native C build selects vpdpbusd, falling back to
-   maddubs); LLC/balance use Halide's CPU defaults. Override any field via `with`."
+  "The descriptor for the running host CPU (projected from runtime.hardware :cpu:0)."
   []
-  (let [vb (or (detect-vector-bits) 256)
-        x86? (let [a (System/getProperty "os.arch" "")]
-               (or (.contains a "amd64") (.contains a "x86")))]
-    {:device-type           :cpu
-     :vector-bits           vb
-     :has-native-dot-reduce (boolean x86?)
-     :num-vector-registers  (if (>= vb 512) 32 16)
-     :llc-bytes             (* 16 1024 1024)
-     :balance               40}))
+  (descriptor-for :cpu:0))
 
-(defn from-gpu-device-info
-  "Project a GPU runtime device-info map (as returned by raster.gpu.ze-runtime /
-   ocl-runtime — :simd-width, :integrated?, :total-eus, :global-mem-bytes, ...) into
-   a HardwareDescriptor so the planner consumes ONE record shape across :cpu/:gpu.
-   The runtime owns the FFI extraction; this is a pure projection, never a re-query.
-   A GPU's int dot-reduce is dp4a/DPAS (assumed present on the dl-targeted parts);
-   the SIMD width is the subgroup × dtype lanes, modelled here as simd-width*32 bits
-   for the f32 lane analogue. Memory/registers map to the device's global mem and a
-   nominal GRF count. (Refined as the GPU planner path lands.)"
-  [{:keys [simd-width integrated? global-mem-bytes] :as dev}]
-  {:device-type           :gpu
-   :vector-bits           (* (long (or simd-width 16)) 32)
-   :has-native-dot-reduce true
-   :num-vector-registers  128                ;; GRF-backed; nominal until profiled
-   :llc-bytes             (long (or global-mem-bytes (* 1024 1024 1024)))
-   :balance               60                 ;; GPU is more bandwidth-tolerant than CPU
-   :integrated?           (boolean integrated?)
-   :gpu-device-info       dev})
+;; Host detection is deferred to first use (runtime.hardware/init! probes GPUs over FFI)
+;; — not paid at load. Production callers pass an explicit descriptor; this is the default.
+(defonce ^:private host-desc (delay (host-descriptor)))
 
 (def ^:dynamic *descriptor*
-  "The active hardware target the planner schedules against."
-  (host-descriptor))
+  "The active hardware target the planner schedules against; nil = the detected host
+   (resolved lazily via `active-descriptor`). Bind to cross-target."
+  nil)
+
+(defn active-descriptor
+  "The descriptor in force: the bound *descriptor*, else the (lazily detected) host."
+  []
+  (or *descriptor* @host-desc))
 
 (defn with
   "Return a copy of the active (or given) descriptor with overrides merged. Handy
    for cross-targeting (e.g. (with {:vector-bits 512}) to plan for AVX-512)."
-  ([overrides] (merge *descriptor* overrides))
+  ([overrides] (merge (active-descriptor) overrides))
   ([desc overrides] (merge desc overrides)))
 
 ;; ---------------------------------------------------------------------------
@@ -136,6 +133,15 @@
   ([desc {:keys [regs-per-tile latency-target] :or {regs-per-tile 2 latency-target 4}}]
    (max 1 (min (long latency-target)
                (quot (long (:num-vector-registers desc)) (long regs-per-tile))))))
+
+(defn reduction-accumulators
+  "Independent vector accumulators to keep live in a SIMD REDUCTION to hide FMA latency
+   (the register-blocking facet for a reduce, vs `register-block` for a GEMM tile).
+   Wider machines hide more latency: ≥8 dtype-lanes -> 8, else 4. Hardware-aware via the
+   descriptor's lane count for the element type — the one place this policy lives (the
+   JVM segop-simd reducer consults this rather than its own lanes check)."
+  [desc elem-type]
+  (if (>= (natural-lanes desc elem-type) 8) 8 4))
 
 (defn roofline-regime
   "Memory-bound vs compute-bound by arithmetic intensity vs machine balance.
