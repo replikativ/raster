@@ -44,6 +44,35 @@
                     (* (long (ra/aget xq (+ xoff k 16))) (bit-shift-right bv 4)))))
       s)))
 
+(deftm ^:no-inline wi8-dot-q4-x8
+  "The 8-column int8-MAC TILE over one Q4_0 block in the repack-stream interleaved
+  layout — the tile-level tensorize seam. Reads the 128 interleaved weight bytes for
+  an 8-column group at wqi[woff..woff+128) and 32 int8 activations at xq[xoff..+32),
+  writes the 8 raw int32 column dots to out[0..8). Column L -> lane L, no horizontal
+  reduce (the interleave puts each column in its own lane). Portable scalar reference
+  that exactly mirrors the persistent-accumulator microkernel its per-backend lowering
+  emits: dpbusd/VNNI on x86, dp4a/DPAS on the GPU. The surrounding GEMV (block loop,
+  per-block scale, zero-point fold, store) stays composable deftm IR."
+  [wqi :- (Array byte), woff :- Long, xq :- (Array byte), xoff :- Long,
+   out :- (Array int)] :- (Array int)
+  (dotimes [L 8]
+    (let [s (loop [ig 0 acc 0]
+              (if (< ig 8)
+                (recur (inc ig)
+                       (loop [k 0 a acc]
+                         (if (< k 4)
+                           (let [nib-idx (+ (* L 4) k)
+                                 bidx (+ woff (* ig 16)
+                                         (if (< nib-idx 16) nib-idx (- nib-idx 16)))
+                                 bv (bit-and (long (ra/aget wqi bidx)) 0xFF)
+                                 nib (if (< nib-idx 16) (bit-and bv 0xF) (bit-shift-right bv 4))
+                                 act (long (ra/aget xq (+ xoff (* ig 4) k)))]
+                             (recur (inc k) (+ a (* act nib))))
+                           a)))
+                acc))]
+      (ra/aset out L (int s))))
+  out)
+
 ;; The ISA seam: wi8-dot-q4's optimal C lowering is the AVX2 maddubs block-dot (the
 ;; widening unsigned-nibble x signed-int8 MAC), not its translated scalar body. Registered
 ;; as a :c-helper override the CPU-C AOT backend emits for the ^:no-inline call. (Halide
