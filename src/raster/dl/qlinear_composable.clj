@@ -11,8 +11,15 @@
   neighbouring norms.
 
   Held to the bench/raster/quant_faithfulness gate: correct + within noise of the hand
-  kernel. The scalar primitive is SLOW by design (no VNNI) — this file establishes the
-  composable path end-to-end + the measured gap; lowering wi8-dot-q4 to dpbusd closes it.
+  kernel. VALIDATED: via `compile-aot :target :c` this composable source is bit-faithful
+  AND roughly per-thread competitive with the handwritten kernel (single-thread C ≈ hand
+  per-thread; -O3 -march=native auto-vectorizes the int8 loop about as well as the hand
+  VNNI). The remaining gap to the hand kernel is THREADING (the hand kernel's 4-thread
+  spin-pool over output-row slices), not codegen. On the JVM backend it is 37x slower —
+  the JVM has no int8-MAC — so :target :c is the correct lowering for quantized math.
+  Next: parallelize the row loop (par/map! → OpenMP in the C backend, or pool-drive the C
+  fn over row slices); optionally lower wi8-dot-q4 → the _i8dot dpbusd intrinsic for the
+  shapes where auto-vec underperforms. Then retire the hand-written string emitter.
 
   Layout: row-major Q4_0 {wq[out*in/2], ws[out*nb]} (the natural layout, same as the
   scalar reference). The permute-free interleaved layout (repack-stream) is a later
