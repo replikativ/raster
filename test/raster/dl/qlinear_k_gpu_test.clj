@@ -119,6 +119,29 @@
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
+(deftest q6k-dp4a-gpu-matches-cpu
+  (when (gpu-available?)
+    (testing "Q6_K dp4a kernel on ze:0 == CPU composable"
+      (let [out 32 in 256
+            W (gen (* out in) 33) x (gen in 44)
+            {:keys [wq sc ds]}   (q/quantize-weight-q6k W q/q6-K)
+            {:keys [xq xs bsums]} (q/quantize-act-q8k x in q/q6-K)
+            ycpu (float-array out)
+            _ (qk/qmatmul-q6k-composable! xq xs bsums wq sc ds ycpu in out 0 out)
+            wp (bytes->ints-le wq) xp (pack-i8 xq)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :q6kdp #'qk/qmatmul-q6k-dp4a!)
+          (gpu/alloc! sess {:xp [:int (alength xp) xp] :xs [:float (alength xs) xs]
+                            :bsums [:int (alength bsums) bsums] :wp [:int (alength wp) wp]
+                            :sc [:byte (alength sc) sc] :ds [:float (alength ds) ds]
+                            :y [:float out nil]})
+          (gpu/invoke! sess :q6kdp
+                       {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "sc" :sc "ds" :ds "y" :y}
+                       [{:type :int :value in}] out)
+          (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
+          (finally (gpu/close-session! sess)))))))
+
 (deftest q6k-gpu-matches-cpu
   (when (gpu-available?)
     (testing "Q6_K work-item-per-row kernel on ze:0 == CPU composable"

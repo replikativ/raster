@@ -210,3 +210,41 @@
                                  (recur (inc sb) (+ a (* dv dact ssum))))
                                a))]
                    (ra/aset y o (float acc)))))
+
+;; ---- Q6_K dp4a GPU kernel ----
+;; Symmetric K dot via par/dp4a. Q6_K weights are full bytes (no nibble split), so they pack
+;; directly to int32 element-order (wp) like the activation (xp); the 16-element sub-block dot
+;; is 4 dp4a calls. 6-bit weights are 0..63 (positive int8), so signed dp4a == the composable's
+;; unsigned-weight × signed-act dpbusd. The zp32 fold (dp − 32·bsum) and per-subblock int8
+;; scale stay as in qmatmul-q6k-gpu!.
+(deftm qmatmul-q6k-dp4a!
+  [xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   wp :- (Array int), sc :- (Array byte), ds :- (Array float),
+   y :- (Array float), in :- Long, out :- Long] :- Void
+  (par/map-void! o out
+                 (let [nsb (quot (long in) 256)
+                       niw (quot (long in) 4)          ; int32 words per row (in bytes / 4)
+                       wb (* (long o) niw)
+                       sbb (* (long o) nsb)
+                       subb (* (long o) (quot (long in) 16))
+                       acc (loop [sb 0 a 0.0]
+                             (if (< sb nsb)
+                               (let [dv (double (ra/aget ds (+ sbb sb)))
+                                     dact (double (ra/aget xs sb))
+                                     wsb (+ wb (* sb 64))   ; 64 int words / super-block (256 elems / 4)
+                                     xsb (* sb 64)
+                                     ssum (loop [j 0 s 0.0]
+                                            (if (< j 16)
+                                              (let [sidx (+ (* sb 16) j)
+                                                    scj (long (ra/aget sc (+ subb sidx)))
+                                                    wj (+ wsb (* j 4)) xj (+ xsb (* j 4))  ; 4 words / 16-sub-block
+                                                    dp (loop [r 0 d 0]
+                                                         (if (< r 4)
+                                                           (recur (inc r) (par/dp4a (ra/aget wp (+ wj r)) (ra/aget xp (+ xj r)) d))
+                                                           d))
+                                                    folded (- dp (* 32 (long (ra/aget bsums sidx))))]
+                                                (recur (inc j) (+ s (* scj (double folded)))))
+                                              s))]
+                                 (recur (inc sb) (+ a (* dv dact ssum))))
+                               a))]
+                   (ra/aset y o (float acc)))))
