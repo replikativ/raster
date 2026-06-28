@@ -1799,14 +1799,20 @@
         _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate
                     [context device cl-desc l-out])
         lst (read-ptr l-out)
-        h-launch @h-zeCommandListAppendLaunchKernel]
+        h-launch @h-zeCommandListAppendLaunchKernel
+        h-barrier @h-zeCommandListAppendBarrier]
     ;; append each bound kernel's launch (args already live on its dedicated handle; the
-    ;; group-count value is captured into the recorded command at append time)
+    ;; group-count value is captured into the recorded command at append time). A barrier
+    ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
+    ;; decode chain is dependent (norm→quant→matmul→…). Independent ops still serialize, but
+    ;; each is memory-bound so overlap buys little; correctness first.
     (doseq [{:keys [bound group-count]} prepareds]
       (let [^MemorySegment gc (:gc-seg bound)]
         (.set gc I32 0 (int group-count))
         (ze-call! "zeCommandListAppendLaunchKernel" h-launch
-                  [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])))
+                  [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
+        (ze-call! "zeCommandListAppendBarrier" h-barrier
+                  [lst MemorySegment/NULL (int 0) MemorySegment/NULL])))
     (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
     (let [lists-arr (ptr-seg arena)]
       (.set lists-arr PTR 0 ^MemorySegment lst)

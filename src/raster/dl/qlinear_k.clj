@@ -11,6 +11,49 @@
             [raster.arrays :as ra]
             [raster.par :as par]))
 
+;; ---- q8_K activation quantizer (the GPU-resident enabler) ----
+;; float activation x[in] → q8_K for the dp4a matmul, ON the GPU: per 256-super-block
+;; d = max|x|/127; int8 quants packed 4-per-int32 element-order (xp); xs = d; bsums = per
+;; 32-sub-block int sum. One work-item per super-block. Output feeds qmatmul-q4k-dp4a!
+;; directly (no host round-trip), so norm→quant→matmul chains entirely on-device in a graph.
+(deftm quant-act-q8k-gpu!
+  [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   nsb :- Long] :- Void
+  (par/map-void! sb nsb
+                 (let [sbase (* (long sb) 256)
+                       mx (loop [i 0 m 0.0]
+                            (if (< i 256)
+                              (let [v (ra/aget x (+ sbase i))]
+                                (recur (inc i) (max m (max v (- v)))))
+                              m))
+                       d (/ (double mx) 127.0)
+                       id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)]
+                   (ra/aset xs sb (float d))
+                   (loop [j 0]
+                     (if (< j 8)
+                       (let [sidx (+ (* (long sb) 8) j)
+                             wbase (+ (* (long sb) 64) (* j 8))
+                             ebase (+ sbase (* j 32))
+                             bs (loop [w 0 s 0]
+                                  (if (< w 8)
+                       ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
+                       ;; int8 range without an explicit clamp; the (long ...) cast types q.
+                                    (let [e (+ ebase (* w 4))
+                                          q0 (long (Math/round (* (double (ra/aget x e)) id)))
+                                          q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
+                                          q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
+                                          q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                                          word (bit-or (bit-and q0 0xFF)
+                                                       (bit-shift-left (bit-and q1 0xFF) 8)
+                                                       (bit-shift-left (bit-and q2 0xFF) 16)
+                                                       (bit-shift-left (bit-and q3 0xFF) 24))]
+                                      (ra/aset xp (+ wbase w) (int word))
+                                      (recur (inc w) (+ s q0 q1 q2 q3)))
+                                    s))]
+                         (ra/aset bsums sidx (int bs))
+                         (recur (inc j)))
+                       nil)))))
+
 (deftm qmatmul-q4k-composable!
   "Q4_K GEMV into y[o] for o in [o-start, o-start+o-count): per super-block
   d_act·[Σ_sub (da·aq)·dpbusd + (db·bq)·bsum], the asymmetric K dot. Weight arrays are the

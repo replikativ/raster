@@ -156,6 +156,42 @@
           (is (< (maxerr (:ycpu b) (gpu/download sess :by)) 1e-3) "binding B correct (not clobbered by A)")
           (finally (gpu/close-session! sess)))))))
 
+(deftest q8k-quant-then-matmul-chain
+  (when (gpu-available?)
+    (testing "GPU q8_K activation quantizer feeds dp4a matmul, all on-device in one graph"
+      ;; The decode enabler: quantize the float activation ON the GPU (quant-act-q8k-gpu!),
+      ;; then the matmul consumes xp/xs/bsums with NO host round-trip. Recorded as a 2-op graph
+      ;; (barrier enforces quant→matmul order). Result must match the CPU dequant reference.
+      (let [out 32 in 256 nsb (quot in 256)
+            W (gen (* out in) 5) x (gen in 6)
+            {:keys [wq da db aq bq] :as ew} (q/quantize-weight-q4k W q/q4-K)
+            wp (bytes->ints-le wq)
+            ;; CPU reference: quantize act, dequant act + weights, plain matmul
+            {:keys [xq xs]} (q/quantize-act-q8k x in q/q4-K)
+            Wdq (q/dequant-q4k ew q/q4-K (* out in))
+            xdq (let [d (float-array in) dact (aget ^floats xs 0)]
+                  (dotimes [k in] (aset d k (float (* dact (aget ^bytes xq k))))) d)
+            yref (let [y (float-array out)]
+                   (dotimes [o out] (aset y o (float (areduce xdq k s 0.0 (+ s (* (aget Wdq (+ (* (long o) (long in)) k)) (aget xdq k)))))))
+                   y)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :quant #'qk/quant-act-q8k-gpu!)
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/alloc! sess {:x [:float in x]
+                            :xp [:int (quot in 4) nil] :xs [:float nsb nil] :bsums [:int (quot in 32) nil]
+                            :wp [:int (alength wp) wp] :da [:float (alength da) da] :db [:float (alength db) db]
+                            :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq] :y [:float out nil]})
+          (gpu/prepare! sess :quant {"x" :x "xp" :xp "xs" :xs "bsums" :bsums} [] nsb {:kernel-phase :quant})
+          (gpu/prepare! sess :mm {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
+                        [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/record-graph! sess [:quant :mm])
+          (gpu/replay! sess)
+          (let [ygpu (gpu/download sess :y)
+                scale (reduce max 1e-9 (map (fn [v] (Math/abs (double v))) (seq yref)))]
+            (is (< (/ (maxerr yref ygpu) scale) 1e-2) "on-device quant→matmul == CPU dequant ref"))
+          (finally (gpu/close-session! sess)))))))
+
 (deftest q4k-dp4a-command-graph
   (when (gpu-available?)
     (testing "record-graph!/replay! runs a fixed kernel sequence; each op reads its own buffers"
