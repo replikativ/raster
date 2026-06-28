@@ -211,6 +211,17 @@
                                             (let [g (aget gate i)]
                                               (aset out i (* (* g (/ 1.0 (+ 1.0 (m/exp (- g))))) (aget up i)))))))
 
+;; GeGLU activation, fused: out = gelu(gate) * up (tanh approximation, gemma's FFN). Mirrors
+;; silu-mul! — one work-item/element, GPU-resident decode FFN form. sqrt(2/pi)=0.7978845608028654
+;; inlined as a literal so no scalar is bound outside the par body.
+(deftm gelu-mul! (All [T] [gate :- (Array T) up :- (Array T) out :- (Array T) n :- Long] :- Void
+                      (raster.par/map-void! i n
+                                            (let [g (aget gate i)]
+                                              (aset out i (* (* 0.5 g
+                                                                (+ 1.0 (m/tanh (* 0.7978845608028654
+                                                                                  (+ g (* 0.044715 g g g))))))
+                                                             (aget up i)))))))
+
 ;; residual add, !-variant: out = a + b (one work-item / element).
 (deftm residual-add! (All [T] [a :- (Array T) b :- (Array T) out :- (Array T) n :- Long] :- Void
                           (raster.par/map-void! i n
