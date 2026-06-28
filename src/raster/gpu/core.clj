@@ -775,12 +775,22 @@
   ([sess ctx inputs] (run-chain-ctx! sess ctx inputs (:chain-dtype @sess)))
   ([sess ctx inputs dtype]
    (let [steps (:chain-steps @sess) roles (:chain-roles @sess)
-         resolve* (fn [v] (if (keyword? v) (get ctx v) v))]
-     (doseq [{:keys [op phase bind scalars n]} steps]
-       (let [ki (first (get-in @sess [:kernels phase]))
-             rscalars (into {} (map (fn [[k v]] [k (resolve* v)]) scalars))
-             tsc (typed-scalars-for op ki rscalars dtype)]
-         (prepare! sess phase bind tsc (long (resolve* n)) {:kernel-phase phase})))
+         resolve* (fn [v] (if (keyword? v) (get ctx v) v))
+         ;; A step is POSITION-DEPENDENT iff a scalar value or its work-item count is a ctx keyword
+         ;; (pos/cache-len). Only those need re-preparing per token; the other ~420 keep their
+         ;; first-call kernel handles. The first call (no :chain-prepared) prepares ALL to establish
+         ;; the static handles. This is what makes per-token cheap: re-prepare drops 453→~30 (the
+         ;; 429ms→~28ms host cost); the static handles persist across tokens, only the position
+         ;; steps + the graph re-record. (record-graph! must still re-bake the changed handles.)
+         prepared? (:chain-prepared @sess)
+         pos-dep? (fn [{:keys [scalars n]}] (or (keyword? n) (some keyword? (vals scalars))))]
+     (doseq [{:keys [op phase bind scalars n] :as step} steps]
+       (when (or (not prepared?) (pos-dep? step))
+         (let [ki (first (get-in @sess [:kernels phase]))
+               rscalars (into {} (map (fn [[k v]] [k (resolve* v)]) scalars))
+               tsc (typed-scalars-for op ki rscalars dtype)]
+           (prepare! sess phase bind tsc (long (resolve* n)) {:kernel-phase phase}))))
+     (swap! sess assoc :chain-prepared true)
      (record-graph! sess (mapv :phase steps) :chain)
      (doseq [[k arr] inputs] (upload! sess k arr))
      (replay! sess :chain)
