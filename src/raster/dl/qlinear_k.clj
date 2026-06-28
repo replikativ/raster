@@ -83,6 +83,22 @@
         (ra/aset y o (float acc))))
     y))
 
+;; ---- dp4a int8-GEMV core (the format-agnostic hardware-accelerated path) ----
+;; int8×int8 GEMV over int32-packed lanes: y[o] = Σ_w dp4a(wp[o*kw+w], xp[w]). par/dp4a
+;; lowers to the portable rstr_dp4a helper which the OpenCL/C compiler pattern-matches to
+;; a hardware dp4a (Intel/CUDA __dp4a, AMD sdot4). This is the reusable MAC core the quant
+;; formats feed unpacked int8 into; validated exact vs scalar on the Arc.
+(deftm i8gemv-dp4a!
+  [wp :- (Array int), xp :- (Array int), y :- (Array float),
+   kw :- Long, out :- Long] :- Void
+  (par/map-void! o out
+                 (let [base (* (long o) (long kw))
+                       acc (loop [k 0 a 0]
+                             (if (< k (long kw))
+                               (recur (inc k) (par/dp4a (ra/aget wp (+ base k)) (ra/aget xp k) a))
+                               a))]
+                   (ra/aset y o (float acc)))))
+
 ;; ---- GPU shape: par/map-void! over output rows (one work-item per row) ----
 ;; The GPU form the opencl-pass turns into a kernel (work-item o computes y[o]). Same K
 ;; dot as the composable CPU deftm; the GPU int8 path needs byte buffers / int32-packing

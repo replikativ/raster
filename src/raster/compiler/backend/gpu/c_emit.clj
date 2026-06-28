@@ -193,7 +193,12 @@
          'floor "floor"
          'ceil  "ceil"
          'round "round"
-         'fma   "fma"}]
+         'fma   "fma"
+   ;; int8 4-way dot-accumulate → portable OpenCL/C helper (pattern-matched to
+   ;; a hardware dp4a). All call spellings that can survive into a par/deftm body.
+         'dp4a            "rstr_dp4a"
+         'par/dp4a        "rstr_dp4a"
+         'raster.par/dp4a "rstr_dp4a"}]
     ;; auto-alias java.lang.Math/X -> the short Math/X entry (the inliner emits
     ;; fully-qualified Java method symbols; both must lower the same).
     (merge base

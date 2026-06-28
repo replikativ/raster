@@ -35,6 +35,31 @@
     } while (old != assumed);
     return as_float(old);
 }\n")
+
+(def ^:private rstr-dp4a-helper
+  "Portable int8 4-way dot-accumulate. `as_char4` reinterprets each int32's 4 bytes
+  (little-endian: .x = low byte) as signed int8 lanes; the OpenCL compiler (Intel IGC,
+  NVIDIA, AMD) pattern-matches this idiom to a hardware dp4a instruction."
+  "inline int rstr_dp4a(int a, int b, int acc) {
+    char4 va = as_char4(a);
+    char4 vb = as_char4(b);
+    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y
+               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;
+}\n")
+
+(defn- body-uses-dp4a?
+  "True if the kernel body calls the dp4a int8-dot primitive (any spelling)."
+  [body]
+  (let [found (atom false)]
+    (walk/postwalk
+     (fn [form]
+       (when (and (seq? form)
+                  (contains? #{'dp4a 'par/dp4a 'raster.par/dp4a} (first form)))
+         (reset! found true))
+       form)
+     body)
+    @found))
+
 ;; Kernel generators
 ;; ================================================================
 
@@ -207,6 +232,7 @@
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
+                    (when (body-uses-dp4a? body) rstr-dp4a-helper)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"

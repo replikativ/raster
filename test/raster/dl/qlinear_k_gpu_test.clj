@@ -7,7 +7,49 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.qlinear-k :as qk]
             [raster.compiler.backend.cpu.quant :as q]
+            [raster.par :as par]
             [raster.gpu.core :as gpu]))
+
+(defn- pack-i8 ^ints [^bytes b]
+  (let [w (quot (alength b) 4) out (int-array w)]
+    (dotimes [i w]
+      (let [j (* i 4)]
+        (aset out i (unchecked-int
+                     (bit-or (bit-and (int (aget b j)) 0xFF)
+                             (bit-shift-left (bit-and (int (aget b (+ j 1))) 0xFF) 8)
+                             (bit-shift-left (bit-and (int (aget b (+ j 2))) 0xFF) 16)
+                             (bit-shift-left (bit-and (int (aget b (+ j 3))) 0xFF) 24))))))
+    out))
+
+(defn- rand-i8 ^bytes [n seed]
+  (let [a (byte-array n) r (java.util.Random. seed)]
+    (dotimes [i n] (aset a i (byte (- (.nextInt r 255) 127)))) a))
+
+(deftest dp4a-jvm-reference
+  (testing "par/dp4a matches scalar 4-lane signed int8 dot (little-endian lanes)"
+    ;; bytes (4,3,2,1)·(1,1,1,1) = 10
+    (is (= 10 (int (par/dp4a (unchecked-int 0x01020304) (unchecked-int 0x01010101) 0))))
+    ;; signed lanes + nonzero acc
+    (is (= 100 (int (par/dp4a (unchecked-int 0x01000000) (unchecked-int 0x05000000) 95)))) ; 1*5+95
+    (is (= -2 (int (par/dp4a (unchecked-int 0x000000FF) (unchecked-int 0x00000002) 0)))))) ; (-1)*2
+
+(deftest i8gemv-dp4a-gpu-exact
+  (when (gpu-available?)
+    (testing "dp4a int8 GEMV core on ze:0 is exact vs scalar int8 dot"
+      (let [out 16 in 256 kw (quot in 4)
+            W (rand-i8 (* out in) 7) x (rand-i8 in 9)
+            wp (pack-i8 W) xp (pack-i8 x)
+            yref (int-array out)
+            _ (dotimes [o out]
+                (aset yref o (int (areduce x k s 0 (+ s (* (int (aget W (+ (* o in) k))) (int (aget x k))))))))
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :g #'qk/i8gemv-dp4a!)
+          (gpu/alloc! sess {:wp [:int (alength wp) wp] :xp [:int (alength xp) xp] :y [:float out nil]})
+          (gpu/invoke! sess :g {"wp" :wp "xp" :xp "y" :y} [{:type :int :value kw}] out)
+          (let [ygpu (gpu/download sess :y)]
+            (is (every? (fn [o] (= (int (aget yref o)) (int (aget ^floats ygpu o)))) (range out))))
+          (finally (gpu/close-session! sess)))))))
 
 (defn- gpu-available? []
   (try (require 'raster.gpu.ze-runtime)
