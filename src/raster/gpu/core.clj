@@ -95,6 +95,8 @@
 ;; Internal: kernel compilation
 ;; ================================================================
 
+(declare array-tag->dtype)  ; defined below; compile-deftm-internal! reads it (fresh-load fwd ref)
+
 (defn- compile-deftm-internal!
   "Compile a deftm var's par forms to GPU kernels and register them.
    Returns vector of kernel-info maps."
@@ -103,12 +105,16 @@
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
+        ;; Per-scalar element type from the deftm's DECLARED tags — the typed-dispatch system
+        ;; already knows these (Long/Double/...), so read them instead of letting the OpenCL
+        ;; emitter guess from parameter names (which e.g. types a Double `gain-offset` as int
+        ;; because the name contains "offset").
         scalar-types (when (and params tags)
                        (into {}
                              (keep (fn [[p t]]
                                      (case t
-                                       (long longs) [p :int]
-                                       (int ints)   [p :int]
+                                       (long longs int ints) [p :int]
+                                       (double doubles float floats) [p :float]
                                        nil))
                                    (map vector params tags))))
         ;; Per-array element dtype from the deftm tags (bytes/floats/ints/…), so a

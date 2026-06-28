@@ -31,6 +31,19 @@
   (let [a (byte-array n) r (java.util.Random. seed)]
     (dotimes [i n] (aset a i (byte (- (.nextInt r 255) 127)))) a))
 
+(defn- gpu-available? []
+  (try (require 'raster.gpu.ze-runtime)
+       (let [qfn (resolve 'raster.gpu.ze-runtime/query-devices)]
+         (boolean (and qfn (seq (qfn)))))
+       (catch Throwable _ false)))
+
+(defn- gen [n seed]
+  (let [a (float-array n) r (java.util.Random. seed)]
+    (dotimes [i n] (aset a i (float (- (.nextDouble r) 0.5)))) a))
+
+(defn- maxerr [^floats a ^floats b]
+  (reduce max 0.0 (map (fn [x y] (Math/abs (double (- x y)))) (seq a) (seq b))))
+
 (deftest dp4a-jvm-reference
   (testing "par/dp4a matches scalar 4-lane signed int8 dot (little-endian lanes)"
     ;; bytes (4,3,2,1)·(1,1,1,1) = 10
@@ -56,19 +69,6 @@
           (let [ygpu (gpu/download sess :y)]
             (is (every? (fn [o] (= (int (aget yref o)) (int (aget ^floats ygpu o)))) (range out))))
           (finally (gpu/close-session! sess)))))))
-
-(defn- gpu-available? []
-  (try (require 'raster.gpu.ze-runtime)
-       (let [qfn (resolve 'raster.gpu.ze-runtime/query-devices)]
-         (boolean (and qfn (seq (qfn)))))
-       (catch Throwable _ false)))
-
-(defn- gen [n seed]
-  (let [a (float-array n) r (java.util.Random. seed)]
-    (dotimes [i n] (aset a i (float (- (.nextDouble r) 0.5)))) a))
-
-(defn- maxerr [^floats a ^floats b]
-  (reduce max 0.0 (map (fn [x y] (Math/abs (double (- x y)))) (seq a) (seq b))))
 
 (deftest q4k-gpu-matches-cpu
   (when (gpu-available?)

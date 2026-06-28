@@ -552,7 +552,12 @@
                       :loop-stmts (conj (or loop-stmts []) loop-code)
                       :seen-names (or seen-names {})
                       :ints ints})
-                   (if (multi-use? sym)
+                   ;; Force-declare loop-valued bindings even when single-use: inlining a
+                   ;; reduction into its use site recomputes it per use AND duplicates the
+                   ;; loop's induction var into the surrounding scope (a shadowing bug the
+                   ;; OpenCL compiler miscompiles). A reduction must be computed once.
+                   (if (or (multi-use? sym)
+                           (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
                      (let [base-name (c-symbol sym)
                            prev-count (get seen-names base-name 0)
                            c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
@@ -857,7 +862,10 @@
                                  (fn [f] (if (and (symbol? f) (contains? env f))
                                            (get env f) f))
                                  val)]
-                  (if (multi-use? sym)
+                  ;; Force-declare loop-valued bindings (see statement-context note): a
+                  ;; reduction must be computed once, not inlined+recomputed per use.
+                  (if (or (multi-use? sym)
+                          (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
                     (let [base-name (c-symbol sym)
                           prev-count (get seen-names base-name 0)
                           c-name (if (> prev-count 0)

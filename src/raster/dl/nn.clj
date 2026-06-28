@@ -361,22 +361,39 @@
 ;; gain-offset = 0.0 for Llama/Qwen (plain weight gain); 1.0 for Gemma, whose
 ;; norm weights are centered at 0 and applied as (1 + weight). Also used for
 ;; per-head QK-norm (rows = heads*seq, features = head_dim).
+;; par-combinator primitive: parallel-map over the (independent) row dimension, scalar
+;; reduce+map inside. This is the form that vectorizes on CPU (the inner feature loops lift
+;; to SIMD) and is the GPU-friendly shape (par/map-void! → one work-item/row, out caller-
+;; provided), so one source serves prefill, decode, and (eventually) the GPU-resident graph.
+;; Index arithmetic uses clojure.core (integer subscripts); float compute uses raster.numeric.
+;; NOTE: CPU path validated; the OpenCL lowering compiles with correct types but still has a
+;; numerical bug under clean load (WIP) — see the GPU emitter declared-type work.
+(deftm rms-norm! (All [T] [x :- (Array T) weight :- (Array T) out :- (Array T)
+                           rows :- Long features :- Long
+                           eps :- Double gain-offset :- Double] :- Void
+                      (raster.par/map-void! r rows
+                        ;; index arithmetic stays clojure.core (integer); only float compute
+                        ;; goes through raster.numeric (devirtualizes + vectorizes).
+                                            (let [offset (clojure.core/* r features)
+                                                  ms (loop [i 0 s 0.0]
+                                                       (if (< i features)
+                                                         (let [v (aget x (clojure.core/+ offset i))]
+                                                           (recur (inc i) (+ s (* v v))))
+                                                         (/ s (double features))))
+                                                  inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                                              (loop [i 0]
+                                                (if (< i features)
+                                                  (do (aset out (clojure.core/+ offset i)
+                                                            (* (aget x (clojure.core/+ offset i)) inv
+                                                               (+ gain-offset (aget weight i))))
+                                                      (recur (inc i)))
+                                                  nil))))))
+
 (deftm rms-norm (All [T] [x :- (Array T) weight :- (Array T)
                           rows :- Long features :- Long
                           eps :- Double gain-offset :- Double] :- (Array T)
                      (let [out (alloc-like x (* rows features))]
-                       (dotimes [r rows]
-                         (let [offset (* r (int features))
-                               ms (loop [i 0 s 0.0]
-                                    (if (< i features)
-                                      (let [v (aget x (+ offset i))]
-                                        (recur (inc i) (+ s (* v v))))
-                                      (/ s features)))
-                               inv (/ 1.0 (n/sqrt (+ ms eps)))]
-                           (dotimes [i features]
-                             (aset out (+ offset i)
-                                   (* (aget x (+ offset i)) inv
-                                      (+ gain-offset (aget weight i)))))))
+                       (rms-norm! x weight out rows features eps gain-offset)
                        out)))
 
 ;; --- Bias-free linear + gated MLP (modern decoder LMs) ---

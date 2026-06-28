@@ -179,16 +179,24 @@
                                                            (str "__global const " ct "* restrict " flat-sym))))
                                                      fields)))
                                             soa-arr-params))
-        ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
+        ;; Scalar param C type: the DECLARED type (from the deftm tags via scalar-types) wins.
+        ;; The name/metadata heuristic is only a fallback for params with no declared type —
+        ;; it must NOT override a declared one (a Double `gain-offset` is float, not int).
         scl-type (fn [s]
                    (let [sname (name s)
                          explicit (get scalar-types s (get scalar-types (symbol sname)))]
                      (cond
-                       (= explicit :int) "int"
+                       (= explicit :int)    "int"
+                       (= explicit :long)   "long"
+                       (= explicit :double) "double"
+                       (= explicit :float)  default-ctype
                        (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
                            (contains? #{'long 'int} (:tag (meta s))))
                        "int"
                        :else default-ctype)))
+        ;; Integer scalar params seed *int-vars* for the body, so index math that uses a scalar
+        ;; (e.g. offset = r*features) infers integer instead of *scalar-type* (float).
+        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -209,7 +217,9 @@
                                     soa-arr-params))
         all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* default-ctype]
+                           ce/*scalar-type* default-ctype
+                           ce/*idx-sym* idx
+                           ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         ;; Detect if body uses float atomic-add (needs CAS helper function)
         needs-float-atomic? (let [found (atom false)]
