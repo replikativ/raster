@@ -303,6 +303,61 @@
                                                           a))))))
                                           0)))
 
+;; GPU/vectorizable decode attention: the SAME per-head computation as
+;; gqa-decode-attention-heads!, but the head loop is a par/map-void! (one work-item per query
+;; head) so it lowers to OpenCL and SIMD-vectorizes on CPU. Per-head scratch is caller-provided
+;; (sc, size n-q*cache-len — GPU work-items can't allocate); index math is clojure.core
+;; (integer subscripts), float compute is raster.numeric/raster.math. Attends all cache positions.
+(deftm gqa-decode-attention-gpu! (All [T]
+                                      [q :- (Array T) k :- (Array T) v :- (Array T)
+                                       out :- (Array T) sc :- (Array T)
+                                       cache-len :- Long n-q :- Long group :- Long
+                                       n-kv :- Long head-dim :- Long scale :- Double] :- Void
+                                      (raster.par/map-void! hq n-q
+                                                            (let [hkv (quot hq group)
+                                                                  qb (clojure.core/* hq head-dim)
+                                                                  scb (clojure.core/* hq cache-len)
+                                                                  kvstride (clojure.core/* n-kv head-dim)
+                                                                  hkvb (clojure.core/* hkv head-dim)
+                                              ;; float sentinel below any real score (OpenCL has
+                                              ;; no NEGATIVE_INFINITY const; keeps the max in float
+                                              ;; so n/max → fmax(float,float) isn't ambiguous).
+                                                                  neg-inf -1.0e38
+                                                                  _ (loop [j 0]
+                                                                      (if (< j cache-len)
+                                                                        (let [kb (clojure.core/+ (clojure.core/* j kvstride) hkvb)
+                                                                              dot (loop [d 0 acc 0.0]
+                                                                                    (if (< d head-dim)
+                                                                                      (recur (inc d)
+                                                                                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                                       (aget k (clojure.core/+ kb d)))))
+                                                                                      acc))]
+                                                                          (aset sc (clojure.core/+ scb j) (* dot scale))
+                                                                          (recur (inc j)))
+                                                                        nil))
+                                                                  mx (loop [j 0 mm neg-inf]
+                                                                       (if (< j cache-len)
+                                                                         (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+                                                                  sum (loop [j 0 s 0.0]
+                                                                        (if (< j cache-len)
+                                                                          (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                                                                            (aset sc (clojure.core/+ scb j) e)
+                                                                            (recur (inc j) (+ s e)))
+                                                                          s))
+                                                                  inv (/ 1.0 sum)]
+                                                              (loop [d 0]
+                                                                (if (< d head-dim)
+                                                                  (do (aset out (clojure.core/+ qb d)
+                                                                            (loop [j 0 a 0.0]
+                                                                              (if (< j cache-len)
+                                                                                (let [kvb (clojure.core/+ (clojure.core/* j kvstride) hkvb)]
+                                                                                  (recur (inc j)
+                                                                                         (+ a (* (* (aget sc (clojure.core/+ scb j)) inv)
+                                                                                                 (aget v (clojure.core/+ kvb d))))))
+                                                                                a)))
+                                                                      (recur (inc d)))
+                                                                  nil))))))
+
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
                                             seq-len :- Long dk :- Long dv :- Long]

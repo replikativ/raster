@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.qlinear-k :as qk]
             [raster.dl.nn :as nn]
+            [raster.dl.attention :as attn]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.par :as par]
             [raster.gpu.core :as gpu]))
@@ -84,6 +85,29 @@
           (gpu/invoke-bound! sess :sm) (gpu/invoke-bound! sess :ra) (gpu/sync! sess)
           (is (< (maxerr sm-ref (gpu/download sess :smo)) 1e-4) "silu-mul")
           (is (< (maxerr ra-ref (gpu/download sess :rao)) 1e-5) "residual-add")
+          (finally (gpu/close-session! sess)))))))
+
+(deftest gqa-decode-attention-gpu-lowers
+  (when (gpu-available?)
+    (testing "GQA decode attention (QK^T+softmax+weighted-V, parallel over heads) lowers to OpenCL"
+      ;; Reuses the per-head computation of gqa-decode-attention-heads! verbatim, as a
+      ;; par/map-void! over query heads with caller-provided per-head scratch — matches the CPU
+      ;; gqa-decode-attention reference. GQA via n-kv < n-q.
+      (let [nq 8 nkv 2 hd 64 cl 16 group (quot nq nkv) scale (/ 1.0 (Math/sqrt hd))
+            q (gen (* nq hd) 1) k (gen (* cl nkv hd) 2) v (gen (* cl nkv hd) 3)
+            ycpu (attn/gqa-decode-attention q k v cl nq nkv hd scale)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :at #'attn/gqa-decode-attention-gpu!)
+          (gpu/alloc! sess {:q [:float (alength q) q] :k [:float (alength k) k] :v [:float (alength v) v]
+                            :out [:float (* nq hd) nil] :sc [:float (* nq cl) nil]})
+          ;; scalars by name: cache-len group head-dim n-kv scale ; par bound = n-q
+          (gpu/prepare! sess :at {"q" :q "k" :k "v" :v "out" :out "sc" :sc}
+                        [{:type :int :value cl} {:type :int :value group} {:type :int :value hd}
+                         {:type :int :value nkv} {:type :float :value scale}]
+                        nq {:kernel-phase :at})
+          (gpu/invoke-bound! sess :at)
+          (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
           (finally (gpu/close-session! sess)))))))
 
 (deftest dp4a-jvm-reference
