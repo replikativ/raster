@@ -675,6 +675,43 @@
     (into {} (for [p array-params :when (= :output (get roles p))]
                [p (download sess (keyword (name p)))]))))
 
+;; ----------------------------------------------------------------
+;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single
+;; fused compile-gpu-program later). Each op is compiled individually and chained into ONE command
+;; graph over SHARED resident buffers with residency roles, so per token only :input moves up and
+;; :output moves down; :constant weights + :state KV stay resident.
+;; ----------------------------------------------------------------
+
+(defn chain-program!
+  "Bind a hand-authored op-chain as one resident command graph.
+     buffers: {buf-key → [dtype size init-array-or-nil role]} — role ∈
+              #{:constant :state :input :output :scratch} (default :scratch).
+     steps:   [{:op #'deftm-var :phase kw
+                :bind {kernel-param-name-string → buf-key}   ; maps EACH array param to a buffer
+                :scalars [typed-scalar-map …] :n work-items}]
+   Allocates the buffers (uploading any init array), compiles each op, prepares each step against
+   the shared buffers, and records the kernel sequence under :chain. run-chain! then replays it."
+  [sess buffers steps]
+  (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
+        roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+    (alloc! sess specs)
+    (doseq [{:keys [op phase bind scalars n]} steps]
+      (compile! sess phase op)
+      (prepare! sess phase bind (vec scalars) (long n) {:kernel-phase phase}))
+    (record-graph! sess (mapv :phase steps) :chain)
+    (swap! sess assoc :chain-roles roles)
+    sess))
+
+(defn run-chain!
+  "Replay a bound op-chain: refresh the given :input buffers (buffer POINTERS stable), replay the
+   graph, download the :output buffers. inputs = {buf-key → jvm-array}. Returns
+   {output-buf-key → downloaded jvm-array}. :constant/:state/:scratch buffers are never moved."
+  [sess inputs]
+  (let [roles (:chain-roles @sess)]
+    (doseq [[k arr] inputs] (upload! sess k arr))
+    (replay! sess :chain)
+    (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)]))))
+
 (defn kernel
   "Get kernel info vector from the session by phase key."
   [sess phase-key]
