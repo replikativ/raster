@@ -37,3 +37,30 @@
                 out)
           ek (maxerr w q4k) e0 (maxerr w q40)]
       (is (< ek e0) (str "Q4_K err " ek " should beat Q4_0 err " e0 " on offset data")))))
+
+(deftest q4k-q8k-dot-structure
+  (testing "the structured K-dot equals dot(dequant-weight, dequant-act) and tracks f32"
+    (let [in 512
+          w (gen in -0.6 0.6 3) x (gen in -0.8 0.8 9)
+          ew (q/quantize-weight-q4k w q/q4-K)
+          ea (q/quantize-act-q8k x in q/q4-K)
+          dotk (q/q4k-q8k-dot ew ea in q/q4-K)
+          ;; reference 1: dot of the dequantized weight & dequantized activation —
+          ;; the structured dot must equal this EXACTLY (it's the same reconstruction)
+          dqw (q/dequant-q4k ew q/q4-K in)
+          dqa (let [out (float-array in) sub 32]
+                (dotimes [sb (quot in 256)]
+                  (let [d (aget ^floats (:xs ea) sb)]
+                    (dotimes [i 256] (let [idx (+ (* sb 256) i)]
+                                       (aset out idx (float (* d (aget ^bytes (:xq ea) idx)))))))) out)
+          ref-dq (areduce dqw i s 0.0 (+ s (* (aget dqw i) (aget dqa i))))
+          ;; reference 2: the true f32 dot — the K-dot tracks it within quant error,
+          ;; measured against the L1 product scale (a random dot near-cancels, so error
+          ;; vs the cancelling sum is meaningless; vs Σ|w·x| it is the real quant error)
+          ref-f32 (areduce w i s 0.0 (+ s (* (aget w i) (aget x i))))
+          l1 (areduce w i s 0.0 (+ s (Math/abs (* (aget w i) (aget x i)))))]
+      (is (< (Math/abs (- dotk ref-dq)) 1e-2)
+          (str "structured K-dot " dotk " must equal dequant·dequant dot " ref-dq))
+      (is (< (Math/abs (- dotk ref-f32)) (* 0.02 l1))
+          (str "K-dot " dotk " vs f32 " ref-f32 " — err " (Math/abs (- dotk ref-f32))
+               " should be < 2% of L1 scale " l1)))))
