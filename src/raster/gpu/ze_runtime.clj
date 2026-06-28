@@ -1817,7 +1817,9 @@
     ;; group-count value is captured into the recorded command at append time). A barrier
     ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
     ;; decode chain is dependent (norm→quant→matmul→…). Independent ops still serialize, but
-    ;; each is memory-bound so overlap buys little; correctness first.
+    ;; each is memory-bound so overlap buys little; correctness first. (Measured: an IN_ORDER
+    ;; command list with no barriers is the same replay time — the ~50µs/kernel floor on this
+    ;; iGPU is per-dispatch overhead, not the barrier. Fewer/bigger kernels is the lever.)
     (doseq [{:keys [bound group-count]} prepareds]
       (let [^MemorySegment gc (:gc-seg bound)]
         (.set gc I32 0 (int group-count))
