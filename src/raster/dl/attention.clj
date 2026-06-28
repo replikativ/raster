@@ -303,6 +303,30 @@
                                                           a))))))
                                           0)))
 
+;; Decode RoPE (single token), par/map-void! over heads — the same NeoX/HF rotate-half as
+;; rope-pos with seq-len=1 (each head rotates its head-dim/2 pairs at absolute position
+;; pos-offset). Lowers to OpenCL and SIMD-vectorizes on CPU. Index math clojure.core; trig
+;; via raster.math. out is caller-provided (in-place-safe: reads x, writes out).
+(deftm rope-pos-gpu! (All [T] [x :- (Array T) out :- (Array T)
+                               heads :- Long head-dim :- Long
+                               theta :- Double pos-offset :- Long] :- Void
+                          (raster.par/map-void! h heads
+                                                (let [hdim2 (quot head-dim 2)
+                                                      base (clojure.core/* h head-dim)
+                                                      ln-theta (m/log theta)
+                                                      pos (double pos-offset)]
+                                                  (loop [i 0]
+                                                    (if (< i hdim2)
+                                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                            ang (* pos freq)
+                                                            c (m/cos ang) s (m/sin ang)
+                                                            x0 (aget x (clojure.core/+ base i))
+                                                            x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                        (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                                        (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))
+                                                        (recur (inc i)))
+                                                      nil))))))
+
 ;; GPU/vectorizable decode attention: the SAME per-head computation as
 ;; gqa-decode-attention-heads!, but the head loop is a par/map-void! (one work-item per query
 ;; head) so it lowers to OpenCL and SIMD-vectorizes on CPU. Per-head scratch is caller-provided

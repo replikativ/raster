@@ -246,8 +246,10 @@
     "for" "while" "do" "if" "else" "return" "break" "continue" "switch" "case"
     "struct" "union" "enum" "typedef" "const" "static" "extern" "auto" "register"
     "sizeof" "goto" "volatile"
-    ;; OpenCL specific
+    ;; OpenCL specific (incl. scalar type keywords that are common variable names —
+    ;; `half` is the OpenCL fp16 type, so a deftm binding named `half` collides)
     "kernel" "global" "local" "constant" "private" "restrict"
+    "half" "bool" "uchar" "ushort" "uint" "ulong" "size_t" "ptrdiff_t"
     ;; GLSL specific
     "attribute" "uniform" "varying" "layout" "buffer" "shared"
     "in" "out" "inout" "precision" "lowp" "mediump" "highp"

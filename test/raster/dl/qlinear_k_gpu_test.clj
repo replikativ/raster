@@ -87,6 +87,24 @@
           (is (< (maxerr ra-ref (gpu/download sess :rao)) 1e-5) "residual-add")
           (finally (gpu/close-session! sess)))))))
 
+(deftest rope-pos-gpu-lowers
+  (when (gpu-available?)
+    (testing "decode RoPE (rope-pos-gpu!, par over heads) lowers to OpenCL == CPU rope-pos"
+      (let [heads 8 hd 64 theta 10000.0 pos 5 n (* heads hd)
+            x (gen n 1)
+            ycpu (attn/rope-pos x 1 heads hd theta pos)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :rope #'attn/rope-pos-gpu!)
+          (gpu/alloc! sess {:x [:float n x] :out [:float n nil]})
+          ;; scalars by name: head-dim pos-offset theta ; par bound = heads
+          (gpu/prepare! sess :rope {"x" :x "out" :out}
+                        [{:type :int :value hd} {:type :int :value pos} {:type :float :value theta}]
+                        heads {:kernel-phase :rope})
+          (gpu/invoke-bound! sess :rope)
+          (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
+          (finally (gpu/close-session! sess)))))))
+
 (deftest gqa-decode-attention-gpu-lowers
   (when (gpu-available?)
     (testing "GQA decode attention (QK^T+softmax+weighted-V, parallel over heads) lowers to OpenCL"
