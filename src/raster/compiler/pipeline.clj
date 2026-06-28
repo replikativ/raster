@@ -1040,7 +1040,15 @@
                       {:kernel-name kernel-name
                        :arrays arrays
                        :n-fn (expr->arg-fn all-params n-expr)
-                       :scalar-fns (mapv #(expr->arg-fn all-params %) scalars)
+                       ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
+                       ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
+                       ;; `features`) is bound as :int, not mis-typed float (→ launch error).
+                       :scalar-specs (mapv (fn [s]
+                                             {:type (or (and (symbol? s)
+                                                             (get (:scalar-types gpu-param-types) s))
+                                                        (if (= effective-dtype :double) :double :float))
+                                              :value-fn (expr->arg-fn all-params s)})
+                                           scalars)
                        :convention convention
                        :phase (keyword (str "gpu-step-" i))})
                     (range) (:steps prog))

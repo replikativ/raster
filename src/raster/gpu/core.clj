@@ -608,7 +608,7 @@
                                   allocs))
         info-fn (rt-resolve device-id "kernel-registry-entry")]
     (alloc! sess (merge param-specs alloc-specs))
-    (doseq [{:keys [kernel-name n-fn scalar-fns phase]} steps]
+    (doseq [{:keys [kernel-name n-fn scalar-specs phase]} steps]
       (let [ki (or (info-fn kernel-name)
                    (throw (ex-info (str "Program kernel not registered: " kernel-name)
                                    {:kernel kernel-name})))
@@ -617,7 +617,9 @@
             ;; so name→same-name-keyword is exact (and SoA-order-robust: prepare! orders by
             ;; :array-params itself via resolve-kernel-bufs).
             sym->buf (into {} (map (fn [p] [(name p) (keyword (name p))]) (:array-params ki)))
-            scalars (mapv (fn [f] (f args)) scalar-fns)]
+            ;; typed scalars ({:type :int|:float|:double :value v}) so int params bind as int.
+            scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                          scalar-specs)]
         (swap! sess assoc-in [:kernels phase] [ki])
         (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase})))
     (record-graph! sess (mapv :phase steps) :program)
