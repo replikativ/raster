@@ -94,6 +94,37 @@
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
+(deftest q4k-dp4a-bound-dispatch
+  (when (gpu-available?)
+    (testing "prepare!/invoke-bound! (sync) and async prepare!+sync! match invoke! result"
+      (let [out 32 in 256
+            W (gen (* out in) 11) x (gen in 22)
+            {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
+            {:keys [xq xs bsums]}    (q/quantize-act-q8k x in q/q4-K)
+            wp (bytes->ints-le wq) xp (pack-i8 xq)
+            ycpu (float-array out)
+            _ (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq ycpu in out 0 out)
+            sym {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
+            scal [{:type :int :value in}]
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a!)
+          (gpu/alloc! sess {:xp [:int (alength xp) xp] :xs [:float (alength xs) xs]
+                            :bsums [:int (alength bsums) bsums] :wp [:int (alength wp) wp]
+                            :da [:float (alength da) da] :db [:float (alength db) db]
+                            :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
+                            :y [:float out nil]})
+          ;; synchronous bound dispatch
+          (gpu/prepare! sess :q4kdp sym scal out)
+          (gpu/invoke-bound! sess :q4kdp)
+          (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "sync bound")
+          ;; async bound dispatch: zero result, batch-launch, sync, then read
+          (gpu/prepare! sess :q4kdp sym scal out {:async? true})
+          (dotimes [_ 3] (gpu/invoke-bound! sess :q4kdp))
+          (gpu/sync! sess)
+          (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "async bound + sync!")
+          (finally (gpu/close-session! sess)))))))
+
 (deftest q4k-dp4a-gpu-matches-cpu
   (when (gpu-available?)
     (testing "Q4_K dp4a kernel on ze:0 (int32-packed nibble-mask trick) == CPU composable"

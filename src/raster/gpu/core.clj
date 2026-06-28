@@ -399,6 +399,50 @@
          invoke-fn! (rt-resolve device-id "invoke-registered-map-void-kernel")]
      (invoke-fn! (:kernel-name kernel-info) buf-vec scalars n))))
 
+(defn prepare!
+  "Pre-bind a kernel's arguments ONCE for fast repeated dispatch (the launch-overhead fix).
+  Resolves the session buffers for the kernel's params, binds them + scalars + n, and caches
+  the bound handle in the session under [:prepared phase-key]. Subsequent invoke-bound! calls
+  skip per-launch arg setup and the barrier (measured 2.6-5× faster than invoke!).
+
+  Requires all kernel array params to map to session buffers (DeviceBuffers) — the residency-
+  friendly path. Re-call prepare! only if a buffer is reallocated or n changes; buffer CONTENTS
+  may change freely between invoke-bound! calls (the bound pointers are stable)."
+  ([sess phase-key sym->buf-key scalars n]
+   (prepare! sess phase-key sym->buf-key scalars n {}))
+  ([sess phase-key sym->buf-key scalars n {:keys [index async?] :or {index 0}}]
+   (let [{:keys [kernels buffers]} @sess
+         kernel-vec (or (get kernels phase-key)
+                        (throw (ex-info (str "No kernel for phase: " phase-key)
+                                        {:available (keys kernels)})))
+         kernel-info (nth kernel-vec index)
+         buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
+         device-id (:device-id @sess)
+         bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
+         prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
+     (swap! sess assoc-in [:prepared phase-key] prepared)
+     prepared)))
+
+(defn invoke-bound!
+  "Dispatch a kernel previously bound with prepare!. No arg setup, no barrier — the
+  low-overhead dispatch path. With an async-prepared kernel the dispatch returns immediately
+  (call sync! before reading results); otherwise it completes synchronously.
+  Throws if the phase was not prepared."
+  [sess phase-key]
+  (let [prepared (or (get-in @sess [:prepared phase-key])
+                     (throw (ex-info (str "Phase not prepared: " phase-key " — call prepare! first")
+                                     {:prepared (keys (:prepared @sess))})))
+        device-id (:device-id @sess)
+        launch-fn (rt-resolve device-id "launch-registered-bound!")]
+    (launch-fn prepared)))
+
+(defn sync!
+  "Block until all async-dispatched kernels on this device have completed. Call once after a
+  batch of async invoke-bound! calls, before downloading results."
+  [sess]
+  (let [device-id (:device-id @sess)]
+    ((rt-resolve device-id "synchronize-async!"))))
+
 (defn invoke-scan!
   "Invoke a compiled Blelloch exclusive-scan kernel pair from the session.
 
