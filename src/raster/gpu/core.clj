@@ -95,8 +95,6 @@
 ;; Internal: kernel compilation
 ;; ================================================================
 
-(declare array-tag->dtype)  ; defined below; compile-deftm-internal! reads it (fresh-load fwd ref)
-
 (defn- compile-deftm-internal!
   "Compile a deftm var's par forms to GPU kernels and register them.
    Returns vector of kernel-info maps."
@@ -105,31 +103,9 @@
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
-        ;; Per-scalar element type from the deftm's DECLARED tags — the typed-dispatch system
-        ;; already knows these (Long/Double/...), so read them instead of letting the OpenCL
-        ;; emitter guess from parameter names (which e.g. types a Double `gain-offset` as int
-        ;; because the name contains "offset").
-        scalar-types (when (and params tags)
-                       (into {}
-                             (keep (fn [[p t]]
-                                     (case t
-                                       (long longs int ints) [p :int]
-                                       (double doubles float floats) [p :float]
-                                       nil))
-                                   (map vector params tags))))
-        ;; Per-array element dtype from the deftm tags (bytes/floats/ints/…), so a
-        ;; mixed kernel (int8 weights + float scales + int bsums) types each pointer
-        ;; correctly instead of collapsing to the single kernel-wide default dtype.
-        ;; Float-family arrays (float OR double) map to the KERNEL dtype — a single-precision
-        ;; GPU kernel reads float buffers, and a parametric (All [T]) deftm's (Array T) params
-        ;; default T inconsistently (some to doubles, some to floats); the kernel precision,
-        ;; not the parametric default, decides. int/long/byte arrays stay concrete.
-        array-types (when (and params tags)
-                      (into {}
-                            (keep (fn [[p t]]
-                                    (when-let [dt (array-tag->dtype t)]
-                                      [p (if (#{:float :double} dt) dtype dt)]))
-                                  (map vector params tags))))
+        ;; Declared scalar/array element types — the SINGLE shared derivation, used by the
+        ;; pipeline's pass-backend too (opencl-pass/derive-param-types). One source of truth.
+        {:keys [scalar-types array-types]} (opencl-pass/derive-param-types params tags dtype)
         form (let [f (if (= 1 (count walked-body))
                        (first walked-body)
                        (cons 'do walked-body))

@@ -631,7 +631,13 @@
       (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
       :opencl
-      (let [result (opencl-pass/opencl-pass form
+      ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
+      ;; generators read declared types instead of guessing. The materialized form preserves
+      ;; the original param symbols, so a name-keyed type map still applies.
+      (let [form (cond-> form
+                   (or (:scalar-types opts) (:array-types opts))
+                   (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
+            result (opencl-pass/opencl-pass form
                                             :device-id target-device
                                             :dtype (:dtype opts))]
         (register-gpu-kernels! (:kernels result))
@@ -856,11 +862,21 @@
                                                (mapv (fn [t] (if (= t 'Object) nil t)) tags)))]
                                 (when (and ps anns (= (count ps) (count anns)))
                                   (zipmap (map #(if (symbol? %) % (symbol (name %))) ps) anns)))
+            ;; Declared GPU param types from the SAME shared derivation Path A uses, so the
+            ;; pipeline's opencl backend gets the deftm's declared scalar/array types (not the
+            ;; emitter's name-regex guess). ONE type source across both compile entries.
+            gpu-param-types (when target-device
+                              (opencl-pass/derive-param-types
+                               (:raster.core/deftm-params (meta resolved-var))
+                               (:raster.core/deftm-tags (meta resolved-var))
+                               effective-dtype))
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
                           :active-params active-params :dtype effective-dtype}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns)
-                   param-annotations (assoc :param-annotations param-annotations))
+                   param-annotations (assoc :param-annotations param-annotations)
+                   gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                          :array-types (:array-types gpu-param-types)))
             compile! (fn []
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)
