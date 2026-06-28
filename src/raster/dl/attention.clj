@@ -327,6 +327,14 @@
                                                         (recur (inc i)))
                                                       nil))))))
 
+;; KV-cache append (decode): write the current token's K (or V) slab of length kvrow = n_kv*head_dim
+;; into the cache at absolute position `pos` (offset pos*kvrow). par/map-void! over kvrow — the
+;; on-device equivalent of the CPU System/arraycopy append. Index math clojure.core (integer).
+(deftm kv-append! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long pos :- Long] :- Void
+                       (raster.par/map-void! i kvrow
+                                             (aset cache (clojure.core/+ (clojure.core/* pos kvrow) i)
+                                                   (aget src i)))))
+
 ;; GPU/vectorizable decode attention: the SAME per-head computation as
 ;; gqa-decode-attention-heads!, but the head loop is a par/map-void! (one work-item per query
 ;; head) so it lowers to OpenCL and SIMD-vectorizes on CPU. Per-head scratch is caller-provided
