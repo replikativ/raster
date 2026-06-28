@@ -21,6 +21,12 @@
                              (bit-shift-left (bit-and (int (aget b (+ j 3))) 0xFF) 24))))))
     out))
 
+(defn- bytes->ints-le ^ints [^bytes b]      ; reinterpret bytes as int32 little-endian
+  (let [w (quot (alength b) 4) out (int-array w)
+        bb (.order (java.nio.ByteBuffer/wrap b) java.nio.ByteOrder/LITTLE_ENDIAN)]
+    (dotimes [i w] (aset out i (.getInt bb (* i 4))))
+    out))
+
 (defn- rand-i8 ^bytes [n seed]
   (let [a (byte-array n) r (java.util.Random. seed)]
     (dotimes [i n] (aset a i (byte (- (.nextInt r 255) 127)))) a))
@@ -83,6 +89,31 @@
                             :y [:float out nil]})
           (gpu/invoke! sess :q4k
                        {"xq" :xq "xs" :xs "bsums" :bsums "wq" :wq "da" :da "db" :db
+                        "aq" :aq "bq" :bq "y" :y}
+                       [{:type :int :value in}] out)
+          (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
+          (finally (gpu/close-session! sess)))))))
+
+(deftest q4k-dp4a-gpu-matches-cpu
+  (when (gpu-available?)
+    (testing "Q4_K dp4a kernel on ze:0 (int32-packed nibble-mask trick) == CPU composable"
+      (let [out 32 in 256
+            W (gen (* out in) 11) x (gen in 22)
+            {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
+            {:keys [xq xs bsums]}    (q/quantize-act-q8k x in q/q4-K)
+            ycpu (float-array out)
+            _ (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq ycpu in out 0 out)
+            wp (bytes->ints-le wq) xp (pack-i8 xq)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a!)
+          (gpu/alloc! sess {:xp [:int (alength xp) xp] :xs [:float (alength xs) xs]
+                            :bsums [:int (alength bsums) bsums] :wp [:int (alength wp) wp]
+                            :da [:float (alength da) da] :db [:float (alength db) db]
+                            :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
+                            :y [:float out nil]})
+          (gpu/invoke! sess :q4kdp
+                       {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db
                         "aq" :aq "bq" :bq "y" :y}
                        [{:type :int :value in}] out)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))

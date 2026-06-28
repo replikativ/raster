@@ -135,6 +135,52 @@
                                a))]
                    (ra/aset y o (float acc)))))
 
+;; ---- Q4_K dp4a GPU kernel (the hardware-accelerated path) ----
+;; Same scale/min fold as qmatmul-q4k-gpu!, but the 32-element sub-block dot is computed
+;; with par/dp4a over int32-packed lanes. Weights uploaded as int32 (wq nibbles reinterpreted
+;; little-endian): one int read yields 4 low nibbles (wi & 0x0F0F0F0F → elements k..k+3) AND
+;; 4 high nibbles ((wi>>4) & 0x0F0F0F0F → elements k+16..k+19), the llama.cpp mmvq trick.
+;; Activation xq packed element-order to int32 (xp). Nibbles 0..15 are positive int8, so the
+;; signed dp4a equals the unsigned-nibble × signed-act dpbusd of the composable kernel.
+(deftm qmatmul-q4k-dp4a!
+  [xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   wp :- (Array int), da :- (Array float), db :- (Array float),
+   aq :- (Array byte), bq :- (Array byte),
+   y :- (Array float), in :- Long, out :- Long] :- Void
+  (par/map-void! o out
+                 (let [nsb (quot (long in) 256)
+                       wiw (quot (long in) 8)           ; weight int32 words per row (in/2 bytes / 4)
+                       wb (long (* (long o) wiw))
+                       sbb (long (* (long o) nsb))
+                       subb (long (* (long o) (quot (long in) 32)))
+                       acc (loop [sb 0 a 0.0]
+                             (if (< sb nsb)
+                               (let [dav (double (ra/aget da (+ sbb sb)))
+                                     dbv (double (ra/aget db (+ sbb sb)))
+                                     dact (double (ra/aget xs sb))
+                                     wsb (long (+ wb (* sb 32)))   ; 32 int words / super-block
+                                     xsb (long (* sb 64))          ; 64 act words / super-block
+                                     ssum (loop [j 0 s 0.0]
+                                            (if (< j 8)
+                                              (let [sidx (long (+ (* sb 8) j))
+                                                    aj (* dav (long (ra/aget aq (+ subb sidx))))
+                                                    bj (* dbv (long (ra/aget bq (+ subb sidx))))
+                                                    wj (long (+ wsb (* j 4))) xj (long (+ xsb (* j 8)))
+                                                    dp (loop [r 0 d 0]
+                                                         (if (< r 4)
+                                                           (let [wi (ra/aget wp (+ wj r))
+                                                                 lo (bit-and wi 0x0F0F0F0F)
+                                                                 hi (bit-and (bit-shift-right wi 4) 0x0F0F0F0F)
+                                                                 d1 (par/dp4a lo (ra/aget xp (+ xj r)) d)
+                                                                 d2 (par/dp4a hi (ra/aget xp (+ xj 4 r)) d1)]
+                                                             (recur (inc r) d2))
+                                                           d))]
+                                                (recur (inc j) (+ s (* aj (double dp)) (* bj (double (ra/aget bsums sidx))))))
+                                              s))]
+                                 (recur (inc sb) (+ a (* dact ssum))))
+                               a))]
+                   (ra/aset y o (float acc)))))
+
 ;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).
 (deftm qmatmul-q6k-gpu!
   [xq :- (Array byte), xs :- (Array float), bsums :- (Array int),
