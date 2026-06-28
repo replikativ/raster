@@ -120,11 +120,15 @@
         ;; Per-array element dtype from the deftm tags (bytes/floats/ints/…), so a
         ;; mixed kernel (int8 weights + float scales + int bsums) types each pointer
         ;; correctly instead of collapsing to the single kernel-wide default dtype.
+        ;; Float-family arrays (float OR double) map to the KERNEL dtype — a single-precision
+        ;; GPU kernel reads float buffers, and a parametric (All [T]) deftm's (Array T) params
+        ;; default T inconsistently (some to doubles, some to floats); the kernel precision,
+        ;; not the parametric default, decides. int/long/byte arrays stay concrete.
         array-types (when (and params tags)
                       (into {}
                             (keep (fn [[p t]]
                                     (when-let [dt (array-tag->dtype t)]
-                                      [p dt]))
+                                      [p (if (#{:float :double} dt) dtype dt)]))
                                   (map vector params tags))))
         form (let [f (if (= 1 (count walked-body))
                        (first walked-body)

@@ -203,6 +203,19 @@
                                                 (fn [dy]
                                                   [(silu-backward dy x n) nil]))})
 
+;; SwiGLU activation, fused: out = silu(gate) * up. par/map-void! !-variant (one work-item /
+;; element) — the GPU-resident decode FFN form, and SIMD-vectorizes on CPU. The par index is the
+;; subscript directly (no computed index); float compute via raster.numeric + raster.math/exp.
+(deftm silu-mul! (All [T] [gate :- (Array T) up :- (Array T) out :- (Array T) n :- Long] :- Void
+                      (raster.par/map-void! i n
+                                            (let [g (aget gate i)]
+                                              (aset out i (* (* g (/ 1.0 (+ 1.0 (m/exp (- g))))) (aget up i)))))))
+
+;; residual add, !-variant: out = a + b (one work-item / element).
+(deftm residual-add! (All [T] [a :- (Array T) b :- (Array T) out :- (Array T) n :- Long] :- Void
+                          (raster.par/map-void! i n
+                                                (aset out i (+ (aget a i) (aget b i))))))
+
 ;; --- GELU: x * Phi(x) (tanh approximation) ---
 (deftm gelu (All [T] [x :- (Array T) n :- Long] :- (Array T)
                  (let [c (n/sqrt (/ 2.0 n/pi))]

@@ -66,6 +66,26 @@
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
+(deftest elementwise-ffin-ops-gpu-lower
+  (when (gpu-available?)
+    (testing "silu-mul! (SwiGLU) and residual-add! par/map-void! ops lower to correct OpenCL"
+      (let [n 512 gate (gen n 1) up (gen n 2) a (gen n 3) b (gen n 4)
+            sig (fn [^double v] (/ 1.0 (+ 1.0 (Math/exp (- v)))))
+            sm-ref (let [o (float-array n)] (dotimes [i n] (aset o i (float (* (* (aget gate i) (sig (aget gate i))) (aget up i))))) o)
+            ra-ref (let [o (float-array n)] (dotimes [i n] (aset o i (float (+ (aget a i) (aget b i))))) o)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :sm #'nn/silu-mul!)
+          (gpu/compile! sess :ra #'nn/residual-add!)
+          (gpu/alloc! sess {:gate [:float n gate] :up [:float n up] :smo [:float n nil]
+                            :a [:float n a] :b [:float n b] :rao [:float n nil]})
+          (gpu/prepare! sess :sm {"gate" :gate "up" :up "out" :smo} [] n {:kernel-phase :sm})
+          (gpu/prepare! sess :ra {"a" :a "b" :b "out" :rao} [] n {:kernel-phase :ra})
+          (gpu/invoke-bound! sess :sm) (gpu/invoke-bound! sess :ra) (gpu/sync! sess)
+          (is (< (maxerr sm-ref (gpu/download sess :smo)) 1e-4) "silu-mul")
+          (is (< (maxerr ra-ref (gpu/download sess :rao)) 1e-5) "residual-add")
+          (finally (gpu/close-session! sess)))))))
+
 (deftest dp4a-jvm-reference
   (testing "par/dp4a matches scalar 4-lane signed int8 dot (little-endian lanes)"
     ;; bytes (4,3,2,1)·(1,1,1,1) = 10
