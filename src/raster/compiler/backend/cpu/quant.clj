@@ -151,6 +151,55 @@
                 (aset out (+ base k half) (float (+ (* a' (bit-shift-right bv 4)) b')))))))))
     out))
 
+(defn quantize-act-q8k
+  "f32 activation [in] (in % super-block = 0) → q8_K for the K-quant dot: per super-block
+  int8 quants + scale d=max/127, plus bsums[nsub] = per-sub-block int sum of the quants
+  (the K min-term needs Σ activation per sub-block, precomputed)."
+  [^floats x in {:keys [super-block subblock]}]
+  (let [sbk (long super-block) sub (long subblock)
+        nsb (quot (long in) sbk) nsub (quot (long in) sub) subs-per (quot sbk sub)
+        xq (byte-array in) xs (float-array nsb) bsums (int-array nsub)]
+    (dotimes [sb nsb]
+      (let [sbase (* sb sbk)
+            mx (loop [i 0 m 0.0] (if (< i sbk) (recur (inc i) (max m (Math/abs (aget x (+ sbase i))))) m))
+            d (/ mx 127.0) id (if (zero? d) 0.0 (/ 1.0 d))]
+        (aset xs sb (float d))
+        (dotimes [j subs-per]
+          (let [base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)]
+            (aset bsums sidx (int (loop [k 0 s 0]
+                                    (if (< k sub)
+                                      (let [qv (max -127 (min 127 (Math/round (* (aget x (+ base k)) id))))]
+                                        (aset xq (+ base k) (unchecked-byte qv)) (recur (inc k) (+ s (int qv))))
+                                      s))))))))
+    {:xq xq :xs xs :bsums bsums}))
+
+(defn q4k-q8k-dot
+  "Reference dot of ONE Q4_K weight row · a q8_K activation — the K-quant compute the
+  fused kernel will SIMD-ize. Per super-block: d_act·[Σ_sub (d·aq)·dpbusd + (dmin·bq)·bsum],
+  where dpbusd = Σ_i q_w·q_act (the int8-MAC, dpbusd-able) and bsum is the precomputed
+  per-sub-block activation sum. Equals dot(dequant weight, dequant act) exactly."
+  [{:keys [wq da db aq bq]} {:keys [xq xs bsums]} in {:keys [super-block subblock]}]
+  (let [sbk (long super-block) sub (long subblock) half (quot sub 2)
+        nsb (quot (long in) sbk) subs-per (quot sbk sub)]
+    (loop [sb 0 acc 0.0]
+      (if (< sb nsb)
+        (let [sbase (* sb sbk) dav (aget da sb) dbv (aget db sb) dact (double (aget xs sb))
+              sbsum (loop [j 0 s 0.0]
+                      (if (< j subs-per)
+                        (let [base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)
+                              a' (* dav (aget aq sidx)) b' (* dbv (aget bq sidx))
+                              dp (loop [k 0 d 0]
+                                   (if (< k half)
+                                     (let [bv (bit-and (long (aget wq (+ (quot base 2) k))) 0xFF)]
+                                       (recur (inc k)
+                                              (+ d (* (bit-and bv 0xF) (long (aget xq (+ base k))))
+                                                 (* (bit-shift-right bv 4) (long (aget xq (+ base k half)))))))
+                                     d))]
+                          (recur (inc j) (+ s (* a' (double dp)) (* b' (double (aget bsums sidx))))))
+                        s))]
+          (recur (inc sb) (+ acc (* dact sbsum))))
+        acc))))
+
 (defn- quantize-act-blocks!
   "Quantize the 32-element blocks [r0, r0+cnt) of activation x into xq/xs/xsum
   (per-block symmetric int8, d=max/127, with the per-block sum for the -8 fold).
