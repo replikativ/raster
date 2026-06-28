@@ -455,11 +455,30 @@
                (util/free-syms (:bound node))
                (if (:init node) (util/free-syms (:init node)) #{}))))
 
+(defn- expr-written-arrays
+  "Arrays written via aset (bare or devirtualized) anywhere in `expr`. Used so a
+   ScalarBinding wrapping a side-effecting void form (a multi-aset par/map-void!
+   like rms-norm/attention/quant-act that doesn't reduce to a single-aset SoacMap)
+   still declares the buffers it produces — otherwise consumers of those buffers
+   get no dependency edge and the scheduler / horizontal-fuser can incorrectly
+   reorder or parallelize across the write (silent miscompile in composed layers)."
+  [expr]
+  (let [w (volatile! #{})]
+    (walk/postwalk
+     (fn [f]
+       (when (descriptor/aset-call? f)
+         (when-let [a (descriptor/aset-array-sym f)] (vswap! w conj a)))
+       f)
+     expr)
+    @w))
+
 (defn node-produced-syms
-  "Get the set of symbols produced (defined) by a node."
+  "Get the set of symbols produced (defined) by a node. For a ScalarBinding this
+   is its binding sym PLUS any arrays its expression writes in place (so in-place
+   void writes participate in dependency analysis)."
   [node]
   (if (instance? ScalarBinding node)
-    #{(:sym node)}
+    (conj (expr-written-arrays (:expr node)) (:sym node))
     (set/union #{(:sym node)} (or (soac-outputs node) #{}))))
 
 ;; ================================================================
