@@ -98,6 +98,11 @@
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
   (let [top-scalar-types (or (:scalar-types (meta form)) {})
+        ;; Capture declared array element types from the TOP form (like scalar-types). The passes
+        ;; wrap the par form in a let*, so the INNER par form the generators see has lost this
+        ;; meta — reading it there (the old code) yielded {} and mis-typed e.g. byte quant weights
+        ;; as float. Thread the top-level map to every generator instead.
+        top-array-types (or (:array-types (meta form)) {})
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :fallback 0})
         kernels (atom [])
 
@@ -196,7 +201,7 @@
                     (par/expand-par-map-void! form))
                 (let [kernel (legacy/generate-par-map-void-kernel form
                                                                   :dtype dtype :device-id device-id
-                                                                  :array-types (or (:array-types (meta form)) {})
+                                                                  :array-types (merge top-array-types (:array-types (meta form)))
                                                                   :scalar-types top-scalar-types)
                       k (register-kernel! kernel :ze-maps)
                       soa-exp (or (:soa-expansions k) {})

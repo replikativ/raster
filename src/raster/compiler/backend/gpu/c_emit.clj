@@ -1374,6 +1374,26 @@
 ;; Body analysis utilities
 ;; ================================================================
 
+(defn normalize-array-prims
+  "Rewrite DEVIRTUALIZED array-primitive .invk forms back to their canonical aget/aset/alength
+   head, using the walker's :raster.op/original metadata (the semantic identity it stamps —
+   CLAUDE.md: 'no pass recovers meaning from mangled names'). A forward-pass devirtualizes the
+   polymorphic raster.arrays/aget into `(.invk aget_m_T-impl arr idx)`; the GPU emitter's
+   aget-op?/aset-op? matchers (array detection, element typing, emit) key on the HEAD, so without
+   this the array args are missed (classified scalar) and aget is mis-emitted as a C helper call
+   subscripting a scalar. One normalization here makes every downstream c_emit site recognize
+   them — preserves the form's metadata so :raster.type/tag survives for element typing."
+  [body]
+  (walk/postwalk
+   (fn [form]
+     (if (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
+       (let [op (:raster.op/original (meta form))]
+         (if (or (descriptor/aget-op? op) (descriptor/aset-op? op) (descriptor/alength-op? op))
+           (with-meta (list* op (nnext form)) (meta form))
+           form))
+       form))
+   body))
+
 (defn collect-arrays-in-body
   "Collect symbols used as arrays in a par body expression."
   [body]

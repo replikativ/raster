@@ -134,7 +134,11 @@
            :or {dtype :float kernel-name-prefix "par_map_void"
                 array-types {} scalar-types {}}}]
   (let [info (par/extract-par-map-void-info form)
-        {:keys [idx body]} info
+        {:keys [idx]} info
+        ;; Normalize devirtualized array prims (.invk aget_m_T-impl …) back to aget/aset heads so
+        ;; array detection + element typing + emit recognize them (else arrays→scalar, aget→broken
+        ;; helper). The forward-pass devirtualizes raster.arrays/aget; Path A skips those passes.
+        body (ce/normalize-array-prims (:body info))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         default-ctype (get codegen/opencl-type-map dtype "float")
         use-fp64? (= dtype :double)
