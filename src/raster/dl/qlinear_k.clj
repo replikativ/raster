@@ -8,7 +8,8 @@
   Weight matrix [out×in] is quantized per-row (each row independent); for in a multiple of
   256 each row spans whole super-blocks, so the flat per-row arrays index as (row, block)."
   (:require [raster.core :refer [deftm]]
-            [raster.arrays :as ra]))
+            [raster.arrays :as ra]
+            [raster.par :as par]))
 
 (deftm qmatmul-q4k-composable!
   "Q4_K GEMV into y[o] for o in [o-start, o-start+o-count): per super-block
@@ -81,3 +82,69 @@
                     a))]
         (ra/aset y o (float acc))))
     y))
+
+;; ---- GPU shape: par/map-void! over output rows (one work-item per row) ----
+;; The GPU form the opencl-pass turns into a kernel (work-item o computes y[o]). Same K
+;; dot as the composable CPU deftm; the GPU int8 path needs byte buffers / int32-packing
+;; (dp4a) — see #26. This is the work-item-mapped twin of qmatmul-q4k-composable!.
+(deftm qmatmul-q4k-gpu!
+  [xq :- (Array byte), xs :- (Array float), bsums :- (Array int),
+   wq :- (Array byte), da :- (Array float), db :- (Array float),
+   aq :- (Array byte), bq :- (Array byte),
+   y :- (Array float), in :- Long, out :- Long] :- Void
+  (par/map-void! o out
+                 (let [nsb (quot (long in) 256) nsub (quot (long in) 32) wrow (quot (long in) 2)
+                       wb (* (long o) wrow) sbb (* (long o) nsb) subb (* (long o) nsub)
+                       acc (loop [sb 0 a 0.0]
+                             (if (< sb nsb)
+                               (let [sbase (* sb 256)
+                                     dav (double (ra/aget da (+ sbb sb)))
+                                     dbv (double (ra/aget db (+ sbb sb)))
+                                     dact (double (ra/aget xs sb))
+                                     ssum (loop [j 0 s 0.0]
+                                            (if (< j 8)
+                                              (let [base (+ sbase (* j 32)) sidx (+ (* sb 8) j)
+                                                    aj (* dav (long (ra/aget aq (+ subb sidx))))
+                                                    bj (* dbv (long (ra/aget bq (+ subb sidx))))
+                                                    dp (loop [k 0 d 0]
+                                                         (if (< k 16)
+                                                           (let [bv (bit-and (long (ra/aget wq (+ wb (quot base 2) k))) 0xFF)]
+                                                             (recur (inc k)
+                                                                    (+ d (* (bit-and bv 0xF) (long (ra/aget xq (+ base k))))
+                                                                       (* (bit-shift-right bv 4) (long (ra/aget xq (+ base k 16)))))))
+                                                           d))]
+                                                (recur (inc j) (+ s (* aj (double dp)) (* bj (double (ra/aget bsums sidx))))))
+                                              s))]
+                                 (recur (inc sb) (+ a (* dact ssum))))
+                               a))]
+                   (ra/aset y o (float acc)))))
+
+;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).
+(deftm qmatmul-q6k-gpu!
+  [xq :- (Array byte), xs :- (Array float), bsums :- (Array int),
+   wq :- (Array byte), sc :- (Array byte), ds :- (Array float),
+   y :- (Array float), in :- Long, out :- Long] :- Void
+  (par/map-void! o out
+                 (let [nsb (quot (long in) 256) nsub (quot (long in) 16)
+                       wb (* (long o) (long in)) sbb (* (long o) nsb) subb (* (long o) nsub)
+                       acc (loop [sb 0 a 0.0]
+                             (if (< sb nsb)
+                               (let [sbase (* sb 256)
+                                     dv (double (ra/aget ds (+ sbb sb)))
+                                     dact (double (ra/aget xs sb))
+                                     ssum (loop [j 0 s 0.0]
+                                            (if (< j 16)
+                                              (let [base (+ sbase (* j 16)) sidx (+ (* sb 16) j)
+                                                    scj (long (ra/aget sc (+ subb sidx)))
+                                                    dp (loop [k 0 d 0]
+                                                         (if (< k 16)
+                                                           (recur (inc k)
+                                                                  (+ d (* (bit-and (long (ra/aget wq (+ wb base k))) 0xFF)
+                                                                          (long (ra/aget xq (+ base k))))))
+                                                           d))
+                                                    folded (- dp (* 32 (long (ra/aget bsums sidx))))]
+                                                (recur (inc j) (+ s (* scj (double folded)))))
+                                              s))]
+                                 (recur (inc sb) (+ a (* dv dact ssum))))
+                               a))]
+                   (ra/aset y o (float acc)))))

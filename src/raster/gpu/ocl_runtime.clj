@@ -115,7 +115,7 @@
   (long (.get seg I32 0)))
 
 (def ^:private dtype-byte-sizes
-  {:float 4, :double 8, :int 4, :long 8, :float16 2, :half 2})
+  {:float 4, :double 8, :int 4, :long 8, :float16 2, :half 2, :byte 1, :int8 1})
 
 ;; ================================================================
 ;; Method handles (lazy, created on first use)
@@ -479,7 +479,11 @@
       :double (let [arr (double-array n)]
                 (MemorySegment/copy (:segment buf) ValueLayout/JAVA_DOUBLE 0
                                     arr 0 (int n))
-                arr))))
+                arr)
+      (:byte :int8) (let [arr (byte-array n)]
+                      (MemorySegment/copy (:segment buf) ValueLayout/JAVA_BYTE 0
+                                          arr 0 (int n))
+                      arr))))
 
 (defn buffer-of-array
   "Create a new OclBuffer from a JVM array (allocates + copies)."

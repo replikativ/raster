@@ -111,12 +111,21 @@
                                        (int ints)   [p :int]
                                        nil))
                                    (map vector params tags))))
+        ;; Per-array element dtype from the deftm tags (bytes/floats/ints/…), so a
+        ;; mixed kernel (int8 weights + float scales + int bsums) types each pointer
+        ;; correctly instead of collapsing to the single kernel-wide default dtype.
+        array-types (when (and params tags)
+                      (into {}
+                            (keep (fn [[p t]]
+                                    (when-let [dt (array-tag->dtype t)]
+                                      [p dt]))
+                                  (map vector params tags))))
         form (let [f (if (= 1 (count walked-body))
                        (first walked-body)
-                       (cons 'do walked-body))]
-               (if (seq scalar-types)
-                 (vary-meta f assoc :scalar-types scalar-types)
-                 f))
+                       (cons 'do walked-body))
+                   f (if (seq scalar-types) (vary-meta f assoc :scalar-types scalar-types) f)
+                   f (if (seq array-types)  (vary-meta f assoc :array-types array-types) f)]
+               f)
         par-opencl opencl-pass/opencl-pass
         register!  (rt-resolve device-id "register-kernel!")
         result (par-opencl form
@@ -172,7 +181,8 @@
   {'doubles :double
    'floats  :float
    'longs   :long
-   'ints    :int})
+   'ints    :int
+   'bytes   :byte})
 
 (defn- object-field
   [obj field-name]

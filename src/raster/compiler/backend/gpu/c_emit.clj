@@ -1355,7 +1355,7 @@
     (walk/postwalk
      (fn [form]
        (when (and (seq? form)
-                  (contains? #{'let 'let* 'loop} (first form))
+                  (contains? #{'let 'let* 'loop 'loop*} (first form))
                   (>= (count form) 3))
          (let [bindings (second form)]
            (doseq [i (range 0 (count bindings) 2)]

@@ -32,7 +32,9 @@
   {:double "double"
    :float  "float"
    :int    "int"
-   :long   "long"})  ;; OpenCL 'long' is 64-bit (unlike CUDA's 'long long')
+   :long   "long"   ;; OpenCL 'long' is 64-bit (unlike CUDA's 'long long')
+   :byte   "char"   ;; int8 weights/activations travel in char buffers
+   :int8   "char"})
 
 ;; ================================================================
 ;; Expression emission (delegates to shared)

@@ -635,7 +635,7 @@
   (instance? DeviceBuffer x))
 
 (def ^:private dtype-byte-sizes
-  {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2})
+  {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
 
 (defn make-buffer
   "Allocate a persistent shared-memory GPU buffer.
@@ -718,6 +718,11 @@
                     dst (MemorySegment/ofArray out)]
                 (MemorySegment/copy seg 0 dst 0 (:byte-size buf))
                 out)
+      (:byte :int8)
+      (let [out (byte-array n)
+            dst (MemorySegment/ofArray out)]
+        (MemorySegment/copy seg 0 dst 0 (:byte-size buf))
+        out)
       (:float16 :half)
       (let [out (short-array n)
             dst (MemorySegment/ofArray out)]
@@ -955,7 +960,7 @@
     (.get field soa-obj)))
 
 (defn- dtype->elem-bytes ^long [dtype]
-  (case dtype :double 8 :float 4 :long 8 :int 4))
+  (case dtype :double 8 :float 4 :long 8 :int 4 (:byte :int8) 1))
 
 (defn copy-to-gpu!
   "Copy a JVM SoA object (defvalue SoA type) into the GpuSoA's field segments.
