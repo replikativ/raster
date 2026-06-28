@@ -911,6 +911,141 @@
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))
 
+;; ================================================================
+;; Resident GPU program extraction (Option A: bound-dispatch path)
+;;
+;; make-gpu-fn returns a per-call STAGING fn (copy JVM arrays in, launch, copy out — every
+;; call). For a straight-line fused sequence (a decoder layer: norm→quant→matmul→…) the kernel
+;; order + buffer dataflow is fixed, so it can instead be bound ONCE to a session (resident
+;; buffers, prepare! each kernel, record-graph! the sequence) and replayed. extract-gpu-program
+;; turns the fused IR into the flat descriptor the session bound path consumes; the bound
+;; machinery (bind-kernel!/launch-bound!/record-graph!) is already convention-agnostic, so map!
+;; and map-void! kernels bind identically — the output is just another resident buffer.
+;; ================================================================
+
+(def ^:private gpu-invoke-heads
+  '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+     raster.gpu.ze-runtime/invoke-registered-kernel
+     raster.gpu.ze-runtime/invoke-reduction-kernel})
+
+(def ^:private gpu-array-alloc-heads
+  '#{double-array float-array int-array long-array byte-array
+     clojure.core/double-array clojure.core/float-array
+     clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
+
+(defn- parse-gpu-step
+  "One invoke-registered-* binding → a step record. :arrays is the full resident-buffer arg
+   list in the kernel's signature order (for map! the separate output is appended, so on the
+   resident path it is just another buffer). nil for an unrecognized head."
+  [sym expr]
+  (let [head (first expr)]
+    (cond
+      (= head 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
+      (let [[_ kname arrays scalars n] expr]
+        {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
+         :convention :map-void :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
+      (let [[_ kname inputs out scalars n] expr]
+        {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
+         :convention :map :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
+      (let [[_ kname inputs n] expr]
+        {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
+         :convention :reduce :returns sym})
+      :else nil)))
+
+(defn extract-gpu-program
+  "Walk a straight-line fused GPU IR (a let* of buffer allocs + invoke-registered-* calls) into
+   a flat program: ordered kernel steps + intermediate buffer allocs + result sym. Returns nil
+   when the form has control flow (loops/branches) or non-trivial scalar bindings the
+   straight-line binder can't yet handle — the caller then falls back to the staging fn."
+  [form]
+  (when (and (seq? form) (#{'let* 'let} (first form)))
+    (let [bindings (partition 2 (second form))
+          body (last form)
+          allocs (volatile! [])
+          steps (volatile! [])
+          ok (volatile! true)]
+      (doseq [[sym expr] bindings]
+        (cond
+          (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+          (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+          (if-let [s (parse-gpu-step sym expr)]
+            (vswap! steps conj s)
+            (vreset! ok false))
+          ;; Any other binding (scalar compute, control flow, host loop) → not straight-line.
+          :else (vreset! ok false)))
+      (when (and @ok (seq @steps))
+        {:allocs @allocs :steps @steps :result body}))))
+
+(defn- expr->arg-fn
+  "Compile a size/count/scalar expr (over the deftm params) into (fn [arg-vector] value).
+   Built once at compile time; called per bind with the runtime arg values."
+  [param-syms expr]
+  (eval (list 'fn [(vec param-syms)] expr)))
+
+(defn compile-gpu-program
+  "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
+   RESIDENT program descriptor for the session bound-dispatch path instead of make-gpu-fn's
+   per-call staging fn. Kernels are registered (globally) as a side effect of the backend pass.
+   Returns nil when the fused IR is not straight-line (caller uses compile-aot staging fn).
+
+   Descriptor:
+     {:dtype :float
+      :all-params  [a out n]        ; deftm param order (the resident fn's arg order)
+      :array-params [a out]         ; array params (resident buffers, up/downloaded)
+      :scalar-params [n]
+      :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
+      :steps  [{:kernel-name str :arrays [syms] :n-fn (fn [args] int)
+                :scalar-fns [(fn [args] v) ...] :convention :map-void|:map :phase kw}]
+      :result-sym sym}"
+  [f-var device-id & {:keys [dtype]}]
+  (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
+        params       (get-params f-var dtype)
+        all-params   (mapv #(if (symbol? %) % (symbol (name %))) params)
+        walked-body  (get-walked-body f-var dtype)
+        active-params (clean-params params)
+        param-env    (build-param-env f-var dtype)
+        effective-dtype (or dtype (infer-dtype resolved-var) :double)
+        source-ns    (let [m (meta resolved-var)]
+                       (or (when-let [s (:raster.core/deftm-source-ns m)]
+                             (try (the-ns s) (catch Exception _ nil)))
+                           (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+        gpu-param-types (opencl-pass/derive-param-types
+                         (:raster.core/deftm-params (meta resolved-var))
+                         (:raster.core/deftm-tags (meta resolved-var))
+                         effective-dtype)
+        array-param-set (set (keys (:array-types gpu-param-types)))
+        array-params (filterv #(contains? array-param-set %) all-params)
+        scalar-params (filterv #(not (contains? array-param-set %)) all-params)
+        opts (cond-> {:inline? true :simd? false :target-device device-id
+                      :active-params active-params :dtype effective-dtype}
+               param-env (assoc :param-env param-env)
+               source-ns (assoc :source-ns source-ns)
+               gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                      :array-types (:array-types gpu-param-types)))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
+        form (run-passes raw-form forward-passes opts)
+        prog (extract-gpu-program form)]
+    (when prog
+      {:dtype effective-dtype
+       :all-params all-params
+       :array-params array-params
+       :scalar-params scalar-params
+       :allocs (mapv (fn [{:keys [sym size-expr]}]
+                       {:sym sym :size-fn (expr->arg-fn all-params size-expr)})
+                     (:allocs prog))
+       :steps (mapv (fn [i {:keys [kernel-name arrays scalars n-expr convention]}]
+                      {:kernel-name kernel-name
+                       :arrays arrays
+                       :n-fn (expr->arg-fn all-params n-expr)
+                       :scalar-fns (mapv #(expr->arg-fn all-params %) scalars)
+                       :convention convention
+                       :phase (keyword (str "gpu-step-" i))})
+                    (range) (:steps prog))
+       :result-sym (:result prog)})))
+
 (defn- wasm-kernel-spec
   "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm
    emitter: walker → forward-passes → soa-lower (value-type SoA → per-field arrays)."

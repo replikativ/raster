@@ -1487,6 +1487,12 @@
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))
 
+(defn kernel-registry-entry
+  "Public read of a registered kernel's info map (source, :array-params, :scalar-params, dtype,
+   …). Used by the resident GPU-program binder to map kernel params → resident buffers."
+  [kernel-name]
+  (get @kernel-registry kernel-name))
+
 (defn- ensure-kernel-loaded!
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."

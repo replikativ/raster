@@ -578,6 +578,65 @@
   [sess key]
   (get-in @sess [:buffers key]))
 
+;; ================================================================
+;; Resident GPU programs (Option A: pipeline → bound-dispatch path)
+;; ================================================================
+
+(defn bind-program!
+  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
+   ONCE: allocate resident buffers for the array params + intermediate scratch, install +
+   prepare! each kernel step against them, and record the kernel sequence as a command graph.
+   After binding, run-program! replays the whole sequence with NO re-binding — the resident
+   bound-dispatch path, vs make-gpu-fn's per-call JVM-array staging. The bound machinery is
+   convention-agnostic, so map! and map-void! kernels bind identically (a map! kernel's output
+   is just another resident buffer in its :array-params).
+
+   args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
+   scalars). Buffer keys are the param/intermediate sym names as keywords."
+  [sess descriptor args]
+  (let [device-id (:device-id @sess)
+        {:keys [dtype all-params array-params allocs steps]} descriptor
+        argmap (zipmap all-params args)
+        dt (if (= dtype :double) :double :float)
+        nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+        param-specs (into {} (map (fn [p]
+                                    (let [arr (get argmap p)]
+                                      [(keyword (name p)) [dt (nel arr) arr]]))
+                                  array-params))
+        alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
+                                    [(keyword (name sym)) [dt (long (size-fn args)) nil]])
+                                  allocs))
+        info-fn (rt-resolve device-id "kernel-registry-entry")]
+    (alloc! sess (merge param-specs alloc-specs))
+    (doseq [{:keys [kernel-name n-fn scalar-fns phase]} steps]
+      (let [ki (or (info-fn kernel-name)
+                   (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                   {:kernel kernel-name})))
+            ;; kernel array-param NAME → resident buffer key. For map-void the invoke arrays ARE
+            ;; the kernel's own param syms, and intermediates/params are keyed by the same names,
+            ;; so name→same-name-keyword is exact (and SoA-order-robust: prepare! orders by
+            ;; :array-params itself via resolve-kernel-bufs).
+            sym->buf (into {} (map (fn [p] [(name p) (keyword (name p))]) (:array-params ki)))
+            scalars (mapv (fn [f] (f args)) scalar-fns)]
+        (swap! sess assoc-in [:kernels phase] [ki])
+        (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase})))
+    (record-graph! sess (mapv :phase steps) :program)
+    (swap! sess assoc :program-descriptor descriptor)
+    sess))
+
+(defn run-program!
+  "Replay a bound resident GPU program: refresh the resident array-param inputs (buffer POINTERS
+   are stable — only CONTENTS change), replay the recorded command graph, and download the array
+   params. args = values in :all-params order (same as bind-program!). Returns
+   {array-param-sym → downloaded JVM array}."
+  [sess descriptor args]
+  (let [{:keys [all-params array-params]} descriptor
+        argmap (zipmap all-params args)]
+    (doseq [p array-params]
+      (upload! sess (keyword (name p)) (get argmap p)))
+    (replay! sess :program)
+    (into {} (map (fn [p] [p (download sess (keyword (name p)))]) array-params))))
+
 (defn kernel
   "Get kernel info vector from the session by phase key."
   [sess phase-key]
