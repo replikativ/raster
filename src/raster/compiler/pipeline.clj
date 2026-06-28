@@ -714,21 +714,27 @@
   "Reduce a form through a sequence of passes, validating arrow types.
   Passes with :from :* accept any input dialect (flexible).
   Validates output against target dialect when *validate-dialects?* is true.
-  Returns the final transformed form."
-  [form passes opts]
-  (first
-   (reduce (fn [[f dialect] pass-key]
-             (let [{:keys [from to]} (get pass-specs pass-key)
-                   pass-fn (:fn (get pass-specs pass-key))
-                   _ (assert (or (= :* from) (= dialect from))
-                             (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
-                                  ". Check pass ordering."))
-                   result (pass-fn f opts)
-                   f' (pass-result-form result)]
+  Returns the final transformed form.
+
+  `start-dialect` (default :walked) lets a caller resume a split pipeline — e.g.
+  the resident GPU path runs the front half to :materialized, applies soa-lower
+  (which is not a registered pass because it also rewrites the param signature),
+  then resumes the back half from :materialized."
+  ([form passes opts] (run-passes form passes opts :walked))
+  ([form passes opts start-dialect]
+   (first
+    (reduce (fn [[f dialect] pass-key]
+              (let [{:keys [from to]} (get pass-specs pass-key)
+                    pass-fn (:fn (get pass-specs pass-key))
+                    _ (assert (or (= :* from) (= dialect from))
+                              (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
+                                   ". Check pass ordering."))
+                    result (pass-fn f opts)
+                    f' (pass-result-form result)]
                 ;; Validate output against target dialect (fails hard)
-               (validate-dialect! to f' pass-key opts)
-               [f' to]))
-           [form :walked] passes)))
+                (validate-dialect! to f' pass-key opts)
+                [f' to]))
+            [form start-dialect] passes))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)
@@ -741,6 +747,17 @@
    write-read-fuse eliminates intermediate buffers by fusing 2D producers into 1D consumers (dW+SGD).
    segop-lower converts par forms to SegOp IR for unified backend consumption."
   [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :segop-lower :compound-detect :backend :resolve-alength :mem-merge])
+
+(def gpu-resident-pre-soa-passes
+  "forward-passes up to (and including) :materialize. The resident GPU path splits here so
+   soa-lower can explode value-type (Params container) params into per-field arrays at the
+   :materialized boundary — BEFORE the :backend pass emits kernels (the JVM bytecode backend
+   keeps Valhalla value-classes native, so soa-lower is per-backend, not a shared pass)."
+  [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
+
+(def gpu-resident-post-soa-passes
+  "forward-passes from :segop-lower onward — resumed (from :materialized) after soa-lower."
+  [:segop-lower :compound-detect :backend :resolve-alength :mem-merge])
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline
@@ -1032,7 +1049,6 @@
   [f-var device-id & {:keys [dtype]}]
   (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
-        all-params   (mapv #(if (symbol? %) % (symbol (name %))) params)
         walked-body  (get-walked-body f-var dtype)
         active-params (clean-params params)
         param-env    (build-param-env f-var dtype)
@@ -1041,21 +1057,41 @@
                        (or (when-let [s (:raster.core/deftm-source-ns m)]
                              (try (the-ns s) (catch Exception _ nil)))
                            (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+        ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
+        ;; Run the front half to :materialized, explode any Params-container / value-type param
+        ;; into per-field array params, then resume to the backend. Gated on a value-type param
+        ;; so flat-param deftms are untouched (their eff-param-specs == param-specs). The
+        ;; descriptor's params + the backend's array types are derived from the EXPLODED leaves.
+        d-params*   (:raster.core/deftm-params (meta resolved-var))
+        d-tags*     (:raster.core/deftm-tags (meta resolved-var))
+        param-specs (mapv (fn [p t] {:sym (if (symbol? p) (with-meta p nil) (symbol (name p)))
+                                     :tag (when t (symbol t))})
+                          d-params* d-tags*)
+        value-reg   @types/soa-registry
+        value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
+        pre-opts (cond-> {:inline? true :simd? false :target-device device-id
+                          :active-params active-params :dtype effective-dtype}
+                   param-env (assoc :param-env param-env)
+                   source-ns (assoc :source-ns source-ns))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
+        form-mat (run-passes raw-form gpu-resident-pre-soa-passes pre-opts)
+        {form-soa :body eff-param-specs :params}
+        (if value-fn?
+          (soa-lower/soa-lower form-mat param-specs)
+          {:body form-mat :params param-specs})
+        all-params (mapv :sym eff-param-specs)
         gpu-param-types (opencl-pass/derive-param-types
-                         (:raster.core/deftm-params (meta resolved-var))
-                         (:raster.core/deftm-tags (meta resolved-var))
-                         effective-dtype)
+                         (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype)
         array-param-set (set (keys (:array-types gpu-param-types)))
         array-params (filterv #(contains? array-param-set %) all-params)
         scalar-params (filterv #(not (contains? array-param-set %)) all-params)
-        opts (cond-> {:inline? true :simd? false :target-device device-id
-                      :active-params active-params :dtype effective-dtype}
-               param-env (assoc :param-env param-env)
-               source-ns (assoc :source-ns source-ns)
-               gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
-                                      :array-types (:array-types gpu-param-types)))
-        raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
-        form (run-passes raw-form forward-passes opts)
+        post-opts (cond-> {:inline? true :simd? false :target-device device-id
+                           :active-params active-params :dtype effective-dtype}
+                    param-env (assoc :param-env param-env)
+                    source-ns (assoc :source-ns source-ns)
+                    gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                           :array-types (:array-types gpu-param-types)))
+        form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
         prog (extract-gpu-program form)
         scalar-lets (:scalar-lets prog)
         ;; Default buffer roles for the residency layer: an array param WRITTEN by any kernel
