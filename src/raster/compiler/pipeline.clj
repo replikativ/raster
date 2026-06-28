@@ -954,17 +954,33 @@
          :convention :reduce :returns sym})
       :else nil)))
 
+(defn- contains-gpu-invoke?
+  "Deep check: does form contain a gpu-invoke head anywhere? (A scalar binding whose value is
+   itself computed from a kernel result is NOT a straight-line scalar let.)"
+  [form]
+  (let [found (volatile! false)]
+    (clojure.walk/postwalk
+     (fn [x] (when (and (seq? x) (symbol? (first x)) (contains? gpu-invoke-heads (first x)))
+               (vreset! found true)) x)
+     form)
+    @found))
+
 (defn extract-gpu-program
-  "Walk a straight-line fused GPU IR (a let* of buffer allocs + invoke-registered-* calls) into
-   a flat program: ordered kernel steps + intermediate buffer allocs + result sym. Returns nil
-   when the form has control flow (loops/branches) or non-trivial scalar bindings the
-   straight-line binder can't yet handle — the caller then falls back to the staging fn."
+  "Walk a straight-line fused GPU IR into a flat program: ordered kernel steps, intermediate
+   buffer allocs, and the pure scalar-let bindings that feed their sizes/counts (e.g.
+   `n (* rows feat)`). Returns nil when a binding has control flow or a kernel result feeding
+   scalar compute — the caller then falls back to the staging fn.
+
+   :scalar-lets is the ordered [sym expr ...] of pure scalar bindings; size/count/scalar exprs
+   are evaluated in an env that binds the deftm params AND these lets (so an intermediate sized
+   `(* rows feat)` resolves)."
   [form]
   (when (and (seq? form) (#{'let* 'let} (first form)))
     (let [bindings (partition 2 (second form))
           body (last form)
           allocs (volatile! [])
           steps (volatile! [])
+          scalar-lets (volatile! [])
           ok (volatile! true)]
       (doseq [[sym expr] bindings]
         (cond
@@ -974,16 +990,29 @@
           (if-let [s (parse-gpu-step sym expr)]
             (vswap! steps conj s)
             (vreset! ok false))
-          ;; Any other binding (scalar compute, control flow, host loop) → not straight-line.
+          ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
+          (not (contains-gpu-invoke? expr))
+          (vswap! scalar-lets into [sym expr])
+          ;; control flow / kernel-result-into-scalar → not straight-line.
           :else (vreset! ok false)))
       (when (and @ok (seq @steps))
-        {:allocs @allocs :steps @steps :result body}))))
+        {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+
+(defn- strip-meta
+  "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
+   carry a type hint (`Can't type hint a local with a primitive initializer`), which the eval'd
+   arg-fn would otherwise hit on e.g. `^long n (* (long rows) (long feat))`."
+  [x]
+  (if (symbol? x) (with-meta x nil) x))
 
 (defn- expr->arg-fn
-  "Compile a size/count/scalar expr (over the deftm params) into (fn [arg-vector] value).
+  "Compile a size/count/scalar expr into (fn [arg-vector] value), evaluating it in an env that
+   binds the deftm params AND the program's pure scalar-lets (so `(* rows feat)` resolves).
    Built once at compile time; called per bind with the runtime arg values."
-  [param-syms expr]
-  (eval (list 'fn [(vec param-syms)] expr)))
+  [param-syms scalar-lets expr]
+  (let [clean-params (mapv strip-meta param-syms)
+        clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
+    (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr])))))
 
 (defn compile-gpu-program
   "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
@@ -1027,19 +1056,20 @@
                                       :array-types (:array-types gpu-param-types)))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
         form (run-passes raw-form forward-passes opts)
-        prog (extract-gpu-program form)]
+        prog (extract-gpu-program form)
+        scalar-lets (:scalar-lets prog)]
     (when prog
       {:dtype effective-dtype
        :all-params all-params
        :array-params array-params
        :scalar-params scalar-params
        :allocs (mapv (fn [{:keys [sym size-expr]}]
-                       {:sym sym :size-fn (expr->arg-fn all-params size-expr)})
+                       {:sym sym :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
                      (:allocs prog))
        :steps (mapv (fn [i {:keys [kernel-name arrays scalars n-expr convention]}]
                       {:kernel-name kernel-name
                        :arrays arrays
-                       :n-fn (expr->arg-fn all-params n-expr)
+                       :n-fn (expr->arg-fn all-params scalar-lets n-expr)
                        ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
                        ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
                        ;; `features`) is bound as :int, not mis-typed float (→ launch error).
@@ -1047,7 +1077,7 @@
                                              {:type (or (and (symbol? s)
                                                              (get (:scalar-types gpu-param-types) s))
                                                         (if (= effective-dtype :double) :double :float))
-                                              :value-fn (expr->arg-fn all-params s)})
+                                              :value-fn (expr->arg-fn all-params scalar-lets s)})
                                            scalars)
                        :convention convention
                        :phase (keyword (str "gpu-step-" i))})
