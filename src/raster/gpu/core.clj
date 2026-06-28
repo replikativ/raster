@@ -313,7 +313,18 @@
   ([sess phase-key v] (compile! sess phase-key v {}))
   ([sess phase-key v opts]
    (let [device-id (:device-id @sess)
-         kernels (compile-deftm-internal! v device-id opts)]
+         ;; Dedup generation by (op, dtype): compile-deftm-internal! emits a gensym-named kernel
+         ;; each call, so without this N phases of the SAME deftm produce N distinct kernel SOURCES
+         ;; → N SPIR-V compiles (ocloc) at first prepare!, even though the bodies are identical.
+         ;; Caching the generated kernel-vec per (op, dtype) makes those phases SHARE one kernel
+         ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
+         ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
+         ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
+         cache-key [v (get opts :dtype :float)]
+         kernels (or (get-in @sess [:kernel-cache cache-key])
+                     (let [ks (compile-deftm-internal! v device-id opts)]
+                       (swap! sess assoc-in [:kernel-cache cache-key] ks)
+                       ks))]
      (swap! sess assoc-in [:kernels phase-key] kernels)
      kernels)))
 
@@ -738,6 +749,42 @@
     (doseq [[k arr] inputs] (upload! sess k arr))
     (replay! sess :chain)
     (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)]))))
+
+(defn bind-chain!
+  "Allocate the resident buffers + compile each op of a multi-step chain ONCE. Buffers
+   (:constant weights, :state KV cache sized to MAX positions, :scratch) persist across
+   run-chain-ctx! calls. Steps + roles are stored on the session. This is the decode-loop split of
+   chain-program!: bind once, then run-chain-ctx! per token re-prepares only the position-dependent
+   steps while weights + KV stay resident on-device."
+  ([sess buffers steps] (bind-chain! sess buffers steps :float))
+  ([sess buffers steps dtype]
+   (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
+         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+     (alloc! sess specs)
+     (doseq [{:keys [op phase]} steps] (compile! sess phase op))
+     (swap! sess assoc :chain-steps steps :chain-roles roles :chain-dtype dtype)
+     sess)))
+
+(defn run-chain-ctx!
+  "Run a bound chain (bind-chain!) for one token: resolve each step's position-dependent scalars
+   and work-item count via ctx (a scalar value or :n that is a KEYWORD is looked up in ctx — e.g.
+   `\"pos-offset\" :pos` or `:n :nq` → (get ctx …)), prepare each step, record the graph, refresh
+   the given :input buffers, replay, and download the :output buffers. Re-callable per token with a
+   new ctx; the resident weights + KV (:state, written in place by kv-append) persist. The KV cache
+   + attention scratch are sized to MAX positions at bind; cache-len/pos vary per token as scalars."
+  ([sess ctx inputs] (run-chain-ctx! sess ctx inputs (:chain-dtype @sess)))
+  ([sess ctx inputs dtype]
+   (let [steps (:chain-steps @sess) roles (:chain-roles @sess)
+         resolve* (fn [v] (if (keyword? v) (get ctx v) v))]
+     (doseq [{:keys [op phase bind scalars n]} steps]
+       (let [ki (first (get-in @sess [:kernels phase]))
+             rscalars (into {} (map (fn [[k v]] [k (resolve* v)]) scalars))
+             tsc (typed-scalars-for op ki rscalars dtype)]
+         (prepare! sess phase bind tsc (long (resolve* n)) {:kernel-phase phase})))
+     (record-graph! sess (mapv :phase steps) :chain)
+     (doseq [[k arr] inputs] (upload! sess k arr))
+     (replay! sess :chain)
+     (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)])))))
 
 (defn kernel
   "Get kernel info vector from the session by phase key."
