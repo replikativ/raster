@@ -617,7 +617,16 @@
                                    allocs))
          info-fn (rt-resolve device-id "kernel-registry-entry")]
      (alloc! sess (merge param-specs alloc-specs))
-     (doseq [{:keys [kernel-name n-fn scalar-specs phase]} steps]
+     (doseq [{:keys [kernel-name n-fn scalar-specs phase convention]} steps]
+       ;; Only the map conventions bind through bind-registered-map-void-kernel (output is just
+       ;; another resident buffer). :reduce has a different launch/partial-sum shape and would
+       ;; SILENTLY mis-bind here — reject it loudly rather than miscompile. (Decode needs no
+       ;; reduce STEP: reductions live inside map-void kernels. Add a reduce bind path when one
+       ;; appears.)
+       (when-not (#{:map-void :map} convention)
+         (throw (ex-info (str "bind-program! cannot bind a " convention " step (" kernel-name
+                              ") — only :map-void / :map are supported on the resident path")
+                         {:convention convention :kernel kernel-name})))
        (let [ki (or (info-fn kernel-name)
                     (throw (ex-info (str "Program kernel not registered: " kernel-name)
                                     {:kernel kernel-name})))
