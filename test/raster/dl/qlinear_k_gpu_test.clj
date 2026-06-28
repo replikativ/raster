@@ -6,6 +6,7 @@
    mixed-dtype kernel. Skipped when no GPU device is present."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.qlinear-k :as qk]
+            [raster.dl.nn :as nn]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.par :as par]
             [raster.gpu.core :as gpu]))
@@ -43,6 +44,27 @@
 
 (defn- maxerr [^floats a ^floats b]
   (reduce max 0.0 (map (fn [x y] (Math/abs (double (- x y)))) (seq a) (seq b))))
+
+(deftest rms-norm-gpu-lowers
+  (when (gpu-available?)
+    (testing "the existing typed library deftm rms-norm! lowers to a correct OpenCL kernel"
+      ;; Proves the GPU emitter reads the deftm's DECLARED types (Double eps/gain-offset stay
+      ;; float not int-by-name-regex; Long features types the index integer), types loop recur
+      ;; counters from var-types (int, not float), and enables fp64 when the body uses double.
+      ;; A real library op (par/map-void! over rows, reduce+map inside), not a hand-shaped kernel.
+      (let [rows 4 feat 256
+            x (gen (* rows feat) 7) w (gen feat 8)
+            ycpu (nn/rms-norm x w rows feat 1.0e-6 1.0)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :rn #'nn/rms-norm!)
+          (gpu/alloc! sess {:x [:float (alength x) x] :w [:float feat w] :out [:float (* rows feat) nil]})
+          (gpu/prepare! sess :rn {"x" :x "weight" :w "out" :out}
+                        [{:type :float :value 1.0e-6} {:type :int :value feat} {:type :float :value 1.0}]
+                        rows {:kernel-phase :rn})  ; scalars ordered by name: eps, features, gain-offset
+          (gpu/invoke-bound! sess :rn)
+          (is (< (maxerr ycpu (gpu/download sess :out)) 1e-3))
+          (finally (gpu/close-session! sess)))))))
 
 (deftest dp4a-jvm-reference
   (testing "par/dp4a matches scalar 4-lane signed int8 dot (little-endian lanes)"

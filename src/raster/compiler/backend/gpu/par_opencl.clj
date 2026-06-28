@@ -238,7 +238,13 @@
         ;; Collect GPU-inlinable deftm helper functions referenced in body
         gpu-helpers (ce/collect-gpu-fn-calls body)
         helper-sources (str/join "\n" (map (comp :source ce/generate-c-helper) gpu-helpers))
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        ;; Enable fp64 whenever double appears in the emitted kernel or its helpers — a float
+        ;; kernel can still carry double from (double ...) casts or raster.numeric helpers, and
+        ;; using double WITHOUT the extension is undefined (garbage) on the GPU.
+        needs-fp64? (or use-fp64?
+                        (str/includes? body-str "double")
+                        (str/includes? helper-sources "double"))
+        source (str (when needs-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)

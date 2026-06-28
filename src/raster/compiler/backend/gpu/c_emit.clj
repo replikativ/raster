@@ -611,7 +611,7 @@
                                      (when (contains? #{"int" "uint" "long"} typ) sym))
                                    (map vector var-names var-types)))
           loop-body (binding [*int-vars* (into *int-vars* int-loop-vars)]
-                      (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+                      (emit-loop-body body var-names var-types idx-sym array-syms opencl-idx))]
       (str "{ " decls " while (true) { " loop-body " } }"))
 
     ;; atomic-add! as statement
@@ -688,23 +688,28 @@
     :else form))
 
 (defn- emit-loop-body
-  "Emit the body of a loop as C while-body statements."
-  [body var-names idx-sym array-syms opencl-idx]
+  "Emit the body of a loop as C while-body statements. var-types parallels var-names — the
+  DECLARED C type of each loop variable, used to type recur temps (a recur value feeds back
+  into its loop var, so the temp must match the var's type — re-inferring it can produce a
+  float type for an int counter, which breaks the OpenCL loop vectorizer)."
+  [body var-names var-types idx-sym array-syms opencl-idx]
   (let [body-expr (if (= 1 (count body)) (first body) (cons 'do body))]
-    (emit-loop-expr body-expr var-names idx-sym array-syms opencl-idx)))
+    (emit-loop-expr body-expr var-names var-types idx-sym array-syms opencl-idx)))
 
 (defn- emit-loop-expr
   "Recursively emit loop body, translating recur to assignments+continue."
-  [expr var-names idx-sym array-syms opencl-idx]
+  [expr var-names var-types idx-sym array-syms opencl-idx]
   (cond
     ;; recur -> parallel assignment via temps, then assign back + continue
     (and (seq? expr) (= 'recur (first expr)))
     (let [new-vals (rest expr)
           indexed (map-indexed vector (map vector var-names new-vals))
           ;; Emit temp declarations: type _t0 = expr_a; type _t1 = expr_b; ...
+          ;; Temp type = the loop var's DECLARED type (var-types), not infer-c-type of the
+          ;; recur value — the temp is assigned back into the loop var, so they must match.
           temps (str/join " "
                           (map (fn [[i [sym val]]]
-                                 (let [typ (remap-type (infer-c-type val))
+                                 (let [typ (or (nth var-types i nil) (remap-type (infer-c-type val)))
                                        val-str (emit-expr val idx-sym array-syms opencl-idx)]
                                    (str typ " _t" i " = " val-str ";")))
                                indexed))
@@ -724,12 +729,12 @@
           cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
       (if else-expr
         (str "if (" cond-str ") { "
-             (emit-loop-expr then-expr var-names idx-sym array-syms opencl-idx)
+             (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
              " } else { "
-             (emit-loop-expr else-expr var-names idx-sym array-syms opencl-idx)
+             (emit-loop-expr else-expr var-names var-types idx-sym array-syms opencl-idx)
              " }")
         (str "if (" cond-str ") { "
-             (emit-loop-expr then-expr var-names idx-sym array-syms opencl-idx)
+             (emit-loop-expr then-expr var-names var-types idx-sym array-syms opencl-idx)
              " } else { break; }")))
 
     ;; do block
@@ -738,7 +743,7 @@
           leading (butlast stmts)
           last-e (last stmts)]
       (str (str/join " " (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx)) leading))
-           " " (emit-loop-expr last-e var-names idx-sym array-syms opencl-idx)))
+           " " (emit-loop-expr last-e var-names var-types idx-sym array-syms opencl-idx)))
 
     ;; let in loop body
     (and (seq? expr) (contains? #{'let 'let*} (first expr)))
@@ -764,7 +769,7 @@
            pairs)
           decls (str/join " " decl-strs)
           body-strs (binding [*int-vars* (into *int-vars* ints)]
-                      (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+                      (emit-loop-body body var-names var-types idx-sym array-syms opencl-idx))]
       (str decls " " body-strs))
 
     ;; when in loop
@@ -773,7 +778,7 @@
           cond-str (emit-expr cond-expr idx-sym array-syms opencl-idx)]
       (str "if (" cond-str ") { "
            (str/join " " (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx)) (butlast body)))
-           " " (emit-loop-expr (last body) var-names idx-sym array-syms opencl-idx)
+           " " (emit-loop-expr (last body) var-names var-types idx-sym array-syms opencl-idx)
            " } else { break; }"))
 
     ;; Void terminal (aset, collect!, atomic-add!) -> emit as stmt then break
@@ -1016,10 +1021,10 @@
            (let [result-var (str (c-symbol (first var-names)) "_res")
                  result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
                  loop-body (binding [*loop-result-var* result-var]
-                             (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+                             (emit-loop-body body var-names var-types idx-sym array-syms opencl-idx))]
              (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
            ;; GLSL: no statement-expressions; result stays in the first loop var.
-           (let [loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+           (let [loop-body (emit-loop-body body var-names var-types idx-sym array-syms opencl-idx)]
              (str decls " while (true) { " loop-body " }")))))
 
      ;; case -> switch
