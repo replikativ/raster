@@ -608,9 +608,21 @@
          argmap (zipmap all-params args)
          dt (if (= dtype :double) :double :float)
          nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+         ;; per-array element dtype from the ACTUAL JVM array — a program can mix dtypes (quant
+         ;; kernels carry byte weights + float scales + int bsums + float output), so a single
+         ;; program dtype mis-allocates (CCE [B→[F). The runtime array type is authoritative.
+         arr-dtype (fn [arr]
+                     (condp instance? arr
+                       (Class/forName "[B") :byte
+                       (Class/forName "[S") :short
+                       (Class/forName "[I") :int
+                       (Class/forName "[J") :long
+                       (Class/forName "[F") :float
+                       (Class/forName "[D") :double
+                       dt))
          param-specs (into {} (map (fn [p]
                                      (let [arr (get argmap p)]
-                                       [(keyword (name p)) [dt (nel arr) arr]]))
+                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
                                    array-params))
          alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
                                      [(keyword (name sym)) [dt (long (size-fn args)) nil]])
