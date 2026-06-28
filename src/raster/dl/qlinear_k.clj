@@ -150,22 +150,22 @@
   (par/map-void! o out
                  (let [nsb (quot (long in) 256)
                        wiw (quot (long in) 8)           ; weight int32 words per row (in/2 bytes / 4)
-                       wb (long (* (long o) wiw))
-                       sbb (long (* (long o) nsb))
-                       subb (long (* (long o) (quot (long in) 32)))
+                       wb (* (long o) wiw)
+                       sbb (* (long o) nsb)
+                       subb (* (long o) (quot (long in) 32))
                        acc (loop [sb 0 a 0.0]
                              (if (< sb nsb)
                                (let [dav (double (ra/aget da (+ sbb sb)))
                                      dbv (double (ra/aget db (+ sbb sb)))
                                      dact (double (ra/aget xs sb))
-                                     wsb (long (+ wb (* sb 32)))   ; 32 int words / super-block
-                                     xsb (long (* sb 64))          ; 64 act words / super-block
+                                     wsb (+ wb (* sb 32))   ; 32 int words / super-block
+                                     xsb (* sb 64)          ; 64 act words / super-block
                                      ssum (loop [j 0 s 0.0]
                                             (if (< j 8)
-                                              (let [sidx (long (+ (* sb 8) j))
+                                              (let [sidx (+ (* sb 8) j)
                                                     aj (* dav (long (ra/aget aq (+ subb sidx))))
                                                     bj (* dbv (long (ra/aget bq (+ subb sidx))))
-                                                    wj (long (+ wsb (* j 4))) xj (long (+ xsb (* j 8)))
+                                                    wj (+ wsb (* j 4)) xj (+ xsb (* j 8))
                                                     dp (loop [r 0 d 0]
                                                          (if (< r 4)
                                                            (let [wi (ra/aget wp (+ wj r))

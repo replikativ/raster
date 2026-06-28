@@ -528,39 +528,48 @@
                                    [sym (count-uses sym rest-forms)]))
                                pairs-vec))
           multi-use? (fn [sym] (> (get use-counts sym 0) 1))
-          {:keys [env locals loop-stmts]}
+          {:keys [env locals loop-stmts ints]}
           (reduce
-           (fn [{:keys [env locals loop-stmts seen-names]} [sym val]]
-             (let [val-subst (walk/postwalk
-                              (fn [f] (if (and (symbol? f) (contains? env f))
-                                        (get env f) f))
-                              val)]
-                ;; Detect loop RHS in GLSL (needs statement hoisting)
-               (if (and (not (supports-stmt-expr?))
-                        (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst)))
-                  ;; Hoist loop: emit as statements, alias sym → first loop var
-                 (let [loop-var (first (take-nth 2 (second val-subst)))
-                       loop-c-name (c-symbol loop-var)
-                       loop-code (emit-expr val-subst idx-sym array-syms opencl-idx)]
-                   {:env (assoc env sym (symbol loop-c-name))
-                    :locals locals
-                    :loop-stmts (conj (or loop-stmts []) loop-code)
-                    :seen-names (or seen-names {})})
-                 (if (multi-use? sym)
-                   (let [base-name (c-symbol sym)
-                         prev-count (get seen-names base-name 0)
-                         c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
-                         c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                         c-type (infer-c-type val-subst)]
-                     {:env (assoc env sym (symbol c-name))
-                      :locals (conj locals [c-name c-expr c-type])
+           (fn [{:keys [env locals loop-stmts seen-names ints]} [sym val]]
+             ;; Type each binding under the integer vars accumulated so far, so a
+             ;; dependent index binding (e.g. sbb = o*nsb after nsb = in/256) infers
+             ;; integer rather than defaulting to *scalar-type* (float) — which would
+             ;; emit a float array subscript and fail to compile.
+             (binding [*int-vars* (into *int-vars* ints)]
+               (let [val-subst (walk/postwalk
+                                (fn [f] (if (and (symbol? f) (contains? env f))
+                                          (get env f) f))
+                                val)]
+                  ;; Detect loop RHS in GLSL (needs statement hoisting)
+                 (if (and (not (supports-stmt-expr?))
+                          (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst)))
+                    ;; Hoist loop: emit as statements, alias sym → first loop var
+                   (let [loop-var (first (take-nth 2 (second val-subst)))
+                         loop-c-name (c-symbol loop-var)
+                         loop-code (emit-expr val-subst idx-sym array-syms opencl-idx)]
+                     {:env (assoc env sym (symbol loop-c-name))
+                      :locals locals
+                      :loop-stmts (conj (or loop-stmts []) loop-code)
+                      :seen-names (or seen-names {})
+                      :ints ints})
+                   (if (multi-use? sym)
+                     (let [base-name (c-symbol sym)
+                           prev-count (get seen-names base-name 0)
+                           c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
+                           c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
+                           c-type (infer-c-type val-subst)]
+                       {:env (assoc env sym (symbol c-name))
+                        :locals (conj locals [c-name c-expr c-type])
+                        :loop-stmts loop-stmts
+                        :seen-names (assoc seen-names base-name (inc prev-count))
+                        :ints (if (contains? #{"int" "uint" "long"} c-type)
+                                (conj ints (symbol c-name)) ints)})
+                     {:env (assoc env sym val-subst)
+                      :locals locals
                       :loop-stmts loop-stmts
-                      :seen-names (assoc seen-names base-name (inc prev-count))})
-                   {:env (assoc env sym val-subst)
-                    :locals locals
-                    :loop-stmts loop-stmts
-                    :seen-names (or seen-names {})}))))
-           {:env {} :locals [] :loop-stmts [] :seen-names {}}
+                      :seen-names (or seen-names {})
+                      :ints ints})))))
+           {:env {} :locals [] :loop-stmts [] :seen-names {} :ints #{}}
            pairs-vec)
           body-subst (map (fn [form]
                             (walk/postwalk
@@ -571,9 +580,12 @@
           loop-prefix (str/join " " loop-stmts)
           local-decls (str/join " "
                                 (map (fn [[n e t]] (str (remap-type t) " " n " = " e ";")) locals))
-          body-stmts (str/join " "
-                               (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx))
-                                    body-subst))]
+          ;; Emit the body under the int vars this scope's bindings introduced, so
+          ;; references to int-typed index locals type as integer (not float).
+          body-stmts (binding [*int-vars* (into *int-vars* ints)]
+                       (str/join " "
+                                 (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx))
+                                      body-subst)))]
       (str "{ " (when (seq loop-prefix) (str loop-prefix " "))
            (when (seq locals) (str local-decls " "))
            body-stmts " }"))
@@ -590,7 +602,11 @@
                                  (str typ " " (c-symbol sym) " = "
                                       (emit-expr init idx-sym array-syms opencl-idx) ";"))
                                var-names var-types var-inits))
-          loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+          int-loop-vars (set (keep (fn [[sym typ]]
+                                     (when (contains? #{"int" "uint" "long"} typ) sym))
+                                   (map vector var-names var-types)))
+          loop-body (binding [*int-vars* (into *int-vars* int-loop-vars)]
+                      (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
       (str "{ " decls " while (true) { " loop-body " } }"))
 
     ;; atomic-add! as statement
@@ -723,17 +739,27 @@
     (and (seq? expr) (contains? #{'let 'let*} (first expr)))
     (let [[_ bindings & body] expr
           pairs (partition 2 bindings)
-          decls (let [seen (atom {})]
-                  (str/join " "
-                            (map (fn [[sym val]]
-                                   (let [base (c-symbol sym)
-                                         prev (get @seen base 0)
-                                         c-name (if (> prev 0) (str base "_" prev) base)]
-                                     (swap! seen assoc base (inc prev))
-                                     (str (remap-type (infer-c-type val)) " " c-name " = "
-                                          (emit-expr val idx-sym array-syms opencl-idx) ";")))
-                                 pairs)))
-          body-strs (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+          ;; Thread integer-typed bindings into *int-vars* so a dependent index
+          ;; binding (e.g. wj = wsb + j*4) infers integer rather than float.
+          {:keys [decl-strs ints]}
+          (reduce
+           (fn [{:keys [decl-strs seen ints]} [sym val]]
+             (binding [*int-vars* (into *int-vars* ints)]
+               (let [base (c-symbol sym)
+                     prev (get seen base 0)
+                     c-name (if (> prev 0) (str base "_" prev) base)
+                     c-type (infer-c-type val)]
+                 {:decl-strs (conj decl-strs
+                                   (str (remap-type c-type) " " c-name " = "
+                                        (emit-expr val idx-sym array-syms opencl-idx) ";"))
+                  :seen (assoc seen base (inc prev))
+                  :ints (if (contains? #{"int" "uint" "long"} c-type)
+                          (conj ints sym) ints)})))
+           {:decl-strs [] :seen {} :ints #{}}
+           pairs)
+          decls (str/join " " decl-strs)
+          body-strs (binding [*int-vars* (into *int-vars* ints)]
+                      (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
       (str decls " " body-strs))
 
     ;; when in loop
@@ -842,7 +868,7 @@
                       {:env (assoc env sym (symbol c-name))
                        :locals (conj locals [c-name c-expr c-type])
                        :seen-names (assoc seen-names base-name (inc prev-count))
-                       :ints (if (contains? #{"int" "uint"} c-type)
+                       :ints (if (contains? #{"int" "uint" "long"} c-type)
                                (conj ints (symbol c-name)) ints)})
                     {:env (assoc env sym val-subst)
                      :locals locals
@@ -967,19 +993,26 @@
                                   (str typ " " (c-symbol sym) " = "
                                        (emit-expr init idx-sym array-syms opencl-idx) ";"))
                                 var-names var-types var-inits))
+           ;; Integer-typed loop induction vars (counters) seed *int-vars* for the
+           ;; loop body, so index math over them (e.g. base = j*4) infers integer
+           ;; instead of *scalar-type* (float) — which would emit a float subscript.
+           int-loop-vars (set (keep (fn [[sym typ]]
+                                      (when (contains? #{"int" "uint" "long"} typ) sym))
+                                    (map vector var-names var-types)))
            terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
-       (if (supports-stmt-expr?)
-         ;; Reduction result: a dedicated var typed from the loop's terminal
-         ;; value, not the first loop var (usually the int counter — assigning a
-         ;; double accumulator into it would truncate).
-         (let [result-var (str (c-symbol (first var-names)) "_res")
-               result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
-               loop-body (binding [*loop-result-var* result-var]
-                           (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
-           (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
-         ;; GLSL: no statement-expressions; result stays in the first loop var.
-         (let [loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
-           (str decls " while (true) { " loop-body " }"))))
+       (binding [*int-vars* (into *int-vars* int-loop-vars)]
+         (if (supports-stmt-expr?)
+           ;; Reduction result: a dedicated var typed from the loop's terminal
+           ;; value, not the first loop var (usually the int counter — assigning a
+           ;; double accumulator into it would truncate).
+           (let [result-var (str (c-symbol (first var-names)) "_res")
+                 result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
+                 loop-body (binding [*loop-result-var* result-var]
+                             (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+             (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
+           ;; GLSL: no statement-expressions; result stays in the first loop var.
+           (let [loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+             (str decls " while (true) { " loop-body " }")))))
 
      ;; case -> switch
      (and (seq? expr) (= 'case (first expr)))
