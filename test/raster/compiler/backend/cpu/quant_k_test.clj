@@ -64,3 +64,30 @@
       (is (< (Math/abs (- dotk ref-f32)) (* 0.02 l1))
           (str "K-dot " dotk " vs f32 " ref-f32 " — err " (Math/abs (- dotk ref-f32))
                " should be < 2% of L1 scale " l1)))))
+
+(deftest q6k-second-variant
+  (testing "Q6_K (symmetric, 16×16, int8-scale, 6-bit) round-trips — registry generalizes"
+    (let [len 1024 w (gen len -0.7 0.7 5)
+          enc (q/quantize-weight-q6k w q/q6-K)
+          dq  (q/dequant-q6k enc q/q6-K len)]
+      (is (= len (alength ^bytes (:wq enc))))
+      (is (= (quot len 16) (alength ^bytes (:sc enc))))   ; 16-elem sub-blocks
+      (is (= (quot len 256) (alength ^floats (:ds enc))))
+      ;; 6-bit ≈ 64 levels (step ≈ max/32) → tighter than Q4_K's 4-bit (0.05 bound)
+      (is (< (maxerr w dq) 0.03) "Q6_K should reconstruct tightly (6-bit)")))
+  (testing "Q6_K·q8_K dot equals dequant·dequant exactly and tracks f32"
+    (let [in 512 w (gen in -0.6 0.6 13) x (gen in -0.8 0.8 17)
+          ew (q/quantize-weight-q6k w q/q6-K)
+          ea (q/quantize-act-q8k x in q/q6-K)             ; same activation quantizer, 16-sub
+          dotk (q/q6k-q8k-dot ew ea in q/q6-K)
+          dqw (q/dequant-q6k ew q/q6-K in)
+          dqa (let [out (float-array in)]
+                (dotimes [sb (quot in 256)]
+                  (let [d (aget ^floats (:xs ea) sb)]
+                    (dotimes [i 256] (let [idx (+ (* sb 256) i)]
+                                       (aset out idx (float (* d (aget ^bytes (:xq ea) idx)))))))) out)
+          ref-dq (areduce dqw i s 0.0 (+ s (* (aget dqw i) (aget dqa i))))
+          ref-f32 (areduce w i s 0.0 (+ s (* (aget w i) (aget x i))))
+          l1 (areduce w i s 0.0 (+ s (Math/abs (* (aget w i) (aget x i)))))]
+      (is (< (Math/abs (- dotk ref-dq)) 1e-2) "Q6_K structured dot == dequant·dequant")
+      (is (< (Math/abs (- dotk ref-f32)) (* 0.015 l1)) "Q6_K dot tracks f32 (tighter than Q4_K)"))))

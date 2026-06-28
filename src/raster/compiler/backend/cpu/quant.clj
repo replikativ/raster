@@ -200,6 +200,85 @@
           (recur (inc sb) (+ acc (* dact sbsum))))
         acc))))
 
+;; ---- Q6_K: the 2nd K-quant — a DIFFERENT variant, to confirm the registry
+;; generalizes across K-quants (not just one). Q6_K is SYMMETRIC (d only, no min/dmin),
+;; 16×16 sub-blocks (vs Q4_K's 8×32), int8 sub-scales (vs Q4_K's 6-bit-packed), 6-bit
+;; weights. Reuses the SAME skeleton + the SAME q8_K activation (parameterized to 16-elem
+;; sub-blocks). The signed 6-bit weight rides the unsigned+zero-point trick (zp=32) so the
+;; dpbusd core is shared. (raster stores 6-bit/byte; GGUF's 4+2 plane is a packing detail.)
+(def q6-K
+  "Symmetric 6-bit super-block: 256 / 16 sub-blocks of 16; per-sub-block int8 scale,
+  one fp super-scale d, no min. x = (d·sc)·(q-32), q unsigned 6-bit [0,63]."
+  {:name "q6_K" :super-block 256 :subblock 16 :n-subblocks 16
+   :weight-bits 6 :scale-bits 8 :has-dmin false :zero-point 32
+   :pack :byte-direct :act-type :i8-K})
+
+(defn quantize-weight-q6k
+  "f32 weight → q6-K: {:wq byte[len] (unsigned 6-bit) :sc byte[nsub] (int8 sub-scale)
+   :ds float[nsb] (super-scale)}. Symmetric: per sub-block a=max|x|/32, super d=max(a)/127."
+  [^floats w {:keys [super-block subblock zero-point]}]
+  (let [len (alength w) sbk (long super-block) sub (long subblock) zp (long zero-point)
+        subs-per (quot sbk sub) nsb (quot len sbk) nsub (quot len sub) qmax 63
+        wq (byte-array len) sc (byte-array nsub) ds (float-array nsb)]
+    (dotimes [sb nsb]
+      (let [sbase (* sb sbk) as (double-array subs-per)]
+        (dotimes [j subs-per]
+          (let [base (+ sbase (* j sub))
+                mx (loop [i 0 m 0.0] (if (< i sub) (recur (inc i) (max m (Math/abs (aget w (+ base i))))) m))]
+            (aset as j (/ mx 32.0))))
+        (let [amax (areduce as i m 0.0 (max m (aget as i)))
+              dv (/ amax 127.0) idv (if (zero? dv) 0.0 (/ 1.0 dv))]
+          (aset ds sb (float dv))
+          (dotimes [j subs-per]
+            (let [scj (max 0 (min 127 (Math/round (* (aget as j) idv))))
+                  a' (* dv scj) ia' (if (zero? a') 0.0 (/ 1.0 a'))
+                  base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)]
+              (aset sc sidx (unchecked-byte scj))
+              (dotimes [k sub]
+                (aset wq (+ base k)
+                      (unchecked-byte (max 0 (min qmax (+ (Math/round (* (aget w (+ base k)) ia')) zp)))))))))))
+    {:wq wq :sc sc :ds ds}))
+
+(defn dequant-q6k
+  "q6-K → f32[len]: x = (ds·sc)·(q-zp) per sub-block."
+  [{:keys [wq sc ds]} {:keys [super-block subblock zero-point]} len]
+  (let [out (float-array len) sbk (long super-block) sub (long subblock) zp (long zero-point)
+        subs-per (quot sbk sub) nsb (quot len sbk)]
+    (dotimes [sb nsb]
+      (let [sbase (* sb sbk) dv (aget ds sb)]
+        (dotimes [j subs-per]
+          (let [base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)
+                a' (* dv (long (aget sc sidx)))]
+            (dotimes [k sub]
+              (aset out (+ base k)
+                    (float (* a' (- (bit-and (long (aget wq (+ base k))) 0xFF) zp)))))))))
+    out))
+
+(defn q6k-q8k-dot
+  "Reference dot of ONE Q6_K weight row · q8_K activation: per super-block d·d_act·Σ_sub
+  sc·(dpbusd - zp·bsum). Symmetric (no min term); the signed 6-bit weight via the unsigned
+  +zp(32) fold reuses the shared dpbusd core. Equals dot(dequant, dequant) exactly."
+  [{:keys [wq sc ds]} {:keys [xq xs bsums]} in {:keys [super-block subblock zero-point]}]
+  (let [sbk (long super-block) sub (long subblock) zp (long zero-point)
+        nsb (quot (long in) sbk) subs-per (quot sbk sub)]
+    (loop [sb 0 acc 0.0]
+      (if (< sb nsb)
+        (let [sbase (* sb sbk) dv (double (aget ds sb)) dact (double (aget xs sb))
+              ssum (loop [j 0 s 0.0]
+                     (if (< j subs-per)
+                       (let [base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)
+                             scj (long (aget sc sidx))
+                             dp (loop [k 0 d 0]
+                                  (if (< k sub)
+                                    (recur (inc k) (+ d (* (bit-and (long (aget wq (+ base k))) 0xFF)
+                                                           (long (aget xq (+ base k))))))
+                                    d))
+                             folded (- dp (* zp (long (aget bsums sidx))))]
+                         (recur (inc j) (+ s (* scj (double folded)))))
+                       s))]
+          (recur (inc sb) (+ acc (* dv dact ssum))))
+        acc))))
+
 (defn- quantize-act-blocks!
   "Quantize the 32-element blocks [r0, r0+cnt) of activation x into xq/xs/xsum
   (per-block symmetric int8, d=max/127, with the per-block sum for the -8 fold).
