@@ -592,52 +592,67 @@
    is just another resident buffer in its :array-params).
 
    args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
-   scalars). Buffer keys are the param/intermediate sym names as keywords."
-  [sess descriptor args]
-  (let [device-id (:device-id @sess)
-        {:keys [dtype all-params array-params allocs steps]} descriptor
-        argmap (zipmap all-params args)
-        dt (if (= dtype :double) :double :float)
-        nel (fn [arr] (java.lang.reflect.Array/getLength arr))
-        param-specs (into {} (map (fn [p]
-                                    (let [arr (get argmap p)]
-                                      [(keyword (name p)) [dt (nel arr) arr]]))
-                                  array-params))
-        alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
-                                    [(keyword (name sym)) [dt (long (size-fn args)) nil]])
-                                  allocs))
-        info-fn (rt-resolve device-id "kernel-registry-entry")]
-    (alloc! sess (merge param-specs alloc-specs))
-    (doseq [{:keys [kernel-name n-fn scalar-specs phase]} steps]
-      (let [ki (or (info-fn kernel-name)
-                   (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                   {:kernel kernel-name})))
+   scalars). Buffer keys are the param/intermediate sym names as keywords.
+
+   roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
+   derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
+   program can't derive: :constant = weights (uploaded once here, never re-uploaded by
+   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
+   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
+   (down)."
+  ([sess descriptor args] (bind-program! sess descriptor args {}))
+  ([sess descriptor args roles]
+   (let [device-id (:device-id @sess)
+         {:keys [dtype all-params array-params allocs steps]} descriptor
+         effective-roles (merge (:array-roles descriptor) roles)
+         argmap (zipmap all-params args)
+         dt (if (= dtype :double) :double :float)
+         nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+         param-specs (into {} (map (fn [p]
+                                     (let [arr (get argmap p)]
+                                       [(keyword (name p)) [dt (nel arr) arr]]))
+                                   array-params))
+         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
+                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
+                                   allocs))
+         info-fn (rt-resolve device-id "kernel-registry-entry")]
+     (alloc! sess (merge param-specs alloc-specs))
+     (doseq [{:keys [kernel-name n-fn scalar-specs phase]} steps]
+       (let [ki (or (info-fn kernel-name)
+                    (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                    {:kernel kernel-name})))
             ;; kernel array-param NAME → resident buffer key. For map-void the invoke arrays ARE
             ;; the kernel's own param syms, and intermediates/params are keyed by the same names,
             ;; so name→same-name-keyword is exact (and SoA-order-robust: prepare! orders by
             ;; :array-params itself via resolve-kernel-bufs).
-            sym->buf (into {} (map (fn [p] [(name p) (keyword (name p))]) (:array-params ki)))
+             sym->buf (into {} (map (fn [p] [(name p) (keyword (name p))]) (:array-params ki)))
             ;; typed scalars ({:type :int|:float|:double :value v}) so int params bind as int.
-            scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
-                          scalar-specs)]
-        (swap! sess assoc-in [:kernels phase] [ki])
-        (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase})))
-    (record-graph! sess (mapv :phase steps) :program)
-    (swap! sess assoc :program-descriptor descriptor)
-    sess))
+             scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                           scalar-specs)]
+         (swap! sess assoc-in [:kernels phase] [ki])
+         (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase})))
+     (record-graph! sess (mapv :phase steps) :program)
+     (swap! sess assoc :program-descriptor descriptor :program-roles effective-roles)
+     sess)))
 
 (defn run-program!
-  "Replay a bound resident GPU program: refresh the resident array-param inputs (buffer POINTERS
-   are stable — only CONTENTS change), replay the recorded command graph, and download the array
-   params. args = values in :all-params order (same as bind-program!). Returns
-   {array-param-sym → downloaded JVM array}."
+  "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
+   stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
+   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
+   resident from bind-program!. args = values in :all-params order (same as bind-program!).
+   Returns {output-param-sym → downloaded JVM array}."
   [sess descriptor args]
   (let [{:keys [all-params array-params]} descriptor
+        roles (:program-roles @sess)
         argmap (zipmap all-params args)]
-    (doseq [p array-params]
+    ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
+    ;; device; output produced by the kernels so its prior content is irrelevant).
+    (doseq [p array-params :when (= :input (get roles p :input))]
       (upload! sess (keyword (name p)) (get argmap p)))
     (replay! sess :program)
-    (into {} (map (fn [p] [p (download sess (keyword (name p)))]) array-params))))
+    ;; download only outputs (inputs/constants/state are not host-visible results).
+    (into {} (for [p array-params :when (= :output (get roles p))]
+               [p (download sess (keyword (name p)))]))))
 
 (defn kernel
   "Get kernel info vector from the session by phase key."

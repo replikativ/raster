@@ -1057,11 +1057,28 @@
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
         form (run-passes raw-form forward-passes opts)
         prog (extract-gpu-program form)
-        scalar-lets (:scalar-lets prog)]
+        scalar-lets (:scalar-lets prog)
+        ;; Default buffer roles for the residency layer: an array param WRITTEN by any kernel
+        ;; (its name is in some kernel's :written-arrays) defaults to :output (downloaded after
+        ;; replay); a read-only param defaults to :input (re-uploaded per call). Intermediates are
+        ;; :scratch (never moved). The CALLER overrides read-only params that are fixed across
+        ;; calls to :constant (weights — uploaded once at bind) and persistent written state to
+        ;; :state (KV cache — never downloaded): that cross-call axis isn't a single-program
+        ;; property (escape analysis can't see it), so it's declared, not derived.
+        reg-entry (when prog (requiring-resolve 'raster.gpu.ze-runtime/kernel-registry-entry))
+        written-params (when prog
+                         (reduce (fn [acc s]
+                                   (let [ki (reg-entry (:kernel-name s))]
+                                     (into acc (map (comp symbol name) (:written-arrays ki)))))
+                                 #{} (:steps prog)))
+        array-roles (when prog
+                      (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
+                                    array-params)))]
     (when prog
       {:dtype effective-dtype
        :all-params all-params
        :array-params array-params
+       :array-roles array-roles
        :scalar-params scalar-params
        :allocs (mapv (fn [{:keys [sym size-expr]}]
                        {:sym sym :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
