@@ -215,6 +215,12 @@
 (def ^:private h-zeKernelDestroy
   (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
 
+(def ^:private h-zeCommandListDestroy
+  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
+
+(def ^:private h-zeCommandQueueDestroy
+  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
+
 ;; ================================================================
 ;; State
 ;; ================================================================
@@ -1823,6 +1829,27 @@
   [graph]
   (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
             [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
+
+(defn- destroy-handle!
+  [^MethodHandle mh ^MemorySegment seg]
+  (when (and seg (not (.equals MemorySegment/NULL seg)))
+    (try (.invokeWithArguments mh ^java.util.List (java.util.List/of (object-array [seg])))
+         (catch Exception _))))
+
+(defn destroy-prepared!
+  "Destroy the DEDICATED kernel handle a prepared binding owns (create-kernel-fresh allocates one
+  per bind; it is NOT in the registry's cache, so shutdown!/free-arena-kernels! never reach it).
+  Without this every prepare!/bind leaks a zeKernel driver object → the driver's kernel table
+  fills → zeKernelCreate / launch eventually fail (SIGABRT). Idempotent; safe on partial maps."
+  [prepared]
+  (destroy-handle! @h-zeKernelDestroy (get-in prepared [:bound :kernel])))
+
+(defn destroy-graph!
+  "Destroy a recorded command graph's queue + list (record-graph! creates one of each per graph
+  and never frees them). Without this every record-graph! leaks a zeCommandQueue + zeCommandList."
+  [graph]
+  (destroy-handle! @h-zeCommandListDestroy (:list graph))
+  (destroy-handle! @h-zeCommandQueueDestroy (:queue graph)))
 
 ;; ================================================================
 ;; Exclusive scan kernel invocation (Blelloch algorithm)

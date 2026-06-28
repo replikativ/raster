@@ -46,6 +46,23 @@
                                  ". Use :ze:N or :ocl:N")
                             {:device-id device-id})))))
 
+(defn- rt-resolve-soft
+  "Like rt-resolve but returns nil instead of throwing when the backend lacks the fn.
+  Used for the bound-dispatch destroyers, which are ze-only."
+  [device-id fn-name]
+  (let [ns-sym (case (backend-type device-id)
+                 :ze  'raster.gpu.ze-runtime
+                 :ocl 'raster.gpu.ocl-runtime)]
+    (requiring-resolve (symbol (str ns-sym) fn-name))))
+
+(defn- destroy-superseded!
+  "Destroy a prepared binding / graph being overwritten under the same key, so re-prepare! /
+  re-record! don't leak the previous dedicated kernel handle (or queue+list). Nil-safe."
+  [device-id destroyer-name old]
+  (when old
+    (when-let [d (rt-resolve-soft device-id destroyer-name)]
+      (try (d old) (catch Exception _)))))
+
 (defn- rt-resolve
   "Resolve a function from the appropriate runtime namespace."
   [device-id fn-name]
@@ -236,15 +253,27 @@
            :closed?   false})))
 
 (defn close-session!
-  "Free all buffers and kernels in a session. Idempotent and thread-safe."
+  "Free all buffers and kernels in a session. Idempotent and thread-safe.
+
+  Also destroys the per-binding fresh kernel handles (:prepared) and recorded command graphs
+  (:graphs). These hold dedicated driver objects (zeKernel per bind, zeCommandQueue+List per
+  graph) that are NOT in the kernel registry, so close-kernel-arena! never reaches them — without
+  this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (let [{:keys [device-id arena-id buffers closed?]} @sess]
+    (let [{:keys [device-id arena-id buffers prepared graphs closed?]} @sess]
       (when-not closed?
+        ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
+        ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
+        (let [ns-sym (case (backend-type device-id) :ze 'raster.gpu.ze-runtime :ocl 'raster.gpu.ocl-runtime)
+              destroy-prepared! (requiring-resolve (symbol (str ns-sym) "destroy-prepared!"))
+              destroy-graph!    (requiring-resolve (symbol (str ns-sym) "destroy-graph!"))]
+          (when destroy-graph!    (doseq [[_ g] graphs]   (try (destroy-graph! g)    (catch Exception _))))
+          (when destroy-prepared! (doseq [[_ p] prepared] (try (destroy-prepared! p) (catch Exception _)))))
         (free-buffers-internal! buffers device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :kernels {})))))
+        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -410,6 +439,7 @@
          device-id (:device-id @sess)
          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
          prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
+     (destroy-superseded! device-id "destroy-prepared!" (get-in @sess [:prepared phase-key]))
      (swap! sess assoc-in [:prepared phase-key] prepared)
      prepared)))
 
@@ -451,6 +481,7 @@
                                                {:prepared (keys (:prepared @sess))}))))
                          phase-keys)
          graph (record-fn prepareds)]
+     (destroy-superseded! device-id "destroy-graph!" (get-in @sess [:graphs graph-key]))
      (swap! sess assoc-in [:graphs graph-key] graph)
      graph)))
 
