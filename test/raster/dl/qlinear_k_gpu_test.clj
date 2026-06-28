@@ -156,6 +156,34 @@
           (is (< (maxerr (:ycpu b) (gpu/download sess :by)) 1e-3) "binding B correct (not clobbered by A)")
           (finally (gpu/close-session! sess)))))))
 
+(deftest q4k-dp4a-command-graph
+  (when (gpu-available?)
+    (testing "record-graph!/replay! runs a fixed kernel sequence; each op reads its own buffers"
+      (let [out 32 in 256
+            mk (fn [sw sx]
+                 (let [W (gen (* out in) sw) x (gen in sx)
+                       {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
+                       {:keys [xq xs bsums]} (q/quantize-act-q8k x in q/q4-K)
+                       y (float-array out)]
+                   (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq y in out 0 out)
+                   {:wp (bytes->ints-le wq) :da da :db db :aq aq :bq bq :xp (pack-i8 xq) :xs xs :bsums bsums :y y}))
+            a (mk 11 22) b (mk 77 88)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/alloc! sess {:axp [:int (alength ^ints (:xp a)) (:xp a)] :axs [:float (alength ^floats (:xs a)) (:xs a)] :abs [:int (alength ^ints (:bsums a)) (:bsums a)] :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
+                            :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)] :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/record-graph! sess [:a :b])
+          (gpu/replay! sess)
+          (is (< (maxerr (:y a) (gpu/download sess :ay)) 1e-3) "graph op A")
+          (is (< (maxerr (:y b) (gpu/download sess :by)) 1e-3) "graph op B")
+          ;; replay again (idempotent, reads current buffers) — still correct
+          (gpu/replay! sess)
+          (is (< (maxerr (:y b) (gpu/download sess :by)) 1e-3) "graph replay idempotent")
+          (finally (gpu/close-session! sess)))))))
+
 (deftest q4k-dp4a-gpu-matches-cpu
   (when (gpu-available?)
     (testing "Q4_K dp4a kernel on ze:0 (int32-packed nibble-mask trick) == CPU composable"

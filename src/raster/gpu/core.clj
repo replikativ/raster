@@ -410,10 +410,14 @@
   may change freely between invoke-bound! calls (the bound pointers are stable)."
   ([sess phase-key sym->buf-key scalars n]
    (prepare! sess phase-key sym->buf-key scalars n {}))
-  ([sess phase-key sym->buf-key scalars n {:keys [index async?] :or {index 0}}]
+  ([sess phase-key sym->buf-key scalars n {:keys [index async? kernel-phase] :or {index 0}}]
    (let [{:keys [kernels buffers]} @sess
-         kernel-vec (or (get kernels phase-key)
-                        (throw (ex-info (str "No kernel for phase: " phase-key)
+         ;; The COMPILED kernel comes from kernel-phase (defaults to phase-key); the bound
+         ;; argument-set is stored under phase-key. This lets one compiled kernel back many
+         ;; distinct bindings (e.g. every matmul in a decode token shares one dp4a kernel).
+         klookup (or kernel-phase phase-key)
+         kernel-vec (or (get kernels klookup)
+                        (throw (ex-info (str "No kernel for phase: " klookup)
                                         {:available (keys kernels)})))
          kernel-info (nth kernel-vec index)
          buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
@@ -442,6 +446,36 @@
   [sess]
   (let [device-id (:device-id @sess)]
     ((rt-resolve device-id "synchronize-async!"))))
+
+(defn record-graph!
+  "Record an ordered sequence of prepared kernels into a replayable command graph (the AOT
+  decode-graph). Pays the per-launch host-append cost ONCE; replay! then runs the whole
+  sequence with a single queue execute — eliminating the per-token dispatch floor.
+
+  phase-keys: ordered vector of phase-keys previously bound via prepare!. The kernel sequence
+  and buffer pointers are fixed; buffer CONTENTS may change between replays. Stored under :graph
+  (or graph-key). Re-record only if the sequence or a buffer is reallocated."
+  ([sess phase-keys] (record-graph! sess phase-keys :graph))
+  ([sess phase-keys graph-key]
+   (let [device-id (:device-id @sess)
+         record-fn (rt-resolve device-id "record-graph!")
+         prepareds (mapv (fn [pk]
+                           (or (get-in @sess [:prepared pk])
+                               (throw (ex-info (str "Phase not prepared: " pk " — call prepare! first")
+                                               {:prepared (keys (:prepared @sess))}))))
+                         phase-keys)
+         graph (record-fn prepareds)]
+     (swap! sess assoc-in [:graphs graph-key] graph)
+     graph)))
+
+(defn replay!
+  "Execute a recorded command graph once (synchronous). Reads current buffer contents."
+  ([sess] (replay! sess :graph))
+  ([sess graph-key]
+   (let [device-id (:device-id @sess)
+         graph (or (get-in @sess [:graphs graph-key])
+                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))]
+     ((rt-resolve device-id "replay-graph!") graph))))
 
 (defn invoke-scan!
   "Invoke a compiled Blelloch exclusive-scan kernel pair from the session.

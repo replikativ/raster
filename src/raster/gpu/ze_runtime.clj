@@ -95,6 +95,7 @@
 (def ^:private ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES 0x03)
 (def ^:private ZE_STRUCTURE_TYPE_CONTEXT_DESC 0x0d)
 (def ^:private ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC 0x0e)
+(def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
 (def ^:private ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC 0x15)
 (def ^:private ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC 0x16)
 (def ^:private ZE_STRUCTURE_TYPE_MODULE_DESC 0x1b)
@@ -158,6 +159,22 @@
 
 (def ^:private h-zeCommandListHostSynchronize
   (delay (make-handle "zeCommandListHostSynchronize" (fd I32 PTR I64))))
+
+;; Regular (replayable) command list + queue — for recorded command graphs
+(def ^:private h-zeCommandQueueCreate
+  (delay (make-handle "zeCommandQueueCreate" (fd I32 PTR PTR PTR PTR))))
+
+(def ^:private h-zeCommandListCreate
+  (delay (make-handle "zeCommandListCreate" (fd I32 PTR PTR PTR PTR))))
+
+(def ^:private h-zeCommandListClose
+  (delay (make-handle "zeCommandListClose" (fd I32 PTR))))
+
+(def ^:private h-zeCommandQueueExecuteCommandLists
+  (delay (make-handle "zeCommandQueueExecuteCommandLists" (fd I32 PTR I32 PTR PTR))))
+
+(def ^:private h-zeCommandQueueSynchronize
+  (delay (make-handle "zeCommandQueueSynchronize" (fd I32 PTR I64))))
 
 (def ^:private h-zeModuleCreate
   (delay (make-handle "zeModuleCreate" (fd I32 PTR PTR PTR PTR PTR))))
@@ -1754,6 +1771,52 @@
   "Dispatch a kernel pre-bound by bind-registered-map-void-kernel. Synchronous."
   [prepared]
   (launch-bound! (:bound prepared) (long (:group-count prepared))))
+
+(defn record-graph!
+  "Record a FIXED ordered sequence of pre-bound kernels into a regular (replayable) command
+  list — a 'command graph'. The per-launch host-append cost (FFI + driver, ~75µs each) is paid
+  ONCE here; replay-graph! then dispatches the whole sequence with a single queue execute. This
+  is the AOT decode-graph: the kernel sequence, group sizes, and buffer POINTERS are baked in at
+  record time; buffer CONTENTS may change freely between replays (the decode pattern — each
+  token rewrites the activation buffers, the recorded matmuls read whatever is there).
+
+  prepareds: ordered seq of maps from bind-registered-map-void-kernel (each carries its own
+  dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
+  Re-record only if the kernel sequence or any buffer is reallocated."
+  [prepareds]
+  (ensure-init!)
+  (let [{:keys [arena context device]} @state
+        cq-desc (.allocate ^Arena arena 40)
+        _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until the list completes
+        q-out (ptr-seg arena)
+        _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
+                    [context device cq-desc q-out])
+        queue (read-ptr q-out)
+        cl-desc (.allocate ^Arena arena 24)
+        _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+        l-out (ptr-seg arena)
+        _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate
+                    [context device cl-desc l-out])
+        lst (read-ptr l-out)
+        h-launch @h-zeCommandListAppendLaunchKernel]
+    ;; append each bound kernel's launch (args already live on its dedicated handle; the
+    ;; group-count value is captured into the recorded command at append time)
+    (doseq [{:keys [bound group-count]} prepareds]
+      (let [^MemorySegment gc (:gc-seg bound)]
+        (.set gc I32 0 (int group-count))
+        (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                  [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])))
+    (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+    (let [lists-arr (ptr-seg arena)]
+      (.set lists-arr PTR 0 ^MemorySegment lst)
+      {:queue queue :list lst :lists-arr lists-arr})))
+
+(defn replay-graph!
+  "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."
+  [graph]
+  (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
+            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
 
 ;; ================================================================
 ;; Exclusive scan kernel invocation (Blelloch algorithm)
