@@ -25,46 +25,73 @@
 (defn generate-segmap-kernel
   "Generate an OpenCL C kernel from a SegMap record.
 
+   Mirrors the legacy par-map-void generator's array handling so a fused pure
+   par/map (possibly composed of several maps the SOAC fuser collapsed) emits
+   correct C: (1) normalize the devirtualized array prims (.invk aget_m_T-impl …)
+   back to aget heads so array detection + per-element typing + emit recognize
+   them (else the array is mis-classified scalar and aget becomes a broken helper
+   call); (2) type each INPUT array by its declared element type (array-types,
+   merged with the body's :tag metadata) — a float input read through a double*
+   param silently miscompiles; (3) type the OUTPUT by the map's computed element
+   dtype (:dtype segmap), which may differ from the inputs (e.g. a float input
+   promoted to double by a double literal).
+
    Returns {:kernel-name str :source str :array-params [syms]
             :scalar-params [syms] :dtype kw}."
-  [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types]
+  [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types]
                      :or {dtype :double kernel-name-prefix "par_map"
-                          scalar-types {}}}]
+                          scalar-types {} array-types {}}}]
   (let [idx (seg-idx segmap)
-        body (:lambda segmap)
+        ;; (1) normalize .invk array prims → aget/aset heads
+        body (ce/normalize-array-prims (:lambda segmap))
         cast-fn (:cast-fn segmap)
-        dtype (or (:dtype segmap) dtype)
+        out-dtype (or (:dtype segmap) dtype)
+        default-ctype (get codegen/opencl-type-map dtype "double")
+        out-ctype (get codegen/opencl-type-map out-dtype "double")
+        ;; (2) per-array element types: declared (array-types) ∪ body :tag metadata
+        meta-types (ce/collect-array-types-from-meta body)
+        array-types (merge meta-types array-types)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         ;; Use pre-computed inputs/scalars from SegOp
         arr-params (vec (sort-by name (:inputs segmap)))
         scl-params (vec (sort-by name (:scalars segmap)))
-        ;; Build parameter strings
+        arr-type (fn [s]
+                   (let [t (get array-types s (get array-types (symbol (name s)) dtype))]
+                     (get codegen/opencl-type-map t default-ctype)))
+        ;; fp64 needed when the output OR any input array is double
+        use-fp64? (or (= out-dtype :double)
+                      (some #(= "double" (arr-type %)) arr-params))
         arr-param-str (str/join ", "
-                                (map (fn [s] (str "__global const " ctype "* restrict "
+                                (map (fn [s] (str "__global const " (arr-type s) "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
+        ;; Integer scalar params seed *int-vars* so index math stays integer
+        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
         scl-type (fn [s]
                    (let [sname (name s)
                          explicit (get scalar-types s (get scalar-types (symbol sname)))]
                      (cond
-                       (= explicit :int) "int"
+                       (= explicit :int)    "int"
+                       (= explicit :long)   "long"
+                       (= explicit :double) "double"
+                       (= explicit :float)  default-ctype
                        (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
                            (contains? #{'long 'int} (:tag (meta s))))
                        "int"
-                       :else ctype)))
+                       :else default-ctype)))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
-        out-param (str "__global " ctype "* restrict out")
+        out-param (str "__global " out-ctype "* restrict out")
         all-params (str/join ", "
                              (remove empty?
                                      [arr-param-str out-param scl-param-str "int _n_bound"]))
         ;; Emit body as C expression
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
+        adapted-body (ce/adapt-casts-for-dtype body out-dtype)
         body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* ctype]
+                           ce/*scalar-type* out-ctype
+                           ce/*idx-sym* idx
+                           ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
         source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
@@ -79,7 +106,7 @@
      :array-params arr-params
      :scalar-params scl-params
      :out-param out-param
-     :dtype dtype}))
+     :dtype out-dtype}))
 
 ;; ================================================================
 ;; SegRed → OpenCL kernel (two-phase reduction)

@@ -138,7 +138,8 @@
                     (par/expand-par-map! form))
                 (if-let [segmap (par->segmap form dtype)]
                   (let [kernel (segop-cl/generate-segmap-kernel segmap out
-                                                                :dtype dtype :scalar-types top-scalar-types)]
+                                                                :dtype dtype :scalar-types top-scalar-types
+                                                                :array-types (merge top-array-types (:array-types (meta form))))]
                     (let [k (register-kernel! kernel :ze-maps)]
                       (list 'raster.gpu.ze-runtime/invoke-registered-kernel
                             (:kernel-name k)

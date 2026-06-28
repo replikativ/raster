@@ -616,18 +616,12 @@
   Returns a set of array symbols (stripped of metadata)."
   [body-expr]
   (cond
-    (and (seq? body-expr)
-         (descriptor/aget-op? (first body-expr))
-         (>= (count body-expr) 3))
-    #{(let [arr-sym (second body-expr)
-            ;; Unwrap cast wrappers: (double arr) → arr, (float arr) → arr
-            unwrapped (if (and (seq? arr-sym)
-                               (contains? #{'double 'float 'int 'long
-                                            'clojure.core/double 'clojure.core/float} (first arr-sym))
-                               (= 2 (count arr-sym)))
-                        (second arr-sym)
-                        arr-sym)]
-        (if (symbol? unwrapped) (symbol (name unwrapped)) unwrapped))}
+    ;; Recognize both bare (aget arr idx) and devirtualized (.invk aget-impl arr idx);
+    ;; descriptor/aget-array-sym unwraps casts + strips metadata. Recurse into the
+    ;; args too so nested aget reads (and the index expr) are still collected.
+    (descriptor/aget-call? body-expr)
+    (apply set/union #{(descriptor/aget-array-sym body-expr)}
+           (map collect-aget-arrays (descriptor/call-args body-expr)))
 
     (seq? body-expr)
     (apply set/union #{} (map collect-aget-arrays (rest body-expr)))
