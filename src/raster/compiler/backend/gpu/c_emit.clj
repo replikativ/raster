@@ -278,7 +278,8 @@
               (str/replace "*" "_star_")
               (str/replace "/" "_slash_")
               (str/replace "?" "_p")
-              (str/replace "!" "_b"))]
+              (str/replace "!" "_b")
+              (str/replace "'" "_prime"))]   ; Clojure allows ' in symbols (a', x'); C does not
     (if (contains? c-reserved-words s)
       (str s "_")
       s)))
