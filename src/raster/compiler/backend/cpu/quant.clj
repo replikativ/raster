@@ -75,6 +75,82 @@
   [^floats w]
   (quantize-weight w q4-0))
 
+;; ---- K-quants: super-block format (the registry case the legacy params don't cover) ----
+;; A K-quant is a SUPER-BLOCK of 256 split into sub-blocks (32 here), each with its OWN
+;; scale + min, those per-sub-block scales/mins themselves quantized to 6-bit via two
+;; super-block fp scales. Asymmetric: x ≈ (d·aq_j)·q + (dmin·bq_j). This is the same
+;; block→scale→int-MAC skeleton, but the unpack + scale-decode are format-specific (the
+;; "registry" not the flat {bits,pack} params). raster's own layout (not GGUF-byte-exact;
+;; GGUF compat is a loader concern) — proves the pipeline generalizes to super-blocks.
+(def q4-K
+  "Asymmetric 4-bit super-block: 256 elems / 8 sub-blocks of 32; per-sub-block 6-bit
+  scale (aq, unsigned) + 6-bit min (bq, signed); two fp super-scales d (of scales) and
+  dmin (of mins). Reconstruct x = (d·aq)·q + (dmin·bq)."
+  {:name "q4_K" :super-block 256 :subblock 32 :n-subblocks 8
+   :weight-bits 4 :scale-bits 6 :has-dmin true :pack :nibble-interleaved :act-type :i8-K})
+
+(defn quantize-weight-q4k
+  "f32 weight (len % super-block = 0) → the q4-K super-block format:
+   {:wq byte[len/2] (nibbles, w[k] low / w[k+16] high per sub-block)
+    :da float[nsb] :db float[nsb]   (super-block scale-of-scales / scale-of-mins)
+    :aq byte[nsub] :bq byte[nsub]}  (per-sub-block 6-bit scale 0..63 / min -32..31).
+   Weights are quantized against the QUANTIZED sub-scales so encode/decode are consistent."
+  [^floats w {:keys [super-block subblock]}]
+  (let [len (alength w) sbk (long super-block) sub (long subblock)
+        subs-per (quot sbk sub) nsb (quot len sbk) nsub (quot len sub) half (quot sub 2)
+        wq (byte-array (quot len 2))
+        da (float-array nsb) db (float-array nsb)
+        aq (byte-array nsub) bq (byte-array nsub)]
+    (dotimes [sb nsb]
+      (let [sbase (* sb sbk)
+            as (double-array subs-per) bs (double-array subs-per)]
+        ;; 1. per sub-block scale a = (max-min)/15 and min b
+        (dotimes [j subs-per]
+          (let [base (+ sbase (* j sub))
+                lo (loop [i 1 m (aget w base)] (if (< i sub) (recur (inc i) (min m (aget w (+ base i)))) m))
+                hi (loop [i 1 m (aget w base)] (if (< i sub) (recur (inc i) (max m (aget w (+ base i)))) m))]
+            (aset as j (/ (- hi lo) 15.0)) (aset bs j lo)))
+        ;; 2. super-block scales-of-scales, quantize sub scales/mins to 6-bit
+        (let [amax (areduce as i m 0.0 (max m (aget as i)))
+              bmax (areduce bs i m 0.0 (max m (Math/abs (aget bs i))))
+              dav (/ amax 63.0) dbv (/ bmax 31.0)
+              ida (if (zero? dav) 0.0 (/ 1.0 dav))
+              idb (if (zero? dbv) 0.0 (/ 1.0 dbv))]
+          (aset da sb (float dav)) (aset db sb (float dbv))
+          (dotimes [j subs-per]
+            (let [aqj (max 0 (min 63 (Math/round (* (aget as j) ida))))
+                  bqj (max -32 (min 31 (Math/round (* (aget bs j) idb))))
+                  a' (* dav aqj) b' (* dbv bqj)
+                  ia' (if (zero? a') 0.0 (/ 1.0 a'))
+                  base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)]
+              (aset aq sidx (unchecked-byte aqj))
+              (aset bq sidx (unchecked-byte bqj))
+              ;; 3. quantize weights against the QUANTIZED sub scale/min (consistency)
+              (dotimes [k half]
+                (let [q0 (max 0 (min 15 (Math/round (* (- (aget w (+ base k)) b') ia'))))
+                      q1 (max 0 (min 15 (Math/round (* (- (aget w (+ base k half)) b') ia'))))]
+                  (aset wq (+ (quot base 2) k)
+                        (unchecked-byte (bit-or q0 (bit-shift-left q1 4)))))))))))
+    {:wq wq :da da :db db :aq aq :bq bq}))
+
+(defn dequant-q4k
+  "q4-K super-block → f32[len]: x = (da·aq)·q + (db·bq) per sub-block. The inverse of
+  quantize-weight-q4k (raster's own layout); the reference the fused kernel matches."
+  [{:keys [wq da db aq bq]} {:keys [super-block subblock]} len]
+  (let [out (float-array len) sbk (long super-block) sub (long subblock)
+        subs-per (quot sbk sub) nsb (quot len sbk) half (quot sub 2)]
+    (dotimes [sb nsb]
+      (let [sbase (* sb sbk) dav (aget da sb) dbv (aget db sb)]
+        (dotimes [j subs-per]
+          (let [base (+ sbase (* j sub)) sidx (+ (* sb subs-per) j)
+                a' (* dav (aget aq sidx))   ;; aq in [0,63] (positive byte)
+                b' (* dbv (aget bq sidx))]  ;; bq signed
+            (dotimes [k half]
+              (let [bv (bit-and (long (aget wq (+ (quot base 2) k))) 0xFF)]
+                (aset out (+ base k)      (float (+ (* a' (bit-and bv 0xF)) b')))
+                (aset out (+ base k half) (float (+ (* a' (bit-shift-right bv 4)) b')))))))))
+    out))
+
 (defn- quantize-act-blocks!
   "Quantize the 32-element blocks [r0, r0+cnt) of activation x into xq/xs/xsum
   (per-block symmetric int8, d=max/127, with the per-block sum for the -8 fold).
