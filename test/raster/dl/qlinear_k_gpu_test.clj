@@ -125,6 +125,37 @@
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "async bound + sync!")
           (finally (gpu/close-session! sess)))))))
 
+(deftest q4k-dp4a-multi-binding
+  (when (gpu-available?)
+    (testing "two bindings of the SAME kernel with different buffers don't clobber each other"
+      ;; Regression: bind-kernel! sets args on the kernel handle (mutable); reusing one shared
+      ;; handle made the last prepare! win, so every invoke ran the last binding's args. Each
+      ;; binding must get its own handle. Two distinct weights → two y buffers, both must match.
+      (let [out 32 in 256
+            mk (fn [seed-w seed-x]
+                 (let [W (gen (* out in) seed-w) x (gen in seed-x)
+                       {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
+                       {:keys [xq xs bsums]} (q/quantize-act-q8k x in q/q4-K)
+                       ycpu (float-array out)]
+                   (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq ycpu in out 0 out)
+                   {:wp (bytes->ints-le wq) :da da :db db :aq aq :bq bq
+                    :xp (pack-i8 xq) :xs xs :bsums bsums :ycpu ycpu}))
+            a (mk 11 22) b (mk 99 88)
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/alloc! sess {:axp [:int (alength ^ints (:xp a)) (:xp a)] :axs [:float (alength ^floats (:xs a)) (:xs a)] :abs [:int (alength ^ints (:bsums a)) (:bsums a)]
+                            :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
+                            :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)]
+                            :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/invoke-bound! sess :a)
+          (gpu/invoke-bound! sess :b)
+          (is (< (maxerr (:ycpu a) (gpu/download sess :ay)) 1e-3) "binding A correct")
+          (is (< (maxerr (:ycpu b) (gpu/download sess :by)) 1e-3) "binding B correct (not clobbered by A)")
+          (finally (gpu/close-session! sess)))))))
+
 (deftest q4k-dp4a-gpu-matches-cpu
   (when (gpu-available?)
     (testing "Q4_K dp4a kernel on ze:0 (int32-packed nibble-mask trick) == CPU composable"

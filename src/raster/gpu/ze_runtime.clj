@@ -501,6 +501,21 @@
         (swap! state assoc-in [:kernels cache-key] kernel)
         kernel))))
 
+(defn create-kernel-fresh
+  "Create a NEW kernel handle from a module (never cached). Each handle has independent,
+  mutable argument state — use one per pre-bound argument-set so concurrent bindings of the
+  same kernel source don't clobber each other (create-kernel shares one cached handle)."
+  ^MemorySegment [^MemorySegment module ^String kernel-name]
+  (ensure-init!)
+  (let [arena (:arena @state)
+        kern-desc (.allocate ^Arena arena 32)
+        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
+        name-seg (.allocateFrom ^Arena arena kernel-name)
+        _ (.set kern-desc PTR 24 name-seg)
+        kern-out (ptr-seg arena)
+        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
+    (read-ptr kern-out)))
+
 ;; ================================================================
 ;; Memory allocation
 ;; ================================================================
@@ -1700,8 +1715,14 @@
   ([^String kernel-name arrays scalar-args n]
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [{:keys [kernel-handle workgroup-size dtype]
+   (let [{:keys [module workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+         ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
+         ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
+         ;; make every binding of the same kernel clobber the others (the last prepare! wins).
+         ;; A fresh handle per binding gives each its own arg state — required for the decode
+         ;; pattern (N matmuls share one kernel SOURCE but need N independent arg sets).
+         kernel-handle (create-kernel-fresh module kernel-name)
          workgroup-size (long (get opts :workgroup-size workgroup-size))
          n (long n)
          dev-segs (reduce
