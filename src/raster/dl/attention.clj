@@ -390,6 +390,85 @@
                                                                       (recur (inc d)))
                                                                   nil))))))
 
+;; ── Device-side-pos decode variants (#32): pos / cache_len come from 1-element DEVICE
+;; buffers read INSIDE the par body (so each is a kernel array param, not a host scalar baked at
+;; prepare!). The resident graph then binds ONCE and per token the host just writes posbuf/clenbuf
+;; + replays — no re-prepare / re-record. Reading the buffer inside the kernel (vs passing
+;; (aget posbuf 0) as a scalar arg) avoids the CSE-hoist that would otherwise pull the read out to
+;; a host-evaluated scalar-let.
+(deftm rope-pos-buf! (All [T] [x :- (Array T) out :- (Array T)
+                               heads :- Long head-dim :- Long
+                               theta :- Double posbuf :- (Array long)] :- Void
+                          (raster.par/map-void! h heads
+                                                (let [hdim2 (quot head-dim 2)
+                                                      base (clojure.core/* h head-dim)
+                                                      ln-theta (m/log theta)
+                                                      pos (double (aget posbuf 0))]
+                                                  (loop [i 0]
+                                                    (if (< i hdim2)
+                                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                            ang (* pos freq)
+                                                            c (m/cos ang) s (m/sin ang)
+                                                            x0 (aget x (clojure.core/+ base i))
+                                                            x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                        (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                                        (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))
+                                                        (recur (inc i)))
+                                                      nil))))))
+
+(deftm kv-append-buf! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long posbuf :- (Array long)] :- Void
+                           (raster.par/map-void! i kvrow
+                                                 (aset cache (clojure.core/+ (clojure.core/* (aget posbuf 0) kvrow) i)
+                                                       (aget src i)))))
+
+(deftm gqa-decode-attention-buf! (All [T]
+                                      [q :- (Array T) k :- (Array T) v :- (Array T)
+                                       out :- (Array T) sc :- (Array T)
+                                       clenbuf :- (Array long) n-q :- Long group :- Long
+                                       n-kv :- Long head-dim :- Long scale :- Double] :- Void
+                                      (raster.par/map-void! hq n-q
+                                                            (let [cache-len (aget clenbuf 0)
+                                                                  hkv (quot hq group)
+                                                                  qb (clojure.core/* hq head-dim)
+                                                                  scb (clojure.core/* hq cache-len)
+                                                                  kvstride (clojure.core/* n-kv head-dim)
+                                                                  hkvb (clojure.core/* hkv head-dim)
+                                                                  neg-inf -1.0e38
+                                                                  _ (loop [j 0]
+                                                                      (if (< j cache-len)
+                                                                        (let [kb (clojure.core/+ (clojure.core/* j kvstride) hkvb)
+                                                                              dot (loop [d 0 acc 0.0]
+                                                                                    (if (< d head-dim)
+                                                                                      (recur (inc d)
+                                                                                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                                       (aget k (clojure.core/+ kb d)))))
+                                                                                      acc))]
+                                                                          (aset sc (clojure.core/+ scb j) (* dot scale))
+                                                                          (recur (inc j)))
+                                                                        nil))
+                                                                  mx (loop [j 0 mm neg-inf]
+                                                                       (if (< j cache-len)
+                                                                         (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+                                                                  sum (loop [j 0 s 0.0]
+                                                                        (if (< j cache-len)
+                                                                          (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                                                                            (aset sc (clojure.core/+ scb j) e)
+                                                                            (recur (inc j) (+ s e)))
+                                                                          s))
+                                                                  inv (/ 1.0 sum)]
+                                                              (loop [d 0]
+                                                                (if (< d head-dim)
+                                                                  (do (aset out (clojure.core/+ qb d)
+                                                                            (loop [j 0 a 0.0]
+                                                                              (if (< j cache-len)
+                                                                                (let [kvb (clojure.core/+ (clojure.core/* j kvstride) hkvb)]
+                                                                                  (recur (inc j)
+                                                                                         (+ a (* (* (aget sc (clojure.core/+ scb j)) inv)
+                                                                                                 (aget v (clojure.core/+ kvb d))))))
+                                                                                a)))
+                                                                      (recur (inc d)))
+                                                                  nil))))))
+
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
                                             seq-len :- Long dk :- Long dv :- Long]
