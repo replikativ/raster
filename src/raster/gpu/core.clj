@@ -682,25 +682,52 @@
 ;; :output moves down; :constant weights + :state KV stay resident.
 ;; ----------------------------------------------------------------
 
+(defn- typed-scalars-for
+  "Build the ordered, typed scalar arg list for a chain step from the kernel's :scalar-params and
+   the deftm's DECLARED scalar types — so hand-wiring can't mis-order or mis-type. :scalar-params
+   EXCLUDES the par bound (it becomes the work-item count _n_bound, passed separately as :n), and
+   the declared type is what the kernel actually emits (e.g. a Double `scale` is emitted float at
+   :float dtype). scalars = {param-name → value} from the caller, in any order. Mirrors
+   compile-gpu-program's scalar typing (same derive-param-types) — not a special case."
+  [op ki scalars dtype]
+  (let [v (or (resolve-deftm-var op) op)
+        types (:scalar-types (opencl-pass/derive-param-types
+                              (:raster.core/deftm-params (meta v))
+                              (:raster.core/deftm-tags (meta v)) dtype))]
+    (mapv (fn [sp]
+            (let [t (get types sp :float)
+                  raw (if (contains? scalars (name sp)) (get scalars (name sp))
+                          (if (contains? scalars sp) (get scalars sp)
+                              (throw (ex-info (str "chain step for " (:name (meta v))
+                                                   " missing scalar: " sp)
+                                              {:need (:scalar-params ki) :have (keys scalars)}))))]
+              {:type t :value (case t :int (int raw) :long (long raw) :double (double raw) (float raw))}))
+          (:scalar-params ki))))
+
 (defn chain-program!
   "Bind a hand-authored op-chain as one resident command graph.
      buffers: {buf-key → [dtype size init-array-or-nil role]} — role ∈
               #{:constant :state :input :output :scratch} (default :scratch).
      steps:   [{:op #'deftm-var :phase kw
-                :bind {kernel-param-name-string → buf-key}   ; maps EACH array param to a buffer
-                :scalars [typed-scalar-map …] :n work-items}]
+                :bind {kernel-param-name-string → buf-key}   ; EACH array param → a buffer
+                :scalars {param-name → value}                ; NON-bound scalars, any order/raw values
+                :n work-items}]                              ; the par bound (work-item count)
    Allocates the buffers (uploading any init array), compiles each op, prepares each step against
-   the shared buffers, and records the kernel sequence under :chain. run-chain! then replays it."
-  [sess buffers steps]
-  (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
-        roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
-    (alloc! sess specs)
-    (doseq [{:keys [op phase bind scalars n]} steps]
-      (compile! sess phase op)
-      (prepare! sess phase bind (vec scalars) (long n) {:kernel-phase phase}))
-    (record-graph! sess (mapv :phase steps) :chain)
-    (swap! sess assoc :chain-roles roles)
-    sess))
+   the shared buffers (scalars ordered + typed from the kernel signature), and records the kernel
+   sequence under :chain. run-chain! then replays it. dtype defaults :float (GPU decode)."
+  ([sess buffers steps] (chain-program! sess buffers steps :float))
+  ([sess buffers steps dtype]
+   (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
+         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+     (alloc! sess specs)
+     (doseq [{:keys [op phase bind scalars n]} steps]
+       (compile! sess phase op)
+       (let [ki (first (get-in @sess [:kernels phase]))
+             tsc (typed-scalars-for op ki (or scalars {}) dtype)]
+         (prepare! sess phase bind tsc (long n) {:kernel-phase phase})))
+     (record-graph! sess (mapv :phase steps) :chain)
+     (swap! sess assoc :chain-roles roles)
+     sess)))
 
 (defn run-chain!
   "Replay a bound op-chain: refresh the given :input buffers (buffer POINTERS stable), replay the
