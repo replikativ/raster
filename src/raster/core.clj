@@ -250,10 +250,8 @@
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} full-type-env)
         ;; TC binding tags (eager for ftm, deferred for deftm)
         tc-binding-tags (when tc-eager?
-                          (try
-                            (:binding-tags (inf/tc-analyze-deftm-body
-                                            (or fn-label '<ftm>) params annotations body *ns*))
-                            (catch Throwable _ nil)))
+                          (inf/safe-tc-binding-tags
+                           (or fn-label '<ftm>) params annotations body *ns*))
         ;; Walk body with plain type-env (IFn path) — skipped for Julia-model deftm
         walk-opts (cond-> {:type-env plain-type-env :source-ns *ns*}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
@@ -304,18 +302,16 @@
   silently falling back to the deftype impl."
   false)
 
-(defn- jit-walk-with-tc
+(clojure.core/defn ^:no-doc jit-walk-with-tc
   "Walk body with TC binding tags for JIT compilation.
   Julia model: type inference + devirtualization happens at first invocation,
   not at definition time. This gives TC-quality code in the JIT path."
   [source-body params tags annotations source-ns]
   (let [type-env (build-walker-type-env params annotations)
-        tc-binding-tags (try
-                          (:binding-tags (inf/tc-analyze-deftm-body
-                                          '<jit> params annotations source-body source-ns))
-                          (catch Throwable _ nil))
+        tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+    ;; walk-body closes the core (macroexpand-core) at its single canonical point.
     (mapv #(walker/walk-body % walk-opts) source-body)))
 
 (def ^:dynamic *jit-simd?*
@@ -522,8 +518,12 @@
                 clean-params (mapv #(if (symbol? %) (with-meta % nil) %) params)
                 flat-env (into {} (map (fn [p t] [(with-meta p nil) t]) params tags))
                 type-env (reduce-kv (fn [m s t] (assoc m s {:tag t})) {} flat-env)
-                ctx (walker/make-ctx {:type-env type-env :source-ns *ns*})
-                walked (try (walker/walk-forms (vec body) ctx)
+                ;; Walk through walk-body (not raw walk-forms) so each body form is
+                ;; closed to the core (let*/loop*/case*...) like every other walked
+                ;; body — keeps ::deftm-walked-body consumers (inline/op_descriptor/
+                ;; bytecode/GPU) on the same closed-core invariant.
+                walked (try (mapv #(walker/walk-body % {:type-env type-env :source-ns *ns*})
+                                  (vec body))
                             (catch Exception _e nil))]
             [params body tags clean-params walked]))]
     ;; Build the defn form + metadata attachment
@@ -618,8 +618,27 @@
                                 [nil args])
         ;; Detect parametric: (deftm name (All [T] [params...] :- Ret body))
         ;; The All form wraps the entire signature + body
-        parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))]
-    (if parametric?
+        parametric? (and (seq? (first rest-args)) (= 'All (ffirst rest-args)))
+        ;; Detect tree-typed annotations in the param vector — these signal
+        ;; that this deftm uses the tree pipeline (compile-time flattening +
+        ;; structured-arg wrapper). Recognized forms:
+        ;;   (HMap ...)       — bare HMap annotation
+        ;;   (HVec [...])     — bare HVec annotation
+        ;;   (Params <inner>) — back-compat alias; <inner> must be HMap/HVec
+        ;; Forward to raster.params/defmodel which owns that machinery. The
+        ;; user namespace must require raster.params for the resolution to
+        ;; succeed (lazy via requiring-resolve at expansion time below).
+        tree-head? #{'Params 'HMap 'HVec}
+        params-arg? (and (not parametric?)
+                         (vector? (first rest-args))
+                         (some (fn [item]
+                                 (and (sequential? item)
+                                      (tree-head? (first item))))
+                               (first rest-args)))]
+    (cond
+      params-arg?
+      `(raster.params/defmodel ~fn-name ~@(if docstring (cons docstring rest-args) rest-args))
+      parametric?
       ;; === Parametric deftm: register template + generate concrete double ===
       (do
         ;; Guard: body forms outside (All [T] ...) are silently dropped.
@@ -684,6 +703,7 @@
              (deftm ~fn-name ~concrete-params
                ~@(when concrete-ret [:- concrete-ret])
                ~@concrete-body))))
+      :else
       ;; === Normal deftm ===
       (let [param-vec (first rest-args)
             _ (assert (vector? param-vec)
@@ -973,6 +993,42 @@
             (swap! parametric-class-cache assoc fqn cls)
             cls))))
 
+;; Marker interface for parameter container value-classes (the composable unit
+;; for nested model params). Only fields whose type :implements Parameters get
+;; typed-value-class field treatment in defvalue — so GA/Dual/etc. value classes
+;; (GradedAlgebra, …) are unaffected.
+(defabstract Parameters)
+
+(defn- implements-parameters?
+  [^Class cls]
+  (try (.isAssignableFrom (Class/forName "raster.core.Parameters") cls)
+       (catch Throwable _ false)))
+
+(defn- value-class-field-tag
+  "If a defvalue field annotation names a (loaded) value-class that implements
+  Parameters — bare `Name` or `(Array Name)` — return a JVM descriptor string so
+  the generated value class has a TYPED field (a nested Parameters value-class or
+  an array of them) instead of Object. Other types (boxed primitives, GA/Dual
+  value classes, unknown tags) return nil (caller falls back to annotation->tag)."
+  [ann]
+  (let [boxed '#{Double Float Long Integer Short Byte Character Boolean
+                 java.lang.Double java.lang.Float java.lang.Long java.lang.Integer
+                 java.lang.Short java.lang.Byte java.lang.Character java.lang.Boolean}
+        vc   (fn [sym]
+               (when (and (symbol? sym) (not (boxed sym)))
+                 (let [r (try (resolve sym) (catch Exception _ nil))]
+                   (when (and (class? r) (not (.isPrimitive ^Class r))
+                              (implements-parameters? r)) r))))
+        ;; JVM field descriptor string (embeddable in the macro's output; the
+        ;; generator's tag->desc resolves a descriptor string to a ClassDesc).
+        desc (fn [^Class c] (str "L" (.replace (.getName c) "." "/") ";"))]
+    (cond
+      (and (sequential? ann) (= 'Array (first ann)) (vc (second ann)))
+      (str "[" (desc (vc (second ann))))
+      (vc ann)
+      (desc (vc ann))
+      :else nil)))
+
 (defmacro defvalue
   "Define a value type with :- Type annotations. On Valhalla JDK, generates
   real value class bytecode for stack allocation and array flattening. Falls
@@ -1022,11 +1078,17 @@
                                   :let [tag (types/annotation->tag ann p)]
                                   :when (not= tag 'Object)]
                               [(clojure.core/name p) tag]))
-          ;; Build field specs for Valhalla value class generation
+          ;; Build field specs for Valhalla value class generation. Value-class
+          ;; fields (nested Parameters) resolve to a ClassDesc tag so the field
+          ;; is typed (not Object).
           field-specs (mapv (fn [p ann]
                               {:name (clojure.core/name p)
-                               :tag (if ann (types/annotation->tag ann p) 'Object)})
+                               :tag (or (value-class-field-tag ann)
+                                        (if ann (types/annotation->tag ann p) 'Object))})
                             params annotations)
+          ;; A value class with any value-class-typed field is not SoA-eligible
+          ;; (SoA needs primitive-array fields only).
+          has-value-class-field? (boolean (some value-class-field-tag annotations))
           ;; Build hinted params for defrecord fallback (Double→^double, etc.)
           hinted (types/build-record-hinted-params params annotations)
           ;; Parse :implements from opts
@@ -1045,7 +1107,8 @@
                   :else (throw (ex-info "defvalue :implements must be a symbol or vector of symbols"
                                         {:implements implements})))
           ;; SoA companion generation
-          soa-eligible (inf/soa-eligible? field-types)
+          soa-eligible (and (not has-value-class-field?)
+                            (inf/soa-eligible? field-types))
           flat-field-info (when soa-eligible
                             (vec (mapcat (fn [[p ann]]
                                            (when ann
@@ -1124,8 +1187,19 @@
                                                           `(mapv (fn [[p# n#]] (java.lang.constant.ClassDesc/of p# n#)) '~iface-descs)
                                                           []))
                (import '~(symbol class-name))
-               (defn ~factory-sym ~factory-params
-                 (new ~name ~@factory-params))
+               ~(if (<= (count factory-params) 20)
+                  `(defn ~factory-sym ~factory-params
+                     (new ~name ~@factory-params))
+                  ;; Clojure caps fns at 20 positional params; for wide value
+                  ;; classes (e.g. a containerized model with >20 leaf fields)
+                  ;; take varargs and nth-destructure. The JVM `new` (constructor
+                  ;; invoke) itself permits up to 255 args, so the value class is
+                  ;; still built positionally. Callers use (apply factory …).
+                  (let [args-sym (gensym "args__")]
+                    `(defn ~factory-sym [~'& ~args-sym]
+                       (let [~@(mapcat (fn [p i] [p (list 'nth args-sym i)])
+                                       factory-params (range))]
+                         (new ~name ~@factory-params)))))
                (try (clojure.core.typed/-ann
                      ['~(ns-name *ns*) '~(symbol (str (ns-name *ns*)) (str factory-sym))
                       '~tc-ann-form {} nil nil])
@@ -1488,13 +1562,8 @@
         typed-iface-name (symbol (.getName ^Class (:iface-class iface-info)))
         ;; Run TC on the specialized body for binding type inference —
         ;; same as prepare-typed-body does for normal deftm
-        tc-binding-tags (try
-                          (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
-                            (:binding-tags (inf/tc-analyze-deftm-body fn-name params concrete-anns body-vec source-ns)))
-                          (catch Throwable e
-                            (println (str "WARNING: TC analysis failed during parametric specialization of `"
-                                          fn-name "`: " (.getMessage e)))
-                            nil))
+        tc-binding-tags (let [body-vec (if (seq? body-with-types) [body-with-types] (vec body-with-types))]
+                          (inf/safe-tc-binding-tags fn-name params concrete-anns body-vec source-ns))
         ;; Walk the body — same as deftm macro does
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)

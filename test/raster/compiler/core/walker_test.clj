@@ -71,7 +71,8 @@
   (testing "array bindings get type hints"
     (let [walked (wb '(let [buf (double-array 16)] buf))]
       (is (seq? walked))
-      (is (= 'let (first walked)))
+      ;; walk-body closes the core: let -> let* (hint still applied below)
+      (is (= 'let* (first walked)))
       (let [bindings (partition 2 (second walked))
             [sym _init] (first bindings)]
         ;; buf should be hinted as doubles (array type)
@@ -169,8 +170,12 @@
     ;; Regression: a qualified clojure.core/case fell through to the generic-call
     ;; handler, which type-tagged integer keys 0 -> (long 0), later breaking
     ;; clojure.core/case macroexpansion in the backends.
+    ;; NB: walk-body now closes the core (case -> case*), which would bury the keys
+    ;; in the case* hash-table; this regression lives in the *walker*, so test the
+    ;; walker's direct (pre-macroexpand) output where the `case` shape is intact.
     (doseq [head '[case clojure.core/case]]
       (let [form   (list head '(clojure.core/int h) 0 'a 1 'b)
-            walked (wb form {'h 'long 'a 'double 'b 'double})
+            ctx    (walker/make-ctx {:type-env (te {'h 'long 'a 'double 'b 'double})})
+            walked (walker/walk form ctx)
             keys   (map first (partition 2 (drop 2 walked)))]
         (is (= [0 1] keys) (str head " keys stay literal (not (long 0)/(long 1))"))))))

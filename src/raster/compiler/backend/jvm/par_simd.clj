@@ -403,12 +403,20 @@
                                 dtype (or (:elem-type par-info)
                                           (cast->elem-type (:cast par-info))
                                           (out-sym->elem-type (:out par-info))
-                                          :double)
-                                soac (raster.compiler.ir.soac/par-form->soac
-                                      (:out par-info) form (swap! segop-id-counter inc))
-                                segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac :cpu:0 :dtype dtype)]
-                            (first segops))
+                                          :double)]
+                            (when (System/getProperty "raster.debug.simd-dtype")
+                              (binding [*out* *err*]
+                                (println "[par-simd] dtype=" dtype
+                                         " out=" (:out par-info)
+                                         " cast=" (:cast par-info)
+                                         " from-meta=" (:elem-type par-info)
+                                         " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
+                                                         (:tag (meta (:out par-info)))))))
+                            (let [soac (raster.compiler.ir.soac/par-form->soac
+                                        (:out par-info) form (swap! segop-id-counter inc))
+                                  segops (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                          soac :cpu:0 :dtype dtype)]
+                              (first segops)))
                           (catch Exception _ nil)))
           par->segred (fn [form]
                         (try

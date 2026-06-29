@@ -216,12 +216,39 @@
 ;; Maps tag symbol → {:element-cast sym, :compute-cast sym}
 (defonce array-like-registry (atom {}))
 
+;; Leaf-semantics wrappers. Param marks a tunable parameter (gradient target,
+;; SGD updates it). Frozen marks a leaf that participates structurally but is
+;; not a gradient target. Params is the outer marker that signals an arg
+;; should be compile-time-flattened (consumed by raster.compiler.core.params-flatten;
+;; never reaches the JVM signature). All three are transparent for type-tag/hint
+;; computation — they pass through to the inner type's tag.
+(def leaf-wrapper-tags '#{Param Frozen Params})
+
+(defn leaf-wrapper?
+  "True iff annotation is a leaf-semantics wrapper like (Param T) or (Frozen T)."
+  [annotation]
+  (and (sequential? annotation)
+       (contains? leaf-wrapper-tags (first annotation))))
+
+(defn unwrap-leaf-wrapper
+  "Strip Param / Frozen wrappers from annotation, returning the inner type.
+  Transparent for tag/hint computation; the wrapper kind is consumed
+  separately by the flatten pass and the optimizer."
+  [annotation]
+  (if (leaf-wrapper? annotation)
+    (recur (second annotation))
+    annotation))
+
 (defn annotation->tag
   "Convert a typedclojure type annotation to a dispatch tag symbol."
   [annotation param]
   (cond
     (nil? annotation)
     (or (:tag (meta param)) 'Object)
+
+    ;; (Param T) / (Frozen T) — leaf-semantics wrappers, transparent for tags
+    (leaf-wrapper? annotation)
+    (annotation->tag (second annotation) param)
 
     ;; (Array T) — check SoA registry first
     (and (sequential? annotation) (= 'Array (first annotation))
@@ -279,6 +306,7 @@
   [annotation]
   (cond
     (nil? annotation) nil
+    (leaf-wrapper? annotation) (annotation->hint (second annotation))
     (and (sequential? annotation) (= 'Array (first annotation)))
     (get array-elem->tag (second annotation))
     (and (sequential? annotation) (= 'Fn (first annotation)))
@@ -294,6 +322,7 @@
   [annotation]
   (cond
     (nil? annotation) nil
+    (leaf-wrapper? annotation) (annotation->return-hint (second annotation))
     (and (sequential? annotation) (= 'Array (first annotation)))
     (get array-elem->tag (second annotation))
     (= annotation 'Void) nil
@@ -323,6 +352,7 @@
   [annotation]
   (cond
     (nil? annotation) nil
+    (leaf-wrapper? annotation) (annotation->record-hint (second annotation))
     (and (sequential? annotation) (= 'Array (first annotation)))
     (get array-elem->tag (second annotation))
     (= annotation 'Void) nil
@@ -345,6 +375,7 @@
   [annotation]
   (cond
     (nil? annotation) nil
+    (leaf-wrapper? annotation) (annotation->prim-hint (second annotation))
     (and (sequential? annotation) (= 'Array (first annotation)))
     (let [tag (get array-elem->tag (second annotation))]
       (when (not= tag 'objects) tag))

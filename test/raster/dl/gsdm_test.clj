@@ -3,6 +3,7 @@
             [raster.dl.gsdm :as gsdm]
             [raster.dl.nn :as nn]
             [raster.dl.diffusion :as diff]
+            [raster.params :as rp]
             [raster.compiler.pipeline :as pipeline]
             [raster.linalg.blas :as blas]))
 
@@ -354,30 +355,6 @@
       (is (arr-finite? pred)))))
 
 ;; ================================================================
-;; Training step
-;; ================================================================
-
-(deftest gsdm-train-step-test
-  (testing "training step produces finite loss"
-    (let [n-vars 4 n-edges 12 n-spaces 1
-          cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces n-spaces)
-          weights (gsdm/init-gsdm-weights cfg)
-          x0 (double-array [1.0 0.0 1.0 0.0])
-          spaces (long-array [0 0 0 0])
-          states (long-array [gsdm/LATENT gsdm/LATENT gsdm/LATENT gsdm/LATENT])
-          src-edges (long-array [0 0 0 1 1 1 2 2 2 3 3 3])
-          dst-edges (long-array [1 2 3 0 2 3 0 1 3 0 1 2])
-          rng (java.util.Random. 42)
-          betas (diff/linear-beta-schedule 100 0.0001 0.005)
-          alphas-cumprod (diff/compute-alphas-cumprod betas)
-          loss (gsdm/gsdm-train-step! weights cfg x0 spaces states
-                                      src-edges dst-edges n-vars n-edges
-                                      0.001 rng alphas-cumprod)]
-      (is (Double/isFinite loss))
-      (is (>= loss 0.0))
-      (println "  Training step loss:" loss))))
-
-;; ================================================================
 ;; GPU kernel codegen tests
 ;; ================================================================
 
@@ -451,153 +428,69 @@
                  (max 0.01 (* 0.002 (Math/abs (aget input i)))))))))))
 
 ;; ================================================================
-;; Code-generated deftm
+;; Tree-based defmodel + compile-train-step (new params API)
 ;; ================================================================
 
-(deftest gen-gsdm-body-test
-  (testing "code generation produces valid body and param ordering"
-    (let [order (gsdm/weight-param-order 2)]
-      ;; 12 non-layer + 36 layer = 48
-      (is (= 48 (count order)))
-      ;; First 4 are temb
-      (is (= 'temb-W1 (first order)))
-      ;; embed-state is in the list
-      (is (some #{'embed-state} order))
-      ;; Last are layer-1 attention
-      (is (= 'l1-attn-b (last order))))
-    ;; All params (weights + data)
-    (let [all (gsdm/all-param-order 2)]
-      ;; 48 weights + 10 data = 58
-      (is (= 58 (count all)))
-      ;; pos-emb is in data params
-      (is (some #{'pos-emb} all)))))
-
-(deftest weights-map->args-test
-  (testing "weights-map->args produces correct ordering"
-    (let [cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces 1)
+(deftest ^:compiled gsdm-defmodel-forward-matches-dynamic
+  (testing "compile-aot of make-gsdm-loss matches gsdm-forward-dynamic"
+    (let [n-vars 4 n-edges 12 n-spaces 1 emb-dim 8 n-heads 2 n-layers 2
+          cfg (gsdm/make-gsdm-config :n-layers n-layers :emb-dim emb-dim
+                                     :n-heads n-heads :n-spaces n-spaces)
           weights (gsdm/init-gsdm-weights cfg)
-          args (gsdm/weights-map->args weights 2)]
-      (is (= 48 (count args)))
-      (is (every? #(instance? (Class/forName "[D") %) args)))))
-
-(deftest gsdm-walk-body-test
-  (testing "walker processes generated body without errors"
-    (let [walked (gsdm/walk-gsdm-body 2 8 2 1)]
-      (is (seq? walked))
-      (is (contains? #{'let 'let*} (first walked)))
-      (println "  Walked body head:" (first walked)))))
-
-(deftest gsdm-walked-forward-test
-  (testing "walked body produces finite loss"
-    (let [n-vars 4 n-edges 12 n-spaces 1
-          cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces n-spaces)
-          weights (gsdm/init-gsdm-weights cfg)
-          walked (gsdm/walk-gsdm-body 2 8 2 1)
-          all-params (gsdm/all-param-order 2)
-          args-sym 'args__
-          bindings (vec (mapcat (fn [i p] [p (list 'nth args-sym i)]) (range) all-params))
-          f (eval (list 'fn ['& args-sym] (list 'let* bindings walked)))
-          weight-args (gsdm/weights-map->args weights 2)
-          values (double-array [0.1 -0.3 0.5 -0.2])
-          spaces (long-array [0 0 0 0])
-          target (double-array [0.1 -0.3 0.5 -0.2])
-          states (long-array [gsdm/LATENT gsdm/LATENT gsdm/LATENT gsdm/LATENT])
-          pos-emb (gsdm/compute-position-embeddings spaces n-vars 8)
-          src-edges (long-array [0 0 0 1 1 1 2 2 2 3 3 3])
-          dst-edges (long-array [1 2 3 0 2 3 0 1 3 0 1 2])
-          all-args (concat weight-args [values spaces target states pos-emb
-                                        src-edges dst-edges 50.0
-                                        (long n-vars) (long n-edges)])
-          loss (apply f all-args)]
-      (is (Double/isFinite loss))
-      (is (>= loss 0.0))
-      (println "  Walked forward loss:" loss))))
-
-(deftest ^:compiled gsdm-compiled-train-test
-  (testing "compiled training matches interpreted forward loss"
-    (let [n-vars 4 n-edges 12 n-spaces 1
-          cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces n-spaces)
-          {:keys [train-fn param-order]}
-          (gsdm/compile-gsdm-train-fn :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces n-spaces)
+          w-tree  (gsdm/flat->tree weights n-layers)
           x0 (double-array [1.0 0.0 1.0 0.0])
           spaces (long-array [0 0 0 0])
-          states (long-array [gsdm/LATENT gsdm/LATENT gsdm/LATENT gsdm/LATENT])
+          states (long-array (repeat n-vars gsdm/LATENT))
           src-edges (long-array [0 0 0 1 1 1 2 2 2 3 3 3])
           dst-edges (long-array [1 2 3 0 2 3 0 1 3 0 1 2])
-          betas (diff/linear-beta-schedule 100 0.0001 0.005)
-          alphas-cumprod (diff/compute-alphas-cumprod betas)
-          rng (java.util.Random. 42)
-          t-val (long (.nextInt rng 100))
-          alpha-t (aget ^doubles alphas-cumprod t-val)
-          sqrt-a (Math/sqrt alpha-t)
-          sqrt-1ma (Math/sqrt (- 1.0 alpha-t))
-          noise (double-array n-vars)
-          _ (dotimes [i n-vars] (aset noise i (.nextGaussian rng)))
-          x-t (double-array n-vars)
-          _ (dotimes [i n-vars]
-              (aset x-t i (+ (* sqrt-a (aget ^doubles x0 i))
-                             (* sqrt-1ma (aget noise i)))))
-          pos-emb (gsdm/compute-position-embeddings spaces n-vars 8)
-          ;; Interpreted forward
-          weights-interp (gsdm/init-gsdm-weights cfg)
-          pred-interp (gsdm/gsdm-forward-dynamic weights-interp cfg x-t spaces states
-                                                 (double t-val) src-edges dst-edges n-vars n-edges)
-          interp-loss (let [sum (loop [i 0 acc 0.0 cnt 0]
-                                  (if (< i n-vars)
-                                    (let [d (- (aget ^doubles pred-interp i) (aget ^doubles x0 i))]
-                                      (recur (inc i) (+ acc (* d d)) (inc cnt)))
-                                    (if (pos? cnt) (/ acc cnt) 0.0)))]
-                        sum)
-          ;; Compiled forward (lr=0 so no weight updates)
-          weights-comp (gsdm/init-gsdm-weights cfg)
-          w-args (gsdm/weights-map->args weights-comp 2)
-          {:keys [m-arrays v-arrays]} (gsdm/init-adam-state weights-comp 2)
-          compiled-loss (double (apply train-fn
-                                       (concat w-args [x-t spaces x0 states pos-emb
-                                                       src-edges dst-edges
-                                                       (double t-val) (double n-vars) (double n-edges)]
-                                               m-arrays v-arrays
-                                               [0.0 0.9 0.999 1e-8 1.0 1])))]
-      (println "  Interpreted loss:" interp-loss)
-      (println "  Compiled loss:   " compiled-loss)
-      (is (< (Math/abs (- compiled-loss interp-loss)) 1e-6)
-          "Compiled loss should match interpreted")))
+          pos-emb (gsdm/compute-position-embeddings spaces n-vars emb-dim)
+          t-val 50.0
+          ;; Reference: dynamic forward + manual MSE
+          pred-dyn (gsdm/gsdm-forward-dynamic weights cfg x0 spaces states
+                                              t-val src-edges dst-edges
+                                              n-vars n-edges)
+          ref-loss (let [acc (atom 0.0)]
+                     (dotimes [i n-vars]
+                       (let [d (- (aget ^doubles pred-dyn i) (aget ^doubles x0 i))]
+                         (swap! acc + (* d d))))
+                     (/ @acc (double n-vars)))
+          ;; defmodel + compile-aot
+          model    (gsdm/make-gsdm-loss {:n-layers n-layers :emb-dim emb-dim
+                                         :n-heads n-heads :n-spaces n-spaces})
+          fast     (rp/compile-aot model)
+          model-loss (fast w-tree x0 spaces x0 states pos-emb
+                           src-edges dst-edges t-val n-vars n-edges)]
+      (is (< (Math/abs (- model-loss ref-loss)) 1e-9)
+          (format "compile-aot model loss %.6f matches reference %.6f"
+                  model-loss ref-loss)))))
 
-  (testing "compiled training converges over 5 steps"
-    (let [n-vars 4 n-edges 12
-          cfg (gsdm/make-gsdm-config :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces 1)
-          {:keys [train-fn]} (gsdm/compile-gsdm-train-fn :n-layers 2 :emb-dim 8 :n-heads 2 :n-spaces 1)
+(deftest ^:compiled gsdm-fused-train-step-converges
+  (testing "rp/compile-train-step with the new tree API converges"
+    (let [n-vars 4 n-edges 12 n-spaces 1 emb-dim 8 n-heads 2 n-layers 2
+          cfg (gsdm/make-gsdm-config :n-layers n-layers :emb-dim emb-dim
+                                     :n-heads n-heads :n-spaces n-spaces)
           weights (gsdm/init-gsdm-weights cfg)
+          w     (gsdm/flat->tree weights n-layers)
+          model (gsdm/make-gsdm-loss {:n-layers n-layers :emb-dim emb-dim
+                                      :n-heads n-heads :n-spaces n-spaces})
+          ts    (rp/compile-train-step model)
+          state ((:init-state ts) w)
+          train-fn (:train-fn ts)
           x0 (double-array [1.0 0.0 1.0 0.0])
           spaces (long-array [0 0 0 0])
-          states (long-array [gsdm/LATENT gsdm/LATENT gsdm/LATENT gsdm/LATENT])
+          states (long-array (repeat n-vars gsdm/LATENT))
           src-edges (long-array [0 0 0 1 1 1 2 2 2 3 3 3])
           dst-edges (long-array [1 2 3 0 2 3 0 1 3 0 1 2])
-          betas (diff/linear-beta-schedule 100 0.0001 0.005)
-          alphas-cumprod (diff/compute-alphas-cumprod betas)
-          w-args (gsdm/weights-map->args weights 2)
-          {:keys [m-arrays v-arrays]} (gsdm/init-adam-state weights 2)
-          ;; Use same noise/timestep for each step so losses are comparable
-          rng (java.util.Random. 42)
-          t-val (long (.nextInt rng 100))
-          alpha-t (aget ^doubles alphas-cumprod t-val)
-          sqrt-a (Math/sqrt alpha-t)
-          sqrt-1ma (Math/sqrt (- 1.0 alpha-t))
-          noise (double-array n-vars)
-          _ (dotimes [i n-vars] (aset noise i (.nextGaussian rng)))
-          x-t (double-array n-vars)
-          _ (dotimes [i n-vars]
-              (aset x-t i (+ (* sqrt-a (aget ^doubles x0 i))
-                             (* sqrt-1ma (aget noise i)))))
-          pos-emb (gsdm/compute-position-embeddings spaces n-vars 8)
-          losses (mapv (fn [step]
-                         (double (apply train-fn
-                                        (concat w-args [x-t spaces x0 states pos-emb
-                                                        src-edges dst-edges
-                                                        (double t-val) (double n-vars) (double n-edges)]
-                                                m-arrays v-arrays
-                                                [0.001 0.9 0.999 1e-8 1.0 (inc step)]))))
-                       (range 5))]
-      (println "  Training losses:" losses)
-      (is (every? #(Double/isFinite %) losses) "All losses should be finite")
-      (is (< (last losses) (first losses)) "Loss should decrease over training"))))
+          pos-emb (gsdm/compute-position-embeddings spaces n-vars emb-dim)
+          losses (vec (for [step (range 1 6)]
+                        (train-fn w (:m state) (:v state)
+                                  x0 spaces x0 states pos-emb
+                                  src-edges dst-edges 50.0 n-vars n-edges
+                                  1.0    ;; max-grad-norm
+                                  0.001  ;; lr
+                                  0.9 0.999 1e-8 step)))]
+      (println "  losses:" (mapv #(format "%.4f" %) losses))
+      (is (every? Double/isFinite losses))
+      (is (< (last losses) (first losses))
+          (format "loss[5]=%.4f should be < loss[1]=%.4f"
+                  (last losses) (first losses))))))

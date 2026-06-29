@@ -68,7 +68,8 @@
       (let [body (first walked-body)]
         ;; Case 1: body is a direct pure alloc call (zeros-like, double-array)
         ;; Returns: just the pre-allocated buffer (no compute body)
-        (if (and (seq? body) (not= 'let (first body)) (array-alloc-size body))
+        ;; (walked body is closed-core: let -> let*)
+        (if (and (seq? body) (not (contains? #{'let 'let*} (first body))) (array-alloc-size body))
           (let [param-set (set params)
                 size (array-alloc-size body)]
             (when (param-derived? size param-set {})
@@ -93,7 +94,8 @@
                                    (list alloc-ctor resolved-size))))
                  :rewrite-fn (fn [_args buf-sym] buf-sym)})))
           ;; Case 2: body is a let form with alloc-return pattern
-          (when (and (seq? body) (= 'let (first body)))
+          ;; (walked body is closed-core: let -> let*)
+          (when (and (seq? body) (contains? #{'let 'let*} (first body)))
             (let [[_ bindings & body-exprs] body
                   pairs (vec (partition 2 bindings))
                   binding-map (into {} (map vec pairs))

@@ -132,6 +132,23 @@
          (or (not= :pure effect)
              (seq flags)))))
 
+(defn- escaping-array-alias-init?
+  "True if `init` binds a local to an ALIAS of escaping/caller-owned array memory:
+   an array-element read `(aget src k)` or a value-class field read `(.-field src)`
+   where `src` is a FREE symbol (a parameter or outer binding, not bound by this
+   let). The bound local then shares identity with memory reachable from the
+   caller, so an in-place mutation of it is externally observable and must survive
+   DCE — exactly the reason function parameters are seeded live. (When `src` is
+   bound locally, the alias doesn't escape and normal in-let liveness applies.)
+   Used to keep a `leaf = (aget params-container k)` + its in-place optimizer
+   update from being silently eliminated."
+  [init bound-syms]
+  (and (seq? init) (symbol? (first init)) (>= (count init) 2)
+       (symbol? (second init))
+       (not (contains? bound-syms (second init)))
+       (or (.startsWith (name (first init)) ".")                  ; .field / .-field / (. obj field) — value-class field access (any interop form)
+           (contains? '#{aget clojure.core/aget raster.arrays/aget} (first init)))))
+
 (defn eliminate-dead-bindings
   "Remove dead bindings from a flat let* form.
    Effectful bindings are preserved only when their side effects are
@@ -156,8 +173,19 @@
                   (clojure.set/union body-free binding-free)
                   bound-syms)
         live (atom (clojure.set/union body-free let-free))
+        ;; All symbols mutated anywhere in this let (handles aset, par mutations,
+        ;; and inlined optimizer .invk/dotimes bodies via extract-mutation-targets).
+        all-mut-targets (apply clojure.set/union #{}
+                               (map #(extract-mutation-targets (second %)) pairs))
         _ (doseq [[sym expr] pairs]
             (when (or (root-pred sym)
+                      ;; A local that ALIASES escaping array memory (a leaf read
+                      ;; out of a caller-owned params container) and is MUTATED
+                      ;; in-place: its write is externally observable, so seed it
+                      ;; live like a parameter — otherwise the alias binding and
+                      ;; its optimizer update are both silently DCE'd.
+                      (and (contains? all-mut-targets sym)
+                           (escaping-array-alias-init? expr bound-syms))
                       ;; Only seed opaque effects (no identifiable mutation targets).
                       ;; Mutation effects are handled by mutates-live? in the backward pass.
                       (and (keep-unconditionally? expr)

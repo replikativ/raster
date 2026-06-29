@@ -249,6 +249,16 @@
       (vec (concat (map raster-ann->tc-type param-types) [:-> (raster-ann->tc-type ret-type)])))
     ann))
 
+(def ^:dynamic *tc-warn-on-error?*
+  "When true, surface every reason Typed Clojure failed to produce binding types
+  (an analysis exception, a TCError return type, or reported type-errors) instead
+  of silently falling back to the walker's structural inference. Off by default:
+  TC failure is non-fatal (devirtualization still proceeds via structural
+  heuristics, just less precisely), but enabling this makes the failures visible
+  for diagnosis — e.g. the source-ns resolution holes that silently discard all
+  binding types and regress devirtualization."
+  false)
+
 (defn tc-analyze-deftm-body
   "Analyze a deftm body once with Typed Clojure.
 
@@ -296,13 +306,19 @@
                                    nil)))))]
         (when result
           (when (and (seq (:type-errors result))
-                     (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref))
+                     (or *tc-warn-on-error?*
+                         (some-> (resolve 'raster.core/*warn-on-boxed-dispatch*) deref)))
             (binding [*out* *err*]
               (println (str "TC type errors in `" fn-name "` (may cause boxed dispatch): "
                             (str/join "; " (map #(-> % ex-data :message (or (str %)))
                                                 (:type-errors result)))))))
           (when (empty? (:type-errors result))
             (let [ret-type (:t (:ret result))]
+              (when (and *tc-warn-on-error?*
+                         (= "TCError" (some-> ret-type type .getSimpleName)))
+                (binding [*out* *err*]
+                  (println (str "[raster.tc] `" fn-name "` returned TCError — binding types "
+                                "discarded, structural fallback used (check source-ns resolution)."))))
               (when-not (= "TCError" (some-> ret-type type .getSimpleName))
                 (let [fn-int (first (:types ret-type))
                       f (first (:types fn-int))
@@ -322,8 +338,27 @@
                   {:ret-tag (when rng (tc-type->tag rng))
                    :stability-warning stability-warning
                    :binding-tags (or binding-tags {})})))))))
-    (catch Exception _
+    (catch Exception e
       ;; TC analysis failure — fall through to walker heuristics
+      (when *tc-warn-on-error?*
+        (binding [*out* *err*]
+          (println (str "[raster.tc] analysis threw for `" fn-name "` — falling back to "
+                        "structural inference: " (.getMessage e)))))
+      nil)))
+
+(defn safe-tc-binding-tags
+  "Run TC binding-type analysis, returning {sym → tag} or nil on failure. TC
+  failure is non-fatal (callers fall back to structural inference); set
+  *tc-warn-on-error?* to surface the cause. Single entry point so every call
+  site shares the same fallback + diagnostics policy."
+  [fn-name params annotations body source-ns]
+  (try
+    (:binding-tags (tc-analyze-deftm-body fn-name params annotations body source-ns))
+    (catch Throwable e
+      (when *tc-warn-on-error?*
+        (binding [*out* *err*]
+          (println (str "[raster.tc] binding-tag analysis failed for `" fn-name "`: "
+                        (.getMessage e)))))
       nil)))
 
 (defn- desugar-invk-for-tc
@@ -1501,7 +1536,14 @@
                               (name expr))
                       :else
                       (if-let [v (try (ns-resolve source-ns expr) (catch Exception _ nil))]
-                        (symbol (str (.name (.ns v))) (str (.sym v)))
+                        (cond
+                          ;; var: qualify to ns/sym
+                          (var? v) (symbol (str (.name (.ns ^clojure.lang.Var v)))
+                                           (str (.sym ^clojure.lang.Var v)))
+                          ;; bare class name (e.g. macroexpand canonicalized (X. a)
+                          ;; -> (new X a), exposing X): qualify to its FQN
+                          (class? v) (symbol (.getName ^Class v))
+                          :else expr)
                         expr))
                     (seq? expr)
                     (let [h (first expr)]
@@ -1546,15 +1588,42 @@
 ;; Late-pipeline type inference (moved from inline.clj to break cycle)
 ;; ================================================================
 
+(defn- var-ref-tag
+  "Type tag for a QUALIFIED symbol that resolves to a constant Var — taken from
+  the var's declared `:tag` (e.g. `(def ^{:tag 'double} pi ...)`) or, for a
+  `:const` var, its numeric value's class. Returns nil for functions, generic
+  dispatch vars, classes, and untagged non-const vars.
+
+  This is the robust path for typing references to numeric constants like
+  `raster.numeric/pi`: it does not depend on the (context-sensitive) constant
+  fold firing — the declared tag alone lets dispatch on the reference
+  devirtualize. Only consulted as a fallback after env + symbol metadata miss."
+  [sym]
+  (try
+    (when-let [v (resolve sym)]
+      (when (and (var? v) (not (:raster.core/generic-function (meta v))))
+        (let [m (meta v)
+              t (:tag m)]
+          (cond
+            (contains? '#{double float long int} t) t
+            (:const m) (condp instance? @v
+                         Double 'double
+                         Float  'float
+                         Long   'long
+                         Integer 'int
+                         nil)))))
+    (catch Throwable _ nil)))
+
 (defn infer-arg-tag
   "Infer the type tag of an expression in the late pipeline.
-   Priority: env lookup → :tag metadata → structural analysis.
+   Priority: env lookup → :tag metadata → resolved-var tag → structural analysis.
    Metadata-based inference is the primary mechanism."
   [expr env]
   (cond
     (symbol? expr) (or (get env expr)
                        (:raster.type/tag (meta expr))
-                       (:tag (meta expr)))
+                       (:tag (meta expr))
+                       (when (namespace expr) (var-ref-tag expr)))
     (number? expr) (condp instance? expr
                      Double 'double
                      Float 'float

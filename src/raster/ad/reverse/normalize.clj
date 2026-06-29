@@ -6,7 +6,8 @@
    - If-expression branches are lifted to separate bindings
    - Body is reduced to a single symbol
 
-   This is required before the reverse pass can track operations.")
+   This is required before the reverse pass can track operations."
+  (:require [raster.compiler.ir.form :as form]))
 
 (defn trivial-expr?
   "True if expr is simple enough to not need its own binding."
@@ -49,8 +50,12 @@
                 [le ln] (anf-normalize-expr last-expr gensym-fn)]
             [(vec (concat @extras le)) ln]))
 
-        ;; Let/let*/loop/loop*/dotimes: structural forms, pass through unchanged
-        (#{'let 'let* 'loop 'loop* 'dotimes} head)
+        ;; Scope-introducing forms (let*/loop*/dotimes/fn*/ftm AND every par/*
+        ;; SOAC) pass through unchanged — their bodies bind their own locals (loop
+        ;; index, accumulator), so lifting a sub-expr OUT of the scope would let a
+        ;; scoped var escape. Use the unified scope classifier, not a hardcoded set,
+        ;; so par forms are covered (and any new binder is automatically handled).
+        (or (form/binding-form? expr) (form/introduces-scope? expr))
         [[] expr]
 
         ;; Regular call: lift non-trivial args

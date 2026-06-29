@@ -314,13 +314,28 @@
              simplified-body
              form))
          remapped-body)]
-    ;; Build the fused 2D structure writing to consumer's output
-    (list 'dotimes [outer-idx outer-bound]
-          (list* 'raster.par/map!
-                 cons-out inner-idx inner-bound
-                 :offset offset
-                 cons-cast
-                 [fused-body]))))
+    ;; Build the fused 2D structure writing to consumer's output.
+    ;; Stamp :raster.type/elem-type on the par/map! so downstream SIMD codegen
+    ;; picks the right Vector species (else falls back to :double, breaking
+    ;; f32 with [F → [D cast at runtime).
+    (let [elem-type (case cons-cast
+                      (float clojure.core/float) :float
+                      (double clojure.core/double) :double
+                      (long clojure.core/long) :long
+                      (int clojure.core/int) :int
+                      (case (or (:raster.type/tag (meta cons-out)) (:tag (meta cons-out)))
+                        floats :float
+                        doubles :double
+                        longs :long
+                        ints :int
+                        nil))
+          map-form (cond-> (list* 'raster.par/map!
+                                  cons-out inner-idx inner-bound
+                                  :offset offset
+                                  cons-cast
+                                  [fused-body])
+                     elem-type (with-meta {:raster.type/elem-type elem-type}))]
+      (list 'dotimes [outer-idx outer-bound] map-form))))
 
 (defn fuse-write-read
   "Main entry point: fuse 2D producer → 1D consumer patterns in let* bindings.

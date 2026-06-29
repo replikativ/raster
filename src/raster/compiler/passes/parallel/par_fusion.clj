@@ -184,8 +184,13 @@
                                 partners)
                           ;; Primary body is last in do block
                           fused-body (list* 'do (concat side-effects [(:body info-i)]))
-                          fused-expr (list 'raster.par/map! (:out info-i) idx
-                                           (:bound info-i) (:cast info-i) fused-body)
+                          ;; Preserve :raster.type/elem-type from the primary form so
+                          ;; downstream SIMD codegen picks the right Vector species
+                          ;; (else falls back to :double — breaks f32 with [F → [D cast).
+                          orig-meta (meta expr)
+                          fused-expr (cond-> (list 'raster.par/map! (:out info-i) idx
+                                                   (:bound info-i) (:cast info-i) fused-body)
+                                       orig-meta (with-meta orig-meta))
                           new-skip (set (map :index partners))]
                       (recur (inc i)
                              (conj result [sym fused-expr])

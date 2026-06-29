@@ -135,13 +135,10 @@
                 source-ns (or (the-ns (:ns m)) target-ns)
             ;; TC binding tags for the specialized body (concrete types now known)
                 tc-binding-tags
-                (try
-                  (let [params (mapv #(with-meta % nil) (remove #{'&} source-params))
-                        tags (mapv #(or (:tag (meta %)) 'Object) (remove #{'&} source-params))
-                        annotations (mapv (fn [t] (if (= t 'Object) nil t)) tags)
-                        result (inf/tc-analyze-deftm-body '<specialize> params annotations source-body source-ns)]
-                    (:binding-tags result))
-                  (catch Throwable _ nil))
+                (let [params (mapv #(with-meta % nil) (remove #{'&} source-params))
+                      tags (mapv #(or (:tag (meta %)) 'Object) (remove #{'&} source-params))
+                      annotations (mapv (fn [t] (if (= t 'Object) nil t)) tags)]
+                  (inf/safe-tc-binding-tags '<specialize> params annotations source-body source-ns))
             ;; Walk the body with unified type-env + TC binding tags
                 walked-body (binding [*ns* source-ns]
                               (mapv #(walk-body % (cond-> {:type-env type-env :source-ns source-ns}

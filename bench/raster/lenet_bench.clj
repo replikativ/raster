@@ -1,102 +1,45 @@
 (ns raster.lenet-bench
-  "LeNet-5 MNIST training benchmark.
-  Uses value+grad for reverse-mode AD + compile-aot for JIT.
+  "LeNet-5 MNIST training benchmark — single-sample SGD, f64.
+
+  Uses raster.params/compile-train-step with :optimizer :sgd. A deftm with
+  HMap-typed weight args expands at compile time into a flat-arg deftm;
+  compile-train-step fuses value+grad + grad-clip + the per-leaf SGD
+  update into one bytecoded train kernel.
 
   Run: clojure -J--add-modules=jdk.incubator.vector -M:bench -m raster.lenet-bench"
-  (:require [raster.core :refer [deftm]]
+  (:require [raster.core :as core]
             [raster.nn :as nn]
             [raster.dl.nn :as dl]
             [raster.dl.lenet :as lenet]
-            [raster.dl.optim :as optim]
             [raster.arrays :as arrays]
-            [raster.ad.reverse :as rev]
-            [raster.compiler.pipeline :as pipeline])
-  (:import [java.io DataInputStream]
-           [java.util Random]
-           [java.util.zip GZIPInputStream]))
+            [raster.params :as rp]
+            [raster.mnist-data :as data])
+  (:import [java.util Random]))
 
 ;; ================================================================
-;; IDX file parsing
+;; Loss model — structured weights, fused train step via compile-train-step
 ;; ================================================================
 
-(defn- parse-idx-images [^String path]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [magic (.readInt dis)
-          _     (assert (= magic 2051))
-          n     (.readInt dis)
-          rows  (.readInt dis)
-          cols  (.readInt dis)
-          dim   (* rows cols)]
-      (mapv (fn [_]
-              (let [arr (double-array dim)]
-                (dotimes [j dim]
-                  (aset arr j (/ (double (Byte/toUnsignedInt (.readByte dis))) 255.0)))
-                arr))
-            (range n)))))
-
-(defn- parse-idx-labels [^String path]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [magic (.readInt dis)
-          _     (assert (= magic 2049))
-          n     (.readInt dis)]
-      (mapv (fn [_]
-              (let [label (Byte/toUnsignedInt (.readByte dis))
-                    arr   (double-array 10)]
-                (aset arr label 1.0)
-                arr))
-            (range n)))))
-
-(defn- parse-idx-labels-int [^String path]
-  (with-open [dis (DataInputStream. (GZIPInputStream. (java.io.FileInputStream. path)))]
-    (let [magic (.readInt dis)
-          _     (assert (= magic 2049))
-          n     (.readInt dis)
-          arr   (int-array n)]
-      (dotimes [i n] (aset arr i (Byte/toUnsignedInt (.readByte dis))))
-      arr)))
+(core/deftm lenet-loss
+  [w :- (HMap :mandatory
+              {:conv1-W (Param (Array double)) :conv1-b (Param (Array double))
+               :conv2-W (Param (Array double)) :conv2-b (Param (Array double))
+               :fc1-W   (Param (Array double)) :fc1-b   (Param (Array double))
+               :fc2-W   (Param (Array double)) :fc2-b   (Param (Array double))})
+   x :- (Array double) y :- (Array double)] :- Double
+  (lenet/lenet-loss-fn (:conv1-W w) (:conv1-b w) (:conv2-W w) (:conv2-b w)
+                       (:fc1-W w) (:fc1-b w) (:fc2-W w) (:fc2-b w)
+                       x y))
 
 ;; ================================================================
-;; Train step: value+grad of lenet loss + SGD update
+;; Forward path for evaluation (lazy JIT — only used to predict accuracy
+;; off the test set, never on the hot training loop)
 ;; ================================================================
-
-(deftm train-step
-  [conv1-W :- (Array double) conv1-b :- (Array double)
-   conv2-W :- (Array double) conv2-b :- (Array double)
-   fc1-W :- (Array double) fc1-b :- (Array double)
-   fc2-W :- (Array double) fc2-b :- (Array double)
-   x :- (Array double) y :- (Array double)
-   lr :- Double] :- Double
-  (let [vg ((rev/value+grad (var lenet/lenet-loss-fn))
-            conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b x y)
-        loss (nth vg 0)]
-    ;; SGD update all 8 weight arrays (indices 1-8 in gradient vector)
-    (optim/sgd-step! conv1-W (nth vg 1) (arrays/alength conv1-W) lr)
-    (optim/sgd-step! conv1-b (nth vg 2) (arrays/alength conv1-b) lr)
-    (optim/sgd-step! conv2-W (nth vg 3) (arrays/alength conv2-W) lr)
-    (optim/sgd-step! conv2-b (nth vg 4) (arrays/alength conv2-b) lr)
-    (optim/sgd-step! fc1-W   (nth vg 5) (arrays/alength fc1-W)   lr)
-    (optim/sgd-step! fc1-b   (nth vg 6) (arrays/alength fc1-b)   lr)
-    (optim/sgd-step! fc2-W   (nth vg 7) (arrays/alength fc2-W)   lr)
-    (optim/sgd-step! fc2-b   (nth vg 8) (arrays/alength fc2-b)   lr)
-    loss))
-
-;; ================================================================
-;; Model init + evaluation
-;; ================================================================
-
-(defn- init-lenet [^Random rng]
-  {:conv1-W (nn/kaiming-init! rng (* 1 5 5) (double-array (* 6 1 5 5)))
-   :conv1-b (double-array 6)
-   :conv2-W (nn/kaiming-init! rng (* 6 5 5) (double-array (* 16 6 5 5)))
-   :conv2-b (double-array 16)
-   :fc1-W   (nn/kaiming-init! rng 256 (double-array (* 120 256)))
-   :fc1-b   (double-array 120)
-   :fc2-W   (nn/kaiming-init! rng 120 (double-array (* 10 120)))
-   :fc2-b   (double-array 10)})
 
 (defn- forward-lenet
-  ^doubles [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b ^doubles x]
-  (let [c1 (dl/conv2d x conv1-W conv1-b 1 1 28 28 6 5 5 1 1 0 0)
+  ^doubles [w ^doubles x]
+  (let [{:keys [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b]} w
+        c1 (dl/conv2d x conv1-W conv1-b 1 1 28 28 6 5 5 1 1 0 0)
         r1 (nn/relu c1)
         p1 (dl/maxpool2d r1 1 6 24 24 2 2)
         c2 (dl/conv2d p1 conv2-W conv2-b 1 6 12 12 16 5 5 1 1 0 0)
@@ -106,17 +49,11 @@
         a1 (nn/relu f1)]
     (nn/dense fc2-W a1 fc2-b)))
 
-(defn- evaluate [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b images ^ints labels predict-compiled]
-  (let [n (alength labels)
-        fwd (or predict-compiled
-                (fn [c1w c1b c2w c2b f1w f1b f2w f2b x]
-                  (forward-lenet c1w c1b c2w c2b f1w f1b f2w f2b x)))]
+(defn- evaluate [w images ^ints labels]
+  (let [n (alength labels)]
     {:accuracy (* 100.0 (/ (double (loop [i 0 c 0]
                                      (if (< i n)
-                                       (let [pred (arrays/argmax
-                                                    (fwd conv1-W conv1-b conv2-W conv2-b
-                                                         fc1-W fc1-b fc2-W fc2-b
-                                                         (nth images i)))]
+                                       (let [pred (arrays/argmax (forward-lenet w (nth images i)))]
                                          (recur (inc i) (if (== pred (aget labels i)) (inc c) c)))
                                        c)))
                            (double n)))}))
@@ -130,86 +67,39 @@
 
   (print "Loading MNIST... ") (flush)
   (let [t0 (System/currentTimeMillis)
-        train-imgs (parse-idx-images "data/mnist/train-images-idx3-ubyte.gz")
-        train-lbls (parse-idx-labels "data/mnist/train-labels-idx1-ubyte.gz")
-        test-imgs  (parse-idx-images "data/mnist/t10k-images-idx3-ubyte.gz")
-        test-lbls  (parse-idx-labels-int "data/mnist/t10k-labels-idx1-ubyte.gz")]
+        {:keys [train-imgs train-lbls test-imgs test-lbls-int]} (data/load-mnist :double)]
     (println (format "done (%.1fs, %d train, %d test)"
                (/ (- (System/currentTimeMillis) t0) 1000.0)
-               (count train-imgs) (alength test-lbls)))
+               (count train-imgs) (alength test-lbls-int)))
 
-    ;; Try compiled, fall back to uncompiled if compiler bug
-    (let [compiled (try
-                     (print "Compiling... ") (flush)
-                     (let [tc (System/currentTimeMillis)
-                           c (pipeline/compile-aot #'train-step)]
-                       (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
-                       c)
-                     (catch Throwable e
-                       (println "compilation failed:" (.getMessage e))
-                       nil))
-          predict-compiled (try
-                             (let [pc (pipeline/compile-aot #'lenet/lenet-predict-fn :mode :forward)
-                                   ;; Smoke test: verify compiled predict returns correct-sized output
-                                   test-m (init-lenet (java.util.Random. 0))
-                                   test-img (double-array 784)]
-                               (pc (:conv1-W test-m) (:conv1-b test-m)
-                                   (:conv2-W test-m) (:conv2-b test-m)
-                                   (:fc1-W test-m) (:fc1-b test-m)
-                                   (:fc2-W test-m) (:fc2-b test-m)
-                                   test-img)
-                               pc)
-                             (catch Throwable _ nil))
-          ;; Test if compiled function actually works
-          f (if compiled
-              (let [test-m (init-lenet (java.util.Random. 0))
-                    test-img (double-array 784)
-                    test-lbl (double-array 10)]
-                (aset test-lbl 0 1.0)
-                (try (compiled (:conv1-W test-m) (:conv1-b test-m)
-                               (:conv2-W test-m) (:conv2-b test-m)
-                               (:fc1-W test-m) (:fc1-b test-m)
-                               (:fc2-W test-m) (:fc2-b test-m)
-                               test-img test-lbl 0.01)
-                     (println "Using compiled pipeline.")
-                     compiled
-                     (catch Throwable e
-                       (println "Compiled function failed, using deftm dispatch:" (.getMessage e))
-                       nil)))
-              nil)
-          f (or f train-step)
-          {:keys [conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b]}
-          (init-lenet (Random. 42))
-          lr 0.01
+    (print "Compiling fused train step (value+grad + grad-clip + SGD)... ") (flush)
+    (let [tc (System/currentTimeMillis)
+          {:keys [train-fn]} (rp/compile-train-step #'lenet-loss {:optimizer :sgd})
+          _ (println (format "done (%.1fs)" (/ (- (System/currentTimeMillis) tc) 1000.0)))
+          w     (data/init-lenet (Random. 42) :double)
+          lr 0.01  max-grad-norm 1.0
           n  (count train-imgs)]
       (println "LeNet-5 (Conv→Pool→Conv→Pool→FC→FC), SGD lr=0.01\n")
 
-      ;; Warmup
+      ;; Warmup: 200 fused train calls
       (print "Warming up JIT... ") (flush)
       (let [tw (System/currentTimeMillis)]
         (dotimes [i 200]
-          (f conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-             (nth train-imgs (mod i n)) (nth train-lbls (mod i n)) lr))
-        ;; Warmup predict too
-        (when predict-compiled
-          (dotimes [i 50]
-            (predict-compiled conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-                              (nth train-imgs (mod i n)))))
-        (println (format "done (%.1fs)\n" (/ (- (System/currentTimeMillis) tw) 1000.0))))
+          (train-fn w (nth train-imgs (mod i n)) (nth train-lbls (mod i n))
+                    max-grad-norm lr))
+        (println (format "done (%.1fs)\n" (/ (- (System/currentTimeMillis) tw) 1000.0)))
 
-      ;; Train
-      (doseq [ep (range 3)]
-        (let [idx (shuffle (range n))
-              t0  (System/currentTimeMillis)
-              total (reduce (fn [acc i]
-                              (+ acc (double (f conv1-W conv1-b conv2-W conv2-b
-                                               fc1-W fc1-b fc2-W fc2-b
-                                               (nth train-imgs i) (nth train-lbls i) lr))))
-                            0.0 idx)
-              dt (/ (- (System/currentTimeMillis) t0) 1000.0)
-              ev (evaluate conv1-W conv1-b conv2-W conv2-b fc1-W fc1-b fc2-W fc2-b
-                           test-imgs test-lbls predict-compiled)]
-          (println (format "Epoch %d/3  loss=%.4f  acc=%.2f%%  time=%.1fs  (%.0f µs/sample)"
-                     (inc ep) (/ total n) (:accuracy ev) dt
-                     (* 1000.0 (/ dt n))))))
-      (println "\nDone."))))
+        ;; Train 3 epochs
+        (doseq [ep (range 3)]
+          (let [idx (shuffle (range n))
+                t0  (System/currentTimeMillis)
+                total (reduce (fn [acc i]
+                                (+ acc (double (train-fn w (nth train-imgs i) (nth train-lbls i)
+                                                         max-grad-norm lr))))
+                              0.0 idx)
+                dt (/ (- (System/currentTimeMillis) t0) 1000.0)
+                ev (evaluate w test-imgs test-lbls-int)]
+            (println (format "Epoch %d/3  loss=%.4f  acc=%.2f%%  time=%.1fs  (%.0f µs/sample)"
+                       (inc ep) (/ total n) (:accuracy ev) dt
+                       (* 1000.0 (/ dt n))))))
+        (println "\nDone.")))))

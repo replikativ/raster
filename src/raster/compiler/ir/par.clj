@@ -480,12 +480,21 @@
 ;; Scope structure (unified for free-var analysis & substitution)
 ;; ================================================================
 
+(defn- pl
+  "Rebuild a par list form preserving the original form's metadata."
+  [form & children]
+  (with-meta (apply list children) (meta form)))
+
 (defn par-scope-info
   "Decompose a par form into scope structure for free-variable analysis
    and substitution. Returns:
      {:scoped-syms [sym ...]     ;; symbols bound by this form (loop vars, accumulators)
       :inner-exprs [expr ...]    ;; body expressions that see scoped-syms
-      :outer-exprs [expr ...]}   ;; expressions in the enclosing scope
+      :outer-exprs [expr ...]    ;; expressions in the enclosing scope
+      :rebuild (fn [scoped' inner' outer'] -> form)}
+   `:rebuild` reconstructs the form from (possibly transformed) scoped-syms,
+   inner-exprs, and outer-exprs vectors of the SAME arity as the originals —
+   co-located with the decomposition so a new par variant updates ONE place.
    Returns nil for non-par forms or forms without explicit scope structure
    (scatter!, rng-fill!, active-ids!, collect!, reduce-by-key)."
   [form]
@@ -496,46 +505,64 @@
         ;; pmap (pure): (head idx bound cast body)
         (par-map-pure-form? form)
         (let [[_ idx bound cast body] form]
-          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [bound cast]})
+          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [bound cast]
+           :rebuild (fn [[idx'] [body'] [bound' cast']]
+                      (pl form head idx' bound' cast' body'))})
 
         ;; map!: standard (head out idx bound cast body)
         ;;    or offset  (head out idx bound :offset base cast body)
         (par-map-form? form)
         (if (and (>= (count form) 8) (= :offset (nth form 4)))
           (let [[_ out idx bound _kw base cast body] form]
-            {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out bound base cast]})
+            {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out bound base cast]
+             :rebuild (fn [[idx'] [body'] [out' bound' base' cast']]
+                        (pl form head out' idx' bound' :offset base' cast' body'))})
           (let [[_ out idx bound cast body] form]
-            {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out bound cast]}))
+            {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out bound cast]
+             :rebuild (fn [[idx'] [body'] [out' bound' cast']]
+                        (pl form head out' idx' bound' cast' body'))}))
 
         ;; map2!: (head out1 out2 idx bound cast body1 body2)
         (par-map2-form? form)
         (let [[_ out1 out2 idx bound cast body1 body2] form]
-          {:scoped-syms [idx] :inner-exprs [body1 body2] :outer-exprs [out1 out2 bound cast]})
+          {:scoped-syms [idx] :inner-exprs [body1 body2] :outer-exprs [out1 out2 bound cast]
+           :rebuild (fn [[idx'] [body1' body2'] [out1' out2' bound' cast']]
+                      (pl form head out1' out2' idx' bound' cast' body1' body2'))})
 
         ;; reduce: (head acc init idx bound body)
         (par-reduce-form? form)
         (let [[_ acc init idx bound body] form]
-          {:scoped-syms [acc idx] :inner-exprs [body] :outer-exprs [init bound]})
+          {:scoped-syms [acc idx] :inner-exprs [body] :outer-exprs [init bound]
+           :rebuild (fn [[acc' idx'] [body'] [init' bound']]
+                      (pl form head acc' init' idx' bound' body'))})
 
         ;; scan / scan-exclusive: (head out acc init idx bound cast body)
         (or (= n "scan") (= n "scan-exclusive"))
         (let [[_ out acc init idx bound cast body] form]
-          {:scoped-syms [acc idx] :inner-exprs [body] :outer-exprs [out init bound cast]})
+          {:scoped-syms [acc idx] :inner-exprs [body] :outer-exprs [out init bound cast]
+           :rebuild (fn [[acc' idx'] [body'] [out' init' bound' cast']]
+                      (pl form head out' acc' init' idx' bound' cast' body'))})
 
         ;; map-void!: (head idx bound body)
         (par-map-void-form? form)
         (let [[_ idx bound body] form]
-          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [bound]})
+          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [bound]
+           :rebuild (fn [[idx'] [body'] [bound']]
+                      (pl form head idx' bound' body'))})
 
         ;; stencil!: (head out [ins] radius boundary cast idx bound body)
         (par-stencil-form? form)
         (let [[_ out ins radius boundary cast idx bound body] form]
-          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out ins radius boundary cast bound]})
+          {:scoped-syms [idx] :inner-exprs [body] :outer-exprs [out ins radius boundary cast bound]
+           :rebuild (fn [[idx'] [body'] [out' ins' radius' boundary' cast' bound']]
+                      (pl form head out' ins' radius' boundary' cast' idx' bound' body'))})
 
         ;; butterfly!: (head re im idx half wr wi base) — fixed body, no user exprs inside
         (par-butterfly-form? form)
         (let [[_ re im idx half wr wi base] form]
-          {:scoped-syms [idx] :inner-exprs [] :outer-exprs [re im half wr wi base]})
+          {:scoped-syms [idx] :inner-exprs [] :outer-exprs [re im half wr wi base]
+           :rebuild (fn [[idx'] _ [re' im' half' wr' wi' base']]
+                      (pl form head re' im' idx' half' wr' wi' base'))})
 
         ;; Forms without explicit scope: scatter!, rng-fill!, active-ids!, collect!, reduce-by-key
         :else nil))))

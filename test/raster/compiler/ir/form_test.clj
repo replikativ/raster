@@ -222,3 +222,66 @@
   (testing "raster.par/scan! is mutating"
     (let [info (form/form-info '(raster.par/scan! out n f))]
       (is (= 0 (:return-type-arg info))))))
+
+;; ================================================================
+;; scope-info — binder decomposition + rebuild round-trip
+;; ================================================================
+
+(deftest scope-info-non-binder-test
+  (testing "non-binding forms return nil (caller recurses generically)"
+    (is (nil? (form/scope-info '(clojure.core/+ a b))))
+    (is (nil? (form/scope-info '(.invk impl a b))))
+    (is (nil? (form/scope-info '(if a b c))))
+    (is (nil? (form/scope-info '(try (foo) (finally (bar))))) "try itself binds nothing")
+    (is (nil? (form/scope-info 'x))
+        "a bare symbol is not a binder")))
+
+(deftest scope-info-decomposition-test
+  (testing "let* — one sequential scope, binders+inits paired"
+    (let [{:keys [scopes sequential? outer]} (form/scope-info '(let* [a 1 b (+ a 2)] (+ a b)))]
+      (is (true? sequential?))
+      (is (= [] outer))
+      (is (= 1 (count scopes)))
+      (is (= '[a b] (:binders (first scopes))))
+      (is (= '[1 (+ a 2)] (:inits (first scopes))))
+      (is (= '[(+ a b)] (:body (first scopes))))))
+  (testing "dotimes — idx binder, bound expr is outer"
+    (let [{:keys [scopes outer]} (form/scope-info '(dotimes [i n] (aset a i i)))]
+      (is (= '[i] (:binders (first scopes))))
+      (is (= '[n] outer))))
+  (testing "fn* multi-arity — one scope per arity"
+    (let [{:keys [scopes]} (form/scope-info '(fn* ([x] x) ([x y] (+ x y))))]
+      (is (= 2 (count scopes)))
+      (is (= '[x] (:binders (first scopes))))
+      (is (= '[x y] (:binders (second scopes))))))
+  (testing "letfn* — recursive scope (binders visible to inits)"
+    (let [{:keys [rec? scopes]} (form/scope-info '(letfn* [f (fn* [x] (g x)) g (fn* [y] (f y))] (f 1)))]
+      (is (true? rec?))
+      (is (= '[f g] (:binders (first scopes))))))
+  (testing "catch — binds ex-sym to catch body"
+    (let [{:keys [scopes]} (form/scope-info '(catch Exception e (handle e)))]
+      (is (= '[e] (:binders (first scopes))))
+      (is (= '[(handle e)] (:body (first scopes))))))
+  (testing "par/reduce — acc + idx binders, init/bound outer"
+    (let [{:keys [scopes outer]} (form/scope-info '(raster.par/reduce acc init i n (+ acc (aget a i))))]
+      (is (= '[acc i] (:binders (first scopes))))
+      (is (= '[init n] outer)))))
+
+(deftest scope-info-rebuild-identity-test
+  (testing "rebuild ∘ scope-info is identity for every closed-core binder form"
+    (doseq [f ['(let* [a 1 b (+ a 2)] (+ a b))
+               '(loop* [i 0 acc 0] (recur (inc i) (+ acc i)))
+               '(dotimes [i n] (aset arr i i))
+               '(fn* [x y] (+ x y))
+               '(fn* self [n] (self (dec n)))
+               '(fn* ([x] x) ([x y] (+ x y)))
+               '(ftm [x] :- Double :raster.walker/source-body [(+ x 1)] (.invk impl x))
+               '(letfn* [f (fn* [x] (g x)) g (fn* [y] (f y))] (f 1))
+               '(catch Exception e (handle e))
+               '(reify* [IFoo] (bar [this x] (+ x 1)) (baz [this] 0))
+               '(raster.par/map! out i n nil (+ (aget in i) 1.0))
+               '(raster.par/map! out i n :offset base nil (aget in i))
+               '(raster.par/reduce acc 0.0 i n (+ acc (aget in i)))
+               '(raster.par/scan res acc 0.0 i n nil (+ acc (aget in i)))]]
+      (let [{:keys [scopes outer rebuild]} (form/scope-info f)]
+        (is (= f (rebuild scopes outer)) (str "round-trip: " (first f)))))))

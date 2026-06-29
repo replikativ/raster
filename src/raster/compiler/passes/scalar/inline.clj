@@ -223,38 +223,44 @@
        (when-not dispatch-no-inline?
          (when-let [v (try (resolve base-sym) (catch Exception _ nil))]
            (when-not (:no-inline (meta v))
-             (or
-              (try-resolve-walked-body v)
-              (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
-                (let [all-methods (mapcat identity (vals @dispatch-table))
-                      has-parametric? (contains? @dispatch/parametric-registry
-                                                 (symbol (namespace base-sym) (name base-sym)))
+             (let [parametric-sym (symbol (namespace base-sym) (name base-sym))
+                   has-parametric? (contains? @dispatch/parametric-registry parametric-sym)]
+               (or
+                ;; For parametric (All [T]) functions, skip the var's parametric
+                ;; template body — its literals are still T-generic. Force the
+                ;; dispatch-table path so try-parametric-specialize! generates
+                ;; (or finds) a concrete entry whose body has the literal-cast-fn
+                ;; applied (e.g. `0.0` → `(float 0.0)` for T=float).
+                (when-not has-parametric?
+                  (try-resolve-walked-body v))
+                (when-let [dispatch-table (:raster.core/dispatch-table (meta v))]
+                  (let [all-methods (mapcat identity (vals @dispatch-table))
                       ;; Type-safe overload selection with parametric specialization.
                       ;; Single-method fallback only when function is NOT parametric
                       ;; (i.e., the one method IS the only possible overload).
-                      match (or (when (seq arg-tags)
-                                  (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
+                        match (or (when (seq arg-tags)
+                                    (or (first (filter #(= (vec arg-tags) (vec (:tags %))) all-methods))
                                       ;; No match — try parametric specialization
-                                      (when (inf/try-parametric-specialize!
-                                             (symbol (namespace base-sym) (name base-sym)) arg-tags)
-                                        (let [new-methods (mapcat identity
-                                                                  (vals @(:raster.core/dispatch-table (meta v))))]
-                                          (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
+                                        (when (inf/try-parametric-specialize!
+                                               parametric-sym arg-tags)
+                                          (let [new-methods (mapcat identity
+                                                                    (vals @(:raster.core/dispatch-table (meta v))))]
+                                            (first (filter #(= (vec arg-tags) (vec (:tags %))) new-methods))))))
                                 ;; Single method fallback: safe when no other overloads exist
                                 ;; AND function is not parametric. Parametric functions
                                 ;; may need a different specialization that hasn't been
                                 ;; generated yet — inlining the only existing overload
                                 ;; (e.g. doubles) into a float pipeline causes VerifyErrors.
-                                (when (and (= 1 (count all-methods))
-                                           (not has-parametric?))
-                                  (first all-methods)))]
-                  (when match
-                    (let [backing-sym (symbol (namespace base-sym)
-                                              (str (types/mangle (name base-sym)
-                                                                 (:tags match))))
-                          backing-var (try (resolve backing-sym) (catch Exception _ nil))]
-                      (when backing-var
-                        (try-resolve-walked-body backing-var))))))))))))))
+                                  (when (and (= 1 (count all-methods))
+                                             (not has-parametric?))
+                                    (first all-methods)))]
+                    (when match
+                      (let [backing-sym (symbol (namespace base-sym)
+                                                (str (types/mangle (name base-sym)
+                                                                   (:tags match))))
+                            backing-var (try (resolve backing-sym) (catch Exception _ nil))]
+                        (when backing-var
+                          (try-resolve-walked-body backing-var)))))))))))))))
 
 (def ^:private alloc-sym->array-tag op/alloc-sym->array-tag)
 
@@ -273,205 +279,16 @@
       (vary-meta replacement merge (meta expr))
       replacement)))
 
-(defn- smap-captures?
-  "Check if any value in smap is equal to the given scope variable symbol.
-   This detects when substitution would introduce a captured reference,
-   e.g., smap {gamma → g} entering (dotimes [g ...]) would make
-   'gamma' references resolve to the loop var instead of the outer 'g'."
-  [smap scope-var]
-  (some #(= scope-var %) (vals smap)))
-
-(defn- alpha-rename-scope-var
-  "When a scope variable collides with a substitution target value,
-   alpha-rename it: generate a fresh name and add the renaming to smap.
-   The smap values that point to scope-var are NOT changed — they refer to
-   the outer scope's binding (which is what we want).
-   Returns [new-var updated-smap]."
-  [smap scope-var]
-  (if (smap-captures? smap scope-var)
-    (let [fresh (with-meta (gensym (str (name scope-var) "_α_"))
-                  (meta scope-var))
-          ;; Don't change existing smap values — they reference the OUTER scope-var.
-          ;; Just dissoc scope-var as key (it's rebound in this scope) and add
-          ;; the renaming so references to the loop/let var use the fresh name.
-          inner-smap (assoc (dissoc smap scope-var) scope-var fresh)]
-      [fresh inner-smap])
-    [scope-var (dissoc smap scope-var)]))
-
 (defn- subst-syms
-  "Recursively substitute symbols in expr according to smap.
-   Scope-aware: when entering a scope form (dotimes, loop, let, fn, par),
-   handles two kinds of variable capture:
-   1. Key capture: scope var is a KEY in smap → dissoc it (don't substitute
-      what the scope rebinds).
-   2. Value capture: scope var appears as a VALUE in smap → alpha-rename
-      the scope var to prevent outer substitution targets from being
-      shadowed by the scope var."
+  "Capture-avoiding symbol substitution — delegates to the unified
+   `util/subst-syms` (generic over form/scope-info, so it correctly handles
+   EVERY closed-core binder incl. all par variants — map2!/map-void!/scan/
+   scan-exclusive/stencil!/butterfly! — plus letfn*/reify*/ftm and varargs `&`,
+   all of which this pass's former hand-rolled version mis-handled or dropped
+   into a capturing `:else`). `subst-sym-leaf` is passed as the leaf policy so
+   use-site metadata is preserved onto the replacement (type-tag propagation)."
   [smap expr]
-  (if (empty? smap)
-    expr
-    (cond
-      (symbol? expr)
-      (subst-sym-leaf smap expr)
-
-      (seq? expr)
-      (let [head (first expr)
-            rebuild (fn [children]
-                      (if-let [m (meta expr)]
-                        (with-meta (apply list children) m)
-                        (apply list children)))]
-        (cond
-          ;; dotimes: (dotimes [var bound] body...)
-          (= 'dotimes head)
-          (let [[_ [var bound] & body] expr
-                new-bound (subst-syms smap bound)
-                [new-var inner-smap] (alpha-rename-scope-var smap var)]
-            (rebuild (cons 'dotimes
-                           (cons [new-var new-bound]
-                                 (map (partial subst-syms inner-smap) body)))))
-
-          ;; loop/loop*: (loop [v1 init1 v2 init2 ...] body...)
-          (contains? #{'loop 'loop*} head)
-          (let [[_ bindings-vec & body] expr
-                pairs (partition 2 bindings-vec)
-                ;; init exprs see outer scope (not loop vars)
-                new-inits (map (fn [[_ init]] (subst-syms smap init)) pairs)
-                ;; Alpha-rename loop vars that collide with smap values
-                loop-vars (map first pairs)
-                [renamed-vars inner-smap]
-                (reduce (fn [[vars sm] v]
-                          (let [[new-v sm'] (alpha-rename-scope-var sm v)]
-                            [(conj vars new-v) sm']))
-                        [[] smap]
-                        loop-vars)
-                new-bindings (vec (mapcat vector renamed-vars new-inits))]
-            (rebuild (cons head (cons new-bindings
-                                      (map (partial subst-syms inner-smap) body)))))
-
-          ;; let/let*: sequential scoping
-          (contains? #{'let 'let*} head)
-          (let [[_ bindings-vec & body] expr
-                pairs (partition 2 bindings-vec)
-                [new-pairs final-smap]
-                (reduce (fn [[acc sm] [v init]]
-                          (let [substed-init (subst-syms sm init)
-                                [new-v sm'] (alpha-rename-scope-var sm v)]
-                            [(conj acc [new-v substed-init]) sm']))
-                        [[] smap]
-                        pairs)
-                new-bindings (vec (mapcat identity new-pairs))]
-            (rebuild (cons head (cons new-bindings
-                                      (map (partial subst-syms final-smap) body)))))
-
-          ;; fn/fn*: (fn* [params...] body...)
-          (contains? #{'fn 'fn*} head)
-          (let [[_ params & body] expr
-                param-vars (filter symbol? (if (vector? params) params []))
-                [renamed-params inner-smap]
-                (reduce (fn [[ps sm] v]
-                          (let [[new-v sm'] (alpha-rename-scope-var sm v)]
-                            [(conj ps new-v) sm']))
-                        [[] smap]
-                        param-vars)
-                new-params (if (vector? params)
-                             (vec (concat renamed-params
-                                          (remove symbol? params)))
-                             params)]
-            (rebuild (cons head (cons new-params
-                                      (map (partial subst-syms inner-smap) body)))))
-
-          ;; par/pmap: (raster.par/pmap idx bound cast body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "pmap" (name head)))
-          (let [[_ idx bound cast body] expr
-                [new-idx inner-smap] (alpha-rename-scope-var smap idx)]
-            (rebuild (list head new-idx
-                           (subst-syms smap bound)
-                           (subst-syms smap cast)
-                           (subst-syms inner-smap body))))
-
-          ;; par/map: (raster.par/map idx bound cast body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "map" (name head)))
-          (let [[_ idx bound cast body] expr
-                [new-idx inner-smap] (alpha-rename-scope-var smap idx)]
-            (rebuild (list head new-idx
-                           (subst-syms smap bound)
-                           (subst-syms smap cast)
-                           (subst-syms inner-smap body))))
-
-          ;; par/map!: (raster.par/map! out idx bound cast body)
-          ;;   offset: (raster.par/map! out idx bound :offset base cast body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "map!" (name head)))
-          (if (and (>= (count expr) 8) (= :offset (nth expr 4)))
-            ;; Offset variant
-            (let [[_ out idx bound _kw base cast body] expr
-                  [new-idx inner-smap] (alpha-rename-scope-var smap idx)]
-              (rebuild (list head
-                             (subst-syms smap out)
-                             new-idx
-                             (subst-syms smap bound)
-                             :offset
-                             (subst-syms smap base)
-                             (subst-syms smap cast)
-                             (subst-syms inner-smap body))))
-            ;; Standard variant
-            (let [[_ out idx bound cast body] expr
-                  [new-idx inner-smap] (alpha-rename-scope-var smap idx)]
-              (rebuild (list head
-                             (subst-syms smap out)
-                             new-idx
-                             (subst-syms smap bound)
-                             (subst-syms smap cast)
-                             (subst-syms inner-smap body)))))
-
-          ;; par/reduce: (raster.par/reduce acc init idx bound body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "reduce" (name head)))
-          (let [[_ acc init idx bound body] expr
-                [new-acc smap1] (alpha-rename-scope-var smap acc)
-                [new-idx inner-smap] (alpha-rename-scope-var smap1 idx)]
-            (rebuild (list head new-acc
-                           (subst-syms smap init)
-                           new-idx
-                           (subst-syms smap bound)
-                           (subst-syms inner-smap body))))
-
-          ;; par/reduce!: (raster.par/reduce! out acc init idx bound cast body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "reduce!" (name head)))
-          (let [[_ out acc init idx bound cast body] expr
-                [new-acc smap1] (alpha-rename-scope-var smap acc)
-                [new-idx inner-smap] (alpha-rename-scope-var smap1 idx)]
-            (rebuild (list head
-                           (subst-syms smap out)
-                           new-acc
-                           (subst-syms smap init)
-                           new-idx
-                           (subst-syms smap bound)
-                           (subst-syms smap cast)
-                           (subst-syms inner-smap body))))
-
-          ;; par/scan!: (raster.par/scan! out idx bound init cast body)
-          (and (symbol? head) (= "raster.par" (namespace head))
-               (= "scan!" (name head)))
-          (let [[_ out idx bound init cast body] expr
-                [new-idx inner-smap] (alpha-rename-scope-var smap idx)]
-            (rebuild (list head
-                           (subst-syms smap out)
-                           new-idx
-                           (subst-syms smap bound)
-                           (subst-syms smap init)
-                           (subst-syms smap cast)
-                           (subst-syms inner-smap body))))
-
-          ;; Default: recurse into all children
-          :else
-          (rebuild (map (partial subst-syms smap) expr))))
-
-      (vector? expr) (mapv (partial subst-syms smap) expr)
-      :else expr)))
+  (util/subst-syms smap expr subst-sym-leaf))
 
 (defn- subst-syms-safe
   "Like subst-syms but also rewrites devirtualized core array ops to
@@ -811,9 +628,11 @@
          (when resolved
            (let [m (meta resolved)
                  walked-body (rcore/ensure-walked-body! resolved)
-                 params (:raster.core/deftm-params m)]
+                 params (:raster.core/deftm-params m)
+                 tags   (:raster.core/deftm-tags m)]
              (when (and walked-body params)
-               {:walked-body walked-body :params params :var resolved}))))))))
+               {:walked-body walked-body :params params :tags tags
+                :var resolved}))))))))
 
 (def ^:dynamic *expand-for-ad-trace* false)
 (def ^:dynamic *param-env* nil)
@@ -896,7 +715,7 @@
                      (when (every? some? tags) tags)))
         deftm-info (resolve-deftm-for-ad var-sym arg-tags)]
     (when deftm-info
-      (let [{:keys [walked-body params]} deftm-info
+      (let [{:keys [walked-body params tags]} deftm-info
             transform-body (or *ad-transform-body-fn*
                                (throw (ex-info "*ad-transform-body-fn* not bound — pipeline must bind it for AD inlining" {})))
             body-form (first walked-body)
@@ -905,7 +724,24 @@
             ;; Template-backed ops (matmul, mse-loss, etc.) stay symbolic
             ;; so the AD transform can use their templates.
             body-form (expand-for-ad body-form 10)
-            active-params (mapv #(if (symbol? %) % (symbol (name %))) params)
+            all-params (mapv #(if (symbol? %) % (symbol (name %))) params)
+            ;; Only floating-point arrays/scalars are differentiable. Long/longs
+            ;; are constants for AD — passing them as active forces AD to look
+            ;; for rules on integer ops like (quot d-model n-heads), which
+            ;; don't exist (and shouldn't, since the result is non-diff).
+            ;; Same rule as raster.ad.reverse/build-grad-walked-body.
+            differentiable-tag? '#{doubles floats double float}
+            tags-vec (or tags (vec (repeat (count all-params) 'double)))
+            active-params (vec (keep-indexed
+                                (fn [i p]
+                                  (let [tag (nth tags-vec i nil)]
+                                    (when (differentiable-tag? tag)
+                                       ;; Stamp :raster.type/tag so AD can read it
+                                       ;; in gen-reverse-let Phase 3 → adj-sym carries
+                                       ;; the tag → closure helpers get typed params
+                                       ;; instead of falling back to Object.
+                                      (with-meta p {:raster.type/tag tag}))))
+                                all-params))
             ad-form (transform-body body-form active-params)
             ;; Canonicalize and flatten
             canonical (flatten/canonicalize-ad-form ad-form)]
@@ -945,7 +781,17 @@
                                              (map first pairs)
                                              renamed-pairs))
                     loss-sym (get final-subst result-sym result-sym)
-                    grad-syms (mapv #(get final-subst % %) param-adj-syms)
+                    diff-grad-syms (mapv #(get final-subst % %) param-adj-syms)
+                    ;; Map each ORIGINAL param to a grad sym (or nil for
+                    ;; non-differentiable params filtered out at AD seed time).
+                    ;; Positional consumers see one slot per original param.
+                    diff-set (set active-params)
+                    diff->idx (zipmap active-params (range))
+                    grad-syms (mapv (fn [p]
+                                      (if (contains? diff-set p)
+                                        (nth diff-grad-syms (diff->idx p))
+                                        nil))
+                                    all-params)
                     ;; Tag gradient syms with expected types from param tags.
                     ;; Array params (doubles, floats, longs) have array gradients.
                     ;; This ensures downstream type inference knows the gradient types
@@ -956,7 +802,7 @@
                                    (:raster.core/deftm-tags (meta (resolve var-sym)))
                                    (vec (repeat (count grad-syms) 'double)))
                     grad-syms (mapv (fn [gs tag]
-                                      (if (and tag (not= tag 'double) (not= tag 'long))
+                                      (if (and gs tag (not= tag 'double) (not= tag 'long))
                                         (with-meta gs {:tag tag})
                                         gs))
                                     grad-syms param-tags)
@@ -1433,10 +1279,23 @@
                                  (let [[lifted cleaned] (anf-lift init)]
                                    (concat lifted [[sym cleaned]])))
                                renamed-pairs)
-          ;; ANF-lift the body (with renaming applied)
-          body-expr (subst-syms @rename-map (last inner-body))
+          ;; CRITICAL: a binding-form with MULTIPLE body-exprs has earlier
+          ;; statements that are side effects (Clojure semantics: do-style
+          ;; eval, drop result of all but last). When we lift into expression
+          ;; position, we must preserve those effects as lifted bindings —
+          ;; previously they were silently dropped via (last inner-body),
+          ;; which lost all asets/mutations from inlined deftm bodies.
+          inner-body-vec (vec inner-body)
+          effect-exprs (mapv #(subst-syms @rename-map %) (butlast inner-body-vec))
+          effect-lifted (mapv (fn [eff]
+                                [(with-meta (gensym "_eff_")
+                                   {:raster.effect/effectful true})
+                                 eff])
+                              effect-exprs)
+          ;; ANF-lift the final body expression (with renaming applied)
+          body-expr (subst-syms @rename-map (last inner-body-vec))
           [body-lifted body-cleaned] (anf-lift body-expr)]
-      [(vec (concat lifted-inner body-lifted)) body-cleaned])
+      [(vec (concat lifted-inner effect-lifted body-lifted)) body-cleaned])
 
     ;; Non-liftable forms — do NOT recurse (would lift bindings
     ;; past scope boundaries or conditional branches)
@@ -1567,6 +1426,15 @@
                    val)))
              (catch Exception _ nil))
         expr)
+    ;; Vectors in value position (e.g. a binding init `[result pullback-fn]`,
+    ;; where the pullback is a (fn* ...) closure carrying gelu's `c` constant):
+    ;; recurse element-wise so dispatch resolution and constant folding reach
+    ;; inside. Binding vectors of let*/loop*/dotimes/par are destructured by
+    ;; their own branches above and never reach here; a vector arriving here is
+    ;; always a data/value vector, so element-wise mapping is sound.
+    (vector? expr)
+    (let [r (mapv #(resolve-dispatch-walk % env) expr)]
+      (if-let [m (meta expr)] (with-meta r m) r))
     (not (seq? expr)) expr
     ;; Loop/loop*: propagate init types for loop vars into body
     (contains? #{'loop 'loop*} (first expr))

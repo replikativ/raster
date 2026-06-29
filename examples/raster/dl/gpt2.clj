@@ -14,6 +14,7 @@
   (:require [raster.core :refer [deftm ftm]]
             [raster.arrays :refer [aget aset alength aclone acopy! alloc-like]]
             [raster.numeric :as n :refer [+ - * /]]
+            [raster.ad.templates :as tmpl]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.dl.safetensors :as st]
@@ -59,6 +60,46 @@
                 (+ (aget wte (+ tok-offset d))
                    (aget wpe (+ pos-offset d)))))))
     out)))
+
+;; AD pullback for gpt2-embeddings.
+;; Forward: out[i*d + d_idx] = wte[token_ids[i]*d + d_idx] + wpe[i*d + d_idx]
+;; Backward:
+;;   d_wte[token_ids[i]*d + d_idx] += d_out[i*d + d_idx]   (scatter)
+;;   d_wpe[i*d + d_idx]            =  d_out[i*d + d_idx]    (slice copy of first seq_len*d entries)
+;;   d_token_ids = nil (long type, non-differentiable)
+;; Vocab size and max-position are recovered from the input arrays' lengths.
+(tmpl/merge-into-template! 'raster.dl.gpt2/gpt2-embeddings
+                           {:pullback-factory
+                            (fn [_result wte wpe token-ids seq-len d-model]
+                              (fn [d-out]
+                                (let [seq-len (long seq-len)
+                                      d-model (long d-model)
+                                      vocab-size (clojure.core/quot
+                                                   (clojure.core/alength ^doubles wte)
+                                                   d-model)
+                                      max-pos    (clojure.core/quot
+                                                   (clojure.core/alength ^doubles wpe)
+                                                   d-model)
+                                      d-wte (double-array (clojure.core/* vocab-size d-model))
+                                      d-wpe (double-array (clojure.core/* max-pos d-model))]
+                                  (dotimes [i seq-len]
+                                    (let [tok (clojure.core/aget ^longs token-ids i)
+                                          tok-off (clojure.core/* tok d-model)
+                                          pos-off (clojure.core/* i d-model)
+                                          out-off (clojure.core/* i d-model)]
+                                      (dotimes [d d-model]
+                                        (let [g (clojure.core/aget ^doubles d-out
+                                                                    (clojure.core/+ out-off d))]
+                                          (clojure.core/aset ^doubles d-wte
+                                                              (clojure.core/+ tok-off d)
+                                                              (clojure.core/+
+                                                                (clojure.core/aget ^doubles d-wte
+                                                                                    (clojure.core/+ tok-off d))
+                                                                g))
+                                          (clojure.core/aset ^doubles d-wpe
+                                                              (clojure.core/+ pos-off d)
+                                                              g)))))
+                                  [d-wte d-wpe nil nil nil])))})
 
 ;; ================================================================
 ;; Logits projection (weight-tied, deftm for typed dispatch)

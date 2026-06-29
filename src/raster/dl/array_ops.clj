@@ -132,6 +132,97 @@
 ;; ================================================================
 
 ;; ================================================================
+;; slice-strided-2d / scatter-strided-2d
+;;
+;; Conceptually src is a 2D matrix [rows × row-stride]; we read or write a
+;; packed [rows × n-cols] sub-block at column offset col-offset. Used for
+;; multi-head attention's head split (slice) and head concat (scatter).
+;;
+;; Forward:  out[r*n-cols + c]               = src   [r*row-stride + col-offset + c]
+;; Forward:  out[r*row-stride + col-offset + c] = packed[r*n-cols + c]
+;;
+;; Both ops are pure (allocate fresh dst); they're each other's pullbacks
+;; (slice ↔ scatter), so the gradient code is just the same op in the dual
+;; direction.
+;; ================================================================
+
+(deftm slice-strided-2d
+  "Read a packed [rows × n-cols] block from src starting at column col-offset
+  with row stride row-stride. Returns a freshly allocated array of length
+  (rows * n-cols)."
+  [src :- (Array double)
+   rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
+  :- (Array double)
+  (let [out (double-array (* rows n-cols))]
+    (dotimes [r rows]
+      (let [src-off (+ (* r (int row-stride)) (int col-offset))
+            dst-off (* r (int n-cols))]
+        (dotimes [c n-cols]
+          (aset out (+ dst-off c)
+                (aget src (+ src-off c))))))
+    out))
+
+(deftm scatter-strided-2d
+  "Write a packed [rows × n-cols] block into a freshly allocated
+  [rows × row-stride] dst at column offset col-offset, with the rest left as
+  zero. Returns a freshly allocated array of length (rows * row-stride)."
+  [packed :- (Array double)
+   rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
+  :- (Array double)
+  (let [out (double-array (* rows row-stride))]
+    (dotimes [r rows]
+      (let [src-off (* r (int n-cols))
+            dst-off (+ (* r (int row-stride)) (int col-offset))]
+        (dotimes [c n-cols]
+          (aset out (+ dst-off c)
+                (aget packed (+ src-off c))))))
+    out))
+
+;; slice ↔ scatter are duals: gradient of slice goes through scatter, and
+;; vice versa. Both pullback-factory (runtime/lazy AD) and grads-fn
+;; (compile-aot flat codegen) are registered. Indices passed back as nil
+;; since they're non-differentiable Long params.
+(tmpl/merge-into-template! 'raster.dl.array-ops/slice-strided-2d
+                           {:pullback-factory
+                            (fn [_result _src rows row-stride col-offset n-cols]
+                              (fn [d-out]
+                                (let [d-src (scatter-strided-2d
+                                             d-out rows row-stride col-offset n-cols)]
+                                  [d-src nil nil nil nil])))})
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/slice-strided-2d
+                           {:params '[src rows row-stride col-offset n-cols]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_src rows row-stride col-offset n-cols]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [d-src (gensym-fn "d_src")]
+                                [(update ctx :bindings into
+                                         [d-src (list 'raster.dl.array-ops/scatter-strided-2d
+                                                      adjoint-sym rows row-stride col-offset n-cols)])
+                                 [d-src nil nil nil nil]]))})
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
+                           {:pullback-factory
+                            (fn [_result _packed rows row-stride col-offset n-cols]
+                              (fn [d-out]
+                                (let [d-packed (slice-strided-2d
+                                                d-out rows row-stride col-offset n-cols)]
+                                  [d-packed nil nil nil nil])))})
+
+(tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
+                           {:params '[packed rows row-stride col-offset n-cols]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_packed rows row-stride col-offset n-cols]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [d-packed (gensym-fn "d_packed")]
+                                [(update ctx :bindings into
+                                         [d-packed (list 'raster.dl.array-ops/slice-strided-2d
+                                                         adjoint-sym rows row-stride col-offset n-cols)])
+                                 [d-packed nil nil nil nil]]))})
+
+;; ================================================================
 ;; gather: out[e*stride+s] = src[indices[e]*stride+s]
 ;; Adjoint of scatter-add.
 ;; ================================================================

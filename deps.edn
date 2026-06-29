@@ -48,7 +48,9 @@
                      "--add-modules=jdk.incubator.vector"]
           :main-opts ["-m" "nrepl.cmdline" "--middleware" "[cider.nrepl/cider-middleware]"]}
   :bench {:extra-paths ["test" "dev" "bench" "examples"]
-          :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}}
+          :extra-deps {criterium/criterium {:mvn/version "0.4.6"}}
+          :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                     "--add-modules=jdk.incubator.vector"]}
   :format {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}
            :main-opts ["-m" "cljfmt.main" "check"]}
   :ffix {:extra-deps {cljfmt/cljfmt {:mvn/version "0.9.2"}}

@@ -99,9 +99,17 @@
               kw-desc (ClassDesc/of "clojure.lang" "Keyword")
               ilookup-desc (ClassDesc/of "clojure.lang" "ILookup")
               tag->desc (fn [tag]
-                          (if-let [d (type-tag->descriptor tag)]
-                            (ClassDesc/ofDescriptor d)
-                            obj-desc))
+                          (cond
+                            ;; value-class / array-of-value-class field: tag is a
+                            ;; ClassDesc, or a JVM descriptor STRING ("Lpkg/Name;",
+                            ;; "[Lpkg/Name;") — embeddable from the defvalue macro.
+                            ;; A typed reference field (nested Parameters); the rest
+                            ;; of the generator handles reference fields already
+                            ;; (default aload, 1 slot, no box).
+                            (instance? java.lang.constant.ClassDesc tag) tag
+                            (string? tag) (ClassDesc/ofDescriptor tag)
+                            (type-tag->descriptor tag) (ClassDesc/ofDescriptor (type-tag->descriptor tag))
+                            :else obj-desc))
                ;; Box a primitive on the stack: emits invokestatic Type.valueOf(prim)
               emit-box (fn [code tag]
                          (when-let [box-cls (tag->box-class-name tag)]

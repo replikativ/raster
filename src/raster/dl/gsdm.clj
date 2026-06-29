@@ -36,10 +36,8 @@
             [raster.dl.diffusion :as diff]
             [raster.dl.loss :as loss]
             [raster.dl.array-ops :as array-ops]
-            [raster.compiler.pipeline :as pipeline]
-            [raster.compiler.core.walker :as walker]))
-
-(declare weights-map->args weight-param-order)
+            [raster.params :as rp]
+            [raster.tree :as tree]))
 
 ;; ================================================================
 ;; Variable state constants
@@ -487,7 +485,13 @@
        (let [n (* n-nodes emb-dim)
         ;; GroupNorm needs channel-first layout [emb-dim, n-nodes] (PyTorch: b d 1 n)
         ;; Our data is node-major [n-nodes, emb-dim] — transpose around GN calls
-             num-groups (n/max 1 (n/min 32 emb-dim))
+        ;; GroupNorm groups: match the original (torch GroupNorm num_groups=32 at
+        ;; emb_dim 64-128 → 2-4 channels/group). The KEY invariant is ≥2 channels
+        ;; per group: with 1 channel/group GroupNorm degenerates to per-channel
+        ;; (Instance)Norm and exactly cancels the per-channel temb shift, making the
+        ;; model time-blind. (quot emb-dim 2) keeps ≥2 ch/group at any emb-dim and
+        ;; equals 32 groups at emb-dim≥64, matching the reference net.
+             num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
         ;; GN1: transpose → group-norm → transpose back
              h-t (nn/transpose-2d x n-nodes emb-dim)
              h-t (nn/group-norm h-t gamma1 beta1 1 emb-dim n-nodes num-groups 1e-5)
@@ -496,10 +500,14 @@
              h (nn/silu h n)
         ;; Linear 1 (per-node: [n-nodes, emb-dim] × [emb-dim, emb-dim])
              h (nn/linear h W1 b1 n-nodes emb-dim emb-dim)
-        ;; Timestep injection: h = h + broadcast(SiLU(linear(temb)))
+        ;; Timestep injection (matches the reference ResnetBlock: h = h +
+        ;; temb_proj(SiLU(temb)), BEFORE norm2). temb-proj is broadcast equally to
+        ;; every node, so it is a per-channel constant along the normalized axis.
+        ;; This survives GN2 because num-groups gives ≥2 channels/group: GroupNorm
+        ;; removes only the per-group mean, leaving the inter-channel temb variation
+        ;; intact (with 1 ch/group it would be fully cancelled — see num-groups).
              temb-proj (nn/silu temb emb-dim)
              temb-proj (nn/linear temb-proj Wt bt 1 emb-dim emb-dim)
-        ;; Broadcast temb-proj to all nodes
              h (array-ops/broadcast-add h temb-proj n-nodes emb-dim)
         ;; GN2: transpose → group-norm → transpose back
              h-t (nn/transpose-2d h n-nodes emb-dim)
@@ -541,7 +549,7 @@
             src-edges :- (Array long) dst-edges :- (Array long)
             n-nodes :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
        :- (Array T)
-       (let [num-groups (n/max 1 (n/min 32 emb-dim))
+       (let [num-groups (n/max 1 (n/min 32 (quot emb-dim 2)))
              dk (quot emb-dim n-heads)
         ;; Pre-attention GroupNorm (channel-first layout for cross-node normalization)
              h-t (nn/transpose-2d h n-nodes emb-dim)
@@ -602,6 +610,48 @@
                                      src-edges dst-edges
                                      n-nodes n-edges emb-dim n-heads)]
     h))
+
+;; ================================================================
+;; TransformerBlock as a tree/scan-vec step (defmodel)
+;; ================================================================
+;; The per-layer fold step for `tree/scan-vec`. Takes the running hidden
+;; state `h` plus one layer's weight sub-tree (the SAME HMap shape as
+;; `layer-spec`) and the shared extras. scan-vec splices each layer element's
+;; leaves into this defmodel's --flat var (canonical key order, so the
+;; ordering aligns automatically with the outer HVec element spec).
+;;
+;; NOTE: this layer spec must stay identical to `layer-spec` below — they are
+;; declared in two places (this defmodel literal + weights-spec's HVec element).
+(rp/defmodel transformer-block-step
+  [h :- (Array double)
+   layer :- (Params (HMap :mandatory
+                          {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
+                           :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
+                           :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
+                           :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
+                           :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
+                           :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
+                           :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
+                           :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
+                           :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
+   temb :- (Array double)
+   src-edges :- (Array long) dst-edges :- (Array long)
+   n-vars :- Long n-edges :- Long emb-dim :- Long n-heads :- Long]
+  :- (Array double)
+  (let [h-res (resnet-block h temb
+                            (:res-W1 layer) (:res-b1 layer)
+                            (:res-W2 layer) (:res-b2 layer)
+                            (:res-Wt layer) (:res-bt layer)
+                            (:res-g1 layer) (:res-bn1 layer)
+                            (:res-g2 layer) (:res-bn2 layer)
+                            n-vars emb-dim)]
+    (graph-attention-multihead h-res
+                               (:attn-Wq layer) (:attn-bq layer)
+                               (:attn-Wk layer) (:attn-bk layer)
+                               (:attn-Wv layer) (:attn-bv layer)
+                               (:attn-g  layer) (:attn-b  layer)
+                               src-edges dst-edges
+                               n-vars n-edges emb-dim n-heads)))
 
 ;; ================================================================
 ;; FlatEmbedder: embed variable values + space + position
@@ -791,221 +841,6 @@
                     n-vars emb-dim))))
 
 ;; ================================================================
-;; GSDM diffusion training step
-;; ================================================================
-
-(defn gsdm-forward-loss
-  "GSDM forward pass + MSE loss computation.
-  Applies marginalization, noise, forward pass, and masked MSE loss.
-
-  Returns {:loss double, :pred double[]}"
-  [weights config x0 spaces states src-edges dst-edges
-   n-vars n-edges t ^doubles alphas-cumprod]
-  (let [;; Marginalize: remove MARGINALIZED variables
-        mg (marginalize-graph x0 spaces states src-edges dst-edges n-vars n-edges)
-        mg-x0 (:values mg)
-        mg-spaces (:spaces mg)
-        mg-states (:states mg)
-        mg-src (:src-edges mg)
-        mg-dst (:dst-edges mg)
-        mg-n-vars (:n-vars mg)
-        mg-n-edges (:n-edges mg)
-        ;; Forward noise: x_t = sqrt(alpha_t)*x0 + sqrt(1-alpha_t)*noise
-        alpha-t (aget alphas-cumprod (int t))
-        sqrt-alpha (Math/sqrt alpha-t)
-        sqrt-one-minus-alpha (Math/sqrt (- 1.0 alpha-t))
-        x-t (double-array mg-n-vars)
-        _ (dotimes [i mg-n-vars]
-            (let [x0i (aget ^doubles mg-x0 i)
-                  state (aget ^longs mg-states i)]
-              (aset x-t i
-                    (if (== state OBSERVED)
-                      x0i
-                      (+ (* sqrt-alpha x0i)
-                         (* sqrt-one-minus-alpha (.nextGaussian (java.util.concurrent.ThreadLocalRandom/current))))))))
-        ;; Forward pass
-        pred (gsdm-forward-dynamic weights config x-t mg-spaces mg-states
-                                   (double t) mg-src mg-dst mg-n-vars mg-n-edges)
-        ;; MSE loss on non-observed variables
-        loss (loop [i 0 acc 0.0 cnt 0]
-               (if (< i mg-n-vars)
-                 (if (not= (aget ^longs mg-states i) OBSERVED)
-                   (let [diff (- (aget ^doubles pred i) (aget ^doubles mg-x0 i))]
-                     (recur (inc i) (+ acc (* diff diff)) (inc cnt)))
-                   (recur (inc i) acc cnt))
-                 (if (pos? cnt) (/ acc (double cnt)) 0.0)))]
-    {:loss loss :pred pred :marginalized mg}))
-
-(defn gsdm-train-step!
-  "Single GSDM training step with numerical gradient SGD.
-
-  Computes forward loss, estimates gradients via finite differences on each
-  weight array, and applies SGD updates in-place. This is the interpreted
-  training path — use compile-gsdm-train-fn for compiled AD training.
-
-  weights: map of keyword→double-array (modified in-place)
-  config: model config
-  x0: [n_vars] clean data
-  spaces: [n_vars] space indices (long[])
-  states: [n_vars] variable states (0=LATENT, 1=OBSERVED, 2=MARGINALIZED)
-  src-edges, dst-edges: [n_edges]
-  n-vars, n-edges: sizes
-  lr: learning rate
-  rng: java.util.Random for noise/timestep sampling
-  alphas-cumprod: [timesteps] precomputed cumulative alpha products
-
-  Returns loss value (double)."
-  [weights config x0 spaces states src-edges dst-edges
-   n-vars n-edges lr ^java.util.Random rng ^doubles alphas-cumprod]
-  (let [n-timesteps (alength alphas-cumprod)
-        t (long (.nextInt rng n-timesteps))
-        ;; Marginalize once
-        mg (marginalize-graph x0 spaces states src-edges dst-edges n-vars n-edges)
-        mg-x0 ^doubles (:values mg)
-        mg-spaces ^longs (:spaces mg)
-        mg-states ^longs (:states mg)
-        mg-src ^longs (:src-edges mg)
-        mg-dst ^longs (:dst-edges mg)
-        mg-n-vars (long (:n-vars mg))
-        mg-n-edges (long (:n-edges mg))
-        ;; Prepare noised input
-        alpha-t (aget alphas-cumprod (int t))
-        sqrt-alpha (Math/sqrt alpha-t)
-        sqrt-1ma (Math/sqrt (- 1.0 alpha-t))
-        x-t (double-array mg-n-vars)
-        _ (dotimes [i mg-n-vars]
-            (aset x-t i
-                  (if (== (aget mg-states i) OBSERVED)
-                    (aget mg-x0 i)
-                    (+ (* sqrt-alpha (aget mg-x0 i))
-                       (* sqrt-1ma (.nextGaussian rng))))))
-        ;; Forward pass
-        pred (gsdm-forward-dynamic weights config x-t mg-spaces mg-states
-                                   (double t) mg-src mg-dst mg-n-vars mg-n-edges)
-        ;; MSE loss on non-observed
-        loss (loop [i 0 acc 0.0 cnt 0]
-               (if (< i mg-n-vars)
-                 (if (not= (aget mg-states i) OBSERVED)
-                   (let [diff (- (aget ^doubles pred i) (aget mg-x0 i))]
-                     (recur (inc i) (+ acc (* diff diff)) (inc cnt)))
-                   (recur (inc i) acc cnt))
-                 (if (pos? cnt) (/ acc (double cnt)) 0.0)))
-        ;; Numerical gradient SGD (interpreted path — slow but correct)
-        eps 1e-5
-        loss-fn (fn []
-                  (let [p (gsdm-forward-dynamic weights config x-t mg-spaces mg-states
-                                                (double t) mg-src mg-dst mg-n-vars mg-n-edges)]
-                    (loop [i 0 acc 0.0 cnt 0]
-                      (if (< i mg-n-vars)
-                        (if (not= (aget mg-states i) OBSERVED)
-                          (let [diff (- (aget ^doubles p i) (aget mg-x0 i))]
-                            (recur (inc i) (+ acc (* diff diff)) (inc cnt)))
-                          (recur (inc i) acc cnt))
-                        (if (pos? cnt) (/ acc (double cnt)) 0.0)))))]
-    ;; SGD with finite-difference gradients for each weight
-    (doseq [[_k ^doubles w] weights]
-      (dotimes [j (alength w)]
-        (let [orig (aget w j)]
-          (aset w j (+ orig eps))
-          (let [loss+ (loss-fn)]
-            (aset w j (- orig eps))
-            (let [loss- (loss-fn)
-                  grad (/ (- loss+ loss-) (* 2.0 eps))]
-              (aset w j (- orig (* lr grad))))))))
-    loss))
-
-;; ================================================================
-;; Training loop (amortized inference — fresh samples each step)
-;; ================================================================
-
-(defn train-gsdm-compiled!
-  "Train GSDM with compiled AD + Adam, fresh samples each step.
-
-  Everything is compiled into one fused kernel: forward pass, backward
-  pass (reverse-mode AD), gradient clipping, and Adam update. The training
-  loop only handles sample generation, noise injection, and calling the kernel.
-
-  compiled: result of compile-gsdm-train-fn
-  gen-fn: (fn [rng] -> {:values :spaces :states :src-edges :dst-edges :n-vars :n-edges})
-  weights: map of keyword→double-array (modified in-place)
-  adam-state: from init-adam-state (modified in-place)
-  config: model config
-  alphas-cumprod: precomputed [timesteps]
-
-  Options:
-    :n-steps       total training steps (default 10000)
-    :lr            learning rate (default 1e-4, matching reference)
-    :beta1         Adam beta1 (default 0.9)
-    :beta2         Adam beta2 (default 0.999)
-    :eps           Adam epsilon (default 1e-8)
-    :max-grad-norm gradient clipping threshold (default 1.0)
-    :log-every     print loss every N steps (default 1000)
-    :seed          random seed (default 42)
-    :normalizer    optional {:mean :std [:mean2 :std2]} from fit-normalizer-2pass
-
-  Returns {:final-loss double}."
-  [compiled gen-fn weights adam-state config ^doubles alphas-cumprod
-   & {:keys [n-steps lr beta1 beta2 eps max-grad-norm log-every seed normalizer]
-      :or {n-steps 10000 lr 1e-4 beta1 0.9 beta2 0.999 eps 1e-8
-           max-grad-norm 1.0 log-every 1000 seed 42}}]
-  (let [{:keys [train-fn n-layers]} compiled
-        {:keys [emb-dim]} config
-        {:keys [m-arrays v-arrays]} adam-state
-        n-timesteps (alength alphas-cumprod)
-        rng (java.util.Random. seed)]
-    (loop [step 0, period-loss 0.0, period-count 0, last-loss 0.0]
-      (if (>= step n-steps)
-        (do (when (pos? period-count)
-              (println (format "Step %d avg-loss: %.6f" step
-                               (/ period-loss (double period-count)))))
-            {:final-loss last-loss})
-        (let [;; 1. Fresh sample from generative model
-              sample (gen-fn rng)
-              {:keys [values spaces states src-edges dst-edges n-vars n-edges]} sample
-              ;; 2. Normalize (2-pass if normalizer has :mean2/:std2)
-              values (if normalizer
-                       (normalize-2pass values normalizer n-vars)
-                       values)
-              ;; 3. Forward noise: sample timestep, noise latent variables
-              t (long (.nextInt rng n-timesteps))
-              alpha-t (aget alphas-cumprod (int t))
-              sqrt-alpha (Math/sqrt alpha-t)
-              sqrt-1ma (Math/sqrt (- 1.0 alpha-t))
-              target (aclone ^doubles values)
-              x-t (double-array n-vars)
-              _ (dotimes [i n-vars]
-                  (aset x-t i
-                        (if (== (aget ^longs states i) OBSERVED)
-                          (aget ^doubles values i)
-                          (+ (* sqrt-alpha (aget ^doubles values i))
-                             (* sqrt-1ma (.nextGaussian rng))))))
-              ;; 4. Position embeddings
-              pos-emb (compute-position-embeddings spaces n-vars emb-dim)
-              ;; 5. Call compiled kernel: forward + backward + clip + Adam
-              w-args (weights-map->args weights n-layers)
-              adam-t (long (inc step))
-              all-args (-> (vec w-args)
-                           (into [x-t spaces target states pos-emb
-                                  src-edges dst-edges
-                                  (double t) (long n-vars) (long n-edges)])
-                           (into m-arrays)
-                           (into v-arrays)
-                           (into [(double lr) (double beta1) (double beta2)
-                                  (double eps) (double max-grad-norm) adam-t]))
-              loss (double (apply train-fn all-args))
-              ;; 6. Logging
-              new-period (+ period-loss loss)
-              new-count (inc period-count)
-              logging? (and (pos? log-every) (zero? (mod (inc step) log-every)))
-              period-avg (/ new-period (double new-count))]
-          (when logging?
-            (println (format "Step %d avg-loss: %.6f" (inc step) period-avg)))
-          (recur (inc step)
-                 (if logging? 0.0 new-period)
-                 (if logging? 0 new-count)
-                 loss))))))
-
-;; ================================================================
 ;; DDPM sampling (inference)
 ;; ================================================================
 
@@ -1109,276 +944,122 @@
       (unmarginalize-values result orig-indices n-vars))))
 
 ;; ================================================================
-;; Code-generated unrolled forward for compiled training
+;; Tree-based defmodel API (params/compile-train-step compatible)
+;;
+;; Composes the block primitives (flat-embed, timestep-mlp, resnet-block,
+;; graph-attention-multihead, flat-unembed) into a single rp/defmodel that
+;; takes a structured weight tree. The user gets compile-aot, value+grad
+;; with structured grads, and compile-train-step for fused training — all
+;; without param-ordering bookkeeping or custom code generation.
 ;; ================================================================
 
-(defn weight-param-order
-  "Return canonical param symbol ordering for n-layers config.
-  Non-layer weights (12): temb(4), embed(4), unembed(4).
-  Per-layer weights (18): 10 resnet + 8 attention."
-  [n-layers]
-  (vec
-   (concat
-      ;; Timestep MLP (4)
-    '[temb-W1 temb-b1 temb-W2 temb-b2]
-      ;; Embedder (4): We, be, space, state
-    '[embed-We embed-be embed-space embed-state]
-      ;; Unembedder (4)
-    '[unembed-Wu1 unembed-bu1 unembed-Wu2 unembed-bu2]
-      ;; Per-layer weights (18 per layer)
-    (mapcat
-     (fn [i]
-       (let [pfx (str "l" i "-")]
-         (mapv #(symbol (str pfx %))
-               ["res-W1" "res-b1" "res-W2" "res-b2"
-                "res-Wt" "res-bt" "res-g1" "res-bn1"
-                "res-g2" "res-bn2"
-                "attn-Wq" "attn-bq" "attn-Wk" "attn-bk"
-                "attn-Wv" "attn-bv"
-                "attn-g" "attn-b"])))
-     (range n-layers)))))
-
-(defn- data-param-order
-  "Data param symbols in canonical order.
-  pos-emb is precomputed sinusoidal position embeddings [n-vars * emb-dim]."
+(defn layer-spec
+  "HMap spec for one transformer block's weights."
   []
-  '[values spaces target states pos-emb src-edges dst-edges t n-vars n-edges])
+  '(HMap :mandatory
+         {:res-W1  (Param (Array double))  :res-b1  (Param (Array double))
+          :res-W2  (Param (Array double))  :res-b2  (Param (Array double))
+          :res-Wt  (Param (Array double))  :res-bt  (Param (Array double))
+          :res-g1  (Param (Array double))  :res-bn1 (Param (Array double))
+          :res-g2  (Param (Array double))  :res-bn2 (Param (Array double))
+          :attn-Wq (Param (Array double))  :attn-bq (Param (Array double))
+          :attn-Wk (Param (Array double))  :attn-bk (Param (Array double))
+          :attn-Wv (Param (Array double))  :attn-bv (Param (Array double))
+          :attn-g  (Param (Array double))  :attn-b  (Param (Array double))}))
 
-(defn all-param-order
-  "Full param order: weights then data."
+(defn weights-spec
+  "HMap spec for the full GSDM weight tree at given n-layers."
   [n-layers]
-  (vec (concat (weight-param-order n-layers) (data-param-order))))
+  (let [ls (layer-spec)]
+    (list 'HMap :mandatory
+          {:temb-W1     '(Param (Array double))   :temb-b1     '(Param (Array double))
+           :temb-W2     '(Param (Array double))   :temb-b2     '(Param (Array double))
+           :embed-We    '(Param (Array double))   :embed-be    '(Param (Array double))
+           :embed-space '(Param (Array double))   :embed-state '(Param (Array double))
+           :unembed-Wu1 '(Param (Array double))   :unembed-bu1 '(Param (Array double))
+           :unembed-Wu2 '(Param (Array double))   :unembed-bu2 '(Param (Array double))
+           :layers      (list 'HVec (vec (repeat n-layers ls)))})))
 
-(defn- weight-kw->sym
-  "Map init-gsdm-weights keyword to param symbol."
-  [kw]
-  (let [s (name kw)]
-    (if-let [[_ layer-idx suffix] (re-matches #"layer-(\d+)-(.*)" s)]
-      (symbol (str "l" layer-idx "-" suffix))
-      (symbol s))))
-
-(defn weights-map->args
-  "Convert init-gsdm-weights map to ordered arg vector matching param order."
+(defn flat->tree
+  "Convert init-gsdm-weights output (flat keyword-keyed) into the tree shape
+  expected by the gsdm-loss defmodel."
   [weights n-layers]
-  (let [order (weight-param-order n-layers)
-        kw-map (into {} (map (fn [[k v]] [(weight-kw->sym k) v]) weights))]
-    (mapv (fn [sym]
-            (or (get kw-map sym)
-                (throw (ex-info (str "Missing weight for param: " sym)
-                                {:param sym :available (keys kw-map)}))))
-          order)))
+  (let [layer-keys [:res-W1 :res-b1 :res-W2 :res-b2 :res-Wt :res-bt
+                    :res-g1 :res-bn1 :res-g2 :res-bn2
+                    :attn-Wq :attn-bq :attn-Wk :attn-bk
+                    :attn-Wv :attn-bv :attn-g :attn-b]]
+    {:temb-W1     (:temb-W1 weights)     :temb-b1     (:temb-b1 weights)
+     :temb-W2     (:temb-W2 weights)     :temb-b2     (:temb-b2 weights)
+     :embed-We    (:embed-We weights)    :embed-be    (:embed-be weights)
+     :embed-space (:embed-space weights) :embed-state (:embed-state weights)
+     :unembed-Wu1 (:unembed-Wu1 weights) :unembed-bu1 (:unembed-bu1 weights)
+     :unembed-Wu2 (:unembed-Wu2 weights) :unembed-bu2 (:unembed-bu2 weights)
+     :layers (mapv (fn [i]
+                     (into {} (map (fn [k]
+                                     [k (get weights
+                                             (keyword (str "layer-" i "-" (name k))))]))
+                           layer-keys))
+                   (range n-layers))}))
 
-(defn- gen-gsdm-loss-body
-  "Generate the unrolled GSDM forward+MSE-loss body as an S-expression.
-  Returns a single let form (not wrapped in deftm)."
-  [n-layers emb-dim n-heads n-spaces]
-  (let [;; Generate per-layer bindings
-        layer-bindings
-        (mapcat
-         (fn [i]
-           (let [pfx (str "l" i "-")
-                 res-sym (fn [s] (symbol (str pfx "res-" s)))
-                 attn-sym (fn [s] (symbol (str pfx "attn-" s)))
-                 h-in (if (zero? i) 'h (symbol (str "h" i)))]
-              ;; ResnetBlock then GraphAttention
-              ;; Use distinct names for resnet vs attention output to avoid
-              ;; let* shadowing — the AD reverse pass captures argument symbols
-              ;; by name, so reusing h1 for both resnet and attention causes the
-              ;; pullback to reference the wrong (shadowed) value.
-             (let [h-res (symbol (str "h" (inc i) "-res"))
-                   h-out (symbol (str "h" (inc i)))]
-               [h-res
-                `(~'raster.dl.gsdm/resnet-block ~h-in ~'temb
-                                                ~(res-sym "W1") ~(res-sym "b1")
-                                                ~(res-sym "W2") ~(res-sym "b2")
-                                                ~(res-sym "Wt") ~(res-sym "bt")
-                                                ~(res-sym "g1") ~(res-sym "bn1")
-                                                ~(res-sym "g2") ~(res-sym "bn2")
-                                                ~'n-vars ~'emb-dim-val)
-                h-out
-                `(~'raster.dl.gsdm/graph-attention-multihead ~h-res
-                                                             ~(attn-sym "Wq") ~(attn-sym "bq")
-                                                             ~(attn-sym "Wk") ~(attn-sym "bk")
-                                                             ~(attn-sym "Wv") ~(attn-sym "bv")
-                                                             ~(attn-sym "g") ~(attn-sym "b")
-                                                             ~'src-edges ~'dst-edges
-                                                             ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)])))
-         (range n-layers))
-        last-h (symbol (str "h" n-layers))]
-    `(~'let [~'emb-dim-val ~(long emb-dim)
-             ~'n-heads-val ~(long n-heads)
-             ~'n-spaces-val ~(long n-spaces)
-             ~'n-states-val ~(long N-STATES)
-             ;; Embed (value + space + state + position)
-             ~'h (~'raster.dl.gsdm/flat-embed ~'values ~'embed-space ~'spaces
-                                              ~'embed-state ~'states ~'pos-emb
-                                              ~'embed-We ~'embed-be
-                                              ~'n-vars ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
-             ;; Timestep MLP
-             ~'temb (~'raster.dl.gsdm/timestep-mlp ~'t ~'temb-W1 ~'temb-b1
-                                                   ~'temb-W2 ~'temb-b2 ~'emb-dim-val)
-             ;; Unrolled layers
-             ~@layer-bindings
-             ;; Unembed
-             ~'pred (~'raster.dl.gsdm/flat-unembed ~last-h
-                                                   ~'unembed-Wu1 ~'unembed-bu1
-                                                   ~'unembed-Wu2 ~'unembed-bu2
-                                                   ~'n-vars ~'emb-dim-val)
-             ;; MSE loss on latent variables (masked)
-             ~'loss (~'raster.dl.array-ops/masked-mse-loss ~'pred ~'target ~'states ~'n-vars)]
-            ~'loss)))
+(defn gsdm-loss-body
+  "Generate the GSDM loss body S-expression. The layer stack is folded by
+  `tree/scan-vec` over `(:layers w)` — the compiler unrolls it from the HVec
+  length in the weights spec, so this body is INDEPENDENT of n-layers (it no
+  longer generates the per-layer chain by hand). Only emb-dim/n-heads/n-spaces
+  are baked as constants.
 
-(defn build-walker-env
-  "Build walker type environment for GSDM params.
-  All typed params are included so the walker can resolve deftm dispatch."
-  [n-layers]
-  (let [weight-syms (weight-param-order n-layers)
-        ;; All weights are (Array double) -> tag 'doubles
-        weight-env (into {} (map (fn [s] [s 'doubles]) weight-syms))
-        ;; Data params with their types
-        data-env {'values 'doubles
-                  'spaces 'longs
-                  'target 'doubles
-                  'states 'longs
-                  'pos-emb 'doubles
-                  'src-edges 'longs
-                  'dst-edges 'longs
-                  't 'double
-                  'n-vars 'long
-                  'n-edges 'long}]
-    (merge weight-env data-env)))
+  The body assumes outer scope binds: w, values, spaces, target, states,
+  pos-emb, src-edges, dst-edges, t, n-vars, n-edges (the defmodel arg vector)."
+  [emb-dim n-heads n-spaces]
+  `(~'let [~'emb-dim-val ~(long emb-dim)
+           ~'n-heads-val ~(long n-heads)
+           ~'n-spaces-val ~(long n-spaces)
+           ~'n-states-val ~(long N-STATES)
+           ~'h-init (raster.dl.gsdm/flat-embed
+                     ~'values (:embed-space ~'w) ~'spaces
+                     (:embed-state ~'w) ~'states ~'pos-emb
+                     (:embed-We ~'w) (:embed-be ~'w)
+                     ~'n-vars ~'emb-dim-val ~'n-spaces-val ~'n-states-val)
+           ~'temb (raster.dl.gsdm/timestep-mlp
+                   ~'t (:temb-W1 ~'w) (:temb-b1 ~'w)
+                   (:temb-W2 ~'w) (:temb-b2 ~'w) ~'emb-dim-val)
+           ~'h-final (raster.tree/scan-vec raster.dl.gsdm/transformer-block-step
+                                           ~'h-init (:layers ~'w)
+                                           ~'temb ~'src-edges ~'dst-edges
+                                           ~'n-vars ~'n-edges ~'emb-dim-val ~'n-heads-val)
+           ~'pred (raster.dl.gsdm/flat-unembed
+                   ~'h-final
+                   (:unembed-Wu1 ~'w) (:unembed-bu1 ~'w)
+                   (:unembed-Wu2 ~'w) (:unembed-bu2 ~'w)
+                   ~'n-vars ~'emb-dim-val)
+           ~'loss (raster.dl.array-ops/masked-mse-loss
+                   ~'pred ~'target ~'states ~'n-vars)]
+          ~'loss))
 
-(defn build-tc-env
-  "Build typedclojure env from walker env."
-  [env]
-  (let [tag->tc {'doubles '(Array double)
-                 'longs '(Array long)
-                 'double 'Double
-                 'long 'Long}]
-    (into {} (map (fn [[k v]] [k (get tag->tc v v)]) env))))
-
-(defn walk-gsdm-body
-  "Generate and walk the GSDM loss body for a fixed n-layers config.
-  Returns the walked S-expression."
-  [n-layers emb-dim n-heads n-spaces]
-  (let [body (gen-gsdm-loss-body n-layers emb-dim n-heads n-spaces)
-        flat-env (build-walker-env n-layers)
-        type-env (reduce-kv (fn [m s t] (assoc m s {:tag t})) {} flat-env)]
-    (walker/walk-body
-     body {:type-env type-env})))
-
-(defn compile-gsdm-train-fn
-  "Compile an optimized GSDM training step with Adam optimizer.
-
-  Generates the GSDM loss as a dynamic deftm, wraps in value+grad,
-  adds per-parameter Adam updates with gradient clipping, then compiles
-  everything through the forward pipeline into one fused kernel.
-
-  The compiled function takes: weight arrays, Adam m/v state arrays,
-  data arrays, and optimizer hyperparameters. Adam state is mutated
-  in-place (caller allocates m/v buffers once via init-adam-state).
-
-  Options:
-    :target-device  e.g. :ze:0 for GPU
-    :dtype          explicit dtype override (:float, :double)
-
-  Returns {:train-fn   compiled function
-           :param-order [sym...] (full param list for calling)
-           :weight-params #{sym...}
-           :n-layers    int}"
-  [& {:keys [n-layers emb-dim n-heads n-spaces target-device dtype simd?]
-      :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1 simd? true}}]
-  (require 'raster.ad.reverse 'raster.dl.optim 'raster.arrays)
-  (let [all-params (all-param-order n-layers)
-        weight-syms (set (weight-param-order n-layers))
-        weight-params-ordered (vec (filter weight-syms all-params))
-        loss-body (gen-gsdm-loss-body n-layers emb-dim n-heads n-spaces)
-        tc-env (build-tc-env (build-walker-env n-layers))
-        ;; Generate namespaced names for the dynamic deftms
-        loss-sym (symbol "raster.dl.gsdm" (str "gsdm-loss-" n-layers "L"))
-        train-sym (symbol "raster.dl.gsdm" (str "gsdm-train-" n-layers "L"))
-        ;; Type annotations for the base loss params
-        annotated-params (vec (mapcat (fn [s]
-                                        (let [tag (get tc-env s)]
-                                          [s :- (or tag 'Double)]))
-                                      all-params))
-        ;; Define loss deftm
-        _ (binding [*ns* (the-ns 'raster.dl.gsdm)]
-            (eval `(core/deftm ~loss-sym [~@annotated-params] :- ~'Double ~loss-body)))
-        ;; Adam state params: m_* and v_* for each weight, plus hyperparams
-        adam-m-syms (mapv #(symbol (str "m_" %)) weight-params-ordered)
-        adam-v-syms (mapv #(symbol (str "v_" %)) weight-params-ordered)
-        adam-m-annotated (vec (mapcat (fn [s] [s :- '(Array double)]) adam-m-syms))
-        adam-v-annotated (vec (mapcat (fn [s] [s :- '(Array double)]) adam-v-syms))
-        ;; Build value+grad call
-        vg-call `((~'raster.ad.reverse/value+grad (~'var ~loss-sym)) ~@all-params)
-        ;; Extract gradients from vg-result
-        grad-bindings (vec (mapcat (fn [wsym]
-                                     (let [grad-sym (symbol (str "d_" wsym))
-                                           idx (inc (.indexOf ^java.util.List
-                                                     (vec all-params) wsym))]
-                                       [(with-meta grad-sym {:tag 'doubles})
-                                        `(~'nth ~'vg-result ~idx)]))
-                                   weight-params-ordered))
-        ;; Gradient clipping: clip each grad array by max-grad-norm
-        clip-updates (mapv (fn [wsym]
-                             (let [grad-sym (symbol (str "d_" wsym))]
-                               `(~'raster.dl.optim/clip-grad-norm!
-                                 ~grad-sym (~'raster.arrays/alength ~grad-sym)
-                                 ~'max-grad-norm)))
-                           weight-params-ordered)
-        ;; Adam updates: adam-step! for each weight
-        adam-updates (mapv (fn [wsym m-sym v-sym]
-                             (let [grad-sym (symbol (str "d_" wsym))]
-                               `(~'raster.dl.optim/adam-step!
-                                 ~wsym ~grad-sym ~m-sym ~v-sym
-                                 (~'raster.arrays/alength ~wsym)
-                                 ~'lr ~'beta1 ~'beta2 ~'eps ~'adam-t)))
-                           weight-params-ordered adam-m-syms adam-v-syms)
-        ;; Full train body
-        train-body `(~'let [~'vg-result ~vg-call
-                            ~(with-meta 'loss {:tag 'double}) (~'nth ~'vg-result 0)
-                            ~@grad-bindings]
-                           ~@clip-updates
-                           ~@adam-updates
-                           ~'loss)
-        ;; Full param list: weights + data + adam-m + adam-v + hyperparams
-        train-params (vec (concat annotated-params
-                                  adam-m-annotated
-                                  adam-v-annotated
-                                  ['lr :- 'Double
-                                   'beta1 :- 'Double
-                                   'beta2 :- 'Double
-                                   'eps :- 'Double
-                                   'max-grad-norm :- 'Double
-                                   'adam-t :- 'Long]))
-        _ (binding [*ns* (the-ns 'raster.dl.gsdm)]
-            (eval `(core/deftm ~train-sym [~@train-params] :- ~'Double ~train-body)))
-        train-var (resolve train-sym)
-        ;; Compile
-        train-fn (pipeline/compile-aot train-var
-                                       :simd? (and simd? (not (some? target-device)))
-                                       :target-device target-device)]
-    {:train-fn train-fn
-     :param-order (vec (concat all-params
-                               adam-m-syms adam-v-syms
-                               ['lr 'beta1 'beta2 'eps 'max-grad-norm 'adam-t]))
-     :weight-params weight-syms
-     :weight-param-order weight-params-ordered
-     :adam-m-syms adam-m-syms
-     :adam-v-syms adam-v-syms
-     :n-layers n-layers}))
-
-(defn init-adam-state
-  "Allocate zeroed Adam m/v arrays for all weight params.
-  Returns {:m-arrays [double-array ...], :v-arrays [double-array ...]}
-  in the same order as weight-param-order."
-  [weights n-layers]
-  (let [w-order (weight-param-order n-layers)
-        kw-map (into {} (map (fn [[k v]] [(weight-kw->sym k) v]) weights))]
-    {:m-arrays (mapv (fn [sym]
-                       (double-array (count (get kw-map sym))))
-                     w-order)
-     :v-arrays (mapv (fn [sym]
-                       (double-array (count (get kw-map sym))))
-                     w-order)}))
+(defn make-gsdm-loss
+  "Eval a deftm for the given config and return its var. The var has
+  structured-arg surface (takes a weights tree via the HMap arg type);
+  compile-aot, value+grad, and compile-train-step pick up the same
+  surface via tree metadata."
+  [{:keys [n-layers emb-dim n-heads n-spaces]
+    :or {n-layers 2 emb-dim 8 n-heads 2 n-spaces 1}}]
+  (let [w-spec (weights-spec n-layers)
+        body (gsdm-loss-body emb-dim n-heads n-spaces)
+        sym  (symbol (str "gsdm-loss-" n-layers "L-" emb-dim "d-" n-heads "h-" n-spaces "s"))
+        form `(raster.core/deftm ~sym
+                [~'w :- ~w-spec
+                 ~'values :- (~'Array ~'double)
+                 ~'spaces :- (~'Array ~'long)
+                 ~'target :- (~'Array ~'double)
+                 ~'states :- (~'Array ~'long)
+                 ~'pos-emb :- (~'Array ~'double)
+                 ~'src-edges :- (~'Array ~'long)
+                 ~'dst-edges :- (~'Array ~'long)
+                 ~'t :- ~'Double
+                 ~'n-vars :- ~'Long
+                 ~'n-edges :- ~'Long]
+                :- ~'Double
+                ~body)]
+    (binding [*ns* (the-ns 'raster.dl.gsdm)]
+      (eval form))
+    (find-var (symbol "raster.dl.gsdm" (str sym)))))

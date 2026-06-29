@@ -1820,7 +1820,9 @@
                     (when (symbol? arr) (:hint (get locals arr))))
         arr-verified? (when (symbol? arr) (:verified (get locals arr)))
         arr-type (emit-form code arr locals ctx)]
-    ;; Checkcast array — skip when type verified by method descriptor
+    ;; Checkcast array — skip when type verified by method descriptor.
+    ;; Unknown arr-tag defaults to Object[] so aastore has a typed array
+    ;; reference (otherwise verifier rejects: 'Object' isn't an array type).
     (when (and (= arr-type :ref) (not arr-verified?))
       (let [arr-cls (case arr-tag
                       objects (Class/forName "[Ljava.lang.Object;")
@@ -1830,8 +1832,9 @@
                       ints    (Class/forName "[I")
                       bytes   (Class/forName "[B")
                       shorts  (Class/forName "[S")
-                      nil)]
-        (when arr-cls (.checkcast code (class-desc-of arr-cls)))))
+                      ;; Unknown arr-tag: assume Object[] for aastore
+                      (Class/forName "[Ljava.lang.Object;"))]
+        (.checkcast code (class-desc-of arr-cls))))
     (let [t (emit-form code idx locals ctx)]
       (when (not= t :int) (emit-coerce code t :int)))
     ;; In void context (non-last statement), emit plain store (1 instr).
@@ -2914,10 +2917,14 @@
                             :float  (.fstore code slot)
                             (.astore code slot)))
                         (if slot
-                          (assoc locs sym {:slot slot :type t :hint tag
-                                           ;; Mark as verified if we just checkcast'd it
-                                           ;; — skips redundant checkcasts on aget/aset
-                                           :verified (boolean (and tag (not= tag 'Object)))})
+                          (let [new-locs (assoc locs sym {:slot slot :type t :hint tag
+                                                          :verified (boolean (and tag (not= tag 'Object)))})]
+                            (when (and (System/getProperty "raster.debug.locals")
+                                       (or (.startsWith (str sym) "K_")
+                                           (.startsWith (str sym) "V_")
+                                           (.startsWith (str sym) "Q_")))
+                              (println (str "  [bind] " sym " → slot " slot " type " t)))
+                            new-locs)
                           locs)))
                     locals pairs)]
     (emit-body code body new-locals ctx)))
@@ -3488,6 +3495,15 @@
 (defn- emit-symbol
   "Emit bytecode for a symbol: local variable load, var deref, constant fold, or static field."
   [code form locals ctx]
+  (when (and (System/getProperty "raster.debug.locals")
+             (symbol? form)
+             (or (.startsWith (str form) "K_")
+                 (.startsWith (str form) "V_")
+                 (.startsWith (str form) "Q_")))
+    (println (str "  [lookup] " form " → " (if (contains? locals form) "FOUND" "MISSING")
+                  " (locals has " (count locals) " entries)"))
+    (when-not (contains? locals form)
+      (println "  [lookup-fail] all locals: " (sort (map str (keys locals))))))
   (if-let [{:keys [slot type]} (get locals form)]
     (do (case type
           :double (.dload code slot)
@@ -4638,11 +4654,15 @@
         _ (try (.verify (java.lang.classfile.ClassFile/of) bytes)
                (catch Exception e
                  (println "WARNING: Bytecode verification failed for" class-name ":" (.getMessage e))))
-        _ (when-let [dir (System/getProperty "raster.dumpdir")]
-            (try (java.nio.file.Files/write
-                  (.toPath (java.io.File. dir (str (clojure.string/replace class-name "." "_") ".class")))
-                  bytes (make-array java.nio.file.OpenOption 0))
-                 (catch Throwable _ nil)))
+        _ (when-let [dir (System/getProperty "raster.debug.dump-class-dir")]
+            (let [safe-name (clojure.string/replace class-name "." "_")
+                  path (str dir "/" safe-name ".class")]
+              (java.nio.file.Files/write
+               (java.nio.file.Paths/get path (into-array String []))
+               bytes
+               (into-array java.nio.file.OpenOption []))
+              (binding [*out* *err*]
+                (println "[dump-class]" class-name "->" path))))
         loader (compilation-loader)
         cls (.defineClass loader class-name bytes nil)]
     {:class cls
@@ -4878,9 +4898,11 @@
   (branch folding, int loops, checkcast elimination)."
   [class-name params tags return-tag walked-body source-ns typed-iface-name
    & [fallback-ns fallback-name]]
-  (when (> (count params) 20)
-    (throw (ex-info "BC compilation: function has more than 20 parameters (IFn limit)"
-                    {:count (count params) :class class-name})))
+  ;; Note: clojure.lang.IFn caps positional invoke at 20 args, but the JVM
+  ;; method limit is 255. For >20 typed params we still emit compute_static
+  ;; and the typed `invk` method as usual; the `invoke(Object…)` overloads
+  ;; are skipped (existing guard) and the applyTo path uses a reflective
+  ;; fallback into compute_static (emitted below).
   (let [;; Par-extraction splitting: extract par/map! and par/reduce forms into
         ;; separate static methods. Keeps scalar code in the main method.
         ;; Uses size estimate to avoid splitting small bodies unnecessarily.
@@ -5146,20 +5168,56 @@
                                                                       (MethodTypeDesc/of int-box-cd (into-array ClassDesc [I-cd])))
                                                        (= crd "V") (.aconst_null code)
                                                        :else nil))
-                                                   (.areturn code)))))
-                      ;; applyTo for varargs
-                            (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
-                                  iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
-                                  apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))]
-                              (.withMethodBody cb "applyTo"
-                                               (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd]))
-                                               (int 0x0001)
-                                               (reify java.util.function.Consumer
-                                                 (accept [_ code]
-                                                   (.aload code 0)
-                                                   (.aload code 1)
-                                                   (.invokestatic code afn-cd "applyToHelper" apply-mt)
-                                                   (.areturn code)))))))))
+                                                   (.areturn code))))))
+                      ;; applyTo for varargs.
+                      ;; For ≤20 params: AFn.applyToHelper unpacks the seq and
+                      ;; routes to one of the IFn.invoke(Object…) overloads.
+                      ;; For >20 params: AFn.applyToHelper caps at 20, so we
+                      ;; emit a custom body that builds an Object[N] from the
+                      ;; seq and invokes compute_static reflectively.
+                          (let [afn-cd (ClassDesc/of "clojure.lang" "AFn")
+                                iseq-cd (ClassDesc/of "clojure.lang" "ISeq")
+                                reflector-cd (ClassDesc/of "clojure.lang" "Reflector")
+                                obj-arr-cd (ClassDesc/ofDescriptor "[Ljava/lang/Object;")
+                                apply-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [ifn-cd iseq-cd]))
+                                reflect-mt (MethodTypeDesc/of obj-cd (into-array ClassDesc [string-cd string-cd obj-arr-cd]))
+                                small? (<= (count param-cds) 20)
+                                load-int (fn [code n]
+                                           (cond (<= -128 n 127) (.bipush code (int n))
+                                                 (<= -32768 n 32767) (.sipush code (int n))
+                                                 :else (.ldc code (int n))))]
+                            (.withMethodBody cb "applyTo"
+                                             (MethodTypeDesc/of obj-cd (into-array ClassDesc [iseq-cd]))
+                                             (int 0x0001)
+                                             (reify java.util.function.Consumer
+                                               (accept [_ code]
+                                                 (if small?
+                                                   (do (.aload code 0)
+                                                       (.aload code 1)
+                                                       (.invokestatic code afn-cd "applyToHelper" apply-mt)
+                                                       (.areturn code))
+                                                   (let [n (count param-cds)]
+                                                     (load-int code n)
+                                                     (.anewarray code obj-cd)
+                                                     (.astore code 2)
+                                                     (.aload code 1)
+                                                     (.astore code 3)
+                                                     (dotimes [i n]
+                                                       (.aload code 2)
+                                                       (load-int code i)
+                                                       (.aload code 3)
+                                                       (.invokeinterface code iseq-cd "first"
+                                                                         (MethodTypeDesc/of obj-cd no-cd))
+                                                       (.aastore code)
+                                                       (.aload code 3)
+                                                       (.invokeinterface code iseq-cd "next"
+                                                                         (MethodTypeDesc/of iseq-cd no-cd))
+                                                       (.astore code 3))
+                                                     (.ldc code class-name)
+                                                     (.ldc code "compute_static")
+                                                     (.aload code 2)
+                                                     (.invokestatic code reflector-cd "invokeStaticMethod" reflect-mt)
+                                                     (.areturn code))))))))))
         loader (compilation-loader)
         wrapper-class (.defineClass loader wrapper-name bytes nil)]
     (.newInstance (.getDeclaredConstructor wrapper-class (into-array Class []))
