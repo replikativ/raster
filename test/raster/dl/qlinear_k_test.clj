@@ -8,6 +8,14 @@
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]))
 
+(defn- clang-available? []
+  (try
+    (let [cc (or (System/getenv "RASTER_CC") "clang")
+          p (-> (ProcessBuilder. ^java.util.List [cc "--version"])
+                (.redirectErrorStream true) (.start))]
+      (.waitFor p) (zero? (.exitValue p)))
+    (catch Exception _ false)))
+
 (defn- gen [n seed]
   (let [a (float-array n) r (java.util.Random. seed)]
     (dotimes [i n] (aset a i (float (- (.nextDouble r) 0.5)))) a))
@@ -24,6 +32,7 @@
     (dotimes [k in] (aset d k (float (* dact (aget ^bytes xq k))))) d))
 
 (deftest q4k-composable-c
+ (when (clang-available?)
   (testing "composable Q4_K GEMV → C matches dequant-matmul"
     (let [out 8 in 256
           W (gen (* out in) 1) x (gen in 2)
@@ -35,9 +44,10 @@
       (let [yref (ref-matmul (q/dequant-q4k ew q/q4-K (* out in)) (dequant-act ea in) out in)]
         (dotimes [o out]
           (is (< (Math/abs (- (aget y o) (aget yref o))) 1e-2)
-              (str "Q4_K row " o ": C " (aget y o) " vs ref " (aget yref o))))))))
+              (str "Q4_K row " o ": C " (aget y o) " vs ref " (aget yref o)))))))))
 
 (deftest q6k-composable-c
+ (when (clang-available?)
   (testing "composable Q6_K GEMV → C matches dequant-matmul"
     (let [out 8 in 256
           W (gen (* out in) 3) x (gen in 4)
@@ -49,4 +59,4 @@
       (let [yref (ref-matmul (q/dequant-q6k ew q/q6-K (* out in)) (dequant-act ea in) out in)]
         (dotimes [o out]
           (is (< (Math/abs (- (aget y o) (aget yref o))) 1e-2)
-              (str "Q6_K row " o ": C " (aget y o) " vs ref " (aget yref o))))))))
+              (str "Q6_K row " o ": C " (aget y o) " vs ref " (aget yref o)))))))))
