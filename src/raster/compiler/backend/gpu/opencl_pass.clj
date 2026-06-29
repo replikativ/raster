@@ -159,6 +159,31 @@
                           (vec (:scalar-params k))
                           bound)))))
 
+            ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
+            ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the
+            ;; resident invoke carries the output buffer (4-arg) so it stays device-resident
+            ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
+            (par/par-reduce-into-form? form)
+            (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
+              (if-let [segred (par->segred reduce-form dtype)]
+                (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
+                  (if kernel
+                    (let [k (register-kernel! kernel :ze-reduces)]
+                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                            (:kernel-name k) (vec (:array-params k)) out-buf bound))
+                    (let [k (register-kernel!
+                             (legacy/generate-par-reduce-kernel reduce-form
+                                                                :dtype dtype :device-id device-id)
+                             :ze-reduces)]
+                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                            (:kernel-name k) (vec (:array-params k)) out-buf bound))))
+                (let [k (register-kernel!
+                         (legacy/generate-par-reduce-kernel reduce-form
+                                                            :dtype dtype :device-id device-id)
+                         :ze-reduces)]
+                  (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                        (:kernel-name k) (vec (:array-params k)) out-buf bound))))
+
             ;; === par/reduce — SegOp path ===
             (par/par-reduce-form? form)
             (let [{:keys [bound]} (par/extract-par-reduce-info form)]

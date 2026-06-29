@@ -1771,7 +1771,11 @@
                                   scalar-args)
          all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
          wg (long workgroup-size)
-         group-count (long (Math/ceil (/ (double n) wg)))
+         ;; A reduction binds via this same path (arrays..., scalars..., _n_bound) but launches a
+         ;; SINGLE workgroup so the kernel's grid-stride loop covers all n and writes output[0] —
+         ;; the result stays device-resident with no host cross-group combine. Callers pass
+         ;; {:group-count 1}; map/map-void leave it nil and get the full ceil(n/wg) grid.
+         group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
          async? (boolean (get opts :async?))
          cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
      {:bound (bind-kernel! kernel-handle wg all-args cmd-list)

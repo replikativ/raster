@@ -9,6 +9,7 @@
    same SegOp IR but produce different target code."
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [clojure.string :as str]))
 
 ;; ================================================================
@@ -138,21 +139,29 @@
           (let [[_ binds & bdy] lambda]
             [(vec (partition 2 binds)) (last bdy)])
           [nil lambda])
-        op-sym (when (seq? inner-body) (first inner-body))
-        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*, 'clojure.core/- '-} op-sym op-sym)
+        ;; .invk-aware: the walker devirtualizes (raster.numeric/+ acc x) into
+        ;; (.invk _plus_impl acc x) with :raster.op/original metadata. semantic-op recovers the
+        ;; original op and call-args the real operands — never parse the mangled impl name (which
+        ;; would mis-detect the op and capture the impl symbol as the element). Same fix #37 made
+        ;; for SegMap; here it keeps SegRed combine-op detection sound for both bare and .invk forms.
+        op-sym (when (seq? inner-body) (descriptor/semantic-op inner-body))
+        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*, 'clojure.core/- '-,
+                            'raster.numeric/+ '+, 'raster.numeric/* '*, 'raster.numeric/- '-}
+                           op-sym op-sym)
         c-op (condp = normalized-op '+ "+" '* "*" 'Math/max "fmax" 'Math/min "fmin" "+")
         c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
         identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
-        ;; Extract element expression (the non-acc part), re-wrap in let if needed
+        ;; Extract the element expression (the non-acc operand) from the SEMANTIC args.
+        op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
+        acc-at? (fn [a] (or (= a acc)
+                            (and (seq? a) (= 'double (first a)) (= acc (second a)))))
         [_acc-pos elem-expr-raw]
-        (when (and (seq? inner-body) (>= (count inner-body) 3))
-          (cond
-            (= (nth inner-body 1) acc) [:left (nth inner-body 2)]
-            (= (nth inner-body 2) acc) [:right (nth inner-body 1)]
-            (and (seq? (nth inner-body 1)) (= 'double (first (nth inner-body 1)))
-                 (= acc (second (nth inner-body 1))))
-            [:left (nth inner-body 2)]
-            :else [nil nil]))
+        (when (>= (count op-args) 2)
+          (let [a0 (nth op-args 0) a1 (nth op-args 1)]
+            (cond
+              (acc-at? a0) [:left a1]
+              (acc-at? a1) [:right a0]
+              :else [nil nil])))
         ;; Re-wrap in let if there were bindings (preserves local variable scope)
         elem-expr (if (and elem-expr-raw (seq let-bindings))
                     (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)

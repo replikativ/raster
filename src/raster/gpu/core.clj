@@ -593,6 +593,54 @@
 ;; Resident GPU programs (Option A: pipeline → bound-dispatch path)
 ;; ================================================================
 
+(defn bind-step!
+  "Bind ONE compiled kernel step (a descriptor :steps entry) into the session under its :phase.
+   Resolves the kernel's array args to resident buffers via `sym->key` (arg-name-symbol → session
+   buffer-key keyword) and its scalars via the step's value-fns over `args`. Handles all three
+   conventions uniformly — the per-step core shared by bind-program! (a single program, sym→key =
+   name) and a multi-instance decode binder (one layer program bound once per layer, sym→key maps
+   weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
+   caller collects :phase keys and records once.
+
+     :reduce    SegRed sig (inputs…, output, scl…, _n_bound); bind inputs ++ [output], SINGLE
+                workgroup (:group-count 1) so the grid-stride loop writes output[0] device-resident.
+     :map       SegMap sig (inputs…, out, scl…, _n_bound); the output is a SEPARATE param not in the
+                registry :array-params, so bind the step's full :arrays (inputs ++ [out]).
+     :map-void  output is an in-place array among :array-params; bind by name via prepare!."
+  [sess step args sym->key]
+  (let [device-id (:device-id @sess)
+        {:keys [kernel-name arrays n-fn scalar-specs phase convention output]} step
+        info-fn (rt-resolve device-id "kernel-registry-entry")]
+    (when-not (#{:map-void :map :reduce} convention)
+      (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
+                           ") — only :map-void / :map / :reduce are supported on the resident path")
+                      {:convention convention :kernel kernel-name})))
+    (let [ki (or (info-fn kernel-name)
+                 (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                 {:kernel kernel-name})))
+          bufs (:buffers @sess)
+          resolve-buf (fn [a] (or (get bufs (sym->key a))
+                                  (throw (ex-info (str "No buffer for kernel arg: " a " → " (sym->key a))
+                                                  {:kernel kernel-name :available (keys bufs)}))))
+          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                        scalar-specs)
+          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")]
+      (case convention
+        :reduce
+        (let [array-bufs (conj (mapv resolve-buf (:array-params ki)) (resolve-buf output))
+              prepared (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})]
+          (swap! sess assoc-in [:prepared phase] prepared))
+
+        :map
+        (let [array-bufs (mapv resolve-buf arrays)
+              prepared (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {})]
+          (swap! sess assoc-in [:prepared phase] prepared))
+
+        (let [sym->buf (into {} (map (fn [p] [(name p) (sym->key p)]) (:array-params ki)))]
+          (swap! sess assoc-in [:kernels phase] [ki])
+          (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase}))))
+    sess))
+
 (defn bind-program!
   "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
    ONCE: allocate resident buffers for the array params + intermediate scratch, install +
@@ -637,32 +685,10 @@
                                    array-params))
          alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
                                      [(keyword (name sym)) [dt (long (size-fn args)) nil]])
-                                   allocs))
-         info-fn (rt-resolve device-id "kernel-registry-entry")]
+                                   allocs))]
      (alloc! sess (merge param-specs alloc-specs))
-     (doseq [{:keys [kernel-name n-fn scalar-specs phase convention]} steps]
-       ;; Only the map conventions bind through bind-registered-map-void-kernel (output is just
-       ;; another resident buffer). :reduce has a different launch/partial-sum shape and would
-       ;; SILENTLY mis-bind here — reject it loudly rather than miscompile. (Decode needs no
-       ;; reduce STEP: reductions live inside map-void kernels. Add a reduce bind path when one
-       ;; appears.)
-       (when-not (#{:map-void :map} convention)
-         (throw (ex-info (str "bind-program! cannot bind a " convention " step (" kernel-name
-                              ") — only :map-void / :map are supported on the resident path")
-                         {:convention convention :kernel kernel-name})))
-       (let [ki (or (info-fn kernel-name)
-                    (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                    {:kernel kernel-name})))
-            ;; kernel array-param NAME → resident buffer key. For map-void the invoke arrays ARE
-            ;; the kernel's own param syms, and intermediates/params are keyed by the same names,
-            ;; so name→same-name-keyword is exact (and SoA-order-robust: prepare! orders by
-            ;; :array-params itself via resolve-kernel-bufs).
-             sym->buf (into {} (map (fn [p] [(name p) (keyword (name p))]) (:array-params ki)))
-            ;; typed scalars ({:type :int|:float|:double :value v}) so int params bind as int.
-             scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
-                           scalar-specs)]
-         (swap! sess assoc-in [:kernels phase] [ki])
-         (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase})))
+     (doseq [step steps]
+       (bind-step! sess step args (fn [a] (keyword (name a)))))
      (record-graph! sess (mapv :phase steps) :program)
      (swap! sess assoc :program-descriptor descriptor :program-roles effective-roles)
      sess)))

@@ -379,6 +379,7 @@
                     'raster.par/map! 'par/map!
                     'raster.par/map2! 'par/map2!
                     'raster.par/reduce 'par/reduce
+                    'raster.par/reduce-into 'par/reduce-into
                     'raster.par/scan 'par/scan
                     'raster.par/scan-exclusive 'par/scan-exclusive
                     'raster.par/stencil! 'par/stencil!
@@ -440,6 +441,23 @@
   "Check if a form is a raster.par/reduce-by-key parallel reduction."
   [form]
   (and (seq? form) (contains? #{'raster.par/reduce-by-key 'par/reduce-by-key} (first form))))
+
+(defn par-reduce-into-form?
+  "Check if a form is a raster.par/reduce-into — an internal IR form (like pmap) emitted by the
+   resident reduce-fusion pass: a parallel reduction that writes its scalar result into element 0
+   of a caller-supplied 1-element output buffer (so it stays device-resident) instead of
+   returning a host scalar. Form: (raster.par/reduce-into out-buf acc init idx bound body)."
+  [form]
+  (and (seq? form) (contains? #{'raster.par/reduce-into 'par/reduce-into} (first form))))
+
+(defn extract-par-reduce-into-info
+  "Extract {:out-buf, :reduce-form, :bound} from a reduce-into form. :reduce-form is the
+   equivalent plain par/reduce (out-buf dropped) so existing SegRed codegen is reused verbatim."
+  [form]
+  (when (par-reduce-into-form? form)
+    (let [[_ out-buf acc init idx bound body] form]
+      {:out-buf out-buf :bound bound
+       :reduce-form (with-meta (list 'raster.par/reduce acc init idx bound body) (meta form))})))
 
 (defn par-rng-fill-form?
   "Check if a form is a raster.par/rng-fill! parallel RNG fill."
