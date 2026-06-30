@@ -89,6 +89,13 @@
     (vector? expr)
     (apply clojure.set/union #{} (map extract-mutation-targets expr))
 
+    ;; map literals carry mutating subforms too — e.g. a `case*` clause map
+    ;; {hash [test (aset buf i v)] …}. Without this, a mutation inside a case arm
+    ;; is invisible, so DCE fails to seed the mutated buffer live and can
+    ;; eliminate the live mutating binding (same map-blind class as free-syms-flat).
+    (map? expr)
+    (apply clojure.set/union #{} (map extract-mutation-targets (apply concat expr)))
+
     :else #{}))
 
 (defn- locally-pure-form?
