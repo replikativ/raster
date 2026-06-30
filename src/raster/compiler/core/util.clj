@@ -16,6 +16,11 @@
   (cond (and (symbol? e) (not (namespace e))) #{e}
         (seq? e)    (apply set/union #{} (map free-syms-flat e))
         (vector? e) (apply set/union #{} (map free-syms-flat e))
+        ;; map literals carry symbol references too — notably a `case*` clause map
+        ;; {hash [test result-expr] …}, whose result exprs reference let-bound
+        ;; locals. Without this, a flat-DCE liveness scan misses those uses and
+        ;; wrongly eliminates the binding they depend on (→ unbound-sym miscompile).
+        (map? e)    (apply set/union #{} (map free-syms-flat (apply concat e)))
         :else       #{}))
 
 (defn- free-leaf?
