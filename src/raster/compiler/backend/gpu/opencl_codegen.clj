@@ -16,6 +16,7 @@
     (emit-reduction-kernel \"sum\" :double '+ 0.0)
     (kernel-launch-config 100000 :device-id :ze:0)"
   (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.backend.gpu.c-emit :as ce]))
 
 ;; ================================================================
@@ -28,11 +29,9 @@
   ce/op-map)
 
 (def opencl-type-map
-  "Maps Raster type keywords to OpenCL C types."
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "long"})  ;; OpenCL 'long' is 64-bit (unlike CUDA's 'long long')
+  "Maps Raster type keywords to OpenCL C types. Derived from the single faceted
+   dtype/native-types. OpenCL 'long' is 64-bit (unlike CUDA's 'long long')."
+  (dtype/backend-types :opencl))
 
 ;; ================================================================
 ;; Expression emission (delegates to shared)

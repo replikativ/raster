@@ -15,6 +15,7 @@
       (emit-expr body idx-sym array-syms \"idx\"))"
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.intrinsics :as intrinsics]
@@ -193,10 +194,8 @@
 ;; ================================================================
 
 (def type-map
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "long long"})
+  "Dtype keyword → C type. Derived from the single faceted dtype/native-types."
+  (dtype/backend-types :c))
 
 (def tag->ctype
   "Map walker :tag metadata to C type strings."
