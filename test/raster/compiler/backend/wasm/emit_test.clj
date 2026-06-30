@@ -654,3 +654,57 @@
                                     (Double/doubleToRawLongBits 4.0)]))]
       (is (= [:f64] (:result-types m)))
       (is (< (Math/abs (- (Double/longBitsToDouble (aget r 0)) 5.0)) 1e-12)))))
+
+;; ── int8 quantized kernels (scalar, Tier 1) ───────────────────────────────
+;; The quant inner products are integer compute on (Array byte): int8×int8 → i32
+;; accumulate, and Q4 nibble unpack via bit-and. These lower through the EXISTING
+;; emitter with no new ops — the 'bytes tag (i32.load8_s) + clojure.core integer
+;; arithmetic + bit-and cover both. SIMD128 i32x4.dot acceleration is Tier 2.
+
+(deftm idot-k [x :- (Array byte), y :- (Array byte), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (clojure.core/+ (long acc)
+                             (clojure.core/* (long (raster.arrays/aget x i))
+                                             (long (raster.arrays/aget y i)))))
+      acc)))
+
+;; Q4_0-style: low nibble of each packed byte, minus the 8 zero-point. bit-and 0xFF
+;; recovers unsigned semantics from the signed byte load; bit-and 0x0F takes the nibble.
+(deftm q4lo-k [p :- (Array byte), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (clojure.core/+ (long acc)
+                             (clojure.core/- (clojure.core/bit-and
+                                              (clojure.core/bit-and (long (raster.arrays/aget p i)) 0xFF)
+                                              0x0F)
+                                             8)))
+      acc)))
+
+(deftest int8-dot-kernel
+  (testing "int8×int8 → i32 accumulate: byte arrays + integer MAC execute correctly"
+    (let [m    (pl/compile-wasm #'idot-k :name "idot")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    64
+          xs   (byte-array (map #(byte (- (mod (* 7 %) 17) 8)) (range n)))
+          ys   (byte-array (map #(byte (- (mod (* 3 %) 13) 6)) (range n)))]
+      (is (= [:i32] (:result-types m)))
+      (dotimes [i n] (.writeByte mem i (aget xs i)) (.writeByte mem (+ n i) (aget ys i)))
+      (let [r   (aget (.apply (.export inst "idot") (long-array [0 n n])) 0)
+            exp (reduce + (map (fn [a b] (* (int a) (int b))) xs ys))]
+        (is (= r exp) (str "idot=" r " exp=" exp))))))
+
+(deftest q4-nibble-unpack-kernel
+  (testing "Q4 low-nibble unpack (bit-and mask + zero-point) executes correctly"
+    (let [m    (pl/compile-wasm #'q4lo-k :name "q4lo")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    32
+          ps   (byte-array (map #(unchecked-byte (mod (* 11 %) 256)) (range n)))]
+      (dotimes [i n] (.writeByte mem i (aget ps i)))
+      (let [r   (aget (.apply (.export inst "q4lo") (long-array [0 n])) 0)
+            exp (reduce + (map (fn [p] (- (bit-and (int p) 0x0F) 8)) ps))]
+        (is (= r exp) (str "q4lo=" r " exp=" exp))))))
