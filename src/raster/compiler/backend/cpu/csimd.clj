@@ -19,7 +19,21 @@
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
-            [clojure.string :as str]))
+            [clojure.string :as str]
+            [clojure.walk :as walk]))
+
+(defn- inline-lets
+  "Substitute a let*/let's bindings into its body so the lane expression is a single
+   form (no manual kernel-source inlining needed). SIMD value-lambdas are effect-free,
+   so this is sound; each binding value gets prior substitutions, and nested/sequential
+   lets recurse."
+  [expr]
+  (if (and (seq? expr) (contains? #{'let 'let*} (first expr)))
+    (let [[_ binds & body] expr
+          env (reduce (fn [m [s v]] (assoc m s (walk/postwalk-replace m v)))
+                      {} (partition 2 binds))]
+      (inline-lets (walk/postwalk-replace env (last body))))
+    expr))
 
 ;; element keyword → intrinsics vector-facet element key
 (defn- vt-of [dtype] (case dtype :double :f64 :float :f32 :long :i32 :int :i32 nil))
@@ -204,13 +218,14 @@
   (let [idx    (ss/seg-idx segmap)
         bound  (ss/seg-bound segmap)
         raw    (:lambda segmap)
-        lambda (when raw (ss/normalize-invk (ss/clean-dead-bindings raw)))
+        ;; inline pure value-lets so a let*-bodied map (composed kernels: folded/scale
+        ;; bindings) is a single lane expression — no manual source inlining needed.
+        lambda (when raw (inline-lets (ss/normalize-invk (ss/clean-dead-bindings raw))))
         out    (:out-sym segmap)
         cast   (:cast-fn segmap)
         elem   (vt-of (:dtype segmap))
         ti     (in/simd-type-info isa elem)]
     (when (and idx bound out ti (seq? lambda)
-               (not (contains? #{'let 'let*} (first lambda)))       ; no let* yet
                (ss/simd-able? lambda idx)
                (empty? (ss/value-position-arrays lambda idx)))
       (let [lanes (:lanes ti)

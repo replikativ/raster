@@ -240,9 +240,9 @@
             ;; (out8 int → cvtepi32_ps, folded into the float acc8 register accumulator):
             ;;   acc8[L] += (xsb * wsi[wbaseL+L]) * (float)(out8[L] - fold)
             (raster.par/map! acc8 L 8 float
-              (+ (double (ra/aget acc8 L))
-                 (* (* xsb (double (ra/aget wsi (+ wbaseL L))))
-                    (double (- (long (ra/aget out8 L)) fold)))))))
+              (let [folded (- (long (ra/aget out8 L)) fold)
+                    scale (* xsb (double (ra/aget wsi (+ wbaseL L))))]
+                (+ (double (ra/aget acc8 L)) (* scale (double folded)))))))
         (dotimes [L 8] (ra/aset y (+ (* g 8) L) (ra/aget acc8 L)))))
     y))
 
