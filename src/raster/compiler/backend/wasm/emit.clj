@@ -465,14 +465,120 @@
 
 (declare emit-result emit-loop-scalar simd-loop-plan emit-loop-simd)
 
+(defn- strip-int-cast
+  "Strip (long …)/(int …) wrappers to reach the underlying expression."
+  [x]
+  (if (and (seq? x) (#{'long 'int} (first x))) (recur (second x)) x))
+
+(defn- byte-aget-arr
+  "If `expr` is (aget arr i-sym) on an int8 (byte, elem-size 1) array indexed
+   exactly by i-sym, return arr; else nil."
+  [ctx expr i-sym]
+  (let [e (strip-int-cast expr)]
+    (when (and (seq? e) (= 'clojure.core/aget (first e))
+               (= 1 (get-in ctx [:elems (second e) :bytes]))
+               (= (strip-int-cast (nth e 2)) i-sym))
+      (second e))))
+
+(defn- int8-dot-loop-plan
+  "Recognize the int8 quantized dot reduction:
+     (loop* [i 0 acc 0]
+       (if (< i n) (recur (inc i) (+ acc (* (aget x i) (aget y i)))) acc))
+   over two int8 (byte) arrays x,y. Returns {:i-sym :acc-sym :x :y :n-node} or nil.
+   This is the pattern that maps to i32x4.dot_i16x8_s (widen i8→i16, dot, accumulate)."
+  [ctx node]
+  (when (and (seq? node) (= 'loop* (first node)))
+    (let [[_ bindvec ifform] node
+          pairs (partition 2 bindvec)]
+      (when (and (= 2 (count pairs)) (seq? ifform) (= 'if (first ifform)))
+        (let [[i-sym i-init] (first pairs)
+              [acc-sym acc-init] (second pairs)
+              [_ cnd then els] ifform]
+          (when (and (= 0 i-init) (= 0 acc-init) (symbol? i-sym) (symbol? acc-sym)
+                     (= els acc-sym)                                   ; recur-in-then, else returns acc
+                     (seq? cnd) (= 'clojure.core/< (first cnd))
+                     (= (strip-int-cast (nth cnd 1)) i-sym)
+                     (seq? then) (= 'recur (first then)))
+            (let [n-node (nth cnd 2)
+                  [_ i-step acc-step] then
+                  is (strip-int-cast i-step)
+                  as (strip-int-cast acc-step)]
+              (when (and (seq? is) (= 'clojure.core/inc (first is)) (= (strip-int-cast (second is)) i-sym)
+                         (seq? as) (= 'clojure.core/+ (first as)) (= (strip-int-cast (nth as 1)) acc-sym))
+                (let [prod (strip-int-cast (nth as 2))]
+                  (when (and (seq? prod) (= 'clojure.core/* (first prod)))
+                    (let [x (byte-aget-arr ctx (nth prod 1) i-sym)
+                          y (byte-aget-arr ctx (nth prod 2) i-sym)]
+                      (when (and x y)
+                        {:i-sym i-sym :acc-sym acc-sym :x x :y y :n-node n-node}))))))))))))
+
+(defn- emit-loop-int8-dot
+  "Emit a v128 int8 dot: 16-wide main loop (widen i8→i16, i32x4.dot_i16x8_s,
+   accumulate into an i32x4) + horizontal sum + scalar remainder. → [bytes :i32]."
+  [ctx {:keys [i-sym acc-sym x y n-node]}]
+  (let [i-idx    (alloc! ctx :i32)
+        acc-idx  (alloc! ctx :i32)
+        vacc-idx (alloc! ctx :v128)
+        vx-idx   (alloc! ctx :v128)
+        vy-idx   (alloc! ctx :v128)
+        ctx'     (-> ctx (assoc-in [:env i-sym] {:idx i-idx :vt :i32})
+                     (assoc-in [:env acc-sym] {:idx acc-idx :vt :i32}))
+        n-bytes  (fn [] (emit-val ctx' n-node))         ; re-emit n each use (pure load)
+        gi       (fn [] (e/local-get i-idx))
+        vload    (fn [arr] (-> (addr ctx' arr i-sym) (into (e/v128-load 0 0))))
+        ;; main loop body: break when i+16 > n, else dot & accumulate, i += 16
+        main-body (-> []
+                      (into (gi)) (into (e/i32-const 16)) (into (e/i :i32.add))
+                      (into (n-bytes)) (into (e/i :i32.gt_s)) (into (e/br-if 1))
+                      (into (vload x)) (into (e/local-set vx-idx))
+                      (into (vload y)) (into (e/local-set vy-idx))
+                      (into (e/local-get vx-idx)) (into (e/v :i16x8.extend-low-i8x16-s))
+                      (into (e/local-get vy-idx)) (into (e/v :i16x8.extend-low-i8x16-s))
+                      (into (e/v :i32x4.dot-i16x8-s))
+                      (into (e/local-get vx-idx)) (into (e/v :i16x8.extend-high-i8x16-s))
+                      (into (e/local-get vy-idx)) (into (e/v :i16x8.extend-high-i8x16-s))
+                      (into (e/v :i32x4.dot-i16x8-s))
+                      (into (e/v :i32x4.add))
+                      (into (e/local-get vacc-idx)) (into (e/v :i32x4.add)) (into (e/local-set vacc-idx))
+                      (into (gi)) (into (e/i32-const 16)) (into (e/i :i32.add)) (into (e/local-set i-idx))
+                      (into (e/br 0)))
+        hsum (-> (e/local-get acc-idx)
+                 (into (e/local-get vacc-idx)) (into (e/v-lane :i32x4.extract-lane 0)) (into (e/i :i32.add))
+                 (into (e/local-get vacc-idx)) (into (e/v-lane :i32x4.extract-lane 1)) (into (e/i :i32.add))
+                 (into (e/local-get vacc-idx)) (into (e/v-lane :i32x4.extract-lane 2)) (into (e/i :i32.add))
+                 (into (e/local-get vacc-idx)) (into (e/v-lane :i32x4.extract-lane 3)) (into (e/i :i32.add))
+                 (into (e/local-set acc-idx)))
+        ;; scalar remainder: while i < n: acc += x[i]*y[i]; i++
+        rem-body (-> []
+                     (into (gi)) (into (n-bytes)) (into (e/i :i32.ge_s)) (into (e/br-if 1))
+                     (into (e/local-get acc-idx))
+                     (into (addr ctx' x i-sym)) (into (e/mem-load :i32.load8_s 0 0))
+                     (into (addr ctx' y i-sym)) (into (e/mem-load :i32.load8_s 0 0))
+                     (into (e/i :i32.mul)) (into (e/i :i32.add)) (into (e/local-set acc-idx))
+                     (into (gi)) (into (e/i32-const 1)) (into (e/i :i32.add)) (into (e/local-set i-idx))
+                     (into (e/br 0)))]
+    [(-> []
+         (into (e/i32-const 0)) (into (e/local-set i-idx))
+         (into (e/i32-const 0)) (into (e/local-set acc-idx))
+         (into (e/i32-const 0)) (into (e/v :i32x4.splat)) (into (e/local-set vacc-idx))
+         (into (e/block (e/loop* main-body)))
+         (into hsum)
+         (into (e/block (e/loop* rem-body)))
+         (into (e/local-get acc-idx)))
+     :i32]))
+
 (defn- emit-loop
   "(loop [v init ...] (if cond <recur|do…recur> <result>)) → [bytes ret-vt].
    When ctx :simd? is set and the loop is an elementwise counted map, emits a
-   v128 main loop + scalar remainder; otherwise the scalar loop."
+   v128 main loop + scalar remainder; otherwise the scalar loop. int8 dot
+   reductions get a dedicated i32x4.dot_i16x8_s vectorization."
   [ctx node]
-  (if-let [plan (and (:simd? ctx) (simd-loop-plan ctx node))]
-    (emit-loop-simd ctx node plan)
-    (emit-loop-scalar ctx node)))
+  (cond
+    (and (:simd? ctx) (int8-dot-loop-plan ctx node))
+    (emit-loop-int8-dot ctx (int8-dot-loop-plan ctx node))
+    (and (:simd? ctx) (simd-loop-plan ctx node))
+    (emit-loop-simd ctx node (simd-loop-plan ctx node))
+    :else (emit-loop-scalar ctx node)))
 
 (defn- emit-loop-scalar
   "(loop [v init ...] (if cond <recur|do…recur> <result>)) → [bytes ret-vt].
