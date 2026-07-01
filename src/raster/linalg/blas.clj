@@ -62,6 +62,21 @@
    "/opt/intel/mkl/lib/intel64/libmkl_sequential.so"
    "/usr/lib/x86_64-linux-gnu/libmkl_sequential.so"])
 
+;; Threaded MKL layer (OpenMP). Preferred over sequential: the intel_thread layer
+;; multithreads GEMM (~3x on this machine at 4 threads) and works with raster's
+;; critical/zero-copy heap-segment downcalls. Requires libiomp5. Set
+;; RASTER_MKL_SEQUENTIAL=1 to force the sequential layer, or MKL_NUM_THREADS=N to
+;; cap threads (4 is best on hybrid P/E-core CPUs; unset defaults to all cores).
+(def ^:private mkl-iomp5-paths
+  ["/opt/intel/oneapi/compiler/latest/lib/libiomp5.so"
+   "/opt/intel/oneapi/compiler/2025.3/lib/libiomp5.so"
+   "/usr/lib/x86_64-linux-gnu/libiomp5.so"])
+
+(def ^:private mkl-thread-paths
+  ["/opt/intel/oneapi/mkl/latest/lib/libmkl_intel_thread.so"
+   "/opt/intel/mkl/lib/intel64/libmkl_intel_thread.so"
+   "/usr/lib/x86_64-linux-gnu/libmkl_intel_thread.so"])
+
 (defn- dlopen-global
   "Load a shared library with RTLD_LAZY | RTLD_GLOBAL via Panama's native linker.
   This makes the library's symbols visible to subsequently loaded libraries,
@@ -87,14 +102,24 @@
   stable SymbolLookup handle via libraryLookup."
   []
   (try
-    (let [core-ok (some dlopen-global mkl-core-paths)
-          seq-ok  (some dlopen-global mkl-sequential-paths)
-          lp64-ok (some dlopen-global mkl-paths)]
-      (when (and core-ok seq-ok lp64-ok)
+    (let [force-seq? (= "1" (System/getenv "RASTER_MKL_SEQUENTIAL"))
+          ;; Prefer the THREADED layer (iomp5 → core → intel_thread → lp64) for
+          ;; multithreaded GEMM; fall back to sequential (core → sequential →
+          ;; lp64) if iomp5/intel_thread are unavailable or forced off.
+          threaded? (and (not force-seq?)
+                         (some dlopen-global mkl-iomp5-paths)
+                         (some dlopen-global mkl-core-paths)
+                         (some dlopen-global mkl-thread-paths)
+                         (some dlopen-global mkl-paths))
+          ok (or threaded?
+                 (and (some dlopen-global mkl-core-paths)
+                      (some dlopen-global mkl-sequential-paths)
+                      (some dlopen-global mkl-paths)))]
+      (when ok
         ;; Get a SymbolLookup handle for the already-loaded library
         (when-let [lib (try-load-lib mkl-paths)]
           (when (.isPresent (.find lib "cblas_dgemm"))
-            [lib :mkl]))))
+            [lib (if threaded? :mkl-threaded :mkl)]))))
     (catch Exception _ nil)))
 
 (defn- try-load-openblas []
