@@ -1713,6 +1713,38 @@
   (let [impl-var (register-parametric-specialization! fn-name template bindings args)]
     (apply @impl-var args)))
 
+(def ^:dynamic *ensuring-specializations*
+  "Set of [qualified-fn-sym dtype] pairs currently being ensured. Guards the
+  bottom-up pre-specialization recursion in ensure-dtype-specialization! against
+  infinite loops on self-recursive or mutually-recursive parametric deftms — the
+  ns-resolve idempotency check alone is insufficient during descent, because the
+  specialization is not yet registered while its callees are being processed."
+  #{})
+
+(defn- parametric-callee-vars
+  "Scan a parametric template body for call heads that resolve (in source-ns) to
+  a var whose qualified name is itself registered as a parametric template.
+  Returns the set of those generic-function vars — the parametric callees that
+  must be specialized BEFORE this deftm so their concrete (e.g. Float) TC
+  signatures exist when this deftm's body is type-checked during registration.
+  Concrete leaf ops (raster.numeric/*, raster.math/* — not in the registry)
+  naturally terminate the recursion."
+  [body source-ns]
+  (let [reg @dispatch/parametric-registry
+        src-ns-obj (if (instance? clojure.lang.Namespace source-ns)
+                     source-ns (the-ns source-ns))
+        vars (atom #{})]
+    (clojure.walk/postwalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)))
+         (when-let [v (try (ns-resolve src-ns-obj (first x)) (catch Exception _ nil))]
+           (when (var? v)
+             (let [fq (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v))))]
+               (when (contains? reg fq) (swap! vars conj v))))))
+       x)
+     body)
+    @vars))
+
 (defn ensure-dtype-specialization!
   "Compile-time analogue of runtime parametric dispatch: ensure a concrete
   specialization of parametric deftm var `f-var` exists for element `dtype`
@@ -1726,14 +1758,22 @@
   leaf translation. Where runtime dispatch unifies T against concrete arg
   classes, here we bind T := dtype up front, with no runtime args needed
   (args are only used to import parametric value-class instances, absent for
-  primitive element types)."
+  primitive element types).
+
+  Specializes the reachable parametric call graph BOTTOM-UP (leaves first): every
+  parametric callee is ensured at the same dtype before this deftm is registered,
+  so each callee's concrete TC signature (rebuilt by register-method! →
+  emit-tc-ann!) exists before any parent body is TC-analyzed. Without this, TC
+  sees only the callee's `double` base signature, rejects the float args, and
+  discards all binding types — leaving the parent under-devirtualized."
   [f-var dtype]
   (let [m (meta f-var)
         fq (symbol (str (ns-name (:ns m))) (str (:name m)))
         elem-sym (case dtype :float 'float :double 'double
                        :int 'int :long 'long nil)
         templates (get @dispatch/parametric-registry fq)]
-    (when (and elem-sym (seq templates))
+    (when (and elem-sym (seq templates)
+               (not (contains? *ensuring-specializations* [fq dtype])))
       ;; Single-arity parametric deftm: one template. Bind all its type vars to
       ;; the requested element type and register the concrete specialization.
       (let [template (first templates)
@@ -1747,11 +1787,20 @@
                              (:annotations template))
                        (:params template))
             mangled (symbol (str (types/mangle fq tags)))
-            src-ns (:source-ns template)]
+            src-ns (:source-ns template)
+            src-ns-obj (if (instance? clojure.lang.Namespace src-ns)
+                         src-ns (the-ns src-ns))]
         ;; Idempotent: reuse an already-registered specialization.
-        (or (ns-resolve src-ns mangled)
-            (do (register-parametric-specialization! fq template bindings [])
-                (ns-resolve src-ns mangled)))))))
+        (or (ns-resolve src-ns-obj mangled)
+            (binding [*ensuring-specializations*
+                      (conj *ensuring-specializations* [fq dtype])]
+              ;; Bottom-up: ensure every parametric callee at the same dtype
+              ;; FIRST, so its concrete TC signature exists before this body is
+              ;; TC-analyzed. The in-progress guard breaks recursive cycles.
+              (doseq [callee-var (parametric-callee-vars (:body template) src-ns-obj)]
+                (ensure-dtype-specialization! callee-var dtype))
+              (register-parametric-specialization! fq template bindings [])
+              (ns-resolve src-ns-obj mangled)))))))
 
 ;; Register the callbacks with dispatch — breaks the cycle. The specializer
 ;; invokes (runtime dispatch); the register-only path just compiles + registers
