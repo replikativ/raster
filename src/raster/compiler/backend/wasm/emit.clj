@@ -470,15 +470,30 @@
   [x]
   (if (and (seq? x) (#{'long 'int} (first x))) (recur (second x)) x))
 
+(defn- aget-call
+  "Normalize an aget call to [arr index], handling BOTH the direct
+   (clojure.core/aget arr i) form and the devirtualized
+   (.invk raster.arrays/aget…-impl arr i) form — keyed on the :raster.op/original
+   semantic-op metadata, never the mangled impl name (per the compiler's
+   semantic-identity contract). Returns nil for non-aget forms."
+  [e]
+  (cond
+    (not (seq? e)) nil
+    (= 'clojure.core/aget (first e)) [(nth e 1) (nth e 2)]
+    (= '.invk (first e))
+    (let [op (:raster.op/original (meta e))]
+      (when (and (symbol? op) (= "aget" (name op)))
+        [(nth e 2) (nth e 3)]))            ; (.invk impl arr idx …)
+    :else nil))
+
 (defn- byte-aget-arr
   "If `expr` is (aget arr i-sym) on an int8 (byte, elem-size 1) array indexed
-   exactly by i-sym, return arr; else nil."
+   exactly by i-sym, return arr; else nil. Robust to devirtualization."
   [ctx expr i-sym]
-  (let [e (strip-int-cast expr)]
-    (when (and (seq? e) (= 'clojure.core/aget (first e))
-               (= 1 (get-in ctx [:elems (second e) :bytes]))
-               (= (strip-int-cast (nth e 2)) i-sym))
-      (second e))))
+  (when-let [[arr idx] (aget-call (strip-int-cast expr))]
+    (when (and (= 1 (get-in ctx [:elems arr :bytes]))
+               (= (strip-int-cast idx) i-sym))
+      arr)))
 
 (defn- int8-dot-loop-plan
   "Recognize the int8 quantized dot reduction:
