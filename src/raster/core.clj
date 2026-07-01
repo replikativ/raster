@@ -1753,5 +1753,8 @@
             (do (register-parametric-specialization! fq template bindings [])
                 (ns-resolve src-ns mangled)))))))
 
-;; Register the callback with dispatch — breaks the cycle
+;; Register the callbacks with dispatch — breaks the cycle. The specializer
+;; invokes (runtime dispatch); the register-only path just compiles + registers
+;; the concrete method (compile-time devirtualization, no invoke).
 (dispatch/set-parametric-specializer! parametric-specialize!)
+(dispatch/set-parametric-register! register-parametric-specialization!)

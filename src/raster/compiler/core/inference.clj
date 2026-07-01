@@ -627,12 +627,18 @@
                                      matches))
                   refined (filterv (complement dominated?) matches)]
               (when (= 1 (count refined)) (first refined)))))))
-    (some (fn [entry]
-            (when (every? true? (map tag-matches? arg-tags
-                                     (:check-classes entry)
-                                     (:tags entry)))
-              entry))
-          methods)))
+    (let [matches (filterv (fn [entry]
+                             (every? true? (map tag-matches? arg-tags
+                                                (:check-classes entry)
+                                                (:tags entry))))
+                           methods)]
+      ;; Prefer an entry whose tags EXACTLY equal the concrete arg-tags over one
+      ;; that matches only via Object wildcards (the parametric `objects`/type-var
+      ;; fallback). Both match float args, but the concrete `_m_floats_..` method
+      ;; is the one to devirtualize to — otherwise resolution is order-dependent
+      ;; (a freshly-registered specialization is appended AFTER the generic).
+      (or (first (filter #(= (:tags %) arg-tags) matches))
+          (first matches)))))
 
 (def ^:private class->dispatch-tag*
   "Reverse of primitive-info: Class → dispatch tag symbol."
@@ -745,10 +751,15 @@
                               ;; For user-defined types, try to find a constructor
                               nil))
                           arg-tags)
-          try-pd (requiring-resolve 'raster.compiler.core.dispatch/try-parametric-dispatch)]
-      (when (and (every? some? fake-args) try-pd)
+          ;; Registration-only trigger: compile + register the concrete method
+          ;; without INVOKING it. Invoking (try-parametric-dispatch) on these
+          ;; degenerate trigger args (zero-length arrays, 0 scalars) crashes any
+          ;; body that divides by a scalar param — a spurious specialization
+          ;; "failure" that would silently drop the call to boxed dispatch.
+          try-reg (requiring-resolve 'raster.compiler.core.dispatch/try-parametric-register!)]
+      (when (and (every? some? fake-args) try-reg)
         (try
-          (some? (try-pd fn-sym fake-args))
+          (some? (try-reg fn-sym fake-args))
           (catch Exception e
             ;; try-parametric-dispatch returns nil (no throw) when no template
             ;; matches — an expected speculative miss. If it THREW, a parametric
