@@ -113,7 +113,7 @@
         (when-let [op (util/impl->op (second form))]
           (get op->canonical op)))))
 
-(defn- normalize-invk
+(defn normalize-invk
   "Rewrite (.invk impl args...) and qualified raster.*/raster.math/* forms
    to canonical (op args...) for SIMD.
    Uses :op metadata first, falls back to parsing mangled impl names.
