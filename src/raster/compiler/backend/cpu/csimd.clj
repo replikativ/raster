@@ -127,27 +127,18 @@
         (throw (ex-info "csimd/emit-c-vexpr: no vector op" {:op (first expr) :expr expr})))
       :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr expr})))))
 
-(defn emit-c-sexpr
-  "Scalar C for a (normalized) lane expression at loop counter jv — the scalar-tail
-   twin of emit-c-vexpr. number/symbol verbatim, affine aget → arr[base+jv], float
-   cast → (float)(..), op → the intrinsics scalar lowering (infix/fn)."
-  [expr idx isa elem jv array-syms]
-  (cond
-    (number? expr) (str expr)
-    (symbol? expr) (ce/c-symbol expr)
-    (ss/aget-form? expr idx)
-    (let [[arr base] (ss/aget-form? expr idx)]
-      (str (ce/c-symbol arr) "[" (vidx base jv array-syms) "]"))
-    (and (seq? expr) (contains? '#{float double clojure.core/float clojure.core/double} (first expr)))
-    (str "(" (name (first expr)) ")(" (emit-c-sexpr (second expr) idx isa elem jv array-syms) ")")
-    (seq? expr)
-    (let [low (in/op->c-lowering (first expr) false)
-          args (map #(emit-c-sexpr % idx isa elem jv array-syms) (rest expr))]
-      (case (:kind low)
-        :infix (str "(" (str/join (str " " (:op low) " ") args) ")")
-        :fn    (str (:op low) "(" (str/join ", " args) ")")
-        (throw (ex-info "csimd/emit-c-sexpr: no scalar lowering" {:op (first expr)}))))
-    :else (throw (ex-info "csimd/emit-c-sexpr: cannot emit" {:expr expr}))))
+(defn- scalar-tail
+  "Scalar C for the remainder loop of a SegMap: emit the NORMALIZED lambda (bare
+   ops + clojure.core/aget) with idx→jv through the SHARED c_emit expression path
+   (which already lowers bare arithmetic / aget / casts), then apply the store
+   cast. Delegating to c_emit rather than a bespoke scalar emitter keeps ONE C
+   emitter (the earlier `.invk`-literal problem came only from feeding c_emit the
+   raw devirtualized form; the normalized form lowers cleanly)."
+  [lambda idx jv cast array-syms]
+  (let [norm-j (clojure.walk/postwalk-replace {idx (symbol jv)} lambda)
+        s (binding [ce/*int-vars* (conj ce/*int-vars* (symbol jv))]
+            (ce/emit-expr norm-j nil array-syms "idx"))]
+    (if cast (str "(" (name cast) ")(" s ")") s)))
 
 (defn compile-segmap-c
   "SegMap → a C statement block (string) that writes the vectorized element-wise map
@@ -172,11 +163,9 @@
             outc  (ce/c-symbol out)
             vexpr (try (emit-c-vexpr lambda idx isa elem "j" array-syms)
                        (catch clojure.lang.ExceptionInfo _ nil))
-            ;; scalar tail from the NORMALIZED lambda (bare ops + clojure.core/aget)
-            ;; with idx→"j", cast applied: out[j] = (cast)(<scalar sexpr>);
-            tail (try (let [s (emit-c-sexpr lambda idx isa elem "j" array-syms)]
-                        (if cast (str "(" (name cast) ")(" s ")") s))
-                      (catch clojure.lang.ExceptionInfo _ nil))]
+            ;; scalar tail via the shared c_emit path (idx→"j", cast applied)
+            tail (try (scalar-tail lambda idx "j" cast array-syms)
+                      (catch Throwable _ nil))]
         (when (and vexpr tail)
           {:includes simd-includes
            :block
