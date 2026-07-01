@@ -72,24 +72,19 @@
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
   [f-var dtype & {:keys [simd?] :or {simd? false}}]
-  (let [gwb   @#'pl/get-walked-body
-        gp    @#'pl/get-params
-        bpe   @#'pl/build-param-env
-        cp    @#'pl/clean-params
-        wb    (gwb f-var dtype)
-        params (gp f-var dtype)
-        raw   (if (= 1 (count wb)) (first wb) (list* 'do wb))
+  (let [wb     (pl/get-walked-body f-var dtype)
+        params (pl/get-params f-var dtype)
+        raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
         source-ns (or (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
+        active (pl/clean-params params)
+        penv   (pl/build-param-env f-var dtype)
         ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
         ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
         ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
         opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
-               :active-params (cp params)
-               :param-env (bpe f-var dtype)
-               :source-ns source-ns}]
+               :active-params active :param-env penv :source-ns source-ns}]
     {:form (pl/run-passes raw pl/forward-passes opts)
-     :params (cp params)
-     :param-env (bpe f-var dtype)}))
+     :params active :param-env penv}))
 
 ;; ---------------------------------------------------------------------------
 ;; Form normalization for C emission.

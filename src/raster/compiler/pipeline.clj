@@ -134,7 +134,7 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
-(defn- get-walked-body [f-var & [dtype]]
+(defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
         m (meta resolved)]
     ;; Always re-walk with TC at compilation time for best type inference.
@@ -162,12 +162,12 @@
         (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body or raw body" {:var f-var})))))
 
-(defn- get-params [f-var & [dtype]]
+(defn get-params [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)]
     (or (:raster.core/deftm-params (meta resolved))
         (throw (ex-info "Var has no deftm params" {:var f-var})))))
 
-(defn- build-param-env
+(defn build-param-env
   "Build a {sym -> tag} type environment from deftm parameter tags.
   Maps each param symbol to its walker tag (e.g. 'doubles, 'double, 'longs).
   Falls back to nil (unknown) for params without tags."
@@ -182,7 +182,7 @@
                     (symbol t)])
                  params tags)))))
 
-(defn- clean-params
+(defn clean-params
   "Strip metadata (type hints) from param symbols for eval."
   [params]
   (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil)
