@@ -654,3 +654,125 @@
                                     (Double/doubleToRawLongBits 4.0)]))]
       (is (= [:f64] (:result-types m)))
       (is (< (Math/abs (- (Double/longBitsToDouble (aget r 0)) 5.0)) 1e-12)))))
+
+;; ── int8 quantized kernels (scalar, Tier 1) ───────────────────────────────
+;; The quant inner products are integer compute on (Array byte): int8×int8 → i32
+;; accumulate, and Q4 nibble unpack via bit-and. These lower through the EXISTING
+;; emitter with no new ops — the 'bytes tag (i32.load8_s) + clojure.core integer
+;; arithmetic + bit-and cover both. SIMD128 i32x4.dot acceleration is Tier 2.
+
+(deftm idot-k [x :- (Array byte), y :- (Array byte), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (clojure.core/+ (long acc)
+                             (clojure.core/* (long (raster.arrays/aget x i))
+                                             (long (raster.arrays/aget y i)))))
+      acc)))
+
+;; Q4_0-style: low nibble of each packed byte, minus the 8 zero-point. bit-and 0xFF
+;; recovers unsigned semantics from the signed byte load; bit-and 0x0F takes the nibble.
+(deftm q4lo-k [p :- (Array byte), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (clojure.core/+ (long acc)
+                             (clojure.core/- (clojure.core/bit-and
+                                              (clojure.core/bit-and (long (raster.arrays/aget p i)) 0xFF)
+                                              0x0F)
+                                             8)))
+      acc)))
+
+(deftest int8-dot-kernel
+  (testing "int8×int8 → i32 accumulate: byte arrays + integer MAC execute correctly"
+    (let [m    (pl/compile-wasm #'idot-k :name "idot")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    64
+          xs   (byte-array (map #(byte (- (mod (* 7 %) 17) 8)) (range n)))
+          ys   (byte-array (map #(byte (- (mod (* 3 %) 13) 6)) (range n)))]
+      (is (= [:i32] (:result-types m)))
+      (dotimes [i n] (.writeByte mem i (aget xs i)) (.writeByte mem (+ n i) (aget ys i)))
+      (let [r   (aget (.apply (.export inst "idot") (long-array [0 n n])) 0)
+            exp (reduce + (map (fn [a b] (* (int a) (int b))) xs ys))]
+        (is (= r exp) (str "idot=" r " exp=" exp))))))
+
+(deftest q4-nibble-unpack-kernel
+  (testing "Q4 low-nibble unpack (bit-and mask + zero-point) executes correctly"
+    (let [m    (pl/compile-wasm #'q4lo-k :name "q4lo")
+          inst (instantiate (:bytes m))
+          mem  (.memory inst)
+          n    32
+          ps   (byte-array (map #(unchecked-byte (mod (* 11 %) 256)) (range n)))]
+      (dotimes [i n] (.writeByte mem i (aget ps i)))
+      (let [r   (aget (.apply (.export inst "q4lo") (long-array [0 n])) 0)
+            exp (reduce + (map (fn [p] (- (bit-and (int p) 0x0F) 8)) ps))]
+        (is (= r exp) (str "q4lo=" r " exp=" exp))))))
+
+;; ── int8 dot SIMD128 vectorization (Tier 2) ───────────────────────────────
+;; The int8-dot reduction lowers to i32x4.dot_i16x8_s (widen i8→i16, dot,
+;; accumulate) + horizontal sum + scalar remainder. Chicory can PARSE (validate)
+;; a v128 module but cannot EXECUTE it, so validity is asserted here and
+;; execution is asserted on V8 via node (guarded — skips where node is absent).
+
+(defn- node-available? []
+  (try
+    (let [p (-> (ProcessBuilder. ^java.util.List ["node" "--version"])
+                (.redirectErrorStream true) (.start))]
+      (.waitFor p) (zero? (.exitValue p)))
+    (catch Exception _ false)))
+
+(defn- run-idot-on-node
+  "Execute the SIMD idot .wasm on V8 for int8 vectors xs,ys (length n).
+   Returns the kernel's i32 result. Requires node."
+  [^bytes wasm xs ys n]
+  (let [dir  (java.nio.file.Files/createTempDirectory "idot" (make-array java.nio.file.attribute.FileAttribute 0))
+        wp   (str dir "/idot.wasm")
+        jp   (str dir "/run.mjs")]
+    (with-open [o (java.io.FileOutputStream. wp)] (.write o wasm))
+    (spit jp (str "import fs from 'fs';\n"
+                  "const b=fs.readFileSync('" wp "');\n"
+                  "const {instance}=await WebAssembly.instantiate(b,{});\n"
+                  "const m=new Int8Array(instance.exports.memory.buffer);\n"
+                  "const xs=[" (clojure.string/join "," xs) "],ys=[" (clojure.string/join "," ys) "];\n"
+                  "for(let i=0;i<" n ";i++){m[i]=xs[i];m[" n "+i]=ys[i];}\n"
+                  "console.log(instance.exports.idot(0," n "," n "));\n"))
+    (let [p (-> (ProcessBuilder. ^java.util.List ["node" jp]) (.redirectErrorStream true) (.start))
+          out (slurp (.getInputStream p))]
+      (.waitFor p)
+      (Integer/parseInt (clojure.string/trim out)))))
+
+(deftm idot-simd-k [x :- (Array byte), y :- (Array byte), n :- Long] :- Long
+  (loop [i 0 acc 0]
+    (if (clojure.core/< (long i) (long n))
+      (recur (clojure.core/inc (long i))
+             (clojure.core/+ (long acc)
+                             (clojure.core/* (long (raster.arrays/aget x i))
+                                             (long (raster.arrays/aget y i)))))
+      acc)))
+
+(deftest int8-dot-simd-vectorizes
+  (testing "int8 dot with :wasm-simd? emits a valid v128 module using i32x4.dot_i16x8_s"
+    (let [m  (pl/compile-wasm #'idot-simd-k :name "idot" :wasm-simd? true)
+          bs (:bytes m)]
+      (is (= [:i32] (:result-types m)))
+      ;; Chicory parses = structural validation of the v128 bytecode
+      (is (some? (Parser/parse bs)))
+      ;; the i32x4.dot_i16x8_s workhorse (0xfd 0xba) is present
+      (is (some (fn [i] (and (= (bit-and (nth bs i) 0xff) 0xfd)
+                             (= (bit-and (nth bs (inc i)) 0xff) 0xba)))
+                (range (dec (count bs))))
+          "emitted module contains i32x4.dot_i16x8_s"))))
+
+(deftest int8-dot-simd-executes-on-v8
+  (testing "SIMD int8 dot executes bit-exactly on V8 across block boundaries"
+    (if-not (node-available?)
+      (println "SKIP int8-dot-simd-executes-on-v8: node not available")
+      (let [m (pl/compile-wasm #'idot-simd-k :name "idot" :wasm-simd? true)]
+        ;; n < 16 (all remainder), = 16 (one block), block+remainder, many blocks
+        (doseq [n [15 16 17 64 70 256]]
+          (let [xs  (mapv #(int (- (mod (* 7 %) 17) 8)) (range n))
+                ys  (mapv #(int (- (mod (* 3 %) 13) 6)) (range n))
+                got (run-idot-on-node (:bytes m) xs ys n)
+                exp (reduce + (map * xs ys))]
+            (is (= got exp) (str "n=" n " got=" got " exp=" exp))))))))
