@@ -135,10 +135,7 @@
                     'Math/max "fmax"
                     'Math/min "fmin"
                     "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str reduce-op "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " reduce-op " " b ")")))]
+        combine (ce/combine-fn reduce-op (ce/fn-style-reduction-op? op))]
     (str (when use-fp64? fp64-pragma)
          subgroup-pragma
          "__kernel void " kernel-name

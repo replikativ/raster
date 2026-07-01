@@ -288,10 +288,7 @@
         block-size (* 2 wg-size) ;; Each thread handles 2 elements
         ;; OpenCL combine op
         combine-str (condp = op '+ "+" '* "*" 'Math/max "fmax" 'Math/min "fmin" "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str combine-str "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " combine-str " " b ")")))
+        combine (ce/combine-fn combine-str (ce/fn-style-reduction-op? op))
         ;; Emit element expression as OpenCL C
         array-sym-names (set (map #(symbol (name %)) arr-params))
         adapted-element (when element-expr (ce/adapt-casts-for-dtype element-expr scan-dtype))
@@ -448,10 +445,7 @@
                         'Math/max "fmax"
                         'Math/min "fmin"
                         "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str reduce-op-str "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " reduce-op-str " " b ")")))
+        combine (ce/combine-fn reduce-op-str (ce/fn-style-reduction-op? op))
         ;; Generate per-array kernel params
         arr-param-str (str/join ", "
                                 (map (fn [s] (str "__global const " ctype "* restrict "
