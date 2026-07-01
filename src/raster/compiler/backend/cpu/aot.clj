@@ -51,6 +51,18 @@
       (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
     (catch Exception _ nil)))
 
+(defn- par-map->segmap
+  "Build a SegMap from a raster.par/map! form (extract-par-map-info → par-form->soac
+   → lower-soac), the same construction par_simd uses. dtype falls back to the
+   kernel element type when the form carries no :elem-type. nil on any failure."
+  [form dtype]
+  (try
+    (let [pi (par/extract-par-map-info form)
+          dt (or (:elem-type pi) dtype)
+          sc (soac/par-form->soac (:out pi) form (swap! segop-id inc))]
+      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
+    (catch Exception _ nil)))
+
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
 ;; ---------------------------------------------------------------------------
@@ -342,6 +354,14 @@
               "\n  "
               (for [b body :when (not (or (symbol? b) (vector? b)))]
                 (emit-host-stmt b array-syms ct))))))
+
+    ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
+    (and (seq? form) (par/par-map-form? form))
+    (or (when-let [sm (par-map->segmap form (get {"float" :float} ct :double))]
+          (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm :avx2 array-syms)]
+            (when *simd-preamble* (swap! *simd-preamble* conj includes))
+            block))
+        (ce/emit-stmt (par/expand-par-map! form) nil array-syms "idx"))
 
     :else (ce/emit-stmt form nil array-syms "idx")))
 

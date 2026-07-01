@@ -14,6 +14,7 @@
             [raster.core :refer [deftm reduce!]]
             [raster.numeric :as rn]
             [raster.arrays :as ra]
+            [raster.par]
             [raster.math]
             [raster.compiler.backend.cpu.aot :as aot]))
 
@@ -160,3 +161,26 @@
                 (str "n=" n " simd == interpreter"))
             (is (every? true? (map #(< (Math/abs (clojure.core/- %1 %2)) 1e-9) os oc))
                 (str "n=" n " simd == scalar-C"))))))))
+
+;; par/map! element-wise map vectorizes on CPU-C (:simd? true) — the other half of
+;; every kernel (silu/relu/residual/the map of rms-norm), same path as the quant fold.
+(deftm axpy-map [a :- (Array float) b :- (Array float) s :- Float n :- Long] :- (Array float)
+  (let [y (float-array n)]
+    (raster.par/map! y L n float (rn/+ (rn/* (ra/aget a L) s) (ra/aget b L)))))
+
+(deftest cpu-c-simd-map
+  (when (clang-available?)
+    (testing ":simd? true emits __m256 store loop for par/map!, matches scalar + interpreter"
+      (let [f-simd (aot/compile-aot-c #'axpy-map :float :simd? true)
+            f-scal (aot/compile-aot-c #'axpy-map :float)]
+        (is (re-find #"_mm256_storeu_ps" (:c-source (meta f-simd))))
+        (is (not (re-find #"_mm256_storeu_ps" (:c-source (meta f-scal)))))
+        (doseq [n [7 64 1000]]
+          (let [a (float-array (map #(clojure.core/- (/ (float %) 13.0) (float 2.0)) (range n)))
+                b (float-array (map #(clojure.core/+ (/ (float %) 7.0) (float 1.0)) (range n)))
+                s (float 2.5)
+                ref (float-array n)
+                _ (dotimes [i n] (aset ref i (float (clojure.core/+ (clojure.core/* (aget a i) s) (aget b i)))))
+                os (f-simd a b s n)]
+            (is (every? true? (map #(< (Math/abs (clojure.core/- (aget os %) (aget ref %))) 1e-4) (range n)))
+                (str "n=" n))))))))
