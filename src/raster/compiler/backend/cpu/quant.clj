@@ -311,194 +311,18 @@
 ;; `maddubs+madd` otherwise. No runtime CPUID needed for the JIT-on-host model.
 ;; (Other ISAs — NEON sdot, SVE — are added as more #elif arms; same descriptor,
 ;; same schedule, different MAC spelling. A shipped fat binary would multi-version.)
-(def ^:private i8dot-helper
-  (str "#include <immintrin.h>\n"
-       "// widening int8 dot, ACCUMULATING: acc += sum_4(u8 w * s8 x) per int32 lane.\n"
-       "// Host-selected MAC via -march=native macros (no runtime CPUID).\n"
-       "static inline __m256i _i8dot_acc(__m256i acc, __m256i wu8, __m256i xs8){\n"
-       "#if defined(__AVX512VNNI__) && defined(__AVX512VL__)\n"
-       "  return _mm256_dpbusd_epi32(acc, wu8, xs8);\n"
-       "#elif defined(__AVXVNNI__)\n"
-       "  return _mm256_dpbusd_avx_epi32(acc, wu8, xs8);\n"
-       "#else\n"
-       "  return _mm256_add_epi32(acc, _mm256_madd_epi16(_mm256_maddubs_epi16(wu8, xs8), _mm256_set1_epi16(1)));\n"
-       "#endif\n}\n"
-       "static inline __m256i _i8dot(__m256i wu8, __m256i xs8){ return _i8dot_acc(_mm256_setzero_si256(), wu8, xs8); }\n"))
-(def ^:private mac-includes {:maddubs i8dot-helper})
-(def ^:private mac-consts
-  {:maddubs "  const __m256i _m4 = _mm256_set1_epi8(0x0F);\n"})
-
-(defn- emit-row
-  "Emit one output row's contribution for the v5 schedule: unpack the weight block
-  (from the FORMAT descriptor), widening-i8-dot with the shared activation `xv`,
-  FMA the scaled int32 partials into accumulator `facc-i`, accrue the zero-point
-  correction `corr-i`. i = row offset within the register block."
-  [{:keys [weight-bits pack]} mac i]
-  (assert (and (= weight-bits 4) (= pack :nibble-interleaved) (= mac :maddubs)))
-  (let [w (str "w" i) s (str "s" i) f (str "f" i) c (str "c" i)]
-    (str "        { __m128i _wl = _mm_loadu_si128((const __m128i*)(" w " + b*16));\n"
-         "          __m256i _wq = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(_wl,4), _wl), _m4);\n"
-         "          __m256i _s32 = _i8dot(_wq, _xv);\n"
-         "          float _sc = _xsb*" s "[b]; " f " = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_s32), _mm256_set1_ps(_sc), " f ");\n"
-         "          " c " += _sc*_xsm; }\n")))
-
-;; ---- compose the v5 (4-row register-blocked) kernel from descriptor + primitive ----
-(def ^:private BR 4) ;; register block: 4 output rows = 4 independent FMA chains
-(defn emit-qmatmul
-  "Emit the v5 quantized matmul C kernel for FORMAT + MAC. Register-blocks BR output
-  rows (independent accumulators hide FMA latency) + loads the activation block once
-  per BR rows. Signature: void NAME(xq,xs,xsum,wq,ws,y,M,in,out,o_start,o_count)."
-  [name format mac]
-  (let [{:keys [block zero-point]} format zp (str zero-point ".f")
-        rows (range BR)]
-    (str "#include <stdint.h>\n" (mac-includes mac)
-         "static inline float _hsum8(__m256 v){__m128 x=_mm_add_ps(_mm256_castps256_ps128(v),_mm256_extractf128_ps(v,1));x=_mm_hadd_ps(x,x);x=_mm_hadd_ps(x,x);return _mm_cvtss_f32(x);}\n"
-         "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
-         "    const uint8_t* wq, const float* ws, float* y, int M, int in, int out,\n"
-         "    int o_start, int o_count) {\n"
-         "  int nb = in/" block ";\n" (mac-consts mac)
-         "  for (int mm = 0; mm < M; mm++) {\n"
-         "    const int8_t* xr = xq + (long)mm*in;\n"
-         "    const float* xsr = xs + (long)mm*nb; const int* xsm = xsum + (long)mm*nb;\n"
-         "    int oend = o_start + o_count, o = o_start;\n"
-         ;; --- main: BR rows at a time ---
-         "    for (; o + " BR " <= oend; o += " BR ") {\n"
-         (apply str (for [i rows] (str "      __m256 f" i "=_mm256_setzero_ps(); float c" i "=0;\n")))
-         (apply str (for [i rows] (str "      const uint8_t* w" i "=wq+(long)(o+" i ")*in/2; const float* s" i "=ws+(long)(o+" i ")*nb;\n")))
-         "      for (int b = 0; b < nb; b++) {\n"
-         "        __m256i _xv = _mm256_loadu_si256((const __m256i*)(xr + b*32));\n"
-         "        float _xsb = xsr[b]; int _xsm = xsm[b];\n"
-         (apply str (for [i rows] (emit-row format mac i)))
-         "      }\n"
-         (apply str (for [i rows] (str "      y[(long)mm*out+o+" i "] = _hsum8(f" i ") - " zp "*c" i ";\n")))
-         "    }\n"
-         ;; --- tail: remaining (<BR) rows, one at a time ---
-         "    for (; o < oend; o++) {\n"
-         "      __m256 f0=_mm256_setzero_ps(); float c0=0;\n"
-         "      const uint8_t* w0=wq+(long)o*in/2; const float* s0=ws+(long)o*nb;\n"
-         "      for (int b = 0; b < nb; b++) {\n"
-         "        __m256i _xv = _mm256_loadu_si256((const __m256i*)(xr + b*32)); float _xsb=xsr[b]; int _xsm=xsm[b];\n"
-         (emit-row format mac 0)
-         "      }\n"
-         "      y[(long)mm*out+o] = _hsum8(f0) - " zp "*c0;\n"
-         "    }\n  }\n}\n")))
-
-(defonce ^:private pool
-  (delay (java.util.concurrent.Executors/newFixedThreadPool
-          (.availableProcessors (Runtime/getRuntime)))))
-
-(defn compile-qmatmul
-  "Emit + compile + load a quantized matmul. Returns a fn (xq xs xsum wq ws y M in
-  out). With n-threads>1, big matmuls (out>=1024) are split over output-row ranges
-  across a JVM thread pool — each native call writes a disjoint y slice (no OpenMP
-  dep; raster scales where memory-bound llama.cpp saturates)."
-  ([name format mac] (compile-qmatmul name format mac 1))
-  ([name format mac n-threads]
-   (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul name format mac)) name 6 5)]
-     (if (<= n-threads 1)
-       (fn [xq xs xsum wq ws y M in out] (k xq xs xsum wq ws y M in out 0 out))
-       (let [p @pool]
-         (fn [xq xs xsum wq ws y M in out]
-           (if (< (int out) 1024)
-             (k xq xs xsum wq ws y M in out 0 out)
-             (let [chunk (quot (+ (int out) (dec n-threads)) n-threads)
-                   tasks (for [t (range n-threads)
-                               :let [o0 (* t chunk) cnt (min chunk (- (int out) o0))]
-                               :when (pos? cnt)]
-                           (reify java.util.concurrent.Callable
-                             (call [_] (k xq xs xsum wq ws y M in out o0 cnt) nil)))]
-               (doseq [f (.invokeAll p tasks)] (.get f))))))))))
-
-;; ============================================================================
-;; SCHEDULES — regime-appropriate kernel strategies (schedule-as-data).
-;; A schedule names a {layout, kernel, parallelization} strategy chosen by the
-;; roofline regime. We measured the decode GEMV to be MEMORY-bandwidth bound (84MB
-;; lm_head streamed at 9.6/11.2 GB/s = 86% of the single-core memory ceiling), so
-;; its optimal schedule is to STREAM the compressed weights contiguously — there is
-;; nothing for a compute schedule to do. The :stream-gemv schedule below is that.
-;; Compute-bound :tile-gemm (prefill M>1, register-block tile) and GPU variants slot
-;; into the same {descriptor × primitive × schedule} skeleton as more entries.
-;; ============================================================================
-;; The stream-gemv dpbusd kernel (emit-qmatmul-stream) is AVX2 — NC=8 f32 lanes. Its
-;; required weight layout is DERIVED from that ISA target via core.layout (not a second
-;; hand-written interleave). When the kernel is parameterized to AVX-512/NEON the target
-;; descriptor follows the chosen ISA and NC with it.
 (def ^:private stream-gemv-layout
   (layout/quant-stream-layout {:vector-bits 256} q4-0)) ; AVX2 NC=8, format-derived
 
 (defn repack-stream
   "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv interleaved layout,
   where output column i lands in accumulator lane i (no shuffles, no permute). Single
-  source: delegates to the descriptor-driven core.layout/repack, which the kernel's
-  gather (emit-qmatmul-stream) mirrors. out must be a multiple of NC=8. One-time cost."
+  source: delegates to the descriptor-driven core.layout/repack, which the composable
+  x8 GEMV (raster.quant.kernels/qmatmul-q4-x8!) mirrors. out must be a multiple of
+  NC=8. One-time cost."
   [^bytes wq ^floats ws out in]
   (layout/repack stream-gemv-layout wq ws out in))
 
-(defn emit-qmatmul-stream
-  "Emit the :stream-gemv decode kernel — the descriptor-driven SCHEDULE for the Q4
-  interleaved layout. The structure (column tile NC, bytes/input-group, input-groups,
-  k-group, block) is sourced from the layout descriptor (`stream-gemv-layout`), so the
-  kernel's gather provably matches `repack-stream`'s scatter — both read ONE descriptor,
-  no drifting convention. Register-resident: per block an int32 lane-packed accumulator
-  (NC dpbusd, no shuffle/blend), the -ZP fold via the activation block-sum, one fmadd of
-  (col×act scale). Column i → lane i, so the store needs no permute. NC=8 is the AVX2
-  path (the f32 lane count); AVX-512 (NC=16) / NEON (NC=4) are intrinsic-family variants
-  keyed off the same descriptor. Signature: void NAME(xq,xs,xsum,wqi,wsi,y,in,out)."
-  [name {:keys [zero-point]} mac]
-  (let [{:keys [tile block bytes-per-igroup igroups k-group]} stream-gemv-layout
-        nc tile
-        bpi bytes-per-igroup
-        blk (* igroups bpi)        ;; bytes per (group, block) = 128 for NC=8
-        zp (str zero-point)]
-    (assert (= nc 8)
-            (str "emit-qmatmul-stream: only NC=8 (AVX2 __m256) implemented; NC=" nc
-                 " (AVX-512/NEON) is an intrinsic-family variant — TODO"))
-    (str "#include <stdint.h>\n" i8dot-helper
-         "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
-         "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out,\n"
-         "    int o_start, int o_count) {\n"
-         "  int nb = in/" block "; const __m256i _m4 = _mm256_set1_epi8(0x0F); int oend = o_start + o_count;\n"
-         "  for (int g = o_start; g + " nc " <= oend; g += " nc ") {\n"
-         "    long gi = g/" nc ";\n"
-         "    const uint8_t* restrict wg = wqi + gi*(long)nb*" blk ";\n"
-         "    const float* restrict sg = wsi + gi*(long)nb*" nc ";\n"
-         "    __m256 acc = _mm256_setzero_ps();\n"
-         "    for (int b = 0; b < nb; b++) {\n"
-         "      const uint8_t* wb = wg + b*" blk "; const int8_t* xb = xq + b*" block ";\n"
-         "      __m256i ia = _mm256_setzero_si256();\n"
-         "      for (int ig = 0; ig < " igroups "; ig++) {\n"
-         "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*" bpi "));\n"
-         "        __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _m4);\n"
-         "        __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*" k-group "));\n"
-         "        ia = _i8dot_acc(ia, nib, ab);\n"
-         "      }\n"
-         "      ia = _mm256_sub_epi32(ia, _mm256_set1_epi32(" zp " * xsum[b]));\n"
-         "      __m256 cs = _mm256_loadu_ps(sg + b*" nc ");\n"
-         "      acc = _mm256_fmadd_ps(_mm256_cvtepi32_ps(ia), _mm256_mul_ps(cs, _mm256_set1_ps(xs[b])), acc);\n"
-         "    }\n"
-         "    _mm256_storeu_ps(y + g, acc);\n"
-         "  }\n}\n")))
-
-(defn classify-regime
-  "Roofline regime classifier (stub). Quant matmul reuses each weight ~M times: decode
-  (M=1) is memory-bound → :stream-gemv. Prefill (M>1) is compute-bound → :tile-gemm
-  (register-block tile, not yet implemented). The default schedule per op lives here."
-  [M]
-  (if (<= (long M) 1) :stream-gemv :stream-gemv))
-
-(def schedules
-  "schedule-key → {:repack :emit :n-ptrs :n-ints}. Only the memory-bound :stream-gemv
-  (decode GEMV) is implemented; :tile-gemm and GPU variants extend this map."
-  {:stream-gemv {:repack repack-stream :emit emit-qmatmul-stream :n-ptrs 6 :n-ints 4}})
-
-;; ---- persistent spin-barrier pool (the ggml model, in the JVM) -----------------
-;; Decode issues ~127 tiny matmuls/token. Forking an Executor per call (invokeAll)
-;; or entering an OpenMP region per call costs more than the work — measured WORSE
-;; than serial. llama.cpp instead keeps a PERSISTENT thread team that spins on an
-;; atomic between ops; kickoff is one atomic store, sync is a spin-barrier. We do the
-;; same: N-1 workers spin on `gen`; each matmul posts a task + bumps `gen`, every
-;; worker runs its output-row slice via a concurrent critical() call (these scale
-;; ~3.16x/4t over shared heap arrays — verified), then a spin-barrier on `arrive`.
 (definterface IParTask (^void runSlice [^int wid ^int n]))
 
 (def ^:private pool-threads
@@ -588,39 +412,6 @@
              (when (pos? cnt) (quantize-act-blocks! x xq xs xsum r0 cnt)))))))
     {:xq xq :xs xs :xsum xsum}))
 
-(defn- matmul-slice-task
-  "An IParTask: worker wid of n streams its disjoint output-row-group slice of one
-  :stream-gemv into the shared y (groups are NC=8 cols; o_start/o_count in cols)."
-  ^IParTask [k xq xs xsum wqi wsi y in out]
-  (let [ng (quot (int out) 8)]
-    (reify IParTask
-      (runSlice [_ wid n]
-        (let [chunk (quot (+ ng (dec (int n))) (int n))
-              g0 (* (int wid) chunk)
-              cnt (max 0 (min chunk (- ng g0)))]
-          (when (pos? cnt)
-            (k xq xs xsum wqi wsi y in out (* g0 8) (* cnt 8))))))))
-
-(defn compile-qmatmul-stream
-  "Compile the :stream-gemv decode kernel. Returns a fn (xq xs xsum wqi wsi y in out)
-  over a repack-stream weight. Each call splits its output-row groups across the
-  persistent spin-barrier pool (RASTER_DECODE_THREADS, default 1) — every worker
-  streams a disjoint weight slice into a disjoint y slice via a concurrent critical
-  call, synchronized by a spin-barrier. The n-threads arg is kept for API symmetry."
-  ([name format mac] (compile-qmatmul-stream name format mac 1))
-  ([name format mac _n-threads]
-   (let [k (cpu/load-kernel (cpu/compile-source! (emit-qmatmul-stream name format mac)) name 6 4)]
-     (fn [xq xs xsum wqi wsi y in out]
-       (if (== 1 (int pool-threads))
-         (k xq xs xsum wqi wsi y in out 0 out)
-         (run-par! (matmul-slice-task k xq xs xsum wqi wsi y in out)))))))
-
-;; ---- (4) GPU lowering: the SAME format descriptor → OpenCL for the Arc ----
-;; The widening-i8-dot primitive's GPU lowering: one work-item per output row,
-;; scalar int8 MAC (SIMT supplies the parallelism — `dot()`/DPAS via
-;; cl_khr_integer_dot_product / cl_intel_subgroup_matrix_multiply_accumulate is
-;; the peak follow-on, the GPU analogue of maddubs). Same data descriptor drives
-;; the unpack; only the scaffold (work-item vs host loop) and MAC spelling differ.
 (defn emit-qmatmul-opencl
   "Emit the OpenCL kernel for FORMAT. Compiles for the Arc (ocloc -device lnl)."
   [name {:keys [block zero-point weight-bits]}]
