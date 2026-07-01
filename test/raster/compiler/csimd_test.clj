@@ -111,3 +111,33 @@
                                      (< (Math/abs (- (double (aget y i))
                                                      (+ (* (double (aget a i)) 2.5) (double (aget b i))))) 1e-4)))]
               (is ok (str dt " n=" n)))))))))
+
+;; int→float widening: acc[L] += scale[L] * (float)(iarr[L] - k) — int iarr/k, float acc/scale
+;; (the quant-fold structure: out8 int dots folded into a float accumulator).
+(deftest segmap-int-float-widening
+  (testing "mixed int/float map via compile-segmap-c emits cvtepi32_ps + epi32 ops, matches scalar"
+    (if-not (clang-avx2?)
+      (println "[csimd-test] clang/AVX2 unavailable — skipping")
+      (let [segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
+                    :lambda '(.invk raster.numeric/_plus__m_float_float-impl
+                               (clojure.core/aget acc (long L))
+                               (.invk raster.numeric/_star__m_float_float-impl
+                                 (clojure.core/aget scale (long L))
+                                 (float (.invk raster.numeric/_minus__m_long_long-impl
+                                          (long (clojure.core/aget iarr (long L))) k))))}
+            {:keys [includes block]}
+            (binding [cs/*array-types* '{acc :float scale :float iarr :int}
+                      ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float" ce/*int-vars* '#{n k}]
+              (cs/compile-segmap-c segmap :avx2 '#{acc scale iarr}))
+            src (str includes "void wfold(float* restrict acc, const float* restrict scale, "
+                     "const int* restrict iarr, int k, int n){\n  " block "\n}\n")
+            native (cpu/load-kernel (cpu/compile-source! src) "wfold" 3 [:int :int])]
+        (is (re-find #"_mm256_cvtepi32_ps" block) "int→float conversion emitted")
+        (is (re-find #"_mm256_sub_epi32" block) "int-domain subtract emitted")
+        (doseq [n [8 15 100 1024]]
+          (let [acc (float-array n) scale (float-array n) iarr (int-array n) r (java.util.Random. n) k 5]
+            (dotimes [i n] (aset scale i (float (- (.nextDouble r) 0.5))) (aset iarr i (int (- (.nextInt r 200) 100))))
+            (native acc scale iarr (int k) (int n))
+            (let [ok (every? true? (for [i (range n)]
+                                     (< (Math/abs (- (aget acc i) (float (* (aget scale i) (float (- (aget iarr i) k)))))) 1e-3)))]
+              (is ok (str "n=" n)))))))))

@@ -443,10 +443,19 @@
                                                  scalar-params))
                               (vals length-syms)))
         simd-pre (atom #{})
+        ;; array symbol → element keyword, so the SIMD emitter loads int-typed arrays
+        ;; as __m256i and converts at float casts (the int8-MAC/quant widening). Params
+        ;; carry a C type; buffers/local-buffers already carry the element keyword.
+        ctype->elem {"double" :double "float" :float "long" :long "int" :int "int8_t" :byte}
+        array-types (into {} (concat
+                              (for [[s c] array-params]     [s (ctype->elem c :double)])
+                              (for [[s _ elem] buffers]      [s elem])
+                              (for [[s _ elem] local-buffers] [s elem])))
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct
                          ce/*int-vars* int-seed
-                         *simd-preamble* simd-pre]
+                         *simd-preamble* simd-pre
+                         csimd/*array-types* array-types]
                  (emit-host-stmt stripped array-syms ct))
         ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
         ;; which lowers to a maddubs helper via its :c-helper override).

@@ -104,28 +104,70 @@
   [base jv array-syms]
   (if base (str "(" (ce/emit-expr base nil array-syms "idx") ") + " jv) jv))
 
+(def ^:dynamic *array-types*
+  "Map array/scalar symbol → element keyword (:double/:float/:int/:long/:byte). Lets
+   emit-c-vexpr load int-typed arrays as __m256i + convert at float-cast boundaries
+   (the int8-MAC/quant widening). Bound by emit-c-fn from param-env + buffer elem
+   types; default {} = everything float (pure-float maps behave as before)."
+  {})
+
+(defn- dom-of
+  "Vector domain of an array/scalar element kind."
+  [elem-kw]
+  (case elem-kw (:int :long :byte) :int (:float :double) :float :float))
+
 (defn emit-c-vexpr
-  "Emit a lane-parallel expression as a C <vtype> value (the C analog of
-   segop_simd/emit-simd). idx = induction sym (its lane loads at &arr[base+jv]);
-   jv = the C loop-counter name. Pure-float today: number/scalar → broadcast,
-   affine aget → vector load, op → the intrinsics vector spelling, float/double
-   cast → passthrough. Throws on anything it can't vectorize (caller guards with
-   simd-able? first, so this only runs on recognized bodies)."
-  [expr idx isa elem jv array-syms]
-  (let [ti (in/simd-type-info isa elem)]
-    (cond
-      (number? expr) (str (:set1 ti) "(" expr ")")
-      (symbol? expr) (str (:set1 ti) "(" (ce/c-symbol expr) ")")   ; loop-invariant scalar → broadcast
-      (ss/aget-form? expr idx)
-      (let [[arr base] (ss/aget-form? expr idx)]
-        (str (:loadu ti) "(&" (ce/c-symbol arr) "[" (vidx base jv array-syms) "])"))
-      (and (seq? expr) (contains? '#{float double clojure.core/float clojure.core/double} (first expr)))
-      (emit-c-vexpr (second expr) idx isa elem jv array-syms)       ; same-domain float cast → passthrough
-      (seq? expr)
-      (if-let [vop (in/simd-op isa (first expr) elem)]
-        (str vop "(" (str/join ", " (map #(emit-c-vexpr % idx isa elem jv array-syms) (rest expr))) ")")
-        (throw (ex-info "csimd/emit-c-vexpr: no vector op" {:op (first expr) :expr expr})))
-      :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr expr})))))
+  "Emit a lane-parallel expression as C, coerced to `target-dom` (:float | :int).
+   DOMAIN-AWARE (the C analog of segop_simd/emit-simd): an internal `go` returns
+   [c-str domain] with domain ∈ {:int :float :poly}. :poly = a number/scalar with
+   no fixed domain (broadcast into whatever its use needs). int-typed arrays (per
+   *array-types*) load as __m256i and use epi32 ops; a `(float/double <int-expr>)`
+   boundary emits _mm256_cvtepi32_ps. `felem` is the float element type (:f32/:f64)
+   for float ops. Throws on anything unvectorizable (caller guards with simd-able?)."
+  [expr idx isa felem jv array-syms target-dom]
+  (let [fti (in/simd-type-info isa felem)
+        iti (in/simd-type-info isa :i32)
+        to-float (fn [[s d]] (case d
+                               :float s
+                               :int   (str (:from-i32 fti) "(" s ")")
+                               :poly  (str (:set1 fti) "(" s ")")))
+        to-int   (fn [[s d]] (case d
+                               :int  s
+                               :poly (str (:set1 iti) "(" s ")")
+                               :float (throw (ex-info "csimd: float→int in vector body unsupported" {:s s}))))
+        go (fn go [e]
+             (cond
+               (number? e) [(str e) :poly]
+               (symbol? e) [(ce/c-symbol e) :poly]           ; loop-invariant scalar → poly broadcast
+               (ss/aget-form? e idx)
+               (let [[arr base] (ss/aget-form? e idx)
+                     off (vidx base jv array-syms)]
+                 (if (= :int (dom-of (get *array-types* arr :float)))
+                   [(str (:loadu iti) "((const __m256i*)&" (ce/c-symbol arr) "[" off "])") :int]
+                   [(str (:loadu fti) "(&" (ce/c-symbol arr) "[" off "])") :float]))
+               ;; (long/int x) → int domain: identity on an int value, broadcast on a poly.
+               (and (seq? e) (contains? '#{long int clojure.core/long clojure.core/int} (first e)))
+               (let [[s d] (go (second e))]
+                 (case d :int [s :int] :poly [s :poly]
+                       :float (throw (ex-info "csimd: float→int cast in vector body" {:e e}))))
+               ;; (float/double x) → float domain, converting an int subexpr here.
+               (and (seq? e) (contains? '#{float double clojure.core/float clojure.core/double} (first e)))
+               [(to-float (go (second e))) :float]
+               (seq? e)
+               (let [op (first e) as (map go (rest e))]
+                 (cond
+                   (some #(= :float (second %)) as)     ; any float operand → float op, coerce rest
+                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]
+                   (some #(= :int (second %)) as)        ; int op (widening MAC subtract/add)
+                   (if-let [iop (in/simd-op isa op :i32)]
+                     [(str iop "(" (str/join ", " (map to-int as)) ")") :int]
+                     (throw (ex-info "csimd: no int vector op" {:op op})))
+                   :else                                 ; all poly → default float
+                   [(str (in/simd-op isa op felem) "(" (str/join ", " (map to-float as)) ")") :float]))
+               :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr e}))))]
+    (case target-dom
+      :int (to-int (go expr))
+      (to-float (go expr)))))
 
 (defn- scalar-tail
   "Scalar C for the remainder loop of a SegMap: emit the NORMALIZED lambda (bare
@@ -161,7 +203,8 @@
       (let [lanes (:lanes ti)
             n-c   (ce/emit-expr bound nil array-syms "idx")
             outc  (ce/c-symbol out)
-            vexpr (try (emit-c-vexpr lambda idx isa elem "j" array-syms)
+            vexpr (try (emit-c-vexpr lambda idx isa (if (#{:f32 :f64} elem) elem :f32) "j"
+                                     array-syms (if (= elem :i32) :int :float))
                        (catch clojure.lang.ExceptionInfo _ nil))
             ;; scalar tail via the shared c_emit path (idx→"j", cast applied)
             tail (try (scalar-tail lambda idx "j" cast array-syms)

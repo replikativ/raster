@@ -227,7 +227,9 @@
    {:f64 {:vtype "__m256d" :lanes 4 :set1 "_mm256_set1_pd" :loadu "_mm256_loadu_pd"
           :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"}
     :f32 {:vtype "__m256"  :lanes 8 :set1 "_mm256_set1_ps" :loadu "_mm256_loadu_ps"
-          :storeu "_mm256_storeu_ps" :setzero "_mm256_setzero_ps"}
+          :storeu "_mm256_storeu_ps" :setzero "_mm256_setzero_ps"
+          ;; widening conversion i32×8 → f32×8 (the int8-MAC/quant fold boundary)
+          :from-i32 "_mm256_cvtepi32_ps"}
     ;; int32 lanes — the accumulator type for the widening int8-MAC
     :i32 {:vtype "__m256i" :lanes 8 :set1 "_mm256_set1_epi32" :loadu "_mm256_loadu_si256"
           :storeu "_mm256_storeu_si256" :setzero "_mm256_setzero_si256"}}})
