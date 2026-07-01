@@ -1,6 +1,25 @@
 (ns raster.compiler.core.dtype
   "Dtype-driven type tag remapping helpers for compiler lowering.")
 
+;; ── Single faceted source for scalar dtype → per-backend native type ────────
+;; Previously each textual backend kept its own {:double "double" …} map, which
+;; drifted independently. Per-backend value differences are LEGITIMATE facets,
+;; not inconsistencies: GLSL has no 64-bit int (long→"int"), OpenCL `long` is
+;; 64-bit, C uses `long long`. Add a new dtype = add ONE row here; backends
+;; derive their map via `backend-types`.
+(def native-types
+  "Scalar dtype keyword → {backend → native type name}."
+  {:double {:c "double"    :opencl "double" :glsl "double"}
+   :float  {:c "float"     :opencl "float"  :glsl "float"}
+   :int    {:c "int"       :opencl "int"    :glsl "int"}
+   :long   {:c "long long" :opencl "long"   :glsl "int"}})
+
+(defn backend-types
+  "The {dtype → native-type-string} map for one backend (:c / :opencl / :glsl),
+   derived from `native-types`. Replaces the per-backend literal type maps."
+  [backend]
+  (into {} (map (fn [[dt facets]] [dt (get facets backend)])) native-types))
+
 (def ^:private dtype-type-remap
   "Type tag remapping per dtype. Only FP types are remapped."
   {:float {'double 'float, 'doubles 'floats}})

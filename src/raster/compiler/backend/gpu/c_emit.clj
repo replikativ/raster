@@ -15,6 +15,7 @@
       (emit-expr body idx-sym array-syms \"idx\"))"
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.intrinsics :as intrinsics]
@@ -193,10 +194,23 @@
 ;; ================================================================
 
 (def type-map
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "long long"})
+  "Dtype keyword → C type. Derived from the single faceted dtype/native-types."
+  (dtype/backend-types :c))
+
+(defn fn-style-reduction-op?
+  "True if a reduction op emits as a C function call `f(a,b)` (fmax/fmin) rather
+   than an infix operator `(a op b)`. Single source for the GPU reduction
+   combine-shape classification (was duplicated across the OpenCL backends)."
+  [op]
+  (contains? #{'Math/max 'Math/min} op))
+
+(defn combine-fn
+  "Return a (fn [a b] -> C string) that combines two operands with reduction
+   operator string `c-op`, as `c-op(a, b)` when `fn-style?` else `(a c-op b)`."
+  [c-op fn-style?]
+  (if fn-style?
+    (fn [a b] (str c-op "(" a ", " b ")"))
+    (fn [a b] (str "(" a " " c-op " " b ")"))))
 
 (def tag->ctype
   "Map walker :tag metadata to C type strings."
