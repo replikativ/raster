@@ -32,9 +32,12 @@
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
-;; One host-best Q4_0 stream-gemv kernel, compiled once — the maddubs/VNNI int8-MAC
-;; seam. Under -march=native the C macro cascade picks dpbusd (AVX-VNNI) or maddubs.
-(def ^:private kq4 (delay (cq/compile-qmatmul-stream "qlinear_i8_q4" cq/q4-0 :maddubs 1)))
+;; One host-best Q4_0 stream-gemv kernel, compiled once. This is now the COMPOSABLE
+;; qmatmul-q4-x8! lowered via compile-aot-c :simd? true (the csimd int→float widening
+;; column fold) — bit-exact and perf-matched to the retired hand-string kernel
+;; (compile-qmatmul-stream), from composable deftm source. Same out%8 / interleaved
+;; repack-stream layout contract.
+(def ^:private kq4 (delay ((requiring-resolve 'raster.quant.kernels/make-x8-c-gemv-into!))))
 
 (deftm ^:no-inline qlinear-i8!
   "In-place quantized linear: int8-quantize x, stream-gemv into y over a repack-stream

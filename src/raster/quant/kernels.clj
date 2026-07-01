@@ -268,3 +268,23 @@
              (when (pos? cnt)
                (cfn xq xs xsum wqi wsi y in out g0 cnt)))))
         y))))
+
+(defn make-x8-c-gemv-into!
+  "Like make-x8-c-gemv but writes into a CALLER-supplied y (in-place), matching the
+  (fn [xq xs xsum wqi wsi y in out]) shape — the drop-in replacement for the hand
+  stream kernel in raster.quant.op/qlinear-i8! (SAME out%8 / interleaved-layout
+  contract, matching perf, bit-exact). Compiles qmatmul-q4-x8! :simd? true once,
+  pool-drives over disjoint column-group slices into y."
+  []
+  (let [cfn ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
+             #'qmatmul-q4-x8! :float :simd? true)]
+    (fn [xq xs xsum wqi wsi y in out]
+      (let [out (long out) ng (quot out 8)]
+        (cq/run-par-fn!
+         (fn [wid n]
+           (let [chunk (quot (+ ng (dec (long n))) (long n))
+                 g0 (* (long wid) chunk)
+                 cnt (max 0 (min chunk (- ng g0)))]
+             (when (pos? cnt)
+               (cfn xq xs xsum wqi wsi y in out g0 cnt)))))
+        y))))
