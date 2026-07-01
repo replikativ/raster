@@ -26,6 +26,7 @@
   optimisation, once the primitive vectorises."
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as ra]
+            [raster.par]
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
@@ -233,11 +234,15 @@
           ;; fill out8 with the 8 column dots (side-effecting tile; mutation registered)
           (wi8-dot-q4-x8 wqi (+ wbase (* (long b) 128)) xq (* (long b) 32) out8)
           (let [xsb (double (ra/aget xs b))
-                fold (* 8 (long (ra/aget xsum b)))]
-            (dotimes [L 8]
-              (let [folded (- (long (ra/aget out8 L)) fold)
-                    scale (* xsb (double (ra/aget wsi (+ sbase (* (long b) 8) L))))]
-                (ra/aset acc8 L (float (+ (double (ra/aget acc8 L)) (* scale (double folded)))))))))
+                fold (* 8 (long (ra/aget xsum b)))
+                wbaseL (+ sbase (* (long b) 8))]     ; wsi affine base (binary +, L-free)
+            ;; the 8-column fold as a par/map! → SegMap → CPU-C AVX2 widening fold
+            ;; (out8 int → cvtepi32_ps, folded into the float acc8 register accumulator):
+            ;;   acc8[L] += (xsb * wsi[wbaseL+L]) * (float)(out8[L] - fold)
+            (raster.par/map! acc8 L 8 float
+              (+ (double (ra/aget acc8 L))
+                 (* (* xsb (double (ra/aget wsi (+ wbaseL L))))
+                    (double (- (long (ra/aget out8 L)) fold)))))))
         (dotimes [L 8] (ra/aset y (+ (* g 8) L) (ra/aget acc8 L)))))
     y))
 
@@ -247,8 +252,10 @@
   GROUP slices. Weight must be the interleaved repack-stream layout (wqi/wsi). The tile-
   tensorize candidate measured against the hand kernel. defn: device/runtime glue."
   []
-  (let [cfn ((requiring-resolve 'raster.compiler.pipeline/compile-aot)
-             #'qmatmul-q4-x8! :target :c)]
+  ;; :simd? true → the column fold lowers to the AVX2 widening block (out8 int →
+  ;; cvtepi32_ps → float acc8 register accumulator) instead of a scalar clang-autovec loop.
+  (let [cfn ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
+             #'qmatmul-q4-x8! :float :simd? true)]
     (fn [xq xs xsum wqi wsi in out]
       (let [out (long out)
             ng (quot out 8)
