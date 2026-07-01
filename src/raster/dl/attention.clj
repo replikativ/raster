@@ -715,6 +715,25 @@
 ;; Separate bias parameters bq/bk/bv/bo for BERT-style models.
 ;; ================================================================
 
+(deftm fast-exp
+  "Portable vectorizing exp(x) for x <= 0 (softmax range): e^x = (e^(x/1024))^1024
+  via a degree-6 Taylor of the small argument then 10 squarings. Uses only n/*
+  and n/+ (no libm call, no SVML, no bitcast) so it lowers to a pure FMA/mul chain
+  that the compiler SIMD-vectorizes on every backend. Rel error <1e-8 over
+  [-88,0]. (SVML VectorOperators/EXP is not intrinsified on this JVM, so Math/exp
+  stays scalar; this does not depend on it.)"
+  (All [T] [x :- T] :- T
+    (let [t (n/* x 9.765625E-4)                    ; x / 1024
+          p (n/+ 0.008333334 (n/* t 0.0013888889)) ; 1/120 + t/720
+          p (n/+ 0.041666668 (n/* t p))            ; 1/24  + t p
+          p (n/+ 0.16666667 (n/* t p))             ; 1/6
+          p (n/+ 0.5 (n/* t p))                    ; 1/2
+          p (n/+ 1.0 (n/* t p))                    ; 1
+          p (n/+ 1.0 (n/* t p))                    ; e^t (Taylor deg 6)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)]
+      p)))
+
 (deftm softmax-rows!
   "In-place row-wise softmax of a [rows, cols] row-major array — one fused pass
   per row (max → exp → sum → normalize). Scale is assumed already folded into the
@@ -723,16 +742,17 @@
     (dotimes [r rows]
       (let [off (* r (int cols))
             mx (loop [j 0 m (n/neg-inf-val (aget x off))]
-                 (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))
-            sm (loop [j 0 s 0.0]
-                 (if (< j cols)
-                   (let [e (m/exp (- (aget x (+ off j)) mx))]
-                     (aset x (+ off j) e)
-                     (recur (inc j) (+ s e)))
-                   s))
-            inv (/ 1.0 sm)]
+                 (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
+        ;; Pure exp-map (separate from the sum) so it lifts to a vectorized
+        ;; SegMap under compile-aot: m/exp lowers to VectorOperators/EXP (SVML).
+        ;; Fused with the sum-reduce it would stay a scalar loop-carried loop.
         (dotimes [j cols]
-          (aset x (+ off j) (* (aget x (+ off j)) inv)))))
+          (aset x (+ off j) (fast-exp (- (aget x (+ off j)) mx))))
+        (let [sm (loop [j 0 s 0.0]
+                   (if (< j cols) (recur (inc j) (+ s (aget x (+ off j)))) s))
+              inv (/ 1.0 sm)]
+          (dotimes [j cols]
+            (aset x (+ off j) (* (aget x (+ off j)) inv))))))
     x))
 
 ;; Batched multi-head attention: composed from the layout/GEMM/softmax
