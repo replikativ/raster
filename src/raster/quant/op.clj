@@ -77,7 +77,10 @@
   {:effects {:pure? false :mutating? true}})
 (descriptor/register-buffer-write! 'raster.quant.op/qlinear-i8! :overwrite 3)
 
-;; Placement: the int8-MAC op runs under the CPU quant profile by default. The GPU
-;; profile re-tags it :gpu to select the emit-qmatmul-opencl lowering (GPU Step 2).
+;; Placement: the int8-MAC op runs under the CPU quant profile. A :gpu profile
+;; (resident-weight OpenCL execution) is a deferred follow-up — the earlier
+;; experimental GPU quant path (raster.quant.gpu + emit-qmatmul-opencl) was UNWIRED
+;; and removed to keep this PR clean; it is reintegrated properly in the PR3 backend-
+;; regularity work (codegen → backend/gpu/quant, residency → raster.gpu.quant).
 (descriptor/register-placement! 'raster.quant.op/qlinear-i8 :cpu-quant)
 (descriptor/register-placement! 'raster.quant.op/qlinear-i8! :cpu-quant)

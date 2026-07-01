@@ -411,30 +411,3 @@
                  cnt (max 0 (min chunk (- nb r0)))]
              (when (pos? cnt) (quantize-act-blocks! x xq xs xsum r0 cnt)))))))
     {:xq xq :xs xs :xsum xsum}))
-
-(defn emit-qmatmul-opencl
-  "Emit the OpenCL kernel for FORMAT. Compiles for the Arc (ocloc -device lnl)."
-  [name {:keys [block zero-point weight-bits]}]
-  (assert (= weight-bits 4) "opencl unpack described for 4-bit")
-  (str "__kernel void " name "(__global const char* xq, __global const float* xs,\n"
-       "    __global const int* xsum, __global const uchar* wq,\n"
-       "    __global const float* ws, __global float* y, int in_, int out_) {\n"
-       "  int o = get_global_id(0); if (o >= out_) return;\n"
-       "  int nb = in_/" block ";\n"
-       "  __global const uchar* wrow = wq + (long)o*in_/2;\n"
-       "  __global const float* wsr = ws + (long)o*nb;\n"
-       "  float acc = 0.f, corr = 0.f;\n"
-       "  for (int b = 0; b < nb; b++) {\n"
-       "    __global const uchar* wb = wrow + b*16;\n"
-       "    __global const char* xb = xq + b*32;\n"
-       "    int s = 0;\n"
-       "    for (int k = 0; k < 16; k++) {\n"
-       "      // raw unsigned nibble * signed activation (the dp4a/dpbusd convention);\n"
-       "      // the zero-point is folded ONCE below via corr = -ZP*sum(xq).\n"
-       "      s += (int)xb[k]    * ((int)(wb[k] & 0xF));\n"
-       "      s += (int)xb[k+16] * ((int)(wb[k] >> 4));\n"
-       "    }\n"
-       "    float scale = xs[b]*wsr[b]; acc += scale*s; corr += scale*xsum[b];\n"
-       "  }\n"
-       "  y[o] = acc - " zero-point ".f*corr;\n"
-       "}\n"))
