@@ -255,17 +255,26 @@
 (defn- has-objects-tag? [entry]
   (some #{'objects} (:tags entry)))
 
+(def ^:private object-array-class (class (object-array 0)))
+
 (defn- detect-element-type
   [entry a0 a1 a2 a3 args n]
   (let [tags (:tags entry)]
     (loop [i 0]
       (when (< i (count tags))
         (if (= 'objects (nth tags i))
-          (let [^objects arr (case (int i) 0 a0 1 a1 2 a2 3 a3 (nth args i))]
-            (when (and arr (pos? (alength arr)))
-              (let [elem (aget arr 0)]
-                (when (and elem (not (.isArray (class elem))))
-                  (class elem)))))
+          ;; Only a genuine Object[] arg carries a per-element class to auto-
+          ;; specialize on (value classes like Dual). A primitive array
+          ;; (float[]/double[]) reaching an 'objects slot has a fixed element
+          ;; type handled by the parametric path — skip it here rather than CCE
+          ;; on the forced Object[] cast.
+          (let [arg (case (int i) 0 a0 1 a1 2 a2 3 a3 (nth args i))]
+            (when (instance? object-array-class arg)
+              (let [^objects arr arg]
+                (when (pos? (alength arr))
+                  (let [elem (aget arr 0)]
+                    (when (and elem (not (.isArray (class elem))))
+                      (class elem)))))))
           (recur (inc i)))))))
 
 (defn- try-auto-specialize!
