@@ -52,8 +52,11 @@
               (aset out i (Float/float16ToFloat (.getShort buf))))
       "BF16" (dotimes [i numel]
                (let [bits (int (bit-and (int (.getShort buf)) 0xFFFF))]
+                 ;; bit-shift-left widens to long; the high bit set (any negative
+                 ;; BF16) makes (bits<<16) exceed Integer.MAX_VALUE, so a CHECKED
+                 ;; int cast overflows. unchecked-int keeps the 32-bit pattern.
                  (aset out i (Float/intBitsToFloat
-                              (bit-shift-left bits 16)))))
+                              (unchecked-int (bit-shift-left bits 16))))))
       "I64" (dotimes [i numel] (aset out i (float (.getLong buf))))
       "I32" (dotimes [i numel] (aset out i (float (.getInt buf))))
       "I16" (dotimes [i numel] (aset out i (float (.getShort buf))))

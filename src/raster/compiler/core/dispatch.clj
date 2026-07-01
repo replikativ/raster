@@ -613,6 +613,32 @@
         (println (str "WARNING: TC annotation failed for " simple-name ": " (.getMessage e)))))))
 
 ;; ================================================================
+;; ^:no-inline opacity — the SINGLE source of truth
+;; ================================================================
+
+(defn no-inline?
+  "True if a deftm var (or the symbol naming it) is ^:no-inline — directly, or via its
+   `_m_` dispatch parent (devirtualized impl/method names carry the mangle, e.g.
+   `foo_m_double-impl` → parent `foo`). The one predicate every pass consults for inline
+   opacity: the scalar inliner and the JVM bytecode backend call THIS rather than each
+   re-parsing the `_m_` convention. Accepts a Var or a (qualified) symbol."
+  [v-or-sym]
+  (let [[the-ns base-name direct-var]
+        (cond
+          (var? v-or-sym)
+          [(:ns (meta v-or-sym)) (str (:name (meta v-or-sym))) v-or-sym]
+          (qualified-symbol? v-or-sym)
+          [(some-> (namespace v-or-sym) symbol find-ns) (name v-or-sym)
+           (try (resolve v-or-sym) (catch Exception _ nil))]
+          :else [nil nil nil])]
+    (boolean
+     (or (some-> direct-var meta :no-inline)
+         (when (and the-ns base-name)
+           (when-let [idx (str/index-of base-name "_m_")]
+             (when-let [parent (ns-resolve the-ns (symbol (subs base-name 0 idx)))]
+               (:no-inline (meta parent)))))))))
+
+;; ================================================================
 ;; register-method!
 ;; ================================================================
 
@@ -662,6 +688,11 @@
                     :raster.core/generic-function true
                     :raster.core/dispatch-table table-atom
                     :raster.core/reducible reducible?
+                    ;; Propagate ^:no-inline explicitly. For unqualified names `intern`
+                    ;; copies it off `simple-name`'s meta, but for QUALIFIED/extension
+                    ;; names simple-name = (symbol (name fn-name)) strips the meta — so
+                    ;; without this the flag would silently drop and the op be inlinable.
+                    :no-inline (:no-inline (meta fn-name))
                     :arglists (seq arglists))
        (clear-specialization-cache! k)
        (emit-tc-ann! target-ns-obj simple-name table-atom)

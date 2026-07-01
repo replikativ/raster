@@ -134,7 +134,7 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
-(defn- get-walked-body [f-var & [dtype]]
+(defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
         m (meta resolved)]
     ;; Always re-walk with TC at compilation time for best type inference.
@@ -162,12 +162,12 @@
         (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body or raw body" {:var f-var})))))
 
-(defn- get-params [f-var & [dtype]]
+(defn get-params [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)]
     (or (:raster.core/deftm-params (meta resolved))
         (throw (ex-info "Var has no deftm params" {:var f-var})))))
 
-(defn- build-param-env
+(defn build-param-env
   "Build a {sym -> tag} type environment from deftm parameter tags.
   Maps each param symbol to its walker tag (e.g. 'doubles, 'double, 'longs).
   Falls back to nil (unknown) for params without tags."
@@ -182,7 +182,7 @@
                     (symbol t)])
                  params tags)))))
 
-(defn- clean-params
+(defn clean-params
   "Strip metadata (type hints) from param symbols for eval."
   [params]
   (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil)
@@ -624,9 +624,13 @@
   Returns {:form :stats :cuda-result :kernels}."
   [form opts]
   (let [target-device (:target-device opts)
-        simd? (:simd? opts true)
-        backend (device/select-runtime-backend target-device simd? nil)]
-    (case backend
+        simd? (:simd? opts true)]
+    (if (:keep-par-forms? opts)
+      ;; CPU-C SIMD path: leave par/map!/par/reduce forms INTACT (neither scalarize
+      ;; nor JVM-Vector-API lower) so the monolithic C backend can consume the same
+      ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
+      {:form (strip-compound-markers form) :stats nil :backend :par-preserve}
+      (case (device/select-runtime-backend target-device simd? nil)
       :cuda
       (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
@@ -643,7 +647,7 @@
         {:form form :stats stats :backend :simd})
 
       ;; :scalar
-      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar})))
+      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.
@@ -772,6 +776,8 @@
 ;; Pipeline: forward-only (buffer fusion, no AD)
 ;; ================================================================
 
+(declare compile-aot-jvm)
+
 (defn compile-aot
   "Compile a deftm var into an optimized forward function with buffer fusion.
 
@@ -789,7 +795,22 @@
     :inline?         - inline deftm calls (default true)
     :simd?           - apply SIMD optimization to parallel forms (default true)
     :dtype           - numeric dtype (:double or :float, selects overload)
-    :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)"
+    :target-device   - device-id for backend selection (e.g. :cuda:0 or :ze:0)
+    :target          - :c routes to the native CPU-C backend (one fused C function
+                       per deftm via Panama FFM, no per-op JVM dispatch). Bypasses
+                       the bytecode/GPU path."
+  [f-var & {:keys [inline? simd? dtype target-device target]
+            :or {inline? true simd? true}}]
+  (if (= target :c)
+    ;; Native CPU-C backend: emit the whole fused body as one C function (no
+    ;; per-op JVM dispatch) + Panama FFM. Bypasses the bytecode/hoist path.
+    ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
+     f-var (or dtype :double))
+    (compile-aot-jvm f-var :inline? inline? :simd? simd? :dtype dtype
+                     :target-device target-device)))
+
+(defn- compile-aot-jvm
+  "JVM/GPU compile-aot: bytecode (SIMD) or GPU (target-device) backend."
   [f-var & {:keys [inline? simd? dtype target-device]
             :or {inline? true simd? true}}]
   (let [;; Use the classloader that defined the target function's defrecord types.

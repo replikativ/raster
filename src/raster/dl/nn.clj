@@ -354,6 +354,67 @@
 
 ;; layer-norm rrule — pullback registered after backward deftm (below)
 
+;; --- RMS Norm ---
+;; Root-mean-square normalization (no mean subtraction, no bias). Used by the
+;; modern decoder LMs (Llama, Qwen, Gemma, Mistral). Per-row over `features`:
+;;   y_i = x_i / sqrt(mean_j(x_j^2) + eps) * (gain-offset + weight_i)
+;; gain-offset = 0.0 for Llama/Qwen (plain weight gain); 1.0 for Gemma, whose
+;; norm weights are centered at 0 and applied as (1 + weight). Also used for
+;; per-head QK-norm (rows = heads*seq, features = head_dim).
+(deftm rms-norm (All [T] [x :- (Array T) weight :- (Array T)
+                          rows :- Long features :- Long
+                          eps :- Double gain-offset :- Double] :- (Array T)
+                     (let [out (alloc-like x (* rows features))]
+                       (dotimes [r rows]
+                         (let [offset (* r (int features))
+                               ms (loop [i 0 s 0.0]
+                                    (if (< i features)
+                                      (let [v (aget x (+ offset i))]
+                                        (recur (inc i) (+ s (* v v))))
+                                      (/ s features)))
+                               inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                           (dotimes [i features]
+                             (aset out (+ offset i)
+                                   (* (aget x (+ offset i)) inv
+                                      (+ gain-offset (aget weight i)))))))
+                       out)))
+
+;; --- Bias-free linear + gated MLP (modern decoder LMs) ---
+;; Modern LLMs (Llama, Qwen, Gemma, Mistral) use bias-free projections.
+;; linear-nb: y = x @ W^T, W:[out_f,in_f] (HF layout), no bias.
+(deftm linear-nb (All [T] [x :- (Array T) W :- (Array T)
+                           batch :- Long in-f :- Long out-f :- Long] :- (Array T)
+                      (let [y (alloc-like x (* batch out-f))]
+                        (blas/dgemm-nt! x W y batch in-f out-f
+                                        (n/oftype x 1.0) (n/oftype x 0.0))
+                        y)))
+
+;; Gated MLP (GeGLU): down( gelu(x@gate^T) ⊙ (x@up^T) ), bias-free.
+;; This is Gemma's / T5-v1.1's MLP. The SwiGLU variant (Llama/Qwen) is identical
+;; with silu in place of gelu — see swiglu.
+(deftm geglu (All [T] [x :- (Array T) gate-w :- (Array T) up-w :- (Array T)
+                       down-w :- (Array T)
+                       rows :- Long d-model :- Long d-ff :- Long] :- (Array T)
+                  (let [g (linear-nb x gate-w rows d-model d-ff)
+                        g (gelu g (* rows d-ff))
+                        u (linear-nb x up-w rows d-model d-ff)
+                        h (broadcast [g u] (* g u))]
+                    (linear-nb h down-w rows d-ff d-model))))
+
+;; SwiGLU (Llama/Qwen gated MLP): down( silu(x@gate^T) ⊙ (x@up^T) ), bias-free.
+(deftm swiglu (All [T] [x :- (Array T) gate-w :- (Array T) up-w :- (Array T)
+                        down-w :- (Array T)
+                        rows :- Long d-model :- Long d-ff :- Long] :- (Array T)
+                   (let [g (linear-nb x gate-w rows d-model d-ff)
+                         g (silu g (* rows d-ff))
+                         u (linear-nb x up-w rows d-model d-ff)
+                         h (broadcast [g u] (* g u))]
+                     (linear-nb h down-w rows d-ff d-model))))
+
+;; Elementwise residual add: out = a + b (parametric; for transformer residuals).
+(deftm residual-add (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
+                         (broadcast [a b] (+ a b))))
+
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
 (deftm group-norm (All [T] [x :- (Array T) gamma :- (Array T)

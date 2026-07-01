@@ -1498,13 +1498,18 @@
   [fn-name template bindings args]
   (let [{:keys [annotations ret-annotation params body source-ns]} template
         ;; Specialize parametric value types (defvalue with All [T])
-        non-prim-tag (first (filter #(and (symbol? %)
-                                          (not (#{'double 'float 'long 'int} %)))
-                                    (vals bindings)))
+        ;; Value-class specialization tag: any NON-double binding (float/int/long
+        ;; or a non-primitive like Sym). double uses the base specialization;
+        ;; every other element type needs its own Name__<tag> value class — else
+        ;; e.g. float[] construction/field-access hits the double base and throws
+        ;; [F cannot be cast to [D. (Previously this excluded float/long/int too,
+        ;; so float parametric value classes silently fell back to double.)
+        vc-spec-tag (first (filter #(and (symbol? %) (not= 'double %))
+                                   (vals bindings)))
         cache-specs
-        (when non-prim-tag
+        (when vc-spec-tag
           (into {} (keep (fn [[cname tmpl]]
-                           (let [concrete-name (symbol (str cname "__" non-prim-tag))]
+                           (let [concrete-name (symbol (str cname "__" vc-spec-tag))]
                              [cname concrete-name]))
                          @parametric-value-registry)))
         ;; Unified substitution: type vars + parametric type names + constructors
@@ -1575,13 +1580,13 @@
         ;; Collect defvalue forms for parametric value types
         body-str (str body)
         ann-str (str annotations)
-        defvalue-forms (when (and cache-specs non-prim-tag)
+        defvalue-forms (when (and cache-specs vc-spec-tag)
                          (vec (keep (fn [[cname tmpl]]
                                       (when (or (.contains ^String body-str (str cname))
                                                 (.contains ^String ann-str (str cname)))
                                         (let [concrete-name (get cache-specs cname)
                                               {:keys [type-vars fields opts]} tmpl
-                                              sub-bindings (zipmap type-vars (repeat non-prim-tag))
+                                              sub-bindings (zipmap type-vars (repeat vc-spec-tag))
                                               substituted-fields (mapv (fn [f]
                                                                          (if (and (sequential? f) (= 'Array (first f)))
                                                                            (clojure.walk/postwalk

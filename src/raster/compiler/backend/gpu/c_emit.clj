@@ -79,9 +79,23 @@
 
 (def ^:dynamic *scalar-type* "double")
 
+(def ^:dynamic *loop-result-var*
+  "When a loop is emitted as a statement-expression value (reduction), the C
+  name of the properly-typed result variable its terminal value is assigned to.
+  nil in statement context, where the loop's value is discarded and the terminal
+  falls back to the first loop var (legacy behavior)."
+  nil)
+
 (def ^:dynamic *idx-sym*
   "The par loop index symbol (always uint/int). Used by infer-c-type."
   nil)
+
+(def ^:dynamic *int-vars*
+  "Set of in-scope symbols known to be integer-typed (loop induction/counter
+  variables and int-inferred let bindings). infer-c-type returns \"int\" for these,
+  so index arithmetic bound to a name (e.g. `base = b*32`) is typed int rather than
+  defaulting to *scalar-type*. Loop and let* emitters seed it for their bodies."
+  #{})
 
 ;; ================================================================
 ;; Op mapping (valid across all C-family backends)
@@ -89,93 +103,104 @@
 
 (def op-map
   "Maps Clojure/Java op symbols to C equivalents.
-  Backend-specific overrides (fabs vs abs) are handled via *emit-config*."
-  {'Math/sin   "sin"
-   'Math/cos   "cos"
-   'Math/tan   "tan"
-   'Math/exp   "exp"
-   'Math/log   "log"
-   'Math/sqrt  "sqrt"
-   'Math/abs   "fabs"    ;; overridden per-backend at emit time
-   'Math/pow   "pow"
-   'Math/max   "fmax"    ;; overridden per-backend at emit time
-   'Math/min   "fmin"    ;; overridden per-backend at emit time
-   'Math/floor "floor"
-   'Math/ceil  "ceil"
-   'Math/round "round"
-   'Math/atan2 "atan2"
-   'Math/fma   "fma"
-   '+          "+"
-   '-          "-"
-   '*          "*"
-   '/          "/"
-   'clojure.core/+  "+"
-   'clojure.core/-  "-"
-   'clojure.core/*  "*"
-   'clojure.core//  "/"
-   'clojure.core/quot "/"
-   'clojure.core/rem  "%"
-   'quot "/"
-   'rem  "%"
-   'clojure.core/unchecked-add "+"
-   'clojure.core/unchecked-multiply "*"
-   'clojure.core/unchecked-subtract "-"
-   'clojure.core/unchecked-inc "+"
-   'clojure.core/unchecked-dec "-"
-   'clojure.core/< "<"
-   'clojure.core/> ">"
-   'clojure.core/<= "<="
-   'clojure.core/>= ">="
-   'clojure.core/== "=="
-   'unchecked-add-int "+"
-   'unchecked-subtract-int "-"
-   'unchecked-multiply-int "*"
-   'clojure.core/unchecked-add-int "+"
-   'clojure.core/unchecked-subtract-int "-"
-   'clojure.core/unchecked-multiply-int "*"
-   'bit-and "&"
-   'clojure.core/bit-and "&"
-   'bit-or "|"
-   'clojure.core/bit-or "|"
-   'bit-xor "^"
-   'clojure.core/bit-xor "^"
-   'bit-shift-left "<<"
-   'clojure.core/bit-shift-left "<<"
-   'unsigned-bit-shift-right ">>"
-   'clojure.core/unsigned-bit-shift-right ">>"
-   '< "<"
-   '> ">"
-   '<= "<="
-   '>= ">="
-   '== "=="
-   '!= "!="
+  Backend-specific overrides (fabs vs abs) are handled via *emit-config*.
+  java.lang.Math/X aliases are auto-added (see below) so inliner-qualified Java
+  method symbols resolve identically to the short Math/X reader forms."
+  (let [base
+        {'Math/sin   "sin"
+         'Math/cos   "cos"
+         'Math/tan   "tan"
+         'Math/exp   "exp"
+         'Math/log   "log"
+         'Math/sqrt  "sqrt"
+         'Math/abs   "fabs"    ;; overridden per-backend at emit time
+         'Math/pow   "pow"
+         'Math/max   "fmax"    ;; overridden per-backend at emit time
+         'Math/min   "fmin"    ;; overridden per-backend at emit time
+         'Math/floor "floor"
+         'Math/ceil  "ceil"
+         'Math/round "round"
+         'Math/atan2 "atan2"
+         'Math/fma   "fma"
+         '+          "+"
+         '-          "-"
+         '*          "*"
+         '/          "/"
+         'clojure.core/+  "+"
+         'clojure.core/-  "-"
+         'clojure.core/*  "*"
+         'clojure.core//  "/"
+         'clojure.core/quot "/"
+         'clojure.core/rem  "%"
+         'quot "/"
+         'rem  "%"
+         'clojure.core/unchecked-add "+"
+         'clojure.core/unchecked-multiply "*"
+         'clojure.core/unchecked-subtract "-"
+         'clojure.core/unchecked-inc "+"
+         'clojure.core/unchecked-dec "-"
+         'clojure.core/< "<"
+         'clojure.core/> ">"
+         'clojure.core/<= "<="
+         'clojure.core/>= ">="
+         'clojure.core/== "=="
+         'unchecked-add-int "+"
+         'unchecked-subtract-int "-"
+         'unchecked-multiply-int "*"
+         'clojure.core/unchecked-add-int "+"
+         'clojure.core/unchecked-subtract-int "-"
+         'clojure.core/unchecked-multiply-int "*"
+         'bit-and "&"
+         'clojure.core/bit-and "&"
+         'bit-or "|"
+         'clojure.core/bit-or "|"
+         'bit-xor "^"
+         'clojure.core/bit-xor "^"
+         'bit-shift-left "<<"
+         'clojure.core/bit-shift-left "<<"
+         'bit-shift-right ">>"
+         'clojure.core/bit-shift-right ">>"
+         'unsigned-bit-shift-right ">>"
+         'clojure.core/unsigned-bit-shift-right ">>"
+         '< "<"
+         '> ">"
+         '<= "<="
+         '>= ">="
+         '== "=="
+         '!= "!="
    ;; GPU math builtins (GLSL/OpenCL/HIP)
-   'fract "fract"
-   'clamp "clamp"
-   'mix   "mix"
-   'step  "step"
-   'smoothstep "smoothstep"
-   'abs   "abs"
-   'sign  "sign"
-   'mod   "mod"
-   'length "length"
-   'distance "distance"
-   'dot   "dot"
-   'cross "cross"
-   'normalize "normalize"
-   'min   "min"
-   'max   "max"
-   'sqrt  "sqrt"
-   'sin   "sin"
-   'cos   "cos"
-   'tan   "tan"
-   'exp   "exp"
-   'log   "log"
-   'pow   "pow"
-   'floor "floor"
-   'ceil  "ceil"
-   'round "round"
-   'fma   "fma"})
+         'fract "fract"
+         'clamp "clamp"
+         'mix   "mix"
+         'step  "step"
+         'smoothstep "smoothstep"
+         'abs   "abs"
+         'sign  "sign"
+         'mod   "mod"
+         'length "length"
+         'distance "distance"
+         'dot   "dot"
+         'cross "cross"
+         'normalize "normalize"
+         'min   "min"
+         'max   "max"
+         'sqrt  "sqrt"
+         'sin   "sin"
+         'cos   "cos"
+         'tan   "tan"
+         'exp   "exp"
+         'log   "log"
+         'pow   "pow"
+         'floor "floor"
+         'ceil  "ceil"
+         'round "round"
+         'fma   "fma"}]
+    ;; auto-alias java.lang.Math/X -> the short Math/X entry (the inliner emits
+    ;; fully-qualified Java method symbols; both must lower the same).
+    (merge base
+           (into {} (for [[k v] base
+                          :when (and (qualified-symbol? k) (= "Math" (namespace k)))]
+                      [(symbol "java.lang.Math" (name k)) v])))))
 
 ;; ================================================================
 ;; Devirtualized arithmetic → C operator/function mapping
@@ -214,12 +239,12 @@
 
 (def tag->ctype
   "Map walker :tag metadata to C type strings."
-  {'ints "int" 'floats "float" 'doubles "double" 'longs "long"
-   'int "int" 'float "float" 'double "double" 'long "long"})
+  {'ints "int" 'floats "float" 'doubles "double" 'longs "long" 'bytes "int8_t"
+   'int "int" 'float "float" 'double "double" 'long "long" 'byte "int8_t"})
 
 (def element-tag->c
   "Map primitive element-tag to C type string."
-  {'double "double" 'float "float" 'long "long" 'int "int"})
+  {'double "double" 'float "float" 'long "long" 'int "int" 'byte "int8_t"})
 
 ;; ================================================================
 ;; Symbol mangling
@@ -253,7 +278,8 @@
               (str/replace "*" "_star_")
               (str/replace "/" "_slash_")
               (str/replace "?" "_p")
-              (str/replace "!" "_b"))]
+              (str/replace "!" "_b")
+              (str/replace "'" "_prime"))]   ; Clojure allows ' in symbols (a', x'); C does not
     (if (contains? c-reserved-words s)
       (str s "_")
       s)))
@@ -276,60 +302,98 @@
 ;; Type inference
 ;; ================================================================
 
+;; quot/rem/mod + bitwise ops produce integers (over integer operands). Without these
+;; in the structural fallback they default to *scalar-type* (double), which silently
+;; widens integer counters/indices and — critically — the Q4 nibble unpack (bit-and/
+;; shift) INSIDE the int8-MAC loop, injecting int<->double conversions that block the
+;; C compiler from lowering the loop to VNNI/maddubs. (Matches the +/-/* clause below.)
+(def ^:private integer-result-ops
+  '#{quot rem mod clojure.core/quot clojure.core/rem clojure.core/mod
+     bit-and bit-or bit-xor bit-shift-left bit-shift-right unsigned-bit-shift-right
+     clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
+     clojure.core/bit-shift-left clojure.core/bit-shift-right
+     clojure.core/unsigned-bit-shift-right})
+
 (defn infer-c-type
-  "Infer the C type of an expression from walker :tag metadata on symbols,
-  primitive casts, and aget on typed arrays. Falls back to *scalar-type*."
+  "Infer the C type of an expression. Prefers the walker-stamped :raster.type/tag
+  result-type metadata (the single source of truth — no mangled-name parsing); falls
+  back to structural inference (casts, aget element type, comparisons) then
+  *scalar-type*."
   [expr]
-  (cond
-    (and (seq? expr) (= 2 (count expr))
-         (contains? #{'int 'float 'double 'long} (first expr)))
-    (get tag->ctype (first expr) *scalar-type*)
+  (or
+   ;; Metadata-first: the walker stamps every typed form (incl. devirtualized .invk
+   ;; arithmetic) with its result element type. Use it directly instead of parsing
+   ;; impl names or re-deriving from operand structure.
+   (when (instance? clojure.lang.IObj expr)
+     (when-let [t (:raster.type/tag (meta expr))]
+       (get tag->ctype t)))
+   (cond
+     (and (seq? expr) (= 2 (count expr))
+          (contains? #{'int 'float 'double 'long} (first expr)))
+     (get tag->ctype (first expr) *scalar-type*)
 
-    (and (seq? expr) (descriptor/aget-op? (first expr))
-         (>= (count expr) 3))
-    (let [arr (second expr)
-          tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
-      (get tag->ctype tag *scalar-type*))
+     (and (seq? expr) (descriptor/aget-op? (first expr))
+          (>= (count expr) 3))
+     (let [arr (second expr)
+           tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
+       (get tag->ctype tag *scalar-type*))
 
-    (and (seq? expr)
-         (contains? #{'unchecked-add-int 'unchecked-subtract-int
-                      'unchecked-multiply-int} (first expr)))
-    "int"
+     (and (seq? expr)
+          (contains? #{'unchecked-add-int 'unchecked-subtract-int
+                       'unchecked-multiply-int} (first expr)))
+     "int"
 
-    (and (seq? expr)
-         (contains? #{'raster.par/atomic-add! 'par/atomic-add!} (first expr)))
-    (let [arr (second expr)
-          tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
-      (get tag->ctype tag "int"))
+     (and (seq? expr)
+          (contains? #{'raster.par/atomic-add! 'par/atomic-add!} (first expr)))
+     (let [arr (second expr)
+           tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
+       (get tag->ctype tag "int"))
 
-    (and (seq? expr) (contains? #{'inc 'dec 'clojure.core/inc 'clojure.core/dec} (first expr)))
-    (let [inner-type (infer-c-type (second expr))]
-      (if (= inner-type "int") "int" *scalar-type*))
+     (and (seq? expr) (contains? #{'inc 'dec 'clojure.core/inc 'clojure.core/dec} (first expr)))
+     (let [inner-type (infer-c-type (second expr))]
+       (if (= inner-type "int") "int" *scalar-type*))
 
     ;; Comparison operators return bool
-    (and (seq? expr)
-         (contains? #{'< '> '<= '>= '== '!=
-                      'clojure.core/< 'clojure.core/> 'clojure.core/<=
-                      'clojure.core/>= 'clojure.core/==
-                      'and 'or 'clojure.core/and 'clojure.core/or} (first expr)))
-    "bool"
+     (and (seq? expr)
+          (contains? #{'< '> '<= '>= '== '!=
+                       'clojure.core/< 'clojure.core/> 'clojure.core/<=
+                       'clojure.core/>= 'clojure.core/==
+                       'and 'or 'clojure.core/and 'clojure.core/or} (first expr)))
+     "bool"
 
     ;; Par loop index variable is always uint/int
-    (and (symbol? expr) *idx-sym* (= (name expr) (name *idx-sym*)))
-    "uint"
+     (and (symbol? expr) *idx-sym* (= (name expr) (name *idx-sym*)))
+     "uint"
 
-    (integer? expr) "int"
-    (float? expr) *scalar-type*
+    ;; In-scope integer variable (loop counter / int-inferred binding)
+     (and (symbol? expr) (contains? *int-vars* expr))
+     "int"
 
-    (and (seq? expr)
-         (let [op (first expr)]
-           (or (descriptor/addition-op? op) (descriptor/subtraction-op? op) (descriptor/multiplication-op? op)))
-         (let [types (map infer-c-type (rest expr))]
-           (every? #(contains? #{"int" "uint"} %) types)))
-    (let [types (map infer-c-type (rest expr))]
-      (if (some #(= "uint" %) types) "uint" "int"))
+     (integer? expr) "int"
+     (float? expr) *scalar-type*
 
-    :else *scalar-type*))
+    ;; Integer index/counter arithmetic: +/-/* over integer operands stays integer.
+    ;; long is integer too (the walker casts index operands to long, e.g.
+    ;; (* (long b) (long 32))) — widen to long if any operand is long.
+     (and (seq? expr)
+          (let [op (first expr)]
+            (or (descriptor/addition-op? op) (descriptor/subtraction-op? op) (descriptor/multiplication-op? op)))
+          (let [types (map infer-c-type (rest expr))]
+            (every? #(contains? #{"int" "uint" "long"} %) types)))
+     (let [types (map infer-c-type (rest expr))]
+       (cond (some #(= "long" %) types) "long"
+             (some #(= "uint" %) types) "uint"
+             :else "int"))
+
+    ;; quot/rem/mod + bitwise over integer operands stay integer (widen to long).
+     (and (seq? expr)
+          (contains? integer-result-ops (first expr))
+          (let [types (map infer-c-type (rest expr))]
+            (every? #(contains? #{"int" "uint" "long"} %) types)))
+     (let [types (map infer-c-type (rest expr))]
+       (if (some #(= "long" %) types) "long" "int"))
+
+     :else *scalar-type*)))
 
 ;; ================================================================
 ;; Side effect detection
@@ -362,6 +426,15 @@
   "Remap a C type name according to backend config (e.g. long -> int for GLSL)."
   [ctype]
   (get (:type-remap *emit-config*) ctype ctype))
+
+(defn decl-type
+  "C declaration type for a binding init: the TC-stamped :raster.type/tag (read via
+  infer-c-type's metadata-first path) when present, else the structural fallback —
+  then backend-remapped. The single type-resolution entry point for backends that
+  declare locals (e.g. the CPU-C AOT outer-let* bindings); they must NOT hardcode a
+  type or re-derive one, only read what the walker stamped."
+  [init]
+  (remap-type (infer-c-type init)))
 
 (defn- supports-stmt-expr?
   "Whether the current backend supports GCC statement expressions ({ ... })."
@@ -586,6 +659,22 @@
     :else
     (str result-var " = " (emit-expr expr idx-sym array-syms opencl-idx) ";")))
 
+(defn- loop-terminal-expr
+  "Find a loop body's terminal (non-recur) value expression — the value the loop
+  evaluates to when it exits. Walks if/when/do/let to the first value leaf; nil
+  if the body only recurs or ends in a void op."
+  [form]
+  (cond
+    (not (seq? form)) form
+    (= 'recur (first form)) nil
+    (= 'if (first form))   (or (loop-terminal-expr (nth form 2 nil))
+                               (loop-terminal-expr (nth form 3 nil)))
+    (= 'when (first form)) (loop-terminal-expr (last form))
+    (= 'do (first form))   (loop-terminal-expr (last form))
+    (contains? #{'let 'let*} (first form)) (loop-terminal-expr (last form))
+    (void-form? form) nil
+    :else form))
+
 (defn- emit-loop-body
   "Emit the body of a loop as C while-body statements."
   [body var-names idx-sym array-syms opencl-idx]
@@ -669,9 +758,10 @@
     (void-form? expr)
     (str (emit-stmt expr idx-sym array-syms opencl-idx) " break;")
 
-    ;; Terminal expression -> assign to first var and break
+    ;; Terminal expression -> assign to the typed result var (reduction value)
+    ;; or, in statement context, the first loop var (value discarded).
     :else
-    (str (c-symbol (first var-names)) " = "
+    (str (or *loop-result-var* (c-symbol (first var-names))) " = "
          (emit-expr expr idx-sym array-syms opencl-idx) "; break;")))
 
 (defn emit-expr
@@ -739,28 +829,35 @@
                                 pairs-vec))
            multi-use? (fn [sym] (and (not force-inline?)
                                      (> (get use-counts sym 0) 1)))
-           {:keys [env locals]}
+           {:keys [env locals ints]}
            (reduce
-            (fn [{:keys [env locals seen-names]} [sym val]]
-              (let [val-subst (walk/postwalk
-                               (fn [f] (if (and (symbol? f) (contains? env f))
-                                         (get env f) f))
-                               val)]
-                (if (multi-use? sym)
-                  (let [base-name (c-symbol sym)
-                        prev-count (get seen-names base-name 0)
-                        c-name (if (> prev-count 0)
-                                 (str base-name "_" prev-count)
-                                 base-name)
-                        c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                        c-type (remap-type (infer-c-type val-subst))]
-                    {:env (assoc env sym (symbol c-name))
-                     :locals (conj locals [c-name c-expr c-type])
-                     :seen-names (assoc seen-names base-name (inc prev-count))})
-                  {:env (assoc env sym val-subst)
-                   :locals locals
-                   :seen-names (or seen-names {})})))
-            {:env {} :locals [] :seen-names {}}
+            (fn [{:keys [env locals seen-names ints]} [sym val]]
+              ;; Type bindings under the integer vars accumulated so far, so a
+              ;; dependent index binding (e.g. k = base*2 after base = b*32) infers
+              ;; int rather than defaulting to *scalar-type*.
+              (binding [*int-vars* (into *int-vars* ints)]
+                (let [val-subst (walk/postwalk
+                                 (fn [f] (if (and (symbol? f) (contains? env f))
+                                           (get env f) f))
+                                 val)]
+                  (if (multi-use? sym)
+                    (let [base-name (c-symbol sym)
+                          prev-count (get seen-names base-name 0)
+                          c-name (if (> prev-count 0)
+                                   (str base-name "_" prev-count)
+                                   base-name)
+                          c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
+                          c-type (remap-type (infer-c-type val-subst))]
+                      {:env (assoc env sym (symbol c-name))
+                       :locals (conj locals [c-name c-expr c-type])
+                       :seen-names (assoc seen-names base-name (inc prev-count))
+                       :ints (if (contains? #{"int" "uint"} c-type)
+                               (conj ints (symbol c-name)) ints)})
+                    {:env (assoc env sym val-subst)
+                     :locals locals
+                     :seen-names (or seen-names {})
+                     :ints ints}))))
+            {:env {} :locals [] :seen-names {} :ints #{}}
             pairs-vec)
            subst-form (fn [form]
                         (walk/postwalk
@@ -771,32 +868,35 @@
            leading-body (butlast all-body)
            tail-body (last all-body)
            has-leading? (and (seq leading-body)
-                             (some has-side-effects? leading-body))
-           body-str (emit-expr tail-body idx-sym array-syms opencl-idx)]
-       (cond
+                             (some has-side-effects? leading-body))]
+       ;; Emit leading statements + body under the int vars bound by this scope's
+       ;; bindings, so references to int-typed locals (index math) type as int.
+       (binding [*int-vars* (into *int-vars* ints)]
+         (let [body-str (emit-expr tail-body idx-sym array-syms opencl-idx)]
+           (cond
          ;; Multiple body forms with side effects — need statement expression
-         (and has-leading? (supports-stmt-expr?))
-         (let [leading-stmts (str/join " "
-                                       (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx))
-                                            leading-body))]
-           (str "({ "
-                (str/join " "
-                          (map (fn [[n e t]] (str t " " n " = " e ";")) locals))
-                " " leading-stmts
-                " " body-str "; })"))
+             (and has-leading? (supports-stmt-expr?))
+             (let [leading-stmts (str/join " "
+                                           (map (fn [s] (emit-stmt s idx-sym array-syms opencl-idx))
+                                                leading-body))]
+               (str "({ "
+                    (str/join " "
+                              (map (fn [[n e t]] (str t " " n " = " e ";")) locals))
+                    " " leading-stmts
+                    " " body-str "; })"))
 
-         (and has-leading? (not (supports-stmt-expr?)))
-         (throw (ex-info "GLSL: let* body has multiple forms with side effects but statement expressions are not supported"
-                         {:expr expr}))
+             (and has-leading? (not (supports-stmt-expr?)))
+             (throw (ex-info "GLSL: let* body has multiple forms with side effects but statement expressions are not supported"
+                             {:expr expr}))
 
          ;; Single body or no side effects in leading forms — original path
-         (seq locals)
-         (str "({ "
-              (str/join " "
-                        (map (fn [[n e t]] (str t " " n " = " e ";")) locals))
-              " " body-str "; })")
+             (seq locals)
+             (str "({ "
+                  (str/join " "
+                            (map (fn [[n e t]] (str t " " n " = " e ";")) locals))
+                  " " body-str "; })")
 
-         :else body-str))
+             :else body-str))))
 
      ;; do block
      (and (seq? expr) (= 'do (first expr)))
@@ -876,13 +976,19 @@
                                   (str typ " " (c-symbol sym) " = "
                                        (emit-expr init idx-sym array-syms opencl-idx) ";"))
                                 var-names var-types var-inits))
-           result-var (c-symbol (first var-names))
-           loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+           terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
        (if (supports-stmt-expr?)
-         (str "({ " decls " while (1) { " loop-body " } " result-var "; })")
-         ;; GLSL: no statement-expressions; emit inline declarations + while
-         ;; Result is in the first loop variable after break.
-         (str decls " while (true) { " loop-body " }")))
+         ;; Reduction result: a dedicated var typed from the loop's terminal
+         ;; value, not the first loop var (usually the int counter — assigning a
+         ;; double accumulator into it would truncate).
+         (let [result-var (str (c-symbol (first var-names)) "_res")
+               result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
+               loop-body (binding [*loop-result-var* result-var]
+                           (emit-loop-body body var-names idx-sym array-syms opencl-idx))]
+           (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
+         ;; GLSL: no statement-expressions; result stays in the first loop var.
+         (let [loop-body (emit-loop-body body var-names idx-sym array-syms opencl-idx)]
+           (str decls " while (true) { " loop-body " }"))))
 
      ;; case -> switch
      (and (seq? expr) (= 'case (first expr)))
@@ -965,12 +1071,13 @@
             " " (get op-map op (name op)) " "
             (emit-expr b idx-sym array-syms opencl-idx) ")"))
 
-     ;; Bitwise ops: bit-and, bit-or, bit-xor, bit-shift-left, unsigned-bit-shift-right
+     ;; Bitwise ops: bit-and, bit-or, bit-xor, bit-shift-left/right, unsigned-bit-shift-right
      (and (seq? expr) (= 3 (count expr))
           (contains? #{'bit-and 'clojure.core/bit-and
                        'bit-or 'clojure.core/bit-or
                        'bit-xor 'clojure.core/bit-xor
                        'bit-shift-left 'clojure.core/bit-shift-left
+                       'bit-shift-right 'clojure.core/bit-shift-right
                        'unsigned-bit-shift-right 'clojure.core/unsigned-bit-shift-right}
                      (first expr)))
      (let [[op a b] expr
@@ -1035,18 +1142,24 @@
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
-           :infix (str "(" (str/join (str " " (:op c-op) " ")
-                                     (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
+           :infix (let [es (map #(emit-expr % idx-sym array-syms opencl-idx) args)]
+                    (if (= 1 (count es))
+                      ;; unary operator (e.g. negation `_minus__m_double`) — prefix
+                      ;; the operator; a str/join over one arg would drop it entirely.
+                      (str "(" (:op c-op) (first es) ")")
+                      (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
            :fn    (str (:op c-op) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
                           (str "((" ea " % " eb " + " eb ") % " eb ")")))
-         ;; Non-arithmetic deftm helper -> C helper invocation
-         (let [c-name (str "gpufn_" (c-symbol sym))]
-           (str c-name "("
-                (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args))
-                ")"))))
+         ;; Non-arithmetic deftm helper -> C helper invocation. Array-sym args are passed
+         ;; as the bare pointer (the helper takes a pointer + offset), not element access.
+         (let [c-name (str "gpufn_" (c-symbol sym))
+               emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
+                                  (c-symbol a)
+                                  (emit-expr a idx-sym array-syms opencl-idx)))]
+           (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
 
      ;; .invk typed dispatch on deftm helper -> check for devirtualized arithmetic
      (and (seq? expr) (= '.invk (first expr))
@@ -1056,24 +1169,33 @@
      (let [resolved-var (resolve-gpu-inlinable-var (second expr))
            var-name (str (:name (meta resolved-var)))
            args (nnext expr)
-           c-op (mangled-name->c-op var-name)]
+           ;; Metadata-first: the walker stamps the .invk form with its semantic op
+           ;; (:raster.op/original). Use it directly; fall back to mangled-name parsing.
+           c-op (or (when-let [op (:raster.op/original (meta expr))]
+                      (intrinsics/op->c-lowering op (= :glsl (:cast-style *emit-config*))))
+                    (mangled-name->c-op var-name))]
        (if c-op
          ;; Devirtualized arithmetic op -> emit native C operator/function
          (case (:kind c-op)
-           :infix (str "(" (str/join (str " " (:op c-op) " ")
-                                     (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
+           :infix (let [es (map #(emit-expr % idx-sym array-syms opencl-idx) args)]
+                    (if (= 1 (count es))
+                      ;; unary operator (e.g. negation `_minus__m_double`) — prefix
+                      ;; the operator; a str/join over one arg would drop it entirely.
+                      (str "(" (:op c-op) (first es) ")")
+                      (str "(" (str/join (str " " (:op c-op) " ") es) ")")))
            :fn    (str (:op c-op) "("
                        (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args)) ")")
            :floored-mod (let [ea (emit-expr (first args) idx-sym array-syms opencl-idx)
                               eb (emit-expr (second args) idx-sym array-syms opencl-idx)]
                           (str "((" ea " % " eb " + " eb ") % " eb ")")))
-         ;; Non-arithmetic deftm helper -> C helper invocation
+         ;; Non-arithmetic deftm helper -> C helper invocation (array-sym args as bare ptr).
          (let [base-sym (symbol (str (.-ns ^clojure.lang.Var resolved-var))
                                 (str (:name (meta resolved-var))))
-               c-name (str "gpufn_" (c-symbol base-sym))]
-           (str c-name "("
-                (str/join ", " (map #(emit-expr % idx-sym array-syms opencl-idx) args))
-                ")"))))
+               c-name (str "gpufn_" (c-symbol base-sym))
+               emit-arg (fn [a] (if (and (symbol? a) (contains? array-syms a))
+                                  (c-symbol a)
+                                  (emit-expr a idx-sym array-syms opencl-idx)))]
+           (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
 
      ;; deftm inlining: try to inline before generic function fallback
      (and (seq? expr) (symbol? (first expr)))
@@ -1081,8 +1203,15 @@
 
          ;; Unary function
          (when (= 2 (count expr))
-           (let [[op arg] expr]
-             (str (resolve-op op) "(" (emit-expr arg idx-sym array-syms opencl-idx) ")")))
+           (let [[op arg] expr
+                 arg-str (emit-expr arg idx-sym array-syms opencl-idx)]
+             (if (= "round" (get op-map op))
+               ;; Java Math.round / raster.math/round are half-UP, defined as
+               ;; floor(x + 0.5). C/OpenCL/WGSL round() round half AWAY FROM ZERO,
+               ;; which diverges on negative .5 values (round(-63.5) = -64 vs Java
+               ;; -63). Emit floor((x) + 0.5) for cross-backend-consistent half-up.
+               (str (resolve-op 'Math/floor) "((" arg-str ") + 0.5)")
+               (str (resolve-op op) "(" arg-str ")"))))
 
          ;; Binary function
          (when (= 3 (count expr))

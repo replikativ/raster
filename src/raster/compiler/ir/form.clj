@@ -337,6 +337,26 @@
   [form]
   (contains? #{:invk :call} (:kind (form-info form))))
 
+(defn tail-symbol
+  "The symbol an expression ultimately evaluates to via its tail position — follows
+   let*/loop*/do/if (else-first) to the value leaf. nil if the tail isn't a symbol.
+   Used by copy-propagation to recognise a binding that aliases another value even
+   through an effectful let*/loop* (e.g. r = (let* [..writes b..] b))."
+  [expr]
+  (cond
+    (symbol? expr) expr
+    (not (seq? expr)) nil
+    (contains? #{'let* 'let} (first expr)) (tail-symbol (last expr))
+    (contains? #{'loop* 'loop} (first expr)) (tail-symbol (nth expr 2 nil)) ; loop body
+    ;; raster.par/map! writes AND returns its out array (arg 1) → that IS its tail value,
+    ;; so a binding r = (par/map! out ..) aliases out (buffer-loop classification +
+    ;; copy-prop + result-buffer resolution), same as the expanded (let* ..out) form.
+    (= 'raster.par/map! (first expr)) (tail-symbol (second expr))
+    (= 'do (first expr)) (tail-symbol (last expr))
+    (= 'if (first expr)) (or (tail-symbol (nth expr 3 nil))   ; base/else first
+                             (tail-symbol (nth expr 2 nil)))
+    :else nil))
+
 (defn effective-op
   "Extract the effective operator symbol from any call expression.
    For (.invk impl-sym args...) returns impl-sym (the devirtualized op).

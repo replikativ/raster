@@ -738,6 +738,64 @@
                :aget-expr aget-expr
                :update-expr update-expr})))))))
 
+;; --- Dot-product (two-array widening) reduction ------------------------------
+;; A dot reduction folds `acc + (mul a[i] b[i])` over the index — the canonical
+;; shape that lowers to a hardware MAC: FMA-reduce (f64/f32), `vpdpbusd`/`maddubs`
+;; (int8 widening), `sdot` (ARM), `dp4a` (GPU). The reduction op + multiplicands
+;; arrive devirtualized as `(.invk impl …)` for `raster.numeric/+`/`*`, so we
+;; canonicalize through `semantic-op`/`call-args` rather than reading raw heads.
+
+(def ^:private canonical-add #{'+ 'clojure.core/+ 'raster.numeric/+})
+(def ^:private canonical-mul #{'* 'clojure.core/* 'raster.numeric/*})
+(def ^:private widening-casts
+  #{'double 'float 'int 'long
+    'clojure.core/double 'clojure.core/float 'clojure.core/int 'clojure.core/long})
+
+(defn- strip-widen
+  "A multiplicand term: a bare `(aget arr i)` or a widening-cast-wrapped one
+   `(long (aget arr i))`. Returns {:array sym :cast cast-fn|nil} or nil."
+  [expr idx-sym]
+  (if-let [arr (aget-form? expr idx-sym)]
+    {:array arr :cast nil}
+    (when (and (seq? expr)
+               (= 2 (count expr))
+               (contains? widening-casts (first expr)))
+      (when-let [arr (aget-form? (second expr) idx-sym)]
+        {:array arr :cast (first expr)}))))
+
+(defn match-dot-reduce-loop
+  "Matcher for two-array dot-product reduction loops:
+     (loop [acc init i 0]
+       (if (< i n) (recur (inc i) (+ acc (* a[i] b[i]))) acc))
+   where each multiplicand is an `aget` on the index, optionally widening-cast.
+   Backend-neutral: emission queries the per-target reduce-intrinsic table.
+   Returns {:op :mul-op :acc-sym :acc-init :index-sym :bound-expr
+            :array-a :array-b :cast-a :cast-b :update-expr} or nil."
+  [loop-form]
+  (when-let [{:keys [acc-sym acc-init index-sym update-expr bound-expr]}
+             (match-reduce-loop loop-form)]
+    (when (and (seq? update-expr)
+               (contains? canonical-add (descriptor/semantic-op update-expr)))
+      (let [[arg1 arg2] (descriptor/call-args update-expr)
+            prod (cond (acc-ref? arg1 acc-sym) arg2
+                       (acc-ref? arg2 acc-sym) arg1
+                       :else nil)]
+        (when (and prod (seq? prod)
+                   (contains? canonical-mul (descriptor/semantic-op prod)))
+          (let [[ma mb] (descriptor/call-args prod)
+                ta (strip-widen ma index-sym)
+                tb (strip-widen mb index-sym)]
+            (when (and ta tb)
+              {:op (descriptor/semantic-op update-expr)
+               :mul-op (descriptor/semantic-op prod)
+               :acc-sym acc-sym
+               :acc-init acc-init
+               :index-sym index-sym
+               :bound-expr bound-expr
+               :array-a (:array ta) :array-b (:array tb)
+               :cast-a (:cast ta) :cast-b (:cast tb)
+               :update-expr update-expr})))))))
+
 (defn match-scan-loop
   "Generic matcher for accumulation loops that also write each intermediate
 	accumulator state into an output array. Returns a structural descriptor or nil."

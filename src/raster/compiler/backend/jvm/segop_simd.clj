@@ -19,7 +19,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.scalar.dce :as dce]
-            [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as hw]
             [clojure.set]
             [clojure.walk]))
 
@@ -113,7 +113,7 @@
         (when-let [op (util/impl->op (second form))]
           (get op->canonical op)))))
 
-(defn- normalize-invk
+(defn normalize-invk
   "Rewrite (.invk impl args...) and qualified raster.*/raster.math/* forms
    to canonical (op args...) for SIMD.
    Uses :op metadata first, falls back to parsing mangled impl names.
@@ -188,7 +188,11 @@
     (+ j 5)              → 5
     (+ 3 (+ (* i n) j))  → (+ 3 (* i n))"
   [idx-expr idx-sym]
-  (when (and (seq? idx-expr) (= '+ (first idx-expr)) (= 3 (count idx-expr)))
+  ;; the additive head may be bare `+` OR `clojure.core/+`: per the index-math
+  ;; convention integer flat-array indices like (+ (* row n) col) stay clojure.core,
+  ;; so real kernels (the quant block index (+ wrow (* b 16)), nested-map bases) carry
+  ;; clojure.core/+ here — recognise both or their affine load sites collapse to scalar.
+  (when (and (seq? idx-expr) (contains? #{'+ 'clojure.core/+} (first idx-expr)) (= 3 (count idx-expr)))
     (let [a (second idx-expr)
           b (nth idx-expr 2)]
       (cond
@@ -641,10 +645,12 @@
 ;; ================================================================
 
 (defn- effective-n-accumulators
+  "SIMD-reduction accumulator count — now derived from the hardware descriptor via the
+  single policy (core.hardware/reduction-accumulators), not a local lanes check, so the
+  JVM reducer and the planner agree on the register-blocking facet."
   ([] (effective-n-accumulators :double))
   ([elem-type]
-   (try (hw/init!) (let [lanes (int (hw/simd-lanes :cpu:0 (or elem-type :double)))]
-                     (if (>= lanes 8) 8 4))
+   (try (hw/reduction-accumulators (hw/active-descriptor) (or elem-type :double))
         (catch Exception _ 4))))
 
 ;; ================================================================
