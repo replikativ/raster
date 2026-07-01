@@ -18,16 +18,29 @@
   (:require [raster.compiler.backend.jvm.segop-simd :as ss]
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.hardware :as hw]
             [clojure.string :as str]))
 
 ;; element keyword → intrinsics vector-facet element key
 (defn- vt-of [dtype] (case dtype :double :f64 :float :f32 :long :i32 :int :i32 nil))
 
-(def ^:private default-n-acc
-  "Independent vector accumulators to break the reduction dependency chain (hides
-   FMA latency). 4 matches the JVM segop_simd default; the hardware-descriptor
-   wiring (core.hardware/reduction-accumulators) replaces this constant later."
-  4)
+(defn active-isa
+  "The SIMD ISA facet key for the active hardware — the target-aware knob call sites
+   use instead of a literal :avx2. Returns :avx512 only when the descriptor is ≥512-bit
+   AND the intrinsics facet actually has that row; else :avx2 (the facet's populated ISA)."
+  []
+  (if (and (>= (long (:vector-bits (hw/active-descriptor) 256)) 512)
+           (get-in in/simd-isa [:avx512 :f32]))
+    :avx512 :avx2))
+
+(defn- n-accumulators
+  "Independent vector accumulators to hide FMA latency — the register-blocking policy
+   from core.hardware/reduction-accumulators (the ONE place it lives, shared with the
+   JVM segop_simd reducer), not a hard-coded constant."
+  [elem]
+  (try (hw/reduction-accumulators (hw/active-descriptor)
+                                  (case elem :f64 :double :f32 :float :double))
+       (catch Throwable _ 4)))
 
 ;; ---------------------------------------------------------------------------
 ;; Horizontal-reduce helpers (emitted once per compiled unit that uses them).
@@ -239,7 +252,7 @@
       (when (and ti vadd (or (nil? factors) vfma))
         (let [vt    (:vtype ti)
               lanes (:lanes ti)
-              nacc  default-n-acc
+              nacc  (n-accumulators elem)
               stride (* nacc lanes)
               accs  (mapv #(str "va" %) (range nacc))
               n-c   (ce/emit-expr bound nil array-syms "idx")

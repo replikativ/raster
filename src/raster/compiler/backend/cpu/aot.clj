@@ -339,7 +339,7 @@
                   (par/par-reduce-form? init)
                   (or (when-let [sr (par-reduce->segred init (get {"float" :float} ct :double))]
                         (when-let [{:keys [includes helpers block]}
-                                   (csimd/compile-segred-c sr :avx2 array-syms sym)]
+                                   (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
                           (when *simd-preamble* (swap! *simd-preamble* conj (str includes helpers)))
                           (str ct " " (ce/c-symbol sym) ";\n  " block)))
                       (let [scalar (par/expand-par-reduce init)]
@@ -361,7 +361,7 @@
     ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
     (and (seq? form) (par/par-map-form? form))
     (or (when-let [sm (par-map->segmap form (get {"float" :float} ct :double))]
-          (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm :avx2 array-syms)]
+          (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm (csimd/active-isa) array-syms)]
             (when *simd-preamble* (swap! *simd-preamble* conj includes))
             block))
         (ce/emit-stmt (par/expand-par-map! form) nil array-syms "idx"))
