@@ -169,7 +169,15 @@
                                 (println "WARNING: walker re-walk failed for" f-var
                                          "- falling back to pre-walked body:" (.getMessage t)))
                               nil))]
-            walked))
+            ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
+            ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
+            ;; conflates the op's input and freshly-allocated output buffer in
+            ;; materialize/buffer analysis (the output alloc reuses `x`, so the
+            ;; body's read of `x` hits the uninitialized output). Distinct names
+            ;; remove the hazard; non-shadowing bindings are untouched.
+            (when walked
+              (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
+                (mapv #(util/uniquify-rebindings param-syms %) walked)))))
         ;; Fallback: use pre-walked body from definition time or lazy walk
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
