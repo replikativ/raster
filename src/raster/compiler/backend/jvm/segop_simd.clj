@@ -80,8 +80,12 @@
 ;; SegOp field accessors
 ;; ================================================================
 
-(defn seg-idx [segop] (-> segop :space :dims first :name))
-(defn seg-bound [segop] (-> segop :space :dims first :bound))
+;; The vectorized loop iterates the INNERMOST (reduced/mapped) dim. For a 1-D
+;; space this is `first` (unchanged); for an N-D segmented space the outer
+;; segment dims are iterated separately (see compile-segred). Route through the
+;; canonical positional accessor so the convention lives in one place.
+(defn seg-idx [segop] (:name (segop/seg-space-reduced-dim (:space segop))))
+(defn seg-bound [segop] (:bound (segop/seg-space-reduced-dim (:space segop))))
 
 ;; ================================================================
 ;; Normalize .invk forms to canonical ops for SIMD

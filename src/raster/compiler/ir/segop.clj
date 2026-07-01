@@ -133,7 +133,43 @@
                                          (list '/ (list 'double n-expr) (double block-size)))))]
     (->KernelGrid grid-expr block-size shared-mem)))
 
+(defn make-seg-space-nd
+  "Create an N-D SegSpace from an ordered [{:name sym :bound expr} ...] vector,
+  OUTER→INNER (Futhark convention). Segmentation is positional: for a segmented
+  reduce/map the INNERMOST dim is the reduced/mapped axis and all outer dims are
+  segments. A 1-D space is the degenerate single-dim case."
+  [dims-vec]
+  (->SegSpace (gensym "tid_") (vec dims-vec)))
+
 (defn make-seg-space
   "Create a SegSpace for a 1D problem."
   [idx-sym bound-expr]
-  (->SegSpace (gensym "tid_") [{:name idx-sym :bound bound-expr}]))
+  (make-seg-space-nd [{:name idx-sym :bound bound-expr}]))
+
+;; --- Positional dim accessors (single source of the Futhark convention) ---
+(defn seg-space-dims [space] (:dims space))
+
+(defn seg-space-1d?
+  "True when the space has a single dimension (the current/degenerate case)."
+  [space]
+  (= 1 (count (:dims space))))
+
+(defn seg-space-reduced-dim
+  "The innermost (reduced/mapped) dim — {:name :bound}. This is what the 1-D
+  consumers historically read as `(-> :space :dims first)`."
+  [space]
+  (last (:dims space)))
+
+(defn seg-space-segment-dims
+  "The outer (segment) dims — all but the innermost. Empty vector for a 1-D space."
+  [space]
+  (vec (butlast (:dims space))))
+
+(defn seg-space-num-segments-expr
+  "Expr for the number of segments = product of the outer dim bounds; 1 (int) for
+  a 1-D space."
+  [space]
+  (let [segs (seg-space-segment-dims space)]
+    (if (empty? segs)
+      1
+      (reduce (fn [acc d] (list '* acc (:bound d))) (:bound (first segs)) (rest segs)))))
