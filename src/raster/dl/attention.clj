@@ -739,21 +739,36 @@
   per row (max → exp → sum → normalize). Scale is assumed already folded into the
   values (via the QK^T GEMM alpha). Parametric; float-pure."
   (All [T] [x :- (Array T) rows :- Long cols :- Long] :- (Array T)
-    (dotimes [r rows]
-      (let [off (* r (int cols))
-            mx (loop [j 0 m (n/neg-inf-val (aget x off))]
-                 (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
-        ;; Pure exp-map (separate from the sum) so it lifts to a vectorized
-        ;; SegMap under compile-aot: m/exp lowers to VectorOperators/EXP (SVML).
-        ;; Fused with the sum-reduce it would stay a scalar loop-carried loop.
-        (dotimes [j cols]
-          (aset x (+ off j) (fast-exp (- (aget x (+ off j)) mx))))
-        (let [sm (loop [j 0 s 0.0]
-                   (if (< j cols) (recur (inc j) (+ s (aget x (+ off j)))) s))
-              inv (/ 1.0 sm)]
-          (dotimes [j cols]
-            (aset x (+ off j) (* (aget x (+ off j)) inv))))))
-    x))
+    (let [n (* rows (int cols))
+          ;; per-row max → broadcast to per-element (cheap, memory-bound scalar)
+          maxes (alloc-like x n)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    mx (loop [j 0 m (n/neg-inf-val (aget x off))]
+                         (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
+                (dotimes [j cols] (aset maxes (+ off j) mx))))
+          ;; VECTORIZED exp = exp(x - max): a flat `broadcast` (recognized par
+          ;; form → SIMD-vectorized SegMap under compile-aot) with the fast-exp
+          ;; polynomial INLINED (e^(v/1024)^1024, deg-6 Taylor + 10 squarings;
+          ;; only +/* → a pure FMA/mul lane chain). A raw nested dotimes here
+          ;; stays scalar; a deftm call stays opaque; SVML EXP is not intrinsified.
+          e (broadcast [x maxes]
+              (let [v (- x maxes) t (* v 9.765625E-4)
+                    a (+ 0.008333334 (* t 0.0013888889)) b (+ 0.041666668 (* t a))
+                    c (+ 0.16666667 (* t b)) d (+ 0.5 (* t c))
+                    ee (+ 1.0 (* t d)) f (+ 1.0 (* t ee))
+                    p1 (* f f) p2 (* p1 p1) p3 (* p2 p2) p4 (* p3 p3) p5 (* p4 p4)
+                    p6 (* p5 p5) p7 (* p6 p6) p8 (* p7 p7) p9 (* p8 p8) p10 (* p9 p9)]
+                p10))
+          ;; per-row sum of e, normalize back into x (cheap, memory-bound scalar)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    s (loop [j 0 acc 0.0]
+                        (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
+                    inv (/ 1.0 s)]
+                (dotimes [j cols]
+                  (aset x (+ off j) (* (aget e (+ off j)) inv)))))]
+      x)))
 
 ;; Batched multi-head attention: composed from the layout/GEMM/softmax
 ;; combinators (pack-heads → batched QK^T with scale folded → fused row-softmax →
