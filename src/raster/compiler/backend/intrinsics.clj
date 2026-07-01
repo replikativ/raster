@@ -76,6 +76,11 @@
    :log {:arity 1 :kind :fn :wasm :poly :c {:fn "log"} :wgsl {:fn "log"}}
    :pow {:arity 2 :kind :fn :wasm :poly :c {:fn "pow"} :wgsl {:fn "pow"}}
    :fma {:arity 3 :kind :fn :wasm :poly :c {:fn "fma"} :wgsl {:fn "fma"}}
+   ;; widening int8 multiply-accumulate: int8×int8 → int32 lane accumulate. The
+   ;; ONE canonical quant primitive; scalar :c is a plain int-widening mul-add,
+   ;; the vector lowering is a fixed intrinsic SEQUENCE per ISA (AVX2
+   ;; maddubs→madd→add, wasm i32x4.dot_i16x8_s, GPU dp4a) — see simd-widen below.
+   :wi8-dot {:arity 2 :kind :widening-mac :wasm {:i32 :i32x4.dot-i16x8-s}}
    ;; broader elementary set — all wasm via composition/polynomial (see
    ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
    ;; omitted → GPU keeps its generated-helper fallback, no regression).
@@ -124,7 +129,7 @@
    "cbrt" :cbrt "log2" :log2 "log10" :log10 "exp2" :exp2 "exp10" :exp10
    "expm1" :expm1 "log1p" :log1p "hypot" :hypot "deg2rad" :deg2rad "rad2deg" :rad2deg
    "clamp" :clamp "signum" :signum "copysign" :copysign "copySign" :copysign
-   "flipsign" :flipsign})
+   "flipsign" :flipsign "wi8-dot" :wi8-dot})
 
 ;; mangled devirtualized prefix → canonical key (e.g. _plus__m_double_double)
 (def ^:private mangled-prefix->key
@@ -197,3 +202,74 @@
     ;; function name (sqrt, via name->key in descriptor).
     (let [prefix (subs mangled-name 0 i)]
       (desc->c-shape (descriptor (or (mangled-prefix->key prefix) prefix)) glsl?))))
+
+;; ---------------------------------------------------------------------------
+;; Vector (SIMD) facet — the lane-parallel analog of the :c facet, for the
+;; explicit CPU-C SIMD emitter (emit-c-vexpr). Two parts, mirroring the JVM
+;; segop_simd split (per-type scaffolding vs per-op VectorOperators):
+;;   simd-isa    per-ELEMENT-TYPE scaffolding (vector ctype, lane count, and the
+;;               broadcast/load/store/zero intrinsics) keyed by ISA → elem.
+;;   simd-ops    per-OP lanewise intrinsic spelling keyed by ISA → op → elem.
+;;   simd-widen  the widening int8-MAC intrinsic SEQUENCE (int8×int8→int32),
+;;               keyed by ISA — the :wi8-dot canonical op's vector lowering.
+;; ISA is the target-aware knob (:avx2 8×f32 / :avx512 16×f32 / :neon 4×f32),
+;; selected from core.hardware's HardwareDescriptor — never hardcoded at a call
+;; site. An absent facet = op/type not vectorizable on that ISA, so the caller
+;; keeps the scalar loop (a clear gap, never a silent miscompile).
+;;
+;; NOTE: op_descriptor's simd-*-ops (the JVM :jvm-vector spelling) are NOT folded
+;; in here yet — that convergence retires the duplicate JVM/GPU/wasm recognizers
+;; and is the LAST cleanup step (#27 step 5'); keeping this purely additive now.
+;; ---------------------------------------------------------------------------
+
+(def simd-isa
+  {:avx2
+   {:f64 {:vtype "__m256d" :lanes 4 :set1 "_mm256_set1_pd" :loadu "_mm256_loadu_pd"
+          :storeu "_mm256_storeu_pd" :setzero "_mm256_setzero_pd"}
+    :f32 {:vtype "__m256"  :lanes 8 :set1 "_mm256_set1_ps" :loadu "_mm256_loadu_ps"
+          :storeu "_mm256_storeu_ps" :setzero "_mm256_setzero_ps"}
+    ;; int32 lanes — the accumulator type for the widening int8-MAC
+    :i32 {:vtype "__m256i" :lanes 8 :set1 "_mm256_set1_epi32" :loadu "_mm256_loadu_si256"
+          :storeu "_mm256_storeu_si256" :setzero "_mm256_setzero_si256"}}})
+
+(def ^:private simd-ops
+  {:avx2
+   {:+   {:f64 "_mm256_add_pd" :f32 "_mm256_add_ps" :i32 "_mm256_add_epi32"}
+    :-   {:f64 "_mm256_sub_pd" :f32 "_mm256_sub_ps" :i32 "_mm256_sub_epi32"}
+    :*   {:f64 "_mm256_mul_pd" :f32 "_mm256_mul_ps"}
+    :div {:f64 "_mm256_div_pd" :f32 "_mm256_div_ps"}
+    :min {:f64 "_mm256_min_pd" :f32 "_mm256_min_ps"}
+    :max {:f64 "_mm256_max_pd" :f32 "_mm256_max_ps"}
+    :sqrt {:f64 "_mm256_sqrt_pd" :f32 "_mm256_sqrt_ps"}
+    ;; a·b+c fused; only where the ISA has a true FMA (AVX2 implies FMA3)
+    :fma {:f64 "_mm256_fmadd_pd" :f32 "_mm256_fmadd_ps"}}})
+
+(def ^:private simd-widen
+  "Widening int8-MAC (:wi8-dot) vector lowering per ISA. On AVX2 it is the
+   maddubs→madd→add sequence: uint8×int8 pairwise → int16, adjacent int16 → int32,
+   accumulate into the int32 lane accumulator (:acc)."
+  {:avx2 {:mul "_mm256_maddubs_epi16" :widen "_mm256_madd_epi16" :acc "_mm256_add_epi32"
+          :ones "_mm256_set1_epi16"}})
+
+(defn simd-type-info
+  "Per-element-type SIMD scaffolding for an ISA — the vector ctype, lane count,
+   and set1/loadu/storeu/setzero intrinsic names — or nil if unsupported."
+  [isa elem]
+  (get-in simd-isa [isa elem]))
+
+(defn simd-lanes
+  "SIMD lane count for element type elem on isa (8 for f32/AVX2, 4 for f64), or nil."
+  [isa elem]
+  (:lanes (simd-type-info isa elem)))
+
+(defn simd-op
+  "Lanewise vector intrinsic name for op at element type elem on isa, or nil if the
+   op has no vector lowering there (caller keeps the scalar loop). op is any form
+   accepted by `canonical` (symbol/string/keyword)."
+  [isa op elem]
+  (get-in simd-ops [isa (canonical op) elem]))
+
+(defn simd-widen-seq
+  "The widening int8-MAC intrinsic sequence for isa (:mul/:widen/:acc/:ones), or nil."
+  [isa]
+  (get simd-widen isa))
