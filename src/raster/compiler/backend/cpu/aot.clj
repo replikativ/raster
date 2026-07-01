@@ -20,10 +20,36 @@
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.scalar.peephole :as peephole]))
+
+(def ^:dynamic *simd-preamble*
+  "When bound to an atom (by emit-c-fn), accumulates C preamble strings (immintrin
+   include + horizontal-reduce helpers) contributed by emitted C-SIMD blocks, so
+   the file header can prepend them exactly once."
+  nil)
+
+(defonce ^:private segop-id (atom 0))
+
+(defn- par-reduce->segred
+  "Build a SegRed from a raster.par/reduce form exactly as par_simd does
+   (extract-par-reduce-info → par-form->soac → lower-soac), so the C-SIMD emitter
+   consumes the SAME record the JVM path does. dtype is the kernel element type
+   (fallback when the form carries no :elem-type). nil on any failure."
+  [form dtype]
+  (try
+    (let [pi  (par/extract-par-reduce-info form)
+          dt  (or (:elem-type pi) dtype)
+          sym (gensym "red_")
+          sc  (soac/par-form->soac sym form (swap! segop-id inc))]
+      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
+    (catch Exception _ nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -33,7 +59,7 @@
   "Run compile-aot's forward passes with the SCALAR backend (no SIMD lowering)
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
-  [f-var dtype]
+  [f-var dtype & {:keys [simd?] :or {simd? false}}]
   (let [gwb   @#'pl/get-walked-body
         gp    @#'pl/get-params
         bpe   @#'pl/build-param-env
@@ -42,7 +68,10 @@
         params (gp f-var dtype)
         raw   (if (= 1 (count wb)) (first wb) (list* 'do wb))
         source-ns (or (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
-        opts  {:inline? true :simd? false :dtype dtype
+        ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
+        ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
+        ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
+        opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
                :active-params (cp params)
                :param-env (bpe f-var dtype)
                :source-ns source-ns}]
@@ -285,10 +314,24 @@
         (str (clojure.string/join
               "\n  "
               (for [[sym init] pairs]
-                (if (buffer-loop? init)
+                (cond
+                  (buffer-loop? init)
                   ;; buffer-writing loop / nested compute — emit for side effects.
                   (emit-host-stmt init array-syms ct)
+                  ;; a preserved par/reduce → C-SIMD block (or scalar fallback). Build
+                  ;; the SAME SegRed the JVM path uses and hand it to csimd; on nil
+                  ;; (not vectorizable) expand to the scalar loop and emit normally.
+                  (par/par-reduce-form? init)
+                  (or (when-let [sr (par-reduce->segred init (get {"float" :float} ct :double))]
+                        (when-let [{:keys [includes helpers block]}
+                                   (csimd/compile-segred-c sr :avx2 array-syms sym)]
+                          (when *simd-preamble* (swap! *simd-preamble* conj (str includes helpers)))
+                          (str ct " " (ce/c-symbol sym) ";\n  " block)))
+                      (let [scalar (par/expand-par-reduce init)]
+                        (str (ce/decl-type scalar) " " (ce/c-symbol sym) " = "
+                             (emit-expr* scalar array-syms) ";")))
                   ;; value binding (scalar or reduction) — declare with its tag type.
+                  :else
                   (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
                        (emit-expr* init array-syms) ";"))))
              "\n  "
@@ -376,14 +419,17 @@
         int-seed (set (concat (map first (filter (fn [[_ c]] (contains? #{"int" "long"} c))
                                                  scalar-params))
                               (vals length-syms)))
+        simd-pre (atom #{})
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct
-                         ce/*int-vars* int-seed]
+                         ce/*int-vars* int-seed
+                         *simd-preamble* simd-pre]
                  (emit-host-stmt stripped array-syms ct))
         ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
         ;; which lowers to a maddubs helper via its :c-helper override).
         [helper-incs helper-defs] (helper-c-defs stripped)]
     (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
+         (apply str @simd-pre)   ; immintrin + hsum helpers, if any C-SIMD block emitted
          helper-incs
          (when (seq helper-defs) (str helper-defs "\n"))
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
@@ -455,9 +501,12 @@
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
-  the native code (zero-copy), and returns the result buffer."
-  [f-var dtype]
-  (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype)
+  the native code (zero-copy), and returns the result buffer.
+
+  With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
+  __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
+  [f-var dtype & {:keys [simd?] :or {simd? false}}]
+  (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype :simd? simd?)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding

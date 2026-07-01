@@ -101,13 +101,16 @@
 
 (defn compile-segred-c
   "SegRed → a C statement block (string) that assigns the reduction result to the
-   caller-declared accumulator variable named by `(:acc reduce-op)`. Returns
-   {:includes :helpers :block} or nil if not vectorizable (caller keeps scalar).
-   The block is self-contained (own `{ }` scope) except for the outer acc var.
-   `array-syms` is the set of array symbols in scope (for c-emit of index exprs)."
-  [segred isa array-syms]
-  (when-let [{:keys [idx bound acc init elem-expr factors]} (reduction-plan segred)]
-    (let [elem (vt-of (:dtype segred))
+   caller-declared variable `target` (a symbol; defaults to the reduce-op's acc).
+   Returns {:includes :helpers :block} or nil if not vectorizable (caller keeps
+   scalar). The block is self-contained (own `{ }` scope) except for the outer
+   target var. `array-syms` is the set of array symbols in scope (for c-emit of
+   index exprs)."
+  ([segred isa array-syms] (compile-segred-c segred isa array-syms nil))
+  ([segred isa array-syms target]
+   (when-let [{:keys [idx bound acc init elem-expr factors]} (reduction-plan segred)]
+    (let [acc (ce/c-symbol (or target acc))
+          elem (vt-of (:dtype segred))
           ti   (in/simd-type-info isa elem)
           vadd (in/simd-op isa :+ elem)
           vfma (in/simd-op isa :fma elem)]
@@ -160,4 +163,4 @@
                 "  " vt " _vc = " combine ";\n"
                 "  " acc " = (" init ") + " hsum "(_vc);\n"
                 "  for (; j < _n; j++) " acc " = " acc " + (" tail-elem ");\n"
-                "}")})))))
+                "}")}))))))

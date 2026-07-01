@@ -624,9 +624,13 @@
   Returns {:form :stats :cuda-result :kernels}."
   [form opts]
   (let [target-device (:target-device opts)
-        simd? (:simd? opts true)
-        backend (device/select-runtime-backend target-device simd? nil)]
-    (case backend
+        simd? (:simd? opts true)]
+    (if (:keep-par-forms? opts)
+      ;; CPU-C SIMD path: leave par/map!/par/reduce forms INTACT (neither scalarize
+      ;; nor JVM-Vector-API lower) so the monolithic C backend can consume the same
+      ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
+      {:form (strip-compound-markers form) :stats nil :backend :par-preserve}
+      (case (device/select-runtime-backend target-device simd? nil)
       :cuda
       (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
@@ -643,7 +647,7 @@
         {:form form :stats stats :backend :simd})
 
       ;; :scalar
-      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar})))
+      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.

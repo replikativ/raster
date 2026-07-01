@@ -11,7 +11,7 @@
    - index arithmetic bound to a name (base = b*32) typed long, not float
    - Math/round half-up semantics (floor(x+0.5)) matching Java on negative .5"
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.core :refer [deftm]]
+            [raster.core :refer [deftm reduce!]]
             [raster.numeric :as rn]
             [raster.arrays :as ra]
             [raster.math]
@@ -125,3 +125,38 @@
             [cq _] (cfn x 2)]
         (is (= (seq rq) (seq cq))
             "no off-by-one from round-half-away-from-zero on negatives")))))
+
+;; ---- #27: explicit C-SIMD reduction (compile-aot-c :simd? true) ----
+
+;; rms-norm with the variance reduction expressed as a reduce! SOAC (par/reduce),
+;; so :simd? true PRESERVES it and emits an AVX2 __m256 FMA loop (via csimd)
+;; instead of a scalar loop left to clang auto-vec. Array output + reduction
+;; intermediate = the real target shape (rms-norm / quant-GEMV).
+(deftm rmsnorm-red [x :- (Array double) w :- (Array double) n :- Long eps :- Double] :- (Array double)
+  (let [out (clojure.core/double-array n)
+        s (reduce! [acc 0.0] [x] (rn/+ acc (rn/* x x)))
+        ms (rn// s (double n))
+        inv (rn// 1.0 (rn/sqrt (rn/+ ms eps)))]
+    (dotimes [i n] (ra/aset out i (rn/* (rn/* (ra/aget x i) inv) (ra/aget w i))))
+    out))
+
+(deftest cpu-c-simd-reduction
+  (when (clang-available?)
+    (testing ":simd? true emits an __m256 FMA reduction and matches the scalar path + interpreter"
+      (let [f-simd (aot/compile-aot-c #'rmsnorm-red :double :simd? true)
+            f-scal (aot/compile-aot-c #'rmsnorm-red :double)]
+        (is (re-find #"_mm256_fmadd_pd" (:c-source (meta f-simd)))
+            ":simd? true lowers the reduce! to a vector FMA loop")
+        (is (not (re-find #"_mm256_fmadd_pd" (:c-source (meta f-scal))))
+            ":simd? false stays scalar (clang auto-vec only)")
+        (doseq [n [16 64 257 1000]]
+          (let [eps 1.0e-6
+                x (double-array (map #(clojure.core/- (/ (double %) 9.0) 3.0) (range n)))
+                w (double-array (repeat n 1.3))
+                ref (rmsnorm-red x w n eps)
+                os  (f-simd x w n eps)
+                oc  (f-scal x w n eps)]
+            (is (every? true? (map #(< (Math/abs (clojure.core/- %1 %2)) 1e-9) os ref))
+                (str "n=" n " simd == interpreter"))
+            (is (every? true? (map #(< (Math/abs (clojure.core/- %1 %2)) 1e-9) os oc))
+                (str "n=" n " simd == scalar-C"))))))))
