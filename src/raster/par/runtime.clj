@@ -19,6 +19,12 @@
   BLAS threads (OPENBLAS_NUM_THREADS)."
   nil)
 
+(def ^:dynamic *par-min-size*
+  "Cost-model gate: parallel-for! runs SEQUENTIALLY when n < this, so small
+  segment loops never pay thread-dispatch overhead (Futhark's parallel/sequential
+  twin, decided at RUNTIME — never a user/compile decision). Tune per machine."
+  8192)
+
 (defn- default-threads ^long []
   (.availableProcessors (Runtime/getRuntime)))
 
@@ -38,7 +44,7 @@
   [n body-fn]
   (let [n (long n)
         p (long (or *par-threads* (default-threads)))]
-    (if (or (<= p 1) (<= n 1))
+    (if (or (<= p 1) (<= n 1) (< n (long *par-min-size*)))
       (do (body-fn 0 n) nil)
       (let [chunk (long (quot (+ n (dec p)) p))          ; ceil(n/p)
             tasks (ArrayList.)]
