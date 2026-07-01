@@ -188,7 +188,11 @@
     (+ j 5)              → 5
     (+ 3 (+ (* i n) j))  → (+ 3 (* i n))"
   [idx-expr idx-sym]
-  (when (and (seq? idx-expr) (= '+ (first idx-expr)) (= 3 (count idx-expr)))
+  ;; the additive head may be bare `+` OR `clojure.core/+`: per the index-math
+  ;; convention integer flat-array indices like (+ (* row n) col) stay clojure.core,
+  ;; so real kernels (the quant block index (+ wrow (* b 16)), nested-map bases) carry
+  ;; clojure.core/+ here — recognise both or their affine load sites collapse to scalar.
+  (when (and (seq? idx-expr) (contains? #{'+ 'clojure.core/+} (first idx-expr)) (= 3 (count idx-expr)))
     (let [a (second idx-expr)
           b (nth idx-expr 2)]
       (cond

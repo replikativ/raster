@@ -300,7 +300,10 @@
         (str "for (int " (ce/c-symbol iv) " = " (emit-expr* init array-syms) "; "
              (emit-expr* test array-syms) "; "
              (ce/c-symbol iv) " = " (emit-expr* step array-syms) ") {\n    "
-             (clojure.string/join "\n    " (map #(ce/emit-stmt % nil array-syms "idx") do-stmts))
+             ;; recurse with emit-host-stmt (not ce/emit-stmt) so par/map!|par/reduce
+             ;; nested INSIDE a counted loop (e.g. the quant block-loop's column fold)
+             ;; reach the csimd SIMD path; plain stmts still fall through to ce/emit-stmt.
+             (clojure.string/join "\n    " (map #(emit-host-stmt % array-syms ct) do-stmts))
              "\n  }")))
 
     (and (seq? form) (= 'let* (first form)))
