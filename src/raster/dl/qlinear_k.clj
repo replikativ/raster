@@ -8,7 +8,8 @@
   Weight matrix [out×in] is quantized per-row (each row independent); for in a multiple of
   256 each row spans whole super-blocks, so the flat per-row arrays index as (row, block)."
   (:require [raster.core :refer [deftm]]
-            [raster.arrays :as ra]))
+            [raster.arrays :as ra]
+            [raster.dl.qlinear-composable :as qc]))
 
 (deftm qmatmul-q4k-composable!
   "Q4_K GEMV into y[o] for o in [o-start, o-start+o-count): per super-block
@@ -34,13 +35,10 @@
                                    (let [base (+ sbase (* j 32)) sidx (+ (* sb 8) j)
                                          aj (* dav (long (ra/aget aq (+ subb sidx))))
                                          bj (* dbv (long (ra/aget bq (+ subb sidx))))
-                                         dp (loop [k 0 d 0]
-                                              (if (< k 16)
-                                                (let [bv (bit-and (long (ra/aget wq (+ wb (quot base 2) k))) 0xFF)]
-                                                  (recur (inc k)
-                                                         (+ d (* (bit-and bv 0xF) (long (ra/aget xq (+ base k))))
-                                                            (* (bit-shift-right bv 4) (long (ra/aget xq (+ base k 16)))))))
-                                                d))]
+                                         ;; the int8-MAC seam — the SHARED primitive (nibble×int8 dot
+                                         ;; over one 32-element block), lowered per backend (maddubs
+                                         ;; on CPU-C via register-c-helper!, dp4a on GPU, …)
+                                         dp (qc/wi8-dot-q4 wq (+ wb (quot base 2)) xq base)]
                                      (recur (inc j) (+ s (* aj (double dp)) (* bj (double (ra/aget bsums sidx))))))
                                    s))]
                       (recur (inc sb) (+ a (* dact ssum))))
@@ -68,12 +66,9 @@
                                  (if (< j 16)
                                    (let [base (+ sbase (* j 16)) sidx (+ (* sb 16) j)
                                          scj (long (ra/aget sc (+ subb sidx)))
-                                         dp (loop [k 0 d 0]
-                                              (if (< k 16)
-                                                (recur (inc k)
-                                                       (+ d (* (bit-and (long (ra/aget wq (+ wb base k))) 0xFF)
-                                                               (long (ra/aget xq (+ base k))))))
-                                                d))
+                                         ;; the int8-MAC seam — the SHARED pure primitive
+                                         ;; (unsigned-byte × int8 dot over the 16-elem sub-block)
+                                         dp (qc/wi8-dot wq (+ wb base) xq base 16)
                                          folded (- dp (* 32 (long (ra/aget bsums sidx))))]
                                      (recur (inc j) (+ s (* scj (double folded)))))
                                    s))]

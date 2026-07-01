@@ -44,6 +44,21 @@
                     (* (long (ra/aget xq (+ xoff k 16))) (bit-shift-right bv 4)))))
       s)))
 
+(deftm wi8-dot
+  "The pure int8-MAC seam over one `len`-element block: unsigned-byte weight × signed
+  int8 activation → raw int32 dot. The direct (no-unpack) sibling of wi8-dot-q4, used by
+  byte-direct formats (Q6_K's already-unpacked 6-bit-in-a-byte, Q8_0). Inlinable so clang
+  auto-vectorizes the fused loop (competitive with hand VNNI, cf. #17); an explicit
+  maddubs/dpbusd ^:no-inline lowering (like wi8-dot-q4's) is a perf option if a benchmark
+  shows autovec leaving cycles on the table."
+  [wq :- (Array byte), woff :- Long, xq :- (Array byte), xoff :- Long, len :- Long] :- Long
+  (loop [k 0 s 0]
+    (if (< k (long len))
+      (recur (inc k)
+             (+ s (* (bit-and (long (ra/aget wq (+ woff k))) 0xFF)
+                     (long (ra/aget xq (+ xoff k))))))
+      s)))
+
 (deftm ^:no-inline wi8-dot-q4-x8
   "The 8-column int8-MAC TILE over one Q4_0 block in the repack-stream interleaved
   layout — the tile-level tensorize seam. Reads the 128 interleaved weight bytes for
