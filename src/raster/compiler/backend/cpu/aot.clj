@@ -350,9 +350,17 @@
    - length-syms  : {arr len-sym} integer length params for (alength arr)
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
-  [kernel-name dtype array-params scalar-params buffers length-syms stripped]
+  [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
-        array-syms (set (concat (map first array-params) (map first buffers)))
+        array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
+        ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted
+        ;; as LOCAL C arrays (not heap params), so clang can scalar-replace them into
+        ;; registers — the difference between a memory round-trip per loop iteration and a
+        ;; register-resident accumulator (the ~4x quant-GEMV codegen gap).
+        ;; zero-init (= {0}) preserves Clojure array semantics (heap arrays are zeroed);
+        ;; clang elides it when the array is fully written before read.
+        local-decls (apply str (for [[s size elem] local-buffers]
+                                  (str (elem->ctype elem "double") " " (ce/c-symbol s) "[" size "] = {0};\n  ")))
         ;; array params that the body writes (aset target) are in-place OUTPUT params —
         ;; emit them non-const; read-only input arrays stay const.
         written (written-array-syms stripped)
@@ -379,6 +387,7 @@
          helper-incs
          (when (seq helper-defs) (str helper-defs "\n"))
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
+         local-decls
          body-c
          "\n}\n")))
 
@@ -420,6 +429,29 @@
   (case elem :double (double-array n) :float (float-array n)
         :long (long-array n) :int (int-array n) :byte (byte-array n)))
 
+(def ^:private sroa-local-max
+  "Max compile-time-constant buffer length emitted as a C-local (register-promotable)
+   scratch array rather than a heap param. Small per-call accumulators/tiles (e.g. the
+   8-wide quant column dots) belong in registers; larger buffers stay hoisted heap."
+  256)
+
+(defn- const-int-size
+  "Resolve a buffer size to a compile-time integer, seeing through the walker's
+   (long N)/(int N) literal wrappers; nil if not a compile-time constant."
+  [size]
+  (cond
+    (integer? size) (long size)
+    (and (seq? size) (#{'long 'int} (first size)) (integer? (second size))) (long (second size))
+    :else nil))
+
+(defn- local-scratch-size
+  "If a buffer is small compile-time-constant scratch (not a returned result), its
+   resolved integer size; else nil. Such buffers become C-locals (register-promotable)
+   instead of heap params."
+  [result-set [sym size _elem]]
+  (when-let [n (const-int-size size)]
+    (when (and (<= n sroa-local-max) (not (contains? result-set sym))) n)))
+
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
@@ -445,13 +477,23 @@
         scalar-ffm (vec (concat (map (fn [[_ c]] (ctype->ffm c "int")) scalar-params)
                                 (repeat (count len-order) :int)))
         kernel-name (str "aot_" (ce/c-symbol (:name (meta f-var))) "_" (name dtype))
-        src (emit-c-fn kernel-name dtype array-params scalar-params buffers length-syms stripped)
+        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
+        ;; SROA partition: small fixed-size non-result scratch buffers → C-locals (kept
+        ;; out of the signature so clang register-promotes them); the rest stay heap.
+        result-set    (set result-syms)
+        ;; local-buffers carry the RESOLVED integer size (for the C `[N]` decl)
+        local-buffers (into [] (keep (fn [[sym _ elem :as buf]]
+                                       (when-let [n (local-scratch-size result-set buf)]
+                                         [sym n elem]))
+                                     buffers))
+        local-set     (set (map first local-buffers))
+        heap-buffers  (filterv #(not (local-set (first %))) buffers)
+        src (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers length-syms stripped)
         so  (cpu/compile-source! src)
         native (cpu/load-kernel so kernel-name
-                                (+ (count array-params) (count buffers))
+                                (+ (count array-params) (count heap-buffers))
                                 scalar-ffm)
-        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
-        buf-syms (mapv first buffers)
+        buf-syms (mapv first heap-buffers)
         ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
         ;; backend uses) — keyed by the resolved size signature, so repeated
         ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
@@ -470,11 +512,11 @@
                             (if-let [v (try (resolve-int-expr init m) (catch Exception _ nil))]
                               (assoc m sym v) m))
                           len-env scalar-bindings)
-              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) buffers)
+              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) heap-buffers)
               c @cache
               buf-arrs (if (and c (= (:sizes c) sizes))
                          (:bufs c)
-                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) buffers sizes)]
+                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) heap-buffers sizes)]
                            (vreset! cache {:sizes sizes :bufs b}) b))
               in-arrs  (map (comp base-env first) array-params)
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)
