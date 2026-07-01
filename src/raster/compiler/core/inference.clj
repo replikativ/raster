@@ -713,6 +713,18 @@
               ;; Promotion failed — accept the abstract fallback if it exists
               (when exact {:entry exact})))))))
 
+(defn- parametric-template-registered?
+  "True when a parametric (All [T]) template is registered for `fn-sym` (bare or
+  namespace-qualified). Used to decide whether a specialization failure is a real
+  hazard worth surfacing vs an expected speculative miss on a non-parametric fn."
+  [fn-sym]
+  (boolean
+   (when-let [reg (requiring-resolve 'raster.compiler.core.dispatch/parametric-registry)]
+     (let [m @@reg
+           fq (when-let [v (resolve fn-sym)]
+                (symbol (str (:ns (meta v))) (str (:name (meta v)))))]
+       (or (get m fn-sym) (and fq (get m fq)))))))
+
 (defn try-parametric-specialize!
   "When a concrete dispatch entry is not found but a parametric template exists,
   trigger specialization and return the new entry. This is the Julia model:
@@ -737,14 +749,47 @@
       (when (and (every? some? fake-args) try-pd)
         (try
           (some? (try-pd fn-sym fake-args))
-          (catch Exception _e nil))))))
+          (catch Exception e
+            ;; try-parametric-dispatch returns nil (no throw) when no template
+            ;; matches — an expected speculative miss. If it THREW, a parametric
+            ;; template matched but its concrete specialization failed to compile.
+            ;; The caller then falls back to the boxed parametric generic: correct
+            ;; but unfused/slow. That is exactly the invisible-devirtualization-hole
+            ;; failure mode, so surface it (only when a template is actually
+            ;; registered, to avoid noise on unrelated speculative errors).
+            (when (parametric-template-registered? fn-sym)
+              (binding [*out* *err*]
+                (println (str "WARNING: compile-time parametric specialization of "
+                              fn-sym " " (vec arg-tags)
+                              " failed — falling back to boxed generic dispatch (slow)."
+                              " Cause: " (.getMessage e)))))
+            nil))))))
+
+(defn- parametric-fallback-entry?
+  "True when a matched method entry is the GENERIC parametric fallback — an
+  `objects`-tagged array param — at a position where the concrete arg tag
+  carries a specific primitive-array element type (floats/doubles/…). In that
+  case the `objects` entry only matches by boxing; a concrete specialization
+  (T := that element type) is a strictly better, fusable, unboxed match. This is
+  what lets an inner parametric call inside a monomorphized body resolve to the
+  concrete `_m_floats_…-impl` instead of stopping at the boxed `_m_objects_T_`."
+  [entry arg-tags]
+  (boolean
+   (some (fn [[et at]]
+           (and (= 'objects et)
+                (contains? '#{floats doubles ints longs bytes} at)))
+         (map vector (:tags entry) arg-tags))))
 
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
 
   When no concrete entry exists but arg types are known, triggers parametric
-  specialization (Julia-style JIT specialization at compile time)."
+  specialization (Julia-style JIT specialization at compile time). When only a
+  generic parametric fallback (`objects`-tagged) matches concrete primitive-array
+  args, it ALSO specializes and prefers the concrete entry — so a monomorphized
+  compile pass devirtualizes inner parametric calls to their concrete element
+  type instead of the boxed fallback."
   ([fn-sym arg-forms type-env]
    (try-resolve-call fn-sym arg-forms type-env nil))
   ([fn-sym arg-forms type-env extra-tags]
@@ -758,11 +803,20 @@
                                   (first form))
                                 extra))
                           arg-forms (or extra-tags (repeat nil)))
-           result (or (resolve-method-entry table arg-tags)
-                      ;; No concrete entry — try parametric specialization
-                      (when (try-parametric-specialize! fn-sym arg-tags)
-                        ;; Re-read table after specialization added the entry
-                        (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))]
+           specialize! (fn []
+                         (when (try-parametric-specialize! fn-sym arg-tags)
+                           ;; Re-read table after specialization added the entry
+                           (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
+           direct (resolve-method-entry table arg-tags)
+           result (cond
+                    ;; A generic parametric fallback matched concrete array args —
+                    ;; specialize to the concrete element type and prefer it.
+                    (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
+                    (or (specialize!) direct)
+                    ;; Concrete/promoted match — use it directly.
+                    direct direct
+                    ;; No entry at all — try parametric specialization.
+                    :else (specialize!))]
        (when result
          (let [entry (:entry result)
                casts (:casts result)

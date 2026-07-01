@@ -1488,9 +1488,11 @@
 ;; core generates the concrete deftm.
 ;; ================================================================
 
-(defn- parametric-specialize!
-  "Generate a concrete deftm specialization for a parametric template.
-  Called by dispatch when a parametric function is invoked with a new type.
+(defn- register-parametric-specialization!
+  "Generate + register a concrete deftm specialization for a parametric template
+  under the given type-var bindings, and return its bytecode-compiled -impl var.
+  Does NOT invoke the impl — that is the caller's job (runtime dispatch invokes
+  with args; compile-time specialization just wants the registration).
 
   Uses the bytecode compiler directly instead of Clojure eval. This ensures
   the invoke(Object) path is a bytecoded unboxing bridge (like manual deftm),
@@ -1696,12 +1698,60 @@
                                            (fn [& call-args]
                                              (apply @impl-var call-args))
                                            (meta (ns-resolve source-ns (symbol (name fn-name)))))
-                ;; Call the newly-compiled impl directly rather than re-dispatching.
-                ;; Re-dispatch through the generic function would fail on first call
-                ;; because the original args may predate the class cache.
-                (apply @impl-var args)))
+                ;; Return the compiled -impl var; the caller decides whether to
+                ;; invoke it (runtime dispatch) or just keep the registration
+                ;; (compile-time specialization).
+                impl-var))
             (finally
               (.setContextClassLoader (Thread/currentThread) prev-tcl))))))))
+
+(defn- parametric-specialize!
+  "Runtime dispatch entry: register the concrete specialization for these arg
+  types, then invoke it directly (avoiding a re-dispatch through the generic
+  function, which could fail on first call if the args predate the class cache)."
+  [fn-name template bindings args]
+  (let [impl-var (register-parametric-specialization! fn-name template bindings args)]
+    (apply @impl-var args)))
+
+(defn ensure-dtype-specialization!
+  "Compile-time analogue of runtime parametric dispatch: ensure a concrete
+  specialization of parametric deftm var `f-var` exists for element `dtype`
+  (:float | :double | :int | :long), binding every type variable of the
+  template to that element type. Returns the concrete mangled var, or nil when
+  `f-var` is not parametric / dtype is nil (caller falls back to plain resolution).
+
+  This is what makes :dtype a MONOMORPHIZATION directive for compile-aot — it
+  narrows the parametric type var T for the whole compile pass (type inference
+  AND dispatch resolution of inner parametric calls), not merely an emit-time
+  leaf translation. Where runtime dispatch unifies T against concrete arg
+  classes, here we bind T := dtype up front, with no runtime args needed
+  (args are only used to import parametric value-class instances, absent for
+  primitive element types)."
+  [f-var dtype]
+  (let [m (meta f-var)
+        fq (symbol (str (ns-name (:ns m))) (str (:name m)))
+        elem-sym (case dtype :float 'float :double 'double
+                       :int 'int :long 'long nil)
+        templates (get @dispatch/parametric-registry fq)]
+    (when (and elem-sym (seq templates))
+      ;; Single-arity parametric deftm: one template. Bind all its type vars to
+      ;; the requested element type and register the concrete specialization.
+      (let [template (first templates)
+            type-vars (or (:type-var-list template) (vec (:type-vars template)))
+            bindings (zipmap type-vars (repeat elem-sym))
+            tags (mapv #(types/annotation->tag %1 %2)
+                       (mapv (fn [ann]
+                               (clojure.walk/postwalk
+                                #(if (contains? bindings %) (get bindings %) %)
+                                (dispatch/substitute-type-var ann bindings)))
+                             (:annotations template))
+                       (:params template))
+            mangled (symbol (str (types/mangle fq tags)))
+            src-ns (:source-ns template)]
+        ;; Idempotent: reuse an already-registered specialization.
+        (or (ns-resolve src-ns mangled)
+            (do (register-parametric-specialization! fq template bindings [])
+                (ns-resolve src-ns mangled)))))))
 
 ;; Register the callback with dispatch — breaks the cycle
 (dispatch/set-parametric-specializer! parametric-specialize!)

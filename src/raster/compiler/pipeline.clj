@@ -87,21 +87,35 @@
      (when-let [dt (:raster.core/dispatch-table (meta f-var))]
        (let [all-methods (mapcat val @dt)
              dtype-tag (case dtype :float 'floats :double 'doubles nil)
-             method (if dtype-tag
-                      (or (first (filter #(some #{dtype-tag} (:tags %)) all-methods))
-                          (first all-methods))
-                      ;; No dtype: use single overload, or error if ambiguous
-                      (if (= 1 (count all-methods))
-                        (first all-methods)
-                        (throw (ex-info
-                                (str "Ambiguous overload for compile-aot on "
-                                     (:name (meta f-var)) ". Specify :dtype to disambiguate.\n"
-                                     "Available: " (mapv :tags all-methods))
-                                {:var f-var :methods (mapv :tags all-methods)}))))
-             ns-obj (:ns (meta f-var))
-             mangled-name (symbol (str (types/mangle
-                                        (:name (meta f-var)) (:tags method))))]
-         (ns-resolve ns-obj mangled-name))))))
+             direct (when dtype-tag
+                      (first (filter #(some #{dtype-tag} (:tags %)) all-methods)))]
+         (if (and dtype-tag (nil? direct))
+           ;; No concrete overload for this dtype yet. If f-var is a parametric
+           ;; (All [T]) deftm, MONOMORPHIZE it: force-create the T := dtype
+           ;; specialization so the whole compile pass — including re-walk type
+           ;; inference and inner parametric calls — resolves to the requested
+           ;; element type, instead of silently falling back to the double
+           ;; method (which bakes double .invk targets into the walked body).
+           (or (when-let [ensure! (requiring-resolve 'raster.core/ensure-dtype-specialization!)]
+                 (ensure! f-var dtype))
+               ;; Non-parametric, or specialization unavailable: fall back to any
+               ;; registered method (legacy behavior).
+               (let [method (first all-methods)
+                     ns-obj (:ns (meta f-var))]
+                 (ns-resolve ns-obj (symbol (str (types/mangle
+                                                  (:name (meta f-var)) (:tags method)))))))
+           (let [method (or direct
+                            ;; No dtype: use single overload, or error if ambiguous
+                            (if (= 1 (count all-methods))
+                              (first all-methods)
+                              (throw (ex-info
+                                      (str "Ambiguous overload for compile-aot on "
+                                           (:name (meta f-var)) ". Specify :dtype to disambiguate.\n"
+                                           "Available: " (mapv :tags all-methods))
+                                      {:var f-var :methods (mapv :tags all-methods)}))))
+                 ns-obj (:ns (meta f-var))]
+             (ns-resolve ns-obj (symbol (str (types/mangle
+                                              (:name (meta f-var)) (:tags method))))))))))))
 
 (defn- infer-dtype
   "Infer dtype from a resolved deftm var's parameter tags.
