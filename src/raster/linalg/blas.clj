@@ -309,6 +309,73 @@
   C)
 
 ;; ================================================================
+;; Batched GEMM — one contiguous [batch,·,·] buffer per operand, looped over
+;; head slabs via asSlice offsets (no per-head alloc). Used by batched multi-head
+;; attention: QK^T (nt) and scores@V (nn). alpha folds the 1/sqrt(dk) scale.
+;; float+double arms (dispatch), mirroring dgemm!. beta is 0 (overwrite C).
+;; ================================================================
+
+(deftm ^:no-inline batched-gemm-nt!
+  "C_h = alpha * A_h @ B_h^T for h in 0..batch. A:[batch,m,k] B:[batch,n,k]
+  C:[batch,m,n], all row-major contiguous."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* n k) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 4)) (int k)
+           (.asSlice sb (* (long h) bs 4)) (int k)
+           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nt!
+  [A :- (Array double) B :- (Array double) C :- (Array double)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* n k) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 8)) (int k)
+           (.asSlice sb (* (long h) bs 8)) (int k)
+           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nn!
+  "C_h = alpha * A_h @ B_h for h in 0..batch. A:[batch,m,k] B:[batch,k,n]
+  C:[batch,m,n], all row-major contiguous."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* k n) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 4)) (int k)
+           (.asSlice sb (* (long h) bs 4)) (int n)
+           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nn!
+  [A :- (Array double) B :- (Array double) C :- (Array double)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* k n) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 8)) (int k)
+           (.asSlice sb (* (long h) bs 8)) (int n)
+           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+  C)
+
+;; ================================================================
 ;; cblas_dgemv — matrix-vector multiply
 ;; ================================================================
 
