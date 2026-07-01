@@ -1,4 +1,4 @@
-(ns raster.dl.qlinear-composable
+(ns raster.quant.qlinear-composable
   "Composable-IR expression of the Q4_0 quantized GEMV — the path to retire the hand-
   written string emitter (raster...cpu.quant/emit-qmatmul-*) in favour of one expression
   the compiler lowers to every backend.
@@ -93,7 +93,7 @@
 ;; as a :c-helper override the CPU-C AOT backend emits for the ^:no-inline call. (Halide
 ;; treats this as a one-row intrinsic table; here it's one registered op helper. The
 ;; surrounding loop/accumulate is still the composable GEMV — see qmatmul-q4-composable.)
-(descriptor/register-c-helper! 'raster.dl.qlinear-composable/wi8-dot-q4
+(descriptor/register-c-helper! 'raster.quant.qlinear-composable/wi8-dot-q4
   {:includes "#include <immintrin.h>\n"
    :gen (fn [c-name]
           (str "static inline long " c-name
@@ -112,7 +112,7 @@
 ;; then store 8 int32 column dots. Column L -> lane L (the interleaved layout puts it
 ;; there). Under -march=native the cascade picks vpdpbusd (AVX-VNNI) or maddubs+madd.
 ;; This is the irreducible intrinsic; the GEMV's scale/fold/accumulate stays composable.
-(descriptor/register-c-helper! 'raster.dl.qlinear-composable/wi8-dot-q4-x8
+(descriptor/register-c-helper! 'raster.quant.qlinear-composable/wi8-dot-q4-x8
   {:includes "#include <immintrin.h>\n"
    :gen (fn [c-name]
           (str "static inline int* " c-name
@@ -208,9 +208,9 @@
 
 ;; The tile call WRITES out8 (arg 4) and is read after — declare the mutation so DCE
 ;; keeps the call and the effects analysis sequences it correctly (mirrors qlinear-i8!).
-(descriptor/register-op-descriptor! 'raster.dl.qlinear-composable/wi8-dot-q4-x8
+(descriptor/register-op-descriptor! 'raster.quant.qlinear-composable/wi8-dot-q4-x8
   {:effects {:pure? false :mutating? true}})
-(descriptor/register-buffer-write! 'raster.dl.qlinear-composable/wi8-dot-q4-x8 :overwrite 4)
+(descriptor/register-buffer-write! 'raster.quant.qlinear-composable/wi8-dot-q4-x8 :overwrite 4)
 
 (deftm qmatmul-q4-x8!
   "Tiled composable Q4_0 GEMV over the INTERLEAVED (repack-stream) layout: processes 8

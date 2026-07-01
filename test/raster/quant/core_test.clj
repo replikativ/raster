@@ -1,12 +1,12 @@
 (ns raster.quant.core-test
   "QMatrix — the extensible quant surface. Validates that (matmul (qmatrix fmt W) x)
    plumbs to the same result as the raw kernel path (the kernels themselves are
-   validated bit-faithful in raster.dl.qlinear-k-test), and that a user can register
+   validated bit-faithful in raster.quant.qlinear-k-test), and that a user can register
    a NEW format and have matmul dispatch to it."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.quant.core :as qm]
             [raster.compiler.backend.cpu.quant :as q]
-            [raster.dl.qlinear-k :as qk]))
+            [raster.quant.qlinear-k :as qk]))
 
 (defn- gen [n seed]
   (let [a (float-array n) r (java.util.Random. seed)]

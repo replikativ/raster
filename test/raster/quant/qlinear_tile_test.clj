@@ -1,10 +1,10 @@
-(ns raster.dl.qlinear-tile-test
+(ns raster.quant.qlinear-tile-test
   "The 8-column tile (reading the interleaved repack layout) must produce the same raw
    int32 column dots as the already-validated single-column wi8-dot-q4 (reading the
    row-major weight). This pins the tile's layout access to the layout descriptor —
    the dpbusd C-helper is then a faithful drop-in for this reference."
   (:require [clojure.test :refer [deftest is]]
-            [raster.dl.qlinear-composable :as qc]
+            [raster.quant.qlinear-composable :as qc]
             [raster.compiler.backend.cpu.quant :as quant]))
 
 (defn- rand-bytes [n seed]
