@@ -6,7 +6,8 @@
    pipeline wiring. Guarded on clang + a machine that runs AVX2."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.cpu.csimd :as cs]
-            [raster.compiler.backend.cpu.codegen :as cpu]))
+            [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.gpu.c-emit :as ce]))
 
 (defn- clang-avx2? []
   (try
@@ -80,3 +81,33 @@
                   ref (loop [i 0 s 0.0] (if (< i n) (recur (inc i) (+ s (* (double (aget a i)) (double (aget b i))))) s))]
               (is (< (Math/abs (- got ref)) (if (= dt :float) 1e-2 1e-9))
                   (str dt " n=" n " got=" got " ref=" ref)))))))))
+
+(defn- axpy-segmap [dt]
+  {:space {:dims [{:name 'L :bound 'n}]} :dtype dt :out-sym 'y :cast-fn (if (= dt :float) 'float 'double)
+   :lambda '(.invk raster.numeric/_plus__m_double_double-impl
+              (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
+              (clojure.core/aget b (long L)))})
+
+(deftest segmap-elementwise-matches-scalar
+  (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"
+    (if-not (clang-avx2?)
+      (println "[csimd-test] clang/AVX2 unavailable — skipping")
+      (doseq [[dt ct castf] [[:double "double" double] [:float "float" float]]]
+        (let [{:keys [includes block]}
+              (binding [ce/*emit-config* cpu/cpu-config ce/*scalar-type* ct ce/*int-vars* '#{n}]
+                (cs/compile-segmap-c (axpy-segmap dt) :avx2 '#{a b y}))
+              src (str includes
+                       "void axpy(const " ct "* restrict a, const " ct "* restrict b, " ct "* restrict y, " ct " s, int n){\n  "
+                       block "\n}\n")
+              native (cpu/load-kernel (cpu/compile-source! src) "axpy" 3 [(if (= dt :float) :float :double) :int])
+              mk (fn [n sd] (let [a (if (= dt :float) (float-array n) (double-array n)) r (java.util.Random. sd)]
+                              (dotimes [i n] (aset a i (castf (- (.nextDouble r) 0.5)))) a))]
+          (is (some? block))
+          (doseq [n [7 8 33 100 1024]]
+            (let [a (mk n n) b (mk n (+ n 1)) s (castf 2.5)
+                  y (if (= dt :float) (float-array n) (double-array n))
+                  _ (native a b y s (int n))
+                  ok (every? true? (for [i (range n)]
+                                     (< (Math/abs (- (double (aget y i))
+                                                     (+ (* (double (aget a i)) 2.5) (double (aget b i))))) 1e-4)))]
+              (is ok (str dt " n=" n)))))))))

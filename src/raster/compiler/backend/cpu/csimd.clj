@@ -99,6 +99,96 @@
                base (as-> o (str "(" (ce/emit-expr base nil array-syms "idx") ") + " o)))]
     (str (:loadu ti) "(&" arrs "[" off "])")))
 
+(defn- vidx
+  "C index expr for an aget at affine base + loop counter jv."
+  [base jv array-syms]
+  (if base (str "(" (ce/emit-expr base nil array-syms "idx") ") + " jv) jv))
+
+(defn emit-c-vexpr
+  "Emit a lane-parallel expression as a C <vtype> value (the C analog of
+   segop_simd/emit-simd). idx = induction sym (its lane loads at &arr[base+jv]);
+   jv = the C loop-counter name. Pure-float today: number/scalar → broadcast,
+   affine aget → vector load, op → the intrinsics vector spelling, float/double
+   cast → passthrough. Throws on anything it can't vectorize (caller guards with
+   simd-able? first, so this only runs on recognized bodies)."
+  [expr idx isa elem jv array-syms]
+  (let [ti (in/simd-type-info isa elem)]
+    (cond
+      (number? expr) (str (:set1 ti) "(" expr ")")
+      (symbol? expr) (str (:set1 ti) "(" (ce/c-symbol expr) ")")   ; loop-invariant scalar → broadcast
+      (ss/aget-form? expr idx)
+      (let [[arr base] (ss/aget-form? expr idx)]
+        (str (:loadu ti) "(&" (ce/c-symbol arr) "[" (vidx base jv array-syms) "])"))
+      (and (seq? expr) (contains? '#{float double clojure.core/float clojure.core/double} (first expr)))
+      (emit-c-vexpr (second expr) idx isa elem jv array-syms)       ; same-domain float cast → passthrough
+      (seq? expr)
+      (if-let [vop (in/simd-op isa (first expr) elem)]
+        (str vop "(" (str/join ", " (map #(emit-c-vexpr % idx isa elem jv array-syms) (rest expr))) ")")
+        (throw (ex-info "csimd/emit-c-vexpr: no vector op" {:op (first expr) :expr expr})))
+      :else (throw (ex-info "csimd/emit-c-vexpr: cannot vectorize" {:expr expr})))))
+
+(defn emit-c-sexpr
+  "Scalar C for a (normalized) lane expression at loop counter jv — the scalar-tail
+   twin of emit-c-vexpr. number/symbol verbatim, affine aget → arr[base+jv], float
+   cast → (float)(..), op → the intrinsics scalar lowering (infix/fn)."
+  [expr idx isa elem jv array-syms]
+  (cond
+    (number? expr) (str expr)
+    (symbol? expr) (ce/c-symbol expr)
+    (ss/aget-form? expr idx)
+    (let [[arr base] (ss/aget-form? expr idx)]
+      (str (ce/c-symbol arr) "[" (vidx base jv array-syms) "]"))
+    (and (seq? expr) (contains? '#{float double clojure.core/float clojure.core/double} (first expr)))
+    (str "(" (name (first expr)) ")(" (emit-c-sexpr (second expr) idx isa elem jv array-syms) ")")
+    (seq? expr)
+    (let [low (in/op->c-lowering (first expr) false)
+          args (map #(emit-c-sexpr % idx isa elem jv array-syms) (rest expr))]
+      (case (:kind low)
+        :infix (str "(" (str/join (str " " (:op low) " ") args) ")")
+        :fn    (str (:op low) "(" (str/join ", " args) ")")
+        (throw (ex-info "csimd/emit-c-sexpr: no scalar lowering" {:op (first expr)}))))
+    :else (throw (ex-info "csimd/emit-c-sexpr: cannot emit" {:expr expr}))))
+
+(defn compile-segmap-c
+  "SegMap → a C statement block (string) that writes the vectorized element-wise map
+   into out-sym, plus a scalar tail. Returns {:includes :block} or nil if not
+   vectorizable (caller keeps the scalar loop). Pure-float lane bodies only for now
+   (no int→float widening / no let*-wrapped lambda)."
+  [segmap isa array-syms]
+  (let [idx    (ss/seg-idx segmap)
+        bound  (ss/seg-bound segmap)
+        raw    (:lambda segmap)
+        lambda (when raw (ss/normalize-invk (ss/clean-dead-bindings raw)))
+        out    (:out-sym segmap)
+        cast   (:cast-fn segmap)
+        elem   (vt-of (:dtype segmap))
+        ti     (in/simd-type-info isa elem)]
+    (when (and idx bound out ti (seq? lambda)
+               (not (contains? #{'let 'let*} (first lambda)))       ; no let* yet
+               (ss/simd-able? lambda idx)
+               (empty? (ss/value-position-arrays lambda idx)))
+      (let [lanes (:lanes ti)
+            n-c   (ce/emit-expr bound nil array-syms "idx")
+            outc  (ce/c-symbol out)
+            vexpr (try (emit-c-vexpr lambda idx isa elem "j" array-syms)
+                       (catch clojure.lang.ExceptionInfo _ nil))
+            ;; scalar tail from the NORMALIZED lambda (bare ops + clojure.core/aget)
+            ;; with idx→"j", cast applied: out[j] = (cast)(<scalar sexpr>);
+            tail (try (let [s (emit-c-sexpr lambda idx isa elem "j" array-syms)]
+                        (if cast (str "(" (name cast) ")(" s ")") s))
+                      (catch clojure.lang.ExceptionInfo _ nil))]
+        (when (and vexpr tail)
+          {:includes simd-includes
+           :block
+           (str "{\n"
+                "  const int _n = " n-c ";\n"
+                "  int j = 0;\n"
+                "  for (; j + " lanes " <= _n; j += " lanes ") {\n"
+                "    " (:storeu ti) "(&" outc "[j], " vexpr ");\n"
+                "  }\n"
+                "  for (; j < _n; j++) " outc "[j] = " tail ";\n"
+                "}")})))))
+
 (defn compile-segred-c
   "SegRed → a C statement block (string) that assigns the reduction result to the
    caller-declared variable `target` (a symbol; defaults to the reduce-op's acc).
