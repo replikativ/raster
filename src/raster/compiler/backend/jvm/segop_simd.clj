@@ -87,6 +87,15 @@
 (defn seg-idx [segop] (:name (segop/seg-space-reduced-dim (:space segop))))
 (defn seg-bound [segop] (:bound (segop/seg-space-reduced-dim (:space segop))))
 
+(def ^:dynamic *emit-parallel?*
+  "When true, compile-segmap emits the SegMap loop wrapped in a compiler-internal
+  raster.par.runtime/parallel-for! over the segment domain (the JVM backend's
+  concurrency lowering — CPU-C uses OpenMP, GPU a grid). This is NOT a user
+  surface: the pure SegMap is backend-agnostic; whether/how-many threads actually
+  run is a RUNTIME decision (*par-threads* + the *par-min-size* cost gate). Off by
+  default so nothing changes unless explicitly enabled."
+  false)
+
 ;; ================================================================
 ;; Normalize .invk forms to canonical ops for SIMD
 ;; ================================================================
@@ -753,17 +762,31 @@
             scalar-aset (if cast-fn
                           (list 'clojure.core/aset out (store-idx j-sym) (list cast-fn scalar-body))
                           (list 'clojure.core/aset out (store-idx j-sym) scalar-body))
-            ;; SIMD loop + tail
+            ;; SIMD loop + tail, parameterized by [start end ret] so it can run
+            ;; either the full [0,n) sequentially or a disjoint chunk [lo,hi) per
+            ;; thread. Each chunk writes only out[.. store-idx(hi)) (SIMD guard on
+            ;; `end`, scalar tail to `end`) → disjoint output, no race.
+            lo-sym (gensym "lo__") hi-sym (gensym "hi__")
+            make-loop (fn [start end ret]
+                        (list 'loop* [j-sym start]
+                              (list 'if (ix<= (ix+ j-sym lanes-sym) end)
+                                    (list 'let* (vec (concat arr-loads [simd-result-sym simd-body-expr]))
+                                          (list '.intoArray simd-result-sym out (store-idx j-sym))
+                                          (list 'recur (ix+ j-sym lanes-sym)))
+                                    (list 'loop* [j-sym j-sym]
+                                          (list 'if (ix< j-sym end)
+                                                (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
+                                                ret)))))
             simd-loop
-            (list 'loop* [j-sym '(int 0)]
-                  (list 'if (ix<= (ix+ j-sym lanes-sym) n-sym)
-                        (list 'let* (vec (concat arr-loads [simd-result-sym simd-body-expr]))
-                              (list '.intoArray simd-result-sym out (store-idx j-sym))
-                              (list 'recur (ix+ j-sym lanes-sym)))
-                        (list 'loop* [j-sym j-sym]
-                              (list 'if (ix< j-sym n-sym)
-                                    (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
-                                    out))))]
+            (if *emit-parallel?*
+              ;; Compiler-internal concurrency emission (JVM backend). The runtime
+              ;; parallel-for! chunks [0,n) across *par-threads*, or runs
+              ;; sequentially below *par-min-size* — never a compile/user decision.
+              (list 'do
+                    (list 'raster.par.runtime/parallel-for! n-sym
+                          (list 'fn* (vector lo-sym hi-sym) (make-loop lo-sym hi-sym nil)))
+                    out)
+              (make-loop '(int 0) n-sym out))]
         (when simd-body-expr
           (list 'let* [species-sym species-expr
                        lanes-sym (list '.length species-sym)
