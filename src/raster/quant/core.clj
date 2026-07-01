@@ -5,7 +5,7 @@
   type + a specialized matmul), like linalg — not deep-learning-specific. A
   `QMatrix` wraps a format's packed weight arrays + its descriptor; `matmul`
   dispatches on the format to its registered GEMV, which reuses the shared int8-MAC
-  primitive (raster.quant.qlinear-composable/wi8-dot…) and lowers per backend (maddubs
+  primitive (raster.quant.kernels/wi8-dot…) and lowers per backend (maddubs
   on CPU-C, dp4a on GPU, i32x4.dot on wasm).
 
   EXTENDING (add a new format, e.g. Q5_K) — three things, no compiler internals and
@@ -17,7 +17,7 @@
   base kernels support. (After the #28 skeleton-factoring, step 2 shrinks to a
   descriptor + a small unpack fn.)"
   (:require [raster.compiler.backend.cpu.quant :as q]
-            [raster.quant.qlinear-k :as qk]))
+            [raster.quant.kernels-k :as qk]))
 
 (defrecord QMatrix [format rows cols arrays])
 

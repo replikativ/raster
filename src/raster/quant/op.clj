@@ -1,4 +1,4 @@
-(ns raster.quant.qlinear
+(ns raster.quant.op
   "Quantized int8-MAC linear as a first-class compiler op.
 
   The one ISA seam — the widening int8 dot (maddubs/dpbusd on x86, dp4a/DPAS on the
@@ -61,20 +61,20 @@
 
 ;; Buffer semantics: qlinear-i8 allocates y[out], no in-place input reuse; the
 ;; into-variant is qlinear-i8! (mirrors matmul -> matmul!).
-(descriptor/register-buffer-semantics! 'raster.quant.qlinear/qlinear-i8
+(descriptor/register-buffer-semantics! 'raster.quant.op/qlinear-i8
   {:allocates? true
    :in-place-arg nil
    :alloc-form (fn [[_x _wqi _wsi _in out] _opts] (list 'float-array out))
    :rewrite-fn (fn [[x wqi wsi in out] buf]
-                 (list 'raster.quant.qlinear/qlinear-i8! x wqi wsi buf in out))})
+                 (list 'raster.quant.op/qlinear-i8! x wqi wsi buf in out))})
 
 ;; qlinear-i8! fully overwrites its y argument (index 3) — safe to reuse without
 ;; zeroing (the kernel stores, never accumulates into, y).
-(descriptor/register-op-descriptor! 'raster.quant.qlinear/qlinear-i8!
+(descriptor/register-op-descriptor! 'raster.quant.op/qlinear-i8!
   {:effects {:pure? false :mutating? true}})
-(descriptor/register-buffer-write! 'raster.quant.qlinear/qlinear-i8! :overwrite 3)
+(descriptor/register-buffer-write! 'raster.quant.op/qlinear-i8! :overwrite 3)
 
 ;; Placement: the int8-MAC op runs under the CPU quant profile by default. The GPU
 ;; profile re-tags it :gpu to select the emit-qmatmul-opencl lowering (GPU Step 2).
-(descriptor/register-placement! 'raster.quant.qlinear/qlinear-i8 :cpu-quant)
-(descriptor/register-placement! 'raster.quant.qlinear/qlinear-i8! :cpu-quant)
+(descriptor/register-placement! 'raster.quant.op/qlinear-i8 :cpu-quant)
+(descriptor/register-placement! 'raster.quant.op/qlinear-i8! :cpu-quant)

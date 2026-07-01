@@ -1,4 +1,4 @@
-(ns raster.quant.qlinear-k
+(ns raster.quant.kernels-k
   "Composable K-quant GEMV kernels — the SAME deftm compiles to CPU-C (gcc auto-vectorizes
   the dpbusd-able inner loop) and, via the shared c_emit, to OpenCL/GPU. The scalar per-row
   dot mirrors the validated references (raster.compiler.backend.cpu.quant/q4k-q8k-dot,
@@ -9,7 +9,7 @@
   256 each row spans whole super-blocks, so the flat per-row arrays index as (row, block)."
   (:require [raster.core :refer [deftm]]
             [raster.arrays :as ra]
-            [raster.quant.qlinear-composable :as qc]))
+            [raster.quant.kernels :as qc]))
 
 (deftm qmatmul-q4k-composable!
   "Q4_K GEMV into y[o] for o in [o-start, o-start+o-count): per super-block

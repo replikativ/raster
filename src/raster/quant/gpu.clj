@@ -1,5 +1,5 @@
-(ns raster.quant.qlinear-gpu
-  "Resident-weight GPU execution of the int8-MAC quantized linear (raster.quant.qlinear)
+(ns raster.quant.gpu
+  "Resident-weight GPU execution of the int8-MAC quantized linear (raster.quant.op)
   — the :gpu compute-profile for qlinear-i8. The SAME Q4_0 weight and the SAME kernel
   descriptor as the CPU path, lowered to OpenCL (cq/emit-qmatmul-opencl) and run on a
   concrete device via Level-Zero.

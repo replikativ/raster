@@ -1,10 +1,10 @@
-(ns raster.quant.qlinear-k-test
+(ns raster.quant.kernels-k-test
   "The composable K-quant GEMV deftms compile to C (compile-aot :target :c) and match the
    dequant-matmul reference — proving the registry's formats reach a working C kernel via
    the SAME composable path the legacy Q4_0 uses (and that the GPU/OpenCL path will reuse).
    Single-call correctness; no spin-pool, no Valhalla."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.quant.qlinear-k :as qk]
+            [raster.quant.kernels-k :as qk]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]))
 
