@@ -224,6 +224,65 @@
      (set? form) (into (empty form) (map #(alpha-convert env %) form))
      :else form)))
 
+(declare uniquify*)
+
+(defn- uniquify-scope
+  "Uniquify one scope's binders, threading [env bound]: a binder that SHADOWS a
+   name already in `bound` is renamed to a fresh name (and recorded in env);
+   non-shadowing binders are kept and added to bound. Sequential inits see prior
+   binders; :rec? inits see all binders."
+  [env bound {:keys [binders inits body aux]} sequential? rec?]
+  (if sequential?
+    (let [[env' bound' binders' inits']
+          (reduce (fn [[env bnd bs is] [b i]]
+                    (let [i' (uniquify* env bnd i)          ;; init sees prior binders
+                          [b' env' bnd'] (if (symbol? b)
+                                           (if (contains? bnd b)
+                                             (let [f (fresh-like b)] [f (assoc env b f) (conj bnd f)])
+                                             [b env (conj bnd b)])
+                                           [b env bnd])]
+                      [env' bnd' (conj bs b') (conj is i')]))
+                  [env bound [] []] (map vector binders inits))]
+      {:binders binders' :inits inits' :body (mapv #(uniquify* env' bound' %) body)})
+    (let [triples (mapv (fn [b] (if (and (symbol? b) (contains? bound b))
+                                  [b (fresh-like b) true] [b b false])) binders)
+          env'   (into env (keep (fn [[o n r]] (when r [o n])) triples))
+          bound' (into bound (map second triples))]
+      {:binders (mapv second triples)
+       :inits (mapv #(uniquify* (if rec? env' env) (if rec? bound' bound) %) inits)
+       :body  (mapv #(uniquify* env' bound' %) body)
+       :aux   (some->> aux (mapv #(uniquify* env' bound' %)))})))
+
+(defn- uniquify*
+  [env bound form]
+  (cond
+    (symbol? form) (get env form form)
+    (and (seq? form) (= 'quote (first form))) form
+    (seq? form)
+    (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
+      (rebuild (mapv #(uniquify-scope env bound % sequential? rec?) scopes)
+               (mapv #(uniquify* env bound %) outer))
+      (remake-from form (map #(uniquify* env bound %) form)))
+    (vector? form) (mapv #(uniquify* env bound %) form)
+    (map? form) (into (empty form) (map (fn [[k v]] [(uniquify* env bound k) (uniquify* env bound v)]) form))
+    (set? form) (into (empty form) (map #(uniquify* env bound %) form))
+    :else form))
+
+(defn uniquify-rebindings
+  "SSA-normalize let*/loop* REBINDINGS: rename any binder that SHADOWS a name
+   already in scope (seeded with `params`) to a fresh name, capture-avoidingly
+   rewriting downstream references. First bindings and non-shadowing names are
+   untouched; sibling scopes don't cross-contaminate (each sees only enclosing
+   bindings). Generic over form/scope-info.
+
+   Why: a rebinding like `up = (gelu up)` where the op ALLOCATES a fresh output
+   buffer conflates the input and output buffers in materialize/buffer analysis —
+   the output alloc is bound to `up`, so the map body's read of `up` resolves to
+   the uninitialized output. Distinct SSA names remove the hazard (matches what a
+   hand-written distinct binding does)."
+  ([form] (uniquify-rebindings #{} form))
+  ([params form] (uniquify* {} (set params) form)))
+
 (defn remake
   "Construct a new list form preserving metadata from orig.
    Use this instead of bare (apply list ...) or (list ...) in compiler passes
