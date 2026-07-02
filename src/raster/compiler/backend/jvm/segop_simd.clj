@@ -777,23 +777,34 @@
                                           (list 'if (ix< j-sym end)
                                                 (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
                                                 ret)))))
-            simd-loop
+            ;; Bind species/lanes (+ scalar broadcasts) around a SIMD loop body.
+            wrap-simd (fn [inner]
+                        (list 'let* [species-sym species-expr
+                                     lanes-sym (list '.length species-sym)]
+                              (if (seq scalar-bcasts)
+                                (list 'let* (vec scalar-bcasts) inner)
+                                inner)))
+            body-form
             (if *emit-parallel?*
-              ;; Compiler-internal concurrency emission (JVM backend). The runtime
-              ;; parallel-for! chunks [0,n) across *par-threads*, or runs
-              ;; sequentially below *par-min-size* — never a compile/user decision.
-              (list 'do
-                    (list 'raster.par.runtime/parallel-for! n-sym
-                          (list 'fn* (vector lo-sym hi-sym) (make-loop lo-sym hi-sym nil)))
-                    out)
-              (make-loop '(int 0) n-sym out))]
-        (when simd-body-expr
-          (list 'let* [species-sym species-expr
-                       lanes-sym (list '.length species-sym)
-                       n-sym (list 'int bound)]
-                (if (seq scalar-bcasts)
-                  (list 'let* (vec scalar-bcasts) simd-loop)
-                  simd-loop)))))))
+              ;; Compiler-internal concurrency emission (JVM backend). parallel-for!
+              ;; chunks [0,n) across *par-threads*, or runs sequentially below
+              ;; *par-min-size* — a RUNTIME decision, never compile/user. It invokes
+              ;; (body-fn lo hi) with BOXED args → unbox to int. The species/lanes/
+              ;; broadcasts are recomputed INSIDE the closure (cheap, per-thread) so
+              ;; the fn* captures only the arrays — a captured VectorSpecies field
+              ;; confuses the anon-fn verifier's stack-map frames for the SIMD body.
+              (let [lo-int (gensym "loi__") hi-int (gensym "hii__")]
+                (list 'let* [n-sym (list 'int bound)]
+                      (list 'do
+                            (list 'raster.par.runtime/parallel-for! n-sym
+                                  (list 'fn* (vector lo-sym hi-sym)
+                                        (list 'let* [lo-int (list 'int lo-sym)
+                                                     hi-int (list 'int hi-sym)]
+                                              (wrap-simd (make-loop lo-int hi-int nil)))))
+                            out)))
+              (list 'let* [n-sym (list 'int bound)]
+                    (wrap-simd (make-loop '(int 0) n-sym out))))]
+        (when simd-body-expr body-form)))))
 
 ;; ================================================================
 ;; par/gather → SIMD hardware vgather
