@@ -1753,6 +1753,45 @@
 ;; Void-map kernel invocation (side-effect-only kernels)
 ;; ================================================================
 
+(defn kernel-registry-entry
+  "Registry info for a kernel-name (source, :array-params, :written-arrays, dtype…)."
+  [kernel-name]
+  (get @kernel-registry kernel-name))
+
+(defn bind-registered-map-void-kernel
+  "Bind a registered void-map kernel over GPU-RESIDENT args, for recording into a
+  command graph (whole-offload). `arrays` must be resident (DeviceBuffer /
+  MemorySegment) — NO per-call JVM-array staging (residency is the whole point).
+  `scalar-args` are scalar values; `n` is the element count. Returns a bound map
+  {:kernel :gc-seg …} (from bind-kernel!, with :gc-seg X pre-set to the group
+  count) — pass directly to record-graph!. A FRESH kernel handle per binding is
+  used (LZ kernel args are mutable handle state → shared handles clobber)."
+  [kernel-name arrays scalar-args n]
+  (let [{:keys [module workgroup-size dtype]
+         :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+        kernel-handle (create-kernel-fresh module kernel-name)
+        wg (long workgroup-size)
+        n (long n)
+        dev-segs (reduce
+                  (fn [acc arr]
+                    (cond
+                      (device-buffer? arr)          (conj acc (:segment ^DeviceBuffer arr))
+                      (instance? MemorySegment arr)  (conj acc arr)
+                      :else (throw (ex-info "bind-registered-map-void-kernel requires GPU-resident args (DeviceBuffer/MemorySegment); JVM-array staging is not supported on the bound path"
+                                            {:arr-type (type arr)}))))
+                  [] arrays)
+        scalar-type (if (= dtype :float) :float :double)
+        scalar-kernel-args (mapv (fn [v]
+                                   (if (map? v) v
+                                       {:type scalar-type
+                                        :value (if (= scalar-type :float) (float v) (double v))}))
+                                 scalar-args)
+        all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
+        group-count (long (Math/ceil (/ (double n) (double wg))))
+        bnd (bind-kernel! kernel-handle wg all-args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
+    bnd))
+
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.
   All arrays are passed as read-write — copies to device before launch,
