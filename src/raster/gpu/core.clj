@@ -897,40 +897,47 @@
                                    allocs))
          info-fn   (rt-resolve device-id "kernel-registry-entry")
          bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
-         record-fn (rt-resolve device-id "record-graph!")]
+         gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
+         conv-fn   (rt-resolve device-id "bind-registered-convert!")
+         mkbuf-fn  (rt-resolve device-id "make-buffer")
+         record-fn (rt-resolve device-id "record-graph!")
+         gemm-scratch (atom [])]
      (alloc! sess (merge param-specs alloc-specs))
      (let [buffers (:buffers @sess)
-           bounds
-           (mapv
-            (fn [{:keys [kernel-name arrays n-fn scalar-specs convention]}]
-              ;; Only the map conventions bind through bind-registered-map-void-kernel (output is
-              ;; just another resident buffer). :reduce has a different launch/partial-sum shape
-              ;; and would SILENTLY mis-bind here — reject it loudly. (Add a reduce bind path when
-              ;; one appears; Milestone 0 straight-line SOAC is map-void/map only.)
-              (when-not (#{:map-void :map} convention)
-                (throw (ex-info (str "bind-program! cannot bind a " convention " step (" kernel-name
-                                     ") — only :map-void / :map are wired on the resident path")
-                                {:convention convention :kernel kernel-name})))
-              (or (info-fn kernel-name)
-                  (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                  {:kernel kernel-name})))
-              (let [;; Resolve resident buffers from the STEP's :arrays — it lists ALL kernel array
-                    ;; args in C-signature order INCLUDING the functional output. (fusion's segop
-                    ;; generator registers the output in :out-param, NOT :array-params, so resolving
-                    ;; from the registry's :array-params drops the output buffer and shifts scalars
-                    ;; into the out-pointer slot → the kernel silently writes nothing.)
-                    buf-vec (mapv (fn [sym]
-                                    (or (get buffers (keyword (name sym)))
-                                        (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
-                                                        {:sym sym :kernel kernel-name :have (keys buffers)}))))
-                                  arrays)
-                    ;; typed scalars ({:type :int|:float|:double :value v}) preserved through
-                    ;; bind-registered-map-void-kernel (it passes map args through), so an int
-                    ;; param binds as int rather than being coerced to the kernel dtype.
-                    scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
-                                  scalar-specs)]
-                (bind-fn kernel-name buf-vec scalars (long (n-fn args)))))
-            steps)
+           buf-of (fn [sym ctx]
+                    (or (get buffers (keyword (name sym)))
+                        (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
+                                        {:sym sym :ctx ctx :have (keys buffers)}))))
+           step->bounds
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention] :as step}]
+             (case convention
+               ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
+               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
+               ;; convert redundantly per replay for now (correctness-first) — hoist to a once-at-
+               ;; bind :constant f16 upload later.
+               :gemm
+               (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
+                     abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
+                     cbuf (buf-of (:C step) :gemm-C)
+                     a16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
+                 (swap! gemm-scratch conj a16 b16)
+                 [(conv-fn abuf a16 (* m k))
+                  (conv-fn bbuf b16 (* k n))
+                  (gemm-fn a16 b16 cbuf m n k :float)])
+               ;; map / map-void bind through bind-registered-map-void-kernel (output is just
+               ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
+               ;; order incl. output).
+               (:map :map-void)
+               (do (or (info-fn kernel-name)
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
+                   (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
+                         scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                                       scalar-specs)]
+                     [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+               (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
+                                    ":map / :map-void / :gemm are wired on the resident path")
+                               {:convention convention :kernel kernel-name}))))
+           bounds (vec (mapcat step->bounds steps))
            graph (record-fn bounds)]
        (swap! sess assoc
               :program-graph graph
