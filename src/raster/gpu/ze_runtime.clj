@@ -1728,6 +1728,40 @@
     (.set gc I32 8 (int 1))
     bnd))
 
+(def ^:private convert-cache (atom nil))
+
+(defn- ensure-convert-kernel!
+  "Lazily compile + cache the f32→f16 element-wise convert kernel. Returns {:module :kernel}."
+  []
+  (ensure-init!)
+  (when (nil? @convert-cache)
+    (let [src (str "__kernel void f32_to_f16(__global const float* restrict in, "
+                   "__global half* restrict out, int n) {\n"
+                   "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
+                   "out[i] = (half)in[i];\n}\n")
+          device-hex (:device-id-hex @state)
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   src :device device-hex))
+          module (load-module! spv)
+          kernel (create-kernel module "f32_to_f16")]
+      (clojure.core/reset! convert-cache {:module module :kernel kernel})))
+  @convert-cache)
+
+(defn bind-registered-convert!
+  "Bind an f32→f16 element-wise convert kernel over RESIDENT buffers for recording into a
+  command graph (the Option-B activation cast before an fp16 XMX GEMM). in: f32 DeviceBuffer,
+  out: f16 (:half) DeviceBuffer, n elements. Returns a bound {:kernel :gc-seg} map. Fresh
+  kernel handle per binding."
+  [in out n]
+  (let [{:keys [module]} (ensure-convert-kernel!)
+        kh (create-kernel-fresh module "f32_to_f16")
+        n (long n)
+        args [(:segment in) (:segment out) {:type :int :value (int n)}]
+        bnd (bind-kernel! kh 256 args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double n) 256.0))))
+    bnd))
+
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.
   All arrays are passed as read-write — copies to device before launch,
