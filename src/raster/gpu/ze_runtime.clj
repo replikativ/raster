@@ -1006,25 +1006,29 @@
 ;; ================================================================
 
 (def ^:private gemm-cache
-  "Cache for compiled GEMM kernel module. Atom holding {:module :kernel}."
-  (atom nil))
+  "Cache for compiled GEMM kernels, keyed by C-output dtype (:half | :float).
+   Each entry is {:module :kernel :kernel-name}. (A/B are always fp16 in.)"
+  (atom {}))
 
 (defn- ensure-gemm-kernel!
-  "Lazily compile + cache the XMX gemm_nonsquare kernel. Returns {:module :kernel}."
-  []
+  "Lazily compile + cache the XMX gemm_nonsquare kernel for a given C-output dtype
+   (:half or :float — A/B always fp16, fp32 accumulate). Returns {:module :kernel :kernel-name}."
+  [c-dtype]
   (ensure-init!)
-  (when (nil? @gemm-cache)
-    (let [cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
-                      "gemm_nonsquare"))
-          device-hex (:device-id-hex @state)
-          spv (do (require 'raster.compiler.support.spirv-cache)
-                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                   cl-src :device device-hex))
-          module (load-module! spv)
-          kernel (create-kernel module "gemm_nonsquare")]
-      (clojure.core/reset! gemm-cache {:module module :kernel kernel})))
-  @gemm-cache)
+  (or (get @gemm-cache c-dtype)
+      (let [kname (str "gemm_nonsquare_" (name c-dtype))
+            cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                        kname :c-dtype c-dtype))
+            device-hex (:device-id-hex @state)
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     cl-src :device device-hex))
+            module (load-module! spv)
+            kernel (create-kernel module kname)
+            entry {:module module :kernel kernel :kernel-name kname}]
+        (swap! gemm-cache assoc c-dtype entry)
+        entry)))
 
 (defn gemm!
   "GPU matrix multiply: C = A × B using XMX DPAS instructions.
@@ -1034,7 +1038,7 @@
 
   Returns C."
   [a b c m n k]
-  (let [{:keys [kernel]} (ensure-gemm-kernel!)
+  (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
         gc-m (int (Math/ceil (/ (double m) 128.0)))
         gc-n (int (Math/ceil (/ (double n) 128.0)))
         args [(:segment a) (:segment b) (:segment c)
@@ -1715,9 +1719,10 @@
   call). A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
   {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
   handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
-  [a b c m n k]
-  (let [{:keys [module]} (ensure-gemm-kernel!)
-        kh (create-kernel-fresh module "gemm_nonsquare")
+  ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
+  ([a b c m n k c-dtype]
+  (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
+        kh (create-kernel-fresh module kernel-name)
         m (long m) n (long n) k (long k)
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
@@ -1726,7 +1731,7 @@
     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
     (.set gc I32 8 (int 1))
-    bnd))
+    bnd)))
 
 (def ^:private convert-cache (atom nil))
 
