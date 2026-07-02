@@ -899,6 +899,7 @@
          bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
          conv-fn   (rt-resolve device-id "bind-registered-convert!")
+         trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
          gemm-scratch (atom [])]
@@ -919,11 +920,23 @@
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
                      cbuf (buf-of (:C step) :gemm-C)
-                     a16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
-                 (swap! gemm-scratch conj a16 b16)
-                 [(conv-fn abuf a16 (* m k))
-                  (conv-fn bbuf b16 (* k n))
-                  (gemm-fn a16 b16 cbuf m n k :float)])
+                     a16 (mkbuf-fn (* m k) :half)]
+                 (case (:variant step)
+                   ;; C = A[m,k] · B[k,n]
+                   :nn
+                   (let [b16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
+                      (gemm-fn a16 b16 cbuf m n k :float)])
+                   ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
+                   ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
+                   :nt
+                   (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16 bt16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
+                      (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                   (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
+                                        " (only :nn / :nt)") {:variant (:variant step)}))))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).
