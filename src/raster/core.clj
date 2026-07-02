@@ -1534,29 +1534,17 @@
         concrete-ret (clojure.walk/postwalk
                       #(if (symbol? %) (subst %) %)
                       (dispatch/substitute-type-var ret-annotation bindings))
-        ;; Determine element type for literal casting (Julia-style)
-        ;; When T=float, double literals like 0.0 should become (float 0.0)
-        ;; so loop accumulators match the element type and dispatch resolves
-        ;; to concrete float+float instead of Number+Number.
+        ;; Element dtype this body is monomorphized to (from the T binding).
+        ;; Threaded to the walker as :element-dtype (see walk-opts below) so
+        ;; CONTEXTUAL literal typing narrows untyped floating literals by their
+        ;; use-site — binding-init → element dtype, call-arg → resolved param
+        ;; dtype — instead of a blind pre-pass that narrowed EVERY double literal
+        ;; and corrupted literals bound to a callee's concrete non-T param
+        ;; (e.g. skip-layer-norm's `eps :- Double`).
         elem-prim (get bindings (first (:type-vars template)))
-        literal-cast-fn (case elem-prim
-                          float  (fn [x]
-                                   (if (and (number? x) (instance? Double (if (int? x) nil x)))
-                                     (list 'float x)
-                                     x))
-                          int    (fn [x]
-                                   (if (and (number? x) (instance? Double (if (int? x) nil x)))
-                                     (list 'int x)
-                                     x))
-                          ;; double or unrecognized — no cast needed
-                          identity)
-        ;; Substitute in body: type vars + literal casting
+        ;; Substitute type vars in the body — NO literal narrowing here.
         body-with-types (clojure.walk/postwalk
-                         (fn [x]
-                           (cond
-                             (symbol? x) (subst x)
-                             (number? x) (literal-cast-fn x)
-                             :else x))
+                         (fn [x] (if (symbol? x) (subst x) x))
                          body)
         ;; Compute tags and mangled name
         tags (mapv #(types/annotation->tag %1 %2) concrete-anns params)
