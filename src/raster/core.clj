@@ -1575,7 +1575,11 @@
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)
         walk-opts (cond-> {:type-env plain-type-env :source-ns source-ns}
-                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                    ;; This body is monomorphized to T := elem-prim. Thread the FP
+                    ;; element dtype so contextual literal typing (B) can narrow an
+                    ;; untyped floating literal to it. Only float/double matter.
+                    (#{'float 'double} elem-prim) (assoc :element-dtype (keyword (str elem-prim))))
         walked-body (vec (map #(walker/walk-body % walk-opts) (if (seq? body-with-types)
                                                                 [body-with-types]
                                                                 body-with-types)))

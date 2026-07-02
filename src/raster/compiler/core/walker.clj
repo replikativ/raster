@@ -57,17 +57,22 @@
   tc-binding-tags: {symbol → dispatch-tag} pre-computed by TC (optional)
   NOTE: type-env entries are processed through ctx-assoc-type to ensure
   fn-info auto-derivation for IFn__ tagged parameters."
-  [{:keys [type-env source-ns tc-binding-tags]
+  [{:keys [type-env source-ns tc-binding-tags element-dtype]
     :or {type-env {} source-ns *ns*}}]
   ;; Build the context by adding each type-env entry through ctx-assoc-type,
   ;; which auto-derives fn-info from IFn__ tags (fixing the ODE fn-param bug).
+  ;; :element-dtype is the dtype keyword (:float/:double) this body is being
+  ;; MONOMORPHIZED to (from a parametric T binding or an AOT :dtype directive),
+  ;; or nil for a polymorphic generic-definition walk. Contextual literal typing
+  ;; reads it so an untyped floating literal adopts the element dtype.
   (reduce-kv (fn [ctx sym record]
                (ctx-assoc-type ctx sym (:tag record)
                                (:fn-info record)
                                (:element record)))
              {:type-env  {}
               :source-ns source-ns
-              :tc-binding-tags (or tc-binding-tags {})}
+              :tc-binding-tags (or tc-binding-tags {})
+              :element-dtype element-dtype}
              type-env))
 
 (defn ctx-assoc-type
@@ -1275,10 +1280,11 @@
 
   type-env: {symbol → {:tag dispatch-tag, :fn-info map?, :element dispatch-tag?}}
   tc-binding-tags: {symbol → dispatch-tag} pre-computed from TC (optional)"
-  [form {:keys [type-env source-ns tc-binding-tags]}]
+  [form {:keys [type-env source-ns tc-binding-tags element-dtype]}]
   (let [ctx (make-ctx {:type-env (or type-env {})
                        :source-ns (or source-ns *ns*)
-                       :tc-binding-tags tc-binding-tags})
+                       :tc-binding-tags tc-binding-tags
+                       :element-dtype element-dtype})
         walked (walk form ctx)]
     ;; Close the core: after type-directed walking (typed macros already expanded
     ;; to SOAC primitives), macroexpand the remaining macro zoo
