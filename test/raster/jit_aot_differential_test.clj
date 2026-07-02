@@ -48,6 +48,19 @@
                               down (nn/linear up2 w2 b2 rows dh din)]
                           (nn/skip-layer-norm down x g be rows din (clojure.core/double 1e-5)))))
 
+;; D2 regression guard — REBINDING a let var to an ALLOCATING-op result
+;; (x = (gelu x)) was the compile_aot_composition_bug: buffer analysis conflated
+;; the two SSA versions of the rebound name → downstream read the wrong buffer,
+;; corrupting at scale (fine at tiny dims). Fixed by util/uniquify-rebindings.
+;; Kept at real-ish dims so the guard actually exercises the size-dependent path.
+(deftm d-rebind-block (All [T] [x :- (Array T) w1 :- (Array T) b1 :- (Array T)
+                                w2 :- (Array T) b2 :- (Array T)
+                                rows :- Long din :- Long dh :- Long] :- (Array T)
+                           (let [x (nn/linear x w1 b1 rows din dh)
+                                 x (nn/gelu x (clojure.core/* rows dh))
+                                 x (nn/linear x w2 b2 rows dh din)]
+                             x)))
+
 ;; ---------------------------------------------------------------------------
 ;; harness
 ;; ---------------------------------------------------------------------------
@@ -95,7 +108,11 @@
    ;; composed last so sub-op float overloads are warm
    {:name "d-ffn-block"     :var #'d-ffn-block
     :make (fn [dt] [(ramp dt 32) (ramp dt 128) (ramp dt 16) (ramp dt 128) (ramp dt 32)
-                    (ramp dt 32) (ramp dt 32) 4 8 16])}])
+                    (ramp dt 32) (ramp dt 32) 4 8 16])}
+   ;; D2 guard — allocating-op rebind at real-ish dims (rows=32, din=64, dh=256)
+   {:name "d-rebind-block"  :var #'d-rebind-block
+    :make (fn [dt] [(ramp dt (* 32 64)) (ramp dt (* 64 256)) (ramp dt 256)
+                    (ramp dt (* 256 64)) (ramp dt 64) 32 64 256])}])
 
 (def tol 1.0e-4)  ;; FP reassociation between serial-JIT and SIMD/fused-AOT
 
