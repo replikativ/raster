@@ -823,7 +823,7 @@
       (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
       (let [[_ kname inputs out scalars n] expr]
         {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
-         :convention :map :returns sym})
+         :convention :map :returns sym :out-buf out})
       (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
       (let [[_ kname inputs n] expr]
         {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
@@ -962,14 +962,31 @@
         ;; :state (KV cache — never downloaded): that cross-call axis isn't a single-program
         ;; property (escape analysis can't see it), so it's declared, not derived.
         reg-entry (when prog (requiring-resolve 'raster.gpu.ze-runtime/kernel-registry-entry))
-        written-params (when prog
-                         (reduce (fn [acc s]
-                                   (let [ki (reg-entry (:kernel-name s))]
-                                     (into acc (map (comp symbol name) (:written-arrays ki)))))
-                                 #{} (:steps prog)))
+        ;; arrays WRITTEN by each step: a :map (functional broadcast OR in-place stencil) writes
+        ;; its explicit output buffer (:out-buf); a :map-void writes in place (kernel registry
+        ;; :written-arrays). A written INTERMEDIATE alloc is not a param, so it's naturally
+        ;; excluded from written-PARAMS below (→ stays :scratch, resident, never downloaded).
+        written-syms (when prog
+                       (reduce (fn [acc s]
+                                 (into acc (map (comp symbol name)
+                                                (case (:convention s)
+                                                  :map (when-let [o (:out-buf s)] #{o})
+                                                  :map-void (:written-arrays (reg-entry (:kernel-name s)))
+                                                  nil))))
+                               #{} (:steps prog)))
+        written-params (when prog (set (filter (set array-params) written-syms)))
         array-roles (when prog
                       (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
-                                    array-params)))]
+                                    array-params)))
+        ;; The program's result: an IN-PLACE kernel (stencil/map-void) returns its output buffer
+        ;; bound to a fresh sym (e.g. body_result ← (invoke .. du ..)), so there is no buffer of
+        ;; that name — resolve the :returns→:out-buf alias to the actual written buffer. A
+        ;; functional map's result is a real alloc (not a step :returns), so it passes through.
+        returns->out (when prog
+                       (into {} (keep (fn [s] (when (and (:returns s) (:out-buf s))
+                                                [(:returns s) (:out-buf s)]))
+                                      (:steps prog))))
+        result-sym (when prog (let [r (:result prog)] (get returns->out r r)))]
     (when prog
       {:dtype effective-dtype
        :all-params all-params
@@ -995,7 +1012,7 @@
                        :convention convention
                        :phase (keyword (str "gpu-step-" i))})
                     (range) (:steps prog))
-       :result-sym (:result prog)})))
+       :result-sym result-sym})))
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline
