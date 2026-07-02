@@ -659,7 +659,9 @@
         :opencl
         (let [result (opencl-pass/opencl-pass form
                                               :device-id target-device
-                                              :dtype (:dtype opts))]
+                                              :dtype (:dtype opts)
+                                              :scalar-types (:scalar-types opts)
+                                              :array-types (:array-types opts))]
           (register-gpu-kernels! (:kernels result))
           {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
 
@@ -983,8 +985,17 @@
         ;; that name — resolve the :returns→:out-buf alias to the actual written buffer. A
         ;; functional map's result is a real alloc (not a step :returns), so it passes through.
         returns->out (when prog
-                       (into {} (keep (fn [s] (when (and (:returns s) (:out-buf s))
-                                                [(:returns s) (:out-buf s)]))
+                       (into {} (keep (fn [s]
+                                        (let [ob (case (:convention s)
+                                                   :map (:out-buf s)
+                                                   ;; a Void map-void writing exactly one array:
+                                                   ;; that array is the program's result (the
+                                                   ;; caller reads it back after replay).
+                                                   :map-void (let [w (seq (map (comp symbol name)
+                                                                               (:written-arrays (reg-entry (:kernel-name s)))))]
+                                                               (when (= 1 (count w)) (first w)))
+                                                   nil)]
+                                          (when (and (:returns s) ob) [(:returns s) ob])))
                                       (:steps prog))))
         result-sym (when prog (let [r (:result prog)] (get returns->out r r)))]
     (when prog
