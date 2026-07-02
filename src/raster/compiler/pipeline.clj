@@ -655,8 +655,8 @@
       ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
       {:form (strip-compound-markers form) :stats nil :backend :par-preserve}
       (case (device/select-runtime-backend target-device simd? nil)
-      :cuda
-      (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
+        :cuda
+        (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
       :opencl
       ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
@@ -671,13 +671,13 @@
         (register-gpu-kernels! (:kernels result))
         {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
 
-      :simd
-      (let [clean-form (strip-compound-markers form)
-            {:keys [form stats]} (par-simd/simd-pass clean-form)]
-        {:form form :stats stats :backend :simd})
+        :simd
+        (let [clean-form (strip-compound-markers form)
+              {:keys [form stats]} (par-simd/simd-pass clean-form)]
+          {:form form :stats stats :backend :simd})
 
       ;; :scalar
-      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
+        {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.
