@@ -203,6 +203,33 @@
                                                 (fn [dy]
                                                   [(silu-backward dy x n) nil]))})
 
+;; --- SkipLayerNorm: fused residual-add + layer-norm (ORT SkipLayerNormalization) ---
+;; out = LayerNorm(a + b). Folds the residual add into layer-norm's reads so the
+;; separate residual-add pass AND its [batch,features] intermediate buffer vanish —
+;; (a+b) is consumed per row, never materialized. One coarse kernel instead of two.
+(deftm skip-layer-norm
+  (All [T] [a :- (Array T) b :- (Array T) gamma :- (Array T) beta :- (Array T)
+            batch :- Long features :- Long eps :- Double] :- (Array T)
+    (let [out  (alloc-like a (* batch features))
+          finv (/ 1.0 (double features))]
+      (dotimes [r batch]
+        (let [offset (* r (int features))
+              mean (loop [i 0 s 0.0]
+                     (if (< i features)
+                       (recur (inc i) (+ s (+ (aget a (+ offset i)) (aget b (+ offset i)))))
+                       (* s finv)))
+              var  (loop [i 0 s 0.0]
+                     (if (< i features)
+                       (let [d (- (+ (aget a (+ offset i)) (aget b (+ offset i))) mean)]
+                         (recur (inc i) (+ s (* d d))))
+                       (* s finv)))
+              inv-std (/ 1.0 (n/sqrt (+ var eps)))]
+          (dotimes [i features]
+            (let [v (+ (aget a (+ offset i)) (aget b (+ offset i)))]
+              (aset out (+ offset i)
+                    (+ (* (aget gamma i) (* (- v mean) inv-std)) (aget beta i)))))))
+      out)))
+
 ;; --- GELU: x * Phi(x) (tanh approximation) ---
 ;; The tanh is inlined as a vectorizable odd-rational approximation (Eigen ptanh:
 ;; clamp + polynomial in u², only +/*//min/max → a pure SIMD lane chain). A libm
