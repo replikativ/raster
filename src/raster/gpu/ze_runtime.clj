@@ -1365,7 +1365,7 @@
   once, with NO per-op barrier — ordering is implicit in the list. Returns a graph
   {:queue :list :lists-arr} for replay-graph!. Re-record only if the kernel
   sequence or any buffer pointer changes; buffer CONTENTS may change between replays."
-  [bounds]
+  [bounds & {:keys [barrier?] :or {barrier? true}}]
   (ensure-init!)
   (let [{:keys [arena context device]} @state
         cq-desc (.allocate ^Arena arena 40)
@@ -1382,7 +1382,15 @@
         h-launch @h-zeCommandListAppendLaunchKernel]
     (doseq [{:keys [kernel gc-seg]} bounds]
       (ze-call! "zeCommandListAppendLaunchKernel" h-launch
-                [lst kernel gc-seg MemorySegment/NULL (int 0) MemorySegment/NULL]))
+                [lst kernel gc-seg MemorySegment/NULL (int 0) MemorySegment/NULL])
+      ;; DEVICE-SIDE barrier between kernels enforces RAW/WAW ordering on the GPU
+      ;; (a GEMM writes H, the next kernel reads H) with no host round-trip. The
+      ;; whole graph still costs ONE host sync (the queue execute). Skip only when
+      ;; all kernels are independent (:barrier? false — e.g. a batch of GEMMs to
+      ;; distinct outputs).
+      (when barrier?
+        (ze-call! "zeCommandListAppendBarrier" @h-zeCommandListAppendBarrier
+                  [lst MemorySegment/NULL (int 0) MemorySegment/NULL])))
     (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
     (let [lists-arr (ptr-seg arena)]
       (.set lists-arr PTR 0 ^MemorySegment lst)
