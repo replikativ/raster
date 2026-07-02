@@ -411,11 +411,17 @@
        (descriptor/void-op? (first expr))))
 
 (defn has-side-effects?
-  "Check if an expression tree contains void (side-effect) operations."
+  "Check if an expression tree contains void (side-effect) operations — including
+  DEVIRTUALIZED array writes (.invk aset-impl …), recognized via the walker-stamped
+  :raster.op/original op (an intermediate's aset materializes to .invk, which the
+  surface-op void-form? check would otherwise miss → a side-effecting binding would be
+  wrongly inlined and re-run)."
   [expr]
   (cond
     (not (seq? expr)) false
     (void-form? expr) true
+    (and (= '.invk (first expr))
+         (descriptor/aset-op? (:raster.op/original (meta expr)))) true
     :else (some has-side-effects? (rest expr))))
 
 ;; ================================================================
@@ -555,7 +561,10 @@
                     :locals locals
                     :loop-stmts (conj (or loop-stmts []) loop-code)
                     :seen-names (or seen-names {})})
-                 (if (multi-use? sym)
+                 ;; Declare (evaluate once) when multi-use OR side-effecting: inlining a
+                 ;; single-use side-effecting binding (e.g. softmax's exp-and-sum loop, which
+                 ;; writes `out`) into a later loop body re-runs its writes every iteration.
+                 (if (or (multi-use? sym) (has-side-effects? val))
                    (let [base-name (c-symbol sym)
                          prev-count (get seen-names base-name 0)
                          c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
@@ -848,7 +857,12 @@
                                  (fn [f] (if (and (symbol? f) (contains? env f))
                                            (get env f) f))
                                  val)]
-                  (if (multi-use? sym)
+                  ;; A binding whose value has SIDE EFFECTS (e.g. a loop that writes an array,
+                  ;; as in softmax's exp-and-sum pass) must be DECLARED (evaluated once), never
+                  ;; inlined — inlining a single-use side-effecting binding into a later loop
+                  ;; body re-runs its writes every iteration (silent miscompile). Hoisting is
+                  ;; also correct for pure single-use bindings, so widen the declare condition.
+                  (if (or (multi-use? sym) (has-side-effects? val))
                     (let [base-name (c-symbol sym)
                           prev-count (get seen-names base-name 0)
                           c-name (if (> prev-count 0)
@@ -1168,6 +1182,14 @@
                                   (c-symbol a)
                                   (emit-expr a idx-sym array-syms opencl-idx)))]
            (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
+
+     ;; oftype: (.invk oftype-impl ref val) coerces `val` to `ref`'s type (parametric
+     ;; materialization inserts it, e.g. to type a reduction seed against a float array). In a
+     ;; GPU kernel the value type is the kernel scalar type, so emit a plain cast of the value
+     ;; arg — the ref only names the target type. Read the carried op, not the mangled impl name.
+     (and (seq? expr) (= '.invk (first expr)) (>= (count expr) 4)
+          (= 'raster.numeric/oftype (:raster.op/original (meta expr))))
+     (str "(" *scalar-type* ")(" (emit-expr (nth expr 3) idx-sym array-syms opencl-idx) ")")
 
      ;; .invk typed dispatch on deftm helper -> check for devirtualized arithmetic
      (and (seq? expr) (= '.invk (first expr))
