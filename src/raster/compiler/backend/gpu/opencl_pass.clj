@@ -94,15 +94,14 @@
      :dtype         — :double or :float (default :double)
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
-  [form & {:keys [device-id dtype min-elements compile-spirv?]
+  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
-  (let [top-scalar-types (or (:scalar-types (meta form)) {})
-        ;; Capture declared array element types from the TOP form (like scalar-types). The passes
-        ;; wrap the par form in a let*, so the INNER par form the generators see has lost this
-        ;; meta — reading it there (the old code) yielded {} and mis-typed e.g. byte quant weights
-        ;; as float. Thread the top-level map to every generator instead.
-        top-array-types (or (:array-types (meta form)) {})
+  ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
+  ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
+  ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
+  (let [top-scalar-types (merge (or (:scalar-types (meta form)) {}) scalar-types)
+        top-array-types (merge (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :fallback 0})
         kernels (atom [])
 
@@ -227,7 +226,7 @@
                     (par/expand-par-map-void! form))
                 (let [kernel (legacy/generate-par-map-void-kernel form
                                                                   :dtype dtype :device-id device-id
-                                                                  :array-types (merge top-array-types (:array-types (meta form)))
+                                                                  :array-types top-array-types
                                                                   :scalar-types top-scalar-types)
                       k (register-kernel! kernel :ze-maps)
                       soa-exp (or (:soa-expansions k) {})

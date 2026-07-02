@@ -960,7 +960,10 @@
     ;; it has no :output role, but it IS the program's return value).
     (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
                        [p (download sess (keyword (name p)))]))
-      (and result-sym (not (some #(= result-sym %) array-params)))
+      ;; download the functional :result-sym only when it is a distinct resident buffer (not
+      ;; already an :output param, and actually allocated — a Void map-void has no result buffer).
+      (and result-sym (not (some #(= result-sym %) array-params))
+           (contains? (:buffers @sess) (keyword (name result-sym))))
       (assoc result-sym (download sess (keyword (name result-sym)))))))
 
 (defn sync-to-arrays!

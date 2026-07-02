@@ -1450,6 +1450,9 @@
     (walk/postwalk
      (fn [form]
        (when (and (seq? form)
+                  ;; loop* (not loop) is what survives macroexpand/materialize into the kernel
+                  ;; body — omitting it leaks loop induction/accumulator vars (i, s) into the
+                  ;; kernel's scalar params (→ unresolved-symbol when arg-fns are built).
                   (contains? #{'let 'let* 'loop 'loop*} (first form))
                   (>= (count form) 3))
          (let [bindings (second form)]
