@@ -329,23 +329,29 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-butterfly! form))))
 
-            ;; === Structural recursion ===
+            ;; === Structural recursion (PRESERVE metadata) ===
+            ;; A bare (apply list head ...) rebuild drops the form's metadata — in particular
+            ;; :raster.op/original on a devirtualized .invk (e.g. blas/dgemm!), which downstream
+            ;; GEMM recognition (parse-gpu-step, gpu_plan) reads. Re-attach the original meta.
 
             (and (seq? form) (contains? #{'let 'let*} (first form)))
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
                   new-bindings (vec (mapcat (fn [[sym expr]] [sym (transform expr)]) pairs))
                   new-body (mapv transform body-exprs)]
-              (apply list let-sym new-bindings new-body))
+              (with-meta (apply list let-sym new-bindings new-body) (meta form)))
 
             (and (seq? form) (= 'do (first form)))
-            (apply list 'do (mapv transform (rest form)))
+            (with-meta (apply list 'do (mapv transform (rest form))) (meta form))
 
             (seq? form)
-            (let [head (first form)]
-              (if (symbol? head)
-                (apply list head (mapv transform (rest form)))
-                (mapv transform form)))
+            (let [head (first form)
+                  rebuilt (if (symbol? head)
+                            (apply list head (mapv transform (rest form)))
+                            (mapv transform form))]
+              (if (and (instance? clojure.lang.IObj rebuilt) (meta form))
+                (with-meta rebuilt (meta form))
+                rebuilt))
 
             :else form))]
     {:form (transform form)
