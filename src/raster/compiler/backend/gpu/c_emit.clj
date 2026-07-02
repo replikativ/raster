@@ -222,6 +222,24 @@
   "Dtype keyword → C type. Derived from the single faceted dtype/native-types."
   (dtype/backend-types :c))
 
+(defn scalar-native-type
+  "Native type for a kernel SCALAR param, for a kernel whose element type is
+   `ctype`. A DECLARED type wins authoritatively — float/double/half → `ctype`
+   (the kernel element type), int/long/byte → \"int\"; ONLY when the declared
+   type is unknown does the name-regex / :tag heuristic apply. Loud-over-silent:
+   a declared float named `step-size`/`max-len` must NOT be truncated to int by
+   the counter-name regex. Single source for the OpenCL/GLSL backends (was a
+   7-way-duplicated cond where only an explicit :int short-circuited)."
+  [sym scalar-types ctype]
+  (let [sname (name sym)
+        explicit (get scalar-types sym (get scalar-types (symbol sname)))]
+    (cond
+      (contains? #{:float :double :half} explicit) ctype
+      (contains? #{:int :long :byte} explicit) "int"
+      (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
+          (contains? #{'long 'int} (:tag (meta sym)))) "int"
+      :else ctype)))
+
 (defn fn-style-reduction-op?
   "True if a reduction op emits as a C function call `f(a,b)` (fmax/fmin) rather
    than an infix operator `(a op b)`. Single source for the GPU reduction
@@ -1267,7 +1285,18 @@
                 ")")))
 
      :else
-     (str expr))))
+     ;; Loud over silently corrupt: an unhandled IR form pr-str'd into the C/OpenCL
+     ;; source produces garbage (a cryptic clang/ocloc error, or a call to a
+     ;; nonexistent function). Surfacing this as a WARNING (was fully silent) flagged
+     ;; two real backend gaps: `case*` branch-maps (abm/firms, blelloch-scan,
+     ;; autotuner) and a SIMD-fold vector `[L 8]` (x8-simd-fold) — both stringified
+     ;; into invalid C. TODO: lower case* → cond and handle the SIMD vector, THEN
+     ;; flip this to `throw` (the true loud form). Tracked in compiler_consolidation.
+     (do (binding [*out* *err*]
+           (println (str "WARNING: c-emit unhandled IR form (" (type expr)
+                         ") — emitting as text, likely invalid. Lower it upstream. Form: "
+                         (pr-str expr))))
+         (str expr)))))
 
 ;; ================================================================
 ;; deftm inlining support

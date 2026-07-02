@@ -48,15 +48,7 @@
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int) "int"
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
