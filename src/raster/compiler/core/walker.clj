@@ -908,12 +908,39 @@
 ;; Branch: deftm call (devirtualization)
 ;; ================================================================
 
+(defn- narrow-fp-literal-form
+  "Wrap a bare Double literal in the element-dtype cast (0.044715 → (float …)) —
+   only for :float (the narrowing monomorphization; :double is identity). The
+   call-arg half of contextual literal typing, applied speculatively and kept
+   only when it yields a clean concrete overload."
+  [x element-dtype]
+  (if (and (= element-dtype :float) (instance? Double x)) (list 'float x) x))
+
 (defmethod walk-form :deftm-call [form ctx]
   (let [source-ns (:source-ns ctx)
         type-env (:type-env ctx)
         fn-sym (first form)
-        rewritten-args (walk-forms (vec (rest form)) ctx)
-        original-args (vec (rest form))
+        elem-dt (:element-dtype ctx)
+        rewritten-args0 (walk-forms (vec (rest form)) ctx)
+        original-args0 (vec (rest form))
+        ;; B3 — call-arg half of contextual literal typing: a floating-literal arg
+        ;; adopts the element dtype WHEN that yields a clean concrete overload
+        ;; (arithmetic, e.g. (* 0.044715 x:float) → [Float Float]). A call whose
+        ;; narrowed args only PROMOTE — a concrete non-T param like eps:Double —
+        ;; keeps the true-typed literal (the un-narrowed fallback below). Self-
+        ;; routing per call; the fallback is exactly the previous behavior.
+        narrowed-orig (when (and (= elem-dt :float)
+                                 (some #(instance? Double %) original-args0))
+                        (mapv #(narrow-fp-literal-form % elem-dt) original-args0))
+        use-narrowed? (and narrowed-orig
+                           (binding [*ns* source-ns]
+                             (when-let [r (inf/try-resolve-call fn-sym narrowed-orig type-env)]
+                               (and (not (:promotion-casts r))
+                                    (not (some #{'Object 'Number} (:tags r)))))))
+        rewritten-args (if use-narrowed?
+                         (mapv #(narrow-fp-literal-form % elem-dt) rewritten-args0)
+                         rewritten-args0)
+        original-args (if use-narrowed? narrowed-orig original-args0)
         extra-tags (mapv (fn [orig rewr]
                            (or (inf/infer-aget-type orig type-env)
                                (when (seq? rewr)
