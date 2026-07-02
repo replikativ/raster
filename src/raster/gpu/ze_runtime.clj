@@ -1721,17 +1721,17 @@
   handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
   ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
   ([a b c m n k c-dtype]
-  (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
-        kh (create-kernel-fresh module kernel-name)
-        m (long m) n (long n) k (long k)
-        args [(:segment a) (:segment b) (:segment c)
-              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd (bind-kernel-2d! kh [256 1] args)
-        gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
-    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
-    (.set gc I32 8 (int 1))
-    bnd)))
+   (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
+         kh (create-kernel-fresh module kernel-name)
+         m (long m) n (long n) k (long k)
+         args [(:segment a) (:segment b) (:segment c)
+               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+         bnd (bind-kernel-2d! kh [256 1] args)
+         gc ^MemorySegment (:gc-seg bnd)]
+     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+     (.set gc I32 8 (int 1))
+     bnd)))
 
 (def ^:private convert-cache (atom nil))
 
@@ -1766,6 +1766,41 @@
         bnd (bind-kernel! kh 256 args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double n) 256.0))))
     bnd))
+
+(def ^:private transpose-cache (atom {}))
+
+(defn- ensure-transpose-kernel!
+  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float). Returns
+   {:module :kernel :kernel-name}."
+  [dtype]
+  (ensure-init!)
+  (or (get @transpose-cache dtype)
+      (let [kname (str "transpose_" (name dtype))
+            src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                    ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)
+                     kname :dtype dtype))
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     src :device (:device-id-hex @state)))
+            module (load-module! spv)
+            kernel (create-kernel module kname)
+            entry {:module module :kernel kernel :kernel-name kname}]
+        (swap! transpose-cache assoc dtype entry)
+        entry)))
+
+(defn bind-registered-transpose!
+  "Bind a 2D transpose kernel (in[rows,cols] → out[cols,rows], row-major) over RESIDENT buffers
+  for recording — used to realize dgemm-nt!/-tn! by transposing an operand before the :nn XMX
+  GEMM. dtype :half (default) | :float. Returns a bound {:kernel :gc-seg} map."
+  ([in out rows cols] (bind-registered-transpose! in out rows cols :half))
+  ([in out rows cols dtype]
+   (let [{:keys [module kernel-name]} (ensure-transpose-kernel! dtype)
+         kh (create-kernel-fresh module kernel-name)
+         total (* (long rows) (long cols))
+         args [(:segment in) (:segment out) {:type :int :value (int rows)} {:type :int :value (int cols)}]
+         bnd (bind-kernel! kh 256 args)]
+     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
+     bnd)))
 
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.
