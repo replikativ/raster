@@ -825,6 +825,17 @@
   (and (seq? form) (= '.invk (first form))
        (contains? blas-gemm-ops (:raster.op/original (meta form)))))
 
+(def ^:private gpu-alloc-invk-ops
+  "Devirtualized array-alloc ops: (.invk op-impl ref size) → an intermediate of `size` elems.
+   These come from functional linear layers (linear-nb allocs its output via zeros-like); the
+   zeroing is moot when a GEMM/kernel fully overwrites the buffer."
+  #{'raster.arrays/zeros-like 'raster.arrays/alloc-like})
+
+(defn- alloc-invk?
+  [form]
+  (and (seq? form) (= '.invk (first form))
+       (contains? gpu-alloc-invk-ops (:raster.op/original (meta form)))))
+
 (defn- parse-gpu-step
   "One invoke-registered-* / GEMM binding → a step record. :arrays is the full resident-buffer
    arg list in the kernel's signature order (for map! the separate output is appended, so on the
@@ -887,6 +898,9 @@
         (cond
           (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
           (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          ;; devirtualized alloc: (.invk zeros-like/alloc-like-impl ref size) → intermediate
+          (alloc-invk? expr)
+          (vswap! allocs conj {:sym sym :size-expr (nth (vec (drop 2 expr)) 1)})
           (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
           (if-let [s (parse-gpu-step sym expr)]
             (vswap! steps conj s)
