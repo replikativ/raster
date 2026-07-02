@@ -789,13 +789,21 @@
          (str n "[" opencl-idx "]")
          (if (= expr idx-sym) opencl-idx n)))
 
-     ;; aget -> array read (SoA reads/field projection are scalar-replaced
-     ;; upstream by soa-lower, so only plain per-field arrays reach here)
-     (and (seq? expr)
-          (descriptor/aget-op? (first expr))
-          (>= (count expr) 3))
-     (let [arr      (second expr)
-           idx-expr (nth expr 2)]
+     ;; aget -> array read. Handles surface forms (aget arr idx) AND devirtualized
+     ;; interface calls (.invk <impl> arr idx) via the walker-stamped :raster.op/original
+     ;; op: typed params stay primitive clojure.core/aget, but INTERMEDIATE arrays are
+     ;; devirtualized to .invk by the materialize pass — both must emit the same C array
+     ;; subscript. (Reading the carried op, not the mangled impl name — see CLAUDE.md.)
+     ;; (SoA reads/field projection are scalar-replaced upstream by soa-lower, so only
+     ;; plain per-field arrays reach here.)
+     (or (and (seq? expr)
+              (descriptor/aget-op? (first expr))
+              (>= (count expr) 3))
+         (and (seq? expr) (= '.invk (first expr)) (>= (count expr) 4)
+              (descriptor/aget-op? (:raster.op/original (meta expr)))))
+     (let [invk?    (= '.invk (first expr))
+           arr      (if invk? (nth expr 2) (second expr))
+           idx-expr (if invk? (nth expr 3) (nth expr 2))]
        (str (c-symbol arr) "["
             (emit-expr idx-expr idx-sym array-syms opencl-idx) "]"))
 

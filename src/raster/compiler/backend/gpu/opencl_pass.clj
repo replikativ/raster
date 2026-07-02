@@ -15,6 +15,36 @@
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
 
+;; ================================================================
+;; Single source of declared GPU param types (shared by BOTH compile entries:
+;; raster.gpu.core/compile-deftm-internal! and the pipeline's pass-backend).
+;; ================================================================
+
+(def array-tag->dtype
+  "Deftm array tag (the Java array-class symbol) → element dtype keyword."
+  {'doubles :double 'floats :float 'longs :long 'ints :int 'bytes :byte})
+
+(defn derive-param-types
+  "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
+  (the typed-dispatch system already knows these — we read them instead of letting the emitter
+  guess from parameter names). Scalar params: long/int→:int, double/float→:float. Array params:
+  the tag's element dtype, with float-family (float/double) mapped to the KERNEL dtype (a single-
+  precision kernel reads float buffers regardless of a parametric (All [T]) param's default).
+  Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
+  opencl-pass reads. ONE derivation, both compile paths."
+  [params tags dtype]
+  (when (and params tags)
+    {:scalar-types (into {} (keep (fn [[p t]]
+                                    (case t
+                                      (long longs int ints) [p :int]
+                                      (double doubles float floats) [p :float]
+                                      nil))
+                                  (map vector params tags)))
+     :array-types (into {} (keep (fn [[p t]]
+                                   (when-let [dt (array-tag->dtype t)]
+                                     [p (if (#{:float :double} dt) dtype dt)]))
+                                 (map vector params tags)))}))
+
 (def ^:private segop-id-counter (atom 0))
 
 (defn- par->segmap
