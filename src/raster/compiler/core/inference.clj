@@ -18,6 +18,7 @@
   (:require [clojure.string :as str]
             [clojure.core.typed :as t]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.tc-extensions]))
@@ -426,6 +427,31 @@
 
 (defn literal-tag [form]
   (some (fn [[pred tag]] (when (pred form) tag)) literal-type-tags))
+
+(defn floating-literal-tag
+  "Type tag for a literal `form`, narrowing a bare floating (Double) literal to
+   the ambient monomorphization `element-dtype` when one is in scope. This is the
+   binding-init half of contextual literal typing: a `0.0` accumulator init in a
+   T=float body tags as 'float so the loop stays devirtualized, without the old
+   blind pre-pass that also corrupted literals bound to concrete non-T params.
+   Integer/other literals are unaffected — index/counter literals stay 'long.
+   Returns nil for non-literals."
+  [form element-dtype]
+  (when-let [lt (literal-tag form)]
+    (if (and element-dtype (instance? Double form))
+      (dtype/scalar-tag-for-dtype element-dtype)
+      lt)))
+
+(defn floating-literal-narrowed-tag
+  "The element-dtype scalar tag IFF `form` is a bare Double literal and an
+   `element-dtype` is in scope; nil otherwise. Distinct from floating-literal-tag
+   in that it fires ONLY for the narrow-worthy case, so it can be used as a
+   priority override of TC's `double` tag on a monomorphized accumulator init
+   (a policy layer above TC — TC's `double` is correct for the source literal;
+   we are deliberately narrowing to the element dtype)."
+  [form element-dtype]
+  (when (and element-dtype (instance? Double form))
+    (dtype/scalar-tag-for-dtype element-dtype)))
 
 (defn hint-tag [form]
   (when-let [m (meta form)]
@@ -1370,13 +1396,15 @@
       compound shapes)
     - Cheap structural fallbacks for when TC didn't run (parametric
       functions, TC errors)"
-  [sym init rewritten-init type-env {:keys [source-ns]}]
+  [sym init rewritten-init type-env {:keys [source-ns element-dtype]}]
   (or
    ;; Explicit ^tag metadata — user override, authoritative
    (when-let [t (hint-tag sym)]
      (trace-inferred sym t :hint))
-   ;; Literal type — TC covers this, but free and needed for parametric fns
-   (when-let [t (literal-tag init)]
+   ;; Literal type — TC covers this, but free and needed for parametric fns.
+   ;; A bare floating literal narrows to the ambient element dtype (binding-init
+   ;; half of contextual literal typing); integer literals stay 'long.
+   (when-let [t (floating-literal-tag init element-dtype)]
      (trace-inferred sym t :literal))
    ;; Symbol alias — propagate known type
    (when-let [t (when (symbol? init) (type-env-tag type-env init))]

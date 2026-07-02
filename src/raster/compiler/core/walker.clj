@@ -514,7 +514,8 @@
                  (if extra-binds
                    (reduce (fn [[binds ctx] [esym einit]]
                              (let [etag (inf/infer-binding-tag esym einit einit (:type-env ctx)
-                                                               {:source-ns (:source-ns ctx)})
+                                                               {:source-ns (:source-ns ctx)
+                                                                :element-dtype (:element-dtype ctx)})
                                    esym (if etag (stamp-type-meta esym etag) esym)]
                                [(conj binds esym einit)
                                 (if etag (ctx-assoc-type ctx esym etag) ctx)]))
@@ -524,9 +525,14 @@
                  type-env (:type-env ctx)
                  ;; TC pre-computed hint takes priority (covers core arith, deftm returns)
                  tc-tag (get (:tc-binding-tags ctx) sym)
-                 tag (or tc-tag
+                 ;; A bare floating-literal init narrows to the element dtype and
+                 ;; OVERRIDES TC's `double` (monomorphization policy above TC), so a
+                 ;; `0.0` accumulator in a T=float body stays devirtualized.
+                 tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
+                         tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
-                                                {:source-ns (:source-ns ctx)}))
+                                                {:source-ns (:source-ns ctx)
+                                                 :element-dtype (:element-dtype ctx)}))
                  elem-tag (inf/infer-element-tag init tag type-env)
                  hint (inf/compute-binding-hint tag sym)
                  sym (stamp-type-meta sym (or hint tag) elem-tag)]
@@ -687,7 +693,7 @@
         walked-init (walk init-expr ctx)
         walked-bound (walk bound-expr ctx)
         acc-tag (or (inf/hint-tag acc-sym)
-                    (inf/literal-tag init-expr)
+                    (inf/floating-literal-tag init-expr (:element-dtype ctx))
                     ;; Recognize cast expressions: (float x), (double x)
                     (when (and (seq? init-expr) (symbol? (first init-expr)))
                       (case (first init-expr)
@@ -724,7 +730,7 @@
         walked-init (walk init-expr ctx)
         walked-bound (walk bound-expr ctx)
         acc-tag (or (inf/hint-tag acc-sym)
-                    (inf/literal-tag init-expr)
+                    (inf/floating-literal-tag init-expr (:element-dtype ctx))
                     (when (and (seq? init-expr) (symbol? (first init-expr)))
                       (case (first init-expr)
                         float 'float
