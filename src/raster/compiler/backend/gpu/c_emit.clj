@@ -568,10 +568,14 @@
                     :locals locals
                     :loop-stmts (conj (or loop-stmts []) loop-code)
                     :seen-names (or seen-names {})})
-                 ;; Declare (evaluate once) when multi-use OR side-effecting: inlining a
-                 ;; single-use side-effecting binding (e.g. softmax's exp-and-sum loop, which
-                 ;; writes `out`) into a later loop body re-runs its writes every iteration.
-                 (if (or (multi-use? sym) (has-side-effects? val))
+                 ;; Declare (evaluate once) when multi-use OR side-effecting OR loop-valued.
+                 ;; Inlining a single-use side-effecting binding (softmax's exp-and-sum loop that
+                 ;; writes `out`) into a later loop re-runs its writes every iteration. A pure
+                 ;; loop-valued binding (softmax's max-reduction) inlined into a later loop is
+                 ;; O(n²) recompute AND — when the kernel writes its input in place (x==out) —
+                 ;; the recompute reads already-overwritten values → wrong. Hoist loops.
+                 (if (or (multi-use? sym) (has-side-effects? val)
+                         (and (seq? val) (contains? #{'loop 'loop*} (first val))))
                    (let [base-name (c-symbol sym)
                          prev-count (get seen-names base-name 0)
                          c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
