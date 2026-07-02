@@ -1081,17 +1081,11 @@
   "Cache for compiled GEMM kernel module. Atom holding {:module :kernel}."
   (atom nil))
 
-(defn gemm!
-  "GPU matrix multiply: C = A × B using XMX DPAS instructions.
-  A: FP16 DeviceBuffer [M×K], B: FP16 DeviceBuffer [K×N],
-  C: FP16 DeviceBuffer [M×N] (output, will be overwritten).
-  All matrices are row-major.
-
-  Returns C."
-  [a b c m n k]
+(defn- ensure-gemm-kernel!
+  "Lazily compile + cache the XMX gemm_nonsquare kernel. Returns {:module :kernel}."
+  []
   (ensure-init!)
   (when (nil? @gemm-cache)
-    ;; Lazy-compile the GEMM kernel on first use
     (let [cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
                      ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
                       "gemm_nonsquare"))
@@ -1102,7 +1096,17 @@
           module (load-module! spv)
           kernel (create-kernel module "gemm_nonsquare")]
       (clojure.core/reset! gemm-cache {:module module :kernel kernel})))
-  (let [{:keys [kernel]} @gemm-cache
+  @gemm-cache)
+
+(defn gemm!
+  "GPU matrix multiply: C = A × B using XMX DPAS instructions.
+  A: FP16 DeviceBuffer [M×K], B: FP16 DeviceBuffer [K×N],
+  C: FP16 DeviceBuffer [M×N] (output, will be overwritten).
+  All matrices are row-major.
+
+  Returns C."
+  [a b c m n k]
+  (let [{:keys [kernel]} (ensure-gemm-kernel!)
         gc-m (int (Math/ceil (/ (double m) 128.0)))
         gc-n (int (Math/ceil (/ (double n) 128.0)))
         args [(:segment a) (:segment b) (:segment c)
@@ -1790,6 +1794,25 @@
         group-count (long (Math/ceil (/ (double n) (double wg))))
         bnd (bind-kernel! kernel-handle wg all-args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
+    bnd))
+
+(defn bind-registered-gemm!
+  "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
+  command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
+  call). A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
+  {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
+  handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
+  [a b c m n k]
+  (let [{:keys [module]} (ensure-gemm-kernel!)
+        kh (create-kernel-fresh module "gemm_nonsquare")
+        m (long m) n (long n) k (long k)
+        args [(:segment a) (:segment b) (:segment c)
+              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+        bnd (bind-kernel-2d! kh [256 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 8 (int 1))
     bnd))
 
 (defn invoke-registered-map-void-kernel
