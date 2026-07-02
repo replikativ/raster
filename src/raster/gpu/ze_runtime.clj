@@ -189,6 +189,23 @@
 (def ^:private h-zeCommandListAppendBarrier
   (delay (make-handle "zeCommandListAppendBarrier" (fd I32 PTR PTR I32 PTR))))
 
+;; --- Regular (replayable) command list + queue: enqueue-all-sync-once (command graph) ---
+(def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
+(def ^:private h-zeCommandQueueCreate
+  (delay (make-handle "zeCommandQueueCreate" (fd I32 PTR PTR PTR PTR))))
+(def ^:private h-zeCommandListCreate
+  (delay (make-handle "zeCommandListCreate" (fd I32 PTR PTR PTR PTR))))
+(def ^:private h-zeCommandListClose
+  (delay (make-handle "zeCommandListClose" (fd I32 PTR))))
+(def ^:private h-zeCommandQueueExecuteCommandLists
+  (delay (make-handle "zeCommandQueueExecuteCommandLists" (fd I32 PTR I32 PTR PTR))))
+(def ^:private h-zeCommandListDestroy
+  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
+(def ^:private h-zeCommandQueueDestroy
+  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
+(def ^:private h-zeKernelDestroy
+  (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
+
 (def ^:private h-zeModuleDestroy
   (delay (make-handle "zeModuleDestroy" (fd I32 PTR))))
 
@@ -1316,6 +1333,79 @@
     (.set gc I32 4 (int group-count-y))
     (.invokeWithArguments ^MethodHandle (:h-launch bound)
                           ^"[Ljava.lang.Object;" (:launch-args bound))))
+
+;; ================================================================
+;; Command graph: enqueue-all → execute-once → sync-once (OpenVINO's model)
+;; The per-op-barrier immediate list pays the ~35-75µs launch floor per kernel;
+;; a recorded regular command list pays the host-append cost ONCE and replays the
+;; whole sequence with a single queue execute. This is the raster analog of
+;; OpenVINO's in-order-enqueue + single-finish (5ms MiniLM vs 36ms per-op).
+;; ================================================================
+
+(defn create-kernel-fresh
+  "Create a NEW, UNCACHED kernel handle. LZ kernel arguments are mutable state on
+  the kernel handle, snapshotted at append; a recorded graph with N launches of
+  the same compiled kernel must give each launch its own handle or the last args
+  win (the 127-matmul clobber). Pair with destroy-kernel! at teardown."
+  ^MemorySegment [^MemorySegment module ^String kernel-name]
+  (ensure-init!)
+  (let [arena (:arena @state)
+        kern-desc (.allocate arena 32)
+        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
+        name-seg (.allocateFrom arena kernel-name)
+        _ (.set kern-desc PTR 24 name-seg)
+        kern-out (ptr-seg arena)
+        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
+    (read-ptr kern-out)))
+
+(defn record-graph!
+  "Record an ordered seq of bound kernels into a regular (replayable) command list.
+  Each `bound` (from bind-kernel!/bind-kernel-2d!, each carrying its own dedicated
+  kernel handle with args + group counts already set into its :gc-seg) is appended
+  once, with NO per-op barrier — ordering is implicit in the list. Returns a graph
+  {:queue :list :lists-arr} for replay-graph!. Re-record only if the kernel
+  sequence or any buffer pointer changes; buffer CONTENTS may change between replays."
+  [bounds]
+  (ensure-init!)
+  (let [{:keys [arena context device]} @state
+        cq-desc (.allocate ^Arena arena 40)
+        _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until list completes
+        q-out (ptr-seg arena)
+        _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate [context device cq-desc q-out])
+        queue (read-ptr q-out)
+        cl-desc (.allocate ^Arena arena 24)
+        _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+        l-out (ptr-seg arena)
+        _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate [context device cl-desc l-out])
+        lst (read-ptr l-out)
+        h-launch @h-zeCommandListAppendLaunchKernel]
+    (doseq [{:keys [kernel gc-seg]} bounds]
+      (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                [lst kernel gc-seg MemorySegment/NULL (int 0) MemorySegment/NULL]))
+    (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+    (let [lists-arr (ptr-seg arena)]
+      (.set lists-arr PTR 0 ^MemorySegment lst)
+      {:queue queue :list lst :lists-arr lists-arr})))
+
+(defn replay-graph!
+  "Execute a recorded command graph once. The SYNCHRONOUS queue blocks until the
+  whole recorded sequence completes — one host round-trip for the entire graph."
+  [graph]
+  (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
+            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
+
+(defn destroy-graph!
+  "Destroy a recorded graph's command list + queue (pairs zeCommandListCreate /
+  zeCommandQueueCreate; avoids the driver-object-leak SIGABRT)."
+  [graph]
+  (when-let [l (:list graph)] (ze-call! "zeCommandListDestroy" @h-zeCommandListDestroy [l]))
+  (when-let [q (:queue graph)] (ze-call! "zeCommandQueueDestroy" @h-zeCommandQueueDestroy [q])))
+
+(defn destroy-kernel!
+  "Destroy a kernel handle from create-kernel-fresh."
+  [^MemorySegment kernel]
+  (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel]))
 
 ;; ================================================================
 ;; Kernel registry (pipeline integration)
