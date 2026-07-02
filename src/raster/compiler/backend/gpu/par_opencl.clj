@@ -220,9 +220,13 @@
                                              (:fields info))))
                                     soa-arr-params))
         all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
+        ;; Seed *int-vars* with the work-item index and the DECLARED-int scalar params
+        ;; (e.g. `features`, `rows`), so index arithmetic like `(* idx features)` infers an
+        ;; integer C type for the offset local rather than defaulting to the float scalar-type
+        ;; (which yields non-integer array subscripts in per-row kernels with inner loops).
+        int-scalar-syms (into #{idx} (filter #(= "int" (scl-type %)) scl-params))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* default-ctype
-                           ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         ;; Detect if body uses float atomic-add (needs CAS helper function)
