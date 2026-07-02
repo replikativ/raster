@@ -83,6 +83,7 @@
                            (contains? #{'long 'int} (:tag (meta s))))
                        "int"
                        :else default-ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))

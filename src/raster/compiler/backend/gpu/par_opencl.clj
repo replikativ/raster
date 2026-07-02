@@ -84,15 +84,7 @@
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int) "int"
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -183,24 +175,8 @@
                                                            (str "__global const " ct "* restrict " flat-sym))))
                                                      fields)))
                                             soa-arr-params))
-        ;; Scalar param C type: the DECLARED type (from the deftm tags via scalar-types) wins.
-        ;; The name/metadata heuristic is only a fallback for params with no declared type —
-        ;; it must NOT override a declared one (a Double `gain-offset` is float, not int).
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int)    "int"
-                       (= explicit :long)   "long"
-                       (= explicit :double) "double"
-                       (= explicit :float)  default-ctype
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else default-ctype)))
-        ;; Integer scalar params seed *int-vars* for the body, so index math that uses a scalar
-        ;; (e.g. offset = r*features) infers integer instead of *scalar-type* (float).
-        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
+        ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -739,15 +715,7 @@
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int) "int"
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
