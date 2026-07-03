@@ -298,3 +298,73 @@
                                  (recur (inc sb) (+ a (* dv dact ssum))))
                                a))]
                    (ra/aset y o (float acc)))))
+
+;; ---- signed q8_0 PREFILL kernels (GPU embed mode, S3) ----
+;; Embeddings need >=8-bit weights (measured: 4-bit costs ~5%+ cosine). Signed
+;; symmetric q8_0 (d = max|x|/127, q in [-127,127]) x signed i8 activations means
+;; the dp4a dot needs NO zero-point fold and NO block sums — the simplest exact
+;; int8 pipeline. Prefill processes T rows per replay (weights read once — the
+;; compute-bound shape where the GPU wins), so both kernels carry a rows dim.
+
+(deftm quant-act-i8-rows-gpu!
+  "Signed q8_0 activation quantizer over T rows: one work-item per (row, 32-block)
+  computes d = max|x|/127 for its block, packs 32 signed int8 into 8 int32 words
+  (xp, little-endian lanes) and stores d (xs, one float per row-block).
+  Grid = nrows*(in/32)."
+  [x :- (Array float), xp :- (Array int), xs :- (Array float),
+   in :- Long, nrows :- Long] :- Void
+  (par/map-void! rb (* nrows (quot in 32))
+    (let [nb (quot in 32)
+          b (rem rb nb)
+          r (quot rb nb)
+          base (+ (* r in) (* b 32))
+          mx (loop [k 0 m 0.0]
+               (if (< k 32)
+                 (let [v (ra/aget x (+ base k))]
+                   (recur (inc k) (max m (max v (- v)))))
+                 m))
+          d (/ (double mx) 127.0)
+          id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)]
+      (ra/aset xs rb (float d))
+      (loop [w 0]
+        (if (< w 8)
+          (let [e (+ base (* w 4))
+                q0 (long (Math/round (* (double (ra/aget x e)) id)))
+                q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
+                q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
+                q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                word (bit-or (bit-and q0 0xFF)
+                             (bit-shift-left (bit-and q1 0xFF) 8)
+                             (bit-shift-left (bit-and q2 0xFF) 16)
+                             (bit-shift-left (bit-and q3 0xFF) 24))]
+            (ra/aset xp (+ (* rb 8) w) (int word))
+            (recur (inc w)))
+          nil)))))
+
+(deftm qmatmul-i8-gemm!
+  "Signed q8_0 x q8_0 GEMM for prefill: one work-item per (token, out-row) —
+  y[t*out+o] = sum_b ws[o,b]*xs[t,b]*dp4a-dot(block b). Weights row-major signed-i8
+  int-packed (wp int[out*in/4], ws float[out*(in/32)]); activations from
+  quant-act-i8-rows-gpu!. Grid = nrows*out."
+  [xp :- (Array int), xs :- (Array float),
+   wp :- (Array int), ws :- (Array float), y :- (Array float),
+   in :- Long, out :- Long, nrows :- Long] :- Void
+  (par/map-void! ot (* nrows out)
+    (let [o (rem ot out)
+          t (quot ot out)
+          nb (quot in 32)
+          ni4 (quot in 4)
+          acc (loop [b 0 a 0.0]
+                (if (< b nb)
+                  (let [dp (loop [k 0 d 0]
+                             (if (< k 8)
+                               (recur (inc k)
+                                      (par/dp4a (ra/aget wp (+ (* o ni4) (* b 8) k))
+                                                (ra/aget xp (+ (* t ni4) (* b 8) k)) d))
+                               d))]
+                    (recur (inc b)
+                           (+ a (* (* (double (ra/aget ws (+ (* o nb) b)))
+                                      (double (ra/aget xs (+ (* t nb) b))))
+                                   (double dp)))))
+                  a))]
+      (ra/aset y (+ (* t out) o) (float acc)))))
