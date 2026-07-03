@@ -570,37 +570,47 @@
           multi-use? (fn [sym] (> (get use-counts sym 0) 1))
           {:keys [env locals loop-stmts ints]}
           (reduce
-           (fn [{:keys [env locals loop-stmts seen-names]} [sym val]]
-             (let [val-subst (walk/postwalk
-                              (fn [f] (if (and (symbol? f) (contains? env f))
-                                        (get env f) f))
-                              val)]
-                ;; Detect loop RHS in GLSL (needs statement hoisting)
-               (if (and (not (supports-stmt-expr?))
-                        (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst)))
-                  ;; Hoist loop: emit as statements, alias sym → first loop var
-                 (let [loop-var (first (take-nth 2 (second val-subst)))
-                       loop-c-name (c-symbol loop-var)
-                       loop-code (emit-expr val-subst idx-sym array-syms opencl-idx)]
-                   {:env (assoc env sym (symbol loop-c-name))
-                    :locals locals
-                    :loop-stmts (conj (or loop-stmts []) loop-code)
-                    :seen-names (or seen-names {})})
-                 ;; Declare (evaluate once) when multi-use OR side-effecting OR loop-valued.
-                 ;; Inlining a single-use side-effecting binding (softmax's exp-and-sum loop that
-                 ;; writes `out`) into a later loop re-runs its writes every iteration. A pure
-                 ;; loop-valued binding (softmax's max-reduction) inlined into a later loop is
-                 ;; O(n²) recompute AND — when the kernel writes its input in place (x==out) —
-                 ;; the recompute reads already-overwritten values → wrong. Hoist loops.
-                 (if (or (multi-use? sym) (has-side-effects? val)
-                         (and (seq? val) (contains? #{'loop 'loop*} (first val))))
-                   (let [base-name (c-symbol sym)
-                         prev-count (get seen-names base-name 0)
-                         c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
-                         c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                         c-type (infer-c-type val-subst)]
-                     {:env (assoc env sym (symbol c-name))
-                      :locals (conj locals [c-name c-expr c-type])
+           (fn [{:keys [env locals loop-stmts seen-names ints]} [sym val]]
+             ;; Type each binding under the integer vars accumulated so far, so a
+             ;; dependent index binding (e.g. sbb = o*nsb after nsb = in/256) infers
+             ;; integer rather than defaulting to *scalar-type* (float) — which would
+             ;; emit a float array subscript and fail to compile.
+             (binding [*int-vars* (into *int-vars* ints)]
+               (let [val-subst (walk/postwalk
+                                (fn [f] (if (and (symbol? f) (contains? env f))
+                                          (get env f) f))
+                                val)]
+                  ;; Detect loop RHS in GLSL (needs statement hoisting)
+                 (if (and (not (supports-stmt-expr?))
+                          (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst)))
+                    ;; Hoist loop: emit as statements, alias sym → first loop var
+                   (let [loop-var (first (take-nth 2 (second val-subst)))
+                         loop-c-name (c-symbol loop-var)
+                         loop-code (emit-expr val-subst idx-sym array-syms opencl-idx)]
+                     {:env (assoc env sym (symbol loop-c-name))
+                      :locals locals
+                      :loop-stmts (conj (or loop-stmts []) loop-code)
+                      :seen-names (or seen-names {})
+                      :ints ints})
+                   ;; Force-declare loop-valued bindings even when single-use: inlining a
+                   ;; reduction into its use site recomputes it per use AND duplicates the
+                   ;; loop's induction var into the surrounding scope (a shadowing bug the
+                   ;; OpenCL compiler miscompiles). A reduction must be computed once.
+                   (if (or (multi-use? sym)
+                           (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
+                     (let [base-name (c-symbol sym)
+                           prev-count (get seen-names base-name 0)
+                           c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
+                           c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
+                           c-type (infer-c-type val-subst)]
+                       {:env (assoc env sym (symbol c-name))
+                        :locals (conj locals [c-name c-expr c-type])
+                        :loop-stmts loop-stmts
+                        :seen-names (assoc seen-names base-name (inc prev-count))
+                        :ints (if (contains? #{"int" "uint" "long"} c-type)
+                                (conj ints (symbol c-name)) ints)})
+                     {:env (assoc env sym val-subst)
+                      :locals locals
                       :loop-stmts loop-stmts
                       :seen-names (or seen-names {})
                       :ints ints})))))
@@ -905,12 +915,14 @@
                                  (fn [f] (if (and (symbol? f) (contains? env f))
                                            (get env f) f))
                                  val)]
-                  ;; A binding whose value has SIDE EFFECTS (e.g. a loop that writes an array,
-                  ;; as in softmax's exp-and-sum pass) must be DECLARED (evaluated once), never
-                  ;; inlined — inlining a single-use side-effecting binding into a later loop
-                  ;; body re-runs its writes every iteration (silent miscompile). Hoisting is
-                  ;; also correct for pure single-use bindings, so widen the declare condition.
-                  (if (or (multi-use? sym) (has-side-effects? val))
+                  ;; Force-declare when: multi-use; loop-valued (a reduction must be computed
+                  ;; once, not inlined+recomputed per use); or SIDE-EFFECTING (e.g. a loop that
+                  ;; writes an array, as in softmax's exp-and-sum pass) — inlining a single-use
+                  ;; side-effecting binding into a later loop body re-runs its writes every
+                  ;; iteration (silent miscompile).
+                  (if (or (multi-use? sym)
+                          (has-side-effects? val)
+                          (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
                     (let [base-name (c-symbol sym)
                           prev-count (get seen-names base-name 0)
                           c-name (if (> prev-count 0)
