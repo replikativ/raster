@@ -71,19 +71,7 @@
                                      arr-params))
         ;; Integer scalar params seed *int-vars* so index math stays integer
         int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int)    "int"
-                       (= explicit :long)   "long"
-                       (= explicit :double) "double"
-                       (= explicit :float)  default-ctype
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else default-ctype)))
-        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
