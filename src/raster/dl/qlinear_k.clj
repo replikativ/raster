@@ -14,45 +14,57 @@
 ;; ---- q8_K activation quantizer (the GPU-resident enabler) ----
 ;; float activation x[in] → q8_K for the dp4a matmul, ON the GPU: per 256-super-block
 ;; d = max|x|/127; int8 quants packed 4-per-int32 element-order (xp); xs = d; bsums = per
-;; 32-sub-block int sum. One work-item per super-block. Output feeds qmatmul-q4k-dp4a!
-;; directly (no host round-trip), so norm→quant→matmul chains entirely on-device in a graph.
+;; 32-sub-block int sum. Output feeds qmatmul-q4k-dp4a! directly (no host round-trip), so
+;; norm→quant→matmul chains run entirely on-device in a graph.
+;;
+;; 2-PHASE PARALLEL (was: one work-item per super-block, 512-deep serial — the same
+;; occupancy disease as the old decode attention, measured ~30µs/launch at nsb=3):
+;; phase 1 computes per-32-sub-block |max| (nsb*8 items, 32-deep), phase 2 folds the 8
+;; sibling submaxes (float max is EXACT under reassociation → d is bit-identical to the
+;; serial scan) and quantizes its 32 elements (nsb*8 items, ~40-deep). `submax` is an
+;; nsb*8 float scratch. The 8 same-value xs writes per super-block are benign.
 (deftm quant-act-q8k-gpu!
   [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
-   nsb :- Long] :- Void
-  (par/map-void! sb nsb
-                 (let [sbase (* (long sb) 256)
-                       mx (loop [i 0 m 0.0]
-                            (if (< i 256)
-                              (let [v (ra/aget x (+ sbase i))]
-                                (recur (inc i) (max m (max v (- v)))))
-                              m))
-                       d (/ (double mx) 127.0)
-                       id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)]
-                   (ra/aset xs sb (float d))
-                   (loop [j 0]
-                     (if (< j 8)
-                       (let [sidx (+ (* (long sb) 8) j)
-                             wbase (+ (* (long sb) 64) (* j 8))
-                             ebase (+ sbase (* j 32))
-                             bs (loop [w 0 s 0]
-                                  (if (< w 8)
-                       ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
-                       ;; int8 range without an explicit clamp; the (long ...) cast types q.
-                                    (let [e (+ ebase (* w 4))
-                                          q0 (long (Math/round (* (double (ra/aget x e)) id)))
-                                          q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
-                                          q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
-                                          q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
-                                          word (bit-or (bit-and q0 0xFF)
-                                                       (bit-shift-left (bit-and q1 0xFF) 8)
-                                                       (bit-shift-left (bit-and q2 0xFF) 16)
-                                                       (bit-shift-left (bit-and q3 0xFF) 24))]
-                                      (ra/aset xp (+ wbase w) (int word))
-                                      (recur (inc w) (+ s q0 q1 q2 q3)))
-                                    s))]
-                         (ra/aset bsums sidx (int bs))
-                         (recur (inc j)))
-                       nil)))))
+   submax :- (Array float), nsb :- Long] :- Void
+  (do
+    (par/map-void! si (* (long nsb) 8)
+      (let [base (* (long si) 32)
+            m (loop [k 0 m 0.0]
+                (if (< k 32)
+                  (let [v (ra/aget x (+ base k))]
+                    (recur (inc k) (max m (max v (- v)))))
+                  m))]
+        (ra/aset submax si (float m))))
+    (par/map-void! sj (* (long nsb) 8)
+      (let [sb (quot sj 8)
+            j (rem sj 8)
+            mx (loop [k 0 m 0.0]
+                 (if (< k 8)
+                   (recur (inc k) (max m (ra/aget submax (+ (* (long sb) 8) k))))
+                   m))
+            d (/ (double mx) 127.0)
+            id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
+            sidx (+ (* (long sb) 8) j)
+            wbase (+ (* (long sb) 64) (* j 8))
+            ebase (+ (* (long sb) 256) (* j 32))]
+        (ra/aset xs sb (float d))
+        (let [bs (loop [w 0 s 0]
+                   (if (< w 8)
+                     ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
+                     ;; int8 range without an explicit clamp; the (long ...) cast types q.
+                     (let [e (+ ebase (* w 4))
+                           q0 (long (Math/round (* (double (ra/aget x e)) id)))
+                           q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
+                           q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
+                           q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                           word (bit-or (bit-and q0 0xFF)
+                                        (bit-shift-left (bit-and q1 0xFF) 8)
+                                        (bit-shift-left (bit-and q2 0xFF) 16)
+                                        (bit-shift-left (bit-and q3 0xFF) 24))]
+                       (ra/aset xp (+ wbase w) (int word))
+                       (recur (inc w) (+ s q0 q1 q2 q3)))
+                     s))]
+          (ra/aset bsums sidx (int bs)))))))
 
 (deftm qmatmul-q4k-composable!
   "Q4_K GEMV into y[o] for o in [o-start, o-start+o-count): per super-block

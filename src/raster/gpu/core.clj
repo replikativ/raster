@@ -757,12 +757,25 @@
    (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
          roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
      (alloc! sess specs)
-     (doseq [{:keys [op phase bind scalars n]} steps]
-       (compile! sess phase op)
-       (let [ki (first (get-in @sess [:kernels phase]))
-             tsc (typed-scalars-for op ki (or scalars {}) dtype)]
-         (prepare! sess phase bind tsc (long n) {:kernel-phase phase})))
-     (record-graph! sess (mapv :phase steps) :chain)
+     ;; A multi-par-form op compiles to SEVERAL kernels — bind them ALL, in order (the old
+     ;; `first` silently dropped every kernel after the first). All kernels of a step share
+     ;; the step's :bind and :n (ops whose par forms need different bounds don't fit the
+     ;; chain API's single :n — use compile-gpu-program/bind-step! for those).
+     (let [all-phases
+           (vec (mapcat
+                 (fn [{:keys [op phase bind scalars n]}]
+                   (compile! sess phase op)
+                   (let [ks (get-in @sess [:kernels phase])]
+                     (mapv (fn [i]
+                             (let [ph (if (zero? (long i)) phase
+                                          (keyword (str (name phase) "_" i)))
+                                   tsc (typed-scalars-for op (nth ks i) (or scalars {}) dtype)]
+                               (prepare! sess ph bind tsc (long n)
+                                         {:kernel-phase phase :index i})
+                               ph))
+                           (range (count ks)))))
+                 steps))]
+       (record-graph! sess all-phases :chain))
      (swap! sess assoc :chain-roles roles)
      sess)))
 

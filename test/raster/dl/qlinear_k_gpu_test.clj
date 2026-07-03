@@ -264,12 +264,17 @@
           (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
           (gpu/alloc! sess {:x [:float in x]
                             :xp [:int (quot in 4) nil] :xs [:float nsb nil] :bsums [:int (quot in 32) nil]
+                            :submax [:float (* nsb 8) nil]
                             :wp [:int (alength wp) wp] :da [:float (alength da) da] :db [:float (alength db) db]
                             :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq] :y [:float out nil]})
-          (gpu/prepare! sess :quant {"x" :x "xp" :xp "xs" :xs "bsums" :bsums} [] nsb {:kernel-phase :quant})
+          ;; 2-phase quant-act: sub-block maxes, then quantize — both kernels in the graph
+          (gpu/prepare! sess :quant {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
+                        [] (* nsb 8) {:kernel-phase :quant :index 0})
+          (gpu/prepare! sess :quant2 {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
+                        [] (* nsb 8) {:kernel-phase :quant :index 1})
           (gpu/prepare! sess :mm {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
                         [{:type :int :value in}] out {:kernel-phase :mm})
-          (gpu/record-graph! sess [:quant :mm])
+          (gpu/record-graph! sess [:quant :quant2 :mm])
           (gpu/replay! sess)
           (let [ygpu (gpu/download sess :y)
                 scale (reduce max 1e-9 (map (fn [v] (Math/abs (double v))) (seq yref)))]

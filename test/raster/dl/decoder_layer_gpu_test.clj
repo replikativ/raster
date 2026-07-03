@@ -52,9 +52,10 @@
                       :x1n [:float H nil :scratch] :fxp [:int (quot H 4) nil :scratch] :fxs [:float (quot H 256) nil :scratch] :fxb [:int (quot H 32) nil :scratch]
                       :gate [:float IM nil :scratch] :up [:float IM nil :scratch] :hh [:float IM nil :scratch]
                       :hxp [:int (quot IM 4) nil :scratch] :hxs [:float (quot IM 256) nil :scratch] :hxb [:int (quot IM 32) nil :scratch]
-                      :down [:float H nil :scratch] :down2 [:float H nil :scratch] :out [:float H nil :output]}
+                      :down [:float H nil :scratch] :down2 [:float H nil :scratch] :out [:float H nil :output]
+                      :submax [:float (quot IM 32) nil :scratch]}
                      (wbuf "wq" Wq) (wbuf "wk" Wk) (wbuf "wv" Wv) (wbuf "wo" Wo) (wbuf "wg" Wg) (wbuf "wu" Wu) (wbuf "wd" Wd))
-            qa (fn [ph xb xpb xsb bsb n] {:op #'qk/quant-act-q8k-gpu! :phase ph :bind {"x" xb "xp" xpb "xs" xsb "bsums" bsb} :scalars {} :n n})
+            qa (fn [ph xb xpb xsb bsb nsb] {:op #'qk/quant-act-q8k-gpu! :phase ph :bind {"x" xb "xp" xpb "xs" xsb "bsums" bsb "submax" :submax} :scalars {} :n (* 8 (long nsb))})
             mm (fn [ph xpb xsb bsb pre yb in n] {:op #'qk/qmatmul-q4k-dp4a! :phase ph :bind {"xp" xpb "xs" xsb "bsums" bsb "wp" (keyword (str pre "p")) "da" (keyword (str pre "da")) "db" (keyword (str pre "db")) "aq" (keyword (str pre "aq")) "bq" (keyword (str pre "bq")) "y" yb} :scalars {"in" in} :n n})
             rms (fn [ph xb wb ob rows feat] {:op #'nn/rms-norm! :phase ph :bind {"x" xb "weight" wb "out" ob} :scalars {"eps" eps "features" feat "gain-offset" 1.0} :n rows})
             radd (fn [ph ab bb ob n] {:op #'nn/residual-add! :phase ph :bind {"a" ab "b" bb "out" ob} :scalars {} :n n})
