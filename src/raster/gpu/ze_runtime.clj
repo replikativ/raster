@@ -1803,7 +1803,8 @@
   prepareds: ordered seq of maps from bind-registered-map-void-kernel (each carries its own
   dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
   Re-record only if the kernel sequence or any buffer is reallocated."
-  [prepareds]
+  ([prepareds] (record-graph! prepareds {:barriers? true}))
+  ([prepareds {:keys [barriers?] :or {barriers? true}}]
   (ensure-init!)
   (let [{:keys [arena context device]} @state
         cq-desc (.allocate ^Arena arena 40)
@@ -1833,12 +1834,13 @@
         (.set gc I32 0 (int group-count))
         (ze-call! "zeCommandListAppendLaunchKernel" h-launch
                   [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
-        (ze-call! "zeCommandListAppendBarrier" h-barrier
-                  [lst MemorySegment/NULL (int 0) MemorySegment/NULL])))
+        (when barriers?
+          (ze-call! "zeCommandListAppendBarrier" h-barrier
+                    [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
     (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
     (let [lists-arr (ptr-seg arena)]
       (.set lists-arr PTR 0 ^MemorySegment lst)
-      {:queue queue :list lst :lists-arr lists-arr})))
+      {:queue queue :list lst :lists-arr lists-arr}))))
 
 (defn replay-graph!
   "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."

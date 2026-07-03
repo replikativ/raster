@@ -422,53 +422,72 @@
                                                  (aset cache (clojure.core/+ (clojure.core/* (aget posbuf 0) kvrow) i)
                                                        (aget src i)))))
 
+;; 3-phase parallel decode attention. The old single-map version ran ONE work-item per Q head
+;; (n-q=4) with three serial loops over cache-len×head-dim — measured 1.6ms/layer on Arc iGPU,
+;; 66% of the whole decode step (occupancy, not dispatch: 4 threads on hundreds of lanes).
+;; Grid sizes are BAKED at graph-record time while cache-len grows per token, so the score and
+;; weighted-sum grids over-provision to `maxpos` work-items and guard on clenbuf[0] (idle items
+;; exit immediately). sc is strided by maxpos (size n-q*maxpos) — the old cache-len stride also
+;; overflowed a 32-float sc buffer at clen>8 (page padding hid it). Math and rounding order are
+;; identical to the serial version (probs stored as e*inv, summed ascending).
 (deftm gqa-decode-attention-buf! (All [T]
                                       [q :- (Array T) k :- (Array T) v :- (Array T)
                                        out :- (Array T) sc :- (Array T)
                                        clenbuf :- (Array long) n-q :- Long group :- Long
-                                       n-kv :- Long head-dim :- Long scale :- Double] :- Void
-                                      (raster.par/map-void! hq n-q
-                                                            (let [cache-len (aget clenbuf 0)
-                                                                  hkv (quot hq group)
-                                                                  qb (clojure.core/* hq head-dim)
-                                                                  scb (clojure.core/* hq cache-len)
-                                                                  kvstride (clojure.core/* n-kv head-dim)
-                                                                  hkvb (clojure.core/* hkv head-dim)
-                                                                  neg-inf -1.0e38
-                                                                  _ (loop [j 0]
-                                                                      (if (< j cache-len)
-                                                                        (let [kb (clojure.core/+ (clojure.core/* j kvstride) hkvb)
-                                                                              dot (loop [d 0 acc 0.0]
-                                                                                    (if (< d head-dim)
-                                                                                      (recur (inc d)
-                                                                                             (+ acc (* (aget q (clojure.core/+ qb d))
-                                                                                                       (aget k (clojure.core/+ kb d)))))
-                                                                                      acc))]
-                                                                          (aset sc (clojure.core/+ scb j) (* dot scale))
-                                                                          (recur (inc j)))
-                                                                        nil))
-                                                                  mx (loop [j 0 mm neg-inf]
-                                                                       (if (< j cache-len)
-                                                                         (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
-                                                                  sum (loop [j 0 s 0.0]
-                                                                        (if (< j cache-len)
-                                                                          (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
-                                                                            (aset sc (clojure.core/+ scb j) e)
-                                                                            (recur (inc j) (+ s e)))
-                                                                          s))
-                                                                  inv (/ 1.0 sum)]
-                                                              (loop [d 0]
-                                                                (if (< d head-dim)
-                                                                  (do (aset out (clojure.core/+ qb d)
-                                                                            (loop [j 0 a 0.0]
-                                                                              (if (< j cache-len)
-                                                                                (let [kvb (clojure.core/+ (clojure.core/* j kvstride) hkvb)]
-                                                                                  (recur (inc j)
-                                                                                         (+ a (* (* (aget sc (clojure.core/+ scb j)) inv)
-                                                                                                 (aget v (clojure.core/+ kvb d))))))
-                                                                                a)))
-                                                                      (recur (inc d)))
-                                                                  nil))))))
+                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- Double] :- Void
+ (do
+  ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
+  (raster.par/map-void! ij (clojure.core/* n-q maxpos)
+    (let [cache-len (aget clenbuf 0)
+          hq (quot ij maxpos)
+          j (rem ij maxpos)]
+      (when (< j cache-len)
+        (let [hkv (quot hq group)
+              qb (clojure.core/* hq head-dim)
+              kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                 (clojure.core/* hkv head-dim))
+              dot (loop [d 0 acc 0.0]
+                    (if (< d head-dim)
+                      (recur (inc d)
+                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                       (aget k (clojure.core/+ kb d)))))
+                      acc))]
+          (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
+  ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
+  (raster.par/map-void! hq n-q
+    (let [cache-len (aget clenbuf 0)
+          scb (clojure.core/* hq maxpos)
+          neg-inf -1.0e38
+          mx (loop [j 0 mm neg-inf]
+               (if (< j cache-len)
+                 (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+          sum (loop [j 0 s 0.0]
+                (if (< j cache-len)
+                  (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                    (aset sc (clojure.core/+ scb j) e)
+                    (recur (inc j) (+ s e)))
+                  s))
+          inv (/ 1.0 sum)]
+      (loop [j 0]
+        (if (< j cache-len)
+          (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
+              (recur (inc j)))
+          nil))))
+  ;; phase 3: out[hq,d] = Σ_j sc[hq,j] * v[j,hkv,d] — one work-item per (hq, d)
+  (raster.par/map-void! hd (clojure.core/* n-q head-dim)
+    (let [cache-len (aget clenbuf 0)
+          hq (quot hd head-dim)
+          d (rem hd head-dim)
+          scb (clojure.core/* hq maxpos)
+          kvstride (clojure.core/* n-kv head-dim)
+          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
+      (aset out (clojure.core/+ (clojure.core/* hq head-dim) d)
+            (loop [j 0 a 0.0]
+              (if (< j cache-len)
+                (recur (inc j)
+                       (+ a (* (aget sc (clojure.core/+ scb j))
+                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
+                a))))))))
 
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
