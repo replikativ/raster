@@ -27,10 +27,7 @@
    :float-min        "fminf"
    :float-suffix?    true})
 
-;; Reuse the shared faceted registry (dtype/native-types via c-emit) rather than a
-;; private copy — the old literal drifted (:long "long" vs the registry's C
-;; "long long") and lacked :half/:byte. E-slice of the dtype-spine convergence.
-(def type-map ce/type-map)
+(def type-map {:float "float" :double "double" :int "int" :long "long"})
 
 (defn- emit-body
   "Emit a body S-expr to a C expression string under the CPU config + scalar type."

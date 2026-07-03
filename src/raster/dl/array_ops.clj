@@ -25,7 +25,7 @@
     masked-mse-loss  - MSE on non-observed variables"
   (:refer-clojure :exclude [aget aset alength aclone])
   (:require [raster.core :refer [deftm ftm broadcast]]
-            [raster.arrays :refer [aget aset alength aclone acopy! alloc-like]]
+            [raster.arrays :refer [aget aset alength aclone acopy!]]
             [raster.math :as m]
             [raster.numeric :as n]
             [raster.ad.templates :as tmpl]))
@@ -177,57 +177,6 @@
           (aset out (+ dst-off c)
                 (aget packed (+ src-off c))))))
     out))
-
-;; ================================================================
-;; pack-heads / unpack-heads: multi-head attention layout combinators.
-;; Both are parametric (All [T]) and allocation-free per element (one contiguous
-;; pass), so the compiler vectorizes the inner head-dim copy. They replace the
-;; per-head nested-dotimes scalar Qh/Kh/Vh extraction + copy-back in
-;; multi-head-attention (the ~1.1M scalar aget/aset/forward that dominate the
-;; naive attention). pack-heads and unpack-heads are exact duals.
-;; ================================================================
-
-(deftm pack-heads
-  "Reshape [seq-len, n-heads*head-dim] (row-major) → [n-heads, seq-len, head-dim]
-  so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d]."
-  (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-    (let [d-model (* n-heads head-dim)
-          out (alloc-like x (* seq-len d-model))]
-      (dotimes [h n-heads]
-        (dotimes [s seq-len]
-          (let [src (+ (* s d-model) (* h head-dim))
-                dst (+ (* h seq-len head-dim) (* s head-dim))]
-            (dotimes [d head-dim]
-              (aset out (+ dst d) (aget x (+ src d)))))))
-      out)))
-
-(deftm unpack-heads
-  "Dual of pack-heads: [n-heads, seq-len, head-dim] → [seq-len, n-heads*head-dim]:
-  out[s*(nh*hd) + h*hd + d] = x[h*seq*hd + s*hd + d]."
-  (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-    (let [d-model (* n-heads head-dim)
-          out (alloc-like x (* seq-len d-model))]
-      (dotimes [h n-heads]
-        (dotimes [s seq-len]
-          (let [src (+ (* h seq-len head-dim) (* s head-dim))
-                dst (+ (* s d-model) (* h head-dim))]
-            (dotimes [d head-dim]
-              (aset out (+ dst d) (aget x (+ src d)))))))
-      out)))
-
-;; pack ↔ unpack are duals (runtime-AD pullbacks; both are non-diff on the Long
-;; shape params). grads-fn (compile-aot training AD) can be added when needed —
-;; the fastembed inference path uses forward only.
-(tmpl/merge-into-template! 'raster.dl.array-ops/pack-heads
-                           {:pullback-factory
-                            (fn [_result _x seq-len n-heads head-dim]
-                              (fn [d-out]
-                                [(unpack-heads d-out seq-len n-heads head-dim) nil nil nil]))})
-(tmpl/merge-into-template! 'raster.dl.array-ops/unpack-heads
-                           {:pullback-factory
-                            (fn [_result _x seq-len n-heads head-dim]
-                              (fn [d-out]
-                                [(pack-heads d-out seq-len n-heads head-dim) nil nil nil]))})
 
 ;; slice ↔ scatter are duals: gradient of slice goes through scatter, and
 ;; vice versa. Both pullback-factory (runtime/lazy AD) and grads-fn

@@ -387,7 +387,7 @@
   dtype: :double or :float (default :float)
   Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
+  (let [ctype (get opencl-type-map dtype "float")
         use-fp64? (= dtype :double)]
     (str (when use-fp64? fp64-pragma)
          "__kernel void " kernel-name

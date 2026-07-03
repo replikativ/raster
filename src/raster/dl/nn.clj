@@ -203,78 +203,10 @@
                                                 (fn [dy]
                                                   [(silu-backward dy x n) nil]))})
 
-;; SwiGLU activation, fused: out = silu(gate) * up. par/map-void! !-variant (one work-item /
-;; element) — the GPU-resident decode FFN form, and SIMD-vectorizes on CPU. The par index is the
-;; subscript directly (no computed index); float compute via raster.numeric + raster.math/exp.
-(deftm silu-mul! (All [T] [gate :- (Array T) up :- (Array T) out :- (Array T) n :- Long] :- Void
-                      (raster.par/map-void! i n
-                                            (let [g (aget gate i)]
-                                              (aset out i (* (* g (/ 1.0 (+ 1.0 (m/exp (- g))))) (aget up i)))))))
-
-;; GeGLU activation, fused: out = gelu(gate) * up (tanh approximation, gemma's FFN). Mirrors
-;; silu-mul! — one work-item/element, GPU-resident decode FFN form. sqrt(2/pi)=0.7978845608028654
-;; inlined as a literal so no scalar is bound outside the par body.
-(deftm gelu-mul! (All [T] [gate :- (Array T) up :- (Array T) out :- (Array T) n :- Long] :- Void
-                      (raster.par/map-void! i n
-                                            (let [g (aget gate i)]
-                                              (aset out i (* (* 0.5 g
-                                                                (+ 1.0 (m/tanh (* 0.7978845608028654
-                                                                                  (+ g (* 0.044715 g g g))))))
-                                                             (aget up i)))))))
-
-;; residual add, !-variant: out = a + b (one work-item / element).
-(deftm residual-add! (All [T] [a :- (Array T) b :- (Array T) out :- (Array T) n :- Long] :- Void
-                          (raster.par/map-void! i n
-                                                (aset out i (+ (aget a i) (aget b i))))))
-;; --- SkipLayerNorm: fused residual-add + layer-norm (ORT SkipLayerNormalization) ---
-;; out = LayerNorm(a + b). Folds the residual add into layer-norm's reads so the
-;; separate residual-add pass AND its [batch,features] intermediate buffer vanish —
-;; (a+b) is consumed per row, never materialized. One coarse kernel instead of two.
-(deftm skip-layer-norm
-  (All [T] [a :- (Array T) b :- (Array T) gamma :- (Array T) beta :- (Array T)
-            batch :- Long features :- Long eps :- Double] :- (Array T)
-    (let [out  (alloc-like a (* batch features))
-          finv (/ 1.0 (double features))]
-      (dotimes [r batch]
-        (let [offset (* r (int features))
-              mean (loop [i 0 s 0.0]
-                     (if (< i features)
-                       (recur (inc i) (+ s (+ (aget a (+ offset i)) (aget b (+ offset i)))))
-                       (* s finv)))
-              var  (loop [i 0 s 0.0]
-                     (if (< i features)
-                       (let [d (- (+ (aget a (+ offset i)) (aget b (+ offset i))) mean)]
-                         (recur (inc i) (+ s (* d d))))
-                       (* s finv)))
-              inv-std (/ 1.0 (n/sqrt (+ var eps)))]
-          (dotimes [i features]
-            (let [v (+ (aget a (+ offset i)) (aget b (+ offset i)))]
-              (aset out (+ offset i)
-                    (+ (* (aget gamma i) (* (- v mean) inv-std)) (aget beta i)))))))
-      out)))
-
 ;; --- GELU: x * Phi(x) (tanh approximation) ---
-;; The tanh is inlined as a vectorizable odd-rational approximation (Eigen ptanh:
-;; clamp + polynomial in u², only +/*//min/max → a pure SIMD lane chain). A libm
-;; m/tanh call stays scalar inside the broadcast (dtanh_stub) and blocks the map.
 (deftm gelu (All [T] [x :- (Array T) n :- Long] :- (Array T)
                  (let [c (n/sqrt (/ 2.0 n/pi))]
-                   (broadcast [x]
-                     (let [u  (n/min 9.0 (n/max -9.0 (* c (+ x (* 0.044715 x x x)))))
-                           u2 (* u u)
-                           np (+ 4.89352455891786e-3
-                                 (* u2 (+ 6.37261928875436e-4
-                                          (* u2 (+ 1.48572235717979e-5
-                                                   (* u2 (+ 5.12229709037114e-8
-                                                            (* u2 (+ -8.60467152213735e-11
-                                                                     (* u2 (+ 2.00018790482477e-13
-                                                                              (* u2 -2.76076847742355e-16))))))))))))
-                           dp (+ 4.89352518554385e-3
-                                 (* u2 (+ 2.268434632439e-3
-                                          (* u2 (+ 1.18534705686654e-4
-                                                   (* u2 1.19825839466702e-6))))))
-                           th (/ (* u np) dp)]
-                       (* 0.5 x (+ 1.0 th)))))))
+                   (broadcast [x] (* 0.5 x (+ 1.0 (m/tanh (* c (+ x (* 0.044715 x x x))))))))))
 
 ;; gelu': 0.5*(1+tanh(inner)) + 0.5*x*sech^2(inner)*c*(1+3*0.044715*x^2)
 (deftm gelu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long]
@@ -429,38 +361,22 @@
 ;; gain-offset = 0.0 for Llama/Qwen (plain weight gain); 1.0 for Gemma, whose
 ;; norm weights are centered at 0 and applied as (1 + weight). Also used for
 ;; per-head QK-norm (rows = heads*seq, features = head_dim).
-;; par-combinator primitive: parallel-map over the (independent) row dimension, scalar
-;; reduce+map inside. This is the form that vectorizes on CPU (the inner feature loops lift
-;; to SIMD) and is the GPU-friendly shape (par/map-void! → one work-item/row, out caller-
-;; provided), so one source serves prefill, decode, and (eventually) the GPU-resident graph.
-;; Index arithmetic uses clojure.core (integer subscripts); float compute uses raster.numeric.
-;; Validated on both CPU and the OpenCL/GPU lowering (maxerr ~5e-7 vs CPU).
-(deftm rms-norm! (All [T] [x :- (Array T) weight :- (Array T) out :- (Array T)
-                           rows :- Long features :- Long
-                           eps :- Double gain-offset :- Double] :- Void
-                      (raster.par/map-void! r rows
-                        ;; index arithmetic stays clojure.core (integer); only float compute
-                        ;; goes through raster.numeric (devirtualizes + vectorizes).
-                                            (let [offset (clojure.core/* r features)
-                                                  ms (loop [i 0 s 0.0]
-                                                       (if (< i features)
-                                                         (let [v (aget x (clojure.core/+ offset i))]
-                                                           (recur (inc i) (+ s (* v v))))
-                                                         (/ s (double features))))
-                                                  inv (/ 1.0 (n/sqrt (+ ms eps)))]
-                                              (loop [i 0]
-                                                (if (< i features)
-                                                  (do (aset out (clojure.core/+ offset i)
-                                                            (* (aget x (clojure.core/+ offset i)) inv
-                                                               (+ gain-offset (aget weight i))))
-                                                      (recur (inc i)))
-                                                  nil))))))
-
 (deftm rms-norm (All [T] [x :- (Array T) weight :- (Array T)
                           rows :- Long features :- Long
                           eps :- Double gain-offset :- Double] :- (Array T)
                      (let [out (alloc-like x (* rows features))]
-                       (rms-norm! x weight out rows features eps gain-offset)
+                       (dotimes [r rows]
+                         (let [offset (* r (int features))
+                               ms (loop [i 0 s 0.0]
+                                    (if (< i features)
+                                      (let [v (aget x (+ offset i))]
+                                        (recur (inc i) (+ s (* v v))))
+                                      (/ s features)))
+                               inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                           (dotimes [i features]
+                             (aset out (+ offset i)
+                                   (* (aget x (+ offset i)) inv
+                                      (+ gain-offset (aget weight i)))))))
                        out)))
 
 ;; --- Bias-free linear + gated MLP (modern decoder LMs) ---

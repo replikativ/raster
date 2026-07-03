@@ -303,22 +303,6 @@
        :else m))
    {:array-equiv {} :scalar-bound {}} nodes-map))
 
-(defn depends-on-reduce?
-  "True if `node-id` transitively reads a SoacReduce result — i.e. it is (downstream of) the
-   BROADCAST node of a reduce→broadcast→map. Such a node must stay a MATERIALIZATION BOUNDARY:
-   fusing it as a producer inlines its body (carrying the reduce-derived scalar) into each
-   consumer, duplicating the reduce dependency and — across a multi-consumer fan-out — cascading
-   into monster kernels that read every upstream buffer. Futhark keeps exactly this boundary
-   (SegRed → SegMap with a 1-element device array between them). Cheap: graphs are O(layer ops)."
-  [graph node-id]
-  (let [nodes (:nodes graph)]
-    (boolean
-     (some (fn [[rid rnode]]
-             (and (instance? raster.compiler.ir.soac.SoacReduce rnode)
-                  (not= rid node-id)
-                  (reachable? graph rid node-id)))
-           nodes))))
-
 (defn can-fuse-vertically?
   "Check if producer can be vertically fused into consumer.
 
@@ -364,12 +348,7 @@
      ;; Sole consumer: producer will be removed. Safe because sole consumer
      ;; means no other node depends on producer's output, so removing it
      ;; cannot break any ordering.
-     true
-      ;; 7. The producer must NOT be a reduce-broadcast node (see depends-on-reduce?).
-      ;; Pinning it keeps the reduce→broadcast→map boundary materialized — without this,
-      ;; introducing a par/reduce (matching the element bound) lets the broadcast map smear
-      ;; the reduce-derived scalar across consumers and cascade into monster kernels.
-     (not (depends-on-reduce? graph producer-id)))))
+     true)))
 
 (defn- fuse-vertical-scan-map
   "Fuse Scan producer into Map consumer by folding the map's body into

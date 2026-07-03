@@ -57,22 +57,17 @@
   tc-binding-tags: {symbol → dispatch-tag} pre-computed by TC (optional)
   NOTE: type-env entries are processed through ctx-assoc-type to ensure
   fn-info auto-derivation for IFn__ tagged parameters."
-  [{:keys [type-env source-ns tc-binding-tags element-dtype]
+  [{:keys [type-env source-ns tc-binding-tags]
     :or {type-env {} source-ns *ns*}}]
   ;; Build the context by adding each type-env entry through ctx-assoc-type,
   ;; which auto-derives fn-info from IFn__ tags (fixing the ODE fn-param bug).
-  ;; :element-dtype is the dtype keyword (:float/:double) this body is being
-  ;; MONOMORPHIZED to (from a parametric T binding or an AOT :dtype directive),
-  ;; or nil for a polymorphic generic-definition walk. Contextual literal typing
-  ;; reads it so an untyped floating literal adopts the element dtype.
   (reduce-kv (fn [ctx sym record]
                (ctx-assoc-type ctx sym (:tag record)
                                (:fn-info record)
                                (:element record)))
              {:type-env  {}
               :source-ns source-ns
-              :tc-binding-tags (or tc-binding-tags {})
-              :element-dtype element-dtype}
+              :tc-binding-tags (or tc-binding-tags {})}
              type-env))
 
 (defn ctx-assoc-type
@@ -514,8 +509,7 @@
                  (if extra-binds
                    (reduce (fn [[binds ctx] [esym einit]]
                              (let [etag (inf/infer-binding-tag esym einit einit (:type-env ctx)
-                                                               {:source-ns (:source-ns ctx)
-                                                                :element-dtype (:element-dtype ctx)})
+                                                               {:source-ns (:source-ns ctx)})
                                    esym (if etag (stamp-type-meta esym etag) esym)]
                                [(conj binds esym einit)
                                 (if etag (ctx-assoc-type ctx esym etag) ctx)]))
@@ -525,14 +519,9 @@
                  type-env (:type-env ctx)
                  ;; TC pre-computed hint takes priority (covers core arith, deftm returns)
                  tc-tag (get (:tc-binding-tags ctx) sym)
-                 ;; A bare floating-literal init narrows to the element dtype and
-                 ;; OVERRIDES TC's `double` (monomorphization policy above TC), so a
-                 ;; `0.0` accumulator in a T=float body stays devirtualized.
-                 tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
-                         tc-tag
+                 tag (or tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
-                                                {:source-ns (:source-ns ctx)
-                                                 :element-dtype (:element-dtype ctx)}))
+                                                {:source-ns (:source-ns ctx)}))
                  elem-tag (inf/infer-element-tag init tag type-env)
                  hint (inf/compute-binding-hint tag sym)
                  sym (stamp-type-meta sym (or hint tag) elem-tag)]
@@ -693,7 +682,7 @@
         walked-init (walk init-expr ctx)
         walked-bound (walk bound-expr ctx)
         acc-tag (or (inf/hint-tag acc-sym)
-                    (inf/floating-literal-tag init-expr (:element-dtype ctx))
+                    (inf/literal-tag init-expr)
                     ;; Recognize cast expressions: (float x), (double x)
                     (when (and (seq? init-expr) (symbol? (first init-expr)))
                       (case (first init-expr)
@@ -730,7 +719,7 @@
         walked-init (walk init-expr ctx)
         walked-bound (walk bound-expr ctx)
         acc-tag (or (inf/hint-tag acc-sym)
-                    (inf/floating-literal-tag init-expr (:element-dtype ctx))
+                    (inf/literal-tag init-expr)
                     (when (and (seq? init-expr) (symbol? (first init-expr)))
                       (case (first init-expr)
                         float 'float
@@ -908,39 +897,12 @@
 ;; Branch: deftm call (devirtualization)
 ;; ================================================================
 
-(defn- narrow-fp-literal-form
-  "Wrap a bare Double literal in the element-dtype cast (0.044715 → (float …)) —
-   only for :float (the narrowing monomorphization; :double is identity). The
-   call-arg half of contextual literal typing, applied speculatively and kept
-   only when it yields a clean concrete overload."
-  [x element-dtype]
-  (if (and (= element-dtype :float) (instance? Double x)) (list 'float x) x))
-
 (defmethod walk-form :deftm-call [form ctx]
   (let [source-ns (:source-ns ctx)
         type-env (:type-env ctx)
         fn-sym (first form)
-        elem-dt (:element-dtype ctx)
-        rewritten-args0 (walk-forms (vec (rest form)) ctx)
-        original-args0 (vec (rest form))
-        ;; B3 — call-arg half of contextual literal typing: a floating-literal arg
-        ;; adopts the element dtype WHEN that yields a clean concrete overload
-        ;; (arithmetic, e.g. (* 0.044715 x:float) → [Float Float]). A call whose
-        ;; narrowed args only PROMOTE — a concrete non-T param like eps:Double —
-        ;; keeps the true-typed literal (the un-narrowed fallback below). Self-
-        ;; routing per call; the fallback is exactly the previous behavior.
-        narrowed-orig (when (and (= elem-dt :float)
-                                 (some #(instance? Double %) original-args0))
-                        (mapv #(narrow-fp-literal-form % elem-dt) original-args0))
-        use-narrowed? (and narrowed-orig
-                           (binding [*ns* source-ns]
-                             (when-let [r (inf/try-resolve-call fn-sym narrowed-orig type-env)]
-                               (and (not (:promotion-casts r))
-                                    (not (some #{'Object 'Number} (:tags r)))))))
-        rewritten-args (if use-narrowed?
-                         (mapv #(narrow-fp-literal-form % elem-dt) rewritten-args0)
-                         rewritten-args0)
-        original-args (if use-narrowed? narrowed-orig original-args0)
+        rewritten-args (walk-forms (vec (rest form)) ctx)
+        original-args (vec (rest form))
         extra-tags (mapv (fn [orig rewr]
                            (or (inf/infer-aget-type orig type-env)
                                (when (seq? rewr)
@@ -1313,11 +1275,10 @@
 
   type-env: {symbol → {:tag dispatch-tag, :fn-info map?, :element dispatch-tag?}}
   tc-binding-tags: {symbol → dispatch-tag} pre-computed from TC (optional)"
-  [form {:keys [type-env source-ns tc-binding-tags element-dtype]}]
+  [form {:keys [type-env source-ns tc-binding-tags]}]
   (let [ctx (make-ctx {:type-env (or type-env {})
                        :source-ns (or source-ns *ns*)
-                       :tc-binding-tags tc-binding-tags
-                       :element-dtype element-dtype})
+                       :tc-binding-tags tc-binding-tags})
         walked (walk form ctx)]
     ;; Close the core: after type-directed walking (typed macros already expanded
     ;; to SOAC primitives), macroexpand the remaining macro zoo

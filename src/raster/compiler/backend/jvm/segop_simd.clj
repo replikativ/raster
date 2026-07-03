@@ -80,21 +80,8 @@
 ;; SegOp field accessors
 ;; ================================================================
 
-;; The vectorized loop iterates the INNERMOST (reduced/mapped) dim. For a 1-D
-;; space this is `first` (unchanged); for an N-D segmented space the outer
-;; segment dims are iterated separately (see compile-segred). Route through the
-;; canonical positional accessor so the convention lives in one place.
-(defn seg-idx [segop] (:name (segop/seg-space-reduced-dim (:space segop))))
-(defn seg-bound [segop] (:bound (segop/seg-space-reduced-dim (:space segop))))
-
-(def ^:dynamic *emit-parallel?*
-  "When true, compile-segmap emits the SegMap loop wrapped in a compiler-internal
-  raster.par.runtime/parallel-for! over the segment domain (the JVM backend's
-  concurrency lowering — CPU-C uses OpenMP, GPU a grid). This is NOT a user
-  surface: the pure SegMap is backend-agnostic; whether/how-many threads actually
-  run is a RUNTIME decision (*par-threads* + the *par-min-size* cost gate). Off by
-  default so nothing changes unless explicitly enabled."
-  false)
+(defn seg-idx [segop] (-> segop :space :dims first :name))
+(defn seg-bound [segop] (-> segop :space :dims first :bound))
 
 ;; ================================================================
 ;; Normalize .invk forms to canonical ops for SIMD
@@ -762,49 +749,24 @@
             scalar-aset (if cast-fn
                           (list 'clojure.core/aset out (store-idx j-sym) (list cast-fn scalar-body))
                           (list 'clojure.core/aset out (store-idx j-sym) scalar-body))
-            ;; SIMD loop + tail, parameterized by [start end ret] so it can run
-            ;; either the full [0,n) sequentially or a disjoint chunk [lo,hi) per
-            ;; thread. Each chunk writes only out[.. store-idx(hi)) (SIMD guard on
-            ;; `end`, scalar tail to `end`) → disjoint output, no race.
-            lo-sym (gensym "lo__") hi-sym (gensym "hi__")
-            make-loop (fn [start end ret]
-                        (list 'loop* [j-sym start]
-                              (list 'if (ix<= (ix+ j-sym lanes-sym) end)
-                                    (list 'let* (vec (concat arr-loads [simd-result-sym simd-body-expr]))
-                                          (list '.intoArray simd-result-sym out (store-idx j-sym))
-                                          (list 'recur (ix+ j-sym lanes-sym)))
-                                    (list 'loop* [j-sym j-sym]
-                                          (list 'if (ix< j-sym end)
-                                                (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
-                                                ret)))))
-            ;; Bind species/lanes (+ scalar broadcasts) around a SIMD loop body.
-            wrap-simd (fn [inner]
-                        (list 'let* [species-sym species-expr
-                                     lanes-sym (list '.length species-sym)]
-                              (if (seq scalar-bcasts)
-                                (list 'let* (vec scalar-bcasts) inner)
-                                inner)))
-            body-form
-            (if *emit-parallel?*
-              ;; Compiler-internal concurrency emission (JVM backend). parallel-for!
-              ;; chunks [0,n) across *par-threads*, or runs sequentially below
-              ;; *par-min-size* — a RUNTIME decision, never compile/user. It invokes
-              ;; (body-fn lo hi) with BOXED args → unbox to int. The species/lanes/
-              ;; broadcasts are recomputed INSIDE the closure (cheap, per-thread) so
-              ;; the fn* captures only the arrays — a captured VectorSpecies field
-              ;; confuses the anon-fn verifier's stack-map frames for the SIMD body.
-              (let [lo-int (gensym "loi__") hi-int (gensym "hii__")]
-                (list 'let* [n-sym (list 'int bound)]
-                      (list 'do
-                            (list 'raster.par.runtime/parallel-for! n-sym
-                                  (list 'fn* (vector lo-sym hi-sym)
-                                        (list 'let* [lo-int (list 'int lo-sym)
-                                                     hi-int (list 'int hi-sym)]
-                                              (wrap-simd (make-loop lo-int hi-int nil)))))
-                            out)))
-              (list 'let* [n-sym (list 'int bound)]
-                    (wrap-simd (make-loop '(int 0) n-sym out))))]
-        (when simd-body-expr body-form)))))
+            ;; SIMD loop + tail
+            simd-loop
+            (list 'loop* [j-sym '(int 0)]
+                  (list 'if (ix<= (ix+ j-sym lanes-sym) n-sym)
+                        (list 'let* (vec (concat arr-loads [simd-result-sym simd-body-expr]))
+                              (list '.intoArray simd-result-sym out (store-idx j-sym))
+                              (list 'recur (ix+ j-sym lanes-sym)))
+                        (list 'loop* [j-sym j-sym]
+                              (list 'if (ix< j-sym n-sym)
+                                    (list 'do scalar-aset (list 'recur (list 'inc j-sym)))
+                                    out))))]
+        (when simd-body-expr
+          (list 'let* [species-sym species-expr
+                       lanes-sym (list '.length species-sym)
+                       n-sym (list 'int bound)]
+                (if (seq scalar-bcasts)
+                  (list 'let* (vec scalar-bcasts) simd-loop)
+                  simd-loop)))))))
 
 ;; ================================================================
 ;; par/gather → SIMD hardware vgather

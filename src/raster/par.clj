@@ -328,27 +328,6 @@
          (clojure.core/aset a# i# (unchecked-add-int old# (int ~val)))
          old#))))
 
-(defn dp4a
-  "4-way int8 dot-accumulate. `a` and `b` each pack four signed int8 lanes into an int32,
-  little-endian (lane 0 = low byte), exactly as `as_char4` reinterprets memory on a
-  little-endian device. Returns `acc + Σ_i lane_i(a)·lane_i(b)`.
-
-  This is the JVM/reference impl of the `rstr_dp4a` primitive: in a deftm/par body the
-  GPU and CPU-C backends lower a `(par/dp4a a b acc)` call to `rstr_dp4a(a, b, acc)` (a
-  portable scalar helper the OpenCL/C compiler pattern-matches to a hardware dp4a:
-  Intel/CUDA `__dp4a`, AMD `sdot4`). The masked extraction below is sign-correct
-  regardless of how the int sign-extends into the JVM long."
-  ^long [a b acc]
-  (let [a (long (unchecked-int a)) b (long (unchecked-int b))
-        sx (fn ^long [^long x ^long sh]
-             (let [v (bit-and (unsigned-bit-shift-right x sh) 0xFF)]
-               (if (>= v 128) (- v 256) v)))]
-    (+ (long acc)
-       (* (sx a 0) (sx b 0))
-       (* (sx a 8) (sx b 8))
-       (* (sx a 16) (sx b 16))
-       (* (sx a 24) (sx b 24)))))
-
 (defmacro rng-fill!
   "Fill a long array with splitmix64 pseudo-random seeds.
   Each element i gets: splitmix64(base-seed + i * 0x9e3779b97f4a7c15).

@@ -255,26 +255,17 @@
 (defn- has-objects-tag? [entry]
   (some #{'objects} (:tags entry)))
 
-(def ^:private object-array-class (class (object-array 0)))
-
 (defn- detect-element-type
   [entry a0 a1 a2 a3 args n]
   (let [tags (:tags entry)]
     (loop [i 0]
       (when (< i (count tags))
         (if (= 'objects (nth tags i))
-          ;; Only a genuine Object[] arg carries a per-element class to auto-
-          ;; specialize on (value classes like Dual). A primitive array
-          ;; (float[]/double[]) reaching an 'objects slot has a fixed element
-          ;; type handled by the parametric path — skip it here rather than CCE
-          ;; on the forced Object[] cast.
-          (let [arg (case (int i) 0 a0 1 a1 2 a2 3 a3 (nth args i))]
-            (when (instance? object-array-class arg)
-              (let [^objects arr arg]
-                (when (pos? (alength arr))
-                  (let [elem (aget arr 0)]
-                    (when (and elem (not (.isArray (class elem))))
-                      (class elem)))))))
+          (let [^objects arr (case (int i) 0 a0 1 a1 2 a2 3 a3 (nth args i))]
+            (when (and arr (pos? (alength arr)))
+              (let [elem (aget arr 0)]
+                (when (and elem (not (.isArray (class elem))))
+                  (class elem)))))
           (recur (inc i)))))))
 
 (defn- try-auto-specialize!
@@ -973,26 +964,13 @@
   [f]
   (reset! parametric-specializer f))
 
-;; Registration-only callback: generate + register the concrete specialization
-;; WITHOUT invoking it. Used at compile time, where invoking the fn (as
-;; try-parametric-dispatch does) is both unnecessary and unsafe — the trigger
-;; args are degenerate placeholders (zero-length arrays, 0 scalars), so a body
-;; that divides by a scalar param (e.g. head-dim = hidden/num-heads) would crash
-;; even though the bytecode compiled fine.
-(defonce ^:private parametric-register
-  (atom (fn [_fn-name _template _bindings _args]
-          (throw (ex-info "Parametric register not initialized (core.clj not loaded)" {})))))
-
-(defn set-parametric-register!
-  "Set the registration-only callback (register, do not invoke). Called by core.clj."
-  [f]
-  (reset! parametric-register f))
-
-(defn- try-parametric-with
-  "Shared core of parametric dispatch/registration: unify the first matching
-  template against `args` and hand off to `callback` (which either invokes or
-  just registers). Returns the callback's result or nil if no template matches."
-  [callback fn-name args]
+(defn try-parametric-dispatch
+  "Try to dispatch via parametric specialization.
+   If a parametric template matches, delegates to the specializer callback
+   (provided by core.clj) to generate and register a concrete method,
+   then invokes it.
+   Returns the result or nil if no match."
+  [fn-name args]
   (let [;; Resolve namespace aliases: nn/linear → raster.dl.nn/linear
         resolved-name (if-let [v (resolve fn-name)]
                         (symbol (str (:ns (meta v))) (str (:name (meta v))))
@@ -1003,22 +981,5 @@
               (when-let [bindings (unify-parametric
                                    (:annotations template) args
                                    (:type-vars template))]
-                (callback resolved-name template bindings args)))
+                (@parametric-specializer resolved-name template bindings args)))
             templates))))
-
-(defn try-parametric-dispatch
-  "Try to dispatch via parametric specialization.
-   If a parametric template matches, delegates to the specializer callback
-   (provided by core.clj) to generate and register a concrete method,
-   then INVOKES it. Returns the result or nil if no match."
-  [fn-name args]
-  (try-parametric-with @parametric-specializer fn-name args))
-
-(defn try-parametric-register!
-  "Like try-parametric-dispatch, but only REGISTERS the concrete specialization
-  (does not invoke it). This is the compile-time trigger: it makes the concrete
-  mangled method available for devirtualization without running the fn on the
-  degenerate trigger args. Returns a truthy registration result or nil if no
-  template matches (throws if a template matches but compilation fails)."
-  [fn-name args]
-  (try-parametric-with @parametric-register fn-name args))

@@ -43,13 +43,13 @@
   Returns {:kind :tile :block :k-group :bits :pack :half :bytes-per-igroup :igroups}."
   ([desc] (quant-stream-layout desc q4-format))
   ([desc {:keys [block weight-bits pack] :or {block 32 weight-bits 4 pack :nibble-interleaved}}]
-   (assert (contains? #{:nibble-interleaved :byte-direct} pack)
-           (str "quant-stream-layout: pack " pack " not implemented (5-bit, ...)"))
+   (assert (= pack :nibble-interleaved)
+           (str "quant-stream-layout: only :nibble-interleaved (4-bit) implemented; pack="
+                pack " is a future packing variant (8-bit direct, 5-bit, ...)"))
    (let [nc (hw/column-tile desc)            ;; output-column tile = f32 lanes
          k-group 4                           ;; dpbusd int8 4-way lane-step
-         nibble? (= pack :nibble-interleaved)
-         half (when nibble? (quot nc 2))]    ;; columns sharing a byte via lo/hi nibble (4-bit)
-     {:kind            (if nibble? :q4-col-interleaved :q8-col-interleaved)
+         half (quot nc 2)]                   ;; columns sharing a byte via lo/hi nibble (4-bit)
+     {:kind            :q4-col-interleaved
       :tile            nc
       :block           block
       :k-group         k-group
@@ -57,9 +57,7 @@
       :pack            pack
       :half            half
       :igroups         (quot block k-group)  ;; dpbusd steps per block (8 for block 32)
-      ;; bytes per input-group: nibble packs 2 columns/byte (half*k-group);
-      ;; byte-direct is one column-element per byte (nc*k-group).
-      :bytes-per-igroup (if nibble? (* half k-group) (* nc k-group))})))
+      :bytes-per-igroup (* half k-group)})))
 
 ;; ---------------------------------------------------------------------------
 ;; The layout function — physical byte index for a (group, block, igroup, byte)
@@ -75,15 +73,13 @@
 ;; ---------------------------------------------------------------------------
 
 (defn repack
-  "Row-major quantized weight {wq, ws[out*nb]} -> the descriptor's interleaved layout.
+  "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} -> the descriptor's interleaved layout.
   Output column i lands in accumulator lane i (no shuffles). Generated from the
-  layout descriptor; byte-identical to the AVX2 (NC=8) hand repack-stream for Q4, and
-  the generalization to NC=16/4 and :byte-direct (8-bit) follows from the descriptor.
-  `out` must be a multiple of :tile (caller pads). One-time weight-load cost.
-  Source wq: :nibble-interleaved = Q4_0 rows (byte[out*in/2], lo=w[k]/hi=w[k+16]);
-  :byte-direct = one unsigned byte per weight (byte[out*in])."
+  layout descriptor; byte-identical to the AVX2 (NC=8) hand repack-stream, and the
+  generalization to NC=16/4 follows from the descriptor. `out` must be a multiple of
+  :tile (caller pads). One-time weight-load cost."
   [layout ^bytes wq ^floats ws out in]
-  (let [{:keys [tile block k-group half igroups bytes-per-igroup pack]} layout
+  (let [{:keys [tile block k-group half igroups bytes-per-igroup]} layout
         nb (quot (int in) (int block))
         ng (quot (int out) (int tile))
         halfw (quot (int in) 2)
@@ -98,19 +94,15 @@
       (dotimes [b nb]
         (dotimes [ig igroups]
           (dotimes [j bytes-per-igroup]
-            (let [idx (+ (* gi nb bytes-per-igroup igroups) (* b bytes-per-igroup igroups)
-                         (* ig bytes-per-igroup) j)
-                  e (+ (* ig k-group) (mod j k-group))]
-              (if (= pack :byte-direct)
-                ;; byte j = column (gi*tile + j/k-group), element e — direct copy
-                (let [row (+ (* gi tile) (quot j k-group))]
-                  (aset wqi idx (aget wq (+ (* row (int in)) (* b block) e))))
-                ;; byte j packs column (gi*tile + j/k-group) low nibble and
-                ;; column (that + half) high nibble, for element e.
-                (let [base (+ (* gi tile) (quot j k-group))
-                      nlo (src-nib base b e)
-                      nhi (src-nib (+ base half) b e)]
-                  (aset wqi idx (unchecked-byte (bit-or nlo (bit-shift-left nhi 4)))))))))
+            ;; byte j packs column (gi*tile + j/k-group) low nibble and
+            ;; column (that + half) high nibble, for element ig*k-group + j%k-group.
+            (let [base (+ (* gi tile) (quot j k-group))
+                  e (+ (* ig k-group) (mod j k-group))
+                  nlo (src-nib base b e)
+                  nhi (src-nib (+ base half) b e)]
+              (aset wqi (+ (* gi nb bytes-per-igroup igroups) (* b bytes-per-igroup igroups)
+                           (* ig bytes-per-igroup) j)
+                    (unchecked-byte (bit-or nlo (bit-shift-left nhi 4)))))))
         (dotimes [r tile]
           (aset wsi (+ (* gi nb tile) (* b tile) r)
                 (aget ws (+ (* (+ (* gi tile) r) nb) b))))))

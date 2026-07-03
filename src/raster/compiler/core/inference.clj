@@ -18,7 +18,6 @@
   (:require [clojure.string :as str]
             [clojure.core.typed :as t]
             [raster.compiler.core.op-descriptor :as descriptor]
-            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.types :as types]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.tc-extensions]))
@@ -428,31 +427,6 @@
 (defn literal-tag [form]
   (some (fn [[pred tag]] (when (pred form) tag)) literal-type-tags))
 
-(defn floating-literal-tag
-  "Type tag for a literal `form`, narrowing a bare floating (Double) literal to
-   the ambient monomorphization `element-dtype` when one is in scope. This is the
-   binding-init half of contextual literal typing: a `0.0` accumulator init in a
-   T=float body tags as 'float so the loop stays devirtualized, without the old
-   blind pre-pass that also corrupted literals bound to concrete non-T params.
-   Integer/other literals are unaffected — index/counter literals stay 'long.
-   Returns nil for non-literals."
-  [form element-dtype]
-  (when-let [lt (literal-tag form)]
-    (if (and element-dtype (instance? Double form))
-      (dtype/scalar-tag-for-dtype element-dtype)
-      lt)))
-
-(defn floating-literal-narrowed-tag
-  "The element-dtype scalar tag IFF `form` is a bare Double literal and an
-   `element-dtype` is in scope; nil otherwise. Distinct from floating-literal-tag
-   in that it fires ONLY for the narrow-worthy case, so it can be used as a
-   priority override of TC's `double` tag on a monomorphized accumulator init
-   (a policy layer above TC — TC's `double` is correct for the source literal;
-   we are deliberately narrowing to the element dtype)."
-  [form element-dtype]
-  (when (and element-dtype (instance? Double form))
-    (dtype/scalar-tag-for-dtype element-dtype)))
-
 (defn hint-tag [form]
   (when-let [m (meta form)]
     (or (:raster.type/tag m)
@@ -653,18 +627,12 @@
                                      matches))
                   refined (filterv (complement dominated?) matches)]
               (when (= 1 (count refined)) (first refined)))))))
-    (let [matches (filterv (fn [entry]
-                             (every? true? (map tag-matches? arg-tags
-                                                (:check-classes entry)
-                                                (:tags entry))))
-                           methods)]
-      ;; Prefer an entry whose tags EXACTLY equal the concrete arg-tags over one
-      ;; that matches only via Object wildcards (the parametric `objects`/type-var
-      ;; fallback). Both match float args, but the concrete `_m_floats_..` method
-      ;; is the one to devirtualize to — otherwise resolution is order-dependent
-      ;; (a freshly-registered specialization is appended AFTER the generic).
-      (or (first (filter #(= (:tags %) arg-tags) matches))
-          (first matches)))))
+    (some (fn [entry]
+            (when (every? true? (map tag-matches? arg-tags
+                                     (:check-classes entry)
+                                     (:tags entry)))
+              entry))
+          methods)))
 
 (def ^:private class->dispatch-tag*
   "Reverse of primitive-info: Class → dispatch tag symbol."
@@ -745,18 +713,6 @@
               ;; Promotion failed — accept the abstract fallback if it exists
               (when exact {:entry exact})))))))
 
-(defn- parametric-template-registered?
-  "True when a parametric (All [T]) template is registered for `fn-sym` (bare or
-  namespace-qualified). Used to decide whether a specialization failure is a real
-  hazard worth surfacing vs an expected speculative miss on a non-parametric fn."
-  [fn-sym]
-  (boolean
-   (when-let [reg (requiring-resolve 'raster.compiler.core.dispatch/parametric-registry)]
-     (let [m @@reg
-           fq (when-let [v (resolve fn-sym)]
-                (symbol (str (:ns (meta v))) (str (:name (meta v)))))]
-       (or (get m fn-sym) (and fq (get m fq)))))))
-
 (defn try-parametric-specialize!
   "When a concrete dispatch entry is not found but a parametric template exists,
   trigger specialization and return the new entry. This is the Julia model:
@@ -777,56 +733,18 @@
                               ;; For user-defined types, try to find a constructor
                               nil))
                           arg-tags)
-          ;; Registration-only trigger: compile + register the concrete method
-          ;; without INVOKING it. Invoking (try-parametric-dispatch) on these
-          ;; degenerate trigger args (zero-length arrays, 0 scalars) crashes any
-          ;; body that divides by a scalar param — a spurious specialization
-          ;; "failure" that would silently drop the call to boxed dispatch.
-          try-reg (requiring-resolve 'raster.compiler.core.dispatch/try-parametric-register!)]
-      (when (and (every? some? fake-args) try-reg)
+          try-pd (requiring-resolve 'raster.compiler.core.dispatch/try-parametric-dispatch)]
+      (when (and (every? some? fake-args) try-pd)
         (try
-          (some? (try-reg fn-sym fake-args))
-          (catch Exception e
-            ;; try-parametric-dispatch returns nil (no throw) when no template
-            ;; matches — an expected speculative miss. If it THREW, a parametric
-            ;; template matched but its concrete specialization failed to compile.
-            ;; The caller then falls back to the boxed parametric generic: correct
-            ;; but unfused/slow. That is exactly the invisible-devirtualization-hole
-            ;; failure mode, so surface it (only when a template is actually
-            ;; registered, to avoid noise on unrelated speculative errors).
-            (when (parametric-template-registered? fn-sym)
-              (binding [*out* *err*]
-                (println (str "WARNING: compile-time parametric specialization of "
-                              fn-sym " " (vec arg-tags)
-                              " failed — falling back to boxed generic dispatch (slow)."
-                              " Cause: " (.getMessage e)))))
-            nil))))))
-
-(defn- parametric-fallback-entry?
-  "True when a matched method entry is the GENERIC parametric fallback — an
-  `objects`-tagged array param — at a position where the concrete arg tag
-  carries a specific primitive-array element type (floats/doubles/…). In that
-  case the `objects` entry only matches by boxing; a concrete specialization
-  (T := that element type) is a strictly better, fusable, unboxed match. This is
-  what lets an inner parametric call inside a monomorphized body resolve to the
-  concrete `_m_floats_…-impl` instead of stopping at the boxed `_m_objects_T_`."
-  [entry arg-tags]
-  (boolean
-   (some (fn [[et at]]
-           (and (= 'objects et)
-                (contains? '#{floats doubles ints longs bytes} at)))
-         (map vector (:tags entry) arg-tags))))
+          (some? (try-pd fn-sym fake-args))
+          (catch Exception _e nil))))))
 
 (defn try-resolve-call
   "Try to resolve a deftm call to a direct mangled call.
   type-env: {sym → {:tag, :fn-info, :element}}
 
   When no concrete entry exists but arg types are known, triggers parametric
-  specialization (Julia-style JIT specialization at compile time). When only a
-  generic parametric fallback (`objects`-tagged) matches concrete primitive-array
-  args, it ALSO specializes and prefers the concrete entry — so a monomorphized
-  compile pass devirtualizes inner parametric calls to their concrete element
-  type instead of the boxed fallback."
+  specialization (Julia-style JIT specialization at compile time)."
   ([fn-sym arg-forms type-env]
    (try-resolve-call fn-sym arg-forms type-env nil))
   ([fn-sym arg-forms type-env extra-tags]
@@ -840,20 +758,11 @@
                                   (first form))
                                 extra))
                           arg-forms (or extra-tags (repeat nil)))
-           specialize! (fn []
-                         (when (try-parametric-specialize! fn-sym arg-tags)
-                           ;; Re-read table after specialization added the entry
-                           (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))
-           direct (resolve-method-entry table arg-tags)
-           result (cond
-                    ;; A generic parametric fallback matched concrete array args —
-                    ;; specialize to the concrete element type and prefer it.
-                    (and direct (parametric-fallback-entry? (:entry direct) arg-tags))
-                    (or (specialize!) direct)
-                    ;; Concrete/promoted match — use it directly.
-                    direct direct
-                    ;; No entry at all — try parametric specialization.
-                    :else (specialize!))]
+           result (or (resolve-method-entry table arg-tags)
+                      ;; No concrete entry — try parametric specialization
+                      (when (try-parametric-specialize! fn-sym arg-tags)
+                        ;; Re-read table after specialization added the entry
+                        (resolve-method-entry (get-dispatch-table fn-sym) arg-tags)))]
        (when result
          (let [entry (:entry result)
                casts (:casts result)
@@ -1396,15 +1305,13 @@
       compound shapes)
     - Cheap structural fallbacks for when TC didn't run (parametric
       functions, TC errors)"
-  [sym init rewritten-init type-env {:keys [source-ns element-dtype]}]
+  [sym init rewritten-init type-env {:keys [source-ns]}]
   (or
    ;; Explicit ^tag metadata — user override, authoritative
    (when-let [t (hint-tag sym)]
      (trace-inferred sym t :hint))
-   ;; Literal type — TC covers this, but free and needed for parametric fns.
-   ;; A bare floating literal narrows to the ambient element dtype (binding-init
-   ;; half of contextual literal typing); integer literals stay 'long.
-   (when-let [t (floating-literal-tag init element-dtype)]
+   ;; Literal type — TC covers this, but free and needed for parametric fns
+   (when-let [t (literal-tag init)]
      (trace-inferred sym t :literal))
    ;; Symbol alias — propagate known type
    (when-let [t (when (symbol? init) (type-env-tag type-env init))]

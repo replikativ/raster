@@ -781,30 +781,18 @@
                                                         ;; Load field from this
                                                               (.aload code 0)
                                                               (.getfield code class-desc fname ftype)
-                                                              ;; Checkcast ref captures with known types. Array-typed
-                                                              ;; captures (floats/doubles/ints/longs) are stored in
-                                                              ;; Object fields but used as [F/[D/[I/[J (e.g. Vector API
-                                                              ;; .intoArray) → checkcast to the array type, else the
-                                                              ;; verifier rejects Object-not-assignable-to-[F.
+                                                              ;; Checkcast ref captures with known types
                                                               (when (and (= st :ref) (:hint info)
                                                                          (not= (:hint info) 'Object))
                                                                 (let [hint (:hint info)
-                                                                      arr-cd (case hint
-                                                                               floats  fltarr-cd
-                                                                               doubles dblarr-cd
-                                                                               ints    intarr-cd
-                                                                               longs   lngarr-cd
-                                                                               nil)]
-                                                                  (if arr-cd
-                                                                    (.checkcast code arr-cd)
-                                                                    (let [cls (or (try (Class/forName (str hint))
-                                                                                       (catch Exception _ nil))
-                                                                                  (when-let [r (ns-resolve
-                                                                                                (or (:source-ns ctx) *ns*)
-                                                                                                (symbol (str hint)))]
-                                                                                    (when (class? r) r)))]
-                                                                      (when cls
-                                                                        (.checkcast code (class-desc-of cls)))))))
+                                                                      cls (or (try (Class/forName (str hint))
+                                                                                   (catch Exception _ nil))
+                                                                              (when-let [r (ns-resolve
+                                                                                            (or (:source-ns ctx) *ns*)
+                                                                                            (symbol (str hint)))]
+                                                                                (when (class? r) r)))]
+                                                                  (when cls
+                                                                    (.checkcast code (class-desc-of cls)))))
                                                               (case st
                                                                 :double (.dstore code slot)
                                                                 :long   (.lstore code slot)
@@ -823,14 +811,7 @@
                                                           (map-indexed vector params))
                                                          inner-ctx {:class-desc class-desc
                                                                     :next-slot  next-slot
-                                                                    :source-ns  (:source-ns ctx)
-                                                                    ;; Propagate typing/sibling context from the enclosing
-                                                                    ;; method — without :element-type the body compiles
-                                                                    ;; float ops as double (stray Double local → bad
-                                                                    ;; stack-map frame → VerifyError in SIMD closures).
-                                                                    :element-type          (:element-type ctx)
-                                                                    :sibling-methods       (:sibling-methods ctx)
-                                                                    :typed-sibling-methods (:typed-sibling-methods ctx)}
+                                                                    :source-ns  (:source-ns ctx)}
                                                          expanded-body (map macroexpand-all-preserving body)
                                                          ret-type (emit-body code expanded-body param-locals inner-ctx)]
                                                ;; Box and return

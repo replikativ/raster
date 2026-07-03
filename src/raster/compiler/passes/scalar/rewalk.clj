@@ -74,9 +74,7 @@
                      (walker/walk-body optimized
                                        (cond-> {:type-env type-env}
                                          (:source-ns opts) (assoc :source-ns (:source-ns opts))
-                                         (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
-                                         ;; AOT monomorphization dtype → contextual literal typing (B)
-                                         (#{:float :double} current-dtype) (assoc :element-dtype current-dtype)))
+                                         (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)))
                      (catch Exception e
                        (binding [*out* *err*]
                          (println (str "WARNING: rewalk failed, passing through: " (.getMessage e))))

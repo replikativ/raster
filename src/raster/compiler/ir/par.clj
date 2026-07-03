@@ -379,7 +379,6 @@
                     'raster.par/map! 'par/map!
                     'raster.par/map2! 'par/map2!
                     'raster.par/reduce 'par/reduce
-                    'raster.par/reduce-into 'par/reduce-into
                     'raster.par/scan 'par/scan
                     'raster.par/scan-exclusive 'par/scan-exclusive
                     'raster.par/stencil! 'par/stencil!
@@ -441,23 +440,6 @@
   "Check if a form is a raster.par/reduce-by-key parallel reduction."
   [form]
   (and (seq? form) (contains? #{'raster.par/reduce-by-key 'par/reduce-by-key} (first form))))
-
-(defn par-reduce-into-form?
-  "Check if a form is a raster.par/reduce-into — an internal IR form (like pmap) emitted by the
-   resident reduce-fusion pass: a parallel reduction that writes its scalar result into element 0
-   of a caller-supplied 1-element output buffer (so it stays device-resident) instead of
-   returning a host scalar. Form: (raster.par/reduce-into out-buf acc init idx bound body)."
-  [form]
-  (and (seq? form) (contains? #{'raster.par/reduce-into 'par/reduce-into} (first form))))
-
-(defn extract-par-reduce-into-info
-  "Extract {:out-buf, :reduce-form, :bound} from a reduce-into form. :reduce-form is the
-   equivalent plain par/reduce (out-buf dropped) so existing SegRed codegen is reused verbatim."
-  [form]
-  (when (par-reduce-into-form? form)
-    (let [[_ out-buf acc init idx bound body] form]
-      {:out-buf out-buf :bound bound
-       :reduce-form (with-meta (list 'raster.par/reduce acc init idx bound body) (meta form))})))
 
 (defn par-rng-fill-form?
   "Check if a form is a raster.par/rng-fill! parallel RNG fill."
@@ -629,38 +611,23 @@
       (cond-> {:acc acc :init init :idx idx :bound bound :body body}
         elem-type (assoc :elem-type elem-type)))))
 
-(defn- unwrap-array-sym
-  "Unwrap cast wrappers around an array argument: (double arr) → arr, (float arr) → arr;
-  then strip metadata to a bare symbol."
-  [arr-sym]
-  (let [unwrapped (if (and (seq? arr-sym)
-                           (contains? #{'double 'float 'int 'long
-                                        'clojure.core/double 'clojure.core/float} (first arr-sym))
-                           (= 2 (count arr-sym)))
-                    (second arr-sym)
-                    arr-sym)]
-    (if (symbol? unwrapped) (symbol (name unwrapped)) unwrapped)))
-
 (defn collect-aget-arrays
   "Collect array symbols referenced via aget in a body expression.
-  Returns a set of array symbols (stripped of metadata).
-
-  Recognizes BOTH surface aget forms — (clojure.core/aget arr idx),
-  (raster.arrays/aget arr idx) — AND devirtualized interface calls,
-  (.invk <impl> arr idx), via the :raster.op/original op the walker stamps on
-  the .invk form. Reading that carried semantic identity (rather than the surface
-  op alone) is what keeps INTERMEDIATE arrays — which the walker devirtualizes to
-  .invk while it emits primitive clojure.core/aget for typed params — classified
-  as array inputs rather than scalars. (Semantic identity is carried as metadata,
-  never recovered from the mangled impl name — see CLAUDE.md compiler principles.)"
+  Returns a set of array symbols (stripped of metadata)."
   [body-expr]
   (cond
-    ;; Recognize both bare (aget arr idx) and devirtualized (.invk aget-impl arr idx);
-    ;; descriptor/aget-array-sym unwraps casts + strips metadata. Recurse into the
-    ;; args too so nested aget reads (and the index expr) are still collected.
-    (descriptor/aget-call? body-expr)
-    (apply set/union #{(descriptor/aget-array-sym body-expr)}
-           (map collect-aget-arrays (descriptor/call-args body-expr)))
+    (and (seq? body-expr)
+         (descriptor/aget-op? (first body-expr))
+         (>= (count body-expr) 3))
+    #{(let [arr-sym (second body-expr)
+            ;; Unwrap cast wrappers: (double arr) → arr, (float arr) → arr
+            unwrapped (if (and (seq? arr-sym)
+                               (contains? #{'double 'float 'int 'long
+                                            'clojure.core/double 'clojure.core/float} (first arr-sym))
+                               (= 2 (count arr-sym)))
+                        (second arr-sym)
+                        arr-sym)]
+        (if (symbol? unwrapped) (symbol (name unwrapped)) unwrapped))}
 
     (seq? body-expr)
     (apply set/union #{} (map collect-aget-arrays (rest body-expr)))
