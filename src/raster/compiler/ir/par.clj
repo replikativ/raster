@@ -27,9 +27,9 @@
   [form]
   (let [[_ ids-arr n-active n-agents base-seed] form
         i-sym (gensym "i__")]
-    (list 'let ['n-active__ (list 'int n-active) 'n-agents__ (list 'long n-agents) 'base__ (list 'long base-seed)]
+    (list 'let* ['n-active__ (list 'int n-active) 'n-agents__ (list 'long n-agents) 'base__ (list 'long base-seed)]
           (list 'dotimes [i-sym 'n-active__]
-                (list 'let ['state__ (list 'unchecked-add 'base__
+                (list 'let* ['state__ (list 'unchecked-add 'base__
                                            (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
                             's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
                             's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
@@ -45,7 +45,7 @@
   [form]
   (let [[_ count-arr & pairs] form
         slot-sym (gensym "slot__")]
-    (list 'let [slot-sym (list 'int (list 'raster.par/atomic-add! count-arr 0 (list 'int 1)))]
+    (list 'let* [slot-sym (list 'int (list 'raster.par/atomic-add! count-arr 0 (list 'int 1)))]
           (cons 'do (map (fn [[arr val]] (list 'clojure.core/aset arr slot-sym val))
                          (partition 2 pairs))))))
 
@@ -54,9 +54,9 @@
   [form]
   (let [[_ seeds-arr n base-seed] form
         i-sym (gensym "i__")]
-    (list 'let ['n__ (list 'int n) 'base__ (list 'long base-seed)]
+    (list 'let* ['n__ (list 'int n) 'base__ (list 'long base-seed)]
           (list 'dotimes [i-sym 'n__]
-                (list 'let ['state__ (list 'unchecked-add 'base__
+                (list 'let* ['state__ (list 'unchecked-add 'base__
                                            (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
                             's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
                             's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
@@ -76,7 +76,7 @@
         aset-expr (if cast-fn
                     (list cast-fn body-expr)
                     body-expr)]
-    (list 'let [n-sym (list 'int bound-expr)]
+    (list 'let* [n-sym (list 'int bound-expr)]
           ;; Fill boundary elements with boundary value
           (list 'do
                 (list 'dotimes [j-sym radius]
@@ -84,7 +84,7 @@
                       (list 'clojure.core/aset out-sym (list '- n-sym 1 j-sym) boundary))
             ;; Interior loop
                 (list 'dotimes [j-sym (list '- n-sym (list '* 2 radius))]
-                      (list 'let [idx-sym (list 'int (list '+ j-sym radius))]
+                      (list 'let* [idx-sym (list 'int (list '+ j-sym radius))]
                             (list 'clojure.core/aset out-sym idx-sym aset-expr)))
                 out-sym))))
 
@@ -204,10 +204,10 @@
         store-expr (if cast-fn
                      (list cast-fn acc-sym)
                      acc-sym)]
-    (list 'let [n-sym (list 'int bound-expr)]
+    (list 'let* [n-sym (list 'int bound-expr)]
           (list 'loop [i-sym 0 acc-sym init-expr]
                 (list 'if (list '< i-sym n-sym)
-                      (list 'let [acc-sym body-expr]
+                      (list 'let* [acc-sym body-expr]
                             (list 'clojure.core/aset out-sym i-sym store-expr)
                             (list 'recur (list 'inc i-sym) acc-sym))
                       out-sym)))))
@@ -224,12 +224,12 @@
         store-expr (if cast-fn
                      (list cast-fn acc-sym)
                      acc-sym)]
-    (list 'let [n-sym (list 'int bound-expr)]
+    (list 'let* [n-sym (list 'int bound-expr)]
           (list 'do
                 (list 'clojure.core/aset out-sym 0 init-store)
                 (list 'loop [i-sym 0 acc-sym init-expr]
                       (list 'if (list '< i-sym n-sym)
-                            (list 'let [acc-sym body-expr]
+                            (list 'let* [acc-sym body-expr]
                                   (list 'clojure.core/aset out-sym (list 'inc i-sym) store-expr)
                                   (list 'recur (list 'inc i-sym) acc-sym))
                             out-sym))))))
@@ -240,7 +240,7 @@
   [form]
   (let [[_ i-sym bound-expr body-expr] form
         n-sym (gensym "n__")]
-    (list 'let [n-sym (list 'int bound-expr)]
+    (list 'let* [n-sym (list 'int bound-expr)]
           (list 'dotimes [i-sym n-sym]
                 body-expr)
           nil)))
@@ -253,9 +253,9 @@
       4 (let [[out src index n] args
               i-sym (gensym "i__")
               idx-sym (gensym "idx__")]
-          (list 'let ['n__ (list 'int n)]
+          (list 'let* ['n__ (list 'int n)]
                 (list 'dotimes [i-sym 'n__]
-                      (list 'let [idx-sym (list 'clojure.core/aget index i-sym)]
+                      (list 'let* [idx-sym (list 'clojure.core/aget index i-sym)]
                             (list 'clojure.core/aset out idx-sym
                                   (list '+ (list 'clojure.core/aget out idx-sym)
                                         (list 'clojure.core/aget src i-sym)))))
@@ -264,11 +264,11 @@
               i-sym (gensym "i__")
               d-sym (gensym "d__")
               idx-sym (gensym "idx__")]
-          (list 'let ['n__ (list 'int n) 'stride__ (list 'int stride)]
+          (list 'let* ['n__ (list 'int n) 'stride__ (list 'int stride)]
                 (list 'dotimes [i-sym 'n__]
-                      (list 'let [idx-sym (list 'clojure.core/aget index i-sym)]
+                      (list 'let* [idx-sym (list 'clojure.core/aget index i-sym)]
                             (list 'dotimes [d-sym 'stride__]
-                                  (list 'let ['src-pos__ (list '+ (list '* i-sym 'stride__) d-sym)
+                                  (list 'let* ['src-pos__ (list '+ (list '* i-sym 'stride__) d-sym)
                                               'dst-pos__ (list '+ (list '* idx-sym 'stride__) d-sym)]
                                         (list 'clojure.core/aset out 'dst-pos__
                                               (list '+ (list 'clojure.core/aget out 'dst-pos__)
@@ -282,7 +282,7 @@
     (case (count args)
       4 (let [[out src index n] args
               i-sym (gensym "i__")]
-          (list 'let ['n__ (list 'int n)]
+          (list 'let* ['n__ (list 'int n)]
                 (list 'dotimes [i-sym 'n__]
                       (list 'clojure.core/aset out i-sym
                             (list 'clojure.core/aget src
@@ -291,9 +291,9 @@
       5 (let [[out src index n stride] args
               i-sym (gensym "i__")
               d-sym (gensym "d__")]
-          (list 'let ['n__ (list 'int n) 'stride__ (list 'int stride)]
+          (list 'let* ['n__ (list 'int n) 'stride__ (list 'int stride)]
                 (list 'dotimes [i-sym 'n__]
-                      (list 'let ['sbase__ (list '* (list 'clojure.core/aget index i-sym) 'stride__)
+                      (list 'let* ['sbase__ (list '* (list 'clojure.core/aget index i-sym) 'stride__)
                                   'obase__ (list '* i-sym 'stride__)]
                             (list 'dotimes [d-sym 'stride__]
                                   (list 'clojure.core/aset out (list '+ 'obase__ d-sym)
@@ -305,9 +305,9 @@
   [form]
   (let [[_ output keys vals n op] form
         i-sym (gensym "i__")]
-    (list 'let ['n__ (list 'int n)]
+    (list 'let* ['n__ (list 'int n)]
           (list 'dotimes [i-sym 'n__]
-                (list 'let ['k__ (list 'clojure.core/aget keys i-sym)
+                (list 'let* ['k__ (list 'clojure.core/aget keys i-sym)
                             'v__ (list 'clojure.core/aget vals i-sym)]
                       (list 'clojure.core/aset output 'k__
                             (list (or op '+) (list 'clojure.core/aget output 'k__) 'v__))))

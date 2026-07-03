@@ -296,7 +296,7 @@
     (let [form '(raster.par/stencil! out [a] 1 :dirichlet double i n body)
           expanded (ir.par/expand-par-stencil! form)]
       ;; Should contain let, do, dotimes
-      (is (= 'let (first expanded)))
+      (is (= 'let* (first expanded)))
       (is (some #(and (seq? %) (= 'dotimes (first %)))
                 (tree-seq seq? seq expanded))))))
 
@@ -416,7 +416,7 @@
   (testing "expand-par-reduce-by-key produces sequential loop"
     (let [form '(raster.par/reduce-by-key out keys vals 10 +)
           expanded (ir.par/expand-par-reduce-by-key form)]
-      (is (= 'let (first expanded)))
+      (is (= 'let* (first expanded)))
       (is (some #(and (seq? %) (= 'dotimes (first %)))
                 (tree-seq seq? seq expanded))))))
 
