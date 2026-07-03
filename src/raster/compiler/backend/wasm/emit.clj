@@ -47,7 +47,7 @@
 ;; raster.compiler.backend.intrinsics — emit dispatches through ix/wasm-op.
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur? emit-bindings)
+(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur? emit-bindings emit-operand-at)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -105,18 +105,28 @@
         (or (nil? c) (false? c))    :else
         :else nil))
 
+(defn- sym-vt
+  "Valtype from the walker's stamped :raster.type/tag on a binding symbol — the
+   single type source (TC-fed). nil when unstamped (pass-introduced bindings)."
+  [s]
+  (when-let [tag (:raster.type/tag (meta s))]
+    (case tag
+      double :f64  float :f32  (long int byte short char boolean) :i32
+      nil)))                                     ; array/ref tags: not a scalar local
+
 (defn- emit-bindings
-  "Lower a let* binding vector → [ctx' init-bytes]: each `[sym init]` either binds a
-   void effect form (no value — recorded as {:void true}, init emitted as an effect) or
-   allocates a typed local and emits `(local-set …)`. Shared by every position handler
-   (value / effect / then / result) so the binding lowering lives in one place."
+  "Lower a let* binding vector → [ctx' init-bytes]. The local's type comes from the
+   STAMPED symbol tag (walker/TC — the single type source); init inference is only
+   the fallback for pass-introduced unstamped bindings. Init values are coerced to
+   the local's valtype (emit-operand-at), so a widened local takes a narrower init."
   [ctx binds]
   (reduce (fn [[c acc] [s init]]
             (if (void-effect-form? init)
               [(assoc-in c [:env s] {:void true}) (into acc (emit-effect c init))]
-              (let [vt (infer-vt c init) idx (alloc! c vt)]
+              (let [vt (or (sym-vt s) (infer-vt c init))
+                    idx (alloc! c vt)]
                 [(assoc-in c [:env s] {:idx idx :vt vt})
-                 (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
+                 (-> acc (into (emit-operand-at c vt init)) (into (e/local-set idx)))])))
           [ctx []] (partition 2 binds)))
 
 (defn- emit-val
@@ -177,7 +187,8 @@
             :else (emit-val ctx e)
             (let [tv (infer-vt ctx t)
                   vt (if (= tv :i32) (infer-vt ctx e) tv)]
-              (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))))
+              (-> (emit-val ctx c)
+                  (into (e/if-t vt (emit-operand-at ctx vt t) (emit-operand-at ctx vt e)))))))
         ;; case* (macroexpanded) → lower to a let*+if-chain, emitted via normal path
         (= h 'case*)
         (emit-val ctx (synth-case* A))
@@ -201,7 +212,7 @@
         (= h '.invk)
         (let [tag (:raster.type/tag (meta node))
               vt  (case tag
-                    double :f64, float :f32, (long int) :i32
+                    double :f64, float :f32, (long int byte short char boolean) :i32
                     ;; No semantic tag — a devirtualization site failed to stamp it
                     ;; (the walker, inline-invk, and resolve-generic-deftm-calls all
                     ;; should). Recover the element type from the first operand
@@ -330,16 +341,26 @@
                 (-> (emit-operand-at ctx vt (first args)) (into (e/i opk))))))
       (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
 
+(def ^:dynamic *lenient-types?*
+  "When true, missing type info warns and defaults to i32 (the historical behavior)
+   instead of throwing. Types come from walker/TC stamps — a miss is a front-half
+   bug; bind this only to diagnose."
+  false)
+
 (defn- warn-unknown-vt
   "G1: surface a type-inference miss (mirrors the .invk loud-recovery policy) and
    default to :i32, instead of *silently* assuming i32 — a silent i32 on a float expr
    miscompiles. A warning here means a node reached the emitter without a resolvable
    type: a missing :raster.type/tag stamp, an unhandled form head, or an unbound symbol."
   [node why]
-  (binding [*out* *err*]
-    (println (str "WARNING: wasm infer-vt — no type for " why ": " (pr-str node)
-                  " → defaulting to i32 (may miscompile a float expr).")))
-  :i32)
+  (if *lenient-types?*
+    (do (binding [*out* *err*]
+          (println (str "WARNING: wasm infer-vt — no type for " why ": " (pr-str node)
+                        " → defaulting to i32 (may miscompile a float expr).")))
+        :i32)
+    (throw (ex-info (str "wasm emit: no type for " why " — a node reached the emitter "
+                         "without a resolvable :raster.type/tag (front-half stamping gap)")
+                    {:node node :why why}))))
 
 (defn- infer-vt
   "Result valtype of an expression, from env + carried :raster.type/tag. Genuinely
@@ -348,12 +369,13 @@
   (cond
     (symbol? node)  (if (contains? (:env ctx) node)
                       (get-in ctx [:env node :vt] :i32)   ; in env w/o :vt = a void binding
-                      (warn-unknown-vt node "unbound symbol"))
+                      (or (sym-vt node)                    ; stamped tag (walker/TC)
+                          (warn-unknown-vt node "unbound symbol")))
     (float? node)   :f64
     (integer? node) :i32
     (seq? node)
     (case (:raster.type/tag (meta node))
-      double :f64, float :f32, long :i32, int :i32
+      double :f64, float :f32, (long int byte short char boolean) :i32
       (let [h (first node)]
         (cond
           (and (symbol? h) (= "float" (name h)))  :f32
@@ -363,7 +385,8 @@
           ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
           ;; may reference a binding introduced inside it).
           (#{'let* 'let} h) (let [c' (reduce (fn [c [s init]]
-                                               (assoc-in c [:env s] {:vt (infer-vt c init)}))
+                                               (assoc-in c [:env s]
+                                                         {:vt (or (sym-vt s) (infer-vt c init))}))
                                              ctx (partition 2 (second node)))]
                               (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
@@ -380,10 +403,12 @@
           (and (symbol? h) (#{"inc" "unchecked-inc-int" "unchecked-inc"
                               "dec" "unchecked-dec-int" "unchecked-dec"} (name h))) :i32
           (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
-          (let [c' (reduce (fn [c [s init]] (assoc-in c [:env s] {:vt (infer-vt c init)}))
+          (let [c' (reduce (fn [c [s init]]
+                             (assoc-in c [:env s] {:vt (or (sym-vt s) (infer-vt c init))}))
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
                 ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
             (infer-vt c' (if (ends-in-recur? then) els then)))
+          (#{'raster.par/dp4a 'par/dp4a} h) :i32       ; int8 dot-accumulate → i32
           (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
@@ -445,11 +470,12 @@
       :else (throw (ex-info (str "unhandled effect head " h) {:node node}))))))
 
 (defn- emit-recur
-  "(recur v0 v1 ...) → push all new values, set loop locals in REVERSE (so each
-   value is read from the OLD locals before any are overwritten), then branch to
-   the loop header at depth `loop-depth`."
-  [ctx args loop-idxs loop-depth]
-  (-> (vec (mapcat #(emit-val ctx %) args))
+  "(recur v0 v1 ...) → push all new values COERCED to their loop-var valtypes
+   (the typed slot, from the stamped loop-var tags), set loop locals in REVERSE
+   (so each value is read from the OLD locals before any are overwritten), then
+   branch to the loop header at depth `loop-depth`."
+  [ctx args loop-idxs loop-vts loop-depth]
+  (-> (vec (mapcat (fn [a vt] (emit-operand-at ctx vt a)) args loop-vts))
       (into (vec (mapcat #(e/local-set %) (reverse loop-idxs))))
       (into (e/br loop-depth))))
 
@@ -468,35 +494,33 @@
 
 (defn- emit-then
   "Emit a loop's recur-branch: effects/bindings ending in a recur, or an `if` that
-   splits into a recur side and a loop-result side (nested-loop early-exit, e.g.
-   aabb-collides?). `loop-depth` is the br target of the enclosing loop header;
-   `block-depth` is the br target of the result block (a result-producing branch
-   pushes its value then br's out). Each nested `if` adds one wasm block level, so
-   both depths increment when recursing through it."
-  [ctx node loop-idxs loop-depth block-depth]
+   splits into a recur side and a loop-result side. Recur args coerce to the
+   loop-var valtypes; a result branch coerces to the block's ret-vt (nil ret-vt =
+   void loop: result side emits as effects). `loop-depth`/`block-depth` as before;
+   both increment through each nested if."
+  [ctx node loop-idxs loop-vts ret-vt loop-depth block-depth]
   (cond
     (and (seq? node) (= 'recur (first node)))
-    (emit-recur ctx (vec (rest node)) loop-idxs loop-depth)
+    (emit-recur ctx (vec (rest node)) loop-idxs loop-vts loop-depth)
     (and (seq? node) (= 'do (first node)))
     (let [stmts (vec (rest node))]
       (-> (vec (mapcat #(emit-effect ctx %) (butlast stmts)))
-          (into (emit-then ctx (last stmts) loop-idxs loop-depth block-depth))))
-    ;; let*/let before the recur — bind locals, then recurse into the tail
+          (into (emit-then ctx (last stmts) loop-idxs loop-vts ret-vt loop-depth block-depth))))
     (and (seq? node) (#{'let* 'let} (first node)))
     (let [[binds & body] (rest node)
           [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))]
-      (into init-bytes (emit-then ctx' tail loop-idxs loop-depth block-depth)))
-    ;; if splitting into recur side + loop-result side. Each side either continues
-    ;; the loop (recur → emit-then) or yields the loop's result (value → br to the
-    ;; result block). The if itself adds a block level → depths +1 inside it.
+      (into init-bytes (emit-then ctx' tail loop-idxs loop-vts ret-vt loop-depth block-depth)))
     (and (seq? node) (= 'if (first node)))
     (let [[_ c a b] node
           ld (inc loop-depth), bd (inc block-depth)
           branch (fn [br-node]
                    (if (ends-in-recur? br-node)
-                     (emit-then ctx br-node loop-idxs ld bd)
-                     (-> (emit-val ctx br-node) (into (e/br bd)))))]  ; loop result → leave block
+                     (emit-then ctx br-node loop-idxs loop-vts ret-vt ld bd)
+                     (-> (if (nil? ret-vt)
+                           (emit-effect ctx br-node)
+                           (emit-operand-at ctx ret-vt br-node))
+                         (into (e/br bd)))))]
       (-> (emit-val ctx c)
           (into [(e/op :if) e/empty-block])
           (into (branch a))
@@ -655,11 +679,12 @@
         ;; allocate loop-var locals; inits emitted with the OUTER env (loop vars
         ;; not yet in scope for their own inits)
         loop-vars (mapv (fn [[sym init]]
-                          (let [vt (infer-vt ctx init)]  ; 0→i32, 0.0→f64, (float 0.0)→f32
+                          ;; stamped symbol tag first (TC loop inference via walker)
+                          (let [vt (or (sym-vt sym) (infer-vt ctx init))]
                             {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
                         pairs)
-        inits (vec (mapcat (fn [{:keys [idx init]}]
-                             (into (emit-val ctx init) (e/local-set idx))) loop-vars))
+        inits (vec (mapcat (fn [{:keys [idx vt init]}]
+                             (into (emit-operand-at ctx vt init) (e/local-set idx))) loop-vars))
         ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
                      ctx loop-vars)
         loop-idxs (mapv :idx loop-vars)
@@ -670,20 +695,21 @@
         recur-then? (ends-in-recur? then)
         result (if recur-then? els then)
         ret-vt (infer-vt ctx' result)
+        loop-vts (mapv :vt loop-vars)
         ;; depths from inside the if: if=0, loop=1, block=2. The result branch
-        ;; leaves its value then br 2 (out of the block); the recur branch br 1.
+        ;; leaves its value (coerced to ret-vt) then br 2; the recur branch br 1.
         if-bytes (if recur-then?
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-then ctx' then loop-idxs 1 2))
+                       (into (emit-then ctx' then loop-idxs loop-vts ret-vt 1 2))
                        (into [(e/op :else)])
-                       (into (emit-val ctx' els)) (into (e/br 2))
+                       (into (emit-operand-at ctx' ret-vt els)) (into (e/br 2))
                        (into [(e/op :end)]))
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-val ctx' then)) (into (e/br 2))
+                       (into (emit-operand-at ctx' ret-vt then)) (into (e/br 2))
                        (into [(e/op :else)])
-                       (into (emit-then ctx' els loop-idxs 1 2))
+                       (into (emit-then ctx' els loop-idxs loop-vts ret-vt 1 2))
                        (into [(e/op :end)])))]
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
@@ -697,11 +723,12 @@
   (let [[_ bindvec ifform] node
         pairs (vec (partition 2 bindvec))
         loop-vars (mapv (fn [[sym init]]
-                          (let [vt (infer-vt ctx init)]
+                          ;; stamped symbol tag first (TC loop inference via walker)
+                          (let [vt (or (sym-vt sym) (infer-vt ctx init))]
                             {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
                         pairs)
-        inits (vec (mapcat (fn [{:keys [idx init]}]
-                             (into (emit-val ctx init) (e/local-set idx))) loop-vars))
+        inits (vec (mapcat (fn [{:keys [idx vt init]}]
+                             (into (emit-operand-at ctx vt init) (e/local-set idx))) loop-vars))
         ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
                      ctx loop-vars)
         loop-idxs (mapv :idx loop-vars)
@@ -710,11 +737,12 @@
         exit (if recur-then? els then)
         rec  (if recur-then? then els)
         exit-bytes (if (nil? exit) [] (emit-effect ctx' exit))
+        loop-vts (mapv :vt loop-vars)
         ;; depths from inside the if: if=0, loop=1, void block=2
         if-bytes (if recur-then?
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-then ctx' rec loop-idxs 1 2))
+                       (into (emit-then ctx' rec loop-idxs loop-vts nil 1 2))
                        (into [(e/op :else)])
                        (into exit-bytes) (into (e/br 2))
                        (into [(e/op :end)]))
@@ -722,7 +750,7 @@
                        (into [(e/op :if) e/empty-block])
                        (into exit-bytes) (into (e/br 2))
                        (into [(e/op :else)])
-                       (into (emit-then ctx' rec loop-idxs 1 2))
+                       (into (emit-then ctx' rec loop-idxs loop-vts nil 1 2))
                        (into [(e/op :end)])))]
     (into inits (e/block-v (into (e/loop* if-bytes) (e/i :unreachable))))))
 
