@@ -30,6 +30,7 @@
     (generate-compute-map-kernel form :dtype :float)
     (generate-compute-map-void-kernel form :dtype :float)"
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.passes.scalar.soa-lower :as sl]
             [clojure.string :as str]))
@@ -39,10 +40,9 @@
 ;; ================================================================
 
 (def glsl-type-map
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "int"})  ;; GLSL has no 64-bit int by default; use int
+  "Dtype keyword → GLSL type. Derived from the single faceted dtype/native-types.
+   GLSL has no 64-bit int by default; long→int."
+  (dtype/backend-types :glsl))
 
 ;; ================================================================
 ;; GLSL buffer declaration helpers

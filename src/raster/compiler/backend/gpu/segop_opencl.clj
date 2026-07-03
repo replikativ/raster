@@ -10,14 +10,17 @@
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.segop :as segop]
             [clojure.string :as str]))
 
 ;; ================================================================
 ;; SegOp field accessors
 ;; ================================================================
 
-(defn- seg-idx [segop] (-> segop :space :dims first :name))
-(defn- seg-bound [segop] (-> segop :space :dims first :bound))
+;; Innermost (reduced/mapped) dim — `first` for the 1-D case (unchanged).
+;; The N-D segmented GPU kernel (deferred, Step 5) iterates outer segment dims.
+(defn- seg-idx [segop] (:name (segop/seg-space-reduced-dim (:space segop))))
+(defn- seg-bound [segop] (:bound (segop/seg-space-reduced-dim (:space segop))))
 
 ;; ================================================================
 ;; SegMap → OpenCL kernel
@@ -68,18 +71,7 @@
                                      arr-params))
         ;; Integer scalar params seed *int-vars* so index math stays integer
         int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int)    "int"
-                       (= explicit :long)   "long"
-                       (= explicit :double) "double"
-                       (= explicit :float)  default-ctype
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else default-ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))

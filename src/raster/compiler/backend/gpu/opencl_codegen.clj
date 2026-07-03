@@ -16,6 +16,7 @@
     (emit-reduction-kernel \"sum\" :double '+ 0.0)
     (kernel-launch-config 100000 :device-id :ze:0)"
   (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.backend.gpu.c-emit :as ce]))
 
 ;; ================================================================
@@ -28,13 +29,9 @@
   ce/op-map)
 
 (def opencl-type-map
-  "Maps Raster type keywords to OpenCL C types."
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "long"   ;; OpenCL 'long' is 64-bit (unlike CUDA's 'long long')
-   :byte   "char"   ;; int8 weights/activations travel in char buffers
-   :int8   "char"})
+  "Maps Raster type keywords to OpenCL C types. Derived from the single faceted
+   dtype/native-types. OpenCL 'long' is 64-bit (unlike CUDA's 'long long')."
+  (dtype/backend-types :opencl))
 
 ;; ================================================================
 ;; Expression emission (delegates to shared)
@@ -138,10 +135,7 @@
                     'Math/max "fmax"
                     'Math/min "fmin"
                     "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str reduce-op "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " reduce-op " " b ")")))]
+        combine (ce/combine-fn reduce-op (ce/fn-style-reduction-op? op))]
     (str (when use-fp64? fp64-pragma)
          subgroup-pragma
          "__kernel void " kernel-name
@@ -393,7 +387,7 @@
   dtype: :double or :float (default :float)
   Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (get opencl-type-map dtype "float")
+  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
         use-fp64? (= dtype :double)]
     (str (when use-fp64? fp64-pragma)
          "__kernel void " kernel-name

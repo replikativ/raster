@@ -6,6 +6,20 @@
 ;; Dead binding removal
 ;; ================================================================
 
+(deftest mutation-targets-traverse-maps-test
+  ;; Regression: extract-mutation-targets must descend into map literals. A `case*`
+  ;; clause map {hash [test (aset buf …)]} can hold a mutation; missing it made DCE
+  ;; fail to seed the mutated buffer live → it could eliminate the live mutating
+  ;; binding (same map-blind class as the free-syms-flat / case* fix in #18).
+  (let [emt @#'dce/extract-mutation-targets
+        form '(case* g 0 0 (throw e)
+                     {0 [0 (clojure.core/aset buf (long i) 1.0)]
+                      1 [1 (clojure.core/aset other (long i) 2.0)]}
+                     :compact :int)]
+    (testing "a mutation inside a case* clause map is seen as a mutation target"
+      (is (contains? (emt form) 'buf))
+      (is (contains? (emt form) 'other)))))
+
 (deftest dead-binding-removal-test
   (testing "unused pure binding is removed"
     (let [form '(let* [x 1 y 2] x)

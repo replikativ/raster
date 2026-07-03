@@ -209,6 +209,23 @@
 (def ^:private h-zeCommandListAppendBarrier
   (delay (make-handle "zeCommandListAppendBarrier" (fd I32 PTR PTR I32 PTR))))
 
+;; --- Regular (replayable) command list + queue: enqueue-all-sync-once (command graph) ---
+(def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
+(def ^:private h-zeCommandQueueCreate
+  (delay (make-handle "zeCommandQueueCreate" (fd I32 PTR PTR PTR PTR))))
+(def ^:private h-zeCommandListCreate
+  (delay (make-handle "zeCommandListCreate" (fd I32 PTR PTR PTR PTR))))
+(def ^:private h-zeCommandListClose
+  (delay (make-handle "zeCommandListClose" (fd I32 PTR))))
+(def ^:private h-zeCommandQueueExecuteCommandLists
+  (delay (make-handle "zeCommandQueueExecuteCommandLists" (fd I32 PTR I32 PTR PTR))))
+(def ^:private h-zeCommandListDestroy
+  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
+(def ^:private h-zeCommandQueueDestroy
+  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
+(def ^:private h-zeKernelDestroy
+  (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
+
 (def ^:private h-zeModuleDestroy
   (delay (make-handle "zeModuleDestroy" (fd I32 PTR))))
 
@@ -1061,8 +1078,29 @@
 ;; ================================================================
 
 (def ^:private gemm-cache
-  "Cache for compiled GEMM kernel module. Atom holding {:module :kernel}."
-  (atom nil))
+  "Cache for compiled GEMM kernels, keyed by C-output dtype (:half | :float).
+   Each entry is {:module :kernel :kernel-name}. (A/B are always fp16 in.)"
+  (atom {}))
+
+(defn- ensure-gemm-kernel!
+  "Lazily compile + cache the XMX gemm_nonsquare kernel for a given C-output dtype
+   (:half or :float — A/B always fp16, fp32 accumulate). Returns {:module :kernel :kernel-name}."
+  [c-dtype]
+  (ensure-init!)
+  (or (get @gemm-cache c-dtype)
+      (let [kname (str "gemm_nonsquare_" (name c-dtype))
+            cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                        kname :c-dtype c-dtype))
+            device-hex (:device-id-hex @state)
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     cl-src :device device-hex))
+            module (load-module! spv)
+            kernel (create-kernel module kname)
+            entry {:module module :kernel kernel :kernel-name kname}]
+        (swap! gemm-cache assoc c-dtype entry)
+        entry)))
 
 (defn gemm!
   "GPU matrix multiply: C = A × B using XMX DPAS instructions.
@@ -1072,20 +1110,7 @@
 
   Returns C."
   [a b c m n k]
-  (ensure-init!)
-  (when (nil? @gemm-cache)
-    ;; Lazy-compile the GEMM kernel on first use
-    (let [cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
-                      "gemm_nonsquare"))
-          device-hex (:device-id-hex @state)
-          spv (do (require 'raster.compiler.support.spirv-cache)
-                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                   cl-src :device device-hex))
-          module (load-module! spv)
-          kernel (create-kernel module "gemm_nonsquare")]
-      (clojure.core/reset! gemm-cache {:module module :kernel kernel})))
-  (let [{:keys [kernel]} @gemm-cache
+  (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
         gc-m (int (Math/ceil (/ (double m) 128.0)))
         gc-n (int (Math/ceil (/ (double n) 128.0)))
         args [(:segment a) (:segment b) (:segment c)
@@ -1395,6 +1420,87 @@
                           ^"[Ljava.lang.Object;" (:launch-args bound))))
 
 ;; ================================================================
+;; Command graph: enqueue-all → execute-once → sync-once (OpenVINO's model)
+;; The per-op-barrier immediate list pays the ~35-75µs launch floor per kernel;
+;; a recorded regular command list pays the host-append cost ONCE and replays the
+;; whole sequence with a single queue execute. This is the raster analog of
+;; OpenVINO's in-order-enqueue + single-finish (5ms MiniLM vs 36ms per-op).
+;; ================================================================
+
+(defn create-kernel-fresh
+  "Create a NEW, UNCACHED kernel handle. LZ kernel arguments are mutable state on
+  the kernel handle, snapshotted at append; a recorded graph with N launches of
+  the same compiled kernel must give each launch its own handle or the last args
+  win (the 127-matmul clobber). Pair with destroy-kernel! at teardown."
+  ^MemorySegment [^MemorySegment module ^String kernel-name]
+  (ensure-init!)
+  (let [arena (:arena @state)
+        kern-desc (.allocate arena 32)
+        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
+        name-seg (.allocateFrom arena kernel-name)
+        _ (.set kern-desc PTR 24 name-seg)
+        kern-out (ptr-seg arena)
+        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
+    (read-ptr kern-out)))
+
+(defn record-graph!
+  "Record an ordered seq of bound kernels into a regular (replayable) command list.
+  Each `bound` (from bind-kernel!/bind-kernel-2d!, each carrying its own dedicated
+  kernel handle with args + group counts already set into its :gc-seg) is appended
+  once, with NO per-op barrier — ordering is implicit in the list. Returns a graph
+  {:queue :list :lists-arr} for replay-graph!. Re-record only if the kernel
+  sequence or any buffer pointer changes; buffer CONTENTS may change between replays."
+  [bounds & {:keys [barrier?] :or {barrier? true}}]
+  (ensure-init!)
+  (let [{:keys [arena context device]} @state
+        cq-desc (.allocate ^Arena arena 40)
+        _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until list completes
+        q-out (ptr-seg arena)
+        _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate [context device cq-desc q-out])
+        queue (read-ptr q-out)
+        cl-desc (.allocate ^Arena arena 24)
+        _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+        l-out (ptr-seg arena)
+        _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate [context device cl-desc l-out])
+        lst (read-ptr l-out)
+        h-launch @h-zeCommandListAppendLaunchKernel]
+    (doseq [{:keys [kernel gc-seg]} bounds]
+      (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                [lst kernel gc-seg MemorySegment/NULL (int 0) MemorySegment/NULL])
+      ;; DEVICE-SIDE barrier between kernels enforces RAW/WAW ordering on the GPU
+      ;; (a GEMM writes H, the next kernel reads H) with no host round-trip. The
+      ;; whole graph still costs ONE host sync (the queue execute). Skip only when
+      ;; all kernels are independent (:barrier? false — e.g. a batch of GEMMs to
+      ;; distinct outputs).
+      (when barrier?
+        (ze-call! "zeCommandListAppendBarrier" @h-zeCommandListAppendBarrier
+                  [lst MemorySegment/NULL (int 0) MemorySegment/NULL])))
+    (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+    (let [lists-arr (ptr-seg arena)]
+      (.set lists-arr PTR 0 ^MemorySegment lst)
+      {:queue queue :list lst :lists-arr lists-arr})))
+
+(defn replay-graph!
+  "Execute a recorded command graph once. The SYNCHRONOUS queue blocks until the
+  whole recorded sequence completes — one host round-trip for the entire graph."
+  [graph]
+  (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
+            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
+
+(defn destroy-graph!
+  "Destroy a recorded graph's command list + queue (pairs zeCommandListCreate /
+  zeCommandQueueCreate; avoids the driver-object-leak SIGABRT)."
+  [graph]
+  (when-let [l (:list graph)] (ze-call! "zeCommandListDestroy" @h-zeCommandListDestroy [l]))
+  (when-let [q (:queue graph)] (ze-call! "zeCommandQueueDestroy" @h-zeCommandQueueDestroy [q])))
+
+(defn destroy-kernel!
+  "Destroy a kernel handle from create-kernel-fresh."
+  [^MemorySegment kernel]
+  (ze-call! "zeKernelDestroy" @h-zeKernelDestroy [kernel]))
+
+;; ================================================================
 ;; Kernel registry (pipeline integration)
 ;; ================================================================
 
@@ -1654,6 +1760,134 @@
 ;; ================================================================
 ;; Void-map kernel invocation (side-effect-only kernels)
 ;; ================================================================
+
+(defn kernel-registry-entry
+  "Registry info for a kernel-name (source, :array-params, :written-arrays, dtype…)."
+  [kernel-name]
+  (get @kernel-registry kernel-name))
+
+(defn bind-registered-map-void-kernel
+  "Bind a registered void-map kernel over GPU-RESIDENT args, for recording into a
+  command graph (whole-offload). `arrays` must be resident (DeviceBuffer /
+  MemorySegment) — NO per-call JVM-array staging (residency is the whole point).
+  `scalar-args` are scalar values; `n` is the element count. Returns a bound map
+  {:kernel :gc-seg …} (from bind-kernel!, with :gc-seg X pre-set to the group
+  count) — pass directly to record-graph!. A FRESH kernel handle per binding is
+  used (LZ kernel args are mutable handle state → shared handles clobber)."
+  [kernel-name arrays scalar-args n]
+  (let [{:keys [module workgroup-size dtype]
+         :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+        kernel-handle (create-kernel-fresh module kernel-name)
+        wg (long workgroup-size)
+        n (long n)
+        dev-segs (reduce
+                  (fn [acc arr]
+                    (cond
+                      (device-buffer? arr)          (conj acc (:segment ^DeviceBuffer arr))
+                      (instance? MemorySegment arr)  (conj acc arr)
+                      :else (throw (ex-info "bind-registered-map-void-kernel requires GPU-resident args (DeviceBuffer/MemorySegment); JVM-array staging is not supported on the bound path"
+                                            {:arr-type (type arr)}))))
+                  [] arrays)
+        scalar-type (if (= dtype :float) :float :double)
+        scalar-kernel-args (mapv (fn [v]
+                                   (if (map? v) v
+                                       {:type scalar-type
+                                        :value (if (= scalar-type :float) (float v) (double v))}))
+                                 scalar-args)
+        all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
+        group-count (long (Math/ceil (/ (double n) (double wg))))
+        bnd (bind-kernel! kernel-handle wg all-args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
+    bnd))
+
+(defn bind-registered-gemm!
+  "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
+  command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
+  call). A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
+  {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
+  handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
+  ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
+  ([a b c m n k c-dtype]
+   (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
+         kh (create-kernel-fresh module kernel-name)
+         m (long m) n (long n) k (long k)
+         args [(:segment a) (:segment b) (:segment c)
+               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+         bnd (bind-kernel-2d! kh [256 1] args)
+         gc ^MemorySegment (:gc-seg bnd)]
+     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+     (.set gc I32 8 (int 1))
+     bnd)))
+
+(def ^:private convert-cache (atom nil))
+
+(defn- ensure-convert-kernel!
+  "Lazily compile + cache the f32→f16 element-wise convert kernel. Returns {:module :kernel}."
+  []
+  (ensure-init!)
+  (when (nil? @convert-cache)
+    (let [src (str "__kernel void f32_to_f16(__global const float* restrict in, "
+                   "__global half* restrict out, int n) {\n"
+                   "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
+                   "out[i] = (half)in[i];\n}\n")
+          device-hex (:device-id-hex @state)
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   src :device device-hex))
+          module (load-module! spv)
+          kernel (create-kernel module "f32_to_f16")]
+      (clojure.core/reset! convert-cache {:module module :kernel kernel})))
+  @convert-cache)
+
+(defn bind-registered-convert!
+  "Bind an f32→f16 element-wise convert kernel over RESIDENT buffers for recording into a
+  command graph (the Option-B activation cast before an fp16 XMX GEMM). in: f32 DeviceBuffer,
+  out: f16 (:half) DeviceBuffer, n elements. Returns a bound {:kernel :gc-seg} map. Fresh
+  kernel handle per binding."
+  [in out n]
+  (let [{:keys [module]} (ensure-convert-kernel!)
+        kh (create-kernel-fresh module "f32_to_f16")
+        n (long n)
+        args [(:segment in) (:segment out) {:type :int :value (int n)}]
+        bnd (bind-kernel! kh 256 args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double n) 256.0))))
+    bnd))
+
+(def ^:private transpose-cache (atom {}))
+
+(defn- ensure-transpose-kernel!
+  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float). Returns
+   {:module :kernel :kernel-name}."
+  [dtype]
+  (ensure-init!)
+  (or (get @transpose-cache dtype)
+      (let [kname (str "transpose_" (name dtype))
+            src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                    ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)
+                     kname :dtype dtype))
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     src :device (:device-id-hex @state)))
+            module (load-module! spv)
+            kernel (create-kernel module kname)
+            entry {:module module :kernel kernel :kernel-name kname}]
+        (swap! transpose-cache assoc dtype entry)
+        entry)))
+
+(defn bind-registered-transpose!
+  "Bind a 2D transpose kernel (in[rows,cols] → out[cols,rows], row-major) over RESIDENT buffers
+  for recording — used to realize dgemm-nt!/-tn! by transposing an operand before the :nn XMX
+  GEMM. dtype :half (default) | :float. Returns a bound {:kernel :gc-seg} map."
+  ([in out rows cols] (bind-registered-transpose! in out rows cols :half))
+  ([in out rows cols dtype]
+   (let [{:keys [module kernel-name]} (ensure-transpose-kernel! dtype)
+         kh (create-kernel-fresh module kernel-name)
+         total (* (long rows) (long cols))
+         args [(:segment in) (:segment out) {:type :int :value (int rows)} {:type :int :value (int cols)}]
+         bnd (bind-kernel! kh 256 args)]
+     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
+     bnd)))
 
 (defn invoke-registered-map-void-kernel
   "Pipeline-friendly void-map kernel invocation. No dedicated output array.

@@ -409,20 +409,6 @@
                              (call [_] (k xq xs xsum wq ws y M in out o0 cnt) nil)))]
                (doseq [f (.invokeAll p tasks)] (.get f))))))))))
 
-;; ============================================================================
-;; SCHEDULES — regime-appropriate kernel strategies (schedule-as-data).
-;; A schedule names a {layout, kernel, parallelization} strategy chosen by the
-;; roofline regime. We measured the decode GEMV to be MEMORY-bandwidth bound (84MB
-;; lm_head streamed at 9.6/11.2 GB/s = 86% of the single-core memory ceiling), so
-;; its optimal schedule is to STREAM the compressed weights contiguously — there is
-;; nothing for a compute schedule to do. The :stream-gemv schedule below is that.
-;; Compute-bound :tile-gemm (prefill M>1, register-block tile) and GPU variants slot
-;; into the same {descriptor × primitive × schedule} skeleton as more entries.
-;; ============================================================================
-;; The stream-gemv dpbusd kernel (emit-qmatmul-stream) is AVX2 — NC=8 f32 lanes. Its
-;; required weight layout is DERIVED from that ISA target via core.layout (not a second
-;; hand-written interleave). When the kernel is parameterized to AVX-512/NEON the target
-;; descriptor follows the chosen ISA and NC with it.
 (def ^:private stream-gemv-layout
   (layout/quant-stream-layout {:vector-bits 256} q4-0)) ; AVX2 NC=8, format-derived
 

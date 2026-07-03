@@ -95,7 +95,13 @@
    :f32x4.add 0xe4 :f32x4.sub 0xe5 :f32x4.mul 0xe6 :f32x4.div 0xe7
    :f32x4.min 0xe8 :f32x4.max 0xe9
    :f64x2.add 0xf0 :f64x2.sub 0xf1 :f64x2.mul 0xf2 :f64x2.div 0xf3
-   :f64x2.min 0xf4 :f64x2.max 0xf5})
+   :f64x2.min 0xf4 :f64x2.max 0xf5
+   ;; integer lanes — int8 quantized dot: widen i8→i16, i32x4.dot_i16x8_s, accumulate
+   :i32x4.splat 0x11
+   :i32x4.extract-lane 0x1b            ; + 1 lane-index immediate byte
+   :i16x8.extend-low-i8x16-s 0x87 :i16x8.extend-high-i8x16-s 0x88
+   :i32x4.add 0xae
+   :i32x4.dot-i16x8-s 0xba})
 
 ;; ---------------------------------------------------------------------------
 ;; instruction helpers — each returns a byte vector
@@ -118,6 +124,8 @@
 (defn v [simd-key] (into [0xfd] (uleb (simd-op simd-key))))
 (defn v128-load  [align offset] (into (into [0xfd] (uleb (simd-op :v128.load)))  (into (uleb align) (uleb offset))))
 (defn v128-store [align offset] (into (into [0xfd] (uleb (simd-op :v128.store))) (into (uleb align) (uleb offset))))
+;; SIMD op carrying a single lane-index immediate (e.g. i32x4.extract_lane)
+(defn v-lane [simd-key lane] (conj (into [0xfd] (uleb (simd-op simd-key))) lane))
 (defn block  [body] (into (into [(op :block) empty-block] body) [(op :end)]))
 (defn loop*  [body] (into (into [(op :loop)  empty-block] body) [(op :end)]))
 ;; block whose result is a single value of valtype vt-kw

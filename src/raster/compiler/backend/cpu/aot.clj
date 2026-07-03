@@ -20,10 +20,48 @@
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.backend.cpu.codegen :as cpu]
+            [raster.compiler.backend.cpu.csimd :as csimd]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.form :as form]
+            [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.passes.scalar.peephole :as peephole]))
+
+(def ^:dynamic *simd-preamble*
+  "When bound to an atom (by emit-c-fn), accumulates C preamble strings (immintrin
+   include + horizontal-reduce helpers) contributed by emitted C-SIMD blocks, so
+   the file header can prepend them exactly once."
+  nil)
+
+(defonce ^:private segop-id (atom 0))
+
+(defn- par-reduce->segred
+  "Build a SegRed from a raster.par/reduce form exactly as par_simd does
+   (extract-par-reduce-info → par-form->soac → lower-soac), so the C-SIMD emitter
+   consumes the SAME record the JVM path does. dtype is the kernel element type
+   (fallback when the form carries no :elem-type). nil on any failure."
+  [form dtype]
+  (try
+    (let [pi  (par/extract-par-reduce-info form)
+          dt  (or (:elem-type pi) dtype)
+          sym (gensym "red_")
+          sc  (soac/par-form->soac sym form (swap! segop-id inc))]
+      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
+    (catch Exception _ nil)))
+
+(defn- par-map->segmap
+  "Build a SegMap from a raster.par/map! form (extract-par-map-info → par-form->soac
+   → lower-soac), the same construction par_simd uses. dtype falls back to the
+   kernel element type when the form carries no :elem-type. nil on any failure."
+  [form dtype]
+  (try
+    (let [pi (par/extract-par-map-info form)
+          dt (or (:elem-type pi) dtype)
+          sc (soac/par-form->soac (:out pi) form (swap! segop-id inc))]
+      (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
+    (catch Exception _ nil)))
 
 ;; ---------------------------------------------------------------------------
 ;; Fused-IR access — reuse compile-aot's forward pipeline at the scalar backend.
@@ -33,22 +71,20 @@
   "Run compile-aot's forward passes with the SCALAR backend (no SIMD lowering)
   to get the inlined, buffer-fused body as plain loops/lets — the dialect the C
   emitter consumes."
-  [f-var dtype]
-  (let [gwb   @#'pl/get-walked-body
-        gp    @#'pl/get-params
-        bpe   @#'pl/build-param-env
-        cp    @#'pl/clean-params
-        wb    (gwb f-var dtype)
-        params (gp f-var dtype)
-        raw   (if (= 1 (count wb)) (first wb) (list* 'do wb))
+  [f-var dtype & {:keys [simd?] :or {simd? false}}]
+  (let [wb     (pl/get-walked-body f-var dtype)
+        params (pl/get-params f-var dtype)
+        raw    (if (= 1 (count wb)) (first wb) (list* 'do wb))
         source-ns (or (when (var? f-var) (.ns ^clojure.lang.Var f-var)) *ns*)
-        opts  {:inline? true :simd? false :dtype dtype
-               :active-params (cp params)
-               :param-env (bpe f-var dtype)
-               :source-ns source-ns}]
+        active (pl/clean-params params)
+        penv   (pl/build-param-env f-var dtype)
+        ;; :simd? false always keeps the JVM Vector-API lowering OFF; :keep-par-forms?
+        ;; (set when simd?=true) instead PRESERVES par/reduce|map forms so the C
+        ;; backend can emit __m256 intrinsics via csimd (vs clang auto-vec only).
+        opts  {:inline? true :simd? false :keep-par-forms? simd? :dtype dtype
+               :active-params active :param-env penv :source-ns source-ns}]
     {:form (pl/run-passes raw pl/forward-passes opts)
-     :params (cp params)
-     :param-env (bpe f-var dtype)}))
+     :params active :param-env penv}))
 
 ;; ---------------------------------------------------------------------------
 ;; Form normalization for C emission.
@@ -259,7 +295,10 @@
         (str "for (int " (ce/c-symbol iv) " = " (emit-expr* init array-syms) "; "
              (emit-expr* test array-syms) "; "
              (ce/c-symbol iv) " = " (emit-expr* step array-syms) ") {\n    "
-             (clojure.string/join "\n    " (map #(ce/emit-stmt % nil array-syms "idx") do-stmts))
+             ;; recurse with emit-host-stmt (not ce/emit-stmt) so par/map!|par/reduce
+             ;; nested INSIDE a counted loop (e.g. the quant block-loop's column fold)
+             ;; reach the csimd SIMD path; plain stmts still fall through to ce/emit-stmt.
+             (clojure.string/join "\n    " (map #(emit-host-stmt % array-syms ct) do-stmts))
              "\n  }")))
 
     (and (seq? form) (= 'let* (first form)))
@@ -285,10 +324,24 @@
         (str (clojure.string/join
               "\n  "
               (for [[sym init] pairs]
-                (if (buffer-loop? init)
+                (cond
+                  (buffer-loop? init)
                   ;; buffer-writing loop / nested compute — emit for side effects.
                   (emit-host-stmt init array-syms ct)
+                  ;; a preserved par/reduce → C-SIMD block (or scalar fallback). Build
+                  ;; the SAME SegRed the JVM path uses and hand it to csimd; on nil
+                  ;; (not vectorizable) expand to the scalar loop and emit normally.
+                  (par/par-reduce-form? init)
+                  (or (when-let [sr (par-reduce->segred init (get {"float" :float} ct :double))]
+                        (when-let [{:keys [includes helpers block]}
+                                   (csimd/compile-segred-c sr (csimd/active-isa) array-syms sym)]
+                          (when *simd-preamble* (swap! *simd-preamble* conj (str includes helpers)))
+                          (str ct " " (ce/c-symbol sym) ";\n  " block)))
+                      (let [scalar (par/expand-par-reduce init)]
+                        (str (ce/decl-type scalar) " " (ce/c-symbol sym) " = "
+                             (emit-expr* scalar array-syms) ";")))
                   ;; value binding (scalar or reduction) — declare with its tag type.
+                  :else
                   (str (ce/decl-type init) " " (ce/c-symbol sym) " = "
                        (emit-expr* init array-syms) ";"))))
              "\n  "
@@ -299,6 +352,14 @@
               "\n  "
               (for [b body :when (not (or (symbol? b) (vector? b)))]
                 (emit-host-stmt b array-syms ct))))))
+
+    ;; a preserved par/map! → C-SIMD element-wise store block (or scalar fallback).
+    (and (seq? form) (par/par-map-form? form))
+    (or (when-let [sm (par-map->segmap form (get {"float" :float} ct :double))]
+          (when-let [{:keys [includes block]} (csimd/compile-segmap-c sm (csimd/active-isa) array-syms)]
+            (when *simd-preamble* (swap! *simd-preamble* conj includes))
+            block))
+        (ce/emit-stmt (par/expand-par-map! form) nil array-syms "idx"))
 
     :else (ce/emit-stmt form nil array-syms "idx")))
 
@@ -350,9 +411,17 @@
    - length-syms  : {arr len-sym} integer length params for (alength arr)
    - stripped     : the let* body (buffer-allocs already removed) to emit
    Returns the C source string."
-  [kernel-name dtype array-params scalar-params buffers length-syms stripped]
+  [kernel-name dtype array-params scalar-params buffers local-buffers length-syms stripped]
   (let [ct (ctype dtype "double")  ; default scalar type for the body (the dominant dtype)
-        array-syms (set (concat (map first array-params) (map first buffers)))
+        array-syms (set (concat (map first array-params) (map first buffers) (map first local-buffers)))
+        ;; SROA: small, compile-time-fixed-size, non-escaping scratch buffers are emitted
+        ;; as LOCAL C arrays (not heap params), so clang can scalar-replace them into
+        ;; registers — the difference between a memory round-trip per loop iteration and a
+        ;; register-resident accumulator (the ~4x quant-GEMV codegen gap).
+        ;; zero-init (= {0}) preserves Clojure array semantics (heap arrays are zeroed);
+        ;; clang elides it when the array is fully written before read.
+        local-decls (apply str (for [[s size elem] local-buffers]
+                                  (str (elem->ctype elem "double") " " (ce/c-symbol s) "[" size "] = {0};\n  ")))
         ;; array params that the body writes (aset target) are in-place OUTPUT params —
         ;; emit them non-const; read-only input arrays stay const.
         written (written-array-syms stripped)
@@ -368,17 +437,30 @@
         int-seed (set (concat (map first (filter (fn [[_ c]] (contains? #{"int" "long"} c))
                                                  scalar-params))
                               (vals length-syms)))
+        simd-pre (atom #{})
+        ;; array symbol → element keyword, so the SIMD emitter loads int-typed arrays
+        ;; as __m256i and converts at float casts (the int8-MAC/quant widening). Params
+        ;; carry a C type; buffers/local-buffers already carry the element keyword.
+        ctype->elem {"double" :double "float" :float "long" :long "int" :int "int8_t" :byte}
+        array-types (into {} (concat
+                              (for [[s c] array-params]     [s (ctype->elem c :double)])
+                              (for [[s _ elem] buffers]      [s elem])
+                              (for [[s _ elem] local-buffers] [s elem])))
         body-c (binding [ce/*emit-config* cpu/cpu-config
                          ce/*scalar-type* ct
-                         ce/*int-vars* int-seed]
+                         ce/*int-vars* int-seed
+                         *simd-preamble* simd-pre
+                         csimd/*array-types* array-types]
                  (emit-host-stmt stripped array-syms ct))
         ;; C definitions for any ^:no-inline deftm helpers (e.g. the int8-MAC seam,
         ;; which lowers to a maddubs helper via its :c-helper override).
         [helper-incs helper-defs] (helper-c-defs stripped)]
     (str "#include <math.h>\n#include <stdbool.h>\n#include <stdint.h>\n"
+         (apply str @simd-pre)   ; immintrin + hsum helpers, if any C-SIMD block emitted
          helper-incs
          (when (seq helper-defs) (str helper-defs "\n"))
          "void " kernel-name "(" (clojure.string/join ", " param-strs) ") {\n  "
+         local-decls
          body-c
          "\n}\n")))
 
@@ -420,12 +502,38 @@
   (case elem :double (double-array n) :float (float-array n)
         :long (long-array n) :int (int-array n) :byte (byte-array n)))
 
+(def ^:private sroa-local-max
+  "Max compile-time-constant buffer length emitted as a C-local (register-promotable)
+   scratch array rather than a heap param. Small per-call accumulators/tiles (e.g. the
+   8-wide quant column dots) belong in registers; larger buffers stay hoisted heap."
+  256)
+
+(defn- const-int-size
+  "Resolve a buffer size to a compile-time integer, seeing through the walker's
+   (long N)/(int N) literal wrappers; nil if not a compile-time constant."
+  [size]
+  (cond
+    (integer? size) (long size)
+    (and (seq? size) (#{'long 'int} (first size)) (integer? (second size))) (long (second size))
+    :else nil))
+
+(defn- local-scratch-size
+  "If a buffer is small compile-time-constant scratch (not a returned result), its
+   resolved integer size; else nil. Such buffers become C-locals (register-promotable)
+   instead of heap params."
+  [result-set [sym size _elem]]
+  (when-let [n (const-int-size size)]
+    (when (and (<= n sroa-local-max) (not (contains? result-set sym))) n)))
+
 (defn compile-aot-c
   "Compile a deftm var to a single native C function via the monolithic CPU-C
   backend. Returns a fn of the deftm's args that allocates output buffers, calls
-  the native code (zero-copy), and returns the result buffer."
-  [f-var dtype]
-  (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype)
+  the native code (zero-copy), and returns the result buffer.
+
+  With :simd? true, par/reduce forms are preserved and emitted as explicit AVX2
+  __m256 intrinsic C (via csimd) instead of scalar loops left to clang auto-vec."
+  [f-var dtype & {:keys [simd?] :or {simd? false}}]
+  (let [{:keys [form params param-env]} (fused-scalar-form f-var dtype :simd? simd?)
         {nform :form length-syms :length-syms} (normalize-for-c form)
         {:keys [buffers scalar-bindings stripped]} (split-let nform)
         ;; canonical copy-propagation: resolve aliases read downstream (e.g. a binding
@@ -445,13 +553,23 @@
         scalar-ffm (vec (concat (map (fn [[_ c]] (ctype->ffm c "int")) scalar-params)
                                 (repeat (count len-order) :int)))
         kernel-name (str "aot_" (ce/c-symbol (:name (meta f-var))) "_" (name dtype))
-        src (emit-c-fn kernel-name dtype array-params scalar-params buffers length-syms stripped)
+        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
+        ;; SROA partition: small fixed-size non-result scratch buffers → C-locals (kept
+        ;; out of the signature so clang register-promotes them); the rest stay heap.
+        result-set    (set result-syms)
+        ;; local-buffers carry the RESOLVED integer size (for the C `[N]` decl)
+        local-buffers (into [] (keep (fn [[sym _ elem :as buf]]
+                                       (when-let [n (local-scratch-size result-set buf)]
+                                         [sym n elem]))
+                                     buffers))
+        local-set     (set (map first local-buffers))
+        heap-buffers  (filterv #(not (local-set (first %))) buffers)
+        src (emit-c-fn kernel-name dtype array-params scalar-params heap-buffers local-buffers length-syms stripped)
         so  (cpu/compile-source! src)
         native (cpu/load-kernel so kernel-name
-                                (+ (count array-params) (count buffers))
+                                (+ (count array-params) (count heap-buffers))
                                 scalar-ffm)
-        {result-shape :shape result-syms :syms} (result-buffers stripped buffers)
-        buf-syms (mapv first buffers)
+        buf-syms (mapv first heap-buffers)
         ;; Output buffers are reused across calls (the hoisted-buffer model the JVM
         ;; backend uses) — keyed by the resolved size signature, so repeated
         ;; same-shape calls (inference) don't re-allocate. Single-consumer: the
@@ -470,11 +588,11 @@
                             (if-let [v (try (resolve-int-expr init m) (catch Exception _ nil))]
                               (assoc m sym v) m))
                           len-env scalar-bindings)
-              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) buffers)
+              sizes (mapv (fn [[_ size-expr]] (long (resolve-int-expr size-expr env))) heap-buffers)
               c @cache
               buf-arrs (if (and c (= (:sizes c) sizes))
                          (:bufs c)
-                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) buffers sizes)]
+                         (let [b (mapv (fn [[_ _ elem] size] (alloc-array elem size)) heap-buffers sizes)]
                            (vreset! cache {:sizes sizes :bufs b}) b))
               in-arrs  (map (comp base-env first) array-params)
               scalars  (map (fn [[p _]] (get base-env p)) scalar-params)

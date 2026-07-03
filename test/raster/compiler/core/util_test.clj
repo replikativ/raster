@@ -32,6 +32,27 @@
     (is (= #{'x} (util/free-syms '(double x)))
         "only x is free in (double x)")))
 
+(deftest free-syms-flat-map-test
+  ;; Regression: the flat scanner (used by DCE liveness) must traverse map
+  ;; literals. A `case*` clause map {hash [test result-expr]} carries symbol
+  ;; references in its result exprs; missing them made DCE drop the binding they
+  ;; depend on → "unbound sym" wasm miscompile (broke valley perlin `grad`).
+  ;; free-syms-flat over-approximates (it keeps all unqualified symbols incl.
+  ;; operators) — that's safe for DCE liveness. What matters is that variable
+  ;; refs inside maps are not MISSED. Assert containment, not exact equality.
+  (testing "free-syms-flat descends into map literals"
+    (let [fs (util/free-syms-flat '{0 [0 (.invk + x y)]})]
+      (is (and (contains? fs 'x) (contains? fs 'y))
+          "symbols inside map values are seen"))
+    (let [fs (util/free-syms-flat '{k v})]
+      (is (and (contains? fs 'k) (contains? fs 'v))
+          "both map keys and values are scanned"))
+    (is (contains? (util/free-syms-flat
+                    '(case* g 0 0 (throw e) {0 [0 (.invk + arg_x yf)]
+                                             1 [1 (.invk - arg_x yf)]} :compact :int))
+                   'arg_x)
+        "case* clause-map result exprs are visible to the flat scanner")))
+
 (deftest free-syms-let-binding-test
   (testing "let* binding scopes correctly"
     (is (= #{'x} (util/free-syms '(let* [a x] a)))

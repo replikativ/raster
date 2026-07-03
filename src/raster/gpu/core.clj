@@ -840,6 +840,152 @@
   [sess phase-key]
   (get-in @sess [:kernels phase-key]))
 
+;; ================================================================
+;; Resident GPU programs (whole-offload: pipeline descriptor → bound command graph)
+;; ================================================================
+;;
+;; RE-TARGETED onto fusion's runtime graph primitives: params-on-main's per-step
+;; prepare!/bind-kernel!(4-arg)/launch-registered-bound! + session-level
+;; record-graph!/replay! are REPLACED by ze-runtime/bind-registered-map-void-kernel
+;; (returns a {:kernel :gc-seg …} bound map over GPU-RESIDENT buffers) collected into
+;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
+
+(defn bind-program!
+  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
+   ONCE: allocate resident buffers for the array params + intermediate scratch, bind each kernel
+   step against them (a fresh kernel handle per step, group count pre-set into its :gc-seg), and
+   record the kernel sequence as ONE replayable command graph. After binding, run-program!
+   replays the whole sequence with NO re-binding. The bound machinery is convention-agnostic, so
+   map! and map-void! kernels bind identically (a map! kernel's output is just another resident
+   buffer in its :array-params).
+
+   args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
+   scalars). Buffer keys are the param/intermediate sym names as keywords.
+
+   roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
+   derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
+   program can't derive: :constant = weights (uploaded once here, never re-uploaded by
+   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
+   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
+   (down)."
+  ([sess descriptor args] (bind-program! sess descriptor args {}))
+  ([sess descriptor args roles]
+   (let [device-id (:device-id @sess)
+         {:keys [dtype all-params array-params allocs steps]} descriptor
+         effective-roles (merge (:array-roles descriptor) roles)
+         argmap (zipmap all-params args)
+         dt (if (= dtype :double) :double :float)
+         nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+         ;; per-array element dtype from the ACTUAL JVM array — a program can mix dtypes (quant
+         ;; kernels carry byte weights + float scales + int bsums + float output), so a single
+         ;; program dtype mis-allocates (CCE [B→[F). The runtime array type is authoritative.
+         arr-dtype (fn [arr]
+                     (condp instance? arr
+                       (Class/forName "[B") :byte
+                       (Class/forName "[S") :short
+                       (Class/forName "[I") :int
+                       (Class/forName "[J") :long
+                       (Class/forName "[F") :float
+                       (Class/forName "[D") :double
+                       dt))
+         param-specs (into {} (map (fn [p]
+                                     (let [arr (get argmap p)]
+                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
+                                   array-params))
+         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
+                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
+                                   allocs))
+         info-fn   (rt-resolve device-id "kernel-registry-entry")
+         bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
+         gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
+         conv-fn   (rt-resolve device-id "bind-registered-convert!")
+         trans-fn  (rt-resolve device-id "bind-registered-transpose!")
+         mkbuf-fn  (rt-resolve device-id "make-buffer")
+         record-fn (rt-resolve device-id "record-graph!")
+         gemm-scratch (atom [])]
+     (alloc! sess (merge param-specs alloc-specs))
+     (let [buffers (:buffers @sess)
+           buf-of (fn [sym ctx]
+                    (or (get buffers (keyword (name sym)))
+                        (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
+                                        {:sym sym :ctx ctx :have (keys buffers)}))))
+           step->bounds
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention] :as step}]
+             (case convention
+               ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
+               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
+               ;; convert redundantly per replay for now (correctness-first) — hoist to a once-at-
+               ;; bind :constant f16 upload later.
+               :gemm
+               (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
+                     abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
+                     cbuf (buf-of (:C step) :gemm-C)
+                     a16 (mkbuf-fn (* m k) :half)]
+                 (case (:variant step)
+                   ;; C = A[m,k] · B[k,n]
+                   :nn
+                   (let [b16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
+                      (gemm-fn a16 b16 cbuf m n k :float)])
+                   ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
+                   ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
+                   :nt
+                   (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16 bt16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
+                      (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                   (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
+                                        " (only :nn / :nt)") {:variant (:variant step)}))))
+               ;; map / map-void bind through bind-registered-map-void-kernel (output is just
+               ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
+               ;; order incl. output).
+               (:map :map-void)
+               (do (or (info-fn kernel-name)
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
+                   (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
+                         scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                                       scalar-specs)]
+                     [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+               (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
+                                    ":map / :map-void / :gemm are wired on the resident path")
+                               {:convention convention :kernel kernel-name}))))
+           bounds (vec (mapcat step->bounds steps))
+           graph (record-fn bounds)]
+       (swap! sess assoc
+              :program-graph graph
+              :program-descriptor descriptor
+              :program-roles effective-roles))
+     sess)))
+
+(defn run-program!
+  "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
+   stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
+   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
+   resident from bind-program!. args = values in :all-params order (same as bind-program!).
+   Returns {output-param-sym → downloaded JVM array}."
+  [sess descriptor args]
+  (let [{:keys [all-params array-params result-sym]} descriptor
+        device-id (:device-id @sess)
+        roles (:program-roles @sess)
+        argmap (zipmap all-params args)
+        replay-fn (rt-resolve device-id "replay-graph!")]
+    ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
+    ;; device; output produced by the kernels so its prior content is irrelevant).
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (keyword (name p)) (get argmap p)))
+    (replay-fn (:program-graph @sess))
+    ;; download :output array-params (in-place-mutated results) PLUS the functional :result-sym
+    ;; (a fresh alloc returned by the deftm — the common SOAC case; it is not an array-param so
+    ;; it has no :output role, but it IS the program's return value).
+    (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
+                       [p (download sess (keyword (name p)))]))
+      ;; download the functional :result-sym only when it is a distinct resident buffer (not
+      ;; already an :output param, and actually allocated — a Void map-void has no result buffer).
+      (and result-sym (not (some #(= result-sym %) array-params))
+           (contains? (:buffers @sess) (keyword (name result-sym))))
+      (assoc result-sym (download sess (keyword (name result-sym)))))))
+
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.
 

@@ -348,6 +348,10 @@
     (not (seq? expr)) nil
     (contains? #{'let* 'let} (first expr)) (tail-symbol (last expr))
     (contains? #{'loop* 'loop} (first expr)) (tail-symbol (nth expr 2 nil)) ; loop body
+    ;; raster.par/map! writes AND returns its out array (arg 1) → that IS its tail value,
+    ;; so a binding r = (par/map! out ..) aliases out (buffer-loop classification +
+    ;; copy-prop + result-buffer resolution), same as the expanded (let* ..out) form.
+    (= 'raster.par/map! (first expr)) (tail-symbol (second expr))
     (= 'do (first expr)) (tail-symbol (last expr))
     (= 'if (first expr)) (or (tail-symbol (nth expr 3 nil))   ; base/else first
                              (tail-symbol (nth expr 2 nil)))

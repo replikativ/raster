@@ -15,6 +15,7 @@
       (emit-expr body idx-sym array-syms \"idx\"))"
   (:require [clojure.string :as str]
             [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.intrinsics :as intrinsics]
@@ -223,10 +224,41 @@
 ;; ================================================================
 
 (def type-map
-  {:double "double"
-   :float  "float"
-   :int    "int"
-   :long   "long long"})
+  "Dtype keyword → C type. Derived from the single faceted dtype/native-types."
+  (dtype/backend-types :c))
+
+(defn scalar-native-type
+  "Native type for a kernel SCALAR param, for a kernel whose element type is
+   `ctype`. A DECLARED type wins authoritatively — float/double/half → `ctype`
+   (the kernel element type), int/long/byte → \"int\"; ONLY when the declared
+   type is unknown does the name-regex / :tag heuristic apply. Loud-over-silent:
+   a declared float named `step-size`/`max-len` must NOT be truncated to int by
+   the counter-name regex. Single source for the OpenCL/GLSL backends (was a
+   7-way-duplicated cond where only an explicit :int short-circuited)."
+  [sym scalar-types ctype]
+  (let [sname (name sym)
+        explicit (get scalar-types sym (get scalar-types (symbol sname)))]
+    (cond
+      (contains? #{:float :double :half} explicit) ctype
+      (contains? #{:int :long :byte} explicit) "int"
+      (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
+          (contains? #{'long 'int} (:tag (meta sym)))) "int"
+      :else ctype)))
+
+(defn fn-style-reduction-op?
+  "True if a reduction op emits as a C function call `f(a,b)` (fmax/fmin) rather
+   than an infix operator `(a op b)`. Single source for the GPU reduction
+   combine-shape classification (was duplicated across the OpenCL backends)."
+  [op]
+  (contains? #{'Math/max 'Math/min} op))
+
+(defn combine-fn
+  "Return a (fn [a b] -> C string) that combines two operands with reduction
+   operator string `c-op`, as `c-op(a, b)` when `fn-style?` else `(a c-op b)`."
+  [c-op fn-style?]
+  (if fn-style?
+    (fn [a b] (str c-op "(" a ", " b ")"))
+    (fn [a b] (str "(" a " " c-op " " b ")"))))
 
 (def tag->ctype
   "Map walker :tag metadata to C type strings."
@@ -404,11 +436,17 @@
        (descriptor/void-op? (first expr))))
 
 (defn has-side-effects?
-  "Check if an expression tree contains void (side-effect) operations."
+  "Check if an expression tree contains void (side-effect) operations — including
+  DEVIRTUALIZED array writes (.invk aset-impl …), recognized via the walker-stamped
+  :raster.op/original op (an intermediate's aset materializes to .invk, which the
+  surface-op void-form? check would otherwise miss → a side-effecting binding would be
+  wrongly inlined and re-run)."
   [expr]
   (cond
     (not (seq? expr)) false
     (void-form? expr) true
+    (and (= '.invk (first expr))
+         (descriptor/aset-op? (:raster.op/original (meta expr)))) true
     :else (some has-side-effects? (rest expr))))
 
 ;; ================================================================
@@ -818,13 +856,21 @@
          (str n "[" opencl-idx "]")
          (if (= expr idx-sym) opencl-idx n)))
 
-     ;; aget -> array read (SoA reads/field projection are scalar-replaced
-     ;; upstream by soa-lower, so only plain per-field arrays reach here)
-     (and (seq? expr)
-          (descriptor/aget-op? (first expr))
-          (>= (count expr) 3))
-     (let [arr      (second expr)
-           idx-expr (nth expr 2)]
+     ;; aget -> array read. Handles surface forms (aget arr idx) AND devirtualized
+     ;; interface calls (.invk <impl> arr idx) via the walker-stamped :raster.op/original
+     ;; op: typed params stay primitive clojure.core/aget, but INTERMEDIATE arrays are
+     ;; devirtualized to .invk by the materialize pass — both must emit the same C array
+     ;; subscript. (Reading the carried op, not the mangled impl name — see CLAUDE.md.)
+     ;; (SoA reads/field projection are scalar-replaced upstream by soa-lower, so only
+     ;; plain per-field arrays reach here.)
+     (or (and (seq? expr)
+              (descriptor/aget-op? (first expr))
+              (>= (count expr) 3))
+         (and (seq? expr) (= '.invk (first expr)) (>= (count expr) 4)
+              (descriptor/aget-op? (:raster.op/original (meta expr)))))
+     (let [invk?    (= '.invk (first expr))
+           arr      (if invk? (nth expr 2) (second expr))
+           idx-expr (if invk? (nth expr 3) (nth expr 2))]
        (str (c-symbol arr) "["
             (emit-expr idx-expr idx-sym array-syms opencl-idx) "]"))
 
@@ -869,9 +915,13 @@
                                  (fn [f] (if (and (symbol? f) (contains? env f))
                                            (get env f) f))
                                  val)]
-                  ;; Force-declare loop-valued bindings (see statement-context note): a
-                  ;; reduction must be computed once, not inlined+recomputed per use.
+                  ;; Force-declare when: multi-use; loop-valued (a reduction must be computed
+                  ;; once, not inlined+recomputed per use); or SIDE-EFFECTING (e.g. a loop that
+                  ;; writes an array, as in softmax's exp-and-sum pass) — inlining a single-use
+                  ;; side-effecting binding into a later loop body re-runs its writes every
+                  ;; iteration (silent miscompile).
                   (if (or (multi-use? sym)
+                          (has-side-effects? val)
                           (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
                     (let [base-name (c-symbol sym)
                           prev-count (get seen-names base-name 0)
@@ -1200,6 +1250,14 @@
                                   (emit-expr a idx-sym array-syms opencl-idx)))]
            (str c-name "(" (str/join ", " (map emit-arg args)) ")"))))
 
+     ;; oftype: (.invk oftype-impl ref val) coerces `val` to `ref`'s type (parametric
+     ;; materialization inserts it, e.g. to type a reduction seed against a float array). In a
+     ;; GPU kernel the value type is the kernel scalar type, so emit a plain cast of the value
+     ;; arg — the ref only names the target type. Read the carried op, not the mangled impl name.
+     (and (seq? expr) (= '.invk (first expr)) (>= (count expr) 4)
+          (= 'raster.numeric/oftype (:raster.op/original (meta expr))))
+     (str "(" *scalar-type* ")(" (emit-expr (nth expr 3) idx-sym array-syms opencl-idx) ")")
+
      ;; .invk typed dispatch on deftm helper -> check for devirtualized arithmetic
      (and (seq? expr) (= '.invk (first expr))
           (>= (count expr) 3)
@@ -1272,7 +1330,18 @@
                 ")")))
 
      :else
-     (str expr))))
+     ;; Loud over silently corrupt: an unhandled IR form pr-str'd into the C/OpenCL
+     ;; source produces garbage (a cryptic clang/ocloc error, or a call to a
+     ;; nonexistent function). Surfacing this as a WARNING (was fully silent) flagged
+     ;; two real backend gaps: `case*` branch-maps (abm/firms, blelloch-scan,
+     ;; autotuner) and a SIMD-fold vector `[L 8]` (x8-simd-fold) — both stringified
+     ;; into invalid C. TODO: lower case* → cond and handle the SIMD vector, THEN
+     ;; flip this to `throw` (the true loud form). Tracked in compiler_consolidation.
+     (do (binding [*out* *err*]
+           (println (str "WARNING: c-emit unhandled IR form (" (type expr)
+                         ") — emitting as text, likely invalid. Lower it upstream. Form: "
+                         (pr-str expr))))
+         (str expr)))))
 
 ;; ================================================================
 ;; deftm inlining support
@@ -1428,6 +1497,9 @@
     (walk/postwalk
      (fn [form]
        (when (and (seq? form)
+                  ;; loop* (not loop) is what survives macroexpand/materialize into the kernel
+                  ;; body — omitting it leaks loop induction/accumulator vars (i, s) into the
+                  ;; kernel's scalar params (→ unresolved-symbol when arg-fns are built).
                   (contains? #{'let 'let* 'loop 'loop*} (first form))
                   (>= (count form) 3))
          (let [bindings (second form)]

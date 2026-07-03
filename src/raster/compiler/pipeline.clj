@@ -89,21 +89,35 @@
      (when-let [dt (:raster.core/dispatch-table (meta f-var))]
        (let [all-methods (mapcat val @dt)
              dtype-tag (case dtype :float 'floats :double 'doubles nil)
-             method (if dtype-tag
-                      (or (first (filter #(some #{dtype-tag} (:tags %)) all-methods))
-                          (first all-methods))
-                      ;; No dtype: use single overload, or error if ambiguous
-                      (if (= 1 (count all-methods))
-                        (first all-methods)
-                        (throw (ex-info
-                                (str "Ambiguous overload for compile-aot on "
-                                     (:name (meta f-var)) ". Specify :dtype to disambiguate.\n"
-                                     "Available: " (mapv :tags all-methods))
-                                {:var f-var :methods (mapv :tags all-methods)}))))
-             ns-obj (:ns (meta f-var))
-             mangled-name (symbol (str (types/mangle
-                                        (:name (meta f-var)) (:tags method))))]
-         (ns-resolve ns-obj mangled-name))))))
+             direct (when dtype-tag
+                      (first (filter #(some #{dtype-tag} (:tags %)) all-methods)))]
+         (if (and dtype-tag (nil? direct))
+           ;; No concrete overload for this dtype yet. If f-var is a parametric
+           ;; (All [T]) deftm, MONOMORPHIZE it: force-create the T := dtype
+           ;; specialization so the whole compile pass — including re-walk type
+           ;; inference and inner parametric calls — resolves to the requested
+           ;; element type, instead of silently falling back to the double
+           ;; method (which bakes double .invk targets into the walked body).
+           (or (when-let [ensure! (requiring-resolve 'raster.core/ensure-dtype-specialization!)]
+                 (ensure! f-var dtype))
+               ;; Non-parametric, or specialization unavailable: fall back to any
+               ;; registered method (legacy behavior).
+               (let [method (first all-methods)
+                     ns-obj (:ns (meta f-var))]
+                 (ns-resolve ns-obj (symbol (str (types/mangle
+                                                  (:name (meta f-var)) (:tags method)))))))
+           (let [method (or direct
+                            ;; No dtype: use single overload, or error if ambiguous
+                            (if (= 1 (count all-methods))
+                              (first all-methods)
+                              (throw (ex-info
+                                      (str "Ambiguous overload for compile-aot on "
+                                           (:name (meta f-var)) ". Specify :dtype to disambiguate.\n"
+                                           "Available: " (mapv :tags all-methods))
+                                      {:var f-var :methods (mapv :tags all-methods)}))))
+                 ns-obj (:ns (meta f-var))]
+             (ns-resolve ns-obj (symbol (str (types/mangle
+                                              (:name (meta f-var)) (:tags method))))))))))))
 
 (defn- infer-dtype
   "Infer dtype from a resolved deftm var's parameter tags.
@@ -136,7 +150,7 @@
                     (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
-(defn- get-walked-body [f-var & [dtype]]
+(defn get-walked-body [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)
         m (meta resolved)]
     ;; Always re-walk with TC at compilation time for best type inference.
@@ -157,19 +171,27 @@
                                 (println "WARNING: walker re-walk failed for" f-var
                                          "- falling back to pre-walked body:" (.getMessage t)))
                               nil))]
-            walked))
+            ;; SSA-normalize let* rebindings (seeded with the params) BEFORE the
+            ;; pass pipeline: a rebinding like `x = (alloc-op x)` otherwise
+            ;; conflates the op's input and freshly-allocated output buffer in
+            ;; materialize/buffer analysis (the output alloc reuses `x`, so the
+            ;; body's read of `x` hits the uninitialized output). Distinct names
+            ;; remove the hazard; non-shadowing bindings are untouched.
+            (when walked
+              (let [param-syms (map #(if (symbol? %) (symbol (name %)) %) params)]
+                (mapv #(util/uniquify-rebindings param-syms %) walked)))))
         ;; Fallback: use pre-walked body from definition time or lazy walk
         (:raster.core/deftm-walked-body-typed m)
         (:raster.core/deftm-walked-body m)
         (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body or raw body" {:var f-var})))))
 
-(defn- get-params [f-var & [dtype]]
+(defn get-params [f-var & [dtype]]
   (let [resolved (or (resolve-deftm-var f-var dtype) f-var)]
     (or (:raster.core/deftm-params (meta resolved))
         (throw (ex-info "Var has no deftm params" {:var f-var})))))
 
-(defn- build-param-env
+(defn build-param-env
   "Build a {sym -> tag} type environment from deftm parameter tags.
   Maps each param symbol to its walker tag (e.g. 'doubles, 'double, 'longs).
   Falls back to nil (unknown) for params without tags."
@@ -184,7 +206,7 @@
                     (symbol t)])
                  params tags)))))
 
-(defn- clean-params
+(defn clean-params
   "Strip metadata (type hints) from param symbols for eval."
   [params]
   (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil)
@@ -626,32 +648,32 @@
   Returns {:form :stats :cuda-result :kernels}."
   [form opts]
   (let [target-device (:target-device opts)
-        simd? (:simd? opts true)
-        backend (device/select-runtime-backend target-device simd? nil)]
-    (case backend
-      :cuda
-      (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
+        simd? (:simd? opts true)]
+    (if (:keep-par-forms? opts)
+      ;; CPU-C SIMD path: leave par/map!/par/reduce forms INTACT (neither scalarize
+      ;; nor JVM-Vector-API lower) so the monolithic C backend can consume the same
+      ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
+      {:form (strip-compound-markers form) :stats nil :backend :par-preserve}
+      (case (device/select-runtime-backend target-device simd? nil)
+        :cuda
+        (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
-      :opencl
-      ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
-      ;; generators read declared types instead of guessing. The materialized form preserves
-      ;; the original param symbols, so a name-keyed type map still applies.
-      (let [form (cond-> form
-                   (or (:scalar-types opts) (:array-types opts))
-                   (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
-            result (opencl-pass/opencl-pass form
-                                            :device-id target-device
-                                            :dtype (:dtype opts))]
-        (register-gpu-kernels! (:kernels result))
-        {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
+        :opencl
+        (let [result (opencl-pass/opencl-pass form
+                                              :device-id target-device
+                                              :dtype (:dtype opts)
+                                              :scalar-types (:scalar-types opts)
+                                              :array-types (:array-types opts))]
+          (register-gpu-kernels! (:kernels result))
+          {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
 
-      :simd
-      (let [clean-form (strip-compound-markers form)
-            {:keys [form stats]} (par-simd/simd-pass clean-form)]
-        {:form form :stats stats :backend :simd})
+        :simd
+        (let [clean-form (strip-compound-markers form)
+              {:keys [form stats]} (par-simd/simd-pass clean-form)]
+          {:form form :stats stats :backend :simd})
 
       ;; :scalar
-      {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar})))
+        {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.
@@ -761,9 +783,138 @@
   "forward-passes from :segop-lower onward — resumed (from :materialized) after soa-lower."
   [:segop-lower :compound-detect :backend :resolve-alength :mem-merge])
 
-;; ================================================================
-;; Diagnostic runner for show-pipeline
-;; ================================================================
+(def ^:private gpu-invoke-heads
+  '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+     raster.gpu.ze-runtime/invoke-registered-kernel
+     raster.gpu.ze-runtime/invoke-reduction-kernel})
+
+(def ^:private gpu-array-alloc-heads
+  '#{double-array float-array int-array long-array byte-array
+     clojure.core/double-array clojure.core/float-array
+     clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
+
+(def ^:private blas-gemm-ops
+  "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
+   .invk form). dgemm! = C=A·B (:nn); -nt! = A·Bᵀ; -tn! = AᵀB."
+  {'raster.linalg.blas/dgemm! :nn
+   'raster.linalg.blas/dgemm-nt! :nt
+   'raster.linalg.blas/dgemm-tn! :tn})
+
+(defn- gemm-invk?
+  "True if form is a devirtualized BLAS GEMM .invk (carries :raster.op/original in
+   blas-gemm-ops). Metadata-based — the walker stamps the op, opencl-pass now preserves it."
+  [form]
+  (and (seq? form) (= '.invk (first form))
+       (contains? blas-gemm-ops (:raster.op/original (meta form)))))
+
+(def ^:private gpu-alloc-invk-ops
+  "Devirtualized array-alloc ops: (.invk op-impl ref size) → an intermediate of `size` elems.
+   These come from functional linear layers (linear-nb allocs its output via zeros-like); the
+   zeroing is moot when a GEMM/kernel fully overwrites the buffer."
+  #{'raster.arrays/zeros-like 'raster.arrays/alloc-like})
+
+(defn- alloc-invk?
+  [form]
+  (and (seq? form) (= '.invk (first form))
+       (contains? gpu-alloc-invk-ops (:raster.op/original (meta form)))))
+
+(defn- parse-gpu-step
+  "One invoke-registered-* / GEMM binding → a step record. :arrays is the full resident-buffer
+   arg list in the kernel's signature order (for map! the separate output is appended, so on the
+   resident path it is just another buffer). nil for an unrecognized head."
+  [sym expr]
+  (let [head (first expr)]
+    (cond
+      (= head 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
+      (let [[_ kname arrays scalars n] expr]
+        {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
+         :convention :map-void :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
+      (let [[_ kname inputs out scalars n] expr]
+        {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
+         :convention :map :returns sym :out-buf out})
+      (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
+      (let [[_ kname inputs n] expr]
+        {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
+         :convention :reduce :returns sym})
+      ;; devirtualized BLAS GEMM: (.invk dgemm*-impl A B C m k n alpha beta). BLAS arg order is
+      ;; (A B C m k n) — note m,k,n (NOT m,n,k). C (out) is written in place.
+      (gemm-invk? expr)
+      (let [args (vec (drop 2 expr))]
+        {:convention :gemm
+         :variant (get blas-gemm-ops (:raster.op/original (meta expr)))
+         :A (nth args 0) :B (nth args 1) :C (nth args 2)
+         :m-expr (nth args 3) :k-expr (nth args 4) :n-expr (nth args 5)
+         :out-buf (nth args 2) :returns sym})
+      :else nil)))
+
+(defn- contains-gpu-invoke?
+  "Deep check: does form contain a gpu-invoke head anywhere? (A scalar binding whose value is
+   itself computed from a kernel result is NOT a straight-line scalar let.)"
+  [form]
+  (let [found (volatile! false)]
+    (clojure.walk/postwalk
+     (fn [x] (when (and (seq? x) (symbol? (first x)) (contains? gpu-invoke-heads (first x)))
+               (vreset! found true)) x)
+     form)
+    @found))
+
+(defn extract-gpu-program
+  "Walk a straight-line fused GPU IR into a flat program: ordered kernel steps, intermediate
+   buffer allocs, and the pure scalar-let bindings that feed their sizes/counts (e.g.
+   `n (* rows feat)`). Returns nil when a binding has control flow or a kernel result feeding
+   scalar compute — the caller then falls back to the staging fn.
+
+   :scalar-lets is the ordered [sym expr ...] of pure scalar bindings; size/count/scalar exprs
+   are evaluated in an env that binds the deftm params AND these lets (so an intermediate sized
+   `(* rows feat)` resolves)."
+  [form]
+  (when (and (seq? form) (#{'let* 'let} (first form)))
+    (let [bindings (partition 2 (second form))
+          body (last form)
+          allocs (volatile! [])
+          steps (volatile! [])
+          scalar-lets (volatile! [])
+          ok (volatile! true)]
+      (doseq [[sym expr] bindings]
+        (cond
+          (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+          (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          ;; devirtualized alloc: (.invk zeros-like/alloc-like-impl ref size) → intermediate
+          (alloc-invk? expr)
+          (vswap! allocs conj {:sym sym :size-expr (nth (vec (drop 2 expr)) 1)})
+          (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+          (if-let [s (parse-gpu-step sym expr)]
+            (vswap! steps conj s)
+            (vreset! ok false))
+          ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step
+          (gemm-invk? expr)
+          (if-let [s (parse-gpu-step sym expr)]
+            (vswap! steps conj s)
+            (vreset! ok false))
+          ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
+          (not (contains-gpu-invoke? expr))
+          (vswap! scalar-lets into [sym expr])
+          ;; control flow / kernel-result-into-scalar → not straight-line.
+          :else (vreset! ok false)))
+      (when (and @ok (seq @steps))
+        {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+
+(defn- strip-meta
+  "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
+   carry a type hint (`Can't type hint a local with a primitive initializer`), which the eval'd
+   arg-fn would otherwise hit on e.g. `^long n (* (long rows) (long feat))`."
+  [x]
+  (if (symbol? x) (with-meta x nil) x))
+
+(defn- expr->arg-fn
+  "Compile a size/count/scalar expr into (fn [arg-vector] value), evaluating it in an env that
+   binds the deftm params AND the program's pure scalar-lets (so `(* rows feat)` resolves).
+   Built once at compile time; called per bind with the runtime arg values."
+  [param-syms scalar-lets expr]
+  (let [clean-params (mapv strip-meta param-syms)
+        clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
+    (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr])))))
 
 (defn- run-passes-diagnostic
   "Run passes with full intermediate recording for diagnostics.

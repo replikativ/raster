@@ -70,8 +70,8 @@ jobs:
           at: ~/
       - install-clojure
       - run:
-          name: Install OpenBLAS
-          command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev
+          name: Install OpenBLAS + clang
+          command: sudo apt-get update && sudo apt-get install -y libopenblas-dev liblapacke-dev clang
       - run:
           name: Run tests
           command: clojure -X:test

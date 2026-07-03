@@ -629,9 +629,30 @@
       (cond-> {:acc acc :init init :idx idx :bound bound :body body}
         elem-type (assoc :elem-type elem-type)))))
 
+(defn- unwrap-array-sym
+  "Unwrap cast wrappers around an array argument: (double arr) → arr, (float arr) → arr;
+  then strip metadata to a bare symbol."
+  [arr-sym]
+  (let [unwrapped (if (and (seq? arr-sym)
+                           (contains? #{'double 'float 'int 'long
+                                        'clojure.core/double 'clojure.core/float} (first arr-sym))
+                           (= 2 (count arr-sym)))
+                    (second arr-sym)
+                    arr-sym)]
+    (if (symbol? unwrapped) (symbol (name unwrapped)) unwrapped)))
+
 (defn collect-aget-arrays
   "Collect array symbols referenced via aget in a body expression.
-  Returns a set of array symbols (stripped of metadata)."
+  Returns a set of array symbols (stripped of metadata).
+
+  Recognizes BOTH surface aget forms — (clojure.core/aget arr idx),
+  (raster.arrays/aget arr idx) — AND devirtualized interface calls,
+  (.invk <impl> arr idx), via the :raster.op/original op the walker stamps on
+  the .invk form. Reading that carried semantic identity (rather than the surface
+  op alone) is what keeps INTERMEDIATE arrays — which the walker devirtualizes to
+  .invk while it emits primitive clojure.core/aget for typed params — classified
+  as array inputs rather than scalars. (Semantic identity is carried as metadata,
+  never recovered from the mangled impl name — see CLAUDE.md compiler principles.)"
   [body-expr]
   (cond
     ;; Recognize both bare (aget arr idx) and devirtualized (.invk aget-impl arr idx);

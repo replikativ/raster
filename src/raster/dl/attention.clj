@@ -715,6 +715,69 @@
 ;; Separate bias parameters bq/bk/bv/bo for BERT-style models.
 ;; ================================================================
 
+(deftm fast-exp
+  "Portable vectorizing exp(x) for x <= 0 (softmax range): e^x = (e^(x/1024))^1024
+  via a degree-6 Taylor of the small argument then 10 squarings. Uses only n/*
+  and n/+ (no libm call, no SVML, no bitcast) so it lowers to a pure FMA/mul chain
+  that the compiler SIMD-vectorizes on every backend. Rel error <1e-8 over
+  [-88,0]. (SVML VectorOperators/EXP is not intrinsified on this JVM, so Math/exp
+  stays scalar; this does not depend on it.)"
+  (All [T] [x :- T] :- T
+    (let [t (n/* x 9.765625E-4)                    ; x / 1024
+          p (n/+ 0.008333334 (n/* t 0.0013888889)) ; 1/120 + t/720
+          p (n/+ 0.041666668 (n/* t p))            ; 1/24  + t p
+          p (n/+ 0.16666667 (n/* t p))             ; 1/6
+          p (n/+ 0.5 (n/* t p))                    ; 1/2
+          p (n/+ 1.0 (n/* t p))                    ; 1
+          p (n/+ 1.0 (n/* t p))                    ; e^t (Taylor deg 6)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)]
+      p)))
+
+(deftm softmax-rows!
+  "In-place row-wise softmax of a [rows, cols] row-major array — one fused pass
+  per row (max → exp → sum → normalize). Scale is assumed already folded into the
+  values (via the QK^T GEMM alpha). Parametric; float-pure."
+  (All [T] [x :- (Array T) rows :- Long cols :- Long] :- (Array T)
+    (let [n (* rows (int cols))
+          ;; per-row max → broadcast to per-element (cheap, memory-bound scalar)
+          maxes (alloc-like x n)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    mx (loop [j 0 m (n/neg-inf-val (aget x off))]
+                         (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
+                (dotimes [j cols] (aset maxes (+ off j) mx))))
+          ;; VECTORIZED exp = exp(x - max): a flat `broadcast` (recognized par
+          ;; form → SIMD-vectorized SegMap under compile-aot) with the fast-exp
+          ;; polynomial INLINED (e^(v/1024)^1024, deg-6 Taylor + 10 squarings;
+          ;; only +/* → a pure FMA/mul lane chain). A raw nested dotimes here
+          ;; stays scalar; a deftm call stays opaque; SVML EXP is not intrinsified.
+          e (broadcast [x maxes]
+              (let [v (- x maxes) t (* v 9.765625E-4)
+                    a (+ 0.008333334 (* t 0.0013888889)) b (+ 0.041666668 (* t a))
+                    c (+ 0.16666667 (* t b)) d (+ 0.5 (* t c))
+                    ee (+ 1.0 (* t d)) f (+ 1.0 (* t ee))
+                    p1 (* f f) p2 (* p1 p1) p3 (* p2 p2) p4 (* p3 p3) p5 (* p4 p4)
+                    p6 (* p5 p5) p7 (* p6 p6) p8 (* p7 p7) p9 (* p8 p8) p10 (* p9 p9)]
+                p10))
+          ;; per-row sum of e, normalize back into x (cheap, memory-bound scalar)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    s (loop [j 0 acc 0.0]
+                        (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
+                    inv (/ 1.0 s)]
+                (dotimes [j cols]
+                  (aset x (+ off j) (* (aget e (+ off j)) inv)))))]
+      x)))
+
+;; Batched multi-head attention: composed from the layout/GEMM/softmax
+;; combinators (pack-heads → batched QK^T with scale folded → fused row-softmax →
+;; batched scores@V → unpack-heads → output proj). Reproduces ORT's attention
+;; computation (scaled-QK^T FusedMatMul + Softmax + scores@V) with NO per-head
+;; scalar copies and 2 batched GEMM calls/head-group instead of ~2*n-heads tiny
+;; ones. NOTE: the forward path is fully composable; training AD through
+;; batched-gemm-*!/softmax-rows! is not yet registered (rrules deferred — the
+;; fastembed inference path is forward-only).
 (deftm multi-head-attention (All [T]
                                  [x :- (Array T) Wq :- (Array T) bq :- (Array T)
                                   Wk :- (Array T) bk :- (Array T)
@@ -722,38 +785,27 @@
                                   Wo :- (Array T) bo :- (Array T)
                                   seq-len :- Long d-model :- Long n-heads :- Long]
                                  :- (Array T)
-                                 (let [dk (quot d-model n-heads)
-        ;; Project Q, K, V: [seq_len, d_model]
-                                       Q (nn/linear x Wq bq seq-len d-model d-model)
-                                       K (nn/linear x Wk bk seq-len d-model d-model)
-                                       V (nn/linear x Wv bv seq-len d-model d-model)
-        ;; Multi-head: process each head separately and concatenate
-                                       out (alloc-like x (* seq-len d-model))]
-                                   (dotimes [h n-heads]
-                                     (let [;; Extract head h from Q, K, V
-            ;; Q_h: [seq_len, dk]
-                                           Qh (alloc-like Q (* seq-len dk))
-                                           Kh (alloc-like K (* seq-len dk))
-                                           Vh (alloc-like V (* seq-len dk))
-                                           h-offset (* h (int dk))]
-                                       (dotimes [s seq-len]
-                                         (dotimes [d dk]
-                                           (let [src-idx (+ (* s (int d-model)) h-offset d)]
-                                             (aset Qh (+ (* s (int dk)) d)
-                                                   (aget Q src-idx))
-                                             (aset Kh (+ (* s (int dk)) d)
-                                                   (aget K src-idx))
-                                             (aset Vh (+ (* s (int dk)) d)
-                                                   (aget V src-idx)))))
-        ;; Apply attention for this head
-                                       (let [head-out (scaled-dot-product-attn Qh Kh Vh seq-len seq-len dk dk)]
-          ;; Copy head output to appropriate position in concatenated output
-                                         (dotimes [s seq-len]
-                                           (dotimes [d dk]
-                                             (aset out (+ (* s (int d-model)) h-offset d)
-                                                   (aget head-out (+ (* s (int dk)) d))))))))
-    ;; Output projection
-                                   (nn/linear out Wo bo seq-len d-model d-model))))
+  (let [dk (quot d-model n-heads)
+        scale (n/oftype x (clojure.core// 1.0 (Math/sqrt (double dk))))
+        ;; Q,K,V projections: [seq_len, d_model]
+        Q (nn/linear x Wq bq seq-len d-model d-model)
+        K (nn/linear x Wk bk seq-len d-model d-model)
+        V (nn/linear x Wv bv seq-len d-model d-model)
+        ;; pack to head-major contiguous [n_heads, seq_len, dk]
+        Qh (ops/pack-heads Q seq-len n-heads dk)
+        Kh (ops/pack-heads K seq-len n-heads dk)
+        Vh (ops/pack-heads V seq-len n-heads dk)
+        ;; scores[n_heads, seq, seq] = scale * Qh @ Kh^T  (one batched GEMM)
+        scores (alloc-like x (* n-heads seq-len seq-len))
+        _ (blas/batched-gemm-nt! Qh Kh scores n-heads seq-len dk seq-len scale)
+        ;; fused row-softmax over the key dimension
+        _ (softmax-rows! scores (* n-heads seq-len) seq-len)
+        ;; ctx[n_heads, seq, dk] = scores @ Vh  (one batched GEMM)
+        ctxh (alloc-like x (* n-heads seq-len dk))
+        _ (blas/batched-gemm-nn! scores Vh ctxh n-heads seq-len seq-len dk (n/oftype x 1.0))
+        ;; unpack to [seq_len, d_model] and project out
+        ctx (ops/unpack-heads ctxh seq-len n-heads dk)]
+    (nn/linear ctx Wo bo seq-len d-model d-model))))
 
 ;; ================================================================
 ;; KV-cache: incremental attention for autoregressive generation

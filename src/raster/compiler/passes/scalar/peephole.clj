@@ -8,7 +8,8 @@
   Includes infrastructure for binding manipulation, alias inlining,
   and nil-binding removal."
   (:require [clojure.walk]
-            [raster.compiler.ir.form :as form]))
+            [raster.compiler.ir.form :as form]
+            [raster.compiler.core.util :as util]))
 
 ;; ================================================================
 ;; Binding manipulation helpers
@@ -62,7 +63,14 @@
 
             ;; effectful binding whose tail is a (different) symbol — record the alias
             ;; for downstream substitution but KEEP the binding for its effects.
-            (and (symbol? tail) (not= tail sym) (not (symbol? init*)))
+            ;; SOUNDNESS: only when `tail` is FREE in init* — i.e. it names an
+            ;; enclosing-scope value (the r=(let* [..writes b..] b) shape). A tail
+            ;; symbol BOUND inside init* (a loop*/let* accumulator, e.g. the `acc` of
+            ;; (loop* [acc ..] .. acc)) does NOT exist in the outer scope; aliasing
+            ;; s→acc there leaks a scope-local name (undeclared-identifier in C /
+            ;; miscompile). Reductions bound to a name + used downstream hit this.
+            (and (symbol? tail) (not= tail sym) (not (symbol? init*))
+                 (contains? (util/free-syms init*) tail))
             (recur (inc i) (assoc result i [sym init*])
                    (assoc alias-map sym (get alias-map tail tail)))
 

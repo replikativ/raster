@@ -84,15 +84,7 @@
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int) "int"
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -183,24 +175,8 @@
                                                            (str "__global const " ct "* restrict " flat-sym))))
                                                      fields)))
                                             soa-arr-params))
-        ;; Scalar param C type: the DECLARED type (from the deftm tags via scalar-types) wins.
-        ;; The name/metadata heuristic is only a fallback for params with no declared type —
-        ;; it must NOT override a declared one (a Double `gain-offset` is float, not int).
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int)    "int"
-                       (= explicit :long)   "long"
-                       (= explicit :double) "double"
-                       (= explicit :float)  default-ctype
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else default-ctype)))
-        ;; Integer scalar params seed *int-vars* for the body, so index math that uses a scalar
-        ;; (e.g. offset = r*features) infers integer instead of *scalar-type* (float).
-        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
+        ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -220,6 +196,11 @@
                                              (:fields info))))
                                     soa-arr-params))
         all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
+        ;; Seed *int-vars* with the work-item index and the DECLARED-int scalar params
+        ;; (e.g. `features`, `rows`), so index arithmetic like `(* idx features)` infers an
+        ;; integer C type for the offset local rather than defaulting to the float scalar-type
+        ;; (which yields non-integer array subscripts in per-row kernels with inner loops).
+        int-scalar-syms (into #{idx} (filter #(= "int" (scl-type %)) scl-params))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* default-ctype
                            ce/*idx-sym* idx
@@ -334,10 +315,7 @@
         block-size (* 2 wg-size) ;; Each thread handles 2 elements
         ;; OpenCL combine op
         combine-str (condp = op '+ "+" '* "*" 'Math/max "fmax" 'Math/min "fmin" "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str combine-str "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " combine-str " " b ")")))
+        combine (ce/combine-fn combine-str (ce/fn-style-reduction-op? op))
         ;; Emit element expression as OpenCL C
         array-sym-names (set (map #(symbol (name %)) arr-params))
         adapted-element (when element-expr (ce/adapt-casts-for-dtype element-expr scan-dtype))
@@ -494,10 +472,7 @@
                         'Math/max "fmax"
                         'Math/min "fmin"
                         "+")
-        is-fn-op (contains? #{'Math/max 'Math/min} op)
-        combine (if is-fn-op
-                  (fn [a b] (str reduce-op-str "(" a ", " b ")"))
-                  (fn [a b] (str "(" a " " reduce-op-str " " b ")")))
+        combine (ce/combine-fn reduce-op-str (ce/fn-style-reduction-op? op))
         ;; Generate per-array kernel params
         arr-param-str (str/join ", "
                                 (map (fn [s] (str "__global const " ctype "* restrict "
@@ -741,15 +716,7 @@
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
-        scl-type (fn [s]
-                   (let [sname (name s)
-                         explicit (get scalar-types s (get scalar-types (symbol sname)))]
-                     (cond
-                       (= explicit :int) "int"
-                       (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-                           (contains? #{'long 'int} (:tag (meta s))))
-                       "int"
-                       :else ctype)))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))

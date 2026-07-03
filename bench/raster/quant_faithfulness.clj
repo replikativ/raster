@@ -1,83 +1,54 @@
 (ns raster.quant-faithfulness
-  "Differential FAITHFULNESS harness for the quantized matmul.
+  "Faithfulness + perf regression harness for the quantized Q4_0 GEMV.
 
-  The hard gate for moving the quantized GEMV from a hand-written string emitter into
-  raster's composable IR: ANY candidate lowering (the current hand kernel, the GPU
-  kernel, or a future par-form / widening-i8-dot composable kernel) is measured here
-  against two oracles on the REAL decode matmul shapes:
+  The original job of this harness — gate moving the quantized GEMV OUT of a
+  hand-written C string emitter INTO raster's composable IR — is DONE: the
+  composable `qmatmul-q4-x8!` (lowered via compile-aot-c :simd? true, the csimd
+  int->float widening column fold) matches the retired hand kernel bit-exact and
+  within noise on latency (#27), and the hand-string emitter has been deleted.
 
-    - CORRECTNESS oracle: an independent scalar Clojure dequant-dot (double precision).
-      A candidate must be bit-faithful (f32 round-off only) — a quantized matmul that is
-      'fast but wrong' is worthless.
-    - PERFORMANCE oracle: the handwritten CPU kernel (raster.dl.qlinear/qlinear-i8, the
-      maddubs/VNNI spin-pool stream-gemv). A composable lowering is only worth adopting
-      if it is within noise of this — top performance is a hard requirement, so the
-      compiler must reproduce the optimal machine code, not regress it.
-
-  A candidate is `(fn [wf in out] -> (fn [^floats x] -> ^floats y))` — it prepares its
-  own weight layout (repack-stream, row-major, packed-IR, ...) then runs. Register a new
-  composable candidate and it is held to the same bar. Run: (run) or (run :shapes ...)."
-  (:require [raster.dl.qlinear :as ql]
-            [raster.dl.qlinear-gpu :as qg]
-            [raster.compiler.backend.cpu.quant :as cq]))
+  So this is now a REGRESSION harness for the production composable path: every
+  shape is checked against an independent scalar dequant-dot oracle (correctness —
+  a quantized matmul that is 'fast but wrong' is worthless) and timed (perf — the
+  composable lowering must keep reproducing optimal machine code, not regress).
+  The row-major `qmatmul-q4-composable` is included as the scalar-fold reference
+  the SIMD x8 path must stay well ahead of.  Run: (run) or (run :shapes ...)."
+  (:require [raster.compiler.backend.cpu.quant :as cq]
+            [raster.quant.kernels :as k]))
 
 (def decode-shapes
   "[in out label] — real decode matmul shapes across model sizes (in%32=0, out%8=0)."
   [[640 1024  "270m attn-q"]
    [2048 640  "270m ffn-down"]
-   [640 262144 "270m lm-head"]
    [1152 6912 "1b ffn-up"]
    [2048 11008 "3b ffn-up"]
-   [4096 14336 "7b ffn-up"]
-   [14336 4096 "7b ffn-down"]])
+   [4096 4096 "square-4k"]])
 
-;; ---- candidates: each prepares its layout, returns a (fn [x] -> y) ----
+;; ---- candidates: each (fn [wf in out] -> (fn [^floats x] -> ^floats y)) ----
 
-(defn cand-cpu-hand
-  "The handwritten CPU kernel — the performance oracle (maddubs/VNNI spin-pool)."
-  [wf in out]
-  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
-        {:keys [wqi wsi]} (cq/repack-stream wq ws out in)]
-    (fn [x] (ql/qlinear-i8 x wqi wsi in out))))
-
-(defn cand-gpu
-  "The GPU OpenCL kernel, resident weights on :ze:0 (different backend; informational)."
-  [wf in out]
-  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
-        W (qg/upload-weight! :ze:0 wq ws in out)]
-    (fn [x] (qg/qlinear-i8-gpu W x))))
-
-(defn cand-cpu-composable
-  "The composable-IR Q4 GEMV (raster.dl.qlinear-composable), lowered via compile-aot
-  :target :c and pool-driven over output-row slices — the candidate we are closing to
-  hand-kernel parity. Row-major weight (no repack-stream); activation int8-quantized per
-  call. Measures the composable path vs the hand kernel to localize the residual gap."
-  [wf in out]
-  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
-        drive ((requiring-resolve 'raster.dl.qlinear-composable/make-composable-c-gemv))]
-    (fn [x]
-      (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
-        (drive xq xs xsum wq ws in out)))))
-
-(defn cand-cpu-x8
-  "The TILED tile-tensorize composable GEMV (raster.dl.qlinear-composable/qmatmul-q4-x8!
-  via compile-aot :target :c, pool-driven over column-group slices). Interleaved repack
-  layout; the wi8-dot-q4-x8 dpbusd tile is the one kernel call, the GEMV composable. The
-  candidate that should close the 8-column-lane gap to the hand kernel."
+(defn cand-x8
+  "Production path: composable qmatmul-q4-x8! (compile-aot-c :simd? true), pool-driven
+  over 8-column groups on the interleaved repack-stream layout. This is what
+  raster.quant.op/qlinear-i8 uses."
   [wf in out]
   (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
         {:keys [wqi wsi]} (cq/repack-stream wq ws out in)
-        drive ((requiring-resolve 'raster.dl.qlinear-composable/make-x8-c-gemv))]
+        drive (k/make-x8-c-gemv)]
     (fn [x]
       (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
         (drive xq xs xsum wqi wsi in out)))))
 
-(def candidates
-  "name -> candidate prep fn. Composable par-form lowerings register here."
-  {:cpu-hand       cand-cpu-hand
-   :cpu-composable cand-cpu-composable
-   :cpu-x8         cand-cpu-x8
-   :gpu            cand-gpu})
+(defn cand-composable-rowmajor
+  "Row-major composable GEMV (scalar-fold reference) — the SIMD x8 path must stay
+  well ahead of this."
+  [wf in out]
+  (let [{:keys [wq ws]} (cq/quantize-weight-q4 wf)
+        drive (k/make-composable-c-gemv)]
+    (fn [x]
+      (let [{:keys [xq xs xsum]} (cq/quantize-act-i8-par x in)]
+        (drive xq xs xsum wq ws in out)))))
+
+(def candidates {:x8 cand-x8 :rowmajor cand-composable-rowmajor})
 
 ;; ---- correctness oracle: independent scalar dequant-dot (double) ----
 
@@ -109,45 +80,28 @@
     (/ (double (nth ts (quot n 2))) 1000.0)))
 
 (defn run
-  "Run the faithfulness comparison. Returns a vector of per-(shape,candidate) rows:
-  {:shape :cand :maxdiff-vs-scalar :maxdiff-vs-hand :us :x-vs-hand :correct? :faithful?}.
-  faithful? = correct (f32 round-off) AND within 15% of the hand kernel's latency."
-  [& {:keys [shapes cands tol perf-slack]
-      :or {shapes decode-shapes cands candidates tol 1.0e-3 perf-slack 1.15}}]
+  "Correctness (max |diff| vs scalar-ref over the first min(out,512) rows) + median
+  latency per candidate on each shape. Returns rows; also prints a table.
+  tol = f32 round-off tolerance for correctness."
+  [& {:keys [shapes cands tol reps] :or {shapes decode-shapes cands candidates tol 1.0e-3}}]
+  (println (format "%-14s %-9s %8s  %10s  %s" "shape" "cand" "us" "maxdiff" "correct?"))
   (vec
-   (for [[in out lbl] shapes]
-     (let [wf (let [a (float-array (* out in))]
-                (dotimes [i (* out in)] (aset a i (float (- (rand) 0.5)))) a)
-           x  (let [a (float-array in)] (dotimes [i in] (aset a i (float (- (rand) 0.5)))) a)
-           ;; correctness oracle over the first min(out,512) rows
-           rows (min out 512)
-           {:keys [wq ws]} (cq/quantize-weight-q4 wf)
-           {:keys [xq xs]} (cq/quantize-act-i8 x 1 in)
-           yref (scalar-ref wq ws xq xs in rows)
-           reps (if (> out 100000) 15 60)
-           prepared (into {} (map (fn [[nm prep]] [nm (prep wf in out)]) cands))
-           y-hand (vec ((:cpu-hand prepared) x))
-           hand-us (median-us (fn [] ((:cpu-hand prepared) x)) reps 25)
-           per-cand
-           (into {}
-                 (for [[nm f] prepared]
-                   (let [y (vec (f x))
-                         dscal (reduce max 0.0 (map (fn [a b] (Math/abs (- (double a) (double b))))
-                                                    yref (take rows y)))
-                         dhand (reduce max 0.0 (map (fn [a b] (Math/abs (- (double a) (double b))))
-                                                    y-hand y))
-                         us (median-us (fn [] (f x)) reps 25)
-                         correct? (< dscal tol)
-                         faithful? (and correct? (<= us (* perf-slack hand-us)))]
-                     [nm {:maxdiff-vs-scalar (float dscal) :maxdiff-vs-hand (float dhand)
-                          :us (Math/round us) :x-vs-hand (Math/round (/ us hand-us))
-                          :correct? correct? :faithful? faithful?}])))]
-       {:shape [in out] :label lbl :hand-us (Math/round hand-us) :cands per-cand}))))
+   (for [[in out lbl] shapes
+         :let [wf (let [a (float-array (* out in))] (dotimes [i (* out in)] (aset a i (float (- (rand) 0.5)))) a)
+               x  (let [a (float-array in)] (dotimes [i in] (aset a i (float (- (rand) 0.5)))) a)
+               rows (min out 512)
+               {:keys [wq ws]} (cq/quantize-weight-q4 wf)
+               {:keys [xq xs]} (cq/quantize-act-i8 x 1 in)
+               yref (scalar-ref wq ws xq xs in rows)
+               n (or reps (if (> out 100000) 15 60))]
+         [nm prep] cands]
+     (let [f (prep wf in out)
+           y (vec (f x))
+           dscal (reduce max 0.0 (map (fn [a b] (Math/abs (- (double a) (double b)))) yref (take rows y)))
+           us (median-us #(f x) n 25)
+           ok (< dscal tol)]
+       (println (format "%-14s %-9s %8.0f  %10.6f  %s" lbl (name nm) us (float dscal) ok))
+       {:shape lbl :cand nm :us (Math/round us) :maxdiff (float dscal) :correct? ok}))))
 
 (defn -main [& _]
-  (doseq [{:keys [label shape hand-us cands]} (run)]
-    (println (format "%-16s %-12s hand=%dus" label (pr-str shape) hand-us))
-    (doseq [[nm r] cands]
-      (println (format "    %-10s %6dus  %2dx-hand  diff(scalar)=%.2g correct=%s faithful=%s"
-                       (name nm) (:us r) (:x-vs-hand r) (:maxdiff-vs-scalar r)
-                       (:correct? r) (:faithful? r))))))
+  (run))
