@@ -1204,3 +1204,30 @@
                        (+ a (* (aget sc (clojure.core/+ scb j))
                                (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
                 a)))))))
+
+;; Bidirectional scores (EmbeddingGemma-style encoder): all-to-all, no causal mask.
+;; (Symmetric sliding window |i-j| < w only matters for T > window — the binder
+;; asserts T <= window, so full attention here is exact.)
+(deftm attn-prefill-scores-bidir! (All [T] [q :- (Array T) k :- (Array T) sc :- (Array T)
+                                            nrows :- Long n-q :- Long group :- Long
+                                            n-kv :- Long head-dim :- Long
+                                            scale :- Double] :- Void
+  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+    (let [per-i (clojure.core/* n-q nrows)
+          i (quot idx per-i)
+          rest0 (rem idx per-i)
+          hq (quot rest0 nrows)
+          j (rem rest0 nrows)
+          row (clojure.core/+ (clojure.core/* i n-q) hq)
+          hkv (quot hq group)
+          qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                             (clojure.core/* hq head-dim))
+          kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                             (clojure.core/* hkv head-dim))
+          dot (loop [d 0 acc 0.0]
+                (if (< d head-dim)
+                  (recur (inc d)
+                         (+ acc (* (aget q (clojure.core/+ qb d))
+                                   (aget k (clojure.core/+ kb d)))))
+                  acc))]
+      (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))
