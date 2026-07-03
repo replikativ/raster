@@ -48,11 +48,11 @@
 
 (def ^:private fp64-pragma
   "Enable double precision (required for OpenCL)."
-  "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+  "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
 
 (def ^:private subgroup-pragma
   "Enable Intel subgroup extensions for shuffle ops."
-  "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n")
+  "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n")
 
 ;; ================================================================
 ;; Kernel templates

@@ -87,7 +87,7 @@
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -191,8 +191,8 @@
                                       "int _n_bound"]))
         ;; Static shared memory — matches invoke-reduction-kernel (no __local arg)
         source (when elem-str
-                 (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
-                      "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
+                 (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                      "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
                       "__kernel void " kernel-name
                       "(" all-params ") {\n"
                       "    __local " ctype " sdata[256];\n"
