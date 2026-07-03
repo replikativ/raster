@@ -97,7 +97,7 @@
                            ce/*scalar-type* ctype]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast (str "(" (name cast) ")(" body-str ")") body-str)
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -228,7 +228,7 @@
         needs-fp64? (or use-fp64?
                         (str/includes? body-str "double")
                         (str/includes? helper-sources "double"))
-        source (str (when needs-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when needs-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
@@ -338,7 +338,7 @@
         half-block (/ block-size 2)
         ;; Generate source with two kernels
         source (str
-                (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+                (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                 "\n"
                  ;; Kernel 1: Block-level exclusive scan (Blelloch)
                 "__kernel void " block-kn "(\n"
@@ -501,8 +501,8 @@
                                                    [(or adapted-element 'input)])]
                                (ce/emit-expr let-body idx array-sym-names "i"))
                              element-str))
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
-                    "#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n"
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                    "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    __local " ctype " sdata[" wg-size "];\n"
@@ -729,7 +729,7 @@
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast (str "(" (name cast) ")(" body-str ")") body-str)
         out-c (ce/c-symbol out)
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -778,7 +778,7 @@
         index-c (ce/c-symbol index)
         ;; Scatter needs float atomic CAS for float types, native atomic for int
         needs-float-atomic? (contains? #{:float :double} dtype)
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     (when needs-float-atomic? atomic-add-float-helper)
                     "__kernel void " kernel-name
@@ -835,7 +835,7 @@
         vals-c (ce/c-symbol vals)
         needs-float-atomic? (contains? #{:float :double} dtype)
         ;; Only + is supported for atomic reduce-by-key (most common case)
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     (when needs-float-atomic? atomic-add-float-helper)
                     "__kernel void " kernel-name
@@ -957,7 +957,7 @@
                                                                (set (map symbol (map name all-arrays)))
                                                                ctype)
                                     non-reduce-phases))
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    int i = get_local_id(0);\n"
@@ -1030,7 +1030,7 @@
                   (str "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
                        "        " (ce/c-symbol out) "[idx] = " body-str ";\n"
                        "    }\n"))
-                source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+                source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
                             "__kernel void " kernel-name
                             "(" all-params ") {\n"
                             kernel-body

@@ -81,6 +81,17 @@
 
 (def ^:private CL_SUCCESS 0)
 (def ^:private CL_DEVICE_TYPE_GPU (long 4))
+(def ^:private CL_DEVICE_TYPE_CPU (long 2))
+(def ^:private CL_DEVICE_TYPE_ALL (long 0xFFFFFFFF))
+
+(defn- requested-device-type
+  "CL device type from RASTER_OCL_DEVICE_TYPE (cpu|all; default gpu) — lets the
+  same runtime bind POCL/Intel-CPU OpenCL for vendor-portability validation."
+  ^long []
+  (case (some-> (System/getenv "RASTER_OCL_DEVICE_TYPE") .toLowerCase)
+    "cpu" CL_DEVICE_TYPE_CPU
+    "all" CL_DEVICE_TYPE_ALL
+    CL_DEVICE_TYPE_GPU))
 (def ^:private CL_MEM_READ_WRITE (long 1))
 (def ^:private CL_MEM_COPY_HOST_PTR (long 32))
 (def ^:private CL_TRUE (int 1))
@@ -272,7 +283,9 @@
 
 (defn init!
   "Initialize OpenCL runtime. Idempotent.
-  Finds first GPU platform/device, creates context and in-order command queue."
+  Finds the first platform with a device of the requested type (default GPU;
+  RASTER_OCL_DEVICE_TYPE=cpu|all selects CPU/any device — POCL, Intel CPU
+  runtime, vendor-portability testing), creates context and in-order queue."
   []
   (when-not (:initialized? @state)
     (let [arena (Arena/ofShared)
@@ -294,14 +307,14 @@
                  (let [plat (.get plat-buf PTR (* plat-idx 8))
                        num-dev-seg (.allocate arena I32)
                        ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
-                                                      (into-array Object [plat (long CL_DEVICE_TYPE_GPU)
+                                                      (into-array Object [plat (long (requested-device-type))
                                                                           (int 0) MemorySegment/NULL num-dev-seg])))]
                    (when (== CL_SUCCESS ret)
                      (let [num-dev (read-int num-dev-seg)]
                        (when (> num-dev 0)
                          (let [dev-buf (.allocate arena 8)
                                _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
-                                           [plat (long CL_DEVICE_TYPE_GPU) (int 1) dev-buf num-dev-seg])
+                                           [plat (long (requested-device-type)) (int 1) dev-buf num-dev-seg])
                                dev (.get dev-buf PTR 0)]
                            [plat dev]))))))
                (range num-plat))
@@ -359,13 +372,13 @@
               (let [plat (.get plat-buf PTR (* plat-idx 8))
                     num-dev-seg (.allocate arena I32)
                     ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
-                                                   (into-array Object [plat (long CL_DEVICE_TYPE_GPU)
+                                                   (into-array Object [plat (long (requested-device-type))
                                                                        (int 0) MemorySegment/NULL num-dev-seg])))]
                 (when (== CL_SUCCESS ret)
                   (let [num-dev (read-int num-dev-seg)
                         dev-buf (.allocate arena (* num-dev 8))
                         _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
-                                    [plat (long CL_DEVICE_TYPE_GPU) (int num-dev) dev-buf num-dev-seg])]
+                                    [plat (long (requested-device-type)) (int num-dev) dev-buf num-dev-seg])]
                     (mapv
                      (fn [dev-idx]
                        (let [dev (.get dev-buf PTR (* dev-idx 8))]
