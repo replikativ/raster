@@ -1109,3 +1109,125 @@
                                                     dK (list 'clojure.core/aget grads-arr 1)
                                                     dV (list 'clojure.core/aget grads-arr 2)])
                                            [dQ dK dV nil nil nil nil]]))})
+
+;; ---------------------------------------------------------------------------
+;; PREFILL variants (S3 GPU embed mode): a whole T-token block per replay, no KV
+;; cache, positions from the work-item index. Causal mask via -1e30 scores.
+;; ---------------------------------------------------------------------------
+
+(deftm rope-prefill! (All [T] [x :- (Array T) out :- (Array T)
+                               nrows :- Long heads :- Long head-dim :- Long
+                               theta :- Double] :- Void
+  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+    (let [hdim2 (quot head-dim 2)
+          per-row (clojure.core/* heads hdim2)
+          t (quot idx per-row)
+          rest0 (rem idx per-row)
+          h (quot rest0 hdim2)
+          i (rem rest0 hdim2)
+          base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                               (clojure.core/* h head-dim))
+          ln-theta (m/log theta)
+          freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+          ang (* (double t) freq)
+          c (m/cos ang) s (m/sin ang)
+          x0 (aget x (clojure.core/+ base i))
+          x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+      (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+      (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+
+;; Causal batched attention, 3 phases. q:[T,nq*hd] k,v:[T,nkv*hd] row-major;
+;; sc:[T*nq, T] scores/probs scratch; out:[T, nq*hd].
+(deftm attn-prefill-scores! (All [T] [q :- (Array T) k :- (Array T) sc :- (Array T)
+                                      nrows :- Long n-q :- Long group :- Long
+                                      n-kv :- Long head-dim :- Long
+                                      scale :- Double] :- Void
+  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+    (let [per-i (clojure.core/* n-q nrows)
+          i (quot idx per-i)
+          rest0 (rem idx per-i)
+          hq (quot rest0 nrows)
+          j (rem rest0 nrows)
+          row (clojure.core/+ (clojure.core/* i n-q) hq)]
+      (if (< i j)
+        (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
+        (let [hkv (quot hq group)
+              qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                                 (clojure.core/* hq head-dim))
+              kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                 (clojure.core/* hkv head-dim))
+              dot (loop [d 0 acc 0.0]
+                    (if (< d head-dim)
+                      (recur (inc d)
+                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                       (aget k (clojure.core/+ kb d)))))
+                      acc))]
+          (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
+
+(deftm attn-prefill-softmax! (All [T] [sc :- (Array T)
+                                       nrows :- Long n-q :- Long] :- Void
+  (raster.par/map-void! row (clojure.core/* nrows n-q)
+    (let [scb (clojure.core/* row nrows)
+          mx (loop [j 0 mm -1.0e30]
+               (if (< j nrows)
+                 (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+          sum (loop [j 0 s 0.0]
+                (if (< j nrows)
+                  (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                    (aset sc (clojure.core/+ scb j) e)
+                    (recur (inc j) (+ s e)))
+                  s))
+          inv (/ 1.0 sum)]
+      (loop [j 0]
+        (if (< j nrows)
+          (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
+              (recur (inc j)))
+          nil))))))
+
+(deftm attn-prefill-out! (All [T] [sc :- (Array T) v :- (Array T) out :- (Array T)
+                                   nrows :- Long n-q :- Long group :- Long
+                                   n-kv :- Long head-dim :- Long] :- Void
+  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q head-dim))
+    (let [per-i (clojure.core/* n-q head-dim)
+          i (quot idx per-i)
+          rest0 (rem idx per-i)
+          hq (quot rest0 head-dim)
+          d (rem rest0 head-dim)
+          row (clojure.core/+ (clojure.core/* i n-q) hq)
+          scb (clojure.core/* row nrows)
+          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)
+          kvstride (clojure.core/* n-kv head-dim)]
+      (aset out (clojure.core/+ (clojure.core/* i per-i) (clojure.core/+ (clojure.core/* hq head-dim) d))
+            (loop [j 0 a 0.0]
+              (if (< j nrows)
+                (recur (inc j)
+                       (+ a (* (aget sc (clojure.core/+ scb j))
+                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
+                a)))))))
+
+;; Bidirectional scores (EmbeddingGemma-style encoder): all-to-all, no causal mask.
+;; (Symmetric sliding window |i-j| < w only matters for T > window — the binder
+;; asserts T <= window, so full attention here is exact.)
+(deftm attn-prefill-scores-bidir! (All [T] [q :- (Array T) k :- (Array T) sc :- (Array T)
+                                            nrows :- Long n-q :- Long group :- Long
+                                            n-kv :- Long head-dim :- Long
+                                            scale :- Double] :- Void
+  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+    (let [per-i (clojure.core/* n-q nrows)
+          i (quot idx per-i)
+          rest0 (rem idx per-i)
+          hq (quot rest0 nrows)
+          j (rem rest0 nrows)
+          row (clojure.core/+ (clojure.core/* i n-q) hq)
+          hkv (quot hq group)
+          qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                             (clojure.core/* hq head-dim))
+          kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                             (clojure.core/* hkv head-dim))
+          dot (loop [d 0 acc 0.0]
+                (if (< d head-dim)
+                  (recur (inc d)
+                         (+ acc (* (aget q (clojure.core/+ qb d))
+                                   (aget k (clojure.core/+ kb d)))))
+                  acc))]
+      (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))
