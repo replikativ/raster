@@ -145,12 +145,23 @@
         ;; would mis-detect the op and capture the impl symbol as the element). Same fix #37 made
         ;; for SegMap; here it keeps SegRed combine-op detection sound for both bare and .invk forms.
         op-sym (when (seq? inner-body) (descriptor/semantic-op inner-body))
-        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*, 'clojure.core/- '-,
-                            'raster.numeric/+ '+, 'raster.numeric/* '*, 'raster.numeric/- '-}
+        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*,
+                            'raster.numeric/+ '+, 'raster.numeric/* '*,
+                            'clojure.core/max 'max, 'raster.numeric/max 'max, 'Math/max 'max,
+                            'clojure.core/min 'min, 'raster.numeric/min 'min, 'Math/min 'min}
                            op-sym op-sym)
-        c-op (condp = normalized-op '+ "+" '* "*" 'Math/max "fmax" 'Math/min "fmin" "+")
+        ;; Unknown combine ops must FAIL LOUD — the old default silently combined with "+"
+        ;; (a max reduce summed the per-lane maxima). Only associative ops are legal here.
+        c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
+               (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
+                                    " — GPU reduction needs an associative op (+ * max min)")
+                               {:op op-sym :lambda lambda})))
         c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
         identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
+        ;; fmax/fmin are functions, not infix operators
+        c-combine (fn [a b] (if (#{"fmax" "fmin"} c-op)
+                              (str c-op "(" a ", " b ")")
+                              (str "(" a " " c-op " " b ")")))
         ;; Extract the element expression (the non-acc operand) from the SEMANTIC args.
         op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
         acc-at? (fn [a] (or (= a acc)
@@ -198,13 +209,13 @@
                       "    int stride = get_global_size(0);\n"
                       "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
                       "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
-                      "        val = (val " c-op " " elem-str ");\n"
+                      "        val = " (c-combine "val" elem-str) ";\n"
                       "    }\n"
                       "    sdata[tid] = val;\n"
                       "    barrier(CLK_LOCAL_MEM_FENCE);\n"
                       "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
                       "        if (tid < s) {\n"
-                      "            sdata[tid] = (sdata[tid] " c-op " sdata[tid + s]);\n"
+                      "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
                       "        }\n"
                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                       "    }\n"

@@ -1608,9 +1608,13 @@
   n: element count
   Dtype is read from kernel registry entry (:dtype, default :double)."
   [^String kernel-name input-arrays n]
-  (let [{:keys [kernel-handle workgroup-size identity-val dtype]
-         :or {workgroup-size 256 identity-val 0.0 dtype :double}
+  (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
+         :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :double}
          :as info} (ensure-kernel-loaded! kernel-name)
+        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
+                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                           "*"    (fn ^double [^double a ^double b] (* a b))
+                           (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))
@@ -1643,8 +1647,8 @@
       (loop [i 0 acc (double identity-val)]
         (if (< i group-count)
           (recur (inc i)
-                 (+ acc (double (.get dev-partial value-layout
-                                      (* i dtype-size)))))
+                 (double (combine acc (double (.get dev-partial value-layout
+                                                    (* i dtype-size))))))
           acc)))))
 
 ;; ================================================================
@@ -2176,9 +2180,13 @@
 
   Backend-agnostic: works with Level Zero today, CUDA/ROCm later."
   [^String kernel-name input-bufs n]
-  (let [{:keys [kernel-handle workgroup-size identity-val dtype]
-         :or {workgroup-size 256 identity-val 0.0 dtype :float}
+  (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
+         :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :float}
          :as info} (ensure-kernel-loaded! kernel-name)
+        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
+                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                           "*"    (fn ^double [^double a ^double b] (* a b))
+                           (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))
@@ -2200,8 +2208,8 @@
       (loop [i 0 acc (double identity-val)]
         (if (< i group-count)
           (recur (inc i)
-                 (+ acc (double (.get dev-partial value-layout
-                                      (* i dtype-size)))))
+                 (double (combine acc (double (.get dev-partial value-layout
+                                                    (* i dtype-size))))))
           acc)))))
 
 (defn invoke-gpu-axpy!
