@@ -1488,9 +1488,11 @@
 ;; core generates the concrete deftm.
 ;; ================================================================
 
-(defn- parametric-specialize!
-  "Generate a concrete deftm specialization for a parametric template.
-  Called by dispatch when a parametric function is invoked with a new type.
+(defn- register-parametric-specialization!
+  "Generate + register a concrete deftm specialization for a parametric template
+  under the given type-var bindings, and return its bytecode-compiled -impl var.
+  Does NOT invoke the impl — that is the caller's job (runtime dispatch invokes
+  with args; compile-time specialization just wants the registration).
 
   Uses the bytecode compiler directly instead of Clojure eval. This ensures
   the invoke(Object) path is a bytecoded unboxing bridge (like manual deftm),
@@ -1532,29 +1534,17 @@
         concrete-ret (clojure.walk/postwalk
                       #(if (symbol? %) (subst %) %)
                       (dispatch/substitute-type-var ret-annotation bindings))
-        ;; Determine element type for literal casting (Julia-style)
-        ;; When T=float, double literals like 0.0 should become (float 0.0)
-        ;; so loop accumulators match the element type and dispatch resolves
-        ;; to concrete float+float instead of Number+Number.
+        ;; Element dtype this body is monomorphized to (from the T binding).
+        ;; Threaded to the walker as :element-dtype (see walk-opts below) so
+        ;; CONTEXTUAL literal typing narrows untyped floating literals by their
+        ;; use-site — binding-init → element dtype, call-arg → resolved param
+        ;; dtype — instead of a blind pre-pass that narrowed EVERY double literal
+        ;; and corrupted literals bound to a callee's concrete non-T param
+        ;; (e.g. skip-layer-norm's `eps :- Double`).
         elem-prim (get bindings (first (:type-vars template)))
-        literal-cast-fn (case elem-prim
-                          float  (fn [x]
-                                   (if (and (number? x) (instance? Double (if (int? x) nil x)))
-                                     (list 'float x)
-                                     x))
-                          int    (fn [x]
-                                   (if (and (number? x) (instance? Double (if (int? x) nil x)))
-                                     (list 'int x)
-                                     x))
-                          ;; double or unrecognized — no cast needed
-                          identity)
-        ;; Substitute in body: type vars + literal casting
+        ;; Substitute type vars in the body — NO literal narrowing here.
         body-with-types (clojure.walk/postwalk
-                         (fn [x]
-                           (cond
-                             (symbol? x) (subst x)
-                             (number? x) (literal-cast-fn x)
-                             :else x))
+                         (fn [x] (if (symbol? x) (subst x) x))
                          body)
         ;; Compute tags and mangled name
         tags (mapv #(types/annotation->tag %1 %2) concrete-anns params)
@@ -1573,7 +1563,11 @@
         type-env (build-walker-type-env params concrete-anns)
         plain-type-env (reduce-kv (fn [m s rec] (assoc m s (dissoc rec :fn-info))) {} type-env)
         walk-opts (cond-> {:type-env plain-type-env :source-ns source-ns}
-                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                    ;; This body is monomorphized to T := elem-prim. Thread the FP
+                    ;; element dtype so contextual literal typing (B) can narrow an
+                    ;; untyped floating literal to it. Only float/double matter.
+                    (#{'float 'double} elem-prim) (assoc :element-dtype (keyword (str elem-prim))))
         walked-body (vec (map #(walker/walk-body % walk-opts) (if (seq? body-with-types)
                                                                 [body-with-types]
                                                                 body-with-types)))
@@ -1696,12 +1690,112 @@
                                            (fn [& call-args]
                                              (apply @impl-var call-args))
                                            (meta (ns-resolve source-ns (symbol (name fn-name)))))
-                ;; Call the newly-compiled impl directly rather than re-dispatching.
-                ;; Re-dispatch through the generic function would fail on first call
-                ;; because the original args may predate the class cache.
-                (apply @impl-var args)))
+                ;; Return the compiled -impl var; the caller decides whether to
+                ;; invoke it (runtime dispatch) or just keep the registration
+                ;; (compile-time specialization).
+                impl-var))
             (finally
               (.setContextClassLoader (Thread/currentThread) prev-tcl))))))))
 
-;; Register the callback with dispatch — breaks the cycle
+(defn- parametric-specialize!
+  "Runtime dispatch entry: register the concrete specialization for these arg
+  types, then invoke it directly (avoiding a re-dispatch through the generic
+  function, which could fail on first call if the args predate the class cache)."
+  [fn-name template bindings args]
+  (let [impl-var (register-parametric-specialization! fn-name template bindings args)]
+    (apply @impl-var args)))
+
+(def ^:dynamic *ensuring-specializations*
+  "Set of [qualified-fn-sym dtype] pairs currently being ensured. Guards the
+  bottom-up pre-specialization recursion in ensure-dtype-specialization! against
+  infinite loops on self-recursive or mutually-recursive parametric deftms — the
+  ns-resolve idempotency check alone is insufficient during descent, because the
+  specialization is not yet registered while its callees are being processed."
+  #{})
+
+(defn- parametric-callee-vars
+  "Scan a parametric template body for call heads that resolve (in source-ns) to
+  a var whose qualified name is itself registered as a parametric template.
+  Returns the set of those generic-function vars — the parametric callees that
+  must be specialized BEFORE this deftm so their concrete (e.g. Float) TC
+  signatures exist when this deftm's body is type-checked during registration.
+  Concrete leaf ops (raster.numeric/*, raster.math/* — not in the registry)
+  naturally terminate the recursion."
+  [body source-ns]
+  (let [reg @dispatch/parametric-registry
+        src-ns-obj (if (instance? clojure.lang.Namespace source-ns)
+                     source-ns (the-ns source-ns))
+        vars (atom #{})]
+    (clojure.walk/postwalk
+     (fn [x]
+       (when (and (seq? x) (symbol? (first x)))
+         (when-let [v (try (ns-resolve src-ns-obj (first x)) (catch Exception _ nil))]
+           (when (var? v)
+             (let [fq (symbol (str (ns-name (:ns (meta v)))) (str (:name (meta v))))]
+               (when (contains? reg fq) (swap! vars conj v))))))
+       x)
+     body)
+    @vars))
+
+(defn ensure-dtype-specialization!
+  "Compile-time analogue of runtime parametric dispatch: ensure a concrete
+  specialization of parametric deftm var `f-var` exists for element `dtype`
+  (:float | :double | :int | :long), binding every type variable of the
+  template to that element type. Returns the concrete mangled var, or nil when
+  `f-var` is not parametric / dtype is nil (caller falls back to plain resolution).
+
+  This is what makes :dtype a MONOMORPHIZATION directive for compile-aot — it
+  narrows the parametric type var T for the whole compile pass (type inference
+  AND dispatch resolution of inner parametric calls), not merely an emit-time
+  leaf translation. Where runtime dispatch unifies T against concrete arg
+  classes, here we bind T := dtype up front, with no runtime args needed
+  (args are only used to import parametric value-class instances, absent for
+  primitive element types).
+
+  Specializes the reachable parametric call graph BOTTOM-UP (leaves first): every
+  parametric callee is ensured at the same dtype before this deftm is registered,
+  so each callee's concrete TC signature (rebuilt by register-method! →
+  emit-tc-ann!) exists before any parent body is TC-analyzed. Without this, TC
+  sees only the callee's `double` base signature, rejects the float args, and
+  discards all binding types — leaving the parent under-devirtualized."
+  [f-var dtype]
+  (let [m (meta f-var)
+        fq (symbol (str (ns-name (:ns m))) (str (:name m)))
+        elem-sym (case dtype :float 'float :double 'double
+                       :int 'int :long 'long nil)
+        templates (get @dispatch/parametric-registry fq)]
+    (when (and elem-sym (seq templates)
+               (not (contains? *ensuring-specializations* [fq dtype])))
+      ;; Single-arity parametric deftm: one template. Bind all its type vars to
+      ;; the requested element type and register the concrete specialization.
+      (let [template (first templates)
+            type-vars (or (:type-var-list template) (vec (:type-vars template)))
+            bindings (zipmap type-vars (repeat elem-sym))
+            tags (mapv #(types/annotation->tag %1 %2)
+                       (mapv (fn [ann]
+                               (clojure.walk/postwalk
+                                #(if (contains? bindings %) (get bindings %) %)
+                                (dispatch/substitute-type-var ann bindings)))
+                             (:annotations template))
+                       (:params template))
+            mangled (symbol (str (types/mangle fq tags)))
+            src-ns (:source-ns template)
+            src-ns-obj (if (instance? clojure.lang.Namespace src-ns)
+                         src-ns (the-ns src-ns))]
+        ;; Idempotent: reuse an already-registered specialization.
+        (or (ns-resolve src-ns-obj mangled)
+            (binding [*ensuring-specializations*
+                      (conj *ensuring-specializations* [fq dtype])]
+              ;; Bottom-up: ensure every parametric callee at the same dtype
+              ;; FIRST, so its concrete TC signature exists before this body is
+              ;; TC-analyzed. The in-progress guard breaks recursive cycles.
+              (doseq [callee-var (parametric-callee-vars (:body template) src-ns-obj)]
+                (ensure-dtype-specialization! callee-var dtype))
+              (register-parametric-specialization! fq template bindings [])
+              (ns-resolve src-ns-obj mangled)))))))
+
+;; Register the callbacks with dispatch — breaks the cycle. The specializer
+;; invokes (runtime dispatch); the register-only path just compiles + registers
+;; the concrete method (compile-time devirtualization, no invoke).
 (dispatch/set-parametric-specializer! parametric-specialize!)
+(dispatch/set-parametric-register! register-parametric-specialization!)

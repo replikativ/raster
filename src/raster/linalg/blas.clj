@@ -62,6 +62,21 @@
    "/opt/intel/mkl/lib/intel64/libmkl_sequential.so"
    "/usr/lib/x86_64-linux-gnu/libmkl_sequential.so"])
 
+;; Threaded MKL layer (OpenMP). Preferred over sequential: the intel_thread layer
+;; multithreads GEMM (~3x on this machine at 4 threads) and works with raster's
+;; critical/zero-copy heap-segment downcalls. Requires libiomp5. Set
+;; RASTER_MKL_SEQUENTIAL=1 to force the sequential layer, or MKL_NUM_THREADS=N to
+;; cap threads (4 is best on hybrid P/E-core CPUs; unset defaults to all cores).
+(def ^:private mkl-iomp5-paths
+  ["/opt/intel/oneapi/compiler/latest/lib/libiomp5.so"
+   "/opt/intel/oneapi/compiler/2025.3/lib/libiomp5.so"
+   "/usr/lib/x86_64-linux-gnu/libiomp5.so"])
+
+(def ^:private mkl-thread-paths
+  ["/opt/intel/oneapi/mkl/latest/lib/libmkl_intel_thread.so"
+   "/opt/intel/mkl/lib/intel64/libmkl_intel_thread.so"
+   "/usr/lib/x86_64-linux-gnu/libmkl_intel_thread.so"])
+
 (defn- dlopen-global
   "Load a shared library with RTLD_LAZY | RTLD_GLOBAL via Panama's native linker.
   This makes the library's symbols visible to subsequently loaded libraries,
@@ -87,14 +102,24 @@
   stable SymbolLookup handle via libraryLookup."
   []
   (try
-    (let [core-ok (some dlopen-global mkl-core-paths)
-          seq-ok  (some dlopen-global mkl-sequential-paths)
-          lp64-ok (some dlopen-global mkl-paths)]
-      (when (and core-ok seq-ok lp64-ok)
+    (let [force-seq? (= "1" (System/getenv "RASTER_MKL_SEQUENTIAL"))
+          ;; Prefer the THREADED layer (iomp5 → core → intel_thread → lp64) for
+          ;; multithreaded GEMM; fall back to sequential (core → sequential →
+          ;; lp64) if iomp5/intel_thread are unavailable or forced off.
+          threaded? (and (not force-seq?)
+                         (some dlopen-global mkl-iomp5-paths)
+                         (some dlopen-global mkl-core-paths)
+                         (some dlopen-global mkl-thread-paths)
+                         (some dlopen-global mkl-paths))
+          ok (or threaded?
+                 (and (some dlopen-global mkl-core-paths)
+                      (some dlopen-global mkl-sequential-paths)
+                      (some dlopen-global mkl-paths)))]
+      (when ok
         ;; Get a SymbolLookup handle for the already-loaded library
         (when-let [lib (try-load-lib mkl-paths)]
           (when (.isPresent (.find lib "cblas_dgemm"))
-            [lib :mkl]))))
+            [lib (if threaded? :mkl-threaded :mkl)]))))
     (catch Exception _ nil)))
 
 (defn- try-load-openblas []
@@ -306,6 +331,73 @@
                            (MemorySegment/ofArray B) (int k)
                            beta
                            (MemorySegment/ofArray C) (int n)]))
+  C)
+
+;; ================================================================
+;; Batched GEMM — one contiguous [batch,·,·] buffer per operand, looped over
+;; head slabs via asSlice offsets (no per-head alloc). Used by batched multi-head
+;; attention: QK^T (nt) and scores@V (nn). alpha folds the 1/sqrt(dk) scale.
+;; float+double arms (dispatch), mirroring dgemm!. beta is 0 (overwrite C).
+;; ================================================================
+
+(deftm ^:no-inline batched-gemm-nt!
+  "C_h = alpha * A_h @ B_h^T for h in 0..batch. A:[batch,m,k] B:[batch,n,k]
+  C:[batch,m,n], all row-major contiguous."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* n k) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 4)) (int k)
+           (.asSlice sb (* (long h) bs 4)) (int k)
+           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nt!
+  [A :- (Array double) B :- (Array double) C :- (Array double)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* n k) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 8)) (int k)
+           (.asSlice sb (* (long h) bs 8)) (int k)
+           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nn!
+  "C_h = alpha * A_h @ B_h for h in 0..batch. A:[batch,m,k] B:[batch,k,n]
+  C:[batch,m,n], all row-major contiguous."
+  [A :- (Array float) B :- (Array float) C :- (Array float)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Float] :- (Array float)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* k n) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 4)) (int k)
+           (.asSlice sb (* (long h) bs 4)) (int n)
+           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+  C)
+
+(deftm ^:no-inline batched-gemm-nn!
+  [A :- (Array double) B :- (Array double) C :- (Array double)
+   batch :- Long m :- Long k :- Long n :- Long alpha :- Double] :- (Array double)
+  (when (and (pos? m) (pos? n) (pos? k))
+    (let [sa (MemorySegment/ofArray A) sb (MemorySegment/ofArray B) sc (MemorySegment/ofArray C)
+          as (* m k) bs (* k n) cs (* m n)]
+      (dotimes [h batch]
+        (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
+          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+           (.asSlice sa (* (long h) as 8)) (int k)
+           (.asSlice sb (* (long h) bs 8)) (int n)
+           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
   C)
 
 ;; ================================================================

@@ -303,6 +303,192 @@
                                                           a))))))
                                           0)))
 
+;; Decode RoPE (single token), par/map-void! over heads — the same NeoX/HF rotate-half as
+;; rope-pos with seq-len=1 (each head rotates its head-dim/2 pairs at absolute position
+;; pos-offset). Lowers to OpenCL and SIMD-vectorizes on CPU. Index math clojure.core; trig
+;; via raster.math. out is caller-provided (in-place-safe: reads x, writes out).
+(deftm rope-pos-gpu! (All [T] [x :- (Array T) out :- (Array T)
+                               heads :- Long head-dim :- Long
+                               theta :- Double pos-offset :- Long] :- Void
+                          (raster.par/map-void! h heads
+                                                (let [hdim2 (quot head-dim 2)
+                                                      base (clojure.core/* h head-dim)
+                                                      ln-theta (m/log theta)
+                                                      pos (double pos-offset)]
+                                                  (loop [i 0]
+                                                    (if (< i hdim2)
+                                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                            ang (* pos freq)
+                                                            c (m/cos ang) s (m/sin ang)
+                                                            x0 (aget x (clojure.core/+ base i))
+                                                            x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                        (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                                        (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))
+                                                        (recur (inc i)))
+                                                      nil))))))
+
+;; KV-cache append (decode): write the current token's K (or V) slab of length kvrow = n_kv*head_dim
+;; into the cache at absolute position `pos` (offset pos*kvrow). par/map-void! over kvrow — the
+;; on-device equivalent of the CPU System/arraycopy append. Index math clojure.core (integer).
+(deftm kv-append! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long pos :- Long] :- Void
+                       (raster.par/map-void! i kvrow
+                                             (aset cache (clojure.core/+ (clojure.core/* pos kvrow) i)
+                                                   (aget src i)))))
+
+;; GPU/vectorizable decode attention: the SAME per-head computation as
+;; gqa-decode-attention-heads!, but the head loop is a par/map-void! (one work-item per query
+;; head) so it lowers to OpenCL and SIMD-vectorizes on CPU. Per-head scratch is caller-provided
+;; (sc, size n-q*cache-len — GPU work-items can't allocate); index math is clojure.core
+;; (integer subscripts), float compute is raster.numeric/raster.math. Attends all cache positions.
+(deftm gqa-decode-attention-gpu! (All [T]
+                                      [q :- (Array T) k :- (Array T) v :- (Array T)
+                                       out :- (Array T) sc :- (Array T)
+                                       cache-len :- Long n-q :- Long group :- Long
+                                       n-kv :- Long head-dim :- Long scale :- Double] :- Void
+                                      (raster.par/map-void! hq n-q
+                                                            (let [hkv (quot hq group)
+                                                                  qb (clojure.core/* hq head-dim)
+                                                                  scb (clojure.core/* hq cache-len)
+                                                                  kvstride (clojure.core/* n-kv head-dim)
+                                                                  hkvb (clojure.core/* hkv head-dim)
+                                              ;; float sentinel below any real score (OpenCL has
+                                              ;; no NEGATIVE_INFINITY const; keeps the max in float
+                                              ;; so n/max → fmax(float,float) isn't ambiguous).
+                                                                  neg-inf -1.0e38
+                                                                  _ (loop [j 0]
+                                                                      (if (< j cache-len)
+                                                                        (let [kb (clojure.core/+ (clojure.core/* j kvstride) hkvb)
+                                                                              dot (loop [d 0 acc 0.0]
+                                                                                    (if (< d head-dim)
+                                                                                      (recur (inc d)
+                                                                                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                                       (aget k (clojure.core/+ kb d)))))
+                                                                                      acc))]
+                                                                          (aset sc (clojure.core/+ scb j) (* dot scale))
+                                                                          (recur (inc j)))
+                                                                        nil))
+                                                                  mx (loop [j 0 mm neg-inf]
+                                                                       (if (< j cache-len)
+                                                                         (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+                                                                  sum (loop [j 0 s 0.0]
+                                                                        (if (< j cache-len)
+                                                                          (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                                                                            (aset sc (clojure.core/+ scb j) e)
+                                                                            (recur (inc j) (+ s e)))
+                                                                          s))
+                                                                  inv (/ 1.0 sum)]
+                                                              (loop [d 0]
+                                                                (if (< d head-dim)
+                                                                  (do (aset out (clojure.core/+ qb d)
+                                                                            (loop [j 0 a 0.0]
+                                                                              (if (< j cache-len)
+                                                                                (let [kvb (clojure.core/+ (clojure.core/* j kvstride) hkvb)]
+                                                                                  (recur (inc j)
+                                                                                         (+ a (* (* (aget sc (clojure.core/+ scb j)) inv)
+                                                                                                 (aget v (clojure.core/+ kvb d))))))
+                                                                                a)))
+                                                                      (recur (inc d)))
+                                                                  nil))))))
+
+;; ── Device-side-pos decode variants (#32): pos / cache_len come from 1-element DEVICE
+;; buffers read INSIDE the par body (so each is a kernel array param, not a host scalar baked at
+;; prepare!). The resident graph then binds ONCE and per token the host just writes posbuf/clenbuf
+;; + replays — no re-prepare / re-record. Reading the buffer inside the kernel (vs passing
+;; (aget posbuf 0) as a scalar arg) avoids the CSE-hoist that would otherwise pull the read out to
+;; a host-evaluated scalar-let.
+;; Flattened over heads×(head-dim/2) so the grid is heads*hdim2 work-items (one rotation each)
+;; instead of `heads` threads each looping hdim2 serially — the n=4 serial version wasted ~98% of
+;; the GPU (low occupancy is the dominant decode cost, NOT dispatch ~2µs nor kernel count).
+(deftm rope-pos-buf! (All [T] [x :- (Array T) out :- (Array T)
+                               heads :- Long head-dim :- Long
+                               theta :- Double posbuf :- (Array long)] :- Void
+                          (raster.par/map-void! idx (clojure.core/* heads (quot head-dim 2))
+                                                (let [hdim2 (quot head-dim 2)
+                                                      h (quot idx hdim2)
+                                                      i (rem idx hdim2)
+                                                      base (clojure.core/* h head-dim)
+                                                      ln-theta (m/log theta)
+                                                      pos (double (aget posbuf 0))
+                                                      freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                      ang (* pos freq)
+                                                      c (m/cos ang) s (m/sin ang)
+                                                      x0 (aget x (clojure.core/+ base i))
+                                                      x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                  (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                                  (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+
+(deftm kv-append-buf! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long posbuf :- (Array long)] :- Void
+                           (raster.par/map-void! i kvrow
+                                                 (aset cache (clojure.core/+ (clojure.core/* (aget posbuf 0) kvrow) i)
+                                                       (aget src i)))))
+
+;; 3-phase parallel decode attention. The old single-map version ran ONE work-item per Q head
+;; (n-q=4) with three serial loops over cache-len×head-dim — measured 1.6ms/layer on Arc iGPU,
+;; 66% of the whole decode step (occupancy, not dispatch: 4 threads on hundreds of lanes).
+;; Grid sizes are BAKED at graph-record time while cache-len grows per token, so the score and
+;; weighted-sum grids over-provision to `maxpos` work-items and guard on clenbuf[0] (idle items
+;; exit immediately). sc is strided by maxpos (size n-q*maxpos) — the old cache-len stride also
+;; overflowed a 32-float sc buffer at clen>8 (page padding hid it). Math and rounding order are
+;; identical to the serial version (probs stored as e*inv, summed ascending).
+(deftm gqa-decode-attention-buf! (All [T]
+                                      [q :- (Array T) k :- (Array T) v :- (Array T)
+                                       out :- (Array T) sc :- (Array T)
+                                       clenbuf :- (Array long) n-q :- Long group :- Long
+                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- Double] :- Void
+ (do
+  ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
+  (raster.par/map-void! ij (clojure.core/* n-q maxpos)
+    (let [cache-len (aget clenbuf 0)
+          hq (quot ij maxpos)
+          j (rem ij maxpos)]
+      (when (< j cache-len)
+        (let [hkv (quot hq group)
+              qb (clojure.core/* hq head-dim)
+              kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                 (clojure.core/* hkv head-dim))
+              dot (loop [d 0 acc 0.0]
+                    (if (< d head-dim)
+                      (recur (inc d)
+                             (+ acc (* (aget q (clojure.core/+ qb d))
+                                       (aget k (clojure.core/+ kb d)))))
+                      acc))]
+          (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
+  ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
+  (raster.par/map-void! hq n-q
+    (let [cache-len (aget clenbuf 0)
+          scb (clojure.core/* hq maxpos)
+          neg-inf -1.0e38
+          mx (loop [j 0 mm neg-inf]
+               (if (< j cache-len)
+                 (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+          sum (loop [j 0 s 0.0]
+                (if (< j cache-len)
+                  (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                    (aset sc (clojure.core/+ scb j) e)
+                    (recur (inc j) (+ s e)))
+                  s))
+          inv (/ 1.0 sum)]
+      (loop [j 0]
+        (if (< j cache-len)
+          (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
+              (recur (inc j)))
+          nil))))
+  ;; phase 3: out[hq,d] = Σ_j sc[hq,j] * v[j,hkv,d] — one work-item per (hq, d)
+  (raster.par/map-void! hd (clojure.core/* n-q head-dim)
+    (let [cache-len (aget clenbuf 0)
+          hq (quot hd head-dim)
+          d (rem hd head-dim)
+          scb (clojure.core/* hq maxpos)
+          kvstride (clojure.core/* n-kv head-dim)
+          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
+      (aset out (clojure.core/+ (clojure.core/* hq head-dim) d)
+            (loop [j 0 a 0.0]
+              (if (< j cache-len)
+                (recur (inc j)
+                       (+ a (* (aget sc (clojure.core/+ scb j))
+                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
+                a))))))))
+
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
                                             seq-len :- Long dk :- Long dv :- Long]
@@ -529,6 +715,69 @@
 ;; Separate bias parameters bq/bk/bv/bo for BERT-style models.
 ;; ================================================================
 
+(deftm fast-exp
+  "Portable vectorizing exp(x) for x <= 0 (softmax range): e^x = (e^(x/1024))^1024
+  via a degree-6 Taylor of the small argument then 10 squarings. Uses only n/*
+  and n/+ (no libm call, no SVML, no bitcast) so it lowers to a pure FMA/mul chain
+  that the compiler SIMD-vectorizes on every backend. Rel error <1e-8 over
+  [-88,0]. (SVML VectorOperators/EXP is not intrinsified on this JVM, so Math/exp
+  stays scalar; this does not depend on it.)"
+  (All [T] [x :- T] :- T
+    (let [t (n/* x 9.765625E-4)                    ; x / 1024
+          p (n/+ 0.008333334 (n/* t 0.0013888889)) ; 1/120 + t/720
+          p (n/+ 0.041666668 (n/* t p))            ; 1/24  + t p
+          p (n/+ 0.16666667 (n/* t p))             ; 1/6
+          p (n/+ 0.5 (n/* t p))                    ; 1/2
+          p (n/+ 1.0 (n/* t p))                    ; 1
+          p (n/+ 1.0 (n/* t p))                    ; e^t (Taylor deg 6)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)
+          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)]
+      p)))
+
+(deftm softmax-rows!
+  "In-place row-wise softmax of a [rows, cols] row-major array — one fused pass
+  per row (max → exp → sum → normalize). Scale is assumed already folded into the
+  values (via the QK^T GEMM alpha). Parametric; float-pure."
+  (All [T] [x :- (Array T) rows :- Long cols :- Long] :- (Array T)
+    (let [n (* rows (int cols))
+          ;; per-row max → broadcast to per-element (cheap, memory-bound scalar)
+          maxes (alloc-like x n)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    mx (loop [j 0 m (n/neg-inf-val (aget x off))]
+                         (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
+                (dotimes [j cols] (aset maxes (+ off j) mx))))
+          ;; VECTORIZED exp = exp(x - max): a flat `broadcast` (recognized par
+          ;; form → SIMD-vectorized SegMap under compile-aot) with the fast-exp
+          ;; polynomial INLINED (e^(v/1024)^1024, deg-6 Taylor + 10 squarings;
+          ;; only +/* → a pure FMA/mul lane chain). A raw nested dotimes here
+          ;; stays scalar; a deftm call stays opaque; SVML EXP is not intrinsified.
+          e (broadcast [x maxes]
+              (let [v (- x maxes) t (* v 9.765625E-4)
+                    a (+ 0.008333334 (* t 0.0013888889)) b (+ 0.041666668 (* t a))
+                    c (+ 0.16666667 (* t b)) d (+ 0.5 (* t c))
+                    ee (+ 1.0 (* t d)) f (+ 1.0 (* t ee))
+                    p1 (* f f) p2 (* p1 p1) p3 (* p2 p2) p4 (* p3 p3) p5 (* p4 p4)
+                    p6 (* p5 p5) p7 (* p6 p6) p8 (* p7 p7) p9 (* p8 p8) p10 (* p9 p9)]
+                p10))
+          ;; per-row sum of e, normalize back into x (cheap, memory-bound scalar)
+          _ (dotimes [r rows]
+              (let [off (* r (int cols))
+                    s (loop [j 0 acc 0.0]
+                        (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
+                    inv (/ 1.0 s)]
+                (dotimes [j cols]
+                  (aset x (+ off j) (* (aget e (+ off j)) inv)))))]
+      x)))
+
+;; Batched multi-head attention: composed from the layout/GEMM/softmax
+;; combinators (pack-heads → batched QK^T with scale folded → fused row-softmax →
+;; batched scores@V → unpack-heads → output proj). Reproduces ORT's attention
+;; computation (scaled-QK^T FusedMatMul + Softmax + scores@V) with NO per-head
+;; scalar copies and 2 batched GEMM calls/head-group instead of ~2*n-heads tiny
+;; ones. NOTE: the forward path is fully composable; training AD through
+;; batched-gemm-*!/softmax-rows! is not yet registered (rrules deferred — the
+;; fastembed inference path is forward-only).
 (deftm multi-head-attention (All [T]
                                  [x :- (Array T) Wq :- (Array T) bq :- (Array T)
                                   Wk :- (Array T) bk :- (Array T)
@@ -536,38 +785,27 @@
                                   Wo :- (Array T) bo :- (Array T)
                                   seq-len :- Long d-model :- Long n-heads :- Long]
                                  :- (Array T)
-                                 (let [dk (quot d-model n-heads)
-        ;; Project Q, K, V: [seq_len, d_model]
-                                       Q (nn/linear x Wq bq seq-len d-model d-model)
-                                       K (nn/linear x Wk bk seq-len d-model d-model)
-                                       V (nn/linear x Wv bv seq-len d-model d-model)
-        ;; Multi-head: process each head separately and concatenate
-                                       out (alloc-like x (* seq-len d-model))]
-                                   (dotimes [h n-heads]
-                                     (let [;; Extract head h from Q, K, V
-            ;; Q_h: [seq_len, dk]
-                                           Qh (alloc-like Q (* seq-len dk))
-                                           Kh (alloc-like K (* seq-len dk))
-                                           Vh (alloc-like V (* seq-len dk))
-                                           h-offset (* h (int dk))]
-                                       (dotimes [s seq-len]
-                                         (dotimes [d dk]
-                                           (let [src-idx (+ (* s (int d-model)) h-offset d)]
-                                             (aset Qh (+ (* s (int dk)) d)
-                                                   (aget Q src-idx))
-                                             (aset Kh (+ (* s (int dk)) d)
-                                                   (aget K src-idx))
-                                             (aset Vh (+ (* s (int dk)) d)
-                                                   (aget V src-idx)))))
-        ;; Apply attention for this head
-                                       (let [head-out (scaled-dot-product-attn Qh Kh Vh seq-len seq-len dk dk)]
-          ;; Copy head output to appropriate position in concatenated output
-                                         (dotimes [s seq-len]
-                                           (dotimes [d dk]
-                                             (aset out (+ (* s (int d-model)) h-offset d)
-                                                   (aget head-out (+ (* s (int dk)) d))))))))
-    ;; Output projection
-                                   (nn/linear out Wo bo seq-len d-model d-model))))
+  (let [dk (quot d-model n-heads)
+        scale (n/oftype x (clojure.core// 1.0 (Math/sqrt (double dk))))
+        ;; Q,K,V projections: [seq_len, d_model]
+        Q (nn/linear x Wq bq seq-len d-model d-model)
+        K (nn/linear x Wk bk seq-len d-model d-model)
+        V (nn/linear x Wv bv seq-len d-model d-model)
+        ;; pack to head-major contiguous [n_heads, seq_len, dk]
+        Qh (ops/pack-heads Q seq-len n-heads dk)
+        Kh (ops/pack-heads K seq-len n-heads dk)
+        Vh (ops/pack-heads V seq-len n-heads dk)
+        ;; scores[n_heads, seq, seq] = scale * Qh @ Kh^T  (one batched GEMM)
+        scores (alloc-like x (* n-heads seq-len seq-len))
+        _ (blas/batched-gemm-nt! Qh Kh scores n-heads seq-len dk seq-len scale)
+        ;; fused row-softmax over the key dimension
+        _ (softmax-rows! scores (* n-heads seq-len) seq-len)
+        ;; ctx[n_heads, seq, dk] = scores @ Vh  (one batched GEMM)
+        ctxh (alloc-like x (* n-heads seq-len dk))
+        _ (blas/batched-gemm-nn! scores Vh ctxh n-heads seq-len seq-len dk (n/oftype x 1.0))
+        ;; unpack to [seq_len, d_model] and project out
+        ctx (ops/unpack-heads ctxh seq-len n-heads dk)]
+    (nn/linear ctx Wo bo seq-len d-model d-model))))
 
 ;; ================================================================
 ;; KV-cache: incremental attention for autoregressive generation

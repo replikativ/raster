@@ -46,6 +46,23 @@
                                  ". Use :ze:N or :ocl:N")
                             {:device-id device-id})))))
 
+(defn- rt-resolve-soft
+  "Like rt-resolve but returns nil instead of throwing when the backend lacks the fn.
+  Used for the bound-dispatch destroyers, which are ze-only."
+  [device-id fn-name]
+  (let [ns-sym (case (backend-type device-id)
+                 :ze  'raster.gpu.ze-runtime
+                 :ocl 'raster.gpu.ocl-runtime)]
+    (requiring-resolve (symbol (str ns-sym) fn-name))))
+
+(defn- destroy-superseded!
+  "Destroy a prepared binding / graph being overwritten under the same key, so re-prepare! /
+  re-record! don't leak the previous dedicated kernel handle (or queue+list). Nil-safe."
+  [device-id destroyer-name old]
+  (when old
+    (when-let [d (rt-resolve-soft device-id destroyer-name)]
+      (try (d old) (catch Exception _)))))
+
 (defn- rt-resolve
   "Resolve a function from the appropriate runtime namespace."
   [device-id fn-name]
@@ -103,20 +120,15 @@
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
-        scalar-types (when (and params tags)
-                       (into {}
-                             (keep (fn [[p t]]
-                                     (case t
-                                       (long longs) [p :int]
-                                       (int ints)   [p :int]
-                                       nil))
-                                   (map vector params tags))))
+        ;; Declared scalar/array element types — the SINGLE shared derivation, used by the
+        ;; pipeline's pass-backend too (opencl-pass/derive-param-types). One source of truth.
+        {:keys [scalar-types array-types]} (opencl-pass/derive-param-types params tags dtype)
         form (let [f (if (= 1 (count walked-body))
                        (first walked-body)
-                       (cons 'do walked-body))]
-               (if (seq scalar-types)
-                 (vary-meta f assoc :scalar-types scalar-types)
-                 f))
+                       (cons 'do walked-body))
+                   f (if (seq scalar-types) (vary-meta f assoc :scalar-types scalar-types) f)
+                   f (if (seq array-types)  (vary-meta f assoc :array-types array-types) f)]
+               f)
         par-opencl opencl-pass/opencl-pass
         register!  (rt-resolve device-id "register-kernel!")
         result (par-opencl form
@@ -172,7 +184,8 @@
   {'doubles :double
    'floats  :float
    'longs   :long
-   'ints    :int})
+   'ints    :int
+   'bytes   :byte})
 
 (defn- object-field
   [obj field-name]
@@ -240,15 +253,27 @@
            :closed?   false})))
 
 (defn close-session!
-  "Free all buffers and kernels in a session. Idempotent and thread-safe."
+  "Free all buffers and kernels in a session. Idempotent and thread-safe.
+
+  Also destroys the per-binding fresh kernel handles (:prepared) and recorded command graphs
+  (:graphs). These hold dedicated driver objects (zeKernel per bind, zeCommandQueue+List per
+  graph) that are NOT in the kernel registry, so close-kernel-arena! never reaches them — without
+  this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (let [{:keys [device-id arena-id buffers closed?]} @sess]
+    (let [{:keys [device-id arena-id buffers prepared graphs closed?]} @sess]
       (when-not closed?
+        ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
+        ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
+        (let [ns-sym (case (backend-type device-id) :ze 'raster.gpu.ze-runtime :ocl 'raster.gpu.ocl-runtime)
+              destroy-prepared! (requiring-resolve (symbol (str ns-sym) "destroy-prepared!"))
+              destroy-graph!    (requiring-resolve (symbol (str ns-sym) "destroy-graph!"))]
+          (when destroy-graph!    (doseq [[_ g] graphs]   (try (destroy-graph! g)    (catch Exception _))))
+          (when destroy-prepared! (doseq [[_ p] prepared] (try (destroy-prepared! p) (catch Exception _)))))
         (free-buffers-internal! buffers device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :kernels {})))))
+        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -288,7 +313,18 @@
   ([sess phase-key v] (compile! sess phase-key v {}))
   ([sess phase-key v opts]
    (let [device-id (:device-id @sess)
-         kernels (compile-deftm-internal! v device-id opts)]
+         ;; Dedup generation by (op, dtype): compile-deftm-internal! emits a gensym-named kernel
+         ;; each call, so without this N phases of the SAME deftm produce N distinct kernel SOURCES
+         ;; → N SPIR-V compiles (ocloc) at first prepare!, even though the bodies are identical.
+         ;; Caching the generated kernel-vec per (op, dtype) makes those phases SHARE one kernel
+         ;; name → one SPIR-V compile. The bound path already mints a fresh handle per binding from
+         ;; the shared module, so distinct phases keep independent arg sets. (e.g. the 18-layer
+         ;; gemma forward: 453 steps / ~8 distinct kernels → first token 171s → ~3s.)
+         cache-key [v (get opts :dtype :float)]
+         kernels (or (get-in @sess [:kernel-cache cache-key])
+                     (let [ks (compile-deftm-internal! v device-id opts)]
+                       (swap! sess assoc-in [:kernel-cache cache-key] ks)
+                       ks))]
      (swap! sess assoc-in [:kernels phase-key] kernels)
      kernels)))
 
@@ -389,6 +425,86 @@
          invoke-fn! (rt-resolve device-id "invoke-registered-map-void-kernel")]
      (invoke-fn! (:kernel-name kernel-info) buf-vec scalars n))))
 
+(defn prepare!
+  "Pre-bind a kernel's arguments ONCE for fast repeated dispatch (the launch-overhead fix).
+  Resolves the session buffers for the kernel's params, binds them + scalars + n, and caches
+  the bound handle in the session under [:prepared phase-key]. Subsequent invoke-bound! calls
+  skip per-launch arg setup and the barrier (measured 2.6-5× faster than invoke!).
+
+  Requires all kernel array params to map to session buffers (DeviceBuffers) — the residency-
+  friendly path. Re-call prepare! only if a buffer is reallocated or n changes; buffer CONTENTS
+  may change freely between invoke-bound! calls (the bound pointers are stable)."
+  ([sess phase-key sym->buf-key scalars n]
+   (prepare! sess phase-key sym->buf-key scalars n {}))
+  ([sess phase-key sym->buf-key scalars n {:keys [index async? kernel-phase] :or {index 0}}]
+   (let [{:keys [kernels buffers]} @sess
+         ;; The COMPILED kernel comes from kernel-phase (defaults to phase-key); the bound
+         ;; argument-set is stored under phase-key. This lets one compiled kernel back many
+         ;; distinct bindings (e.g. every matmul in a decode token shares one dp4a kernel).
+         klookup (or kernel-phase phase-key)
+         kernel-vec (or (get kernels klookup)
+                        (throw (ex-info (str "No kernel for phase: " klookup)
+                                        {:available (keys kernels)})))
+         kernel-info (nth kernel-vec index)
+         buf-vec (resolve-kernel-bufs kernel-info buffers sym->buf-key)
+         device-id (:device-id @sess)
+         bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
+         prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
+     (destroy-superseded! device-id "destroy-prepared!" (get-in @sess [:prepared phase-key]))
+     (swap! sess assoc-in [:prepared phase-key] prepared)
+     prepared)))
+
+(defn invoke-bound!
+  "Dispatch a kernel previously bound with prepare!. No arg setup, no barrier — the
+  low-overhead dispatch path. With an async-prepared kernel the dispatch returns immediately
+  (call sync! before reading results); otherwise it completes synchronously.
+  Throws if the phase was not prepared."
+  [sess phase-key]
+  (let [prepared (or (get-in @sess [:prepared phase-key])
+                     (throw (ex-info (str "Phase not prepared: " phase-key " — call prepare! first")
+                                     {:prepared (keys (:prepared @sess))})))
+        device-id (:device-id @sess)
+        launch-fn (rt-resolve device-id "launch-registered-bound!")]
+    (launch-fn prepared)))
+
+(defn sync!
+  "Block until all async-dispatched kernels on this device have completed. Call once after a
+  batch of async invoke-bound! calls, before downloading results."
+  [sess]
+  (let [device-id (:device-id @sess)]
+    ((rt-resolve device-id "synchronize-async!"))))
+
+(defn record-graph!
+  "Record an ordered sequence of prepared kernels into a replayable command graph (the AOT
+  decode-graph). Pays the per-launch host-append cost ONCE; replay! then runs the whole
+  sequence with a single queue execute — eliminating the per-token dispatch floor.
+
+  phase-keys: ordered vector of phase-keys previously bound via prepare!. The kernel sequence
+  and buffer pointers are fixed; buffer CONTENTS may change between replays. Stored under :graph
+  (or graph-key). Re-record only if the sequence or a buffer is reallocated."
+  ([sess phase-keys] (record-graph! sess phase-keys :graph))
+  ([sess phase-keys graph-key]
+   (let [device-id (:device-id @sess)
+         record-fn (rt-resolve device-id "record-graph!")
+         prepareds (mapv (fn [pk]
+                           (or (get-in @sess [:prepared pk])
+                               (throw (ex-info (str "Phase not prepared: " pk " — call prepare! first")
+                                               {:prepared (keys (:prepared @sess))}))))
+                         phase-keys)
+         graph (record-fn prepareds)]
+     (destroy-superseded! device-id "destroy-graph!" (get-in @sess [:graphs graph-key]))
+     (swap! sess assoc-in [:graphs graph-key] graph)
+     graph)))
+
+(defn replay!
+  "Execute a recorded command graph once (synchronous). Reads current buffer contents."
+  ([sess] (replay! sess :graph))
+  ([sess graph-key]
+   (let [device-id (:device-id @sess)
+         graph (or (get-in @sess [:graphs graph-key])
+                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))]
+     ((rt-resolve device-id "replay-graph!") graph))))
+
 (defn invoke-scan!
   "Invoke a compiled Blelloch exclusive-scan kernel pair from the session.
 
@@ -473,10 +589,402 @@
   [sess key]
   (get-in @sess [:buffers key]))
 
+;; ================================================================
+;; Resident GPU programs (Option A: pipeline → bound-dispatch path)
+;; ================================================================
+
+(defn bind-step!
+  "Bind ONE compiled kernel step (a descriptor :steps entry) into the session under its :phase.
+   Resolves the kernel's array args to resident buffers via `sym->key` (arg-name-symbol → session
+   buffer-key keyword) and its scalars via the step's value-fns over `args`. Handles all three
+   conventions uniformly — the per-step core shared by bind-program! (a single program, sym→key =
+   name) and a multi-instance decode binder (one layer program bound once per layer, sym→key maps
+   weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
+   caller collects :phase keys and records once.
+
+     :reduce    SegRed sig (inputs…, output, scl…, _n_bound); bind inputs ++ [output], SINGLE
+                workgroup (:group-count 1) so the grid-stride loop writes output[0] device-resident.
+     :map       SegMap sig (inputs…, out, scl…, _n_bound); the output is a SEPARATE param not in the
+                registry :array-params, so bind the step's full :arrays (inputs ++ [out]).
+     :map-void  output is an in-place array among :array-params; bind by name via prepare!."
+  [sess step args sym->key]
+  (let [device-id (:device-id @sess)
+        {:keys [kernel-name arrays n-fn scalar-specs phase convention output]} step
+        info-fn (rt-resolve device-id "kernel-registry-entry")]
+    (when-not (#{:map-void :map :reduce} convention)
+      (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
+                           ") — only :map-void / :map / :reduce are supported on the resident path")
+                      {:convention convention :kernel kernel-name})))
+    (let [ki (or (info-fn kernel-name)
+                 (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                 {:kernel kernel-name})))
+          bufs (:buffers @sess)
+          resolve-buf (fn [a] (or (get bufs (sym->key a))
+                                  (throw (ex-info (str "No buffer for kernel arg: " a " → " (sym->key a))
+                                                  {:kernel kernel-name :available (keys bufs)}))))
+          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                        scalar-specs)
+          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")]
+      (case convention
+        :reduce
+        (let [array-bufs (conj (mapv resolve-buf (:array-params ki)) (resolve-buf output))
+              prepared (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})]
+          (swap! sess assoc-in [:prepared phase] prepared))
+
+        :map
+        (let [array-bufs (mapv resolve-buf arrays)
+              prepared (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {})]
+          (swap! sess assoc-in [:prepared phase] prepared))
+
+        (let [sym->buf (into {} (map (fn [p] [(name p) (sym->key p)]) (:array-params ki)))]
+          (swap! sess assoc-in [:kernels phase] [ki])
+          (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase}))))
+    sess))
+
+(defn bind-program!
+  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
+   ONCE: allocate resident buffers for the array params + intermediate scratch, install +
+   prepare! each kernel step against them, and record the kernel sequence as a command graph.
+   After binding, run-program! replays the whole sequence with NO re-binding — the resident
+   bound-dispatch path, vs make-gpu-fn's per-call JVM-array staging. The bound machinery is
+   convention-agnostic, so map! and map-void! kernels bind identically (a map! kernel's output
+   is just another resident buffer in its :array-params).
+
+   args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
+   scalars). Buffer keys are the param/intermediate sym names as keywords.
+
+   roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
+   derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
+   program can't derive: :constant = weights (uploaded once here, never re-uploaded by
+   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
+   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
+   (down)."
+  ([sess descriptor args] (bind-program! sess descriptor args {}))
+  ([sess descriptor args roles]
+   (let [device-id (:device-id @sess)
+         {:keys [dtype all-params array-params allocs steps]} descriptor
+         effective-roles (merge (:array-roles descriptor) roles)
+         argmap (zipmap all-params args)
+         dt (if (= dtype :double) :double :float)
+         nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+         ;; per-array element dtype from the ACTUAL JVM array — a program can mix dtypes (quant
+         ;; kernels carry byte weights + float scales + int bsums + float output), so a single
+         ;; program dtype mis-allocates (CCE [B→[F). The runtime array type is authoritative.
+         arr-dtype (fn [arr]
+                     (condp instance? arr
+                       (Class/forName "[B") :byte
+                       (Class/forName "[S") :short
+                       (Class/forName "[I") :int
+                       (Class/forName "[J") :long
+                       (Class/forName "[F") :float
+                       (Class/forName "[D") :double
+                       dt))
+         param-specs (into {} (map (fn [p]
+                                     (let [arr (get argmap p)]
+                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
+                                   array-params))
+         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
+                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
+                                   allocs))]
+     (alloc! sess (merge param-specs alloc-specs))
+     (doseq [step steps]
+       (bind-step! sess step args (fn [a] (keyword (name a)))))
+     (record-graph! sess (mapv :phase steps) :program)
+     (swap! sess assoc :program-descriptor descriptor :program-roles effective-roles)
+     sess)))
+
+(defn run-program!
+  "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
+   stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
+   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
+   resident from bind-program!. args = values in :all-params order (same as bind-program!).
+   Returns {output-param-sym → downloaded JVM array}."
+  [sess descriptor args]
+  (let [{:keys [all-params array-params]} descriptor
+        roles (:program-roles @sess)
+        argmap (zipmap all-params args)]
+    ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
+    ;; device; output produced by the kernels so its prior content is irrelevant).
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (keyword (name p)) (get argmap p)))
+    (replay! sess :program)
+    ;; download only outputs (inputs/constants/state are not host-visible results).
+    (into {} (for [p array-params :when (= :output (get roles p))]
+               [p (download sess (keyword (name p)))]))))
+
+;; ----------------------------------------------------------------
+;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single
+;; fused compile-gpu-program later). Each op is compiled individually and chained into ONE command
+;; graph over SHARED resident buffers with residency roles, so per token only :input moves up and
+;; :output moves down; :constant weights + :state KV stay resident.
+;; ----------------------------------------------------------------
+
+(defn- typed-scalars-for
+  "Build the ordered, typed scalar arg list for a chain step from the kernel's :scalar-params and
+   the deftm's DECLARED scalar types — so hand-wiring can't mis-order or mis-type. :scalar-params
+   EXCLUDES the par bound (it becomes the work-item count _n_bound, passed separately as :n), and
+   the declared type is what the kernel actually emits (e.g. a Double `scale` is emitted float at
+   :float dtype). scalars = {param-name → value} from the caller, in any order. Mirrors
+   compile-gpu-program's scalar typing (same derive-param-types) — not a special case."
+  [op ki scalars dtype]
+  (let [v (or (resolve-deftm-var op) op)
+        types (:scalar-types (opencl-pass/derive-param-types
+                              (:raster.core/deftm-params (meta v))
+                              (:raster.core/deftm-tags (meta v)) dtype))]
+    (mapv (fn [sp]
+            (let [t (get types sp :float)
+                  raw (if (contains? scalars (name sp)) (get scalars (name sp))
+                          (if (contains? scalars sp) (get scalars sp)
+                              (throw (ex-info (str "chain step for " (:name (meta v))
+                                                   " missing scalar: " sp)
+                                              {:need (:scalar-params ki) :have (keys scalars)}))))]
+              {:type t :value (case t :int (int raw) :long (long raw) :double (double raw) (float raw))}))
+          (:scalar-params ki))))
+
+(defn chain-program!
+  "Bind a hand-authored op-chain as one resident command graph.
+     buffers: {buf-key → [dtype size init-array-or-nil role]} — role ∈
+              #{:constant :state :input :output :scratch} (default :scratch).
+     steps:   [{:op #'deftm-var :phase kw
+                :bind {kernel-param-name-string → buf-key}   ; EACH array param → a buffer
+                :scalars {param-name → value}                ; NON-bound scalars, any order/raw values
+                :n work-items}]                              ; the par bound (work-item count)
+   Allocates the buffers (uploading any init array), compiles each op, prepares each step against
+   the shared buffers (scalars ordered + typed from the kernel signature), and records the kernel
+   sequence under :chain. run-chain! then replays it. dtype defaults :float (GPU decode)."
+  ([sess buffers steps] (chain-program! sess buffers steps :float))
+  ([sess buffers steps dtype]
+   (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
+         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+     (alloc! sess specs)
+     ;; A multi-par-form op compiles to SEVERAL kernels — bind them ALL, in order (the old
+     ;; `first` silently dropped every kernel after the first). All kernels of a step share
+     ;; the step's :bind and :n (ops whose par forms need different bounds don't fit the
+     ;; chain API's single :n — use compile-gpu-program/bind-step! for those).
+     (let [all-phases
+           (vec (mapcat
+                 (fn [{:keys [op phase bind scalars n]}]
+                   (compile! sess phase op)
+                   (let [ks (get-in @sess [:kernels phase])]
+                     (mapv (fn [i]
+                             (let [ph (if (zero? (long i)) phase
+                                          (keyword (str (name phase) "_" i)))
+                                   tsc (typed-scalars-for op (nth ks i) (or scalars {}) dtype)]
+                               (prepare! sess ph bind tsc (long n)
+                                         {:kernel-phase phase :index i})
+                               ph))
+                           (range (count ks)))))
+                 steps))]
+       (record-graph! sess all-phases :chain))
+     (swap! sess assoc :chain-roles roles)
+     sess)))
+
+(defn run-chain!
+  "Replay a bound op-chain: refresh the given :input buffers (buffer POINTERS stable), replay the
+   graph, download the :output buffers. inputs = {buf-key → jvm-array}. Returns
+   {output-buf-key → downloaded jvm-array}. :constant/:state/:scratch buffers are never moved."
+  [sess inputs]
+  (let [roles (:chain-roles @sess)]
+    (doseq [[k arr] inputs] (upload! sess k arr))
+    (replay! sess :chain)
+    (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)]))))
+
+(defn bind-chain!
+  "Allocate the resident buffers + compile each op of a multi-step chain ONCE. Buffers
+   (:constant weights, :state KV cache sized to MAX positions, :scratch) persist across
+   run-chain-ctx! calls. Steps + roles are stored on the session. This is the decode-loop split of
+   chain-program!: bind once, then run-chain-ctx! per token re-prepares only the position-dependent
+   steps while weights + KV stay resident on-device."
+  ([sess buffers steps] (bind-chain! sess buffers steps :float))
+  ([sess buffers steps dtype]
+   (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
+         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+     (alloc! sess specs)
+     (doseq [{:keys [op phase]} steps] (compile! sess phase op))
+     (swap! sess assoc :chain-steps steps :chain-roles roles :chain-dtype dtype)
+     sess)))
+
+(defn run-chain-ctx!
+  "Run a bound chain (bind-chain!) for one token: resolve each step's position-dependent scalars
+   and work-item count via ctx (a scalar value or :n that is a KEYWORD is looked up in ctx — e.g.
+   `\"pos-offset\" :pos` or `:n :nq` → (get ctx …)), prepare each step, record the graph, refresh
+   the given :input buffers, replay, and download the :output buffers. Re-callable per token with a
+   new ctx; the resident weights + KV (:state, written in place by kv-append) persist. The KV cache
+   + attention scratch are sized to MAX positions at bind; cache-len/pos vary per token as scalars."
+  ([sess ctx inputs] (run-chain-ctx! sess ctx inputs (:chain-dtype @sess)))
+  ([sess ctx inputs dtype]
+   (let [steps (:chain-steps @sess) roles (:chain-roles @sess)
+         resolve* (fn [v] (if (keyword? v) (get ctx v) v))
+         ;; A step is POSITION-DEPENDENT iff a scalar value or its work-item count is a ctx keyword
+         ;; (pos/cache-len). Only those need re-preparing per token; the other ~420 keep their
+         ;; first-call kernel handles. The first call (no :chain-prepared) prepares ALL to establish
+         ;; the static handles. This is what makes per-token cheap: re-prepare drops 453→~30 (the
+         ;; 429ms→~28ms host cost); the static handles persist across tokens, only the position
+         ;; steps + the graph re-record. (record-graph! must still re-bake the changed handles.)
+         prepared? (:chain-prepared @sess)
+         pos-dep? (fn [{:keys [scalars n]}] (or (keyword? n) (some keyword? (vals scalars))))]
+     (doseq [{:keys [op phase bind scalars n] :as step} steps]
+       (when (or (not prepared?) (pos-dep? step))
+         (let [ki (first (get-in @sess [:kernels phase]))
+               rscalars (into {} (map (fn [[k v]] [k (resolve* v)]) scalars))
+               tsc (typed-scalars-for op ki rscalars dtype)]
+           (prepare! sess phase bind tsc (long (resolve* n)) {:kernel-phase phase}))))
+     (swap! sess assoc :chain-prepared true)
+     (record-graph! sess (mapv :phase steps) :chain)
+     (doseq [[k arr] inputs] (upload! sess k arr))
+     (replay! sess :chain)
+     (into {} (for [[k r] roles :when (= r :output)] [k (download sess k)])))))
+
 (defn kernel
   "Get kernel info vector from the session by phase key."
   [sess phase-key]
   (get-in @sess [:kernels phase-key]))
+
+;; ================================================================
+;; Resident GPU programs (whole-offload: pipeline descriptor → bound command graph)
+;; ================================================================
+;;
+;; RE-TARGETED onto fusion's runtime graph primitives: params-on-main's per-step
+;; prepare!/bind-kernel!(4-arg)/launch-registered-bound! + session-level
+;; record-graph!/replay! are REPLACED by ze-runtime/bind-registered-map-void-kernel
+;; (returns a {:kernel :gc-seg …} bound map over GPU-RESIDENT buffers) collected into
+;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
+
+(defn bind-program!
+  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
+   ONCE: allocate resident buffers for the array params + intermediate scratch, bind each kernel
+   step against them (a fresh kernel handle per step, group count pre-set into its :gc-seg), and
+   record the kernel sequence as ONE replayable command graph. After binding, run-program!
+   replays the whole sequence with NO re-binding. The bound machinery is convention-agnostic, so
+   map! and map-void! kernels bind identically (a map! kernel's output is just another resident
+   buffer in its :array-params).
+
+   args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
+   scalars). Buffer keys are the param/intermediate sym names as keywords.
+
+   roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
+   derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
+   program can't derive: :constant = weights (uploaded once here, never re-uploaded by
+   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
+   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
+   (down)."
+  ([sess descriptor args] (bind-program! sess descriptor args {}))
+  ([sess descriptor args roles]
+   (let [device-id (:device-id @sess)
+         {:keys [dtype all-params array-params allocs steps]} descriptor
+         effective-roles (merge (:array-roles descriptor) roles)
+         argmap (zipmap all-params args)
+         dt (if (= dtype :double) :double :float)
+         nel (fn [arr] (java.lang.reflect.Array/getLength arr))
+         ;; per-array element dtype from the ACTUAL JVM array — a program can mix dtypes (quant
+         ;; kernels carry byte weights + float scales + int bsums + float output), so a single
+         ;; program dtype mis-allocates (CCE [B→[F). The runtime array type is authoritative.
+         arr-dtype (fn [arr]
+                     (condp instance? arr
+                       (Class/forName "[B") :byte
+                       (Class/forName "[S") :short
+                       (Class/forName "[I") :int
+                       (Class/forName "[J") :long
+                       (Class/forName "[F") :float
+                       (Class/forName "[D") :double
+                       dt))
+         param-specs (into {} (map (fn [p]
+                                     (let [arr (get argmap p)]
+                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
+                                   array-params))
+         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
+                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
+                                   allocs))
+         info-fn   (rt-resolve device-id "kernel-registry-entry")
+         bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
+         gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
+         conv-fn   (rt-resolve device-id "bind-registered-convert!")
+         trans-fn  (rt-resolve device-id "bind-registered-transpose!")
+         mkbuf-fn  (rt-resolve device-id "make-buffer")
+         record-fn (rt-resolve device-id "record-graph!")
+         gemm-scratch (atom [])]
+     (alloc! sess (merge param-specs alloc-specs))
+     (let [buffers (:buffers @sess)
+           buf-of (fn [sym ctx]
+                    (or (get buffers (keyword (name sym)))
+                        (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
+                                        {:sym sym :ctx ctx :have (keys buffers)}))))
+           step->bounds
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention] :as step}]
+             (case convention
+               ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
+               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
+               ;; convert redundantly per replay for now (correctness-first) — hoist to a once-at-
+               ;; bind :constant f16 upload later.
+               :gemm
+               (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
+                     abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
+                     cbuf (buf-of (:C step) :gemm-C)
+                     a16 (mkbuf-fn (* m k) :half)]
+                 (case (:variant step)
+                   ;; C = A[m,k] · B[k,n]
+                   :nn
+                   (let [b16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
+                      (gemm-fn a16 b16 cbuf m n k :float)])
+                   ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
+                   ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
+                   :nt
+                   (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
+                     (swap! gemm-scratch conj a16 b16 bt16)
+                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
+                      (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                   (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
+                                        " (only :nn / :nt)") {:variant (:variant step)}))))
+               ;; map / map-void bind through bind-registered-map-void-kernel (output is just
+               ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
+               ;; order incl. output).
+               (:map :map-void)
+               (do (or (info-fn kernel-name)
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
+                   (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
+                         scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                                       scalar-specs)]
+                     [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+               (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
+                                    ":map / :map-void / :gemm are wired on the resident path")
+                               {:convention convention :kernel kernel-name}))))
+           bounds (vec (mapcat step->bounds steps))
+           graph (record-fn bounds)]
+       (swap! sess assoc
+              :program-graph graph
+              :program-descriptor descriptor
+              :program-roles effective-roles))
+     sess)))
+
+(defn run-program!
+  "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
+   stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
+   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
+   resident from bind-program!. args = values in :all-params order (same as bind-program!).
+   Returns {output-param-sym → downloaded JVM array}."
+  [sess descriptor args]
+  (let [{:keys [all-params array-params result-sym]} descriptor
+        device-id (:device-id @sess)
+        roles (:program-roles @sess)
+        argmap (zipmap all-params args)
+        replay-fn (rt-resolve device-id "replay-graph!")]
+    ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
+    ;; device; output produced by the kernels so its prior content is irrelevant).
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (keyword (name p)) (get argmap p)))
+    (replay-fn (:program-graph @sess))
+    ;; download :output array-params (in-place-mutated results) PLUS the functional :result-sym
+    ;; (a fresh alloc returned by the deftm — the common SOAC case; it is not an array-param so
+    ;; it has no :output role, but it IS the program's return value).
+    (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
+                       [p (download sess (keyword (name p)))]))
+      ;; download the functional :result-sym only when it is a distinct resident buffer (not
+      ;; already an :output param, and actually allocated — a Void map-void has no result buffer).
+      (and result-sym (not (some #(= result-sym %) array-params))
+           (contains? (:buffers @sess) (keyword (name result-sym))))
+      (assoc result-sym (download sess (keyword (name result-sym)))))))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.

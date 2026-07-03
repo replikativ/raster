@@ -246,6 +246,109 @@
         (dotimes [L 8] (ra/aset y (+ (* g 8) L) (ra/aget acc8 L)))))
     y))
 
+
+;; ---------------------------------------------------------------------------
+;; Q8_0 x8 twins — the EMBEDDER-QUALITY format (measured on Qwen3-Embedding-0.6B:
+;; 4-bit weights cost ~5%+ embedding cosine regardless of scheme; Q8_0 is lossless
+;; at 0.9997). Byte-direct layout (one unsigned byte per weight, zero-point 128):
+;; same interleaved column-group structure as Q4 with bytes-per-igroup 32 (vs 16),
+;; so the tile is the SAME dpbusd loop minus the nibble unpack.
+;; ---------------------------------------------------------------------------
+
+(deftm ^:no-inline wi8-dot-q8-x8
+  "The 8-column int8-MAC tile over one Q8_0 block in the byte-direct interleaved
+  layout: 256 weight bytes for an 8-column group at wqi[woff..+256) (byte
+  ig*32 + L*4 + k = column L, element ig*4+k, unsigned), 32 int8 activations at
+  xq[xoff..+32), 8 raw int32 column dots to out[0..8). Scalar reference for the
+  dpbusd lowering below."
+  [wqi :- (Array byte), woff :- Long, xq :- (Array byte), xoff :- Long,
+   out :- (Array int)] :- (Array int)
+  (dotimes [L 8]
+    (let [s (loop [ig 0 acc 0]
+              (if (< ig 8)
+                (recur (inc ig)
+                       (loop [k 0 a acc]
+                         (if (< k 4)
+                           (let [w (bit-and (long (ra/aget wqi (+ woff (* ig 32) (* L 4) k))) 0xFF)
+                                 act (long (ra/aget xq (+ xoff (* ig 4) k)))]
+                             (recur (inc k) (+ a (* act w))))
+                           a)))
+                acc))]
+      (ra/aset out L (int s))))
+  out)
+
+;; Q8 tile's optimal C lowering: direct 32-byte loads (no nibble unpack), same
+;; persistent-accumulator dpbusd cascade as the Q4 tile.
+(descriptor/register-c-helper! 'raster.quant.kernels/wi8-dot-q8-x8
+  {:includes "#include <immintrin.h>\n"
+   :gen (fn [c-name]
+          (str "static inline int* " c-name
+               "(const signed char* wqi, long woff, const signed char* xq, long xoff, int* out) {\n"
+               "  const unsigned char* wb = (const unsigned char*)(wqi + woff);\n"
+               "  const signed char* xb = xq + xoff;\n"
+               "  __m256i ia = _mm256_setzero_si256();\n"
+               "  for (int ig = 0; ig < 8; ig++) {\n"
+               "    __m256i wv = _mm256_loadu_si256((const __m256i*)(wb + ig*32));\n"
+               "    __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*4));\n"
+               "#if defined(__AVX512VNNI__) && defined(__AVX512VL__)\n"
+               "    ia = _mm256_dpbusd_epi32(ia, wv, ab);\n"
+               "#elif defined(__AVXVNNI__)\n"
+               "    ia = _mm256_dpbusd_avx_epi32(ia, wv, ab);\n"
+               "#else\n"
+               "    ia = _mm256_add_epi32(ia, _mm256_madd_epi16(_mm256_maddubs_epi16(wv, ab), _mm256_set1_epi16(1)));\n"
+               "#endif\n"
+               "  }\n"
+               "  _mm256_storeu_si256((__m256i*)out, ia);\n"
+               "  return out;\n}\n"))})
+
+(descriptor/register-op-descriptor! 'raster.quant.kernels/wi8-dot-q8-x8
+  {:effects {:pure? false :mutating? true}})
+(descriptor/register-buffer-write! 'raster.quant.kernels/wi8-dot-q8-x8 :overwrite 4)
+
+(deftm qmatmul-q8-x8!
+  "Tiled composable Q8_0 GEMV over the byte-direct interleaved layout — the Q4 x8
+  structure with 256 block-group bytes and zero-point 128. Sliceable over column
+  GROUPS [g-start, g-start+g-count); pool-driven."
+  [xq :- (Array byte), xs :- (Array float), xsum :- (Array int),
+   wqi :- (Array byte), wsi :- (Array float), y :- (Array float),
+   in :- Long, out :- Long, g-start :- Long, g-count :- Long] :- (Array float)
+  (let [nb (quot (long in) 32)
+        out8 (int-array 8)
+        acc8 (float-array 8)]
+    (dotimes [gi (long g-count)]
+      (let [g (+ (long g-start) gi)
+            wbase (* g nb 256)
+            sbase (* g nb 8)]
+        (dotimes [L 8] (ra/aset acc8 L (float 0.0)))
+        (dotimes [b (long nb)]
+          (wi8-dot-q8-x8 wqi (+ wbase (* (long b) 256)) xq (* (long b) 32) out8)
+          (let [xsb (double (ra/aget xs b))
+                fold (* 128 (long (ra/aget xsum b)))
+                wbaseL (+ sbase (* (long b) 8))]
+            (raster.par/map! acc8 L 8 float
+              (let [folded (- (long (ra/aget out8 L)) fold)
+                    scale (* xsb (double (ra/aget wsi (+ wbaseL L))))]
+                (+ (double (ra/aget acc8 L)) (* scale (double folded)))))))
+        (dotimes [L 8] (ra/aset y (+ (* g 8) L) (ra/aget acc8 L)))))
+    y))
+
+(defn make-x8-q8-c-gemv-into!
+  "Q8_0 twin of make-x8-c-gemv-into!: compile qmatmul-q8-x8! (:simd? true) once,
+  pool-drive over disjoint column-group slices into a caller-supplied y."
+  []
+  (let [cfn ((requiring-resolve 'raster.compiler.backend.cpu.aot/compile-aot-c)
+             #'qmatmul-q8-x8! :float :simd? true)]
+    (fn [xq xs xsum wqi wsi y in out]
+      (let [out (long out) ng (quot out 8)]
+        (cq/run-par-fn!
+         (fn [wid n]
+           (let [chunk (quot (+ ng (dec (long n))) (long n))
+                 g0 (* (long wid) chunk)
+                 cnt (max 0 (min chunk (- ng g0)))]
+             (when (pos? cnt)
+               (cfn xq xs xsum wqi wsi y in out g0 cnt)))))
+        y))))
+
 (defn make-x8-c-gemv
   "Compile qmatmul-q4-x8! to one C slice-kernel (compile-aot :target :c) once; return a
   driver (fn [xq xs xsum wqi wsi in out] -> y) that pool-drives it over disjoint COLUMN-

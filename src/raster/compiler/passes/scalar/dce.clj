@@ -30,7 +30,15 @@
   "Find buffer symbols mutated by mutation ops anywhere in expr."
   [expr]
   (cond
-    ;; Par forms: only the first arg (output buffer) is mutated
+    ;; par/map-void! is `(map-void! idx bound body…)` — it has NO output-buffer arg slot; its
+    ;; written buffers are the aset/atomic-add! targets INSIDE the body (args after idx+bound).
+    ;; (second expr) is the loop INDEX, not a buffer — recursing there recorded the wrong target
+    ;; and left the real written buffers invisible to liveness, so a `_`-bound void map whose
+    ;; output is read downstream could be wrongly eliminated. Scan the body instead.
+    (par/par-map-void-form? expr)
+    (apply clojure.set/union #{} (map extract-mutation-targets (drop 3 expr)))
+
+    ;; Other par mutation forms (map!, scatter!, stencil!, scan, rng-fill!, …) write arg 0.
     (par-mutation-form? expr)
     (let [buf-arg (second expr)]
       (if (symbol? buf-arg)

@@ -197,9 +197,19 @@
 
 (defn lower-body
   "Scalar-replace value-type access in body given a SoA env (the shared lowering
-   the GPU pass calls after computing its env via collect-soa-env)."
+   the GPU pass calls after computing its env via collect-soa-env).
+
+   Each SoA/container param is pre-exploded so a WHOLE-ARRAY field access `(.field w)`
+   — the compile-train-step container model, where every leaf is itself an array —
+   resolves to the generated per-field array param `w_field`. Per-element CxSoA access
+   `(.field (aget os i))` is unaffected (it goes through `explode`'s aget branch). Bare
+   use of a SoA param (non-projective) remains an error (the v1 escape guard)."
   [soa-env body]
-  (lower {:soa soa-env :exploded {}} body))
+  (let [exploded (into {} (map (fn [[sym info]]
+                                 [sym (into {} (map (fn [{nm :name}] [nm (field-arr-sym sym nm)])
+                                                    (:fields info)))])
+                               soa-env))]
+    (lower {:soa soa-env :exploded exploded} body)))
 
 (defn soa-lower
   "Top-level (wasm): expand SoA params + scalar-replace value-type access.

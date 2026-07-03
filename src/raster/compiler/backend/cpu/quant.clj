@@ -320,8 +320,10 @@
   source: delegates to the descriptor-driven core.layout/repack, which the composable
   x8 GEMV (raster.quant.kernels/qmatmul-q4-x8!) mirrors. out must be a multiple of
   NC=8. One-time cost."
-  [^bytes wq ^floats ws out in]
-  (layout/repack stream-gemv-layout wq ws out in))
+  ([^bytes wq ^floats ws out in]
+   (layout/repack stream-gemv-layout wq ws out in))
+  ([^bytes wq ^floats ws out in format]
+   (layout/repack (layout/quant-stream-layout {:vector-bits 256} format) wq ws out in)))
 
 (definterface IParTask (^void runSlice [^int wid ^int n]))
 

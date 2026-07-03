@@ -574,6 +574,52 @@
   (when (seq? form)
     (if (= '.invk (first form)) (nnext form) (rest form))))
 
+(defn- unwrap-array-arg
+  "Unwrap a cast wrapper around an array argument — (double arr) → arr,
+   (float arr) → arr — and strip metadata/namespace from a bare symbol so it
+   matches binding names. Non-symbol args (rare) pass through unwrapped."
+  [arr-sym]
+  (let [unwrapped (if (and (seq? arr-sym)
+                           (contains? #{'double 'float 'int 'long
+                                        'clojure.core/double 'clojure.core/float}
+                                      (first arr-sym))
+                           (= 2 (count arr-sym)))
+                    (second arr-sym)
+                    arr-sym)]
+    (if (symbol? unwrapped) (symbol (name unwrapped)) unwrapped)))
+
+(defn aget-call?
+  "True if `form` is an array-read call — either a bare (aget arr idx ...) or a
+   walker-devirtualized (.invk aget-impl arr idx ...). Recovers the semantic op
+   via :raster.op/original metadata (semantic-op) so the SOAC/fusion matchers do
+   not go blind once raster.arrays/aget is devirtualized to .invk."
+  [form]
+  (and (seq? form)
+       (aget-op? (semantic-op form))
+       (>= (count (call-args form)) 2)))
+
+(defn aget-array-sym
+  "The array symbol read by an aget call (bare or devirtualized), with cast
+   wrappers unwrapped and metadata stripped. nil when `form` is not an aget call."
+  [form]
+  (when (aget-call? form)
+    (unwrap-array-arg (first (call-args form)))))
+
+(defn aset-call?
+  "True if `form` is an array-write call — bare (aset arr idx val) or
+   walker-devirtualized (.invk aset-impl arr idx val)."
+  [form]
+  (and (seq? form)
+       (aset-op? (semantic-op form))
+       (>= (count (call-args form)) 3)))
+
+(defn aset-array-sym
+  "The array symbol written by an aset call (bare or devirtualized), with cast
+   wrappers unwrapped and metadata stripped. nil when `form` is not an aset call."
+  [form]
+  (when (aset-call? form)
+    (unwrap-array-arg (first (call-args form)))))
+
 (defn affine-step
   "If `expr` is an affine step of the induction variable `idx-sym` — i.e.
    (inc idx), (unchecked-inc idx), or (+ idx c) / (+ c idx) with a constant
