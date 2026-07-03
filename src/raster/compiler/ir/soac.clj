@@ -110,6 +110,64 @@
 ;; par S-expression → SOAC conversion
 ;; ================================================================
 
+(defn- strip-index-cast
+  "Unwrap a (long i)/(int i) cast around a bare index symbol; else return as-is."
+  [e]
+  (if (and (seq? e) (contains? #{'long 'int 'clojure.core/long 'clojure.core/int} (first e))
+           (= 2 (count e)))
+    (second e)
+    e))
+
+(defn- inline-let-bindings
+  "Beta-reduce let* bindings into `expr`: substitute each bound symbol with its
+   definition. Walker-produced bindings are SSA (each symbol bound once, no
+   shadowing), so iterative substitution in reverse order is sound — a later
+   binding referencing an earlier one is resolved when the earlier one is
+   inlined. Duplicates loads (e.g. g=gate[i] used several times), which the C
+   compiler CSEs; the payoff is a single flat expression that the existing
+   aget-substitution fusion + expression emitter handle directly."
+  [binds expr]
+  (reduce (fn [acc [s e]] (walk/postwalk-replace {s e} acc))
+          expr (reverse (partition 2 binds))))
+
+(defn- single-aset-void
+  "If a par/map-void! body is a SINGLE in-place write `(aset OUT idx VAL)` whose
+   index is exactly the loop index (a 1:1 elementwise write — NOT an offset/scatter
+   write like cache[base+i]), return {:out OUT :value VAL :cast cf}. Otherwise nil.
+
+   Unwraps a `do` with one statement and any let* scaffolding the walker emits
+   around the write (e.g. `(let* [g (aget gate i)] (aset tmp i …g…))`), inlining
+   those bindings into VAL so the returned :value is one flat expression — the
+   same shape a pure map's lambda has, which is what lets the SAME vertical-fusion
+   path inline it downstream. Recognizes bare `aset` and walker-devirtualized
+   `(.invk aset-impl …)` via the op-descriptor matchers."
+  [body idx-sym]
+  (let [stmt (if (and (seq? body) (= 'do (first body)) (= 2 (count body)))
+               (second body) body)]
+    (cond
+      ;; let*-wrapped write: recurse into the let body, then inline the bindings
+      (and (seq? stmt) (contains? #{'let* 'let} (first stmt)))
+      (let [[_ binds & lbody] stmt]
+        (when-let [inner (single-aset-void (last lbody) idx-sym)]
+          (update inner :value #(inline-let-bindings binds %))))
+
+      (descriptor/aset-call? stmt)
+      (let [cargs (vec (descriptor/call-args stmt))]   ;; (arr idx-expr val)
+        (when (and (= 3 (count cargs))
+                   (= idx-sym (strip-index-cast (nth cargs 1))))
+          (let [out-arr (descriptor/aset-array-sym stmt)
+                val (nth cargs 2)
+                [cast-fn value]
+                (if (and (seq? val)
+                         (contains? #{'float 'double 'int 'long
+                                      'clojure.core/float 'clojure.core/double} (first val))
+                         (= 2 (count val)))
+                  [(first val) (second val)]
+                  [nil val])]
+            {:out out-arr :value value :cast cast-fn})))
+
+      :else nil)))
+
 (defn par-form->soac
   "Convert a raster.par/* S-expression to a SOAC record.
   Returns a SoacMap, SoacReduce, SoacScan, SoacStencil, or nil."
@@ -175,6 +233,27 @@
                              (:body info) inputs outputs scalars)
         elem-type (assoc :elem-type elem-type)))
 
+    ;; Imperative par/map-void! with a SINGLE 1:1 in-place write — model as a
+    ;; non-pure (in-place) SoacMap whose OUTPUT is the written array and whose
+    ;; LAMBDA is the written value. This makes it indistinguishable from a pure
+    ;; map for the SOAC fuser: a downstream map reading (aget OUT i) fuses by
+    ;; substituting this value (the existing vertical-fusion path), eliminating
+    ;; the intermediate buffer. :void? round-trips it back to map-void! in
+    ;; soac->par-form, so codegen stays on the (correct) legacy void generator
+    ;; whether or not it fused. Multi-aset / offset-scatter / reduction void
+    ;; bodies return nil here → ScalarBinding → unchanged legacy path.
+    (par/par-map-void-form? expr)
+    (let [info (par/extract-par-map-void-info expr)
+          idx (:idx info)]
+      (when-let [{:keys [out value cast]} (single-aset-void (:body info) idx)]
+        (let [{:keys [inputs scalars]} (extract-io value idx [out])
+              elem-type (or (:elem-type info)
+                            (:raster.type/elem-type (meta expr)))]
+          (cond-> (->SoacMap id sym idx (:bound info) cast value
+                             inputs #{out} scalars)
+            elem-type (assoc :elem-type elem-type)
+            true (assoc :void? true :primary-out out)))))
+
     :else nil))
 
 ;; ================================================================
@@ -194,8 +273,20 @@
   (stamp-elem-type
    (condp instance? soac
      SoacMap
-     (if (:pure? soac)
+     (cond
+       ;; In-place single-aset void map: reconstruct the imperative write so codegen
+       ;; stays on the legacy void generator (handles normalize + per-array dtype +
+       ;; written-arrays). The lambda is the produced value; re-wrap it in the aset.
+       (:void? soac)
+       (let [out (or (:primary-out soac) (first (:outputs soac)))
+             v (if (:cast-fn soac) (list (:cast-fn soac) (:lambda soac)) (:lambda soac))]
+         (list 'raster.par/map-void! (:idx soac) (:bound soac)
+               (list 'raster.arrays/aset out (:idx soac) v)))
+
+       (:pure? soac)
        (list 'raster.par/pmap (:idx soac) (:bound soac) (:cast-fn soac) (:lambda soac))
+
+       :else
        (list 'raster.par/map! (or (:primary-out soac) (first (:outputs soac)))
              (:idx soac) (:bound soac) (:cast-fn soac) (:lambda soac)))
 
@@ -364,11 +455,30 @@
                (util/free-syms (:bound node))
                (if (:init node) (util/free-syms (:init node)) #{}))))
 
+(defn- expr-written-arrays
+  "Arrays written via aset (bare or devirtualized) anywhere in `expr`. Used so a
+   ScalarBinding wrapping a side-effecting void form (a multi-aset par/map-void!
+   like rms-norm/attention/quant-act that doesn't reduce to a single-aset SoacMap)
+   still declares the buffers it produces — otherwise consumers of those buffers
+   get no dependency edge and the scheduler / horizontal-fuser can incorrectly
+   reorder or parallelize across the write (silent miscompile in composed layers)."
+  [expr]
+  (let [w (volatile! #{})]
+    (walk/postwalk
+     (fn [f]
+       (when (descriptor/aset-call? f)
+         (when-let [a (descriptor/aset-array-sym f)] (vswap! w conj a)))
+       f)
+     expr)
+    @w))
+
 (defn node-produced-syms
-  "Get the set of symbols produced (defined) by a node."
+  "Get the set of symbols produced (defined) by a node. For a ScalarBinding this
+   is its binding sym PLUS any arrays its expression writes in place (so in-place
+   void writes participate in dependency analysis)."
   [node]
   (if (instance? ScalarBinding node)
-    #{(:sym node)}
+    (conj (expr-written-arrays (:expr node)) (:sym node))
     (set/union #{(:sym node)} (or (soac-outputs node) #{}))))
 
 ;; ================================================================

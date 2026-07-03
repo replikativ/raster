@@ -9,11 +9,11 @@
   [body target-sym source-idx target-idx replacement]
   (walk/postwalk
    (fn [form]
-     (if (and (seq? form)
-              (descriptor/aget-op? (first form))
-              (>= (count form) 3)
-              (symbol? (second form))
-              (= (name target-sym) (name (second form))))
+     ;; Match both bare (aget target idx) and devirtualized (.invk aget-impl target idx);
+     ;; aget-array-sym unwraps casts + strips ns so it compares against target-sym by name.
+     (if (and (descriptor/aget-call? form)
+              (let [s (descriptor/aget-array-sym form)]
+                (and (symbol? s) (= (name target-sym) (name s)))))
        (walk/postwalk
         (fn [inner]
           (if (= inner source-idx) target-idx inner))

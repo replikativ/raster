@@ -117,3 +117,22 @@
       ;; x is dead, y is kept by root-pred, z is live from body
       (is (= 1 (:bindings-removed stats))
           "only x should be removed; y is a root"))))
+
+;; ================================================================
+;; par/map-void! mutation targets (regression: index vs body buffer)
+;; ================================================================
+
+(deftest map-void-mutation-target-test
+  (testing "a _-bound par/map-void! writing a live buffer is preserved"
+    ;; `(map-void! idx bound body)` has NO output-buffer arg slot; its written buffer is the
+    ;; aset target in the body. The old code took (second expr) = the INDEX `i` as the mutation
+    ;; target — never live — so this void map (writing `b`, which `r` reads) was wrongly DCE'd.
+    (let [form '(let* [b (clojure.core/double-array 4)
+                       _ (raster.par/map-void! i 4 (raster.arrays/aset b i 1.0))
+                       r (raster.arrays/aget b 0)]
+                      r)
+          {:keys [form stats]} (dce/eliminate-dead-bindings form)
+          syms (set (take-nth 2 (second form)))]
+      (is (contains? syms 'b) "buffer alloc stays (read by r)")
+      (is (contains? syms '_) "the void map writing the live buffer is NOT eliminated")
+      (is (= 0 (:bindings-removed stats)) "nothing removed — b is written then read"))))

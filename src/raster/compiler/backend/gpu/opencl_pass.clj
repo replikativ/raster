@@ -15,6 +15,36 @@
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
 
+;; ================================================================
+;; Single source of declared GPU param types (shared by BOTH compile entries:
+;; raster.gpu.core/compile-deftm-internal! and the pipeline's pass-backend).
+;; ================================================================
+
+(def array-tag->dtype
+  "Deftm array tag (the Java array-class symbol) → element dtype keyword."
+  {'doubles :double 'floats :float 'longs :long 'ints :int 'bytes :byte})
+
+(defn derive-param-types
+  "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
+  (the typed-dispatch system already knows these — we read them instead of letting the emitter
+  guess from parameter names). Scalar params: long/int→:int, double/float→:float. Array params:
+  the tag's element dtype, with float-family (float/double) mapped to the KERNEL dtype (a single-
+  precision kernel reads float buffers regardless of a parametric (All [T]) param's default).
+  Returns {:scalar-types {sym kw} :array-types {sym kw}}, attached as form metadata that
+  opencl-pass reads. ONE derivation, both compile paths."
+  [params tags dtype]
+  (when (and params tags)
+    {:scalar-types (into {} (keep (fn [[p t]]
+                                    (case t
+                                      (long longs int ints) [p :int]
+                                      (double doubles float floats) [p :float]
+                                      nil))
+                                  (map vector params tags)))
+     :array-types (into {} (keep (fn [[p t]]
+                                   (when-let [dt (array-tag->dtype t)]
+                                     [p (if (#{:float :double} dt) dtype dt)]))
+                                 (map vector params tags)))}))
+
 (def ^:private segop-id-counter (atom 0))
 
 (defn- par->segmap
@@ -64,10 +94,14 @@
      :dtype         — :double or :float (default :double)
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
-  [form & {:keys [device-id dtype min-elements compile-spirv?]
+  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
-  (let [top-scalar-types (or (:scalar-types (meta form)) {})
+  ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
+  ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
+  ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
+  (let [top-scalar-types (merge (or (:scalar-types (meta form)) {}) scalar-types)
+        top-array-types (merge (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :fallback 0})
         kernels (atom [])
 
@@ -103,7 +137,8 @@
                     (par/expand-par-map! form))
                 (if-let [segmap (par->segmap form dtype)]
                   (let [kernel (segop-cl/generate-segmap-kernel segmap out
-                                                                :dtype dtype :scalar-types top-scalar-types)]
+                                                                :dtype dtype :scalar-types top-scalar-types
+                                                                :array-types (merge top-array-types (:array-types (meta form))))]
                     (let [k (register-kernel! kernel :ze-maps)]
                       (list 'raster.gpu.ze-runtime/invoke-registered-kernel
                             (:kernel-name k)
@@ -122,6 +157,31 @@
                           out
                           (vec (:scalar-params k))
                           bound)))))
+
+            ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
+            ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the
+            ;; resident invoke carries the output buffer (4-arg) so it stays device-resident
+            ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
+            (par/par-reduce-into-form? form)
+            (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
+              (if-let [segred (par->segred reduce-form dtype)]
+                (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
+                  (if kernel
+                    (let [k (register-kernel! kernel :ze-reduces)]
+                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                            (:kernel-name k) (vec (:array-params k)) out-buf bound))
+                    (let [k (register-kernel!
+                             (legacy/generate-par-reduce-kernel reduce-form
+                                                                :dtype dtype :device-id device-id)
+                             :ze-reduces)]
+                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                            (:kernel-name k) (vec (:array-params k)) out-buf bound))))
+                (let [k (register-kernel!
+                         (legacy/generate-par-reduce-kernel reduce-form
+                                                            :dtype dtype :device-id device-id)
+                         :ze-reduces)]
+                  (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                        (:kernel-name k) (vec (:array-params k)) out-buf bound))))
 
             ;; === par/reduce — SegOp path ===
             (par/par-reduce-form? form)
@@ -166,7 +226,7 @@
                     (par/expand-par-map-void! form))
                 (let [kernel (legacy/generate-par-map-void-kernel form
                                                                   :dtype dtype :device-id device-id
-                                                                  :array-types (or (:array-types (meta form)) {})
+                                                                  :array-types top-array-types
                                                                   :scalar-types top-scalar-types)
                       k (register-kernel! kernel :ze-maps)
                       soa-exp (or (:soa-expansions k) {})
@@ -269,23 +329,29 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-butterfly! form))))
 
-            ;; === Structural recursion ===
+            ;; === Structural recursion (PRESERVE metadata) ===
+            ;; A bare (apply list head ...) rebuild drops the form's metadata — in particular
+            ;; :raster.op/original on a devirtualized .invk (e.g. blas/dgemm!), which downstream
+            ;; GEMM recognition (parse-gpu-step, gpu_plan) reads. Re-attach the original meta.
 
             (and (seq? form) (contains? #{'let 'let*} (first form)))
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
                   new-bindings (vec (mapcat (fn [[sym expr]] [sym (transform expr)]) pairs))
                   new-body (mapv transform body-exprs)]
-              (apply list let-sym new-bindings new-body))
+              (with-meta (apply list let-sym new-bindings new-body) (meta form)))
 
             (and (seq? form) (= 'do (first form)))
-            (apply list 'do (mapv transform (rest form)))
+            (with-meta (apply list 'do (mapv transform (rest form))) (meta form))
 
             (seq? form)
-            (let [head (first form)]
-              (if (symbol? head)
-                (apply list head (mapv transform (rest form)))
-                (mapv transform form)))
+            (let [head (first form)
+                  rebuilt (if (symbol? head)
+                            (apply list head (mapv transform (rest form)))
+                            (mapv transform form))]
+              (if (and (instance? clojure.lang.IObj rebuilt) (meta form))
+                (with-meta rebuilt (meta form))
+                rebuilt))
 
             :else form))]
     {:form (transform form)
