@@ -130,6 +130,7 @@
 (defn loop*  [body] (into (into [(op :loop)  empty-block] body) [(op :end)]))
 ;; block whose result is a single value of valtype vt-kw
 (defn block-t [vt-kw body] (into (into [(op :block) (valtype vt-kw)] body) [(op :end)]))
+(defn block-v [body] (into (into [(op :block) empty-block] body) [(op :end)]))
 ;; value-position if: cond already on stack → if(result vt){then}else{else}
 (defn if-t [vt-kw then-bytes else-bytes]
   (-> [(op :if) (valtype vt-kw)] (into then-bytes) (into [(op :else)]) (into else-bytes) (into [(op :end)])))

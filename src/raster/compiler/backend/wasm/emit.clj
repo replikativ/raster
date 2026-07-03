@@ -59,17 +59,27 @@
         (into (e/i32-const eb)) (into (e/i :i32.mul)) (into (e/i :i32.add)))))
 
 (defn- void-effect-form?
-  "A form producing no value (side-effect only): an array store (aset), dotimes/
-   when, or a do whose tail is itself a void effect. Such a form bound in a let*
-   — e.g. the inliner's (let* [_ret (dotimes …)] _ret) body-lift, or trailing
-   `(aset …)` statements lifted to `_eff_` bindings — is emitted as an effect, not
-   a value."
+  "A form producing no value (side-effect only): nil, an array store (aset),
+   dotimes/when, a statement loop ending in nil, or a do/let* whose TAIL is
+   itself void. Such a form bound in a let* — e.g. the inliner's
+   (let* [_ret (dotimes …)] _ret) body-lift, the par lowering's
+   (let* [body_result (let* [n …] (dotimes …) nil)] body_result), or trailing
+   `(aset …)` statements lifted to `_eff_` bindings — is emitted as an effect,
+   not a value."
   [node]
-  (and (seq? node)
-       (let [h (first node)]
-         (or (#{'dotimes 'when} h)
-             (and (symbol? h) (= "aset" (name h)))
-             (and (= 'do h) (void-effect-form? (last node)))))))
+  (or (nil? node)
+      (and (seq? node)
+           (let [h (first node)]
+             (or (#{'dotimes 'when} h)
+                 (and (symbol? h) (= "aset" (name h)))
+                 ;; statement loop: (loop [..] (if c <recur…> nil)) — void exit
+                 (and (#{'loop 'loop*} h)
+                      (let [[_ _ ifform] node]
+                        (and (seq? ifform) (= 'if (first ifform))
+                             (let [[_ _ t e] ifform]
+                               (or (and (ends-in-recur? t) (void-effect-form? e))
+                                   (and (ends-in-recur? e) (void-effect-form? t)))))))
+                 (and (#{'do 'let* 'let} h) (void-effect-form? (last node))))))))
 
 (defn- synth-case*
   "Lower the macroexpanded `case*` special form
@@ -143,7 +153,7 @@
               (cond-> (emit-val ctx x)
                 (= xv :f64) (into (e/i :f32.demote_f64))      ; (float <f64>) → demote
                 (= xv :i32) (into (e/i :f32.convert_i32_s)))))) ; (float <i32>) → convert
-        (= h 'clojure.core/aget)
+        (#{'clojure.core/aget 'raster.arrays/aget} h)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
         ;; integer step (inc/dec, incl. unchecked-*-int) — index/counter steppers
@@ -205,6 +215,26 @@
                                       " from its operand. A devirtualization site didn't stamp it.")))
                       v))]
           (emit-intrinsic ctx (:raster.op/original (meta node)) (drop 1 A) vt))
+        ;; par/dp4a — 4-way signed-int8 dot + accumulate: the ONE quantization
+        ;; primitive, spelled per backend (CUDA __dp4a / AMD sdot4 / OpenCL helper /
+        ;; CPU-C dpbusd). Wasm Tier-1 scalar: extract sign-extended bytes by
+        ;; shl/shr_s pairs, 4 muls, chained adds onto acc. (Tier-2 SIMD via the
+        ;; existing i32x4.dot int8-dot loop plan when the enclosing loop matches.)
+        (or (= h 'raster.par/dp4a) (= h 'par/dp4a))
+        (let [[a b acc] A
+              la (alloc! ctx :i32) lb (alloc! ctx :i32)
+              lane (fn [l k]                               ; sign-extended byte k
+                     (let [sh (- 24 (* 8 k))]
+                       (cond-> (e/local-get l)
+                         (pos? sh) (-> (into (e/i32-const sh)) (into (e/i :i32.shl)))
+                         true      (-> (into (e/i32-const 24)) (into (e/i :i32.shr_s))))))]
+          (-> (emit-val ctx a) (into (e/local-set la))
+              (into (emit-val ctx b)) (into (e/local-set lb))
+              (into (emit-val ctx acc))
+              (into (vec (mapcat (fn [k]
+                                   (-> (lane la k) (into (lane lb k))
+                                       (into (e/i :i32.mul)) (into (e/i :i32.add))))
+                                 (range 4))))))
         ;; any registered numeric op / intrinsic (arith, comparison, rem/mod,
         ;; Math, min/max) — dispatched through backend.intrinsics (single table).
         (and (symbol? h) (ix/canonical h))
@@ -218,6 +248,7 @@
         (= h 'do)
         (into (vec (mapcat #(emit-effect ctx %) (butlast A))) (emit-val ctx (last A)))
         :else (throw (ex-info (str "unhandled value head " h) {:node node}))))
+    (nil? node) []                                  ; void leaf (statement-loop exit, if-void arm)
     :else (throw (ex-info (str "unhandled value node " (pr-str node)) {}))))
 
 (defn- emit-rem-mod
@@ -353,24 +384,40 @@
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
                 ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
             (infer-vt c' (if (ends-in-recur? then) els then)))
-          (= 'clojure.core/aget h)  (get-in ctx [:elems (second node) :vt] :f64)
+          (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
           (ix/canonical h) (if (= :cmp (ix/kind h)) :i32 (infer-vt ctx (second node)))
           :else (warn-unknown-vt node (str "unhandled head " h)))))
     :else (warn-unknown-vt node "non-expression node")))
 
-(declare emit-dotimes emit-dotimes-scalar)
+(declare emit-dotimes emit-dotimes-scalar emit-loop-void)
 
 (defn- emit-effect
   "Side-effecting statement that leaves nothing on the stack (aset / when / do /
    let* / dotimes)."
   [ctx node]
+  (if (nil? node)
+    []                                              ; statement nil (void tails)
   (let [h (first node), A (vec (rest node))]
     (cond
-      (= h 'clojure.core/aset)
+      ;; devirtualized statement call: recover the semantic op and re-dispatch
+      ;; (raster.arrays/aset is a deftm — it can arrive as (.invk impl arr i v))
+      (and (= h '.invk) (:raster.op/original (meta node)))
+      (emit-effect ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
+                                  (meta node)))
+      (#{'clojure.core/aset 'raster.arrays/aset} h)
       (let [[arr idx v] A elem (get-in ctx [:elems arr])]
-        (-> (addr ctx arr idx) (into (emit-val ctx v)) (into (e/mem-store (:store elem) (:align elem) 0))))
+        (when-not elem
+          (throw (ex-info (str "aset target " arr " has no element info (not an array param?)")
+                          {:arr arr :node node})))
+        ;; the store's element type is ground truth — coerce the value like an
+        ;; intrinsic operand (kernels' explicit (float ...) casts make this a
+        ;; no-op; a mixed-width expression gets the correct convert instead of
+        ;; a validation failure)
+        (-> (addr ctx arr idx)
+            (into (emit-operand-at ctx (:vt elem) v))
+            (into (e/mem-store (:store elem) (:align elem) 0))))
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
       ;; let* in effect position (e.g. soa-lower floats arg bindings out of a
       ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
@@ -391,7 +438,11 @@
       (= h 'case*) (emit-effect ctx (synth-case* A))
       (= h 'throw) (e/i :unreachable)               ; exhaustive-case default
       (= h 'dotimes) (emit-dotimes ctx node)
-      :else (throw (ex-info (str "unhandled effect head " h) {:node node})))))
+      (= h 'when) (emit-effect ctx (list 'if (second node) (list* 'do (drop 2 node))))
+      ;; statement-position loop (model kernels: packing/softmax inner loops that
+      ;; end in nil) — the value-loop emission with a void exit branch.
+      (#{'loop 'loop*} h) (emit-loop-void ctx node)
+      :else (throw (ex-info (str "unhandled effect head " h) {:node node}))))))
 
 (defn- emit-recur
   "(recur v0 v1 ...) → push all new values, set loop locals in REVERSE (so each
@@ -636,6 +687,44 @@
                        (into [(e/op :end)])))]
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
+
+(defn- emit-loop-void
+  "(loop [v init ...] (if cond <recur-branch> <exit>)) in STATEMENT position —
+   the exit branch is effects/nil, the block carries no result. Model kernels'
+   packing/softmax inner loops end in nil; rms/softmax normalize loops end in a
+   final effect."
+  [ctx node]
+  (let [[_ bindvec ifform] node
+        pairs (vec (partition 2 bindvec))
+        loop-vars (mapv (fn [[sym init]]
+                          (let [vt (infer-vt ctx init)]
+                            {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
+                        pairs)
+        inits (vec (mapcat (fn [{:keys [idx init]}]
+                             (into (emit-val ctx init) (e/local-set idx))) loop-vars))
+        ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
+                     ctx loop-vars)
+        loop-idxs (mapv :idx loop-vars)
+        [_ cnd then els] ifform
+        recur-then? (ends-in-recur? then)
+        exit (if recur-then? els then)
+        rec  (if recur-then? then els)
+        exit-bytes (if (nil? exit) [] (emit-effect ctx' exit))
+        ;; depths from inside the if: if=0, loop=1, void block=2
+        if-bytes (if recur-then?
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into (emit-then ctx' rec loop-idxs 1 2))
+                       (into [(e/op :else)])
+                       (into exit-bytes) (into (e/br 2))
+                       (into [(e/op :end)]))
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into exit-bytes) (into (e/br 2))
+                       (into [(e/op :else)])
+                       (into (emit-then ctx' rec loop-idxs 1 2))
+                       (into [(e/op :end)])))]
+    (into inits (e/block-v (into (e/loop* if-bytes) (e/i :unreachable))))))
 
 ;; ─────────────────────────────────────────────────────────────────────────
 ;; SIMD128 vectorization of elementwise dotimes-maps (opt-in via ctx :simd?).

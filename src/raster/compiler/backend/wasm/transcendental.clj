@@ -133,6 +133,9 @@
       :rad2deg (list '* a RAD2DEG)
       :clamp (list 'min (list 'max a b) (nth args 2))
       :ceil (neg (list 'floor (neg a)))
+      ;; Java Math/round semantics: floor(x + 0.5) — NOT wasm f64.nearest
+      ;; (round-half-even), which would diverge from the JVM reference at .5
+      :round (list 'floor (list '+ a 0.5))
       :signum (list 'let* ['tr-gx a]
                     (list 'if (list '> 'tr-gx 0.0) 1.0 (list 'if (list '< 'tr-gx 0.0) -1.0 0.0)))
       :copysign (list 'let* ['tr-cax (list 'abs a)] (list 'if (list '< b 0.0) (neg 'tr-cax) 'tr-cax))
