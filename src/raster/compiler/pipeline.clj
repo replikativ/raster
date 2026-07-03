@@ -570,16 +570,23 @@
     (par-fusion/par-fusion-pass form)))
 
 (defn- register-gpu-kernels!
-  "Register generated GPU kernels eagerly so they're available at eval time."
-  [kernels]
-  (when (seq kernels)
-    (try
-      (require 'raster.gpu.ze-runtime)
-      (let [register! (resolve 'raster.gpu.ze-runtime/register-kernel!)]
-        (doseq [k kernels]
-          (register! (:kernel-name k) k)))
-      (catch Exception e
-        (println "Warning: could not register GPU kernels:" (.getMessage e))))))
+  "Register generated GPU kernels eagerly so they're available at eval time.
+  Registers into the TARGET backend's registry (ze for :ze:N, ocl for :ocl:N) —
+  a hardcoded ze registration left :ocl programs unbindable (kernel lookup at
+  bind-program! time hits the per-backend registry)."
+  ([kernels] (register-gpu-kernels! kernels :ze:0))
+  ([kernels device-id]
+   (when (seq kernels)
+     (let [ns-sym (if (and device-id (.startsWith (name device-id) "ocl"))
+                    'raster.gpu.ocl-runtime
+                    'raster.gpu.ze-runtime)]
+       (try
+         (require ns-sym)
+         (let [register! (resolve (symbol (str ns-sym) "register-kernel!"))]
+           (doseq [k kernels]
+             (register! (:kernel-name k) k)))
+         (catch Exception e
+           (println "Warning: could not register GPU kernels:" (.getMessage e))))))))
 
 (defn- pass-gpu-plan
   "GPU execution plan: rewrite BLAS calls to GPU GEMM kernels,
@@ -598,7 +605,7 @@
                                            :active-params (:active-params opts)
                                            :target-device target-device)
             kernels (:kernels result)]
-        (register-gpu-kernels! kernels)
+        (register-gpu-kernels! kernels target-device)
         (if (pos? (+ (get-in result [:stats :gemm-rewrites] 0)
                      (get-in result [:stats :transpose-rewrites] 0)
                      (get-in result [:stats :map-rewrites] 0)
@@ -668,7 +675,7 @@
             result (opencl-pass/opencl-pass form
                                             :device-id target-device
                                             :dtype (:dtype opts))]
-        (register-gpu-kernels! (:kernels result))
+        (register-gpu-kernels! (:kernels result) target-device)
         {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
 
         :simd

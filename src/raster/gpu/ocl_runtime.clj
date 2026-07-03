@@ -961,6 +961,141 @@
 ;; Lifecycle
 ;; ================================================================
 
+
+;; ================================================================
+;; Resident session layer (ports of the ze_runtime bound/graph API)
+;; OpenCL has no command graphs in core: record-graph! stores the ordered
+;; launches; replay-graph! enqueues them on the in-order queue (which gives
+;; the ze barrier semantics) and clFinish-es once. The ~us/enqueue host cost
+;; is paid per replay rather than once — correct now, cl_khr_command_buffer
+;; later if it matters.
+;; ================================================================
+
+(defn kernel-registry-entry
+  "Public read of a registered kernel's info map (source, :array-params,
+  :scalar-params, dtype, ...). Same contract as ze-runtime."
+  [kernel-name]
+  (get @kernel-registry kernel-name))
+
+(defn- create-kernel-fresh
+  "A DEDICATED cl_kernel per binding — kernel args are mutable state on the
+  kernel object (same clobbering hazard as Level Zero shared handles)."
+  ^MemorySegment [^MemorySegment program ^String kernel-name]
+  (let [{:keys [arena]} @state
+        err-seg (.allocate ^Arena arena I32)
+        kname-seg (.allocateFrom ^Arena arena kernel-name)
+        kh (.invokeWithArguments ^MethodHandle @h-clCreateKernel
+                                 (into-array Object [program kname-seg err-seg]))]
+    (when (not= CL_SUCCESS (read-int err-seg))
+      (throw (ex-info (str "clCreateKernel (fresh) failed for " kernel-name)
+                      {:error (read-int err-seg)})))
+    kh))
+
+(defn- device-mem-of
+  "cl_mem of a resident arg (OclBuffer or raw cl_mem MemorySegment)."
+  ^MemorySegment [arr]
+  (cond
+    (device-buffer? arr) (:cl-mem arr)
+    (instance? MemorySegment arr) arr
+    :else (throw (ex-info "bound path requires GPU-resident args (OclBuffer); JVM-array staging is not supported here"
+                          {:arr-type (type arr)}))))
+
+(defn bind-registered-map-void-kernel
+  "Pre-bind a registered void-map kernel's args ONCE over RESIDENT OclBuffers.
+  Same contract as ze-runtime/bind-registered-map-void-kernel: buffer CONTENTS
+  may change between launches; re-bind only on reallocation or n change."
+  ([^String kernel-name arrays scalar-args n]
+   (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
+  ([^String kernel-name arrays scalar-args n opts]
+   (let [{:keys [program workgroup-size dtype]
+          :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+         kh (create-kernel-fresh program kernel-name)
+         wg (long (get opts :workgroup-size workgroup-size))
+         n (long n)
+         scalar-type (if (= dtype :float) :float :double)
+         idx (atom -1)
+         next-idx! #(swap! idx inc)]
+     (doseq [arr arrays]
+       (set-kernel-arg-buffer! kh (next-idx!) (device-mem-of arr)))
+     (doseq [v scalar-args]
+       (set-kernel-arg-scalar! kh (next-idx!)
+                               (if (map? v) v
+                                   {:type scalar-type
+                                    :value (if (= scalar-type :float) (float v) (double v))})))
+     (set-kernel-arg-scalar! kh (next-idx!) {:type :int :value (int n)})
+     {:bound {:kernel kh :wg wg}
+      :group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
+      :kernel-name kernel-name
+      :async? (boolean (get opts :async?))})))
+
+(defn- enqueue-bound!
+  "Enqueue one pre-bound kernel (no finish)."
+  [{:keys [^MemorySegment kernel ^long wg]} ^long group-count]
+  (let [{:keys [queue]} @state
+        arena (Arena/ofConfined)]
+    (try
+      (let [g (.allocate ^Arena arena I64) l (.allocate ^Arena arena I64)]
+        (.set g I64 0 (* group-count wg))
+        (.set l I64 0 wg)
+        (cl-call! "clEnqueueNDRangeKernel" @h-clEnqueueNDRangeKernel
+                  [queue kernel (int 1) MemorySegment/NULL g l
+                   (int 0) MemorySegment/NULL MemorySegment/NULL]))
+      (finally (.close arena)))))
+
+(defn launch-registered-bound!
+  "Dispatch a pre-bound kernel. Synchronous."
+  [prepared]
+  (enqueue-bound! (:bound prepared) (long (:group-count prepared)))
+  (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
+
+(defn record-graph!
+  "OpenCL 'graph': capture the ordered pre-bound launches for replay. The
+  in-order queue serializes them (= ze per-kernel barriers)."
+  ([prepareds] (record-graph! prepareds {}))
+  ([prepareds _opts]
+   {:launches (mapv (fn [{:keys [bound group-count]}]
+                      {:bound bound :group-count (long group-count)})
+                    prepareds)}))
+
+(defn replay-graph!
+  "Enqueue every recorded launch in order, then clFinish. Synchronous."
+  [graph]
+  (doseq [{:keys [bound group-count]} (:launches graph)]
+    (enqueue-bound! bound group-count))
+  (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
+
+(defn synchronize-async!
+  "Block until all enqueued work completes."
+  []
+  (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
+
+(defn destroy-prepared!
+  "Release the dedicated cl_kernel a binding owns."
+  [prepared]
+  (when-let [^MemorySegment kh (get-in prepared [:bound :kernel])]
+    (try (.invokeWithArguments ^MethodHandle @h-clReleaseKernel
+                               (into-array Object [kh]))
+         (catch Exception _))))
+
+(defn destroy-graph!
+  "OpenCL graphs hold no driver objects (the launches reference kernels owned
+  by their bindings) — nothing to free."
+  [_graph]
+  nil)
+
+(defn bind-registered-gemm!
+  "Intel-XMX fp16 GEMM is not available on generic OpenCL devices."
+  [& _]
+  (throw (ex-info "bind-registered-gemm! (XMX fp16 tile GEMM) is Level-Zero/Intel-only; generic OpenCL GEMM fallback not yet implemented" {})))
+
+(defn bind-registered-convert!
+  [& _]
+  (throw (ex-info "bind-registered-convert! (fp16 cast for XMX) is Level-Zero/Intel-only" {})))
+
+(defn bind-registered-transpose!
+  [& _]
+  (throw (ex-info "bind-registered-transpose! (XMX operand transpose) is Level-Zero/Intel-only" {})))
+
 (defn shutdown!
   "Shutdown OpenCL runtime, releasing all handles."
   []
