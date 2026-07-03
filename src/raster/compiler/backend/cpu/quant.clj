@@ -427,12 +427,15 @@
   (layout/quant-stream-layout {:vector-bits 256} q4-0)) ; AVX2 NC=8, format-derived
 
 (defn repack-stream
-  "Row-major Q4_0 {wq[out*in/2], ws[out*nb]} → the :stream-gemv interleaved layout,
+  "Row-major quantized {wq, ws[out*nb]} → the :stream-gemv interleaved layout,
   where output column i lands in accumulator lane i (no shuffles, no permute). Single
   source: delegates to the descriptor-driven core.layout/repack, which the kernel's
-  gather (emit-qmatmul-stream) mirrors. out must be a multiple of NC=8. One-time cost."
-  [^bytes wq ^floats ws out in]
-  (layout/repack stream-gemv-layout wq ws out in))
+  gather (emit-qmatmul-stream) mirrors. out must be a multiple of NC=8. One-time cost.
+  Default format q4-0; pass q8-0 for the byte-direct 8-bit layout (embedder quality)."
+  ([^bytes wq ^floats ws out in]
+   (layout/repack stream-gemv-layout wq ws out in))
+  ([^bytes wq ^floats ws out in format]
+   (layout/repack (layout/quant-stream-layout {:vector-bits 256} format) wq ws out in)))
 
 (defn emit-qmatmul-stream
   "Emit the :stream-gemv decode kernel — the descriptor-driven SCHEDULE for the Q4
@@ -444,11 +447,13 @@
   (col×act scale). Column i → lane i, so the store needs no permute. NC=8 is the AVX2
   path (the f32 lane count); AVX-512 (NC=16) / NEON (NC=4) are intrinsic-family variants
   keyed off the same descriptor. Signature: void NAME(xq,xs,xsum,wqi,wsi,y,in,out)."
-  [name {:keys [zero-point]} mac]
-  (let [{:keys [tile block bytes-per-igroup igroups k-group]} stream-gemv-layout
+  [name {:keys [zero-point] :as format} mac]
+  (let [{:keys [tile block bytes-per-igroup igroups k-group pack]}
+        (if format (layout/quant-stream-layout {:vector-bits 256} format) stream-gemv-layout)
         nc tile
         bpi bytes-per-igroup
-        blk (* igroups bpi)        ;; bytes per (group, block) = 128 for NC=8
+        blk (* igroups bpi)        ;; bytes per (group, block): 128 for Q4/NC=8, 256 for Q8
+        byte-direct? (= pack :byte-direct)
         zp (str zero-point)]
     (assert (= nc 8)
             (str "emit-qmatmul-stream: only NC=8 (AVX2 __m256) implemented; NC=" nc
@@ -457,7 +462,9 @@
          "void " name "(const int8_t* xq, const float* xs, const int* xsum,\n"
          "    const uint8_t* restrict wqi, const float* restrict wsi, float* y, int in, int out,\n"
          "    int o_start, int o_count) {\n"
-         "  int nb = in/" block "; const __m256i _m4 = _mm256_set1_epi8(0x0F); int oend = o_start + o_count;\n"
+         "  int nb = in/" block ";"
+         (when-not byte-direct? " const __m256i _m4 = _mm256_set1_epi8(0x0F);")
+         " int oend = o_start + o_count;\n"
          "  for (int g = o_start; g + " nc " <= oend; g += " nc ") {\n"
          "    long gi = g/" nc ";\n"
          "    const uint8_t* restrict wg = wqi + gi*(long)nb*" blk ";\n"
@@ -467,10 +474,13 @@
          "      const uint8_t* wb = wg + b*" blk "; const int8_t* xb = xq + b*" block ";\n"
          "      __m256i ia = _mm256_setzero_si256();\n"
          "      for (int ig = 0; ig < " igroups "; ig++) {\n"
-         "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*" bpi "));\n"
-         "        __m256i nib = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _m4);\n"
+         (if byte-direct?
+           ;; 8-bit: one unsigned byte per weight — direct 32-byte load, no unpack
+           (str "        __m256i wv = _mm256_loadu_si256((const __m256i*)(wb + ig*" bpi "));\n")
+           (str "        __m128i raw = _mm_loadu_si128((const __m128i*)(wb + ig*" bpi "));\n"
+                "        __m256i wv = _mm256_and_si256(_mm256_set_m128i(_mm_srli_epi16(raw,4), raw), _m4);\n"))
          "        __m256i ab = _mm256_set1_epi32(*(const int*)(xb + ig*" k-group "));\n"
-         "        ia = _i8dot_acc(ia, nib, ab);\n"
+         "        ia = _i8dot_acc(ia, wv, ab);\n"
          "      }\n"
          "      ia = _mm256_sub_epi32(ia, _mm256_set1_epi32(" zp " * xsum[b]));\n"
          "      __m256 cs = _mm256_loadu_ps(sg + b*" nc ");\n"

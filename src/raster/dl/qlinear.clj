@@ -32,9 +32,12 @@
             [raster.compiler.backend.cpu.quant :as cq]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
-;; One host-best Q4_0 stream-gemv kernel, compiled once — the maddubs/VNNI int8-MAC
-;; seam. Under -march=native the C macro cascade picks dpbusd (AVX-VNNI) or maddubs.
+;; One host-best stream-gemv kernel per weight format, compiled once — the
+;; maddubs/VNNI int8-MAC seam. Under -march=native the C macro cascade picks
+;; dpbusd (AVX-VNNI) or maddubs. Q4_0 = decode default; Q8_0 = the embedder-quality
+;; format (measured: 4-bit weights cost ~5%+ embedding cosine, Q8_0 is lossless).
 (def ^:private kq4 (delay (cq/compile-qmatmul-stream "qlinear_i8_q4" cq/q4-0 :maddubs 1)))
+(def ^:private kq8 (delay (cq/compile-qmatmul-stream "qlinear_i8_q8" cq/q8-0 :maddubs 1)))
 
 (deftm ^:no-inline qlinear-i8!
   "In-place quantized linear: int8-quantize x, stream-gemv into y over a repack-stream
@@ -53,6 +56,26 @@
    in :- Long, out :- Long] :- (Array float)
   (let [y (float-array out)]
     (qlinear-i8! x wqi wsi y in out)
+    y))
+
+(deftm ^:no-inline qlinear-i8-q8!
+  "In-place quantized linear over a Q8_0 repack-stream weight (byte-direct layout,
+  `(repack-stream wq ws out in q8-0)`). Same A8 activation quant + dpbusd core as the
+  Q4 op — only the weight unpack differs. The embedder-quality op: Q8_0 weights are
+  cosine-lossless where 4-bit costs ~5%."
+  [x :- (Array float), wqi :- (Array byte), wsi :- (Array float),
+   y :- (Array float), in :- Long, out :- Long] :- (Array float)
+  (let [q (cq/quantize-act-i8-par x in)]
+    (@kq8 (:xq q) (:xs q) (:xsum q) wqi wsi y in out)
+    y))
+
+(deftm qlinear-i8-q8
+  "Quantized linear over a Q8_0 weight: allocates y then delegates to the in-place op
+  (buffer-semantics rewrites this to qlinear-i8-q8!)."
+  [x :- (Array float), wqi :- (Array byte), wsi :- (Array float),
+   in :- Long, out :- Long] :- (Array float)
+  (let [y (float-array out)]
+    (qlinear-i8-q8! x wqi wsi y in out)
     y))
 
 ;; ---------------------------------------------------------------------------
@@ -78,3 +101,16 @@
 ;; profile re-tags it :gpu to select the emit-qmatmul-opencl lowering (GPU Step 2).
 (descriptor/register-placement! 'raster.dl.qlinear/qlinear-i8 :cpu-quant)
 (descriptor/register-placement! 'raster.dl.qlinear/qlinear-i8! :cpu-quant)
+
+;; The Q8_0 twin: identical semantics/effects/placement, byte-direct weight layout.
+(descriptor/register-buffer-semantics! 'raster.dl.qlinear/qlinear-i8-q8
+  {:allocates? true
+   :in-place-arg nil
+   :alloc-form (fn [[_x _wqi _wsi _in out] _opts] (list 'float-array out))
+   :rewrite-fn (fn [[x wqi wsi in out] buf]
+                 (list 'raster.dl.qlinear/qlinear-i8-q8! x wqi wsi buf in out))})
+(descriptor/register-op-descriptor! 'raster.dl.qlinear/qlinear-i8-q8!
+  {:effects {:pure? false :mutating? true}})
+(descriptor/register-buffer-write! 'raster.dl.qlinear/qlinear-i8-q8! :overwrite 3)
+(descriptor/register-placement! 'raster.dl.qlinear/qlinear-i8-q8 :cpu-quant)
+(descriptor/register-placement! 'raster.dl.qlinear/qlinear-i8-q8! :cpu-quant)
