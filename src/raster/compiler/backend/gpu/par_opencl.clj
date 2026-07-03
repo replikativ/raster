@@ -35,6 +35,31 @@
     } while (old != assumed);
     return as_float(old);
 }\n")
+
+(def ^:private rstr-dp4a-helper
+  "Portable int8 4-way dot-accumulate. `as_char4` reinterprets each int32's 4 bytes
+  (little-endian: .x = low byte) as signed int8 lanes; the OpenCL compiler (Intel IGC,
+  NVIDIA, AMD) pattern-matches this idiom to a hardware dp4a instruction."
+  "inline int rstr_dp4a(int a, int b, int acc) {
+    char4 va = as_char4(a);
+    char4 vb = as_char4(b);
+    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y
+               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;
+}\n")
+
+(defn- body-uses-dp4a?
+  "True if the kernel body calls the dp4a int8-dot primitive (any spelling)."
+  [body]
+  (let [found (atom false)]
+    (walk/postwalk
+     (fn [form]
+       (when (and (seq? form)
+                  (contains? #{'dp4a 'par/dp4a 'raster.par/dp4a} (first form)))
+         (reset! found true))
+       form)
+     body)
+    @found))
+
 ;; Kernel generators
 ;; ================================================================
 
@@ -109,7 +134,11 @@
            :or {dtype :float kernel-name-prefix "par_map_void"
                 array-types {} scalar-types {}}}]
   (let [info (par/extract-par-map-void-info form)
-        {:keys [idx body]} info
+        {:keys [idx]} info
+        ;; Normalize devirtualized array prims (.invk aget_m_T-impl …) back to aget/aset heads so
+        ;; array detection + element typing + emit recognize them (else arrays→scalar, aget→broken
+        ;; helper). The forward-pass devirtualizes raster.arrays/aget; Path A skips those passes.
+        body (ce/normalize-array-prims (:body info))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         default-ctype (get codegen/opencl-type-map dtype "float")
         use-fp64? (= dtype :double)
@@ -154,16 +183,24 @@
                                                            (str "__global const " ct "* restrict " flat-sym))))
                                                      fields)))
                                             soa-arr-params))
-        ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
+        ;; Scalar param C type: the DECLARED type (from the deftm tags via scalar-types) wins.
+        ;; The name/metadata heuristic is only a fallback for params with no declared type —
+        ;; it must NOT override a declared one (a Double `gain-offset` is float, not int).
         scl-type (fn [s]
                    (let [sname (name s)
                          explicit (get scalar-types s (get scalar-types (symbol sname)))]
                      (cond
-                       (= explicit :int) "int"
+                       (= explicit :int)    "int"
+                       (= explicit :long)   "long"
+                       (= explicit :double) "double"
+                       (= explicit :float)  default-ctype
                        (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
                            (contains? #{'long 'int} (:tag (meta s))))
                        "int"
                        :else default-ctype)))
+        ;; Integer scalar params seed *int-vars* for the body, so index math that uses a scalar
+        ;; (e.g. offset = r*features) infers integer instead of *scalar-type* (float).
+        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
@@ -184,7 +221,9 @@
                                     soa-arr-params))
         all-arr-syms (into (set (map #(symbol (name %)) plain-arr-params)) soa-field-syms)
         body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* default-ctype]
+                           ce/*scalar-type* default-ctype
+                           ce/*idx-sym* idx
+                           ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
         ;; Detect if body uses float atomic-add (needs CAS helper function)
         needs-float-atomic? (let [found (atom false)]
@@ -203,10 +242,17 @@
         ;; Collect GPU-inlinable deftm helper functions referenced in body
         gpu-helpers (ce/collect-gpu-fn-calls body)
         helper-sources (str/join "\n" (map (comp :source ce/generate-c-helper) gpu-helpers))
-        source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+        ;; Enable fp64 whenever double appears in the emitted kernel or its helpers — a float
+        ;; kernel can still carry double from (double ...) casts or raster.numeric helpers, and
+        ;; using double WITHOUT the extension is undefined (garbage) on the GPU.
+        needs-fp64? (or use-fp64?
+                        (str/includes? body-str "double")
+                        (str/includes? helper-sources "double"))
+        source (str (when needs-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
+                    (when (body-uses-dp4a? body) rstr-dp4a-helper)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"

@@ -22,3 +22,4 @@ _site/
 
 # local dev sandbox for the cljs/browser port (not shipped; testing strategy TBD)
 /cljs-sandbox/
+raster_qmm_gpu_lnl.bin

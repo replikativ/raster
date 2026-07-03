@@ -64,6 +64,8 @@
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.invariants :as invariants]
             [raster.compiler.ir.form :as form]
+            [raster.analysis.memory :as mem]
+            [clojure.set :as set]
             [raster.compiler.core.method-entry :as me]
             [raster.core :as rcore]))
 
@@ -635,7 +637,13 @@
       (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
       :opencl
-      (let [result (opencl-pass/opencl-pass form
+      ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
+      ;; generators read declared types instead of guessing. The materialized form preserves
+      ;; the original param symbols, so a name-keyed type map still applies.
+      (let [form (cond-> form
+                   (or (:scalar-types opts) (:array-types opts))
+                   (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
+            result (opencl-pass/opencl-pass form
                                             :device-id target-device
                                             :dtype (:dtype opts))]
         (register-gpu-kernels! (:kernels result))
@@ -712,21 +720,27 @@
   "Reduce a form through a sequence of passes, validating arrow types.
   Passes with :from :* accept any input dialect (flexible).
   Validates output against target dialect when *validate-dialects?* is true.
-  Returns the final transformed form."
-  [form passes opts]
-  (first
-   (reduce (fn [[f dialect] pass-key]
-             (let [{:keys [from to]} (get pass-specs pass-key)
-                   pass-fn (:fn (get pass-specs pass-key))
-                   _ (assert (or (= :* from) (= dialect from))
-                             (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
-                                  ". Check pass ordering."))
-                   result (pass-fn f opts)
-                   f' (pass-result-form result)]
+  Returns the final transformed form.
+
+  `start-dialect` (default :walked) lets a caller resume a split pipeline — e.g.
+  the resident GPU path runs the front half to :materialized, applies soa-lower
+  (which is not a registered pass because it also rewrites the param signature),
+  then resumes the back half from :materialized."
+  ([form passes opts] (run-passes form passes opts :walked))
+  ([form passes opts start-dialect]
+   (first
+    (reduce (fn [[f dialect] pass-key]
+              (let [{:keys [from to]} (get pass-specs pass-key)
+                    pass-fn (:fn (get pass-specs pass-key))
+                    _ (assert (or (= :* from) (= dialect from))
+                              (str "Pass :" pass-key " expects :" from " but pipeline is at :" dialect
+                                   ". Check pass ordering."))
+                    result (pass-fn f opts)
+                    f' (pass-result-form result)]
                 ;; Validate output against target dialect (fails hard)
-               (validate-dialect! to f' pass-key opts)
-               [f' to]))
-           [form :walked] passes)))
+                (validate-dialect! to f' pass-key opts)
+                [f' to]))
+            [form start-dialect] passes))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)
@@ -739,6 +753,17 @@
    write-read-fuse eliminates intermediate buffers by fusing 2D producers into 1D consumers (dW+SGD).
    segop-lower converts par forms to SegOp IR for unified backend consumption."
   [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :segop-lower :compound-detect :backend :resolve-alength :mem-merge])
+
+(def gpu-resident-pre-soa-passes
+  "forward-passes up to (and including) :materialize. The resident GPU path splits here so
+   soa-lower can explode value-type (Params container) params into per-field arrays at the
+   :materialized boundary — BEFORE the :backend pass emits kernels (the JVM bytecode backend
+   keeps Valhalla value-classes native, so soa-lower is per-backend, not a shared pass)."
+  [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
+
+(def gpu-resident-post-soa-passes
+  "forward-passes from :segop-lower onward — resumed (from :materialized) after soa-lower."
+  [:segop-lower :compound-detect :backend :resolve-alength :mem-merge])
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline
@@ -860,11 +885,21 @@
                                                (mapv (fn [t] (if (= t 'Object) nil t)) tags)))]
                                 (when (and ps anns (= (count ps) (count anns)))
                                   (zipmap (map #(if (symbol? %) % (symbol (name %))) ps) anns)))
+            ;; Declared GPU param types from the SAME shared derivation Path A uses, so the
+            ;; pipeline's opencl backend gets the deftm's declared scalar/array types (not the
+            ;; emitter's name-regex guess). ONE type source across both compile entries.
+            gpu-param-types (when target-device
+                              (opencl-pass/derive-param-types
+                               (:raster.core/deftm-params (meta resolved-var))
+                               (:raster.core/deftm-tags (meta resolved-var))
+                               effective-dtype))
             opts (cond-> {:inline? inline? :simd? simd? :target-device target-device
                           :active-params active-params :dtype effective-dtype}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns)
-                   param-annotations (assoc :param-annotations param-annotations))
+                   param-annotations (assoc :param-annotations param-annotations)
+                   gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                          :array-types (:array-types gpu-param-types)))
             compile! (fn []
                        (let [raw-form (if (= 1 (count walked-body))
                                         (first walked-body)
@@ -898,6 +933,302 @@
         (if target-device
           ((requiring-resolve 'raster.gpu.ze-runtime/make-gpu-fn) compile!)
           (compile!))))))
+
+;; ================================================================
+;; Resident GPU program extraction (Option A: bound-dispatch path)
+;;
+;; make-gpu-fn returns a per-call STAGING fn (copy JVM arrays in, launch, copy out — every
+;; call). For a straight-line fused sequence (a decoder layer: norm→quant→matmul→…) the kernel
+;; order + buffer dataflow is fixed, so it can instead be bound ONCE to a session (resident
+;; buffers, prepare! each kernel, record-graph! the sequence) and replayed. extract-gpu-program
+;; turns the fused IR into the flat descriptor the session bound path consumes; the bound
+;; machinery (bind-kernel!/launch-bound!/record-graph!) is already convention-agnostic, so map!
+;; and map-void! kernels bind identically — the output is just another resident buffer.
+;; ================================================================
+
+(def ^:private gpu-invoke-heads
+  '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+     raster.gpu.ze-runtime/invoke-registered-kernel
+     raster.gpu.ze-runtime/invoke-reduction-kernel})
+
+(def ^:private gpu-array-alloc-heads
+  '#{double-array float-array int-array long-array byte-array
+     clojure.core/double-array clojure.core/float-array
+     clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
+
+;; --- Stage A: functional reduce → resident-buffer fusion ------------------------------------
+;; A par/reduce result is a SCALAR in the materialized IR, but on the resident GPU path it must
+;; live in device memory (a 1-element buffer) so the per-token graph never syncs to host. This
+;; pass (Futhark's reduce→broadcast→map fusion) realizes each non-escaping reduce result as a
+;; 1-element buffer written by `par/reduce-into`, and FORWARD-INLINES the pure scalar chain that
+;; depends on it (e.g. rms-norm's `ms`/`inv`) into the consuming kernel bodies, with the reduce
+;; result read back as `(aget buf 0)`. The existing SegMap aget-array path (#37) then consumes
+;; the buffer with NO new machinery. Escape analysis is the accept predicate: a reduce result
+;; that reaches the host result (or any non-kernel binding — e.g. a buffer alloc size) is NOT
+;; realizable, so the whole form is left unchanged (host-roundtrip fallback path).
+
+(defn- pure-scalar-init?
+  "init is a pure scalar expr — a candidate to forward-inline into a consuming kernel body —
+   i.e. not a par form, a buffer alloc, or a kernel invoke."
+  [init]
+  (not (and (seq? init)
+            (or (par/par-form? init)
+                (and (symbol? (first init))
+                     (or (contains? gpu-array-alloc-heads (first init))
+                         (contains? gpu-invoke-heads (first init))))))))
+
+(defn- reduce-buffer-alloc-head [dtype]
+  (if (= dtype :double) 'clojure.core/double-array 'clojure.core/float-array))
+
+(defn fuse-reduce-results
+  "See block comment above. Returns the fused let* form, or the input form UNCHANGED when there
+   is no realizable reduce (no par/reduce, or a reduce result genuinely escapes to host). `dtype`
+   selects the 1-element buffer element type. Operates on the materialized IR (par/reduce +
+   par/map! still present), so it must run before the SegOp/backend lowering."
+  [form dtype]
+  (if-not (and (seq? form) (#{'let* 'let} (first form)))
+    form
+    (let [pairs      (vec (partition 2 (second form)))
+          body-forms (drop 2 form)
+          body-expr  (if (= 1 (count body-forms)) (first body-forms) (cons 'do body-forms))]
+      (loop [ps (seq pairs), subst {}, realized #{}, rbufs #{}, out []]
+        (if-not ps
+          (let [body' (util/subst-syms subst body-expr)
+                ;; Soundness guard: an (aget rbuf 0) may appear ONLY inside par-form bodies
+                ;; (device kernels). If a reduce buffer leaks into the host result or any
+                ;; non-par kept binding (e.g. an alloc size), the reduce result genuinely
+                ;; escapes — bail entirely (no fusion), preserving the host-roundtrip path.
+                leaks-at-host? (fn [e] (boolean (some #(contains? (mem/sexp-free-vars e) %) rbufs)))
+                leaked? (or (leaks-at-host? body')
+                            (some (fn [[_ i]] (and (not (par/par-form? i)) (leaks-at-host? i))) out))]
+            (if (or (empty? rbufs) leaked?)
+              form
+              (apply list (first form) (vec (mapcat identity out)) [body'])))
+          (let [[sym init] (first ps)
+                init' (util/subst-syms subst init)]
+            (cond
+              ;; reduce result → realize as a 1-element device buffer + a reduce-into step
+              (par/par-reduce-form? init')
+              (let [[_ acc init0 idx bound rbody] init'
+                    buf     (gensym (str (name sym) "__rbuf"))
+                    alloc-b [buf (list (reduce-buffer-alloc-head dtype) 1)]
+                    red-b   [(gensym "_red__")
+                             (list 'raster.par/reduce-into buf acc init0 idx bound rbody)]]
+                (recur (next ps)
+                       (assoc subst sym (list 'clojure.core/aget buf 0))
+                       (conj realized sym) (conj rbufs buf)
+                       (conj out alloc-b red-b)))
+              ;; pure scalar depending on a realized value → forward-inline (drop the binding)
+              (and (pure-scalar-init? init')
+                   (seq (set/intersection (mem/sexp-free-vars init) realized)))
+              (recur (next ps) (assoc subst sym init') (conj realized sym) rbufs out)
+              ;; everything else (allocs, par/map! consumers, kernels): keep, subst applied
+              :else
+              (recur (next ps) subst realized rbufs (conj out [sym init'])))))))))
+
+(defn- parse-gpu-step
+  "One invoke-registered-* binding → a step record. :arrays is the full resident-buffer arg
+   list in the kernel's signature order (for map! the separate output is appended, so on the
+   resident path it is just another buffer). nil for an unrecognized head."
+  [sym expr]
+  (let [head (first expr)]
+    (cond
+      (= head 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
+      (let [[_ kname arrays scalars n] expr]
+        {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
+         :convention :map-void :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
+      (let [[_ kname inputs out scalars n] expr]
+        {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
+         :convention :map :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
+      ;; 3-arg legacy (host-scalar return) vs 4-arg resident (writes out-buf, stays on device).
+      (if (= 5 (count expr))
+        (let [[_ kname inputs out-buf n] expr]
+          {:kernel-name kname :arrays (vec inputs) :output out-buf :scalars [] :n-expr n
+           :convention :reduce :returns sym})
+        (let [[_ kname inputs n] expr]
+          {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
+           :convention :reduce :returns sym}))
+      :else nil)))
+
+(defn- contains-gpu-invoke?
+  "Deep check: does form contain a gpu-invoke head anywhere? (A scalar binding whose value is
+   itself computed from a kernel result is NOT a straight-line scalar let.)"
+  [form]
+  (let [found (volatile! false)]
+    (clojure.walk/postwalk
+     (fn [x] (when (and (seq? x) (symbol? (first x)) (contains? gpu-invoke-heads (first x)))
+               (vreset! found true)) x)
+     form)
+    @found))
+
+(defn extract-gpu-program
+  "Walk a straight-line fused GPU IR into a flat program: ordered kernel steps, intermediate
+   buffer allocs, and the pure scalar-let bindings that feed their sizes/counts (e.g.
+   `n (* rows feat)`). Returns nil when a binding has control flow or a kernel result feeding
+   scalar compute — the caller then falls back to the staging fn.
+
+   :scalar-lets is the ordered [sym expr ...] of pure scalar bindings; size/count/scalar exprs
+   are evaluated in an env that binds the deftm params AND these lets (so an intermediate sized
+   `(* rows feat)` resolves)."
+  [form]
+  (when (and (seq? form) (#{'let* 'let} (first form)))
+    (let [bindings (partition 2 (second form))
+          body (last form)
+          allocs (volatile! [])
+          steps (volatile! [])
+          scalar-lets (volatile! [])
+          ok (volatile! true)]
+      (doseq [[sym expr] bindings]
+        (cond
+          (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+          (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+          (if-let [s (parse-gpu-step sym expr)]
+            (vswap! steps conj s)
+            (vreset! ok false))
+          ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
+          (not (contains-gpu-invoke? expr))
+          (vswap! scalar-lets into [sym expr])
+          ;; control flow / kernel-result-into-scalar → not straight-line.
+          :else (vreset! ok false)))
+      (when (and @ok (seq @steps))
+        {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+
+(defn- strip-meta
+  "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
+   carry a type hint (`Can't type hint a local with a primitive initializer`), which the eval'd
+   arg-fn would otherwise hit on e.g. `^long n (* (long rows) (long feat))`."
+  [x]
+  (if (symbol? x) (with-meta x nil) x))
+
+(defn- expr->arg-fn
+  "Compile a size/count/scalar expr into (fn [arg-vector] value), evaluating it in an env that
+   binds the deftm params AND the program's pure scalar-lets (so `(* rows feat)` resolves).
+   Built once at compile time; called per bind with the runtime arg values."
+  [param-syms scalar-lets expr]
+  (let [clean-params (mapv strip-meta param-syms)
+        clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
+    (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr])))))
+
+(defn compile-gpu-program
+  "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
+   RESIDENT program descriptor for the session bound-dispatch path instead of make-gpu-fn's
+   per-call staging fn. Kernels are registered (globally) as a side effect of the backend pass.
+   Returns nil when the fused IR is not straight-line (caller uses compile-aot staging fn).
+
+   Descriptor:
+     {:dtype :float
+      :all-params  [a out n]        ; deftm param order (the resident fn's arg order)
+      :array-params [a out]         ; array params (resident buffers, up/downloaded)
+      :scalar-params [n]
+      :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
+      :steps  [{:kernel-name str :arrays [syms] :n-fn (fn [args] int)
+                :scalar-fns [(fn [args] v) ...] :convention :map-void|:map :phase kw}]
+      :result-sym sym}"
+  [f-var device-id & {:keys [dtype]}]
+  (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
+        params       (get-params f-var dtype)
+        walked-body  (get-walked-body f-var dtype)
+        active-params (clean-params params)
+        param-env    (build-param-env f-var dtype)
+        effective-dtype (or dtype (infer-dtype resolved-var) :double)
+        source-ns    (let [m (meta resolved-var)]
+                       (or (when-let [s (:raster.core/deftm-source-ns m)]
+                             (try (the-ns s) (catch Exception _ nil)))
+                           (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
+        ;; --- soa-lower (resident GPU value-type explosion) ----------------------------------
+        ;; Run the front half to :materialized, explode any Params-container / value-type param
+        ;; into per-field array params, then resume to the backend. Gated on a value-type param
+        ;; so flat-param deftms are untouched (their eff-param-specs == param-specs). The
+        ;; descriptor's params + the backend's array types are derived from the EXPLODED leaves.
+        d-params*   (:raster.core/deftm-params (meta resolved-var))
+        d-tags*     (:raster.core/deftm-tags (meta resolved-var))
+        param-specs (mapv (fn [p t] {:sym (if (symbol? p) (with-meta p nil) (symbol (name p)))
+                                     :tag (when t (symbol t))})
+                          d-params* d-tags*)
+        value-reg   @types/soa-registry
+        value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
+        pre-opts (cond-> {:inline? true :simd? false :target-device device-id
+                          :active-params active-params :dtype effective-dtype}
+                   param-env (assoc :param-env param-env)
+                   source-ns (assoc :source-ns source-ns))
+        raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
+        form-mat (run-passes raw-form gpu-resident-pre-soa-passes pre-opts)
+        {form-soa :body eff-param-specs :params}
+        (if value-fn?
+          (soa-lower/soa-lower form-mat param-specs)
+          {:body form-mat :params param-specs})
+        all-params (mapv :sym eff-param-specs)
+        gpu-param-types (opencl-pass/derive-param-types
+                         (mapv :sym eff-param-specs) (mapv :tag eff-param-specs) effective-dtype)
+        array-param-set (set (keys (:array-types gpu-param-types)))
+        array-params (filterv #(contains? array-param-set %) all-params)
+        scalar-params (filterv #(not (contains? array-param-set %)) all-params)
+        post-opts (cond-> {:inline? true :simd? false :target-device device-id
+                           :active-params active-params :dtype effective-dtype}
+                    param-env (assoc :param-env param-env)
+                    source-ns (assoc :source-ns source-ns)
+                    gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                           :array-types (:array-types gpu-param-types)))
+        ;; Stage A: realize non-escaping par/reduce results as device-resident 1-elem buffers and
+        ;; fuse their dependent scalar chains into consuming kernels (before SegOp/backend lowering).
+        _pre-fuse form-soa
+        form-soa (fuse-reduce-results form-soa effective-dtype)
+        _ (when (System/getProperty "raster.debug.fuse")
+            (binding [*out* *err*]
+              (println "=== MATERIALIZED (pre-fuse) ===") (println (pr-str _pre-fuse))
+              (println "=== POST-FUSE ===") (println (pr-str form-soa))
+              (println "=== END-FUSE-DUMP ===")))
+        form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
+        prog (extract-gpu-program form)
+        scalar-lets (:scalar-lets prog)
+        ;; Default buffer roles for the residency layer: an array param WRITTEN by any kernel
+        ;; (its name is in some kernel's :written-arrays) defaults to :output (downloaded after
+        ;; replay); a read-only param defaults to :input (re-uploaded per call). Intermediates are
+        ;; :scratch (never moved). The CALLER overrides read-only params that are fixed across
+        ;; calls to :constant (weights — uploaded once at bind) and persistent written state to
+        ;; :state (KV cache — never downloaded): that cross-call axis isn't a single-program
+        ;; property (escape analysis can't see it), so it's declared, not derived.
+        reg-entry (when prog (requiring-resolve 'raster.gpu.ze-runtime/kernel-registry-entry))
+        written-params (when prog
+                         (reduce (fn [acc s]
+                                   (let [ki (reg-entry (:kernel-name s))]
+                                     (into acc (map (comp symbol name) (:written-arrays ki)))))
+                                 #{} (:steps prog)))
+        array-roles (when prog
+                      (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
+                                    array-params)))]
+    (when prog
+      {:dtype effective-dtype
+       :all-params all-params
+       :array-params array-params
+       :array-roles array-roles
+       :scalar-params scalar-params
+       :allocs (mapv (fn [{:keys [sym size-expr]}]
+                       {:sym sym :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
+                     (:allocs prog))
+       :steps (mapv (fn [i {:keys [kernel-name arrays scalars n-expr convention output]}]
+                      {:kernel-name kernel-name
+                       :arrays arrays
+                       ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
+                       ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
+                       :output (when output (keyword (name output)))
+                       :n-fn (expr->arg-fn all-params scalar-lets n-expr)
+                       ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
+                       ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
+                       ;; `features`) is bound as :int, not mis-typed float (→ launch error).
+                       :scalar-specs (mapv (fn [s]
+                                             {:type (or (and (symbol? s)
+                                                             (get (:scalar-types gpu-param-types) s))
+                                                        (if (= effective-dtype :double) :double :float))
+                                              :value-fn (expr->arg-fn all-params scalar-lets s)})
+                                           scalars)
+                       :convention convention
+                       :phase (keyword (str "gpu-step-" i))})
+                    (range) (:steps prog))
+       :result-sym (:result prog)})))
 
 (defn- wasm-kernel-spec
   "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm

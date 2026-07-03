@@ -95,6 +95,7 @@
 (def ^:private ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES 0x03)
 (def ^:private ZE_STRUCTURE_TYPE_CONTEXT_DESC 0x0d)
 (def ^:private ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC 0x0e)
+(def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
 (def ^:private ZE_STRUCTURE_TYPE_DEVICE_MEM_ALLOC_DESC 0x15)
 (def ^:private ZE_STRUCTURE_TYPE_HOST_MEM_ALLOC_DESC 0x16)
 (def ^:private ZE_STRUCTURE_TYPE_MODULE_DESC 0x1b)
@@ -156,6 +157,25 @@
 (def ^:private h-zeCommandListCreateImmediate
   (delay (make-handle "zeCommandListCreateImmediate" (fd I32 PTR PTR PTR PTR))))
 
+(def ^:private h-zeCommandListHostSynchronize
+  (delay (make-handle "zeCommandListHostSynchronize" (fd I32 PTR I64))))
+
+;; Regular (replayable) command list + queue — for recorded command graphs
+(def ^:private h-zeCommandQueueCreate
+  (delay (make-handle "zeCommandQueueCreate" (fd I32 PTR PTR PTR PTR))))
+
+(def ^:private h-zeCommandListCreate
+  (delay (make-handle "zeCommandListCreate" (fd I32 PTR PTR PTR PTR))))
+
+(def ^:private h-zeCommandListClose
+  (delay (make-handle "zeCommandListClose" (fd I32 PTR))))
+
+(def ^:private h-zeCommandQueueExecuteCommandLists
+  (delay (make-handle "zeCommandQueueExecuteCommandLists" (fd I32 PTR I32 PTR PTR))))
+
+(def ^:private h-zeCommandQueueSynchronize
+  (delay (make-handle "zeCommandQueueSynchronize" (fd I32 PTR I64))))
+
 (def ^:private h-zeModuleCreate
   (delay (make-handle "zeModuleCreate" (fd I32 PTR PTR PTR PTR PTR))))
 
@@ -194,6 +214,12 @@
 
 (def ^:private h-zeKernelDestroy
   (delay (make-handle "zeKernelDestroy" (fd I32 PTR))))
+
+(def ^:private h-zeCommandListDestroy
+  (delay (make-handle "zeCommandListDestroy" (fd I32 PTR))))
+
+(def ^:private h-zeCommandQueueDestroy
+  (delay (make-handle "zeCommandQueueDestroy" (fd I32 PTR))))
 
 ;; ================================================================
 ;; State
@@ -302,6 +328,32 @@
 (defn- ensure-init! []
   (when-not (:initialized? @state)
     (init!)))
+
+(defn async-cmd-list
+  "The shared ASYNCHRONOUS immediate command list, created lazily. Unlike the default
+  synchronous list (every append blocks until the kernel completes ~100µs), appends to this
+  list return immediately and execute in order; the host waits once via synchronize-async!.
+  This amortizes the completion-wait across a batch of dispatches (the decode pattern: queue a
+  token's ~200 dependent GEMVs, sync once)."
+  ^MemorySegment []
+  (ensure-init!)
+  (or (:cmd-list-async @state)
+      (let [{:keys [arena context device]} @state
+            cq-desc (.allocate ^Arena arena 40)
+            _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+            _ (.set cq-desc I32 28 (int 0)) ;; ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS
+            cmd-out (ptr-seg arena)
+            _ (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
+                        [context device cq-desc cmd-out])
+            lst (read-ptr cmd-out)]
+        (clojure.core/swap! state assoc :cmd-list-async lst)
+        lst)))
+
+(defn synchronize-async!
+  "Block until all commands appended to the async command list have completed."
+  []
+  (ze-call! "zeCommandListHostSynchronize" @h-zeCommandListHostSynchronize
+            [(async-cmd-list) (long -1)]))  ;; UINT64_MAX = wait forever
 
 ;; ================================================================
 ;; Public accessors
@@ -472,6 +524,21 @@
         (swap! state assoc-in [:kernels cache-key] kernel)
         kernel))))
 
+(defn create-kernel-fresh
+  "Create a NEW kernel handle from a module (never cached). Each handle has independent,
+  mutable argument state — use one per pre-bound argument-set so concurrent bindings of the
+  same kernel source don't clobber each other (create-kernel shares one cached handle)."
+  ^MemorySegment [^MemorySegment module ^String kernel-name]
+  (ensure-init!)
+  (let [arena (:arena @state)
+        kern-desc (.allocate ^Arena arena 32)
+        _ (.set kern-desc I32 0 (int ZE_STRUCTURE_TYPE_KERNEL_DESC))
+        name-seg (.allocateFrom ^Arena arena kernel-name)
+        _ (.set kern-desc PTR 24 name-seg)
+        kern-out (ptr-seg arena)
+        _ (ze-call! "zeKernelCreate" @h-zeKernelCreate [module kern-desc kern-out])]
+    (read-ptr kern-out)))
+
 ;; ================================================================
 ;; Memory allocation
 ;; ================================================================
@@ -635,7 +702,7 @@
   (instance? DeviceBuffer x))
 
 (def ^:private dtype-byte-sizes
-  {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2})
+  {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
 
 (defn make-buffer
   "Allocate a persistent shared-memory GPU buffer.
@@ -718,6 +785,11 @@
                     dst (MemorySegment/ofArray out)]
                 (MemorySegment/copy seg 0 dst 0 (:byte-size buf))
                 out)
+      (:byte :int8)
+      (let [out (byte-array n)
+            dst (MemorySegment/ofArray out)]
+        (MemorySegment/copy seg 0 dst 0 (:byte-size buf))
+        out)
       (:float16 :half)
       (let [out (short-array n)
             dst (MemorySegment/ofArray out)]
@@ -955,7 +1027,7 @@
     (.get field soa-obj)))
 
 (defn- dtype->elem-bytes ^long [dtype]
-  (case dtype :double 8 :float 4 :long 8 :int 4))
+  (case dtype :double 8 :float 4 :long 8 :int 4 (:byte :int8) 1))
 
 (defn copy-to-gpu!
   "Copy a JVM SoA object (defvalue SoA type) into the GpuSoA's field segments.
@@ -1200,49 +1272,54 @@
   Returns a map that can be passed to launch-bound!.
 
   kernel-args: same format as launch! args
-  Binds all arguments once; use launch-bound! for zero-overhead dispatch."
-  [^MemorySegment kernel ^long workgroup-size-x kernel-args]
-  (ensure-init!)
-  (let [arena (:arena @state)]
+  Binds all arguments once; use launch-bound! for zero-overhead dispatch.
+  Optional cmd-list selects which immediate command list launch-bound! appends to —
+  default is the synchronous list (each dispatch blocks); pass (async-cmd-list) for batched
+  dispatch (appends return immediately; sync once via synchronize-async!)."
+  ([^MemorySegment kernel ^long workgroup-size-x kernel-args]
+   (bind-kernel! kernel workgroup-size-x kernel-args (:cmd-list @state)))
+  ([^MemorySegment kernel ^long workgroup-size-x kernel-args ^MemorySegment cmd-list]
+   (ensure-init!)
+   (let [arena (:arena @state)]
     ;; Set group size once
-    (ze-call! "zeKernelSetGroupSize" @h-zeKernelSetGroupSize
-              [kernel (int workgroup-size-x) (int 1) (int 1)])
+     (ze-call! "zeKernelSetGroupSize" @h-zeKernelSetGroupSize
+               [kernel (int workgroup-size-x) (int 1) (int 1)])
     ;; Set all arguments once
-    (doseq [[idx arg] (map-indexed vector kernel-args)]
-      (if (instance? MemorySegment arg)
-        (let [arg-ptr (ptr-seg arena)]
-          (.set arg-ptr PTR 0 ^MemorySegment arg)
-          (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                    [kernel (int idx) (long (.byteSize PTR)) arg-ptr]))
-        (let [{:keys [type value]} arg]
-          (case type
-            :int    (let [s (.allocate ^Arena arena I32)]
-                      (.set s I32 0 (int value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 4) s]))
-            :float  (let [s (.allocate ^Arena arena ValueLayout/JAVA_FLOAT)]
-                      (.set s ValueLayout/JAVA_FLOAT 0 (float value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 4) s]))
-            :double (let [s (.allocate ^Arena arena F64)]
-                      (.set s F64 0 (double value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))
-            :long   (let [s (.allocate ^Arena arena I64)]
-                      (.set s I64 0 (long value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))))))
-    (let [gc-seg (.allocate arena 12)
-          cmd (:cmd-list @state)]
+     (doseq [[idx arg] (map-indexed vector kernel-args)]
+       (if (instance? MemorySegment arg)
+         (let [arg-ptr (ptr-seg arena)]
+           (.set arg-ptr PTR 0 ^MemorySegment arg)
+           (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                     [kernel (int idx) (long (.byteSize PTR)) arg-ptr]))
+         (let [{:keys [type value]} arg]
+           (case type
+             :int    (let [s (.allocate ^Arena arena I32)]
+                       (.set s I32 0 (int value))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 4) s]))
+             :float  (let [s (.allocate ^Arena arena ValueLayout/JAVA_FLOAT)]
+                       (.set s ValueLayout/JAVA_FLOAT 0 (float value))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 4) s]))
+             :double (let [s (.allocate ^Arena arena F64)]
+                       (.set s F64 0 (double value))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 8) s]))
+             :long   (let [s (.allocate ^Arena arena I64)]
+                       (.set s I64 0 (long value))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 8) s]))))))
+     (let [gc-seg (.allocate arena 12)
+           cmd cmd-list]
       ;; Pre-fill Y=1, Z=1 (only X changes per launch)
-      (.set gc-seg I32 4 (int 1))
-      (.set gc-seg I32 8 (int 1))
+       (.set gc-seg I32 4 (int 1))
+       (.set gc-seg I32 8 (int 1))
       ;; Pre-allocate launch args array (reused every call)
-      (let [launch-args (object-array [cmd kernel gc-seg
-                                       MemorySegment/NULL (int 0) MemorySegment/NULL])]
-        {:kernel kernel :cmd cmd :gc-seg gc-seg
-         :launch-args launch-args
-         :h-launch @h-zeCommandListAppendLaunchKernel}))))
+       (let [launch-args (object-array [cmd kernel gc-seg
+                                        MemorySegment/NULL (int 0) MemorySegment/NULL])]
+         {:kernel kernel :cmd cmd :gc-seg gc-seg
+          :launch-args launch-args
+          :h-launch @h-zeCommandListAppendLaunchKernel})))))
 
 (defn launch-bound!
   "Launch a pre-bound kernel. Only dispatches (no arg setup, no barrier).
@@ -1410,6 +1487,12 @@
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))
 
+(defn kernel-registry-entry
+  "Public read of a registered kernel's info map (source, :array-params, :scalar-params, dtype,
+   …). Used by the resident GPU-program binder to map kernel params → resident buffers."
+  [kernel-name]
+  (get @kernel-registry kernel-name))
+
 (defn- ensure-kernel-loaded!
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."
@@ -1525,9 +1608,13 @@
   n: element count
   Dtype is read from kernel registry entry (:dtype, default :double)."
   [^String kernel-name input-arrays n]
-  (let [{:keys [kernel-handle workgroup-size identity-val dtype]
-         :or {workgroup-size 256 identity-val 0.0 dtype :double}
+  (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
+         :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :double}
          :as info} (ensure-kernel-loaded! kernel-name)
+        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
+                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                           "*"    (fn ^double [^double a ^double b] (* a b))
+                           (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))
@@ -1560,8 +1647,8 @@
       (loop [i 0 acc (double identity-val)]
         (if (< i group-count)
           (recur (inc i)
-                 (+ acc (double (.get dev-partial value-layout
-                                      (* i dtype-size)))))
+                 (double (combine acc (double (.get dev-partial value-layout
+                                                    (* i dtype-size))))))
           acc)))))
 
 ;; ================================================================
@@ -1648,6 +1735,139 @@
        (when source
          (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab))))
      nil)))
+
+(defn bind-registered-map-void-kernel
+  "Pre-bind a registered void-map kernel's arguments ONCE for fast repeated dispatch.
+  All array args must be GPU-resident (DeviceBuffer / GpuSoA / MemorySegment) — no per-call
+  JVM-array staging copy is allowed, since the whole point is to skip per-launch arg setup.
+  Buffer CONTENTS may change between launches (the bound pointers are stable); only re-bind
+  if a buffer is reallocated or n changes. Returns a map for launch-registered-bound!.
+
+  This is the dispatch-overhead fix: launch! re-sets every arg + appends a barrier each call
+  (~450µs measured); a pre-bound kernel dispatches via launch-bound! (no arg setup, no barrier)."
+  ([^String kernel-name arrays scalar-args n]
+   (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
+  ([^String kernel-name arrays scalar-args n opts]
+   (let [{:keys [module workgroup-size dtype]
+          :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+         ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
+         ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
+         ;; make every binding of the same kernel clobber the others (the last prepare! wins).
+         ;; A fresh handle per binding gives each its own arg state — required for the decode
+         ;; pattern (N matmuls share one kernel SOURCE but need N independent arg sets).
+         kernel-handle (create-kernel-fresh module kernel-name)
+         workgroup-size (long (get opts :workgroup-size workgroup-size))
+         n (long n)
+         dev-segs (reduce
+                   (fn [acc arr]
+                     (cond
+                       (gpu-soa? arr)        (into acc (mapv :seg (:field-segs ^GpuSoA arr)))
+                       (device-buffer? arr)  (conj acc (:segment ^DeviceBuffer arr))
+                       (instance? MemorySegment arr) (conj acc arr)
+                       :else (throw (ex-info "bind-registered-map-void-kernel requires GPU-resident args (DeviceBuffer/GpuSoA); JVM-array staging is not supported on the bound path"
+                                             {:arr-type (type arr)}))))
+                   [] arrays)
+         scalar-type (if (= dtype :float) :float :double)
+         scalar-kernel-args (mapv (fn [v]
+                                    (if (map? v) v
+                                        {:type scalar-type
+                                         :value (if (= scalar-type :float) (float v) (double v))}))
+                                  scalar-args)
+         all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
+         wg (long workgroup-size)
+         ;; A reduction binds via this same path (arrays..., scalars..., _n_bound) but launches a
+         ;; SINGLE workgroup so the kernel's grid-stride loop covers all n and writes output[0] —
+         ;; the result stays device-resident with no host cross-group combine. Callers pass
+         ;; {:group-count 1}; map/map-void leave it nil and get the full ceil(n/wg) grid.
+         group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
+         async? (boolean (get opts :async?))
+         cmd-list (if async? (async-cmd-list) (:cmd-list @state))]
+     {:bound (bind-kernel! kernel-handle wg all-args cmd-list)
+      :group-count group-count
+      :kernel-name kernel-name
+      :async? async?})))
+
+(defn launch-registered-bound!
+  "Dispatch a kernel pre-bound by bind-registered-map-void-kernel. Synchronous."
+  [prepared]
+  (launch-bound! (:bound prepared) (long (:group-count prepared))))
+
+(defn record-graph!
+  "Record a FIXED ordered sequence of pre-bound kernels into a regular (replayable) command
+  list — a 'command graph'. The per-launch host-append cost (FFI + driver, ~75µs each) is paid
+  ONCE here; replay-graph! then dispatches the whole sequence with a single queue execute. This
+  is the AOT decode-graph: the kernel sequence, group sizes, and buffer POINTERS are baked in at
+  record time; buffer CONTENTS may change freely between replays (the decode pattern — each
+  token rewrites the activation buffers, the recorded matmuls read whatever is there).
+
+  prepareds: ordered seq of maps from bind-registered-map-void-kernel (each carries its own
+  dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
+  Re-record only if the kernel sequence or any buffer is reallocated."
+  ([prepareds] (record-graph! prepareds {:barriers? true}))
+  ([prepareds {:keys [barriers?] :or {barriers? true}}]
+  (ensure-init!)
+  (let [{:keys [arena context device]} @state
+        cq-desc (.allocate ^Arena arena 40)
+        _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until the list completes
+        q-out (ptr-seg arena)
+        _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
+                    [context device cq-desc q-out])
+        queue (read-ptr q-out)
+        cl-desc (.allocate ^Arena arena 24)
+        _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+        l-out (ptr-seg arena)
+        _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate
+                    [context device cl-desc l-out])
+        lst (read-ptr l-out)
+        h-launch @h-zeCommandListAppendLaunchKernel
+        h-barrier @h-zeCommandListAppendBarrier]
+    ;; append each bound kernel's launch (args already live on its dedicated handle; the
+    ;; group-count value is captured into the recorded command at append time). A barrier
+    ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
+    ;; decode chain is dependent (norm→quant→matmul→…). Independent ops still serialize, but
+    ;; each is memory-bound so overlap buys little; correctness first. (Measured: an IN_ORDER
+    ;; command list with no barriers is the same replay time — the ~50µs/kernel floor on this
+    ;; iGPU is per-dispatch overhead, not the barrier. Fewer/bigger kernels is the lever.)
+    (doseq [{:keys [bound group-count]} prepareds]
+      (let [^MemorySegment gc (:gc-seg bound)]
+        (.set gc I32 0 (int group-count))
+        (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                  [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
+        (when barriers?
+          (ze-call! "zeCommandListAppendBarrier" h-barrier
+                    [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
+    (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+    (let [lists-arr (ptr-seg arena)]
+      (.set lists-arr PTR 0 ^MemorySegment lst)
+      {:queue queue :list lst :lists-arr lists-arr}))))
+
+(defn replay-graph!
+  "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."
+  [graph]
+  (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
+            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
+
+(defn- destroy-handle!
+  [^MethodHandle mh ^MemorySegment seg]
+  (when (and seg (not (.equals MemorySegment/NULL seg)))
+    (try (.invokeWithArguments mh ^java.util.List (java.util.List/of (object-array [seg])))
+         (catch Exception _))))
+
+(defn destroy-prepared!
+  "Destroy the DEDICATED kernel handle a prepared binding owns (create-kernel-fresh allocates one
+  per bind; it is NOT in the registry's cache, so shutdown!/free-arena-kernels! never reach it).
+  Without this every prepare!/bind leaks a zeKernel driver object → the driver's kernel table
+  fills → zeKernelCreate / launch eventually fail (SIGABRT). Idempotent; safe on partial maps."
+  [prepared]
+  (destroy-handle! @h-zeKernelDestroy (get-in prepared [:bound :kernel])))
+
+(defn destroy-graph!
+  "Destroy a recorded command graph's queue + list (record-graph! creates one of each per graph
+  and never frees them). Without this every record-graph! leaks a zeCommandQueue + zeCommandList."
+  [graph]
+  (destroy-handle! @h-zeCommandListDestroy (:list graph))
+  (destroy-handle! @h-zeCommandQueueDestroy (:queue graph)))
 
 ;; ================================================================
 ;; Exclusive scan kernel invocation (Blelloch algorithm)
@@ -1962,9 +2182,13 @@
 
   Backend-agnostic: works with Level Zero today, CUDA/ROCm later."
   [^String kernel-name input-bufs n]
-  (let [{:keys [kernel-handle workgroup-size identity-val dtype]
-         :or {workgroup-size 256 identity-val 0.0 dtype :float}
+  (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
+         :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :float}
          :as info} (ensure-kernel-loaded! kernel-name)
+        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
+                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                           "*"    (fn ^double [^double a ^double b] (* a b))
+                           (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))
@@ -1986,8 +2210,8 @@
       (loop [i 0 acc (double identity-val)]
         (if (< i group-count)
           (recur (inc i)
-                 (+ acc (double (.get dev-partial value-layout
-                                      (* i dtype-size)))))
+                 (double (combine acc (double (.get dev-partial value-layout
+                                                    (* i dtype-size))))))
           acc)))))
 
 (defn invoke-gpu-axpy!

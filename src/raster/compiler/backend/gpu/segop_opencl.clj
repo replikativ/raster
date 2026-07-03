@@ -9,6 +9,7 @@
    same SegOp IR but produce different target code."
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [clojure.string :as str]))
 
 ;; ================================================================
@@ -25,46 +26,73 @@
 (defn generate-segmap-kernel
   "Generate an OpenCL C kernel from a SegMap record.
 
+   Mirrors the legacy par-map-void generator's array handling so a fused pure
+   par/map (possibly composed of several maps the SOAC fuser collapsed) emits
+   correct C: (1) normalize the devirtualized array prims (.invk aget_m_T-impl …)
+   back to aget heads so array detection + per-element typing + emit recognize
+   them (else the array is mis-classified scalar and aget becomes a broken helper
+   call); (2) type each INPUT array by its declared element type (array-types,
+   merged with the body's :tag metadata) — a float input read through a double*
+   param silently miscompiles; (3) type the OUTPUT by the map's computed element
+   dtype (:dtype segmap), which may differ from the inputs (e.g. a float input
+   promoted to double by a double literal).
+
    Returns {:kernel-name str :source str :array-params [syms]
             :scalar-params [syms] :dtype kw}."
-  [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types]
+  [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types]
                      :or {dtype :double kernel-name-prefix "par_map"
-                          scalar-types {}}}]
+                          scalar-types {} array-types {}}}]
   (let [idx (seg-idx segmap)
-        body (:lambda segmap)
+        ;; (1) normalize .invk array prims → aget/aset heads
+        body (ce/normalize-array-prims (:lambda segmap))
         cast-fn (:cast-fn segmap)
-        dtype (or (:dtype segmap) dtype)
+        out-dtype (or (:dtype segmap) dtype)
+        default-ctype (get codegen/opencl-type-map dtype "double")
+        out-ctype (get codegen/opencl-type-map out-dtype "double")
+        ;; (2) per-array element types: declared (array-types) ∪ body :tag metadata
+        meta-types (ce/collect-array-types-from-meta body)
+        array-types (merge meta-types array-types)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         ;; Use pre-computed inputs/scalars from SegOp
         arr-params (vec (sort-by name (:inputs segmap)))
         scl-params (vec (sort-by name (:scalars segmap)))
-        ;; Build parameter strings
+        arr-type (fn [s]
+                   (let [t (get array-types s (get array-types (symbol (name s)) dtype))]
+                     (get codegen/opencl-type-map t default-ctype)))
+        ;; fp64 needed when the output OR any input array is double
+        use-fp64? (or (= out-dtype :double)
+                      (some #(= "double" (arr-type %)) arr-params))
         arr-param-str (str/join ", "
-                                (map (fn [s] (str "__global const " ctype "* restrict "
+                                (map (fn [s] (str "__global const " (arr-type s) "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
+        ;; Integer scalar params seed *int-vars* so index math stays integer
+        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k)))) scalar-types))
         scl-type (fn [s]
                    (let [sname (name s)
                          explicit (get scalar-types s (get scalar-types (symbol sname)))]
                      (cond
-                       (= explicit :int) "int"
+                       (= explicit :int)    "int"
+                       (= explicit :long)   "long"
+                       (= explicit :double) "double"
+                       (= explicit :float)  default-ctype
                        (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
                            (contains? #{'long 'int} (:tag (meta s))))
                        "int"
-                       :else ctype)))
+                       :else default-ctype)))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
-        out-param (str "__global " ctype "* restrict out")
+        out-param (str "__global " out-ctype "* restrict out")
         all-params (str/join ", "
                              (remove empty?
                                      [arr-param-str out-param scl-param-str "int _n_bound"]))
         ;; Emit body as C expression
-        adapted-body (ce/adapt-casts-for-dtype body dtype)
+        adapted-body (ce/adapt-casts-for-dtype body out-dtype)
         body-str (binding [ce/*emit-config* ce/opencl-config
-                           ce/*scalar-type* ctype]
+                           ce/*scalar-type* out-ctype
+                           ce/*idx-sym* idx
+                           ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
         source (str (when use-fp64? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
@@ -79,7 +107,7 @@
      :array-params arr-params
      :scalar-params scl-params
      :out-param out-param
-     :dtype dtype}))
+     :dtype out-dtype}))
 
 ;; ================================================================
 ;; SegRed → OpenCL kernel (two-phase reduction)
@@ -111,21 +139,40 @@
           (let [[_ binds & bdy] lambda]
             [(vec (partition 2 binds)) (last bdy)])
           [nil lambda])
-        op-sym (when (seq? inner-body) (first inner-body))
-        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*, 'clojure.core/- '-} op-sym op-sym)
-        c-op (condp = normalized-op '+ "+" '* "*" 'Math/max "fmax" 'Math/min "fmin" "+")
+        ;; .invk-aware: the walker devirtualizes (raster.numeric/+ acc x) into
+        ;; (.invk _plus_impl acc x) with :raster.op/original metadata. semantic-op recovers the
+        ;; original op and call-args the real operands — never parse the mangled impl name (which
+        ;; would mis-detect the op and capture the impl symbol as the element). Same fix #37 made
+        ;; for SegMap; here it keeps SegRed combine-op detection sound for both bare and .invk forms.
+        op-sym (when (seq? inner-body) (descriptor/semantic-op inner-body))
+        normalized-op (get {'clojure.core/+ '+, 'clojure.core/* '*,
+                            'raster.numeric/+ '+, 'raster.numeric/* '*,
+                            'clojure.core/max 'max, 'raster.numeric/max 'max, 'Math/max 'max,
+                            'clojure.core/min 'min, 'raster.numeric/min 'min, 'Math/min 'min}
+                           op-sym op-sym)
+        ;; Unknown combine ops must FAIL LOUD — the old default silently combined with "+"
+        ;; (a max reduce summed the per-lane maxima). Only associative ops are legal here.
+        c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
+               (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
+                                    " — GPU reduction needs an associative op (+ * max min)")
+                               {:op op-sym :lambda lambda})))
         c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
         identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
-        ;; Extract element expression (the non-acc part), re-wrap in let if needed
+        ;; fmax/fmin are functions, not infix operators
+        c-combine (fn [a b] (if (#{"fmax" "fmin"} c-op)
+                              (str c-op "(" a ", " b ")")
+                              (str "(" a " " c-op " " b ")")))
+        ;; Extract the element expression (the non-acc operand) from the SEMANTIC args.
+        op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
+        acc-at? (fn [a] (or (= a acc)
+                            (and (seq? a) (= 'double (first a)) (= acc (second a)))))
         [_acc-pos elem-expr-raw]
-        (when (and (seq? inner-body) (>= (count inner-body) 3))
-          (cond
-            (= (nth inner-body 1) acc) [:left (nth inner-body 2)]
-            (= (nth inner-body 2) acc) [:right (nth inner-body 1)]
-            (and (seq? (nth inner-body 1)) (= 'double (first (nth inner-body 1)))
-                 (= acc (second (nth inner-body 1))))
-            [:left (nth inner-body 2)]
-            :else [nil nil]))
+        (when (>= (count op-args) 2)
+          (let [a0 (nth op-args 0) a1 (nth op-args 1)]
+            (cond
+              (acc-at? a0) [:left a1]
+              (acc-at? a1) [:right a0]
+              :else [nil nil])))
         ;; Re-wrap in let if there were bindings (preserves local variable scope)
         elem-expr (if (and elem-expr-raw (seq let-bindings))
                     (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
@@ -162,13 +209,13 @@
                       "    int stride = get_global_size(0);\n"
                       "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
                       "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
-                      "        val = (val " c-op " " elem-str ");\n"
+                      "        val = " (c-combine "val" elem-str) ";\n"
                       "    }\n"
                       "    sdata[tid] = val;\n"
                       "    barrier(CLK_LOCAL_MEM_FENCE);\n"
                       "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
                       "        if (tid < s) {\n"
-                      "            sdata[tid] = (sdata[tid] " c-op " sdata[tid + s]);\n"
+                      "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
                       "        }\n"
                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                       "    }\n"
