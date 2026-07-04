@@ -94,21 +94,21 @@
 ;; No trainable params (theta/positions are fixed) — only x gets a gradient.
 (deftm rope-backward-dx (All [T] [dy :- (Array T) seq-len :- Long heads :- Long
                                   head-dim :- Long theta :- Double] :- (Array T)
-                            (let [dx (alloc-like dy (* seq-len (* heads head-dim)))
-                                  half (quot head-dim 2)
-                                  ln-theta (m/log theta)]
-                              (dotimes [p seq-len]
-                                (dotimes [h heads]
-                                  (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))]
-                                    (dotimes [i half]
-                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                            ang (* (double p) freq)
-                                            c (m/cos ang) s (m/sin ang)
-                                            d0 (aget dy (+ base i))
-                                            d1 (aget dy (+ (+ base i) half))]
-                                        (aset dx (+ base i) (+ (* d0 c) (* d1 s)))
-                                        (aset dx (+ (+ base i) half) (- (* d1 c) (* d0 s))))))))
-                              dx)))
+                             (let [dx (alloc-like dy (* seq-len (* heads head-dim)))
+                                   half (quot head-dim 2)
+                                   ln-theta (m/log theta)]
+                               (dotimes [p seq-len]
+                                 (dotimes [h heads]
+                                   (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))]
+                                     (dotimes [i half]
+                                       (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                             ang (* (double p) freq)
+                                             c (m/cos ang) s (m/sin ang)
+                                             d0 (aget dy (+ base i))
+                                             d1 (aget dy (+ (+ base i) half))]
+                                         (aset dx (+ base i) (+ (* d0 c) (* d1 s)))
+                                         (aset dx (+ (+ base i) half) (- (* d1 c) (* d0 s))))))))
+                               dx)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
                            {:params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
@@ -410,59 +410,59 @@
                                        out :- (Array T) sc :- (Array T)
                                        clenbuf :- (Array long) n-q :- Long group :- Long
                                        n-kv :- Long head-dim :- Long maxpos :- Long scale :- Double] :- Void
- (do
+                                      (do
   ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
-  (raster.par/map-void! ij (clojure.core/* n-q maxpos)
-    (let [cache-len (aget clenbuf 0)
-          hq (quot ij maxpos)
-          j (rem ij maxpos)]
-      (when (< j cache-len)
-        (let [hkv (quot hq group)
-              qb (clojure.core/* hq head-dim)
-              kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
-                                 (clojure.core/* hkv head-dim))
-              dot (loop [d 0 acc 0.0]
-                    (if (< d head-dim)
-                      (recur (inc d)
-                             (+ acc (* (aget q (clojure.core/+ qb d))
-                                       (aget k (clojure.core/+ kb d)))))
-                      acc))]
-          (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
+                                        (raster.par/map-void! ij (clojure.core/* n-q maxpos)
+                                                              (let [cache-len (aget clenbuf 0)
+                                                                    hq (quot ij maxpos)
+                                                                    j (rem ij maxpos)]
+                                                                (when (< j cache-len)
+                                                                  (let [hkv (quot hq group)
+                                                                        qb (clojure.core/* hq head-dim)
+                                                                        kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                                                                           (clojure.core/* hkv head-dim))
+                                                                        dot (loop [d 0 acc 0.0]
+                                                                              (if (< d head-dim)
+                                                                                (recur (inc d)
+                                                                                       (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                                 (aget k (clojure.core/+ kb d)))))
+                                                                                acc))]
+                                                                    (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
   ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
-  (raster.par/map-void! hq n-q
-    (let [cache-len (aget clenbuf 0)
-          scb (clojure.core/* hq maxpos)
-          neg-inf -1.0e38
-          mx (loop [j 0 mm neg-inf]
-               (if (< j cache-len)
-                 (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
-          sum (loop [j 0 s 0.0]
-                (if (< j cache-len)
-                  (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
-                    (aset sc (clojure.core/+ scb j) e)
-                    (recur (inc j) (+ s e)))
-                  s))
-          inv (/ 1.0 sum)]
-      (loop [j 0]
-        (if (< j cache-len)
-          (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
-              (recur (inc j)))
-          nil))))
+                                        (raster.par/map-void! hq n-q
+                                                              (let [cache-len (aget clenbuf 0)
+                                                                    scb (clojure.core/* hq maxpos)
+                                                                    neg-inf -1.0e38
+                                                                    mx (loop [j 0 mm neg-inf]
+                                                                         (if (< j cache-len)
+                                                                           (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+                                                                    sum (loop [j 0 s 0.0]
+                                                                          (if (< j cache-len)
+                                                                            (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                                                                              (aset sc (clojure.core/+ scb j) e)
+                                                                              (recur (inc j) (+ s e)))
+                                                                            s))
+                                                                    inv (/ 1.0 sum)]
+                                                                (loop [j 0]
+                                                                  (if (< j cache-len)
+                                                                    (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
+                                                                        (recur (inc j)))
+                                                                    nil))))
   ;; phase 3: out[hq,d] = Σ_j sc[hq,j] * v[j,hkv,d] — one work-item per (hq, d)
-  (raster.par/map-void! hd (clojure.core/* n-q head-dim)
-    (let [cache-len (aget clenbuf 0)
-          hq (quot hd head-dim)
-          d (rem hd head-dim)
-          scb (clojure.core/* hq maxpos)
-          kvstride (clojure.core/* n-kv head-dim)
-          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
-      (aset out (clojure.core/+ (clojure.core/* hq head-dim) d)
-            (loop [j 0 a 0.0]
-              (if (< j cache-len)
-                (recur (inc j)
-                       (+ a (* (aget sc (clojure.core/+ scb j))
-                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
-                a))))))))
+                                        (raster.par/map-void! hd (clojure.core/* n-q head-dim)
+                                                              (let [cache-len (aget clenbuf 0)
+                                                                    hq (quot hd head-dim)
+                                                                    d (rem hd head-dim)
+                                                                    scb (clojure.core/* hq maxpos)
+                                                                    kvstride (clojure.core/* n-kv head-dim)
+                                                                    hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)]
+                                                                (aset out (clojure.core/+ (clojure.core/* hq head-dim) d)
+                                                                      (loop [j 0 a 0.0]
+                                                                        (if (< j cache-len)
+                                                                          (recur (inc j)
+                                                                                 (+ a (* (aget sc (clojure.core/+ scb j))
+                                                                                         (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
+                                                                          a))))))))
 
 (deftm causal-scaled-dot-product-attn (All [T]
                                            [Q :- (Array T) K :- (Array T) V :- (Array T)
@@ -612,6 +612,88 @@
                                           dK (list 'clojure.core/aget bundle 1)
                                           dV (list 'clojure.core/aget bundle 2)])
                                  [dQ dK dV nil nil nil]]))})
+
+;; Forward tangent (JVP, §13 A3) of causal SDPA — the standard form, single
+;; output array (mirrors the backward's recompute-then-gemm structure):
+;;   W  = causal-softmax(s·Q·Kᵀ)              (recomputed)
+;;   dZ = s·(dQ·Kᵀ + Q·dKᵀ)
+;;   dW = W ⊙ (dZ − rowsum(W⊙dZ))             (softmax JVP per query row;
+;;                                             masked j>i have W=0 ⇒ dW=0)
+;;   dO = dW·V + W·dV
+(deftm causal-scaled-dot-product-attn-jvp
+  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
+   Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-len :- Long dk :- Long dv :- Long]
+  :- (Array double)
+  (let [scale (/ 1.0 (n/sqrt (double dk)))
+        neg-inf-c Double/NEGATIVE_INFINITY
+        ;; Recompute causal softmax weights (same as the backward)
+        weights (double-array (* seq-len seq-len))
+        _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale 0.0)
+        _ (dotimes [i seq-len]
+            (let [offset (* i (int seq-len))]
+              (dotimes [j seq-len]
+                (when (> j i)
+                  (aset weights (+ offset j) neg-inf-c)))))
+        _ (dotimes [i seq-len]
+            (let [offset (* i (int seq-len))
+                  max-s (loop [j 0 m neg-inf-c]
+                          (if (< j seq-len)
+                            (recur (inc j) (n/max m (aget weights (+ offset j))))
+                            m))
+                  sum-exp (loop [j 0 s 0.0]
+                            (if (< j seq-len)
+                              (let [s-ij (aget weights (+ offset j))
+                                    e (if (== s-ij neg-inf-c)
+                                        0.0
+                                        (m/exp (- s-ij max-s)))]
+                                (aset weights (+ offset j) e)
+                                (recur (inc j) (+ s e)))
+                              s))
+                  inv-sum (if (== sum-exp 0.0) 0.0 (/ 1.0 sum-exp))]
+              (dotimes [j seq-len]
+                (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
+        ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
+        dZ (double-array (* seq-len seq-len))
+        _ (blas/dgemm-nt! dQ K dZ seq-len dk seq-len scale 0.0)
+        _ (blas/dgemm-nt! Q dK dZ seq-len dk seq-len scale 1.0)
+        ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
+        dW (double-array (* seq-len seq-len))
+        _ (dotimes [i seq-len]
+            (let [offset (* i (int seq-len))
+                  wdz (loop [j 0 s 0.0]
+                        (if (< j seq-len)
+                          (recur (inc j) (+ s (* (aget weights (+ offset j))
+                                                 (aget dZ (+ offset j)))))
+                          s))]
+              (dotimes [j seq-len]
+                (aset dW (+ offset j)
+                      (* (aget weights (+ offset j))
+                         (- (aget dZ (+ offset j)) wdz))))))
+        ;; dO = dW·V + W·dV
+        dO (double-array (* seq-len dv))
+        _ (blas/dgemm! dW V dO seq-len seq-len dv 1.0 0.0)
+        _ (blas/dgemm! weights dV dO seq-len seq-len dv 1.0 1.0)]
+    dO))
+
+;; causal SDPA :jvp-fn — one kernel call; absent tangents get typed zeros
+;; (the pushforward is jointly linear in (dQ,dK,dV), so zeros are exact).
+(tmpl/merge-into-template!
+ 'raster.dl.attention/causal-scaled-dot-product-attn
+ {:jvp-fn
+  (fn [ctx [Q K V seq-len dk dv] tangent-args _result-sym gensym-fn]
+    (let [dQ (nth tangent-args 0 nil)
+          dK (nth tangent-args 1 nil)
+          dV (nth tangent-args 2 nil)]
+      (when-not (or dQ dK dV)
+        (throw (ex-info "causal-scaled-dot-product-attn jvp: no active tangent reached the call"
+                        {:op 'raster.dl.attention/causal-scaled-dot-product-attn})))
+      (tmpl/bind-jvp-term ctx gensym-fn "jcspa"
+                          (list 'raster.dl.attention/causal-scaled-dot-product-attn-jvp
+                                (or dQ (tmpl/jvp-zero-like Q))
+                                (or dK (tmpl/jvp-zero-like K))
+                                (or dV (tmpl/jvp-zero-like V))
+                                Q K V seq-len dk dv))))})
 
 ;; ================================================================
 ;; Causal single-head attention (AD-friendly: no head-split shuffles).
@@ -769,6 +851,57 @@
                                           dV (list 'clojure.core/aget b 2)])
                                  [dQ dK dV nil nil nil nil]]))})
 
+;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention — mirrors
+;; gqa-causal-mha-backward's head iteration: per query head hq, slice the
+;; (Q,K,V) and (dQ,dK,dV) head slabs, run the single-head causal-SDPA JVP,
+;; and WRITE the head tangent into hq's output slab (each hq owns its slab —
+;; no accumulation on the output side; the kv-head fan-IN that forces dK/dV
+;; accumulation in the backward has no forward counterpart).
+(deftm gqa-causal-mha-jvp
+  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
+   Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+  :- (Array double)
+  (let [group (quot n-q n-kv)
+        qstride (* n-q head-dim)
+        kvstride (* n-kv head-dim)
+        dOut (double-array (* seq-len qstride))]
+    (dotimes [hq n-q]
+      (let [hkv (quot hq (int group))
+            Qh (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
+            Kh (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
+            Vh (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
+            dQh (ops/slice-strided-2d dQ seq-len qstride (* hq (int head-dim)) head-dim)
+            dKh (ops/slice-strided-2d dK seq-len kvstride (* hkv (int head-dim)) head-dim)
+            dVh (ops/slice-strided-2d dV seq-len kvstride (* hkv (int head-dim)) head-dim)
+            dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
+                                                    seq-len head-dim head-dim)]
+        (dotimes [r seq-len]
+          (let [qoff (+ (* r (int qstride)) (* hq (int head-dim)))
+                hoff (* r (int head-dim))]
+            (dotimes [c head-dim]
+              (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))
+    dOut))
+
+;; gqa-causal-mha :jvp-fn — one kernel call; absent tangents get typed zeros
+;; (jointly linear pushforward in (dQ,dK,dV)).
+(tmpl/merge-into-template!
+ 'raster.dl.attention/gqa-causal-mha
+ {:jvp-fn
+  (fn [ctx [Q K V seq-len n-q n-kv head-dim] tangent-args _result-sym gensym-fn]
+    (let [dQ (nth tangent-args 0 nil)
+          dK (nth tangent-args 1 nil)
+          dV (nth tangent-args 2 nil)]
+      (when-not (or dQ dK dV)
+        (throw (ex-info "gqa-causal-mha jvp: no active tangent reached the call"
+                        {:op 'raster.dl.attention/gqa-causal-mha})))
+      (tmpl/bind-jvp-term ctx gensym-fn "jgqa"
+                          (list 'raster.dl.attention/gqa-causal-mha-jvp
+                                (or dQ (tmpl/jvp-zero-like Q))
+                                (or dK (tmpl/jvp-zero-like K))
+                                (or dV (tmpl/jvp-zero-like V))
+                                Q K V seq-len n-q n-kv head-dim))))})
+
 ;; ================================================================
 ;; Multi-head self-attention (bidirectional, for BERT-style models)
 ;; x:[seq_len, d_model], Wq/Wk/Wv:[d_model, d_model], Wo:[d_model, d_model]
@@ -783,52 +916,52 @@
   [-88,0]. (SVML VectorOperators/EXP is not intrinsified on this JVM, so Math/exp
   stays scalar; this does not depend on it.)"
   (All [T] [x :- T] :- T
-    (let [t (n/* x 9.765625E-4)                    ; x / 1024
-          p (n/+ 0.008333334 (n/* t 0.0013888889)) ; 1/120 + t/720
-          p (n/+ 0.041666668 (n/* t p))            ; 1/24  + t p
-          p (n/+ 0.16666667 (n/* t p))             ; 1/6
-          p (n/+ 0.5 (n/* t p))                    ; 1/2
-          p (n/+ 1.0 (n/* t p))                    ; 1
-          p (n/+ 1.0 (n/* t p))                    ; e^t (Taylor deg 6)
-          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)
-          p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)]
-      p)))
+       (let [t (n/* x 9.765625E-4)                    ; x / 1024
+             p (n/+ 0.008333334 (n/* t 0.0013888889)) ; 1/120 + t/720
+             p (n/+ 0.041666668 (n/* t p))            ; 1/24  + t p
+             p (n/+ 0.16666667 (n/* t p))             ; 1/6
+             p (n/+ 0.5 (n/* t p))                    ; 1/2
+             p (n/+ 1.0 (n/* t p))                    ; 1
+             p (n/+ 1.0 (n/* t p))                    ; e^t (Taylor deg 6)
+             p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)
+             p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p) p (n/* p p)]
+         p)))
 
 (deftm softmax-rows!
   "In-place row-wise softmax of a [rows, cols] row-major array — one fused pass
   per row (max → exp → sum → normalize). Scale is assumed already folded into the
   values (via the QK^T GEMM alpha). Parametric; float-pure."
   (All [T] [x :- (Array T) rows :- Long cols :- Long] :- (Array T)
-    (let [n (* rows (int cols))
+       (let [n (* rows (int cols))
           ;; per-row max → broadcast to per-element (cheap, memory-bound scalar)
-          maxes (alloc-like x n)
-          _ (dotimes [r rows]
-              (let [off (* r (int cols))
-                    mx (loop [j 0 m (n/neg-inf-val (aget x off))]
-                         (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
-                (dotimes [j cols] (aset maxes (+ off j) mx))))
+             maxes (alloc-like x n)
+             _ (dotimes [r rows]
+                 (let [off (* r (int cols))
+                       mx (loop [j 0 m (n/neg-inf-val (aget x off))]
+                            (if (< j cols) (recur (inc j) (n/max m (aget x (+ off j)))) m))]
+                   (dotimes [j cols] (aset maxes (+ off j) mx))))
           ;; VECTORIZED exp = exp(x - max): a flat `broadcast` (recognized par
           ;; form → SIMD-vectorized SegMap under compile-aot) with the fast-exp
           ;; polynomial INLINED (e^(v/1024)^1024, deg-6 Taylor + 10 squarings;
           ;; only +/* → a pure FMA/mul lane chain). A raw nested dotimes here
           ;; stays scalar; a deftm call stays opaque; SVML EXP is not intrinsified.
-          e (broadcast [x maxes]
-              (let [v (- x maxes) t (* v 9.765625E-4)
-                    a (+ 0.008333334 (* t 0.0013888889)) b (+ 0.041666668 (* t a))
-                    c (+ 0.16666667 (* t b)) d (+ 0.5 (* t c))
-                    ee (+ 1.0 (* t d)) f (+ 1.0 (* t ee))
-                    p1 (* f f) p2 (* p1 p1) p3 (* p2 p2) p4 (* p3 p3) p5 (* p4 p4)
-                    p6 (* p5 p5) p7 (* p6 p6) p8 (* p7 p7) p9 (* p8 p8) p10 (* p9 p9)]
-                p10))
+             e (broadcast [x maxes]
+                          (let [v (- x maxes) t (* v 9.765625E-4)
+                                a (+ 0.008333334 (* t 0.0013888889)) b (+ 0.041666668 (* t a))
+                                c (+ 0.16666667 (* t b)) d (+ 0.5 (* t c))
+                                ee (+ 1.0 (* t d)) f (+ 1.0 (* t ee))
+                                p1 (* f f) p2 (* p1 p1) p3 (* p2 p2) p4 (* p3 p3) p5 (* p4 p4)
+                                p6 (* p5 p5) p7 (* p6 p6) p8 (* p7 p7) p9 (* p8 p8) p10 (* p9 p9)]
+                            p10))
           ;; per-row sum of e, normalize back into x (cheap, memory-bound scalar)
-          _ (dotimes [r rows]
-              (let [off (* r (int cols))
-                    s (loop [j 0 acc 0.0]
-                        (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
-                    inv (/ 1.0 s)]
-                (dotimes [j cols]
-                  (aset x (+ off j) (* (aget e (+ off j)) inv)))))]
-      x)))
+             _ (dotimes [r rows]
+                 (let [off (* r (int cols))
+                       s (loop [j 0 acc 0.0]
+                           (if (< j cols) (recur (inc j) (+ acc (aget e (+ off j)))) acc))
+                       inv (/ 1.0 s)]
+                   (dotimes [j cols]
+                     (aset x (+ off j) (* (aget e (+ off j)) inv)))))]
+         x)))
 
 ;; Batched multi-head attention: composed from the layout/GEMM/softmax
 ;; combinators (pack-heads → batched QK^T with scale folded → fused row-softmax →
@@ -845,27 +978,27 @@
                                   Wo :- (Array T) bo :- (Array T)
                                   seq-len :- Long d-model :- Long n-heads :- Long]
                                  :- (Array T)
-  (let [dk (quot d-model n-heads)
-        scale (n/oftype x (clojure.core// 1.0 (Math/sqrt (double dk))))
+                                 (let [dk (quot d-model n-heads)
+                                       scale (n/oftype x (clojure.core// 1.0 (Math/sqrt (double dk))))
         ;; Q,K,V projections: [seq_len, d_model]
-        Q (nn/linear x Wq bq seq-len d-model d-model)
-        K (nn/linear x Wk bk seq-len d-model d-model)
-        V (nn/linear x Wv bv seq-len d-model d-model)
+                                       Q (nn/linear x Wq bq seq-len d-model d-model)
+                                       K (nn/linear x Wk bk seq-len d-model d-model)
+                                       V (nn/linear x Wv bv seq-len d-model d-model)
         ;; pack to head-major contiguous [n_heads, seq_len, dk]
-        Qh (ops/pack-heads Q seq-len n-heads dk)
-        Kh (ops/pack-heads K seq-len n-heads dk)
-        Vh (ops/pack-heads V seq-len n-heads dk)
+                                       Qh (ops/pack-heads Q seq-len n-heads dk)
+                                       Kh (ops/pack-heads K seq-len n-heads dk)
+                                       Vh (ops/pack-heads V seq-len n-heads dk)
         ;; scores[n_heads, seq, seq] = scale * Qh @ Kh^T  (one batched GEMM)
-        scores (alloc-like x (* n-heads seq-len seq-len))
-        _ (blas/batched-gemm-nt! Qh Kh scores n-heads seq-len dk seq-len scale)
+                                       scores (alloc-like x (* n-heads seq-len seq-len))
+                                       _ (blas/batched-gemm-nt! Qh Kh scores n-heads seq-len dk seq-len scale)
         ;; fused row-softmax over the key dimension
-        _ (softmax-rows! scores (* n-heads seq-len) seq-len)
+                                       _ (softmax-rows! scores (* n-heads seq-len) seq-len)
         ;; ctx[n_heads, seq, dk] = scores @ Vh  (one batched GEMM)
-        ctxh (alloc-like x (* n-heads seq-len dk))
-        _ (blas/batched-gemm-nn! scores Vh ctxh n-heads seq-len seq-len dk (n/oftype x 1.0))
+                                       ctxh (alloc-like x (* n-heads seq-len dk))
+                                       _ (blas/batched-gemm-nn! scores Vh ctxh n-heads seq-len seq-len dk (n/oftype x 1.0))
         ;; unpack to [seq_len, d_model] and project out
-        ctx (ops/unpack-heads ctxh seq-len n-heads dk)]
-    (nn/linear ctx Wo bo seq-len d-model d-model))))
+                                       ctx (ops/unpack-heads ctxh seq-len n-heads dk)]
+                                   (nn/linear ctx Wo bo seq-len d-model d-model))))
 
 ;; ================================================================
 ;; KV-cache: incremental attention for autoregressive generation
@@ -1170,6 +1303,76 @@
                                                     dV (list 'clojure.core/aget grads-arr 2)])
                                            [dQ dK dV nil nil nil nil]]))})
 
+;; Forward tangent (JVP, §13 A3) of (bidirectional) SDPA — the standard form,
+;; single output array (mirrors the backward's recompute-then-gemm structure):
+;;   W  = softmax(s·Q·Kᵀ);  dZ = s·(dQ·Kᵀ + Q·dKᵀ)
+;;   dW = W ⊙ (dZ − rowsum(W⊙dZ));  dO = dW·V + W·dV
+(deftm scaled-dot-product-attn-jvp
+  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
+   Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+  :- (Array double)
+  (let [scale (/ 1.0 (n/sqrt (double dk)))
+        ;; Recompute softmax weights (same as the backward)
+        weights (double-array (* seq-q seq-k))
+        _ (blas/dgemm-nt! Q K weights seq-q dk seq-k scale 0.0)
+        _ (dotimes [i seq-q]
+            (let [offset (* i (int seq-k))
+                  max-s (loop [j 0 m n/neg-inf]
+                          (if (< j seq-k)
+                            (recur (inc j) (n/max m (aget weights (+ offset j))))
+                            m))
+                  sum-exp (loop [j 0 s 0.0]
+                            (if (< j seq-k)
+                              (let [e (m/exp (- (aget weights (+ offset j)) max-s))]
+                                (aset weights (+ offset j) e)
+                                (recur (inc j) (+ s e)))
+                              s))
+                  inv-sum (/ 1.0 sum-exp)]
+              (dotimes [j seq-k]
+                (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
+        ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
+        dZ (double-array (* seq-q seq-k))
+        _ (blas/dgemm-nt! dQ K dZ seq-q dk seq-k scale 0.0)
+        _ (blas/dgemm-nt! Q dK dZ seq-q dk seq-k scale 1.0)
+        ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
+        dW (double-array (* seq-q seq-k))
+        _ (dotimes [i seq-q]
+            (let [offset (* i (int seq-k))
+                  wdz (loop [j 0 s 0.0]
+                        (if (< j seq-k)
+                          (recur (inc j) (+ s (* (aget weights (+ offset j))
+                                                 (aget dZ (+ offset j)))))
+                          s))]
+              (dotimes [j seq-k]
+                (aset dW (+ offset j)
+                      (* (aget weights (+ offset j))
+                         (- (aget dZ (+ offset j)) wdz))))))
+        ;; dO = dW·V + W·dV
+        dO (double-array (* seq-q dv))
+        _ (blas/dgemm! dW V dO seq-q seq-k dv 1.0 0.0)
+        _ (blas/dgemm! weights dV dO seq-q seq-k dv 1.0 1.0)]
+    dO))
+
+;; SDPA :jvp-fn — one kernel call; absent tangents get typed zeros (the
+;; pushforward is jointly linear in (dQ,dK,dV), so zeros are exact).
+(tmpl/merge-into-template!
+ 'raster.dl.attention/scaled-dot-product-attn
+ {:jvp-fn
+  (fn [ctx [Q K V seq-q seq-k dk dv] tangent-args _result-sym gensym-fn]
+    (let [dQ (nth tangent-args 0 nil)
+          dK (nth tangent-args 1 nil)
+          dV (nth tangent-args 2 nil)]
+      (when-not (or dQ dK dV)
+        (throw (ex-info "scaled-dot-product-attn jvp: no active tangent reached the call"
+                        {:op 'raster.dl.attention/scaled-dot-product-attn})))
+      (tmpl/bind-jvp-term ctx gensym-fn "jsdpa"
+                          (list 'raster.dl.attention/scaled-dot-product-attn-jvp
+                                (or dQ (tmpl/jvp-zero-like Q))
+                                (or dK (tmpl/jvp-zero-like K))
+                                (or dV (tmpl/jvp-zero-like V))
+                                Q K V seq-q seq-k dk dv))))})
+
 ;; ---------------------------------------------------------------------------
 ;; PREFILL variants (S3 GPU embed mode): a whole T-token block per replay, no KV
 ;; cache, positions from the work-item index. Causal mask via -1e30 scores.
@@ -1178,23 +1381,23 @@
 (deftm rope-prefill! (All [T] [x :- (Array T) out :- (Array T)
                                nrows :- Long heads :- Long head-dim :- Long
                                theta :- Double] :- Void
-  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
-    (let [hdim2 (quot head-dim 2)
-          per-row (clojure.core/* heads hdim2)
-          t (quot idx per-row)
-          rest0 (rem idx per-row)
-          h (quot rest0 hdim2)
-          i (rem rest0 hdim2)
-          base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
-                               (clojure.core/* h head-dim))
-          ln-theta (m/log theta)
-          freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-          ang (* (double t) freq)
-          c (m/cos ang) s (m/sin ang)
-          x0 (aget x (clojure.core/+ base i))
-          x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-      (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-      (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+                          (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+                                                (let [hdim2 (quot head-dim 2)
+                                                      per-row (clojure.core/* heads hdim2)
+                                                      t (quot idx per-row)
+                                                      rest0 (rem idx per-row)
+                                                      h (quot rest0 hdim2)
+                                                      i (rem rest0 hdim2)
+                                                      base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                                                                           (clojure.core/* h head-dim))
+                                                      ln-theta (m/log theta)
+                                                      freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                      ang (* (double t) freq)
+                                                      c (m/cos ang) s (m/sin ang)
+                                                      x0 (aget x (clojure.core/+ base i))
+                                                      x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                  (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                                  (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
 
 ;; Causal batched attention, 3 phases. q:[T,nq*hd] k,v:[T,nkv*hd] row-major;
 ;; sc:[T*nq, T] scores/probs scratch; out:[T, nq*hd].
@@ -1202,68 +1405,68 @@
                                       nrows :- Long n-q :- Long group :- Long
                                       n-kv :- Long head-dim :- Long
                                       scale :- Double] :- Void
-  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
-    (let [per-i (clojure.core/* n-q nrows)
-          i (quot idx per-i)
-          rest0 (rem idx per-i)
-          hq (quot rest0 nrows)
-          j (rem rest0 nrows)
-          row (clojure.core/+ (clojure.core/* i n-q) hq)]
-      (if (< i j)
-        (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
-        (let [hkv (quot hq group)
-              qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
-                                 (clojure.core/* hq head-dim))
-              kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
-                                 (clojure.core/* hkv head-dim))
-              dot (loop [d 0 acc 0.0]
-                    (if (< d head-dim)
-                      (recur (inc d)
-                             (+ acc (* (aget q (clojure.core/+ qb d))
-                                       (aget k (clojure.core/+ kb d)))))
-                      acc))]
-          (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
+                                 (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+                                                       (let [per-i (clojure.core/* n-q nrows)
+                                                             i (quot idx per-i)
+                                                             rest0 (rem idx per-i)
+                                                             hq (quot rest0 nrows)
+                                                             j (rem rest0 nrows)
+                                                             row (clojure.core/+ (clojure.core/* i n-q) hq)]
+                                                         (if (< i j)
+                                                           (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
+                                                           (let [hkv (quot hq group)
+                                                                 qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                                                                                    (clojure.core/* hq head-dim))
+                                                                 kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                                                                    (clojure.core/* hkv head-dim))
+                                                                 dot (loop [d 0 acc 0.0]
+                                                                       (if (< d head-dim)
+                                                                         (recur (inc d)
+                                                                                (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                          (aget k (clojure.core/+ kb d)))))
+                                                                         acc))]
+                                                             (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
 
 (deftm attn-prefill-softmax! (All [T] [sc :- (Array T)
                                        nrows :- Long n-q :- Long] :- Void
-  (raster.par/map-void! row (clojure.core/* nrows n-q)
-    (let [scb (clojure.core/* row nrows)
-          mx (loop [j 0 mm -1.0e30]
-               (if (< j nrows)
-                 (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
-          sum (loop [j 0 s 0.0]
-                (if (< j nrows)
-                  (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
-                    (aset sc (clojure.core/+ scb j) e)
-                    (recur (inc j) (+ s e)))
-                  s))
-          inv (/ 1.0 sum)]
-      (loop [j 0]
-        (if (< j nrows)
-          (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
-              (recur (inc j)))
-          nil))))))
+                                  (raster.par/map-void! row (clojure.core/* nrows n-q)
+                                                        (let [scb (clojure.core/* row nrows)
+                                                              mx (loop [j 0 mm -1.0e30]
+                                                                   (if (< j nrows)
+                                                                     (recur (inc j) (n/max mm (aget sc (clojure.core/+ scb j)))) mm))
+                                                              sum (loop [j 0 s 0.0]
+                                                                    (if (< j nrows)
+                                                                      (let [e (m/exp (- (aget sc (clojure.core/+ scb j)) mx))]
+                                                                        (aset sc (clojure.core/+ scb j) e)
+                                                                        (recur (inc j) (+ s e)))
+                                                                      s))
+                                                              inv (/ 1.0 sum)]
+                                                          (loop [j 0]
+                                                            (if (< j nrows)
+                                                              (do (aset sc (clojure.core/+ scb j) (* (aget sc (clojure.core/+ scb j)) inv))
+                                                                  (recur (inc j)))
+                                                              nil))))))
 
 (deftm attn-prefill-out! (All [T] [sc :- (Array T) v :- (Array T) out :- (Array T)
                                    nrows :- Long n-q :- Long group :- Long
                                    n-kv :- Long head-dim :- Long] :- Void
-  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q head-dim))
-    (let [per-i (clojure.core/* n-q head-dim)
-          i (quot idx per-i)
-          rest0 (rem idx per-i)
-          hq (quot rest0 head-dim)
-          d (rem rest0 head-dim)
-          row (clojure.core/+ (clojure.core/* i n-q) hq)
-          scb (clojure.core/* row nrows)
-          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)
-          kvstride (clojure.core/* n-kv head-dim)]
-      (aset out (clojure.core/+ (clojure.core/* i per-i) (clojure.core/+ (clojure.core/* hq head-dim) d))
-            (loop [j 0 a 0.0]
-              (if (< j nrows)
-                (recur (inc j)
-                       (+ a (* (aget sc (clojure.core/+ scb j))
-                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
-                a)))))))
+                              (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q head-dim))
+                                                    (let [per-i (clojure.core/* n-q head-dim)
+                                                          i (quot idx per-i)
+                                                          rest0 (rem idx per-i)
+                                                          hq (quot rest0 head-dim)
+                                                          d (rem rest0 head-dim)
+                                                          row (clojure.core/+ (clojure.core/* i n-q) hq)
+                                                          scb (clojure.core/* row nrows)
+                                                          hkvb (clojure.core/+ (clojure.core/* (quot hq group) head-dim) d)
+                                                          kvstride (clojure.core/* n-kv head-dim)]
+                                                      (aset out (clojure.core/+ (clojure.core/* i per-i) (clojure.core/+ (clojure.core/* hq head-dim) d))
+                                                            (loop [j 0 a 0.0]
+                                                              (if (< j nrows)
+                                                                (recur (inc j)
+                                                                       (+ a (* (aget sc (clojure.core/+ scb j))
+                                                                               (aget v (clojure.core/+ (clojure.core/* j kvstride) hkvb)))))
+                                                                a)))))))
 
 ;; Bidirectional scores (EmbeddingGemma-style encoder): all-to-all, no causal mask.
 ;; (Symmetric sliding window |i-j| < w only matters for T > window — the binder
@@ -1272,22 +1475,22 @@
                                             nrows :- Long n-q :- Long group :- Long
                                             n-kv :- Long head-dim :- Long
                                             scale :- Double] :- Void
-  (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
-    (let [per-i (clojure.core/* n-q nrows)
-          i (quot idx per-i)
-          rest0 (rem idx per-i)
-          hq (quot rest0 nrows)
-          j (rem rest0 nrows)
-          row (clojure.core/+ (clojure.core/* i n-q) hq)
-          hkv (quot hq group)
-          qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
-                             (clojure.core/* hq head-dim))
-          kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
-                             (clojure.core/* hkv head-dim))
-          dot (loop [d 0 acc 0.0]
-                (if (< d head-dim)
-                  (recur (inc d)
-                         (+ acc (* (aget q (clojure.core/+ qb d))
-                                   (aget k (clojure.core/+ kb d)))))
-                  acc))]
-      (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))
+                                       (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+                                                             (let [per-i (clojure.core/* n-q nrows)
+                                                                   i (quot idx per-i)
+                                                                   rest0 (rem idx per-i)
+                                                                   hq (quot rest0 nrows)
+                                                                   j (rem rest0 nrows)
+                                                                   row (clojure.core/+ (clojure.core/* i n-q) hq)
+                                                                   hkv (quot hq group)
+                                                                   qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                                                                                      (clojure.core/* hq head-dim))
+                                                                   kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                                                                      (clojure.core/* hkv head-dim))
+                                                                   dot (loop [d 0 acc 0.0]
+                                                                         (if (< d head-dim)
+                                                                           (recur (inc d)
+                                                                                  (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                            (aget k (clojure.core/+ kb d)))))
+                                                                           acc))]
+                                                               (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))

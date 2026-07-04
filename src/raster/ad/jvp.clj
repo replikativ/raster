@@ -23,7 +23,9 @@
             [raster.ad.tangent :as tangent]
             [raster.ad.reverse.normalize :as anf]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.op-descriptor :as opdesc]
             [raster.core :as rcore]
+            [clojure.string :as string]
             [clojure.walk :as walk]
             ;; Kernel namespaces the derived rules emit calls into:
             [raster.par]      ;; dot-product — the scalar-loss frule contraction
@@ -72,6 +74,11 @@
     (if (some? btag)
       (tangent/zero-expr btag (list 'raster.arrays/alength branch))
       (list 'raster.ad.tangent/zero-like branch))))
+
+(def ^:private shape-read-heads
+  "Shape/length reads: integer-valued, no tangent space — an active array
+  reaching them is a shape REFERENCE, not a differentiable dependence."
+  '#{raster.arrays/alength clojure.core/alength alength})
 
 (def ^:private unsupported-forward-heads
   "Differentiable-in-reverse forms with NO forward fold yet (follow-up):
@@ -162,11 +169,30 @@
 
              ;; call (incl. devirtualized .invk)
              :else
-             (if (some #(and (symbol? %) (contains? tenv %))
+             (let [op-sym (if (= '.invk head)
+                            (or (:raster.op/original (meta init))
+                                (:op (meta init)) (second init))
+                            head)]
+               (cond
+                 ;; Pure allocations (zeros-like / alloc-like / *-array …):
+                 ;; a fresh zero/uninitialized buffer with NO differentiable
+                 ;; dependence on any input — active syms reach them only as
+                 ;; shape/dtype REFERENCES (e.g. the gradient program's
+                 ;; (zeros-like tgt (alength tgt)) typed zeros). No tangent.
+                 ;; aclone is a COPY, deliberately NOT covered — it carries a
+                 ;; :linear structure tag (tangent = aclone of the tangent).
+                 (and (symbol? op-sym)
+                      (or (contains? shape-read-heads op-sym)
+                          (and (opdesc/alloc-op? op-sym)
+                               (not (string/starts-with? (name op-sym) "aclone")))))
+                 (done tenv [])
+
+                 (some #(and (symbol? %) (contains? tenv %))
                        (if (= '.invk head) (nnext init) (rest init)))
-               (let [[tenv' extra] (fold-call tenv sym init tag)]
-                 (done tenv' extra))
-               (done tenv []))))
+                 (let [[tenv' extra] (fold-call tenv sym init tag)]
+                   (done tenv' extra))
+
+                 :else (done tenv [])))))
 
          :else (done tenv []))))
    {:tenv param-tangents :bindings []}
@@ -256,3 +282,96 @@
        :raster.core/deftm-walked-body [qualified]
        :raster.core/deftm-params fn-params
        :raster.core/deftm-tags out-tags})))
+
+;; ================================================================
+;; HVP — forward-over-reverse (§13 A4, Pearlmutter 1994)
+;; ================================================================
+
+(defn ^clojure.lang.IFn hvp
+  "Exact Hessian-vector product for a SCALAR-valued deftm var via
+  forward-over-reverse: the jvp-fold applied to the GRADIENT PROGRAM.
+
+  Mechanics: reify-pullback (the shared reverse engine) yields the flat
+  forward bindings and the reverse bindings that compute [g_a … g_k]; the
+  gradient program is their concatenation assembled with the unit adjoint
+  (dy__rad = 1.0) — exactly compile-hvp-fn's combined form WITHOUT the
+  v·grad dot. The jvp-fold then runs over THAT program with tangent seeds
+  v on the differentiable params: the tangent of each gradient g_i is
+  (H·v)_i. The pullback's kernels are linear/bilinear in dy (§13 classes
+  b/c — including the backward kernels' own :structure tags), so no
+  second-order rrules are needed.
+
+  (hvp #'f) → (fn [p1 … pN Δp_a … Δp_k] -> [grads hv])
+
+  where Δp_a … Δp_k are tangent (v) slots for the DIFFERENTIABLE params
+  only (⊥ slots — Long dims etc. — have no tangent slot), in param order;
+  `grads` is the gradient vector [∂f/∂p_a …] and `hv` its directional
+  tangent [(H·v)_a …], both aligned with the differentiable params."
+  [f-var]
+  (let [resolved (rev/resolve-deftm-var f-var)
+        m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "hvp requires a deftm var" {:var f-var})))
+        walked-body (or (rcore/ensure-walked-body! resolved)
+                        (throw (ex-info "No walked body on var" {:var f-var})))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        all-params (vec (map-indexed
+                         (fn [i p]
+                           (let [tag (nth tags i nil)
+                                 base (if (symbol? p) p (symbol (name p)))]
+                             (if tag
+                               (with-meta base {:raster.type/tag tag})
+                               (with-meta base nil))))
+                         params))
+        diff-params (vec (keep-indexed
+                          (fn [i p]
+                            (when (tangent/differentiable? (nth tags i nil)) p))
+                          all-params))
+        _ (when (empty? diff-params)
+            (throw (ex-info (str "hvp: no differentiable params on " f-var
+                                 " — every param tag is ⊥ (no tangent space)")
+                            {:var f-var :tags tags})))
+        ;; The gradient program: shared prep → reified pullback → flat
+        ;; fwd + (dy = 1.0) + rev bindings, outputs [g_a … g_k].
+        prepared (rev/ad-prepare (first walked-body))
+        {:keys [fwd-bindings result-sym body-sym pullback-form]}
+        (rev/reify-pullback prepared diff-params)
+        [_ rev-bindings grad-vec] pullback-form
+        grad-slots (vec grad-vec)
+        ;; ANF-normalize: the reverse engine's grad-acc chains nest calls in
+        ;; argument position; the fold's tangent lookup is symbol-only, so
+        ;; un-lifted nested calls would silently DROP tangent contributions.
+        grad-bindings (anf/anf-normalize-bindings
+                       (vec (concat fwd-bindings
+                                    [result-sym body-sym]
+                                    ['dy__rad 1.0]
+                                    rev-bindings))
+                       jvp-gensym)
+        ;; Seed tangents: one v per differentiable param, tagged like it.
+        tangent-params (mapv (fn [p] (with-meta (symbol (str "d" (name p) "__jt"))
+                                       (meta p)))
+                             diff-params)
+        {:keys [tenv bindings]} (jvp-fold grad-bindings
+                                          (zipmap diff-params tangent-params))
+        ;; Tangent of each gradient slot = the H·v row. Non-symbol slots
+        ;; (nil / materialized typed-zero exprs for rule-frozen params) have
+        ;; constant gradients → nil tangent (dynamic 0̄).
+        hv-outs (mapv (fn [g]
+                        (when (symbol? g)
+                          (or (get tenv g) (branch-tangent-zero g))))
+                      grad-slots)
+        hvp-form (list 'let* (vec bindings)
+                       (list 'clojure.core/vector grad-slots hv-outs))
+        fn-params (into all-params tangent-params)
+        source-ns (or (:ns m) *ns*)
+        qualified (inf/qualify-body-symbols hvp-form source-ns (set fn-params))
+        runtime-fn (make-runtime-jvp-fn qualified fn-params)]
+    (with-meta (fn [& args] (apply runtime-fn args))
+      {::hvp true
+       :raster.core/deftm true
+       :raster.core/deftm-walked-body [qualified]
+       :raster.core/deftm-params fn-params
+       :raster.core/deftm-tags (into (vec (take (count params)
+                                                (concat tags (repeat nil))))
+                                     (mapv #(:raster.type/tag (meta %))
+                                           tangent-params))})))

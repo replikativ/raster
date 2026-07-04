@@ -51,7 +51,6 @@
     (acopy! dy 0 out 0 n)
     out))
 
-
 ;; ================================================================
 ;; array-copy: utility for gradient copying
 ;; ================================================================
@@ -101,7 +100,6 @@
                 (+ (aget out d)
                    (aget dy idx))))))
     out))
-
 
 ;; ================================================================
 ;; GENERIC PRIMITIVES
@@ -167,29 +165,29 @@
   "Reshape [seq-len, n-heads*head-dim] (row-major) → [n-heads, seq-len, head-dim]
   so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d]."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-    (let [d-model (* n-heads head-dim)
-          out (alloc-like x (* seq-len d-model))]
-      (dotimes [h n-heads]
-        (dotimes [s seq-len]
-          (let [src (+ (* s d-model) (* h head-dim))
-                dst (+ (* h seq-len head-dim) (* s head-dim))]
-            (dotimes [d head-dim]
-              (aset out (+ dst d) (aget x (+ src d)))))))
-      out)))
+       (let [d-model (* n-heads head-dim)
+             out (alloc-like x (* seq-len d-model))]
+         (dotimes [h n-heads]
+           (dotimes [s seq-len]
+             (let [src (+ (* s d-model) (* h head-dim))
+                   dst (+ (* h seq-len head-dim) (* s head-dim))]
+               (dotimes [d head-dim]
+                 (aset out (+ dst d) (aget x (+ src d)))))))
+         out)))
 
 (deftm unpack-heads
   "Dual of pack-heads: [n-heads, seq-len, head-dim] → [seq-len, n-heads*head-dim]:
   out[s*(nh*hd) + h*hd + d] = x[h*seq*hd + s*hd + d]."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-    (let [d-model (* n-heads head-dim)
-          out (alloc-like x (* seq-len d-model))]
-      (dotimes [h n-heads]
-        (dotimes [s seq-len]
-          (let [src (+ (* h seq-len head-dim) (* s head-dim))
-                dst (+ (* s d-model) (* h head-dim))]
-            (dotimes [d head-dim]
-              (aset out (+ dst d) (aget x (+ src d)))))))
-      out)))
+       (let [d-model (* n-heads head-dim)
+             out (alloc-like x (* seq-len d-model))]
+         (dotimes [h n-heads]
+           (dotimes [s seq-len]
+             (let [src (+ (* h seq-len head-dim) (* s head-dim))
+                   dst (+ (* s d-model) (* h head-dim))]
+               (dotimes [d head-dim]
+                 (aset out (+ dst d) (aget x (+ src d)))))))
+         out)))
 
 ;; pack ↔ unpack are duals (both are non-diff on the Long shape params). No
 ;; grads-fn exists for them, so the runtime pullback (each is the other's
@@ -220,7 +218,6 @@
                                          [d-src (list 'raster.dl.array-ops/scatter-strided-2d
                                                       adjoint-sym rows row-stride col-offset n-cols)])
                                  [d-src nil nil nil nil]]))})
-
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
                            {:params '[packed rows row-stride col-offset n-cols]
@@ -278,7 +275,6 @@
     out))
 
 ;; scatter-add backward = gather, gather backward = scatter-add
-
 
 ;; ================================================================
 ;; indexed-dot: batched indexed dot product (multi-head aware)
@@ -359,7 +355,6 @@
                          (* coeff (aget A a-idx))))))))))
     out))
 
-
 ;; ================================================================
 ;; scatter-mul-add: weighted scatter (multi-head aware)
 ;; out[dst[e]*total-dim+s*slice-dim+d] += coeffs[e*n-slices+s]
@@ -438,7 +433,6 @@
                          (* w (aget dy dst-idx))))))))))
     out))
 
-
 ;; ================================================================
 ;; scale-clamp-exp: out[i] = exp(clamp(x[i]*scale, -bound, bound))
 ;; Separates attention nonlinearity from dot product.
@@ -468,7 +462,6 @@
                     (aget result i))
                  (* scale clamp-mask)))))
     out))
-
 
 ;; ================================================================
 ;; reduce-axis: out[d] = Σ_b src[b*n-cols+d]
@@ -500,7 +493,6 @@
         (aset out (+ (* b (int n-cols)) d)
               (aget dy d))))
     out))
-
 
 ;; ================================================================
 ;; segment-div: out[n*d+h_off+j] = wV[n*d+h_off+j] / (Z[n*nh+h] + eps)
@@ -543,6 +535,28 @@
                     (/ (aget dy idx) z)))))))
     dwV))
 
+(deftm segment-div-jvp-dZ
+  "Forward tangent (JVP, §13 A3) of segment-div in the Z direction — the
+  quotient rule's second term: out = wV/(Z+eps) so
+    d_i = −out_i·dZ_seg/(Z_seg+eps) = −wV_i·dZ_seg/(Z_seg+eps)².
+  (The wV-direction term dwV/(Z+eps) is segment-div itself — linear in wV;
+  see the :jvp-fn registration below.) Mirrors segment-div's loop structure."
+  [wV :- (Array double) dZ :- (Array double) Z :- (Array double)
+   n-nodes :- Long emb-dim :- Long n-heads :- Long eps :- Double]
+  :- (Array double)
+  (let [dk (quot emb-dim n-heads)
+        out (double-array (* n-nodes emb-dim))]
+    (dotimes [node n-nodes]
+      (dotimes [head n-heads]
+        (let [z-idx (+ (* node (int n-heads)) head)
+              z (+ (aget Z z-idx) eps)
+              factor (- (/ (aget dZ z-idx) (* z z)))
+              off (+ (* node (int emb-dim)) (* head (int dk)))]
+          (dotimes [d dk]
+            (let [idx (+ off d)]
+              (aset out idx (* (aget wV idx) factor)))))))
+    out))
+
 (deftm segment-div-dZ
   "Backward for Z: dZ[n*nh+h] = -sum_d(dy[..] * wV[..] / z²)"
   [dy :- (Array double) wV :- (Array double) Z :- (Array double)
@@ -564,7 +578,6 @@
                                  (aget wV idx)))))
               (aset dZ z-idx (- (/ acc z2))))))))
     dZ))
-
 
 ;; ================================================================
 ;; flat-embed-op: out[v*d+j] = values[v]*We[j] + be[j]
@@ -667,7 +680,6 @@
                      (aget dy (+ (* v (int emb-dim)) d))))))))
     out))
 
-
 ;; ================================================================
 ;; dot-rows: out[v] = h[v,:] · W + bias[0]
 ;; ================================================================
@@ -726,7 +738,6 @@
         (aset out 0 acc)))
     out))
 
-
 ;; ================================================================
 ;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]!=1)
 ;; ================================================================
@@ -767,7 +778,6 @@
                   (* scale (- (aget pred i)
                               (aget target i))))))))
     out))
-
 
 ;; ================================================================
 ;; Flat AD templates
@@ -898,6 +908,35 @@
                                           dZ (list 'raster.dl.array-ops/segment-div-dZ
                                                    adjoint-sym wV Z n-nodes emb-dim n-heads eps)])
                                  [dwV dZ nil nil nil nil]]))})
+
+;; segment-div forward tangent (JVP, §13 A3) — quotient rule:
+;;   d = dwV/(Z+eps) ⊕ (−out⊙dZ/(Z+eps))
+;; The wV term is segment-div ITSELF on the tangent (linear in wV); the Z
+;; term is the dedicated segment-div-jvp-dZ kernel above.
+(tmpl/merge-into-template!
+ 'raster.dl.array-ops/segment-div
+ {:jvp-fn
+  (fn [ctx [wV Z n-nodes emb-dim n-heads eps] tangent-args _result-sym gensym-fn]
+    (let [dwV (nth tangent-args 0 nil)
+          dZ (nth tangent-args 1 nil)]
+      (when-not (or dwV dZ)
+        (throw (ex-info "segment-div jvp: no active tangent reached the call"
+                        {:op 'raster.dl.array-ops/segment-div})))
+      (let [[ctx terms]
+            (if dwV
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jsdiv_wV"
+                                                 (list 'raster.dl.array-ops/segment-div
+                                                       dwV Z n-nodes emb-dim n-heads eps))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if dZ
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jsdiv_Z"
+                                                 (list 'raster.dl.array-ops/segment-div-jvp-dZ
+                                                       wV dZ Z n-nodes emb-dim n-heads eps))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (tmpl/sum-tangent-contribs ctx terms gensym-fn))))})
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/flat-embed-op
                            {:params '[values space-emb spaces state-emb states pos-emb
