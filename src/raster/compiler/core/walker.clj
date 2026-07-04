@@ -377,6 +377,25 @@
                    form)
                  form)
                form)
+        ;; #61: canonicalize the CALL-POSITION head once, before classification,
+        ;; so dispatch and every handler see the canonical var symbol per op
+        ;; (ra/aget → raster.arrays/aget, n/+ → raster.numeric/+). The array-op
+        ;; family is NOT collapsed here: typed arrays get clojure.core/* from
+        ;; the :array-op handler and parametric arrays must still reach
+        ;; :deftm-call for dispatch — the walk's OUTPUT spellings per array op
+        ;; are exactly {clojure.core/x (typed), .invk+:raster.op/original
+        ;; (parametric)}. Bare heads, macros, special forms and locals are
+        ;; untouched — macros must stay unqualified for macroexpansion.
+        form (if (and (seq? form) (symbol? (first form)) (namespace (first form))
+                      (not (ctx-get-tag ctx (first form))))
+               (let [h  (first form)
+                     h' (resolve-aliased-symbol h (:source-ns ctx))]
+                 (if (identical? h' h)
+                   form
+                   (with-meta (cons (if-let [m (meta h)] (with-meta h' m) h')
+                                    (rest form))
+                              (meta form))))
+               form)
         result (walk-form form ctx)
         ;; Preserve metadata from original form
         result (if-let [m (meta form)]
