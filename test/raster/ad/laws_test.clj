@@ -17,6 +17,7 @@
             [raster.math :as m]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
+            [raster.ad.jvp :as jvp]
             [raster.ad.tangent :as tangent]
             [raster.ad.forward :as fwd]
             [raster.ad.jet :as jet]
@@ -151,6 +152,41 @@
                      batch :- Long in :- Long out :- Long] :- Double
   (loss/mse-loss (nn/linear-nb x W batch in out) tgt (clojure.core/* batch out)))
 
+;; Float-only silu wrapper: under a full-suite load the parametric
+;; (All [T]) silu already has a DOUBLES specialization when this ns walks,
+;; and a TC failure inside the composite makes the walker's single-method
+;; fallback pick it → silent [F→[D miscompile of the PRIMAL body (direct
+;; call breaks too — pre-existing devirt hole, not an AD defect). The
+;; single-method float wrapper makes even the fallback resolve float; the
+;; AD paths inline it (un-templated) down to the templated silu.
+(deftm laws-jvp-silu [x :- (Array float) n :- Long] :- (Array float)
+  (nn/silu x n))
+
+;; Deeper float chain for O1b: linear-nb → silu → linear-nb → mse.
+;; Exercises every derived-JVP class in one graph: bilinear (both x- and
+;; W-sides of two linear-nbs), elementwise (silu via diagonal grads-fn
+;; reuse), scalar-loss (mse via ⟨grads-fn(1̄), v⟩ dot contraction).
+(deftm laws-jvp-chain [x :- (Array float) W1 :- (Array float) W2 :- (Array float)
+                       tgt :- (Array float)
+                       batch :- Long in :- Long hid :- Long out :- Long] :- Double
+  (loss/mse-loss
+   (nn/linear-nb (laws-jvp-silu (nn/linear-nb x W1 batch in hid)
+                                (clojure.core/* batch hid))
+                 W2 batch hid out)
+   tgt (clojure.core/* batch out)))
+
+;; Array-OUTPUT fn for the real-jvp O7 adjoint identity (single-method float
+;; wrapper — the parametric nn/linear-nb dispatch var is ambiguous for AD).
+(deftm laws-jvp-lnb [x :- (Array float) W :- (Array float)
+                     batch :- Long in :- Long out :- Long] :- (Array float)
+  (nn/linear-nb x W batch in out))
+
+;; Class-(d) residue op (rms-norm: reverse template, NO structure tag / frule
+;; yet — §13 A3): jvp over it must FAIL LOUD naming the op.
+(deftm laws-jvp-rms [x :- (Array float) w :- (Array float)
+                     rows :- Long feats :- Long] :- (Array float)
+  (nn/rms-norm x w rows feats 1.0e-6 0.0))
+
 ;; g(x) = <f(x), w> for O7 (w passed as a param array)
 (deftm laws-lnb-dotw [x :- (Array float) W :- (Array float) w :- (Array float)
                       batch :- Long in :- Long out :- Long] :- Double
@@ -259,6 +295,93 @@
           (is (close? gr (erf-analytic-deriv x) 1e-10) (str "erf rev=analytic at " x))
           (is (close? gf (erf-analytic-deriv x) 1e-10) (str "erf fwd=analytic at " x))
           (is (close? gr (central-fd laws-f5 x 1e-4) 5e-6) (str "erf rev~FD at " x)))))))
+
+;; ================================================================
+;; O1b — array-forward mode (JVP transform, §13 A1/A2): the directional
+;; tangent J·v equals the central directional FD (f(p+hv)−f(p−hv))/2h at
+;; float tolerance, for tangents seeded on EACH active param class
+;; (elementwise / linear / bilinear / scalar-loss all exercised).
+;; ================================================================
+
+(defn- fd-dir
+  "Central directional FD of scalar (apply f args) with args[slot] shifted
+  along v."
+  [f args slot v h]
+  (let [shift (fn [s] (update (vec args) slot faxpy s v))]
+    (/ (- (double (apply f (shift h))) (double (apply f (shift (- h)))))
+       (* 2.0 h))))
+
+(deftest o1b-jvp-array-law
+  (testing "mse∘linear-nb (float): jvp tangent = directional FD per seeded param"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 61) W (fa (* out in) 62) tgt (fa (* batch out) 63)
+          jf (jvp/jvp #'laws-lnb-mse)
+          zx (float-array (* batch in)) zW (float-array (* out in))
+          ztgt (float-array (* batch out))
+          h 1e-2
+          run (fn [tx tW ttgt] (jf x W tgt batch in out tx tW ttgt))]
+      ;; primal agreement
+      (is (close? (nth (run zx zW ztgt) 0) (laws-lnb-mse x W tgt batch in out)
+                  tol-float) "jvp primal = direct evaluation")
+      ;; bilinear x-side + scalar-loss
+      (let [v (fa (* batch in) 64)
+            [_ t] (run v zW ztgt)]
+        (is (close? t (fd-dir laws-lnb-mse [x W tgt batch in out] 0 v h) tol-float)
+            "x-seeded tangent = FD"))
+      ;; bilinear W-side
+      (let [v (fa (* out in) 65)
+            [_ t] (run zx v ztgt)]
+        (is (close? t (fd-dir laws-lnb-mse [x W tgt batch in out] 1 v h) tol-float)
+            "W-seeded tangent = FD"))
+      ;; target is RULE-frozen (mse rrule gives target a nil grad): the
+      ;; derived JVP must mirror the rule — tangent exactly 0, matching
+      ;; reverse's typed-zero d_tgt, NOT the mathematical ∂/∂tgt.
+      (let [v (fa (* batch out) 66)
+            [_ t] (run zx zW v)]
+        (is (== 0.0 (double t)) "tgt-seeded tangent = 0 (rule-frozen slot)"))))
+
+  (testing "deep chain linear-nb→silu→linear-nb→mse: every derived class"
+    (let [batch 2 in 4 hid 5 out 3
+          x (fa (* batch in) 71) W1 (fa (* hid in) 72) W2 (fa (* out hid) 73)
+          tgt (fa (* batch out) 74)
+          args [x W1 W2 tgt batch in hid out]
+          jf (jvp/jvp #'laws-jvp-chain)
+          zx (float-array (* batch in)) zW1 (float-array (* hid in))
+          zW2 (float-array (* out hid)) ztgt (float-array (* batch out))
+          h 1e-2
+          ;; FD referee tolerance through the deep chain: float rounding +
+          ;; h² truncation across the silu nonlinearity compound to ~1e-3
+          ;; relative — the exact-vs-exact assertions below stay at tol-float.
+          tol-fd 5e-3
+          run (fn [tx tW1 tW2] (jf x W1 W2 tgt batch in hid out tx tW1 tW2 ztgt))]
+      (let [v (fa (* batch in) 75)
+            [_ t] (run v zW1 zW2)]
+        (is (close? t (fd-dir laws-jvp-chain args 0 v h) tol-fd)
+            "x seed: bilinear-x → elementwise → bilinear-x → scalar-loss"))
+      (let [v (fa (* hid in) 76)
+            [_ t] (run zx v zW2)]
+        (is (close? t (fd-dir laws-jvp-chain args 1 v h) tol-fd)
+            "W1 seed: bilinear-W through the elementwise layer"))
+      (let [v (fa (* out hid) 77)
+            [_ t] (run zx zW1 v)]
+        (is (close? t (fd-dir laws-jvp-chain args 2 v h) tol-fd)
+            "W2 seed: bilinear-W direct into the loss"))
+      ;; joint seed = sum of single seeds (linearity of the pushforward)
+      (let [vx (fa (* batch in) 75) vW1 (fa (* hid in) 76) vW2 (fa (* out hid) 77)
+            [_ tj] (run vx vW1 vW2)
+            [_ t1] (run vx zW1 zW2)
+            [_ t2] (run zx vW1 zW2)
+            [_ t3] (run zx zW1 vW2)]
+        (is (close? tj (+ (double t1) (double t2) (double t3)) tol-float)
+            "joint tangent = Σ single-seed tangents (linearity)"))))
+
+  (testing "unsupported forward forms fail LOUD naming the op (A3 pending)"
+    ;; rms-norm has a reverse template but sits in the class-(d) residue —
+    ;; no :structure tag, no :jvp-fn: the transform must throw, never drop
+    ;; a tangent silently.
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"rms-norm.*§13 A3"
+         (jvp/jvp #'laws-jvp-rms)))))
 
 ;; ================================================================
 ;; O3 — tangent-algebra laws: ⊕ accumulation, 0̄, ⊥ slots
@@ -607,7 +730,31 @@
 ;; ================================================================
 
 (deftest o7-adjoint-identity-law
-  (testing "array composite (linear-nb, float): <J·v, w> = <v, grad <f(x),w>>"
+  (testing "REAL adjoint identity <jvp(v), w> = <v, vjp(w)> — frule and rrule
+            test each other with NO FD oracle (§12 O7, upgraded for §13 A2)"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 11) W (fa (* out in) 12)
+          v (fa (* batch in) 13)                     ;; input tangent (x-side)
+          u (fa (* out in) 15)                       ;; input tangent (W-side)
+          w (fa (* batch out) 14)                    ;; output cotangent
+          jf (jvp/jvp #'laws-jvp-lnb)
+          zx (float-array (* batch in)) zW (float-array (* out in))
+          [y dy-x] (jf x W batch in out v zW)        ;; J·(v,0)
+          [_ dy-W] (jf x W batch in out zx u)        ;; J·(0,u)
+          res ((rev/value+grad #'laws-lnb-dotw) x W w batch in out)
+          gx ^floats (nth res 1)                     ;; Jᵀw over x
+          gW ^floats (nth res 2)]                    ;; Jᵀw over W
+      (is (close? (fdot dy-x w) (fdot v gx) tol-float)
+          "⟨jvp(v),w⟩ = ⟨v, vjp(w)⟩ over x")
+      (is (close? (fdot dy-W w) (fdot u gW) tol-float)
+          "⟨jvp(u),w⟩ = ⟨u, vjp(w)⟩ over W")
+      ;; jvp primal = the op itself
+      (is (farr-close? y (nn/linear-nb x W batch in out) tol-float)
+          "jvp primal output = forward evaluation")
+      ;; Sanity: the scalar pairing itself matches the primal value.
+      (is (close? (first res) (fdot (nn/linear-nb x W batch in out) w) tol-float))))
+
+  (testing "directional-FD anchor for the same composite (the external referee)"
     (let [batch 2 in 4 out 3
           x (fa (* batch in) 11) W (fa (* out in) 12)
           v (fa (* batch in) 13)                     ;; input tangent
@@ -619,9 +766,7 @@
           res ((rev/value+grad #'laws-lnb-dotw) x W w batch in out)
           gx ^floats (nth res 1)
           rhs (fdot v gx)]
-      (is (close? lhs rhs tol-float) "adjoint identity over x")
-      ;; Sanity: the scalar pairing itself matches the primal value.
-      (is (close? (first res) (fdot (nn/linear-nb x W batch in out) w) tol-float))))
+      (is (close? lhs rhs tol-float) "adjoint identity over x (FD LHS)")))
 
   (testing "scalar anchor: <f'(x)v, w> = <v, d/dx (w*f(x))>"
     (let [x 1.3 v 0.37 w -2.1
