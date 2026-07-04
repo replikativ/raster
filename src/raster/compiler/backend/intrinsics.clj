@@ -31,6 +31,29 @@
 (defn- vt3 [f64 f32 i32] (cond-> {} f64 (assoc :f64 f64) f32 (assoc :f32 f32) i32 (assoc :i32 i32)))
 (defn- math1 [f64 f32 cfn] {:arity 1 :kind :fn :wasm (vt3 f64 f32 nil) :c {:fn cfn} :wgsl {:fn cfn}})
 
+;; ---------------------------------------------------------------------------
+;; CROSS-BACKEND SEMANTICS DECISION TABLE (A2)
+;; Where backends could diverge on the same op, the CHOICE is recorded here —
+;; an emitter deviating from this table is a bug, not a preference.
+;;
+;; :round  Java semantics — floor(x+0.5) — everywhere possible. wasm lowers as
+;;         the floor(x+0.5) polynomial (NOT f64.nearest: round-half-EVEN).
+;;         KNOWN DEVIATION: the C backends emit native round() =
+;;         round-half-AWAY-from-zero, which differs from Java at NEGATIVE .5
+;;         ties (C round(-2.5) = -3, Java = -2). Exact half-ties are
+;;         measure-zero on real data; accepted for GPU speed. Fixing = emit
+;;         floor(x+0.5) in C too.
+;; :mod    floored (Julia/Clojure mod). C/WGSL lower via the :floored-mod
+;;         strategy; wasm computes a-floor(a/b)*b; JVM uses clojure.core/mod.
+;; :rem    truncated (C %, JVM rem, wasm i32.rem_s) — all agree natively.
+;; :i64    wasm v1 treats long/int scalars as i32 (loads reject 'longs arrays);
+;;         JVM keeps true :long; C widens integer arith to long. A kernel whose
+;;         values exceed i32 range is NOT portable to wasm — the emitter's
+;;         reject-guards are the enforcement.
+;; :div    integer division truncates toward zero on all backends (C, JVM,
+;;         wasm i32.div_s agree).
+;; ---------------------------------------------------------------------------
+
 (def table
   {;; binary arithmetic
    :+ {:arity 2 :kind :infix :wasm (vt3 :f64.add :f32.add :i32.add) :c "+" :wgsl "+"}

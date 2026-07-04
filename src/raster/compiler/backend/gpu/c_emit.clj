@@ -208,6 +208,23 @@
                           :when (and (qualified-symbol? k) (= "Math" (namespace k)))]
                       [(symbol "java.lang.Math" (name k)) v])))))
 
+;; A2 drift guard: op-map is a PARALLEL table to backend.intrinsics (the full
+;; fold — per-dialect :c facets — is the D4 end state, tracked in
+;; .internal/emitter_review/). Until then: for the unambiguous infix/cmp/bitwise
+;; subset, the two tables must agree at load time. Fn-style ops (fabs vs abs,
+;; fmax vs max) are per-backend override territory and excluded.
+(let [checkable (fn [k] (and (string? (get op-map k))
+                             (re-matches #"[+\-*/%<>=!&|^]+" (get op-map k))))]
+  (doseq [k (keys op-map)
+          :when (checkable k)
+          :let [canon (intrinsics/canonical k)
+                ix-c  (when canon (get-in intrinsics/table [canon :c]))]
+          :when (string? ix-c)]
+    (when (not= ix-c (get op-map k))
+      (throw (ex-info (str "c_emit op-map drifted from intrinsics for " k
+                           ": op-map=" (get op-map k) " intrinsics=" ix-c)
+                      {:op k})))))
+
 ;; ================================================================
 ;; Devirtualized arithmetic → C operator/function mapping
 ;; ================================================================

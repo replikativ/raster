@@ -14,7 +14,8 @@
    memory). Float element type from the array param's tag (doubles→f64, floats→f32).
    Every loop returns its non-recur (else) value, so the function result type is
    the deftm's return tag."
-  (:require [raster.compiler.backend.wasm.encoder :as e]
+  (:require [raster.compiler.ir.form :as form]
+            [raster.compiler.backend.wasm.encoder :as e]
             [raster.compiler.backend.wasm.transcendental :as tr]
             [raster.compiler.backend.intrinsics :as ix]))
 
@@ -73,13 +74,13 @@
              (or (#{'dotimes 'when} h)
                  (and (symbol? h) (= "aset" (name h)))
                  ;; statement loop: (loop [..] (if c <recur…> nil)) — void exit
-                 (and (#{'loop 'loop*} h)
+                 (and (form/loop-head? h)
                       (let [[_ _ ifform] node]
                         (and (seq? ifform) (= 'if (first ifform))
                              (let [[_ _ t e] ifform]
                                (or (and (ends-in-recur? t) (void-effect-form? e))
                                    (and (ends-in-recur? e) (void-effect-form? t)))))))
-                 (and (#{'do 'let* 'let} h) (void-effect-form? (last node))))))))
+                 (and (or (= 'do h) (form/let-head? h)) (void-effect-form? (last node))))))))
 
 (defn- synth-case*
   "Lower the macroexpanded `case*` special form
@@ -197,7 +198,7 @@
         (e/i :unreachable)
         ;; loop in VALUE position (e.g. an inlined reduction as a let* binding init)
         ;; — emit-loop already yields a value-producing block(result vt); take bytes.
-        (#{'loop 'loop*} h)
+        (form/loop-head? h)
         (first (emit-loop ctx node))
         ;; array access .invk (aget is a deftm and may arrive devirtualized OR
         ;; survive as an un-inlined callee) — ALWAYS emit through the elems
@@ -261,7 +262,7 @@
         (and (symbol? h) (ix/canonical h))
         (emit-intrinsic ctx h A nil)
         ;; let* / do in VALUE position (introduced by inlined deftm calls)
-        (#{'let* 'let} h)
+        (form/let-head? h)
         (let [[binds & body] A
               [ctx' init-bytes] (emit-bindings ctx binds)
               tail (if (= 1 (count body)) (first body) (cons 'do body))]
@@ -407,7 +408,7 @@
           ;; let* — bind its locals so the tail's refs resolve (a let* used as an
           ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
           ;; may reference a binding introduced inside it).
-          (#{'let* 'let} h) (let [c' (reduce (fn [c [s init]]
+          (form/let-head? h) (let [c' (reduce (fn [c [s init]]
                                                (assoc-in c [:env s]
                                                          {:vt (or (sym-vt s) (infer-vt c init))}))
                                              ctx (partition 2 (second node)))]
@@ -425,7 +426,7 @@
           ;; so it's intentional rather than relying on the unknown-head default
           (and (symbol? h) (#{"inc" "unchecked-inc-int" "unchecked-inc"
                               "dec" "unchecked-dec-int" "unchecked-dec"} (name h))) :i32
-          (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
+          (form/loop-head? h)                                         ; loop result = its non-recur branch
           (let [c' (reduce (fn [c [s init]]
                              (assoc-in c [:env s] {:vt (or (sym-vt s) (infer-vt c init))}))
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
@@ -470,7 +471,7 @@
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
       ;; let* in effect position (e.g. soa-lower floats arg bindings out of a
       ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
-      (#{'let* 'let} h)
+      (form/let-head? h)
       (let [[binds & body] A
             [ctx' init-bytes] (emit-bindings ctx binds)]
         (into init-bytes (vec (mapcat #(emit-effect ctx' %) body))))
@@ -490,7 +491,7 @@
       (= h 'when) (emit-effect ctx (list 'if (second node) (list* 'do (drop 2 node))))
       ;; statement-position loop (model kernels: packing/softmax inner loops that
       ;; end in nil) — the value-loop emission with a void exit branch.
-      (#{'loop 'loop*} h) (emit-loop-void ctx node)
+      (form/loop-head? h) (emit-loop-void ctx node)
       :else (throw (ex-info (str "unhandled effect head " h) {:node node}))))))
 
 (defn- emit-recur
@@ -512,7 +513,7 @@
   (and (seq? node)
        (let [h (first node)]
          (or (= 'recur h)
-             (and (#{'do 'let* 'let} h) (ends-in-recur? (last node)))
+             (and (or (= 'do h) (form/let-head? h)) (ends-in-recur? (last node)))
              (and (= 'if h) (or (ends-in-recur? (nth node 2))
                                 (ends-in-recur? (nth node 3 nil))))))))
 
@@ -530,7 +531,7 @@
     (let [stmts (vec (rest node))]
       (-> (vec (mapcat #(emit-effect ctx %) (butlast stmts)))
           (into (emit-then ctx (last stmts) loop-idxs loop-vts ret-vt loop-depth block-depth))))
-    (and (seq? node) (#{'let* 'let} (first node)))
+    (and (seq? node) (form/let-head? (first node)))
     (let [[binds & body] (rest node)
           [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))]
@@ -999,7 +1000,7 @@
     ;; void-bound symbol in tail position (e.g. (let* [_ret (dotimes …)] _ret))
     (and (symbol? node) (get-in ctx [:env node :void])) [[] nil]
 
-    (and (seq? node) (#{'let* 'let} (first node)))
+    (and (seq? node) (form/let-head? (first node)))
     (let [[_ binds & body] node
           [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))
