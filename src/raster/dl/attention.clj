@@ -144,6 +144,42 @@
                              (aset out (+ (+ base i) half) (+ (* x1 c) (* x0 s))))))))
                    out)))
 
+;; RoPE backward: RoPE applies the orthogonal rotation R(ang) to each (x0,x1)
+;; pair, so the pullback is the transpose rotation R(-ang) applied to (dy0,dy1):
+;;   dx0 =  c·dy0 + s·dy1
+;;   dx1 = −s·dy0 + c·dy1
+;; No trainable params (theta/positions are fixed) — only x gets a gradient.
+(deftm rope-backward-dx (All [T] [dy :- (Array T) seq-len :- Long heads :- Long
+                                  head-dim :- Long theta :- Double] :- (Array T)
+                            (let [dx (alloc-like dy (* seq-len (* heads head-dim)))
+                                  half (quot head-dim 2)
+                                  ln-theta (m/log theta)]
+                              (dotimes [p seq-len]
+                                (dotimes [h heads]
+                                  (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))]
+                                    (dotimes [i half]
+                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                            ang (* (double p) freq)
+                                            c (m/cos ang) s (m/sin ang)
+                                            d0 (aget dy (+ base i))
+                                            d1 (aget dy (+ (+ base i) half))]
+                                        (aset dx (+ base i) (+ (* d0 c) (* d1 s)))
+                                        (aset dx (+ (+ base i) half) (- (* d1 c) (* d0 s))))))))
+                              dx)))
+
+(tmpl/merge-into-template! 'raster.dl.attention/rope
+                           {:pullback-factory (fn [_result _x seq-len heads head-dim theta]
+                                                (fn [dy]
+                                                  [(rope-backward-dx dy seq-len heads head-dim theta)
+                                                   nil nil nil nil]))
+                            :params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [_x seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx")]
+                                          [(update ctx :bindings into
+                                                   [dx (list 'raster.dl.attention/rope-backward-dx
+                                                             adjoint-sym seq-len heads head-dim theta)])
+                                           [dx nil nil nil nil]]))})
+
 ;; --- Grouped / multi-query causal attention ---
 ;; q:[seq,n_q,hd]  k,v:[seq,n_kv,hd]  (n_kv divides n_q; n_kv<n_q = GQA, n_kv=1 = MQA).
 ;; Causal softmax with an EXPLICIT scale (Gemma: query_pre_attn_scalar^-0.5, which
@@ -708,6 +744,107 @@
                      head-out seq-len d-model col-off dk)]
           (recur (inc h) (ops/array-add acc out-h n)))
         (nn/linear acc Wo bo seq-len d-model d-model)))))
+
+;; ================================================================
+;; Differentiable GQA/MQA causal attention (Llama/Qwen/Gemma decoders)
+;; ================================================================
+
+(deftm gqa-causal-mha
+  "Differentiable grouped/multi-query causal self-attention over PRE-PROJECTED,
+  PRE-ROPED Q:[seq,n_q·hd] and K/V:[seq,n_kv·hd] (n_kv divides n_q; n_kv<n_q = GQA,
+  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Composed only from
+  AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
+  scatter-strided-2d → array-add) in the tail-loop-with-let shape, so value+grad
+  inlines it cleanly — no explicit pullback (the training-forward twin of the
+  inference-only gqa-causal-attention above). Returns [seq, n_q·hd]; the output
+  projection is a separate linear-nb in the model forward. Scale is 1/sqrt(hd)
+  (correct for Llama/Qwen, and Gemma when query_pre_attn_scalar = head_dim; a
+  custom-scale variant is a follow-up)."
+  [Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+  :- (Array double)
+  (let [group    (quot n-q n-kv)
+        qstride  (* n-q head-dim)
+        kvstride (* n-kv head-dim)
+        n        (* seq-len qstride)]
+    (loop [hq 0 acc (double-array n)]
+      (if (< hq n-q)
+        (let [hkv      (quot hq group)
+              Qh       (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
+              Kh       (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
+              Vh       (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
+              head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len head-dim head-dim)
+              out-h    (ops/scatter-strided-2d head-out seq-len qstride (* hq (int head-dim)) head-dim)]
+          (recur (inc hq) (ops/array-add acc out-h n)))
+        acc))))
+
+;; GQA backward: per query head, run the single-head causal-SDPA backward, then
+;; scatter dQ into head hq's slab and ACCUMULATE dK/dV into head hkv's slab
+;; (each kv head is read by `group` query heads). Returns object-array [dQ dK dV].
+;; A registered op (raw loops here are never differentiated) so the forward stays
+;; symbolic — needed because the compose-from-primitives forward returns the bare
+;; accumulator (no baked output projection), which the loop-inlining reverse pass
+;; can't handle as a let-bound/argument loop result.
+(deftm gqa-causal-mha-backward
+  [dY :- (Array double) Q :- (Array double) K :- (Array double) V :- (Array double)
+   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+  :- (Array Object)
+  (let [group    (quot n-q n-kv)
+        qstride  (* n-q head-dim)
+        kvstride (* n-kv head-dim)
+        dQ (double-array (clojure.core/* seq-len qstride))
+        dK (double-array (clojure.core/* seq-len kvstride))
+        dV (double-array (clojure.core/* seq-len kvstride))]
+    (dotimes [hq n-q]
+      (let [hkv (clojure.core/quot hq (int group))
+            Qh  (ops/slice-strided-2d Q seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
+            Kh  (ops/slice-strided-2d K seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
+            Vh  (ops/slice-strided-2d V seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
+            dYh (ops/slice-strided-2d dY seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
+            b   (causal-scaled-dot-product-attn-backward dYh Qh Kh Vh seq-len head-dim head-dim)
+            dQh (clojure.core/aget ^objects b 0)
+            dKh (clojure.core/aget ^objects b 1)
+            dVh (clojure.core/aget ^objects b 2)]
+        (dotimes [r seq-len]
+          (let [qoff  (clojure.core/+ (clojure.core/* r (int qstride)) (clojure.core/* hq (int head-dim)))
+                kvoff (clojure.core/+ (clojure.core/* r (int kvstride)) (clojure.core/* hkv (int head-dim)))
+                hoff  (clojure.core/* r (int head-dim))]
+            (dotimes [c head-dim]
+              (clojure.core/aset ^doubles dQ (clojure.core/+ qoff c)
+                                 (double (clojure.core/aget ^doubles dQh (clojure.core/+ hoff c))))
+              (clojure.core/aset ^doubles dK (clojure.core/+ kvoff c)
+                                 (clojure.core/+ (clojure.core/aget ^doubles dK (clojure.core/+ kvoff c))
+                                                 (clojure.core/aget ^doubles dKh (clojure.core/+ hoff c))))
+              (clojure.core/aset ^doubles dV (clojure.core/+ kvoff c)
+                                 (clojure.core/+ (clojure.core/aget ^doubles dV (clojure.core/+ kvoff c))
+                                                 (clojure.core/aget ^doubles dVh (clojure.core/+ hoff c)))))))))
+    (let [out (object-array 3)]
+      (clojure.core/aset out 0 dQ)
+      (clojure.core/aset out 1 dK)
+      (clojure.core/aset out 2 dV)
+      out)))
+
+(tmpl/merge-into-template! 'raster.dl.attention/gqa-causal-mha
+                           {:pullback-factory
+                            (fn [_result Q K V seq-len n-q n-kv head-dim]
+                              (fn [dY]
+                                (let [b (gqa-causal-mha-backward dY Q K V seq-len n-q n-kv head-dim)]
+                                  [(clojure.core/aget ^objects b 0)
+                                   (clojure.core/aget ^objects b 1)
+                                   (clojure.core/aget ^objects b 2)
+                                   nil nil nil nil])))
+                            :params '[Q K V seq-len n-q n-kv head-dim] :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [Q K V seq-len n-q n-kv head-dim] _result-sym adjoint-sym gensym-fn]
+                              (let [b (gensym-fn "gqa_b") dQ (gensym-fn "dQ")
+                                    dK (gensym-fn "dK") dV (gensym-fn "dV")]
+                                [(update ctx :bindings into
+                                         [b (list 'raster.dl.attention/gqa-causal-mha-backward
+                                                  adjoint-sym Q K V seq-len n-q n-kv head-dim)
+                                          dQ (list 'clojure.core/aget b 0)
+                                          dK (list 'clojure.core/aget b 1)
+                                          dV (list 'clojure.core/aget b 2)])
+                                 [dQ dK dV nil nil nil nil]]))})
 
 ;; ================================================================
 ;; Multi-head self-attention (bidirectional, for BERT-style models)
