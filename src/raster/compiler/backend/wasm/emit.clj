@@ -14,7 +14,8 @@
    memory). Float element type from the array param's tag (doubles→f64, floats→f32).
    Every loop returns its non-recur (else) value, so the function result type is
    the deftm's return tag."
-  (:require [raster.compiler.ir.form :as form]
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.backend.wasm.encoder :as e]
             [raster.compiler.backend.wasm.transcendental :as tr]
             [raster.compiler.backend.intrinsics :as ix]))
@@ -164,7 +165,7 @@
               (cond-> (emit-val ctx x)
                 (= xv :f64) (into (e/i :f32.demote_f64))      ; (float <f64>) → demote
                 (= xv :i32) (into (e/i :f32.convert_i32_s)))))) ; (float <i32>) → convert
-        (#{'clojure.core/aget 'raster.arrays/aget} h)
+        (descriptor/aget-op? h)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
         ;; integer step (inc/dec, incl. unchecked-*-int) — index/counter steppers
@@ -207,7 +208,7 @@
         ;; e.g. f32-loads an int array — seen in qgemm's int-aget helper).
         (and (= h '.invk)
              (let [op (:raster.op/original (meta node))]
-               (contains? #{'raster.arrays/aget 'clojure.core/aget} op)))
+               (descriptor/aget-op? op)))
         (emit-val ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
                                  (meta node)))
         ;; non-intrinsic deftm callee kept as a real wasm function (not inlined):
@@ -434,7 +435,7 @@
             (infer-vt c' (if (ends-in-recur? then) els then)))
           (= 'throw h) :diverge                        ; never produces a value
           (= :dp4a (ix/canonical h)) :i32              ; int8 dot-accumulate → i32
-          (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
+          (descriptor/aget-op? h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
           (ix/canonical h) (if (= :cmp (ix/kind h)) :i32 (infer-vt ctx (second node)))
@@ -456,7 +457,7 @@
       (and (= h '.invk) (:raster.op/original (meta node)))
       (emit-effect ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
                                   (meta node)))
-      (#{'clojure.core/aset 'raster.arrays/aset} h)
+      (descriptor/aset-op? h)
       (let [[arr idx v] A elem (get-in ctx [:elems arr])]
         (when-not elem
           (throw (ex-info (str "aset target " arr " has no element info (not an array param?)")

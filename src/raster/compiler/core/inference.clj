@@ -1831,7 +1831,7 @@
             (descriptor/scalar-op? head)
             (let [arg-tags (keep #(infer-arg-tag % env) (rest expr))]
               (cond
-                (contains? #{'clojure.core/alength 'raster.arrays/alength} head) 'long
+                (descriptor/alength-op? head) 'long
                 (some #{'double} arg-tags) 'double
                 (some #{'float} arg-tags) 'float
                 (some #{'long} arg-tags) 'long

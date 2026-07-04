@@ -18,7 +18,8 @@
    deftm* (a `.invk` returning a value type whose body is a bare constructor) is
    NOT inlined by the current inliner, so such calls don't explode yet — that's a
    separable follow-on (extend inlinable-body? / inline value-type deftms)."
-  (:require [raster.compiler.core.types :as types]
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [clojure.walk :as walk]))
 
 (defn field-arr-sym [soa-sym field-name]
@@ -81,11 +82,12 @@
          (and (.startsWith s ".") (> (count s) 1) (not (#{".invk" "."} s))))))
 
 (defn- aget-head? [head]
-  (or (#{'aget 'clojure.core/aget 'raster.arrays/aget} head)
+  (or (descriptor/aget-op? head)
       (.startsWith (local-name head) "aget-")))
 
 (defn- aset-head? [head]
-  (or (#{'aset 'clojure.core/aset 'raster.arrays/aset 'raster.arrays/aset!} head)
+  (or (descriptor/aset-op? head)
+      (= 'raster.arrays/aset! head)
       (.startsWith (local-name head) "aset-")))
 
 ;; ctx: {:soa {soa-sym → soa-info}  :exploded {local-sym → {field-name → expr}}}
