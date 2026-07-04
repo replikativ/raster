@@ -330,6 +330,31 @@
   (aget (.partials ^Dual x) 0))
 
 ;; ================================================================
+;; Comparisons — branch selection on the PRIMAL value (standard
+;; forward-AD semantics; ForwardDiff.jl does the same). The derivative
+;; of the branch indicator is zero a.e., so comparing .v is exactly
+;; the "differentiate the taken branch" rule (a.e.-correct at kinks —
+;; see .internal/ad_formal_framework.md §8). Without these, forward
+;; mode over ANY branching fn throws (laws O1 gap, found 2026-07-04).
+;; ================================================================
+
+(deftm raster.numeric/> [x :- Dual, y :- Dual] :- Boolean (clojure.core/> (.v x) (.v y)))
+(deftm raster.numeric/> [x :- Dual, y :- Double] :- Boolean (clojure.core/> (.v x) y))
+(deftm raster.numeric/> [x :- Double, y :- Dual] :- Boolean (clojure.core/> x (.v y)))
+
+(deftm raster.numeric/< [x :- Dual, y :- Dual] :- Boolean (clojure.core/< (.v x) (.v y)))
+(deftm raster.numeric/< [x :- Dual, y :- Double] :- Boolean (clojure.core/< (.v x) y))
+(deftm raster.numeric/< [x :- Double, y :- Dual] :- Boolean (clojure.core/< x (.v y)))
+
+(deftm raster.numeric/>= [x :- Dual, y :- Dual] :- Boolean (clojure.core/>= (.v x) (.v y)))
+(deftm raster.numeric/>= [x :- Dual, y :- Double] :- Boolean (clojure.core/>= (.v x) y))
+(deftm raster.numeric/>= [x :- Double, y :- Dual] :- Boolean (clojure.core/>= x (.v y)))
+
+(deftm raster.numeric/<= [x :- Dual, y :- Dual] :- Boolean (clojure.core/<= (.v x) (.v y)))
+(deftm raster.numeric/<= [x :- Dual, y :- Double] :- Boolean (clojure.core/<= (.v x) y))
+(deftm raster.numeric/<= [x :- Double, y :- Dual] :- Boolean (clojure.core/<= x (.v y)))
+
+;; ================================================================
 ;; Gradient control
 ;; ================================================================
 

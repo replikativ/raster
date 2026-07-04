@@ -988,7 +988,13 @@
   [fqn create-fn]
   (or (get @parametric-class-cache fqn)
       (do (create-fn)
-          (let [cl (.getContextClassLoader (Thread/currentThread))
+          ;; Resolve via a Clojure DynamicClassLoader, NOT the thread-context
+          ;; loader: the class was just eval'd into the DynamicClassLoader's
+          ;; static in-memory cache, which the context loader (AppClassLoader
+          ;; under plain `clojure -e` / test runners) cannot see. RT/makeClassLoader
+          ;; consults that cache first, so this works in both REPL and runner
+          ;; contexts.
+          (let [cl (clojure.lang.RT/makeClassLoader)
                 cls (Class/forName fqn true cl)]
             (swap! parametric-class-cache assoc fqn cls)
             cls))))
