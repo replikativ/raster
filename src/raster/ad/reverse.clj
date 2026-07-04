@@ -33,6 +33,8 @@
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.util :as util]
+            [raster.compiler.core.dispatch :as dispatch]
+            [raster.compiler.support.mangled :as mangled]
             [raster.core :as rcore]
             [raster.arrays :as arrays]))
 
@@ -2751,6 +2753,144 @@
         (eval (list 'fn ['& args-sym]
                     (list 'let unpack body)))))))
 
+;; ================================================================
+;; Forward-mode admissibility (framework §11): mode selection is
+;; constrained by CARRIER COVERAGE — an interpretation is admissible
+;; only when every op that would execute on the carrier has a lift in
+;; that carrier. The coverage matrix is a queryable artifact derived
+;; from the dispatch registry (the single source of truth for what a
+;; carrier accepts) — never documentation, never a hardcoded op list.
+;; ================================================================
+
+(def ^:private forward-neutral-namespaces
+  "Op namespaces that never execute on the Dual carrier: clojure.core is
+  integer index/counter arithmetic by convention (see CLAUDE.md), and
+  raster.arrays is array plumbing (forward mode is scalar-only — array
+  params are rejected separately)."
+  #{"clojure.core" "raster.arrays"})
+
+(def ^:private forward-interop-namespaces
+  "JVM static-method namespaces: primitive interop calls cannot accept a
+  Dual, so their presence in a body makes forward mode inadmissible."
+  #{"Math" "java.lang.Math" "StrictMath" "java.lang.StrictMath"})
+
+(defn- collect-op-heads
+  "All semantic op heads in a walked-body form. For devirtualized
+  (.invk impl args...) calls this reads the walk's stamped original-op
+  metadata via op/semantic-op (never parses mangled names); a bare .invk
+  without metadata (typed fn-param call) contributes nothing."
+  [form]
+  (let [acc (volatile! #{})]
+    (letfn [(go [f]
+              (cond
+                (seq? f)
+                (do (when-let [h (if (= '.invk (first f))
+                                   ;; same recovery order as undevirtualize
+                                   (or (:raster.op/original (meta f)) (:op (meta f)))
+                                   (op/semantic-op f))]
+                      (when (symbol? h) (vswap! acc conj h)))
+                    (doseq [x f] (go x)))
+                (vector? f) (doseq [x f] (go x))
+                (map? f) (doseq [[k v] f] (go k) (go v))))]
+      (go form))
+    @acc))
+
+(defn- dual-tag?
+  "True if a dispatch tag denotes the Dual carrier (short `Dual` for explicit
+  overloads, fully qualified `raster.ad.forward.Dual` for auto-specialized
+  parametric entries). Dual__Sym etc. do NOT count — they are other carriers."
+  [tag]
+  (cond
+    (symbol? tag) (= "Dual" (peek (str/split (name tag) #"\.")))
+    (class? tag) (= "Dual" (.getSimpleName ^Class tag))
+    :else false))
+
+(defn- dual-lift?
+  "True when a deftm generic var can accept a Dual argument: an explicit
+  Dual overload in its dispatch table, or a parametric (All [T]) template
+  with a bare type-var param (auto-specializes for Dual on first dispatch,
+  e.g. raster.sci.special/sinc)."
+  [v qualified-op]
+  (or (when-let [dt (:raster.core/dispatch-table (meta v))]
+        (boolean (some (fn [entry] (some dual-tag? (:tags entry)))
+                       (mapcat val @dt))))
+      (boolean (some (fn [entry]
+                       (some #(contains? (:type-vars entry) %)
+                             (:annotations entry)))
+                     (get @dispatch/parametric-registry qualified-op)))))
+
+(defn- forward-op-status
+  "Classify one op head for execution on the Dual carrier.
+  Returns :covered, :neutral (never carries a Dual), or :uncovered."
+  [op-sym]
+  (let [ns-str (namespace op-sym)
+        nm (name op-sym)]
+    (cond
+      ;; Unqualified heads: special forms, binders, locals, constructors,
+      ;; interop field/method access (.v/.partials/...) — structural, not
+      ;; Dual-carrying calls (the walk qualifies every deftm call head).
+      (nil? ns-str) :neutral
+
+      ;; JVM static interop (Math/tan ...) — no Dual lift is possible.
+      (contains? forward-interop-namespaces ns-str) :uncovered
+
+      (contains? forward-neutral-namespaces ns-str) :neutral
+
+      :else
+      (let [base (mangled/extract-deftm-base
+                  (symbol ns-str (mangled/strip-impl-suffix nm)))
+            v (try (resolve base) (catch Exception _ nil))]
+        (cond
+          (nil? v) :neutral
+          ;; deftm generic (dispatch table or parametric template): the
+          ;; registry decides whether the Dual carrier is accepted.
+          (or (:raster.core/dispatch-table (meta v))
+              (contains? @dispatch/parametric-registry base))
+          (if (dual-lift? v base) :covered :uncovered)
+          ;; Plain var (defn helper, constant) — not carrier-dispatched.
+          :else :neutral)))))
+
+(def ^:private array-param-tags
+  '#{doubles floats ints longs shorts bytes booleans chars objects})
+
+(defn forward-coverage
+  "Queryable Dual-carrier coverage for a deftm var (framework §4a/§11).
+  Walks the deftm's walked body, collects semantic op heads, and checks
+  each op that would execute on the Dual carrier against the dispatch
+  registry for a Dual lift.
+
+  Returns {:admissible?   bool
+           :uncovered-ops sorted vector of op symbols without a Dual lift
+           :array-params  params whose type is an array (forward mode is
+                          scalar-only — arrays have no Dual seeding)}"
+  [f-var]
+  (let [resolved (resolve-deftm-var f-var)
+        m (meta resolved)
+        walked-body (or (rcore/ensure-walked-body! resolved)
+                        (throw (ex-info "No walked body on var" {:var f-var})))
+        params (or (:raster.core/deftm-params m) [])
+        tags (or (:raster.core/deftm-tags m) [])
+        array-params (vec (remove nil?
+                                  (map (fn [p tag]
+                                         (when (or (contains? array-param-tags tag)
+                                                   (and (seq? tag) (= 'Array (first tag))))
+                                           p))
+                                       params (concat tags (repeat nil)))))
+        uncovered (->> (collect-op-heads (first walked-body))
+                       (filter #(= :uncovered (forward-op-status %)))
+                       sort
+                       vec)]
+    {:admissible? (and (empty? uncovered) (empty? array-params))
+     :uncovered-ops uncovered
+     :array-params array-params}))
+
+(defn forward-admissible?
+  "True when forward mode (the Dual carrier) is admissible for f-var:
+  every op in the walked body that would execute on the Dual carrier has
+  a Dual lift in the dispatch registry, and no param is array-typed."
+  [f-var]
+  (:admissible? (forward-coverage f-var)))
+
 (defn ^clojure.lang.IFn value+grad
   "Composable value+gradient operator.
 
@@ -2809,7 +2949,26 @@
      :forward
      ;; Forward-mode gradient via Dual numbers on the walked body.
      ;; Un-devirtualize .invk → generic dispatch so Dual numbers propagate.
-     (let [resolved (resolve-deftm-var f-var)
+     ;; Admissibility is checked at CONSTRUCTION time (framework §11): fail
+     ;; with the uncovered ops named, never a No-matching-method at call time.
+     (let [cov (forward-coverage f-var)
+           _ (when-not (:admissible? cov)
+               (throw (ex-info
+                       (str "value+grad :mode :forward is not admissible for `"
+                            f-var "` — "
+                            (when (seq (:uncovered-ops cov))
+                              (str "ops without a Dual lift: "
+                                   (str/join ", " (:uncovered-ops cov)) ". "))
+                            (when (seq (:array-params cov))
+                              (str "array-typed params (forward mode is scalar-only): "
+                                   (str/join ", " (:array-params cov)) ". "))
+                            "Mode selection is constrained by carrier coverage "
+                            "(framework §11): use :mode :reverse, or add the "
+                            "missing Dual overloads in raster.ad.forward.")
+                       {:var f-var
+                        :uncovered-ops (:uncovered-ops cov)
+                        :array-params (:array-params cov)})))
+           resolved (resolve-deftm-var f-var)
            m (meta resolved)
            params (or (:raster.core/deftm-params m)
                       (throw (ex-info "grad requires a deftm var" {:var f-var})))
@@ -2849,12 +3008,18 @@
                       (seq grads))))))
 
      :auto
-     ;; Griewank heuristic: forward when n_inputs ≤ n_outputs, reverse otherwise.
-     ;; For scalar-output functions (the common case), reverse is better for n > 1.
-     ;; For n = 1, forward avoids tape overhead.
+     ;; Mode selection = argmin cost over ADMISSIBLE interpretations
+     ;; (framework §7 + §11). The Griewank dimension test (forward when
+     ;; n_inputs ≤ n_outputs; reverse otherwise — for n = 1 forward avoids
+     ;; tape overhead) is the cost heuristic; carrier coverage is the HARD
+     ;; filter: forward is only selectable when every op in the body has a
+     ;; Dual lift. Reverse is always admissible for deftm bodies (templates
+     ;; + composite inlining), so it is the fallback.
      (let [resolved (resolve-deftm-var f-var)
            n-params (count (or (:raster.core/deftm-params (meta resolved)) []))
-           selected (if (<= n-params 1) :forward :reverse)]
+           selected (if (and (<= n-params 1) (forward-admissible? f-var))
+                      :forward
+                      :reverse)]
        (value+grad f-var :mode selected)))))
 
 (defn grad
