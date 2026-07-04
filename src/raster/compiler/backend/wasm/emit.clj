@@ -47,7 +47,7 @@
 ;; raster.compiler.backend.intrinsics — emit dispatches through ix/wasm-op.
 
 ;; ctx: {:env {sym {:idx :vt}}  :elems {sym elem-map}}
-(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur? emit-bindings)
+(declare emit-val infer-vt emit-effect alloc! emit-intrinsic emit-loop ends-in-recur? emit-bindings emit-operand-at)
 
 (defn- addr
   "byte address of array element: ptr + idx*elem-bytes  (i32)."
@@ -59,17 +59,27 @@
         (into (e/i32-const eb)) (into (e/i :i32.mul)) (into (e/i :i32.add)))))
 
 (defn- void-effect-form?
-  "A form producing no value (side-effect only): an array store (aset), dotimes/
-   when, or a do whose tail is itself a void effect. Such a form bound in a let*
-   — e.g. the inliner's (let* [_ret (dotimes …)] _ret) body-lift, or trailing
-   `(aset …)` statements lifted to `_eff_` bindings — is emitted as an effect, not
-   a value."
+  "A form producing no value (side-effect only): nil, an array store (aset),
+   dotimes/when, a statement loop ending in nil, or a do/let* whose TAIL is
+   itself void. Such a form bound in a let* — e.g. the inliner's
+   (let* [_ret (dotimes …)] _ret) body-lift, the par lowering's
+   (let* [body_result (let* [n …] (dotimes …) nil)] body_result), or trailing
+   `(aset …)` statements lifted to `_eff_` bindings — is emitted as an effect,
+   not a value."
   [node]
-  (and (seq? node)
-       (let [h (first node)]
-         (or (#{'dotimes 'when} h)
-             (and (symbol? h) (= "aset" (name h)))
-             (and (= 'do h) (void-effect-form? (last node)))))))
+  (or (nil? node)
+      (and (seq? node)
+           (let [h (first node)]
+             (or (#{'dotimes 'when} h)
+                 (and (symbol? h) (= "aset" (name h)))
+                 ;; statement loop: (loop [..] (if c <recur…> nil)) — void exit
+                 (and (#{'loop 'loop*} h)
+                      (let [[_ _ ifform] node]
+                        (and (seq? ifform) (= 'if (first ifform))
+                             (let [[_ _ t e] ifform]
+                               (or (and (ends-in-recur? t) (void-effect-form? e))
+                                   (and (ends-in-recur? e) (void-effect-form? t)))))))
+                 (and (#{'do 'let* 'let} h) (void-effect-form? (last node))))))))
 
 (defn- synth-case*
   "Lower the macroexpanded `case*` special form
@@ -95,18 +105,28 @@
         (or (nil? c) (false? c))    :else
         :else nil))
 
+(defn- sym-vt
+  "Valtype from the walker's stamped :raster.type/tag on a binding symbol — the
+   single type source (TC-fed). nil when unstamped (pass-introduced bindings)."
+  [s]
+  (when-let [tag (:raster.type/tag (meta s))]
+    (case tag
+      double :f64  float :f32  (long int byte short char boolean) :i32
+      nil)))                                     ; array/ref tags: not a scalar local
+
 (defn- emit-bindings
-  "Lower a let* binding vector → [ctx' init-bytes]: each `[sym init]` either binds a
-   void effect form (no value — recorded as {:void true}, init emitted as an effect) or
-   allocates a typed local and emits `(local-set …)`. Shared by every position handler
-   (value / effect / then / result) so the binding lowering lives in one place."
+  "Lower a let* binding vector → [ctx' init-bytes]. The local's type comes from the
+   STAMPED symbol tag (walker/TC — the single type source); init inference is only
+   the fallback for pass-introduced unstamped bindings. Init values are coerced to
+   the local's valtype (emit-operand-at), so a widened local takes a narrower init."
   [ctx binds]
   (reduce (fn [[c acc] [s init]]
             (if (void-effect-form? init)
               [(assoc-in c [:env s] {:void true}) (into acc (emit-effect c init))]
-              (let [vt (infer-vt c init) idx (alloc! c vt)]
+              (let [vt (or (sym-vt s) (infer-vt c init))
+                    idx (alloc! c vt)]
                 [(assoc-in c [:env s] {:idx idx :vt vt})
-                 (-> acc (into (emit-val c init)) (into (e/local-set idx)))])))
+                 (-> acc (into (emit-operand-at c vt init)) (into (e/local-set idx)))])))
           [ctx []] (partition 2 binds)))
 
 (defn- emit-val
@@ -143,7 +163,7 @@
               (cond-> (emit-val ctx x)
                 (= xv :f64) (into (e/i :f32.demote_f64))      ; (float <f64>) → demote
                 (= xv :i32) (into (e/i :f32.convert_i32_s)))))) ; (float <i32>) → convert
-        (= h 'clojure.core/aget)
+        (#{'clojure.core/aget 'raster.arrays/aget} h)
         (let [[arr idx] A elem (get-in ctx [:elems arr])]
           (into (addr ctx arr idx) (e/mem-load (:load elem) (:align elem) 0)))
         ;; integer step (inc/dec, incl. unchecked-*-int) — index/counter steppers
@@ -167,7 +187,8 @@
             :else (emit-val ctx e)
             (let [tv (infer-vt ctx t)
                   vt (if (= tv :i32) (infer-vt ctx e) tv)]
-              (-> (emit-val ctx c) (into (e/if-t vt (emit-val ctx t) (emit-val ctx e)))))))
+              (-> (emit-val ctx c)
+                  (into (e/if-t vt (emit-operand-at ctx vt t) (emit-operand-at ctx vt e)))))))
         ;; case* (macroexpanded) → lower to a let*+if-chain, emitted via normal path
         (= h 'case*)
         (emit-val ctx (synth-case* A))
@@ -178,6 +199,16 @@
         ;; — emit-loop already yields a value-producing block(result vt); take bytes.
         (#{'loop 'loop*} h)
         (first (emit-loop ctx node))
+        ;; array access .invk (aget is a deftm and may arrive devirtualized OR
+        ;; survive as an un-inlined callee) — ALWAYS emit through the elems
+        ;; machinery: outlining it as a sibling function loses the per-array
+        ;; element type (the callee monomorphizes under the CALLER's dtype and
+        ;; e.g. f32-loads an int array — seen in qgemm's int-aget helper).
+        (and (= h '.invk)
+             (let [op (:raster.op/original (meta node))]
+               (contains? #{'raster.arrays/aget 'clojure.core/aget} op)))
+        (emit-val ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
+                                 (meta node)))
         ;; non-intrinsic deftm callee kept as a real wasm function (not inlined):
         ;; push args, then `call` its function index. Intrinsics (raster.numeric,
         ;; Math, …) fall through to inline emission below.
@@ -191,7 +222,7 @@
         (= h '.invk)
         (let [tag (:raster.type/tag (meta node))
               vt  (case tag
-                    double :f64, float :f32, (long int) :i32
+                    double :f64, float :f32, (long int byte short char boolean) :i32
                     ;; No semantic tag — a devirtualization site failed to stamp it
                     ;; (the walker, inline-invk, and resolve-generic-deftm-calls all
                     ;; should). Recover the element type from the first operand
@@ -205,6 +236,26 @@
                                       " from its operand. A devirtualization site didn't stamp it.")))
                       v))]
           (emit-intrinsic ctx (:raster.op/original (meta node)) (drop 1 A) vt))
+        ;; par/dp4a — 4-way signed-int8 dot + accumulate: the ONE quantization
+        ;; primitive, spelled per backend (CUDA __dp4a / AMD sdot4 / OpenCL helper /
+        ;; CPU-C dpbusd). Wasm Tier-1 scalar: extract sign-extended bytes by
+        ;; shl/shr_s pairs, 4 muls, chained adds onto acc. (Tier-2 SIMD via the
+        ;; existing i32x4.dot int8-dot loop plan when the enclosing loop matches.)
+        (or (= h 'raster.par/dp4a) (= h 'par/dp4a))
+        (let [[a b acc] A
+              la (alloc! ctx :i32) lb (alloc! ctx :i32)
+              lane (fn [l k]                               ; sign-extended byte k
+                     (let [sh (- 24 (* 8 k))]
+                       (cond-> (e/local-get l)
+                         (pos? sh) (-> (into (e/i32-const sh)) (into (e/i :i32.shl)))
+                         true      (-> (into (e/i32-const 24)) (into (e/i :i32.shr_s))))))]
+          (-> (emit-val ctx a) (into (e/local-set la))
+              (into (emit-val ctx b)) (into (e/local-set lb))
+              (into (emit-val ctx acc))
+              (into (vec (mapcat (fn [k]
+                                   (-> (lane la k) (into (lane lb k))
+                                       (into (e/i :i32.mul)) (into (e/i :i32.add))))
+                                 (range 4))))))
         ;; any registered numeric op / intrinsic (arith, comparison, rem/mod,
         ;; Math, min/max) — dispatched through backend.intrinsics (single table).
         (and (symbol? h) (ix/canonical h))
@@ -218,6 +269,7 @@
         (= h 'do)
         (into (vec (mapcat #(emit-effect ctx %) (butlast A))) (emit-val ctx (last A)))
         :else (throw (ex-info (str "unhandled value head " h) {:node node}))))
+    (nil? node) []                                  ; void leaf (statement-loop exit, if-void arm)
     :else (throw (ex-info (str "unhandled value node " (pr-str node)) {}))))
 
 (defn- emit-rem-mod
@@ -247,6 +299,7 @@
         b  (emit-val ctx node)]
     (cond
       (= nv vt) b
+      (= nv :diverge) b                       ; throw/unreachable: value never flows
       (and (= vt :f64) (= nv :i32)) (into b (e/i :f64.convert_i32_s))
       (and (= vt :f32) (= nv :i32)) (into b (e/i :f32.convert_i32_s))
       (and (= vt :f64) (= nv :f32)) (into b (e/i :f64.promote_f32))
@@ -285,11 +338,15 @@
                          (emit-operand-at ctx vt (first args)) (rest args))))
       :fn (if (ix/wasm-poly? k)
             ;; transcendental → inline polynomial form, emitted via the normal path.
-            ;; f32: compute in f64 (promote args) and demote the result.
-            (let [vt (or vt-hint (infer-vt ctx (first args)))]
+            ;; Args are ALWAYS cast-wrapped to f64 so the synthetic form is
+            ;; homogeneous by construction — a raw f32 arg inside an f64 poly
+            ;; otherwise makes individual ops pick f32 (first-operand rule) while
+            ;; the caller believes f64 (mixed-width miscompile). f32 result demotes.
+            (let [vt (or vt-hint (infer-vt ctx (first args)))
+                  form (tr/form k (map #(list 'double %) args))]
               (if (= vt :f32)
-                (emit-val ctx (list 'float (tr/form k (map #(list 'double %) args))))
-                (emit-val ctx (tr/form k args))))
+                (emit-val ctx (list 'float form))
+                (emit-val ctx form)))
             (let [vt (or vt-hint (infer-vt ctx (first args)))
                   opk (or (ix/wasm-op k vt)
                           (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
@@ -299,30 +356,49 @@
                 (-> (emit-operand-at ctx vt (first args)) (into (e/i opk))))))
       (throw (ex-info (str "intrinsic not emittable: " op) {:op op :kind (:kind d)})))))
 
+(def ^:dynamic *lenient-types?*
+  "When true, missing type info warns and defaults to i32 (the historical behavior)
+   instead of throwing. Types come from walker/TC stamps — a miss is a front-half
+   bug; bind this only to diagnose."
+  false)
+
 (defn- warn-unknown-vt
   "G1: surface a type-inference miss (mirrors the .invk loud-recovery policy) and
    default to :i32, instead of *silently* assuming i32 — a silent i32 on a float expr
    miscompiles. A warning here means a node reached the emitter without a resolvable
    type: a missing :raster.type/tag stamp, an unhandled form head, or an unbound symbol."
   [node why]
-  (binding [*out* *err*]
-    (println (str "WARNING: wasm infer-vt — no type for " why ": " (pr-str node)
-                  " → defaulting to i32 (may miscompile a float expr).")))
-  :i32)
+  (if *lenient-types?*
+    (do (binding [*out* *err*]
+          (println (str "WARNING: wasm infer-vt — no type for " why ": " (pr-str node)
+                        " → defaulting to i32 (may miscompile a float expr).")))
+        :i32)
+    (throw (ex-info (str "wasm emit: no type for " why " — a node reached the emitter "
+                         "without a resolvable :raster.type/tag (front-half stamping gap)")
+                    {:node node :why why}))))
 
 (defn- infer-vt
-  "Result valtype of an expression, from env + carried :raster.type/tag. Genuinely
-   undeterminable types warn (warn-unknown-vt) rather than silently defaulting to i32."
+  "node-vt: the TOTAL type reader (never an inferrer). Sources, in order:
+   stamped :raster.type/tag (walker/TC — symbols and forms), a literal's Clojure
+   class (0.5 IS a double; retyping a literal is the narrowing pass's job via
+   cast-wrapping), the binding env, and a CLOSED set of dialect rules for the
+   untagged heads the lowered dialect defines (clojure.core index arith → i32,
+   comparisons/predicates → i32, casts, aget element types, dp4a → i32,
+   control forms = their tail, synthetic math forms = their first operand —
+   homogeneous by construction). Anything else THROWS (front-half stamping gap);
+   bind *lenient-types?* only to diagnose. Emission emits exactly this type and
+   consumers coerce at typed slots — prediction ≡ lookup, divergence impossible."
   [ctx node]
   (cond
     (symbol? node)  (if (contains? (:env ctx) node)
                       (get-in ctx [:env node :vt] :i32)   ; in env w/o :vt = a void binding
-                      (warn-unknown-vt node "unbound symbol"))
+                      (or (sym-vt node)                    ; stamped tag (walker/TC)
+                          (warn-unknown-vt node "unbound symbol")))
     (float? node)   :f64
     (integer? node) :i32
     (seq? node)
     (case (:raster.type/tag (meta node))
-      double :f64, float :f32, long :i32, int :i32
+      double :f64, float :f32, (long int byte short char boolean) :i32
       (let [h (first node)]
         (cond
           (and (symbol? h) (= "float" (name h)))  :f32
@@ -332,7 +408,8 @@
           ;; operand, e.g. (/ (let* …) (let* …)), must infer its tail's vt, which
           ;; may reference a binding introduced inside it).
           (#{'let* 'let} h) (let [c' (reduce (fn [c [s init]]
-                                               (assoc-in c [:env s] {:vt (infer-vt c init)}))
+                                               (assoc-in c [:env s]
+                                                         {:vt (or (sym-vt s) (infer-vt c init))}))
                                              ctx (partition 2 (second node)))]
                               (infer-vt c' (last node)))
           (= 'do h) (infer-vt ctx (last node))           ; value of tail
@@ -349,28 +426,47 @@
           (and (symbol? h) (#{"inc" "unchecked-inc-int" "unchecked-inc"
                               "dec" "unchecked-dec-int" "unchecked-dec"} (name h))) :i32
           (#{'loop 'loop*} h)                                         ; loop result = its non-recur branch
-          (let [c' (reduce (fn [c [s init]] (assoc-in c [:env s] {:vt (infer-vt c init)}))
+          (let [c' (reduce (fn [c [s init]]
+                             (assoc-in c [:env s] {:vt (or (sym-vt s) (infer-vt c init))}))
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
                 ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
             (infer-vt c' (if (ends-in-recur? then) els then)))
-          (= 'clojure.core/aget h)  (get-in ctx [:elems (second node) :vt] :f64)
+          (= 'throw h) :diverge                        ; never produces a value
+          (#{'raster.par/dp4a 'par/dp4a} h) :i32       ; int8 dot-accumulate → i32
+          (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand
           (ix/canonical h) (if (= :cmp (ix/kind h)) :i32 (infer-vt ctx (second node)))
           :else (warn-unknown-vt node (str "unhandled head " h)))))
     :else (warn-unknown-vt node "non-expression node")))
 
-(declare emit-dotimes emit-dotimes-scalar)
+(declare emit-dotimes emit-dotimes-scalar emit-loop-void)
 
 (defn- emit-effect
   "Side-effecting statement that leaves nothing on the stack (aset / when / do /
    let* / dotimes)."
   [ctx node]
+  (if (nil? node)
+    []                                              ; statement nil (void tails)
   (let [h (first node), A (vec (rest node))]
     (cond
-      (= h 'clojure.core/aset)
+      ;; devirtualized statement call: recover the semantic op and re-dispatch
+      ;; (raster.arrays/aset is a deftm — it can arrive as (.invk impl arr i v))
+      (and (= h '.invk) (:raster.op/original (meta node)))
+      (emit-effect ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
+                                  (meta node)))
+      (#{'clojure.core/aset 'raster.arrays/aset} h)
       (let [[arr idx v] A elem (get-in ctx [:elems arr])]
-        (-> (addr ctx arr idx) (into (emit-val ctx v)) (into (e/mem-store (:store elem) (:align elem) 0))))
+        (when-not elem
+          (throw (ex-info (str "aset target " arr " has no element info (not an array param?)")
+                          {:arr arr :node node})))
+        ;; the store's element type is ground truth — coerce the value like an
+        ;; intrinsic operand (kernels' explicit (float ...) casts make this a
+        ;; no-op; a mixed-width expression gets the correct convert instead of
+        ;; a validation failure)
+        (-> (addr ctx arr idx)
+            (into (emit-operand-at ctx (:vt elem) v))
+            (into (e/mem-store (:store elem) (:align elem) 0))))
       (= h 'do) (vec (mapcat #(emit-effect ctx %) A))
       ;; let* in effect position (e.g. soa-lower floats arg bindings out of a
       ;; store: (let* [args…] (do (aset …) …))). Bind locals, emit body as effects.
@@ -391,14 +487,19 @@
       (= h 'case*) (emit-effect ctx (synth-case* A))
       (= h 'throw) (e/i :unreachable)               ; exhaustive-case default
       (= h 'dotimes) (emit-dotimes ctx node)
-      :else (throw (ex-info (str "unhandled effect head " h) {:node node})))))
+      (= h 'when) (emit-effect ctx (list 'if (second node) (list* 'do (drop 2 node))))
+      ;; statement-position loop (model kernels: packing/softmax inner loops that
+      ;; end in nil) — the value-loop emission with a void exit branch.
+      (#{'loop 'loop*} h) (emit-loop-void ctx node)
+      :else (throw (ex-info (str "unhandled effect head " h) {:node node}))))))
 
 (defn- emit-recur
-  "(recur v0 v1 ...) → push all new values, set loop locals in REVERSE (so each
-   value is read from the OLD locals before any are overwritten), then branch to
-   the loop header at depth `loop-depth`."
-  [ctx args loop-idxs loop-depth]
-  (-> (vec (mapcat #(emit-val ctx %) args))
+  "(recur v0 v1 ...) → push all new values COERCED to their loop-var valtypes
+   (the typed slot, from the stamped loop-var tags), set loop locals in REVERSE
+   (so each value is read from the OLD locals before any are overwritten), then
+   branch to the loop header at depth `loop-depth`."
+  [ctx args loop-idxs loop-vts loop-depth]
+  (-> (vec (mapcat (fn [a vt] (emit-operand-at ctx vt a)) args loop-vts))
       (into (vec (mapcat #(e/local-set %) (reverse loop-idxs))))
       (into (e/br loop-depth))))
 
@@ -417,35 +518,33 @@
 
 (defn- emit-then
   "Emit a loop's recur-branch: effects/bindings ending in a recur, or an `if` that
-   splits into a recur side and a loop-result side (nested-loop early-exit, e.g.
-   aabb-collides?). `loop-depth` is the br target of the enclosing loop header;
-   `block-depth` is the br target of the result block (a result-producing branch
-   pushes its value then br's out). Each nested `if` adds one wasm block level, so
-   both depths increment when recursing through it."
-  [ctx node loop-idxs loop-depth block-depth]
+   splits into a recur side and a loop-result side. Recur args coerce to the
+   loop-var valtypes; a result branch coerces to the block's ret-vt (nil ret-vt =
+   void loop: result side emits as effects). `loop-depth`/`block-depth` as before;
+   both increment through each nested if."
+  [ctx node loop-idxs loop-vts ret-vt loop-depth block-depth]
   (cond
     (and (seq? node) (= 'recur (first node)))
-    (emit-recur ctx (vec (rest node)) loop-idxs loop-depth)
+    (emit-recur ctx (vec (rest node)) loop-idxs loop-vts loop-depth)
     (and (seq? node) (= 'do (first node)))
     (let [stmts (vec (rest node))]
       (-> (vec (mapcat #(emit-effect ctx %) (butlast stmts)))
-          (into (emit-then ctx (last stmts) loop-idxs loop-depth block-depth))))
-    ;; let*/let before the recur — bind locals, then recurse into the tail
+          (into (emit-then ctx (last stmts) loop-idxs loop-vts ret-vt loop-depth block-depth))))
     (and (seq? node) (#{'let* 'let} (first node)))
     (let [[binds & body] (rest node)
           [ctx' init-bytes] (emit-bindings ctx binds)
           tail (if (= 1 (count body)) (first body) (cons 'do body))]
-      (into init-bytes (emit-then ctx' tail loop-idxs loop-depth block-depth)))
-    ;; if splitting into recur side + loop-result side. Each side either continues
-    ;; the loop (recur → emit-then) or yields the loop's result (value → br to the
-    ;; result block). The if itself adds a block level → depths +1 inside it.
+      (into init-bytes (emit-then ctx' tail loop-idxs loop-vts ret-vt loop-depth block-depth)))
     (and (seq? node) (= 'if (first node)))
     (let [[_ c a b] node
           ld (inc loop-depth), bd (inc block-depth)
           branch (fn [br-node]
                    (if (ends-in-recur? br-node)
-                     (emit-then ctx br-node loop-idxs ld bd)
-                     (-> (emit-val ctx br-node) (into (e/br bd)))))]  ; loop result → leave block
+                     (emit-then ctx br-node loop-idxs loop-vts ret-vt ld bd)
+                     (-> (if (nil? ret-vt)
+                           (emit-effect ctx br-node)
+                           (emit-operand-at ctx ret-vt br-node))
+                         (into (e/br bd)))))]
       (-> (emit-val ctx c)
           (into [(e/op :if) e/empty-block])
           (into (branch a))
@@ -604,11 +703,12 @@
         ;; allocate loop-var locals; inits emitted with the OUTER env (loop vars
         ;; not yet in scope for their own inits)
         loop-vars (mapv (fn [[sym init]]
-                          (let [vt (infer-vt ctx init)]  ; 0→i32, 0.0→f64, (float 0.0)→f32
+                          ;; stamped symbol tag first (TC loop inference via walker)
+                          (let [vt (or (sym-vt sym) (infer-vt ctx init))]
                             {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
                         pairs)
-        inits (vec (mapcat (fn [{:keys [idx init]}]
-                             (into (emit-val ctx init) (e/local-set idx))) loop-vars))
+        inits (vec (mapcat (fn [{:keys [idx vt init]}]
+                             (into (emit-operand-at ctx vt init) (e/local-set idx))) loop-vars))
         ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
                      ctx loop-vars)
         loop-idxs (mapv :idx loop-vars)
@@ -619,23 +719,64 @@
         recur-then? (ends-in-recur? then)
         result (if recur-then? els then)
         ret-vt (infer-vt ctx' result)
+        loop-vts (mapv :vt loop-vars)
         ;; depths from inside the if: if=0, loop=1, block=2. The result branch
-        ;; leaves its value then br 2 (out of the block); the recur branch br 1.
+        ;; leaves its value (coerced to ret-vt) then br 2; the recur branch br 1.
         if-bytes (if recur-then?
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-then ctx' then loop-idxs 1 2))
+                       (into (emit-then ctx' then loop-idxs loop-vts ret-vt 1 2))
                        (into [(e/op :else)])
-                       (into (emit-val ctx' els)) (into (e/br 2))
+                       (into (emit-operand-at ctx' ret-vt els)) (into (e/br 2))
                        (into [(e/op :end)]))
                    (-> (emit-val ctx' cnd)
                        (into [(e/op :if) e/empty-block])
-                       (into (emit-val ctx' then)) (into (e/br 2))
+                       (into (emit-operand-at ctx' ret-vt then)) (into (e/br 2))
                        (into [(e/op :else)])
-                       (into (emit-then ctx' els loop-idxs 1 2))
+                       (into (emit-then ctx' els loop-idxs loop-vts ret-vt 1 2))
                        (into [(e/op :end)])))]
     [(into inits (e/block-t ret-vt (into (e/loop* if-bytes) (e/i :unreachable))))
      ret-vt]))
+
+(defn- emit-loop-void
+  "(loop [v init ...] (if cond <recur-branch> <exit>)) in STATEMENT position —
+   the exit branch is effects/nil, the block carries no result. Model kernels'
+   packing/softmax inner loops end in nil; rms/softmax normalize loops end in a
+   final effect."
+  [ctx node]
+  (let [[_ bindvec ifform] node
+        pairs (vec (partition 2 bindvec))
+        loop-vars (mapv (fn [[sym init]]
+                          ;; stamped symbol tag first (TC loop inference via walker)
+                          (let [vt (or (sym-vt sym) (infer-vt ctx init))]
+                            {:sym sym :idx (alloc! ctx vt) :vt vt :init init}))
+                        pairs)
+        inits (vec (mapcat (fn [{:keys [idx vt init]}]
+                             (into (emit-operand-at ctx vt init) (e/local-set idx))) loop-vars))
+        ctx' (reduce (fn [c {:keys [sym idx vt]}] (assoc-in c [:env sym] {:idx idx :vt vt}))
+                     ctx loop-vars)
+        loop-idxs (mapv :idx loop-vars)
+        [_ cnd then els] ifform
+        recur-then? (ends-in-recur? then)
+        exit (if recur-then? els then)
+        rec  (if recur-then? then els)
+        exit-bytes (if (nil? exit) [] (emit-effect ctx' exit))
+        loop-vts (mapv :vt loop-vars)
+        ;; depths from inside the if: if=0, loop=1, void block=2
+        if-bytes (if recur-then?
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into (emit-then ctx' rec loop-idxs loop-vts nil 1 2))
+                       (into [(e/op :else)])
+                       (into exit-bytes) (into (e/br 2))
+                       (into [(e/op :end)]))
+                   (-> (emit-val ctx' cnd)
+                       (into [(e/op :if) e/empty-block])
+                       (into exit-bytes) (into (e/br 2))
+                       (into [(e/op :else)])
+                       (into (emit-then ctx' rec loop-idxs loop-vts nil 1 2))
+                       (into [(e/op :end)])))]
+    (into inits (e/block-v (into (e/loop* if-bytes) (e/i :unreachable))))))
 
 ;; ─────────────────────────────────────────────────────────────────────────
 ;; SIMD128 vectorization of elementwise dotimes-maps (opt-in via ctx :simd?).

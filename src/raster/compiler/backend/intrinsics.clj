@@ -61,7 +61,7 @@
    :floor (math1 :f64.floor :f32.floor "floor")
    :ceil  {:arity 1 :kind :fn :wasm :poly :c {:fn "ceil"} :wgsl {:fn "ceil"}}   ; -floor(-x)
    :trunc {:arity 1 :kind :fn :wasm (vt3 :f64.trunc :f32.trunc nil) :c {:fn "trunc"} :wgsl {:fn "trunc"}}
-   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"}}    ; returns int — no wasm
+   :round {:arity 1 :kind :fn :c {:fn "round"} :wgsl {:fn "round"} :wasm :poly} ; wasm: floor(x+0.5) poly (Java semantics)
    :neg   {:arity 1 :kind :fn :wasm (vt3 :f64.neg :f32.neg nil) :c {:prefix "-"} :wgsl {:prefix "-"}}
    ;; math — binary
    :min {:arity 2 :kind :fn :wasm (vt3 :f64.min :f32.min nil) :c {:fn "fmin" :glsl "min"} :wgsl {:fn "min"}}
