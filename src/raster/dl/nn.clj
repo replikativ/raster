@@ -420,6 +420,50 @@
                                           (aget beta i)))))))
                          out)))
 
+;; !-variant for resident GPU programs: one work-item per row, writes into a
+;; pre-allocated out buffer (same convention as rms-norm!). The AuT audio
+;; encoder (Qwen3-ASR) and BERT-family layers use this (LN with bias), where
+;; the decoder LMs use rms-norm!.
+(deftm layer-norm! (All [T] [x :- (Array T) gamma :- (Array T) beta :- (Array T)
+                             out :- (Array T) rows :- Long features :- Long
+                             eps :- Double] :- Void
+  (raster.par/map-void! r rows
+    (let [offset (clojure.core/* r features)
+          mean (loop [i 0 s 0.0]
+                 (if (< i features)
+                   (recur (inc i) (+ s (aget x (clojure.core/+ offset i))))
+                   (/ s (double features))))
+          var (loop [i 0 s 0.0]
+                (if (< i features)
+                  (let [dv (- (aget x (clojure.core/+ offset i)) mean)]
+                    (recur (inc i) (+ s (* dv dv))))
+                  (/ s (double features))))
+          inv (/ 1.0 (n/sqrt (+ var eps)))]
+      (loop [i 0]
+        (if (< i features)
+          (do (aset out (clojure.core/+ offset i)
+                    (+ (* (aget gamma i)
+                          (* (- (aget x (clojure.core/+ offset i)) mean) inv))
+                       (aget beta i)))
+              (recur (inc i)))
+          nil))))))
+
+;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
+(deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
+  (raster.par/map-void! i n
+    (let [v (aget x i)]
+      (aset out i (* 0.5 v
+                     (+ 1.0 (m/tanh (* 0.7978845608028654
+                                       (+ v (* 0.044715 v v v)))))))))))
+
+;; Broadcast row-bias add in place semantics via separate out (resident-graph
+;; friendly): out[r,j] = x[r,j] + b[j]. Follows every biased linear in
+;; encoder-family layers (AuT, BERT) — the quantized GEMM kernels are bias-free.
+(deftm add-bias-rows! (All [T] [x :- (Array T) b :- (Array T) out :- (Array T)
+                                rows :- Long features :- Long] :- Void
+  (raster.par/map-void! i (* rows features)
+    (aset out i (+ (aget x i) (aget b (clojure.core/rem i features)))))))
+
 ;; layer-norm rrule — pullback registered after backward deftm (below)
 
 ;; --- RMS Norm ---
