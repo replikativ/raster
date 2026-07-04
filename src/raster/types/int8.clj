@@ -38,19 +38,27 @@
 ;; Construction + WIDENING conversions (the defining operations)
 ;; ================================================================
 
-(defn int8
-  "Create an Int8 from any integer, truncated to signed 8-bit (wraps, like Julia)."
-  [x]
+(deftm int8
+  "Create an Int8 from a long, truncated to signed 8-bit (wraps, like Julia)."
+  [x :- Long] :- Int8
+  (->Int8 (unchecked-byte x)))
+
+(deftm int8 [x :- Integer] :- Int8
   (->Int8 (unchecked-byte (long x))))
 
-(defn int8->long
+(deftm int8
+  "From a byte (e.g. a byte-array read) — already 8-bit, wrap directly."
+  [x :- Byte] :- Int8
+  (->Int8 x))
+
+(deftm int8->long
   "Widen an Int8 to a (sign-extended) long — the exact embedding int8 ↪ int64."
-  ^long [^Int8 x]
+  [x :- Int8] :- Long
   (long (.val x)))
 
-(defn int8->int
-  "Widen an Int8 to a (sign-extended) int."
-  ^long [^Int8 x]
+(deftm int8->int
+  "Widen an Int8 to a (sign-extended) int (returned as long — JVM int-width value)."
+  [x :- Int8] :- Long
   (long (int (.val x))))
 
 ;; ================================================================
@@ -91,8 +99,8 @@
 ;; byte[] + explicit widening). Pull an int8 out with `(int8 (raster.arrays/aget
 ;; bs i))` or widen directly with `(int8->long (int8 (aget bs i)))`.
 
-(defn aget-widen
+(deftm aget-widen
   "Read byte[] element i and widen (sign-extend) to a long — the int8 load used by
    the quantized dot. Equivalent to (int8->long (int8 (aget bs i))) but direct."
-  ^long [^bytes bs ^long i]
-  (long (clojure.core/aget bs (int i))))
+  [bs :- (Array byte), i :- Long] :- Long
+  (long (raster.arrays/aget bs i)))

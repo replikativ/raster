@@ -4473,6 +4473,13 @@
     float    {:class-desc F-cd :stack-type :float}
     long     {:class-desc J-cd :stack-type :long}
     int      {:class-desc I-cd :stack-type :int}
+    ;; byte/short/char are int-width on the JVM stack; without these cases a
+    ;; Byte-tagged deftm param fell to the boxed default while the typed
+    ;; interface declared primitive B — a VerifyError'ing bridge mismatch
+    ;; (surfaced converting raster.types.int8 ops to deftm).
+    (byte Byte)      {:class-desc (ClassDesc/ofDescriptor "B") :stack-type :int}
+    (short Short)    {:class-desc (ClassDesc/ofDescriptor "S") :stack-type :int}
+    (char Character) {:class-desc (ClassDesc/ofDescriptor "C") :stack-type :int}
     boolean  {:class-desc (ClassDesc/ofDescriptor "Z") :stack-type :bool}
     objects  {:class-desc objarr-cd :stack-type :ref}
     doubles  {:class-desc dblarr-cd :stack-type :ref}
@@ -5128,7 +5135,22 @@
                                           (= iface-pd "D") (do (.dload code slot) (recur (+ slot 2) (inc i)))
                                           (= iface-pd "J") (do (.lload code slot) (recur (+ slot 2) (inc i)))
                                           (= iface-pd "F") (do (.fload code slot) (recur (+ slot 1) (inc i)))
-                                          (#{"I" "Z" "B" "S" "C"} iface-pd) (do (.iload code slot) (recur (+ slot 1) (inc i)))
+                                          (#{"I" "Z" "B" "S" "C"} iface-pd)
+                                          (do (.iload code slot)
+                                              ;; compute takes a REF here → box with the
+                                              ;; exact wrapper (Byte/valueOf, not Integer)
+                                              ;; so downstream type dispatch stays correct
+                                              (when-not (#{"I" "Z" "B" "S" "C"} (.descriptorString ^ClassDesc (nth compute-param-cds i)))
+                                                (let [[cls prim] (case iface-pd
+                                                                   "B" ["java.lang.Byte" "B"]
+                                                                   "S" ["java.lang.Short" "S"]
+                                                                   "C" ["java.lang.Character" "C"]
+                                                                   "Z" ["java.lang.Boolean" "Z"]
+                                                                   ["java.lang.Integer" "I"])
+                                                      box-cd (ClassDesc/of cls)]
+                                                  (.invokestatic code box-cd "valueOf"
+                                                                 (MethodTypeDesc/of box-cd (into-array ClassDesc [(ClassDesc/ofDescriptor prim)])))))
+                                              (recur (+ slot 1) (inc i)))
                                           :else (do (.aload code slot)
                                                     (when (not= iface-pd compute-pd)
                                                       (.checkcast code (nth compute-param-cds i)))
