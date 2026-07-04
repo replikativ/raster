@@ -722,10 +722,38 @@
          'bit-and {:associative? true :commutative? true :identity -1}
          'bit-or  {:associative? true :commutative? true :identity 0}
          'bit-xor {:associative? true :commutative? true :identity 0}}
-        v    [base
-              (symbol "clojure.core" (name base))
-              (symbol "raster.numeric" (name base))]]
+        v    (cond-> [base
+                      (symbol "clojure.core" (name base))
+                      (symbol "raster.numeric" (name base))]
+               (contains? #{'min 'max} base) (conj (symbol "Math" (name base))))]
   (register-algebra! v algebra))
+
+(defn typed-reduce-identity
+  "The identity element for a reduction op, TYPED for the element dtype — the
+   single source emitters use to seed accumulators (segop-simd, GPU segred).
+   Derived from the :algebra facet's abstract identity; min/max (whose abstract
+   identity is nil — no identity over unbounded domains) become the dtype's
+   ∓Infinity, which IS their identity over IEEE floats. Emits a LITERAL or a
+   symbol suitable for splicing into generated code. Throws for ops without a
+   registered monoid — an unregistered reduction must fail loud, not seed 0."
+  [op-sym dtype]
+  (let [base (symbol (name op-sym))                 ; spelling-collapse
+        a    (algebra-facet base)]
+    (when-not a
+      (throw (ex-info (str "no :algebra facet for reduction op " op-sym
+                           " — register it (op-descriptor) before reducing with it")
+                      {:op op-sym :dtype dtype})))
+    (let [float? (= dtype :float)]
+      (case base
+        (min Math/min) (if float? 'Float/POSITIVE_INFINITY 'Double/POSITIVE_INFINITY)
+        (max Math/max) (if float? 'Float/NEGATIVE_INFINITY 'Double/NEGATIVE_INFINITY)
+        ;; numeric monoids: type the abstract identity for the dtype
+        (let [id (:identity a)]
+          (cond
+            (nil? id) (throw (ex-info (str "op " op-sym " has no identity") {:op op-sym}))
+            (contains? #{:int :long :byte} dtype) id
+            float?    (list 'float (double id))
+            :else     (double id)))))))
 
 ;; --- Devirtualization detection ---
 

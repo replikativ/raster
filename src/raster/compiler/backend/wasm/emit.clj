@@ -241,7 +241,7 @@
         ;; CPU-C dpbusd). Wasm Tier-1 scalar: extract sign-extended bytes by
         ;; shl/shr_s pairs, 4 muls, chained adds onto acc. (Tier-2 SIMD via the
         ;; existing i32x4.dot int8-dot loop plan when the enclosing loop matches.)
-        (or (= h 'raster.par/dp4a) (= h 'par/dp4a))
+        (= :dp4a (ix/canonical h))    ; any spelling — canonical collapses them
         (let [[a b acc] A
               la (alloc! ctx :i32) lb (alloc! ctx :i32)
               lane (fn [l k]                               ; sign-extended byte k
@@ -432,7 +432,7 @@
                 ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
             (infer-vt c' (if (ends-in-recur? then) els then)))
           (= 'throw h) :diverge                        ; never produces a value
-          (#{'raster.par/dp4a 'par/dp4a} h) :i32       ; int8 dot-accumulate → i32
+          (= :dp4a (ix/canonical h)) :i32              ; int8 dot-accumulate → i32
           (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
           ;; math / rem-mod → element type of first operand

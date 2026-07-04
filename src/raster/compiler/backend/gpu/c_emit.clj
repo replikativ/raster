@@ -196,10 +196,11 @@
          'round "round"
          'fma   "fma"
    ;; int8 4-way dot-accumulate → portable OpenCL/C helper (pattern-matched to
-   ;; a hardware dp4a). All call spellings that can survive into a par/deftm body.
-         'dp4a            "rstr_dp4a"
-         'par/dp4a        "rstr_dp4a"
-         'raster.par/dp4a "rstr_dp4a"}]
+   ;; a hardware dp4a). Spelling sourced from the intrinsics registry (:dp4a
+   ;; canonical entry) — CUDA/HIP spellings will be sibling rows there, not here.
+         'dp4a            (get-in intrinsics/table [:dp4a :c :fn])
+         'par/dp4a        (get-in intrinsics/table [:dp4a :c :fn])
+         'raster.par/dp4a (get-in intrinsics/table [:dp4a :c :fn])}]
     ;; auto-alias java.lang.Math/X -> the short Math/X entry (the inliner emits
     ;; fully-qualified Java method symbols; both must lower the same).
     (merge base
@@ -339,6 +340,22 @@
      clojure.core/bit-shift-left clojure.core/bit-shift-right
      clojure.core/unsigned-bit-shift-right})
 
+(def ^:private scalar-default-seen (atom #{}))
+
+(defn- warn-scalar-default!
+  "A2 instrumentation: infer-c-type fell through to *scalar-type* — the silent
+   default that miscompiles when the expression isn't actually the kernel element
+   type. Warn ONCE per distinct head so hot compile paths don't flood stderr.
+   Goal: zero warnings across the suite, then this default becomes a throw
+   (same fail-loud policy as the wasm emitter's *lenient-types?*)."
+  [expr]
+  (let [k (if (seq? expr) (first expr) (class expr))]
+    (when-not (contains? @scalar-default-seen k)
+      (swap! scalar-default-seen conj k)
+      (binding [*out* *err*]
+        (println (str "WARNING: infer-c-type scalar-type default for head " (pr-str k)
+                      " — expr: " (pr-str (if (seq? expr) (take 4 expr) expr))))))))
+
 (defn infer-c-type
   "Infer the C type of an expression. Prefers the walker-stamped :raster.type/tag
   result-type metadata (the single source of truth — no mangled-name parsing); falls
@@ -418,7 +435,7 @@
      (let [types (map infer-c-type (rest expr))]
        (if (some #(= "long" %) types) "long" "int"))
 
-     :else *scalar-type*)))
+     :else (do (warn-scalar-default! expr) *scalar-type*))))
 
 ;; ================================================================
 ;; Side effect detection

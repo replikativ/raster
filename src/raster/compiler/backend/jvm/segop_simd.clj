@@ -51,25 +51,12 @@
             :broadcast     'jdk.incubator.vector.FloatVector/broadcast
             :cast-fn       'float}})
 
-(def ^:private reduce-identity-double
-  {'+ 0.0, '- 0.0, '* 1.0,
-   'Math/max 'Double/NEGATIVE_INFINITY,
-   'Math/min 'Double/POSITIVE_INFINITY})
-
-(def ^:private reduce-identity-float
-  {'+ '(float 0.0), '- '(float 0.0), '* '(float 1.0),
-   'Math/max 'Float/NEGATIVE_INFINITY,
-   'Math/min 'Float/POSITIVE_INFINITY})
-
 (defn- reduce-identity
-  "Look up the identity element for a reduction op, typed by elem-type."
+  "Identity element for a reduction op, typed by elem-type — sourced from the
+   op-descriptor :algebra facet (single registry), not a local table. `-` in a
+   reduction accumulates additively (a - x0 - x1 ...), so it seeds like +."
   [op elem-type]
-  (let [table (if (= elem-type :float) reduce-identity-float reduce-identity-double)]
-    (or (get table op)
-        (throw (ex-info (str "segop-simd: no reduction identity for op `" op
-                             "` (elem-type=" elem-type "). Register in reduce-identity-"
-                             (name elem-type) ".")
-                        {:op op :elem-type elem-type})))))
+  (descriptor/typed-reduce-identity (if (= op '-) '+ op) elem-type))
 
 (defn- normalize-reduce-op
   "clojure.core/+ → +, etc."

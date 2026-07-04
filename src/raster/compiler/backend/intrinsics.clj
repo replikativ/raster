@@ -81,6 +81,25 @@
    ;; the vector lowering is a fixed intrinsic SEQUENCE per ISA (AVX2
    ;; maddubs→madd→add, wasm i32x4.dot_i16x8_s, GPU dp4a) — see simd-widen below.
    :wi8-dot {:arity 2 :kind :widening-mac :wasm {:i32 :i32x4.dot-i16x8-s}}
+   ;; dp4a(a, b, acc) = acc + Σₖ aₖ·bₖ over the 4 SIGNED bytes packed
+   ;; little-endian in each i32 — the scalar int8-MAC primitive (semantic op
+   ;; raster.par/dp4a, JVM reference impl in raster.par). ONE canonical entry;
+   ;; every backend spelling lives HERE as data:
+   ;;   :c    — portable helper name; :c-helper-src is its OpenCL/C source
+   ;;           (as_char4 idiom, pattern-matched to hardware dp4a by IGC/NV/AMD)
+   ;;   :cuda/:hip (Phase B) — __dp4a / __builtin_amdgcn_sdot4 go HERE, not in
+   ;;           an emitter table
+   ;;   :wasm — :scalar-lanes (shift/mask lane extraction; emitter-local emit fn)
+   ;; The VECTOR schedules (AVX2 maddubs, wasm i32x4.dot) are :wi8-dot above.
+   :dp4a {:arity 3 :kind :dp4a
+          :c {:fn "rstr_dp4a"}
+          :c-helper-src (str "inline int rstr_dp4a(int a, int b, int acc) {\n"
+                             "    char4 va = as_char4(a);\n"
+                             "    char4 vb = as_char4(b);\n"
+                             "    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y\n"
+                             "               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;\n"
+                             "}\n")
+          :wasm :scalar-lanes}
    ;; broader elementary set — all wasm via composition/polynomial (see
    ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
    ;; omitted → GPU keeps its generated-helper fallback, no regression).
@@ -129,7 +148,7 @@
    "cbrt" :cbrt "log2" :log2 "log10" :log10 "exp2" :exp2 "exp10" :exp10
    "expm1" :expm1 "log1p" :log1p "hypot" :hypot "deg2rad" :deg2rad "rad2deg" :rad2deg
    "clamp" :clamp "signum" :signum "copysign" :copysign "copySign" :copysign
-   "flipsign" :flipsign "wi8-dot" :wi8-dot})
+   "flipsign" :flipsign "wi8-dot" :wi8-dot "dp4a" :dp4a})
 
 ;; mangled devirtualized prefix → canonical key (e.g. _plus__m_double_double)
 (def ^:private mangled-prefix->key
