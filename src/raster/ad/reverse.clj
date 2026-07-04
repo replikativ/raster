@@ -28,6 +28,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.ad.reverse.normalize :as anf]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.parallel.materialize :as materialize]
             [raster.compiler.core.util :as util]
@@ -128,6 +129,28 @@
 
 (defn- normalize-for-ad [bindings body-exprs]
   (anf/normalize-for-ad bindings body-exprs ad-gensym))
+
+(defn- anf-wrap-bare-body
+  "Normalize a BARE (non-binding-form) walked body into a `let*` whose bindings
+  put every nested call in binding position, BEFORE `lower-to-ad-primitives`.
+
+  Lowering's `inline-deftm-calls` only descends into binding forms
+  (`form/binding-form?`), so a deftm whose body is a bare nested expression —
+  e.g. `(n/* 2.0 (ad-inner x))` → `(.invk _star 2.0 (.invk ad-inner x))` —
+  never gets its composite sub-call inlined. The un-inlined composite then
+  reaches `transform-body` with no AD template → nil pullback (the LoRA-wrapper
+  null-pullback bug). ANF-lifting the nested call into a binding lets the
+  inliner fire and recurse.
+
+  No-op on already-binding-form bodies: the existing (working) let*-bodied path
+  is unchanged."
+  [body]
+  (if (form/binding-form? body)
+    body
+    (with-ad-gensym
+      (let [r-sym (ad-gensym "adbody")
+            anf-b (anf-normalize-bindings [r-sym body])]
+        (list 'let* anf-b r-sym)))))
 
 ;; ================================================================
 ;; Core reverse-mode AD transform
@@ -264,8 +287,9 @@
 (defn- ad-form-kind
   "Classify a binding init into a reverse-record kind. The three array SOACs are
   recognized BEFORE the activity gate (they manage their own activity via the
-  active-set); everything else is gated on `active?`."
-  [init-expr active?]
+  active-set); everything else is gated on `active?`. `sym` is the binding
+  symbol, used only for a fail-loud message on unsupported control-flow forms."
+  [init-expr active? sym]
   (cond
     (and (seq? init-expr) (= 'raster.par/map!   (first init-expr))) :par-map
     (and (seq? init-expr) (= 'raster.par/reduce (first init-expr))) :par-reduce
@@ -274,6 +298,20 @@
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
     (symbol? init-expr)                                             :alias
     (and (seq? init-expr) (contains? #{'loop 'loop*} (first init-expr))) :loop
+    ;; Fail loud on control-flow / interop forms carrying an ACTIVE value: the
+    ;; `:call` fallthrough would wrap them in a bogus deftm rule → silently
+    ;; wrong/dropped gradient. AD through these is unsupported — throw a clear
+    ;; message instead of miscompiling. (Inactive occurrences already routed to
+    ;; :inactive above, so constant control flow is untouched.)
+    (and (seq? init-expr)
+         (contains? '#{case case* try letfn letfn* fn fn* new
+                       monitor-enter monitor-exit}
+                    (first init-expr)))
+    (throw (ex-info (str "AD through `" (first init-expr)
+                         "` is not supported (form bound to `" sym "`). "
+                         "Rewrite using a differentiable primitive "
+                         "(e.g. `if`, `par/reduce`, or a deftm with an AD template).")
+                    {:form-head (first init-expr) :sym sym :init init-expr}))
     (seq? init-expr)                                                :call
     :else                                                          :inactive))
 
@@ -393,7 +431,7 @@
      (let [active?  (init-active? init-expr activity)
            activity (assoc activity sym active?)
            fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
-           {:keys [record fwd-patch]} (ad-record (ad-form-kind init-expr active?)
+           {:keys [record fwd-patch]} (ad-record (ad-form-kind init-expr active? sym)
                                                  sym init-expr activity)]
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
@@ -2055,6 +2093,41 @@
 
 (declare hoist-nested-lets)
 
+(defn- lower-composites
+  "ANF-normalize + inline composite (un-templated) deftm calls into AD
+  primitives, iterating to a fixpoint.
+
+  `lower-to-ad-primitives` (`inline-deftm-calls`) only descends into binding
+  forms, so a BARE-expression body (e.g. `(.invk _star 2.0 (.invk ad-inner x))`)
+  is never inlined → the composite reaches `transform-body` with no template →
+  nil pullback. `anf-wrap-bare-body` fixes the bare case by lifting nested calls
+  into binding position. But a single lowering pass splices callee bodies
+  verbatim, so a callee's OWN nested composite lands back in argument position
+  (multi-level composite); re-ANF (`relift`) lifts it into binding position for
+  the next lowering pass. Each pass strictly reduces the composite-call count,
+  so the fixpoint terminates.
+
+  No-op (beyond behavior-preserving ANF) on already-primitive forms: `relift`
+  leaves a flat ANF form unchanged, so the loop converges on the first pass."
+  [body]
+  (with-ad-gensym
+    (letfn [(lower1 [f]
+              (binding [inline/*ad-transform-body-fn* transform-body]
+                (inline/lower-to-ad-primitives f)))
+            (relift [f]
+              (if (form/binding-form? f)
+                (let [[bindings body-exprs] (extract-let-parts f)]
+                  (apply list 'let* (anf-normalize-bindings bindings) body-exprs))
+                f))]
+      (loop [f (anf-wrap-bare-body body) i 0]
+        (let [lowered   (lower1 f)
+              relifted  (relift lowered)]
+          (cond
+            (= relifted lowered) lowered           ;; fixpoint: nothing left to inline
+            (>= i 32) (throw (ex-info "AD composite lowering did not converge"
+                                      {:body body}))
+            :else (recur relifted (inc i))))))))
+
 (defn grad-expr
   "Transform a quoted S-expression for reverse-mode AD.
   Returns the transformed S-expression that evaluates to
@@ -2068,8 +2141,9 @@
   because the differentiator core only knows template-bearing primitives. Ops
   WITH a template stay symbolic for the transform."
   [form active-params]
-  (let [lowered (binding [inline/*ad-transform-body-fn* transform-body]
-                  (inline/lower-to-ad-primitives form))
+  (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
+        ;; and multi-level composites fully lower before AD (see lower-composites).
+        lowered (lower-composites form)
         ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
         ;; so the AD sees the mutating, value-producing form it can differentiate
         ;; (the pure pmap has no reverse rule).
@@ -2555,9 +2629,10 @@
         source-ns (or (:ns m) *ns*)
         ;; Infer dtype from parameter tags for correct AD seed type
         dtype (if (some #{'floats 'float} tags) :float :double)
-        ;; Lower: inline compound deftm ops into primitives before AD
-        lowered (binding [inline/*ad-transform-body-fn* transform-body]
-                  (inline/lower-to-ad-primitives (first walked-body)))
+        ;; Lower: ANF-normalize + inline compound deftm ops into primitives
+        ;; before AD, to a fixpoint so BARE and multi-level composites fully
+        ;; inline (see lower-composites).
+        lowered (lower-composites (first walked-body))
         ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
         ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
         materialized (:form (materialize/materialize-pass lowered nil))
