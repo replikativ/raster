@@ -401,8 +401,15 @@
       ;; Propagates the return type from impl-sym metadata onto the call form,
       ;; so downstream passes and GPU codegen can query (:raster.type/tag (meta expr)).
       ;; Stripped before reify emission in ftm to avoid 64KB bytecode limit.
+      ;; Re-derive even when a tag is already present: on the specialization
+      ;; REWALK, forms arrive carrying the GENERIC phase's tags (e.g. a loop
+      ;; form tagged double whose accumulator was narrowed to float) — a
+      ;; preserved stale tag diverges from the re-stamped binding symbols and
+      ;; miscompiles any backend that trusts form tags. Each arm below only
+      ;; overwrites when it can derive a value; underivable forms keep their
+      ;; existing tag (par-form out-tags etc. are stamped by their own handlers
+      ;; and don't match these heads).
       (if (and (seq? result)
-               (not (:raster.type/tag (meta result)))
                (instance? clojure.lang.IObj result))
         (let [head (first result)
               type-env (:type-env ctx)

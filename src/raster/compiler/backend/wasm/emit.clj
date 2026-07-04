@@ -199,6 +199,16 @@
         ;; — emit-loop already yields a value-producing block(result vt); take bytes.
         (#{'loop 'loop*} h)
         (first (emit-loop ctx node))
+        ;; array access .invk (aget is a deftm and may arrive devirtualized OR
+        ;; survive as an un-inlined callee) — ALWAYS emit through the elems
+        ;; machinery: outlining it as a sibling function loses the per-array
+        ;; element type (the callee monomorphizes under the CALLER's dtype and
+        ;; e.g. f32-loads an int array — seen in qgemm's int-aget helper).
+        (and (= h '.invk)
+             (let [op (:raster.op/original (meta node))]
+               (contains? #{'raster.arrays/aget 'clojure.core/aget} op)))
+        (emit-val ctx (with-meta (cons (:raster.op/original (meta node)) (rest A))
+                                 (meta node)))
         ;; non-intrinsic deftm callee kept as a real wasm function (not inlined):
         ;; push args, then `call` its function index. Intrinsics (raster.numeric,
         ;; Math, …) fall through to inline emission below.
@@ -289,6 +299,7 @@
         b  (emit-val ctx node)]
     (cond
       (= nv vt) b
+      (= nv :diverge) b                       ; throw/unreachable: value never flows
       (and (= vt :f64) (= nv :i32)) (into b (e/i :f64.convert_i32_s))
       (and (= vt :f32) (= nv :i32)) (into b (e/i :f32.convert_i32_s))
       (and (= vt :f64) (= nv :f32)) (into b (e/i :f64.promote_f32))
@@ -327,11 +338,15 @@
                          (emit-operand-at ctx vt (first args)) (rest args))))
       :fn (if (ix/wasm-poly? k)
             ;; transcendental → inline polynomial form, emitted via the normal path.
-            ;; f32: compute in f64 (promote args) and demote the result.
-            (let [vt (or vt-hint (infer-vt ctx (first args)))]
+            ;; Args are ALWAYS cast-wrapped to f64 so the synthetic form is
+            ;; homogeneous by construction — a raw f32 arg inside an f64 poly
+            ;; otherwise makes individual ops pick f32 (first-operand rule) while
+            ;; the caller believes f64 (mixed-width miscompile). f32 result demotes.
+            (let [vt (or vt-hint (infer-vt ctx (first args)))
+                  form (tr/form k (map #(list 'double %) args))]
               (if (= vt :f32)
-                (emit-val ctx (list 'float (tr/form k (map #(list 'double %) args))))
-                (emit-val ctx (tr/form k args))))
+                (emit-val ctx (list 'float form))
+                (emit-val ctx form)))
             (let [vt (or vt-hint (infer-vt ctx (first args)))
                   opk (or (ix/wasm-op k vt)
                           (throw (ex-info (str "no wasm lowering for intrinsic " k " @ " vt
@@ -363,8 +378,16 @@
                     {:node node :why why}))))
 
 (defn- infer-vt
-  "Result valtype of an expression, from env + carried :raster.type/tag. Genuinely
-   undeterminable types warn (warn-unknown-vt) rather than silently defaulting to i32."
+  "node-vt: the TOTAL type reader (never an inferrer). Sources, in order:
+   stamped :raster.type/tag (walker/TC — symbols and forms), a literal's Clojure
+   class (0.5 IS a double; retyping a literal is the narrowing pass's job via
+   cast-wrapping), the binding env, and a CLOSED set of dialect rules for the
+   untagged heads the lowered dialect defines (clojure.core index arith → i32,
+   comparisons/predicates → i32, casts, aget element types, dp4a → i32,
+   control forms = their tail, synthetic math forms = their first operand —
+   homogeneous by construction). Anything else THROWS (front-half stamping gap);
+   bind *lenient-types?* only to diagnose. Emission emits exactly this type and
+   consumers coerce at typed slots — prediction ≡ lookup, divergence impossible."
   [ctx node]
   (cond
     (symbol? node)  (if (contains? (:env ctx) node)
@@ -408,6 +431,7 @@
                            ctx (partition 2 (nth node 1)))  ; bind loop vars so the result ref resolves
                 ifform (nth node 2) then (nth ifform 2) els (nth ifform 3)]
             (infer-vt c' (if (ends-in-recur? then) els then)))
+          (= 'throw h) :diverge                        ; never produces a value
           (#{'raster.par/dp4a 'par/dp4a} h) :i32       ; int8 dot-accumulate → i32
           (#{'clojure.core/aget 'raster.arrays/aget} h) (get-in ctx [:elems (second node) :vt] :f64)
           ;; registered numeric op/intrinsic: comparisons → bool (i32); arith /
