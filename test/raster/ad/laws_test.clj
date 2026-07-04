@@ -176,6 +176,14 @@
               (if (< i 3) (recur (inc i) nxt) acc)))]
     (n/* a a)))
 
+;; body IS a canonical tail-accumulation loop — the shape that used to yield a
+;; silent broken IFn from value+grad (flatten nil, unguarded). Now fails loud.
+(deftm laws-tail-loop-fn [x :- Double] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i 4)
+      (recur (inc i) (n/+ acc (n/* x x)))
+      acc)))
+
 ;; ================================================================
 ;; O1 — mode agreement: grad_rev = grad_fwd = FD on the shared domain
 ;; ================================================================
@@ -212,18 +220,18 @@
           (is (close? rx (laws-f6-dx x y) tol-double))
           (is (close? ry (laws-f6-dy x y) tol-double))))))
 
-  (testing "if-branch fn: reverse = FD away from the kink"
-    ;; KNOWN-GAP: forward mode has no Dual overload for `>` (Jet has one,
-    ;; Dual does not), so grad_fwd of any branching fn throws — same coverage
-    ;; gap class as erf below. Reverse and FD anchor the law meanwhile.
-    (let [vg-r (rev/value+grad #'laws-f4)]
+  (testing "if-branch fn: reverse = forward = FD away from the kink"
+    ;; Forward over branches works via Dual comparison overloads (compare .v —
+    ;; branch selection on the primal, a.e.-correct; framework §8). Was a
+    ;; KNOWN-GAP (no Dual `>`), fixed 2026-07-04 after the laws suite found it.
+    (let [vg-r (rev/value+grad #'laws-f4)
+          vg-f (rev/value+grad #'laws-f4 :mode :forward)]
       (doseq [x [0.4 2.5 3.1]]
-        (let [gr (nth (vg-r x) 1)]
+        (let [gr (nth (vg-r x) 1)
+              gf (nth (vg-f x) 1)]
           (is (close? gr (central-fd laws-f4 x) tol-double) (str "branch rev=FD at " x))
-          (is (close? gr (laws-f4' x) tol-double) (str "branch rev=analytic at " x))))
-      (is (thrown-with-msg? Exception #"No matching method for `>`"
-                            ((rev/value+grad #'laws-f4 :mode :forward) 2.5))
-          "forward over a branch currently throws (missing Dual `>` overload)")))
+          (is (close? gr (laws-f4' x) tol-double) (str "branch rev=analytic at " x))
+          (is (close? gf gr tol-double) (str "branch fwd=rev at " x))))))
 
   (testing "erf: reverse = analytic; FD only loosely (approximation slope)"
     ;; KNOWN-GAP: erf has a reverse template but no Dual overload, so forward
@@ -329,6 +337,16 @@
          clojure.lang.ExceptionInfo
          #"Cannot differentiate through raw `loop`"
          (rev/value+grad #'laws-loop-fn))))
+
+  (testing "tail-loop body: value+grad fails LOUDLY (never a broken IFn)"
+    ;; Laws-suite finding 2026-07-04: a body that IS (or tail-lifts to) a raw
+    ;; loop produced flatten nil → an unguarded broken IFn (wrong-arity at call
+    ;; time). Now guarded: clear ex-info at construction time. The compiled /
+    ;; inline path handles these loops; the runtime assembler does not yet.
+    (is (thrown-with-msg?
+         Exception
+         #"cannot assemble a runtime gradient"
+         (rev/value+grad #'laws-tail-loop-fn))))
 
   (testing ":mode :auto on erf throws loudly (n=1 selects forward; no Dual lift)"
     ;; KNOWN-GAP (§11): mode selection lacks the admissibility constraint —

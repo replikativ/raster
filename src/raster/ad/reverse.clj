@@ -2712,8 +2712,22 @@
   ([f-var & {:keys [mode] :or {mode :reverse}}]
    (case mode
      :reverse
-     (let [{:keys [walked-body params tags source-ns]}
-           (build-grad-walked-body f-var)
+     (let [bgw (build-grad-walked-body f-var)
+           ;; Fail loud, never return a broken IFn: flatten-for-gradient returns
+           ;; nil when the AD form isn't the flat [primal (fn* [dy] ...)] shape —
+           ;; today that's a body that IS (or tail-lifts to) a raw loop, whose
+           ;; loop-with-let output the runtime assembler can't flatten yet
+           ;; (laws-suite finding 2026-07-04; the compiled/inline path handles it).
+           _ (when (nil? bgw)
+               (throw (ex-info
+                       (str "value+grad: cannot assemble a runtime gradient for `"
+                            f-var "` — the body reduces to a loop form the runtime "
+                            "flattener does not support. Express the reduction via "
+                            "`par/reduce` or a registered op (e.g. a loss deftm with "
+                            "an AD template), or use the compiled path (compile-aot "
+                            "of a deftm calling value+grad).")
+                       {:var f-var :reason :flatten-failed})))
+           {:keys [walked-body params tags source-ns]} bgw
            runtime-fn (make-runtime-value+grad-fn walked-body params)
            ;; Qualify symbols in walked body for inlining from other namespaces
            inline-ns inf/qualify-body-symbols
