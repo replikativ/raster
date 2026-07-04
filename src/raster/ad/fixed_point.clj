@@ -66,12 +66,6 @@
 ;; Rrule: register so AD can differentiate through fixed-point-solve
 ;; ================================================================
 
-(tmpl/merge-into-template! 'raster.ad.fixed-point/fixed-point-solve
-                           {:pullback-factory (fn [z-star g z0 theta tol maxiter]
-                       ;; Pullback: given cotangent v (adjoint of z*), compute gradients
-                       ;; Only theta gets a gradient via IFT; g, z0, tol, maxiter get nil
-                                                (fn [v]
-                                                  [nil nil (fixed-point-backward g z-star theta v) nil nil]))})
 
 ;; ================================================================
 ;; Template registration for fixed-point-solve

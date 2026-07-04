@@ -47,7 +47,7 @@
   (testing "mse-loss gradient"
     (let [pred (double-array [0.5 1.5 2.5])
           target (double-array [1.0 2.0 3.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.loss/mse-loss)
+          rrfn (tmpl/template-pullback 'raster.dl.loss/mse-loss)
           l (loss/mse-loss pred target 3)
           pb (rrfn l pred target 3)
           [d-pred _ _] (pb 1.0)
@@ -70,7 +70,7 @@
   (testing "cross-entropy-loss gradient"
     (let [logits (double-array [1.0 2.0 3.0])  ;; [1, 3]
           target (long-array [2])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.loss/cross-entropy-loss)
+          rrfn (tmpl/template-pullback 'raster.dl.loss/cross-entropy-loss)
           l (loss/cross-entropy-loss logits target 1 3)
           pb (rrfn l logits target 1 3)
           [d-logits _ _ _] (pb 1.0)
@@ -94,7 +94,7 @@
   (testing "huber-loss gradient"
     (let [pred (double-array [0.5 3.0])
           target (double-array [1.0 0.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.loss/huber-loss)
+          rrfn (tmpl/template-pullback 'raster.dl.loss/huber-loss)
           l (loss/huber-loss pred target 2 1.0)
           pb (rrfn l pred target 2 1.0)
           [d-pred _ _ _] (pb 1.0)

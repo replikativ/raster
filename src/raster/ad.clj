@@ -13,14 +13,12 @@
     raster.ad.forward   — dual number forward-mode AD
     raster.ad.reverse   — reverse-mode AD (VJP, gradient, Hessian)
         raster.ad.jet       — truncated Taylor series (higher-order)
-        raster.ad.pullbacks — runtime pullback factories
     raster.ad.activity  — activity analysis
     raster.ad.purity    — purity analysis for AD safety"
   (:require [raster.ad.forward]
             [raster.ad.reverse]
             [raster.ad.jet]
             [raster.ad.templates]
-            [raster.ad.pullbacks]
             [raster.support :refer [import-vars]]))
 
 ;; ================================================================

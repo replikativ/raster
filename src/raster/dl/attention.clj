@@ -57,63 +57,6 @@
                                       out)))
 
 ;; rrule for scaled-dot-product-attn (pullback operates on double[])
-(tmpl/merge-into-template! 'raster.dl.attention/scaled-dot-product-attn
-                           {:pullback-factory (fn [_result Q K V seq-q seq-k dk dv]
-                                                (fn [d-out]
-                                                  (let [seq-q (long seq-q) seq-k (long seq-k)
-                                                        dk (long dk) dv (long dv)
-                                                        scale (/ 1.0 (n/sqrt (double dk)))
-                               ;; Recompute weights
-                                                        scores (double-array (* seq-q seq-k))
-                                                        weights (double-array (* seq-q seq-k))]
-                           ;; Forward recomputation
-                                                    (dotimes [i seq-q]
-                                                      (dotimes [j seq-k]
-                                                        (let [dot (loop [d 0 acc 0.0]
-                                                                    (if (< d dk)
-                                                                      (recur (inc d) (+ acc (* (aget Q (+ (* i (int dk)) d))
-                                                                                               (aget K (+ (* j (int dk)) d)))))
-                                                                      acc))]
-                                                          (aset scores (+ (* i (int seq-k)) j) (* dot scale)))))
-                                                    (dotimes [i seq-q]
-                                                      (let [offset (* i (int seq-k))
-                                                            max-s (loop [j 0 m n/neg-inf]
-                                                                    (if (< j seq-k) (recur (inc j) (n/max m (aget scores (+ offset j)))) m))
-                                                            sum-exp (loop [j 0 s 0.0]
-                                                                      (if (< j seq-k)
-                                                                        (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
-                                                                          (aset weights (+ offset j) e)
-                                                                          (recur (inc j) (+ s e))) s))
-                                                            inv-sum (/ 1.0 sum-exp)]
-                                                        (dotimes [j seq-k]
-                                                          (aset weights (+ offset j)
-                                                                (* (aget weights (+ offset j)) inv-sum)))))
-                           ;; d_weights = d_out @ V^T -> [seq_q, seq_k]
-                                                    (let [d-weights (double-array (* seq-q seq-k))
-                                                          _ (blas/dgemm-nt! d-out V d-weights seq-q dv seq-k 1.0 0.0)
-                                 ;; d_V = weights^T @ d_out -> [seq_k, dv]
-                                                          dV (double-array (* seq-k dv))
-                                                          _ (blas/dgemm-tn! weights d-out dV seq-k seq-q dv 1.0 0.0)
-                                 ;; Backprop through softmax
-                                                          d-scores (double-array (* seq-q seq-k))]
-                                                      (dotimes [i seq-q]
-                                                        (let [offset (* i (int seq-k))
-                                     ;; dot(weights[i], d_weights[i])
-                                                              dot-wdw (loop [j 0 acc 0.0]
-                                                                        (if (< j seq-k)
-                                                                          (recur (inc j) (+ acc (* (aget weights (+ offset j))
-                                                                                                   (aget d-weights (+ offset j)))))
-                                                                          acc))]
-                                                          (dotimes [j seq-k]
-                                                            (aset d-scores (+ offset j)
-                                                                  (* scale (aget weights (+ offset j))
-                                                                     (- (aget d-weights (+ offset j)) dot-wdw))))))
-                             ;; dQ = d_scores @ K -> [seq_q, dk]
-                                                      (let [dQ (nn/matmul d-scores K seq-q seq-k dk)
-                                   ;; dK = d_scores^T @ Q -> [seq_k, dk]
-                                                            dK (double-array (* seq-k dk))
-                                                            _ (blas/dgemm-tn! d-scores Q dK seq-k seq-q dk 1.0 0.0)]
-                                                        [dQ dK dV nil nil nil nil])))))})
 
 ;; ================================================================
 ;; Causal scaled dot-product attention (for autoregressive models)
@@ -168,11 +111,7 @@
                               dx)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
-                           {:pullback-factory (fn [_result _x seq-len heads head-dim theta]
-                                                (fn [dy]
-                                                  [(rope-backward-dx dy seq-len heads head-dim theta)
-                                                   nil nil nil nil]))
-                            :params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
+                           {:params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [_x seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
                                         (let [dx (gensym-fn "dx")]
                                           [(update ctx :bindings into
@@ -653,17 +592,9 @@
         (clojure.core/aset out 2 dV)
         out))))
 
-;; Both pullback-factory (runtime/lazy AD) and grads-fn (compile-aot flat
-;; codegen). The grads-fn calls the backward deftm above and extracts the
-;; three gradients via aget — a single flat let-binding shape for PE/CSE/DCE.
-(tmpl/merge-into-template! 'raster.dl.attention/causal-scaled-dot-product-attn
-                           {:pullback-factory
-                            (fn [_result Q K V seq-len dk dv]
-                              (fn [d-out]
-                                (let [bundle (causal-scaled-dot-product-attn-backward
-                                              d-out Q K V seq-len dk dv)]
-                                  [(aget bundle 0) (aget bundle 1) (aget bundle 2)
-                                   nil nil nil])))})
+;; grads-fn (compile-aot flat codegen): calls the backward deftm above and
+;; extracts the three gradients via aget — a single flat let-binding shape
+;; for PE/CSE/DCE.
 
 (tmpl/merge-into-template! 'raster.dl.attention/causal-scaled-dot-product-attn
                            {:params '[Q K V seq-len dk dv]
@@ -825,15 +756,7 @@
       out)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/gqa-causal-mha
-                           {:pullback-factory
-                            (fn [_result Q K V seq-len n-q n-kv head-dim]
-                              (fn [dY]
-                                (let [b (gqa-causal-mha-backward dY Q K V seq-len n-q n-kv head-dim)]
-                                  [(clojure.core/aget ^objects b 0)
-                                   (clojure.core/aget ^objects b 1)
-                                   (clojure.core/aget ^objects b 2)
-                                   nil nil nil nil])))
-                            :params '[Q K V seq-len n-q n-kv head-dim] :result nil :adjoint 'dy
+                           {:params '[Q K V seq-len n-q n-kv head-dim] :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [Q K V seq-len n-q n-kv head-dim] _result-sym adjoint-sym gensym-fn]
                               (let [b (gensym-fn "gqa_b") dQ (gensym-fn "dQ")

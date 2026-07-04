@@ -320,31 +320,12 @@
 ;; array types without hardcoded dispatch.
 
 ;; Dense: y = W*x + b → dW = dy⊗x^T, dx = W^T*dy, db = clone(dy)
-(tmpl/merge-into-template! 'raster.nn/dense
-                           {:pullback-factory (fn [_result W x _b]
-                                                (fn [dy]
-                                                  [(dense-backward-dW dy x)
-                                                   (dense-backward-dx dy W x)
-                                                   (dense-backward-db dy)]))})
 
 ;; ReLU: dy/dx_i = dy_i * (x_i > 0 ? 1 : 0)
-(tmpl/merge-into-template! 'raster.nn/relu
-                           {:pullback-factory (fn [_result x]
-                                                (fn [dy]
-                                                  [(relu-backward dy x)]))})
 
 ;; Softmax: dx_i = s_i * (dy_i - dot(s, dy))
-(tmpl/merge-into-template! 'raster.nn/softmax
-                           {:pullback-factory (fn [result _x]
-                                                (fn [dy]
-                                                  [(softmax-backward dy result)]))})
 
 ;; Cross-entropy: dL/dp_i = -t_i/p_i * dy
-(tmpl/merge-into-template! 'raster.nn/cross-entropy
-                           {:pullback-factory (fn [_result p t]
-                                                (fn [dy]
-                                                  [(cross-entropy-backward-dp dy p t)
-                                                   nil]))})
 
 ;; d_logits = (s - t) * dy, where s is the softmax output from the forward result
 (deftm softmax-cross-entropy-backward
@@ -355,12 +336,6 @@
        (broadcast [s t] (* dy (- s t)))))
 
 ;; Combined softmax-cross-entropy: d_logits = (s - t) * dy
-(tmpl/merge-into-template! 'raster.nn/softmax-cross-entropy
-                           {:pullback-factory (fn [result _logits _t]
-                                                (let [[_loss s] result]
-                                                  (fn [dy]
-                                                    [(softmax-cross-entropy-backward dy s _t)
-                                                     nil])))})
 
 ;; ================================================================
 ;; Template registration for softmax-cross-entropy

@@ -113,7 +113,7 @@
           x2 (double-array [0.0 1.0])
           W (double-array [0.5 0.3 0.2 0.7])  ;; [2, 2]
           b (double-array [0.0 0.0])
-          linear-rrule (tmpl/get-pullback-factory 'raster.dl.nn/linear)
+          linear-rrule (tmpl/template-pullback 'raster.dl.nn/linear)
 
           ;; Forward + backward for x1
           y1 (nn/linear x1 W b 1 2 2)
@@ -181,9 +181,9 @@
                            :t (atom 0)}}
           lr 0.01
           ;; rrules
-          linear-rrule (tmpl/get-pullback-factory 'raster.dl.nn/linear)
-          relu-rrule (tmpl/get-pullback-factory 'raster.dl.nn/leaky-relu)
-          mse-rrule (tmpl/get-pullback-factory 'raster.dl.loss/mse-loss)
+          linear-rrule (tmpl/template-pullback 'raster.dl.nn/linear)
+          relu-rrule (tmpl/template-pullback 'raster.dl.nn/leaky-relu)
+          mse-rrule (tmpl/template-pullback 'raster.dl.loss/mse-loss)
           ;; Model function: forward + backward + update, returns loss
           model-fn
           (fn [batch]
@@ -269,9 +269,9 @@
                            :v (double-array out-dim)
                            :t (atom 0)}}
           lr 0.01
-          linear-rrule (tmpl/get-pullback-factory 'raster.dl.nn/linear)
-          relu-rrule (tmpl/get-pullback-factory 'raster.dl.nn/leaky-relu)
-          mse-rrule (tmpl/get-pullback-factory 'raster.dl.loss/mse-loss)
+          linear-rrule (tmpl/template-pullback 'raster.dl.nn/linear)
+          relu-rrule (tmpl/template-pullback 'raster.dl.nn/leaky-relu)
+          mse-rrule (tmpl/template-pullback 'raster.dl.loss/mse-loss)
           model-fn
           (fn [batch]
             (let [xs (train/collate-doubles (:xs batch))

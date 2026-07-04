@@ -123,31 +123,14 @@ into ~80 flat bindings covering the full forward + backward pass. The compiler
 then applies buffer fusion, memory merge, and bytecode emission to the
 combined form — producing a single JVM class with zero per-call allocations.
 
-## The rrule Registry
+## The Template Registry
 
-Gradient rules for primitive operations are registered in two forms:
-
-### Runtime Pullbacks (`rrule.clj`)
-
-Used for interpreted AD. Each rule is a factory that takes the forward result
-and inputs, returning a pullback function:
-
-```clojure
-;; Multiplication: d(x*y) = [dy*y, dy*x]
-(register-rrule! 'raster.numeric/*
-  (fn [_result x y]
-    (fn [dy] [(* dy y) (* dy x)])))
-
-;; sin: d(sin(x)) = cos(x)*dy
-(register-rrule! 'raster.math/sin
-  (fn [_result x]
-    (fn [dy] [(* dy (Math/cos x))])))
-```
-
-### Compile-Time Templates (`templates.clj`)
-
-Used when the compiler inlines AD. Templates are S-expression patterns that
-the reverse pass splices into the generated code:
+Gradient rules live in a single registry (`templates.clj`). The canonical form
+is `:grads` — static S-expression gradients that the reverse pass splices into
+the generated code. At registration time `:grads` is auto-compiled to a
+`:grads-fn` (a code-generating closure); both the compiled path and the
+interpreted `value+grad` path run the *same* generated backward bindings, so
+there is one source of truth per op:
 
 ```clojure
 (register-template! 'raster.math/sin
@@ -157,10 +140,16 @@ the reverse pass splices into the generated code:
    :grads [(list 'raster.numeric/* 'dy (list 'raster.math/cos 'x))]})
 ```
 
+For ops whose backward isn't a simple S-expression (array kernels calling BLAS
+backward routines), a `:grads-fn` may be supplied directly — it emits flat
+`let*` bindings that call the backward deftm (e.g. `linear-dx`/`linear-dW`),
+keeping the backward pass BLAS-visible to buffer fusion.
+
 The compiler's inline pass checks for `:grads` / `:grads-fn` metadata to
-decide whether a `deftm` call is **AD-opaque** (has explicit gradient rule,
+decide whether a `deftm` call is **AD-opaque** (has an explicit gradient rule,
 stays symbolic during AD) or **AD-transparent** (no rule, gets inlined and
-differentiated through).
+differentiated through — the Zygote "recurse-into-IR unless a rule exists"
+model).
 
 For the MLP training step, `dense`, `relu`, `softmax`, and `cross-entropy`
 all have explicit gradient templates. Their rules are inlined as flat `let*`
@@ -263,12 +252,19 @@ precomputed values that don't depend on the parameters.
 
 ### Loops
 
-Reverse-mode AD supports `loop*/recur` by storing per-iteration pullbacks:
+Reverse-mode AD supports **tail-position** `loop*/recur` (accumulation loops)
+by storing per-iteration pullbacks:
 
 1. **Forward:** run the loop, store each iteration's pullback in a list
 2. **Backward:** replay pullbacks in reverse order, accumulating adjoints
 
-This is exact (not truncated) reverse-mode through arbitrary-length loops.
+This is exact (not truncated) reverse-mode through the loop. Note the current
+limitation: only tail-position loops lift this way; a raw `loop` bound in a
+`let` binding is **rejected** (it throws, mirroring JAX's refusal to reverse
+`while_loop` — a data-dependent trip count can't size/reverse the residual
+stack). The sanctioned differentiable-recurrence primitive is `par/reduce`
+(and, in progress, a `par/scan` with a flat residual buffer); arbitrary raw
+loops are not generally differentiable. See `.internal/ad_generalization_plan.md`.
 
 ### Parallel Forms
 

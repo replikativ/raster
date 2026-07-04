@@ -261,7 +261,7 @@
                                     (if (< i n) (recur (inc i) (+ s (aget out i))) s))))
           ;; Analytical gradient via rrule
           result (ops/array-add a b n)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/array-add)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/array-add)
           pullback ((pullback-fn result a b n) (double-array (repeat n 1.0)))
           da (first pullback)]
       (dotimes [i n]
@@ -283,7 +283,7 @@
                                   (loop [i 0 s 0.0]
                                     (if (< i n) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/broadcast-add h t batch dim)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/broadcast-add)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/broadcast-add)
           grads ((pullback-fn result h t batch dim) (double-array (repeat n 1.0)))
           dh (nth grads 0)
           dt (nth grads 1)]
@@ -310,7 +310,7 @@
                      (loop [i 0 s 0.0]
                        (if (< i (alength out)) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/scatter-add vals indices n-dst n-pairs stride)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/scatter-add)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/scatter-add)
           grads ((pullback-fn result vals indices n-dst n-pairs stride)
                  (double-array (repeat (* n-dst stride) 1.0)))
           d-vals (first grads)]
@@ -328,7 +328,7 @@
                     (loop [i 0 s 0.0]
                       (if (< i (alength out)) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/gather src indices n-src n-pairs stride)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/gather)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/gather)
           grads ((pullback-fn result src indices n-src n-pairs stride)
                  (double-array (repeat (* n-pairs stride) 1.0)))
           d-src (first grads)]
@@ -356,7 +356,7 @@
                     (if (< i n-out) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/indexed-dot A B idx-a idx-b n-nodes n-nodes
                                   n-edges dk emb-dim n-heads)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/indexed-dot)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/indexed-dot)
           grads ((pullback-fn result A B idx-a idx-b n-nodes n-nodes
                               n-edges dk emb-dim n-heads)
                  (double-array (repeat n-out 1.0)))
@@ -389,7 +389,7 @@
                       (if (< i n-out) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/scatter-mul-add coeffs src dst-indices src-indices
                                       n-dst n-src n-pairs dk emb-dim n-heads)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/scatter-mul-add)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/scatter-mul-add)
           grads ((pullback-fn result coeffs src dst-indices src-indices
                               n-dst n-src n-pairs dk emb-dim n-heads)
                  (double-array (repeat n-out 1.0)))
@@ -413,7 +413,7 @@
                   (loop [i 0 s 0.0]
                     (if (< i n) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/scale-clamp-exp x scale bound n)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/scale-clamp-exp)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/scale-clamp-exp)
           grads ((pullback-fn result x scale bound n)
                  (double-array (repeat n 1.0)))
           dx (first grads)]
@@ -430,7 +430,7 @@
                     (loop [i 0 s 0.0]
                       (if (< i n-cols) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/reduce-axis src n-rows n-cols)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/reduce-axis)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/reduce-axis)
           grads ((pullback-fn result src n-rows n-cols)
                  (double-array (repeat n-cols 1.0)))
           d-src (first grads)]
@@ -454,7 +454,7 @@
                   (loop [i 0 s 0.0]
                     (if (< i n) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/segment-div wV Z n-nodes emb-dim n-heads eps)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/segment-div)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/segment-div)
           grads ((pullback-fn result wV Z n-nodes emb-dim n-heads eps)
                  (double-array (repeat n 1.0)))
           dwV (nth grads 0)
@@ -484,7 +484,7 @@
                                   (loop [i 0 s 0.0]
                                     (if (< i n-rows) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/dot-rows h W bias n-rows dim)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/dot-rows)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/dot-rows)
           grads ((pullback-fn result h W bias n-rows dim) (double-array (repeat n-rows 1.0)))
           dh (nth grads 0)
           dW (nth grads 1)
@@ -523,7 +523,7 @@
                      (if (< i n) (recur (inc i) (+ s (aget out i))) s))))
           result (ops/flat-embed-op values space-emb spaces state-emb states pos-emb
                                     We be n-vars emb-dim n-spaces n-states)
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/flat-embed-op)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/flat-embed-op)
           grads ((pullback-fn result values space-emb spaces state-emb states pos-emb
                               We be n-vars emb-dim n-spaces n-states)
                  (double-array (repeat n 1.0)))
@@ -543,7 +543,7 @@
           target (double-array [1.5 2.0 2.5 3.5])
           states (long-array [0 1 0 0])
           f-pred (fn [^doubles p'] (double (ops/masked-mse-loss p' target states n)))
-          pullback-fn (tmpl/get-pullback-factory 'raster.dl.array-ops/masked-mse-loss)
+          pullback-fn (tmpl/template-pullback 'raster.dl.array-ops/masked-mse-loss)
           grads ((pullback-fn nil pred target states n) 1.0)
           d-pred (first grads)]
       (dotimes [i n]

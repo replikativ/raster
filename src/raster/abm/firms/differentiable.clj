@@ -90,9 +90,9 @@
     (aset result 6 dFdomega)
     result))
 
-;; Register rrule for solve-effort
-;; solve-effort params: [a, b, beta, others-effort, theta, endowment]
-;; Returns e*
+;; solve-effort's gradient is the implicit-function-theorem pullback (not a
+;; static grads-fn — the FOC is solved numerically), so this runtime pullback
+;; is its sole gradient representation.
 (tmpl/merge-into-template! 'raster.abm.firms.econ/solve-effort
                            {:pullback-factory (fn [e-star a b beta others-effort theta endowment]
                                                 (let [partials (solve-effort-foc-partials

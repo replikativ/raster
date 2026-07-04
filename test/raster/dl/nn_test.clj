@@ -66,7 +66,7 @@
     (testing "matmul gradients vs finite diff"
       (let [A (double-array [0.1 0.2 0.3 0.4 0.5 0.6])
             B (double-array [0.7 0.8 0.9 1.0 1.1 1.2])
-            rrfn (tmpl/get-pullback-factory 'raster.dl.nn/matmul)
+            rrfn (tmpl/template-pullback 'raster.dl.nn/matmul)
             C (nn/matmul A B 2 3 2)
             pb (rrfn C A B 2 3 2)
             ;; Use dC = ones as upstream gradient
@@ -123,7 +123,7 @@
       (let [x (double-array [0.1 0.2 0.3])
             W (double-array [0.4 0.5 0.6 0.7 0.8 0.9])
             b (double-array [0.01 0.02])
-            rrfn (tmpl/get-pullback-factory 'raster.dl.nn/linear)
+            rrfn (tmpl/template-pullback 'raster.dl.nn/linear)
             y (nn/linear x W b 1 3 2)
             pb (rrfn y x W b 1 3 2)
             dy (double-array [1 1])
@@ -155,7 +155,7 @@
 
   (testing "silu gradient"
     (let [x (double-array [0.5 1.0 -0.5])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/silu)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/silu)
           y (nn/silu x 3)
           pb (rrfn y x 3)
           dy (double-array [1 1 1])
@@ -177,7 +177,7 @@
 
   (testing "gelu gradient"
     (let [x (double-array [0.5 1.0 -0.5])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/gelu)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/gelu)
           y (nn/gelu x 3)
           pb (rrfn y x 3)
           dy (double-array [1 1 1])
@@ -198,7 +198,7 @@
 
   (testing "sigmoid gradient"
     (let [x (double-array [0.5 -0.5 1.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/sigmoid)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/sigmoid)
           y (nn/sigmoid x 3)
           pb (rrfn y x 3)
           dy (double-array [1 1 1])
@@ -218,7 +218,7 @@
 
   (testing "tanh gradient"
     (let [x (double-array [0.5 -0.5 1.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/tanh-act)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/tanh-act)
           y (nn/tanh-act x 3)
           pb (rrfn y x 3)
           dy (double-array [1 1 1])
@@ -239,7 +239,7 @@
 
   (testing "leaky-relu gradient"
     (let [x (double-array [0.5 -0.5 1.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/leaky-relu)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/leaky-relu)
           y (nn/leaky-relu x 3 0.01)
           pb (rrfn y x 3 0.01)
           dy (double-array [1 1 1])
@@ -266,7 +266,7 @@
     (let [x (double-array [0.1 0.2 0.3 0.4 0.5 0.6])
           gamma (double-array [1.0 1.0 1.0])
           beta (double-array [0.0 0.0 0.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/layer-norm)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/layer-norm)
           y (nn/layer-norm x gamma beta 2 3 1e-5)
           pb (rrfn y x gamma beta 2 3 1e-5)
           dy (double-array [1 0 0 0 1 0])
@@ -337,7 +337,7 @@
       (let [x (double-array [0.1 0.2 0.3 0.4 0.5])
             W (double-array [0.1 0.2 0.3])
             b (double-array [0.01])
-            rrfn (tmpl/get-pullback-factory 'raster.dl.nn/conv1d)
+            rrfn (tmpl/template-pullback 'raster.dl.nn/conv1d)
             y (nn/conv1d x W b 1 1 5 1 3 1 0)
             pb (rrfn y x W b 1 1 5 1 3 1 0)
             dy (double-array (repeat (alength y) 1.0))
@@ -405,7 +405,7 @@
                            5  6  7  8
                            9 10 11 12
                            13 14 15 16])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/maxpool2d)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/maxpool2d)
           y (nn/maxpool2d x 1 1 4 4 2 2)
           pb (rrfn y x 1 1 4 4 2 2)
           dy (double-array [1.0 2.0 3.0 4.0])
@@ -431,7 +431,7 @@
                            0.5 0.2 0.8 0.4
                            0.6 0.3 0.1 0.5
                            0.4 0.8 0.7 0.2])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/maxpool2d)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/maxpool2d)
           y (nn/maxpool2d x 1 1 4 4 2 2)
           pb (rrfn y x 1 1 4 4 2 2)
           dy (double-array [1 1 1 1])
@@ -464,7 +464,7 @@
   (testing "embedding gradient"
     (let [table (double-array [0.1 0.2  0.3 0.4  0.5 0.6])
           indices (long-array [1 0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/embedding)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/embedding)
           out (nn/embedding table indices 2 3 2)
           pb (rrfn out table indices 2 3 2)
           dy (double-array [1 0 0 1])
@@ -506,7 +506,7 @@
 
   (testing "softmax gradient"
     (let [x (double-array [1.0 2.0 3.0])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.nn/softmax-1d)
+          rrfn (tmpl/template-pullback 'raster.dl.nn/softmax-1d)
           s (nn/softmax-1d x 3)
           pb (rrfn s x 3)
           dy (double-array [1 0 0])
