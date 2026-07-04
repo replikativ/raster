@@ -20,6 +20,7 @@
             [raster.par]
             [raster.numeric :as n]
             [raster.math :as m]
+            [raster.sci.special :as special]
             [raster.types.promote :as promote]))
 
 ;; ================================================================
@@ -292,6 +293,369 @@
                                  (dotimes [i len]
                                    (aset result i (n/* (aget px i) scale)))
                                  (->Dual (n/pow xv n) result))))
+
+;; pow with an active (Dual) exponent: d/dx x^n = n*x^(n-1), d/dn x^n = x^n ln(x)
+(deftm raster.numeric/pow (All [T] [x :- Dual, y :- Dual] :- Dual
+                               (let [xv (.v x) yv (.v y)
+                                     pv (n/pow xv yv)
+                                     dfdx (n/* yv (n/pow xv (n/- yv 1.0)))
+                                     dfdy (n/* pv (m/log xv))
+                                     px (.partials x) py (.partials y)
+                                     len (alength px)
+                                     result (aclone px)]
+                                 (dotimes [i len]
+                                   (aset result i (n/+ (n/* (aget px i) dfdx)
+                                                       (n/* (aget py i) dfdy))))
+                                 (->Dual pv result))))
+
+(deftm raster.numeric/pow (All [T] [x :- Double, y :- Dual] :- Dual
+                               (let [yv (.v y)
+                                     pv (n/pow x yv)
+                                     dfdy (n/* pv (m/log x))
+                                     py (.partials y)
+                                     len (alength py)
+                                     result (aclone py)]
+                                 (dotimes [i len]
+                                   (aset result i (n/* (aget py i) dfdy)))
+                                 (->Dual pv result))))
+
+;; ================================================================
+;; Math functions — carrier-coverage completion (framework §4a/§11):
+;; every scalar op with a reverse template gets a Dual lift. Forward
+;; mode is rule-free by construction — these are Σ-algebra overloads,
+;; NOT template registrations. Same chunked-partials style as above;
+;; parametric (All [T]) + n/ ops so Dual{Sym} flows (initiality, O6).
+;; ================================================================
+
+(deftm raster.math/tan (All [T] [x :- Dual] :- Dual
+                            (let [tv (m/tan (.v x))
+                                  scale (n/+ 1.0 (n/* tv tv))
+                                  px (.partials x)
+                                  len (alength px)
+                                  result (aclone px)]
+                              (dotimes [i len]
+                                (aset result i (n/* (aget px i) scale)))
+                              (->Dual tv result))))
+
+(deftm raster.math/asin (All [T] [x :- Dual] :- Dual
+                             (let [xv (.v x)
+                                   scale (n// 1.0 (n/sqrt (n/- 1.0 (n/* xv xv))))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual (m/asin xv) result))))
+
+(deftm raster.math/acos (All [T] [x :- Dual] :- Dual
+                             (let [xv (.v x)
+                                   scale (n/- (n// 1.0 (n/sqrt (n/- 1.0 (n/* xv xv)))))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual (m/acos xv) result))))
+
+(deftm raster.math/atan (All [T] [x :- Dual] :- Dual
+                             (let [xv (.v x)
+                                   scale (n// 1.0 (n/+ 1.0 (n/* xv xv)))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual (m/atan xv) result))))
+
+;; atan2(y, x): d/dy = x/(x²+y²), d/dx = -y/(x²+y²)
+(deftm raster.math/atan2 (All [T] [y :- Dual, x :- Dual] :- Dual
+                              (let [yv (.v y) xv (.v x)
+                                    denom (n/+ (n/* xv xv) (n/* yv yv))
+                                    py (.partials y) px (.partials x)
+                                    len (alength py)
+                                    result (aclone py)]
+                                (dotimes [i len]
+                                  (aset result i (n// (n/- (n/* (aget py i) xv)
+                                                           (n/* (aget px i) yv))
+                                                      denom)))
+                                (->Dual (m/atan2 yv xv) result))))
+
+(deftm raster.math/atan2 (All [T] [y :- Dual, x :- Number] :- Dual
+                              (let [yv (.v y)
+                                    denom (n/+ (n/* x x) (n/* yv yv))
+                                    py (.partials y)
+                                    len (alength py)
+                                    result (aclone py)]
+                                (dotimes [i len]
+                                  (aset result i (n// (n/* (aget py i) x) denom)))
+                                (->Dual (m/atan2 yv x) result))))
+
+(deftm raster.math/atan2 (All [T] [y :- Number, x :- Dual] :- Dual
+                              (let [xv (.v x)
+                                    denom (n/+ (n/* xv xv) (n/* y y))
+                                    px (.partials x)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n/- (n// (n/* (aget px i) y) denom))))
+                                (->Dual (m/atan2 y xv) result))))
+
+(deftm raster.math/sinh (All [T] [x :- Dual] :- Dual
+                             (let [xv (.v x)
+                                   scale (m/cosh xv)
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual (m/sinh xv) result))))
+
+(deftm raster.math/cosh (All [T] [x :- Dual] :- Dual
+                             (let [xv (.v x)
+                                   scale (m/sinh xv)
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual (m/cosh xv) result))))
+
+(deftm raster.math/tanh (All [T] [x :- Dual] :- Dual
+                             (let [tv (m/tanh (.v x))
+                                   scale (n/- 1.0 (n/* tv tv))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual tv result))))
+
+(deftm raster.math/log1p (All [T] [x :- Dual] :- Dual
+                              (let [xv (.v x)
+                                    scale (n// 1.0 (n/+ 1.0 xv))
+                                    px (.partials x)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n/* (aget px i) scale)))
+                                (->Dual (m/log1p xv) result))))
+
+(deftm raster.math/expm1 (All [T] [x :- Dual] :- Dual
+                              (let [ev (m/expm1 (.v x))
+                                    scale (n/+ ev 1.0)
+                                    px (.partials x)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n/* (aget px i) scale)))
+                                (->Dual ev result))))
+
+(deftm raster.math/cbrt (All [T] [x :- Dual] :- Dual
+                             (let [cv (m/cbrt (.v x))
+                                   scale (n// 1.0 (n/* 3.0 (n/* cv cv)))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) scale)))
+                               (->Dual cv result))))
+
+(deftm raster.math/log10 (All [T] [x :- Dual] :- Dual
+                              (let [xv (.v x)
+                                    scale (n// 1.0 (n/* xv 2.302585092994046))
+                                    px (.partials x)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n/* (aget px i) scale)))
+                                (->Dual (m/log10 xv) result))))
+
+;; hypot(x, y): d/dx = x/hypot, d/dy = y/hypot
+(deftm raster.math/hypot (All [T] [x :- Dual, y :- Dual] :- Dual
+                              (let [xv (.v x) yv (.v y)
+                                    hv (m/hypot xv yv)
+                                    px (.partials x) py (.partials y)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n// (n/+ (n/* (aget px i) xv)
+                                                           (n/* (aget py i) yv))
+                                                      hv)))
+                                (->Dual hv result))))
+
+(deftm raster.math/hypot (All [T] [x :- Dual, y :- Number] :- Dual
+                              (let [xv (.v x)
+                                    hv (m/hypot xv y)
+                                    px (.partials x)
+                                    len (alength px)
+                                    result (aclone px)]
+                                (dotimes [i len]
+                                  (aset result i (n// (n/* (aget px i) xv) hv)))
+                                (->Dual hv result))))
+
+(deftm raster.math/hypot (All [T] [x :- Number, y :- Dual] :- Dual
+                              (let [yv (.v y)
+                                    hv (m/hypot x yv)
+                                    py (.partials y)
+                                    len (alength py)
+                                    result (aclone py)]
+                                (dotimes [i len]
+                                  (aset result i (n// (n/* (aget py i) yv) hv)))
+                                (->Dual hv result))))
+
+;; ================================================================
+;; min/max — primal-select (branch on .v, like the comparisons above)
+;; + partial routing: the winner's partials flow, the loser's are
+;; dropped. Tie-breaking mirrors the reverse templates (min: x on
+;; ties via <=; max: x on ties via >=) so both modes agree at kinks.
+;; ================================================================
+
+(deftm raster.numeric/min [x :- Dual, y :- Dual] :- Dual
+  (if (clojure.core/<= (.v x) (.v y)) x y))
+
+(deftm raster.numeric/min [x :- Dual, y :- Double] :- Dual
+  (if (clojure.core/<= (.v x) y) x (->Dual y (zero-partials (.partials x)))))
+
+(deftm raster.numeric/min [x :- Double, y :- Dual] :- Dual
+  (if (clojure.core/<= x (.v y)) (->Dual x (zero-partials (.partials y))) y))
+
+(deftm raster.numeric/max [x :- Dual, y :- Dual] :- Dual
+  (if (clojure.core/>= (.v x) (.v y)) x y))
+
+(deftm raster.numeric/max [x :- Dual, y :- Double] :- Dual
+  (if (clojure.core/>= (.v x) y) x (->Dual y (zero-partials (.partials x)))))
+
+(deftm raster.numeric/max [x :- Double, y :- Dual] :- Dual
+  (if (clojure.core/>= x (.v y)) (->Dual x (zero-partials (.partials y))) y))
+
+;; ================================================================
+;; Special functions (raster.sci.special) — concrete Double carriers
+;; (the primal calls the double-only special-function implementations)
+;; ================================================================
+
+;; erf: d/dx = 2/sqrt(pi) * exp(-x²)
+(deftm raster.sci.special/erf [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n/* 1.1283791670955126 (m/exp (n/- (n/* xv xv))))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/erf xv) result)))
+
+;; erfc = 1 - erf: d/dx = -2/sqrt(pi) * exp(-x²)
+(deftm raster.sci.special/erfc [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n/* -1.1283791670955126 (m/exp (n/- (n/* xv xv))))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/erfc xv) result)))
+
+;; erfinv: d/dy = sqrt(pi)/2 * exp(erfinv(y)²)
+(deftm raster.sci.special/erfinv [y :- Dual] :- Dual
+  (let [rv (special/erfinv (.v y))
+        scale (n/* 0.8862269254527579 (m/exp (n/* rv rv)))
+        py (.partials y)
+        len (alength py)
+        result (aclone py)]
+    (dotimes [i len]
+      (aset result i (n/* (aget py i) scale)))
+    (->Dual rv result)))
+
+;; lgamma: d/dx = digamma(x)
+(deftm raster.sci.special/lgamma [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (special/digamma xv)
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/lgamma xv) result)))
+
+;; digamma: d/dx = trigamma(x)
+(deftm raster.sci.special/digamma [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (special/trigamma xv)
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/digamma xv) result)))
+
+;; expit (sigmoid): d/dx = s(x)(1 - s(x))
+(deftm raster.sci.special/expit [x :- Dual] :- Dual
+  (let [sv (special/expit (.v x))
+        scale (n/* sv (n/- 1.0 sv))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual sv result)))
+
+;; logit: d/dx = 1/(x(1-x))
+(deftm raster.sci.special/logit [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n// 1.0 (n/* xv (n/- 1.0 xv)))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/logit xv) result)))
+
+;; log1pexp (softplus): d/dx = expit(x)
+(deftm raster.sci.special/log1pexp [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (special/expit xv)
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/log1pexp xv) result)))
+
+;; besselj0: d/dx J0(x) = -J1(x)
+(deftm raster.sci.special/besselj0 [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n/- (special/besselj1 xv))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/besselj0 xv) result)))
+
+;; besselj1: d/dx J1(x) = J0(x) - J1(x)/x
+(deftm raster.sci.special/besselj1 [x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n/- (special/besselj0 xv) (n// (special/besselj1 xv) xv))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/besselj1 xv) result)))
+
+;; betainc: differentiable in x only (a, b parameters — same contract
+;; as the reverse template): d/dx I_x(a,b) = x^(a-1)(1-x)^(b-1)/B(a,b)
+(deftm raster.sci.special/betainc [a :- Double, b :- Double, x :- Dual] :- Dual
+  (let [xv (.v x)
+        scale (n// (n/* (n/pow xv (n/- a 1.0))
+                        (n/pow (n/- 1.0 xv) (n/- b 1.0)))
+                   (special/beta a b))
+        px (.partials x)
+        len (alength px)
+        result (aclone px)]
+    (dotimes [i len]
+      (aset result i (n/* (aget px i) scale)))
+    (->Dual (special/betainc a b xv) result)))
 
 ;; Re-export math functions for backward compatibility.
 ;; After loading raster.ad, these dispatch to raster.math/* or raster.numeric/*

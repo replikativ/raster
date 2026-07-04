@@ -1,5 +1,15 @@
 (ns raster.sym.diff
-  "Symbolic differentiation of S-expressions.
+  "INTERNAL — symbolic differentiation of raw S-expressions.
+
+   This is the fast-path calculus engine for raster.sym.analysis and
+   raster.sym.taylor. It is NOT the semantically-primary symbolic-derivative
+   route: that is Dual{Sym} — flowing a Dual number with Sym components
+   through the UNCHANGED numeric/math ops (initiality of the Sym carrier,
+   .internal/ad_formal_framework.md §4b). This hand-unrolled rule table is
+   redundant in principle; it is kept only as a fast path, and the O6 law
+   (test/raster/ad/laws_test.clj, o6-initiality-law) enforces agreement of
+   the two routes over the shared op corpus. When adding a derivative rule
+   here, add the op to the O6 corpus as well.
 
    Differentiates an S-expression w.r.t. a named variable using
    standard calculus rules (sum, product, quotient, chain).
@@ -222,8 +232,18 @@
 
 (defn differentiate
   "Differentiate and simplify a symbolic expression.
-   Uses raster.compiler.passes.scalar.simplify/simplify-derivative for cleanup."
+   Uses raster.compiler.passes.scalar.simplify/simplify-derivative for cleanup.
+
+   Takes a RAW S-expression form (seq/symbol/number), not a Sym object —
+   a Sym-wrapped input used to silently differentiate to 0 (garbage-in-
+   zero-out, framework §11 hazard); it now fails loud."
   ([expr var-sym]
    (differentiate expr var-sym 5))
   ([expr var-sym max-rounds]
+   (when-not (or (seq? expr) (symbol? expr) (number? expr))
+     (throw (ex-info (str "differentiate expects a raw S-expression form "
+                          "(seq/symbol/number), got " (pr-str (class expr))
+                          ". If this is a raster.sym.core Sym object, unwrap it "
+                          "first: (raster.sym.core/unwrap expr).")
+                     {:expr expr :class (class expr) :var var-sym})))
    (simplify/simplify-derivative (diff expr var-sym) max-rounds)))

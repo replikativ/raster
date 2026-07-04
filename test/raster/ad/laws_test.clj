@@ -185,6 +185,14 @@
       (recur (inc i) (n/+ acc (n/* x x)))
       acc)))
 
+;; Deliberately-UNCOVERED op for the §11 admissibility law: Math/expm1 as a
+;; raw JVM static interop call has a reverse template (Math/expm1) but can
+;; NEVER have a Dual lift (primitive-typed static method), so forward mode
+;; must be inadmissible while reverse works. (Every templated scalar deftm
+;; op now has a Dual overload — interop is the remaining uncovered class.)
+(deftm laws-uncovered-fn [x :- Double] :- Double
+  (n/* x (Math/expm1 (double x))))
+
 ;; ================================================================
 ;; O1 — mode agreement: grad_rev = grad_fwd = FD on the shared domain
 ;; ================================================================
@@ -234,18 +242,22 @@
           (is (close? gr (laws-f4' x) tol-double) (str "branch rev=analytic at " x))
           (is (close? gf gr tol-double) (str "branch fwd=rev at " x))))))
 
-  (testing "erf: reverse = analytic; FD only loosely (approximation slope)"
-    ;; KNOWN-GAP: erf has a reverse template but no Dual overload, so forward
-    ;; mode is unavailable (see o5-boundary-law for the loud :auto trap).
-    ;; The erf rrule is the ANALYTIC derivative 2/sqrt(pi)*exp(-x^2); the
-    ;; primal is the Abramowitz-Stegun 7.1.26 approximation (max err 1.5e-7),
-    ;; so FD-of-the-primal converges ~1.4e-6 away from the rule — the 5e-6
-    ;; tolerance absorbs the approximation's slope error (measured, stable
-    ;; across h), not an AD error. A wrong rule would be off by O(1).
-    (let [vg-r (rev/value+grad #'laws-f5)]
+  (testing "erf: reverse = forward = analytic; FD only loosely (approximation slope)"
+    ;; erf got its Dual lift in the carrier-coverage completion (framework
+    ;; §4a/§11): forward mode is available and must agree with reverse.
+    ;; The erf rrule (and the Dual scale) is the ANALYTIC derivative
+    ;; 2/sqrt(pi)*exp(-x^2); the primal is the Abramowitz-Stegun 7.1.26
+    ;; approximation (max err 1.5e-7), so FD-of-the-primal converges ~1.4e-6
+    ;; away from the rule — the 5e-6 tolerance absorbs the approximation's
+    ;; slope error (measured, stable across h), not an AD error. A wrong
+    ;; rule would be off by O(1).
+    (let [vg-r (rev/value+grad #'laws-f5)
+          vg-f (rev/value+grad #'laws-f5 :mode :forward)]
       (doseq [x [0.3 0.5 1.1]]
-        (let [gr (nth (vg-r x) 1)]
+        (let [gr (nth (vg-r x) 1)
+              gf (nth (vg-f x) 1)]
           (is (close? gr (erf-analytic-deriv x) 1e-10) (str "erf rev=analytic at " x))
+          (is (close? gf (erf-analytic-deriv x) 1e-10) (str "erf fwd=analytic at " x))
           (is (close? gr (central-fd laws-f5 x 1e-4) 5e-6) (str "erf rev~FD at " x)))))))
 
 ;; ================================================================
@@ -460,18 +472,35 @@
          #"cannot assemble a runtime gradient"
          (rev/value+grad #'laws-tail-loop-fn))))
 
-  (testing ":mode :auto on erf throws loudly (n=1 selects forward; no Dual lift)"
-    ;; KNOWN-GAP (§11): mode selection lacks the admissibility constraint —
-    ;; :auto must select argmin-cost over interpretations whose carrier covers
-    ;; every op in the body. erf has a reverse template but no Dual overload,
-    ;; so :auto (n<=1 → forward) throws at call time. This test documents the
-    ;; CURRENT loud behavior; when admissibility lands, :auto must fall back
-    ;; to :reverse here and this test flips to a value assertion.
-    (is (thrown-with-msg? Exception #"No matching method for `erf`"
-                          ((rev/value+grad #'laws-f5 :mode :auto) 0.5)))
-    ;; ...while :reverse on the same fn works (coverage exists there).
+  (testing ":auto is admissibility-constrained (§11): erf goes forward AND is correct"
+    ;; FLIPPED 2026-07-04 (was the KNOWN-GAP ':auto trap'): erf now has a
+    ;; Dual lift, so :auto (n=1 + admissible) legitimately selects forward.
+    ;; The LAW is the gradient value, whatever admissible mode is selected.
+    (is (rev/forward-admissible? #'laws-f5) "erf body is Dual-covered")
+    (is (close? (nth ((rev/value+grad #'laws-f5 :mode :auto) 0.7) 1)
+                (erf-analytic-deriv 0.7) 1e-10)
+        ":auto on erf returns the analytic gradient")
+    ;; ...and :reverse on the same fn agrees (coverage exists there too).
     (is (close? (nth ((rev/value+grad #'laws-f5 :mode :reverse) 0.5) 1)
-                (erf-analytic-deriv 0.5) 1e-10))))
+                (erf-analytic-deriv 0.5) 1e-10)))
+
+  (testing ":auto hard-filters inadmissible forward; :forward fails loud at construction"
+    ;; laws-uncovered-fn calls Math/expm1 (JVM static interop): reverse-
+    ;; templated, but no Dual lift can exist. n=1 would select forward by
+    ;; the Griewank dimension test alone — admissibility must force reverse
+    ;; (§11: select argmin-cost over ADMISSIBLE interpretations only).
+    (is (not (rev/forward-admissible? #'laws-uncovered-fn)))
+    (is (= '[Math/expm1] (:uncovered-ops (rev/forward-coverage #'laws-uncovered-fn)))
+        "the coverage artifact names exactly the uncovered op")
+    (let [x 0.7
+          expected (+ (Math/expm1 x) (* x (Math/exp x)))] ;; d/dx x·expm1(x)
+      (is (close? (nth ((rev/value+grad #'laws-uncovered-fn :mode :auto) x) 1)
+                  expected tol-double)
+          ":auto selects reverse and the gradient is correct"))
+    ;; :mode :forward itself: a clear CONSTRUCTION-time ex-info naming the
+    ;; uncovered op — never a No-matching-method at call time.
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Math/expm1"
+                          (rev/value+grad #'laws-uncovered-fn :mode :forward)))))
 
 ;; ================================================================
 ;; O6 — initiality / two-route symbolic agreement:
@@ -482,8 +511,18 @@
 ;; Flow the corpus ops over an arbitrary carrier (Sym or Dual__Sym): the
 ;; UNCHANGED numeric/math ops, generic dispatch. Must stay in sync with
 ;; laws-f2 / the x^2*cos(x) form below.
+;;
+;; Corpus rule: SHARED-COVERAGE ops only — an op joins when it has BOTH a
+;; Dual lift (raster.ad.forward) AND Sym support (sym/core overload + a
+;; sdiff rule). tan/tanh/atan2 joined with the carrier-coverage completion.
+;; erf is deliberately absent: it has a Dual lift but NO Sym overload/sdiff
+;; rule, so there is no second route to agree with (its Dual route is
+;; law-checked against the analytic derivative in O1/O5 instead).
 (defn- o6-f2-ops [x] (n/+ (n/* x (m/sin x)) (m/exp x)))
 (defn- o6-x2cos-ops [x] (n/* (n/* x x) (m/cos x)))
+(defn- o6-xtan-ops [x] (n/* x (m/tan x)))
+(defn- o6-tanh-ops [x] (m/tanh (n/* x x)))
+(defn- o6-atan2-ops [x] (m/atan2 x 2.0))
 
 (defn- num-eval
   "Numerically evaluate a symbolic derivative form at x. Direct structural
@@ -505,6 +544,10 @@
                    sin (Math/sin (first args))
                    cos (Math/cos (first args))
                    exp (Math/exp (first args))
+                   tan (Math/tan (first args))
+                   tanh (Math/tanh (first args))
+                   atan2 (Math/atan2 (first args) (second args))
+                   sqrt (Math/sqrt (first args))
                    pow (Math/pow (first args) (second args))
                    (throw (ex-info "num-eval: unknown op in symbolic derivative"
                                    {:op (first f) :form form}))))
@@ -536,7 +579,13 @@
   (doseq [[label ops-fn analytic]
           [["x*sin(x)+exp(x)" o6-f2-ops laws-f2']
            ["x^2*cos(x)" o6-x2cos-ops
-            (fn [x] (- (* 2.0 x (Math/cos x)) (* x x (Math/sin x))))]]]
+            (fn [x] (- (* 2.0 x (Math/cos x)) (* x x (Math/sin x))))]
+           ["x*tan(x)" o6-xtan-ops
+            (fn [x] (let [t (Math/tan x)] (+ t (* x (+ 1.0 (* t t))))))]
+           ["tanh(x^2)" o6-tanh-ops
+            (fn [x] (let [t (Math/tanh (* x x))] (* (- 1.0 (* t t)) 2.0 x)))]
+           ["atan2(x,2)" o6-atan2-ops
+            (fn [x] (/ 2.0 (+ 4.0 (* x x))))]]]
     (testing (str "two-route symbolic derivative agreement: " label)
       (let [traced (sym/unwrap (ops-fn (sym/sym 'x)))     ;; Sym trace of f
             route-a (sdiff/differentiate traced 'x)        ;; diff.clj calculus
