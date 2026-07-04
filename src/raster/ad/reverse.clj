@@ -2173,6 +2173,28 @@
                                       {:body body}))
             :else (recur relifted (inc i))))))))
 
+(defn ^:no-doc ad-prepare
+  "The ONE shared pre-AD preparation, used by the reverse path
+  (`build-grad-walked-body`, `grad-expr`) AND the forward/JVP path
+  (`raster.ad.jvp/jvp`). Exactly the order the reverse path has always used:
+
+    anf-wrap-bare-body → lower-composites (inline un-templated composites to
+    a fixpoint) → materialize-pass (pure par/map → alloc + par/map!) →
+    hoist-nested-lets (flat ANF).
+
+  Behavior-identical refactor of the duplicated prep — the laws suite is the
+  regression net."
+  [body]
+  (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
+        ;; and multi-level composites fully lower before AD (lower-composites
+        ;; runs anf-wrap-bare-body itself).
+        lowered (lower-composites body)
+        ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
+        ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
+        materialized (:form (materialize/materialize-pass lowered nil))]
+    ;; Hoist nested lets out of call args into flat ANF for AD.
+    (hoist-nested-lets materialized)))
+
 (defn grad-expr
   "Transform a quoted S-expression for reverse-mode AD.
   Returns the transformed S-expression that evaluates to
@@ -2186,15 +2208,7 @@
   because the differentiator core only knows template-bearing primitives. Ops
   WITH a template stay symbolic for the transform."
   [form active-params]
-  (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
-        ;; and multi-level composites fully lower before AD (see lower-composites).
-        lowered (lower-composites form)
-        ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
-        ;; so the AD sees the mutating, value-producing form it can differentiate
-        ;; (the pure pmap has no reverse rule).
-        materialized (:form (materialize/materialize-pass lowered nil))
-        hoisted (hoist-nested-lets materialized)]
-    (transform-body hoisted (vec active-params))))
+  (transform-body (ad-prepare form) (vec active-params)))
 
 (defn numerical-gradient
   "Compute gradient by finite differences (for testing).
@@ -2695,15 +2709,9 @@
                 float  :float
                 double :double
                 (if (some #{'floats 'float} tags) :float :double))
-        ;; Lower: ANF-normalize + inline compound deftm ops into primitives
-        ;; before AD, to a fixpoint so BARE and multi-level composites fully
-        ;; inline (see lower-composites).
-        lowered (lower-composites (first walked-body))
-        ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
-        ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
-        materialized (:form (materialize/materialize-pass lowered nil))
-        ;; Hoist nested lets out of call args into flat ANF for AD
-        hoisted (hoist-nested-lets materialized)
+        ;; Shared pre-AD preparation (lower composites → materialize → hoist
+        ;; into flat ANF) — see ad-prepare, shared with the JVP path.
+        hoisted (ad-prepare (first walked-body))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
         ad-form (transform-body hoisted diff-active-params)

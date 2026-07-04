@@ -21,7 +21,8 @@
      :grads-fn (optional)  ;; (fn [ctx params result-sym adjoint-sym gensym-fn]
                            ;;   -> [updated-ctx [grad-sym ...]]) for flat bindings}"
   (:require [raster.compiler.support.mangled :as mangled]
-            [raster.compiler.core.util :as util]))
+            [raster.compiler.core.util :as util]
+            [raster.ad.tangent :as tangent]))
 
 ;; ================================================================
 ;; Template registry
@@ -1014,3 +1015,321 @@
                                               [dA (list 'raster.linalg.core/array-det-backward
                                                         adjoint-sym result-sym A n)])
                                       [dA nil]]))})
+
+;; ================================================================
+;; §13 A1 — structure tags + DERIVED forward rules (JVP), one rule source
+;;
+;; The :structure facet is a presentation of the op's Jacobian
+;; (framework §2: ONE presentation, two contractions). The reverse
+;; contraction is the existing :grads/:grads-fn; the forward contraction
+;; (:jvp-fn) is DERIVED from the structure class — never a second
+;; hand-written table (the Julia two-forward-tables mistake):
+;;
+;;   :elementwise  diagonal J = Jᵀ      → frule(v) = grads-fn with dy:=v
+;;                 (also every SCALAR op: output is 1-dim, so grads[i] is
+;;                  Jᵢ·dy, linear in dy ⇒ frule = Σᵢ grads[i](dy:=Δxᵢ) —
+;;                  the @scalar_rule mechanics, product rule falls out)
+;;   :symmetric    J = Jᵀ (softmax)     → same diagonal reuse
+;;   :linear       jointly-linear in :in → frule = the op itself on the
+;;                 tangents (inactive :in slots get typed zeros — NOT the
+;;                 primal: f(Δa, b) ≠ df for additive ops)
+;;   :bilinear     frule = op(Δx,W,0ₑ) ⊕ op(x,ΔW,0ₑ), affine :linear-extra
+;;                 slots (biases) zeroed in every term except the first,
+;;                 which routes the extras' own tangents
+;;   :scalar-loss  frule = ⟨grads-fn(dy:=1̄), v⟩ via a generic dot kernel
+;;
+;; Emission hazard (RoR recon): every emitted call is FULLY QUALIFIED and
+;; tangent syms carry their primal's :raster.type/tag (tangent protocol) so
+;; parametric dispatch resolves and devirtualization can work downstream.
+;;
+;; ⊕ for tangent contributions is raster.ad.reverse/grad-acc — the SAME
+;; polymorphic (scalar/array, nil-safe) accumulator the reverse pass uses.
+;; The dot kernel is raster.par/dot-product ((All [T]) → Double), reused —
+;; no new kernel needed.
+;; ================================================================
+
+(def ^:private op-structures
+  "Jacobian structure classes per §13-RESOLVED inventory (indices verified
+  against each op's registered :params / deftm param list).
+  NOTE inventory corrections:
+   - class (b) linear counts 16 ops here (the doc's `14` undercounts the
+     pack/unpack and slice/scatter pairs it lists as single entries);
+   - raster.nn/dense arg order is [W x b] (weights first, unlike linear);
+   - raster.nn/softmax-cross-entropy returns a TUPLE [loss s]; its derived
+     JVP is the tangent of the LOSS component (mirrors the reverse rule,
+     whose scalar adjoint dy also addresses only the loss slot);
+   - forward-noise is JOINTLY linear in {x0, noise} (alpha-t rule-frozen);
+   - maxpool2d, einsum, dgemm! deliberately untagged (A3/kernel gaps)."
+  {;; --- (a) elementwise: diagonal Jacobian, frule = backward(tangent) ---
+   'raster.nn/relu                       {:class :elementwise :in #{0}} ;; [x]
+   'raster.dl.nn/gelu                    {:class :elementwise :in #{0}} ;; [x n]
+   'raster.dl.nn/silu                    {:class :elementwise :in #{0}} ;; [x n]
+   'raster.dl.nn/sigmoid                 {:class :elementwise :in #{0}} ;; [x n]
+   'raster.dl.nn/tanh-act                {:class :elementwise :in #{0}} ;; [x n]
+   'raster.dl.nn/leaky-relu              {:class :elementwise :in #{0}} ;; [x n alpha]
+   'raster.dl.nn/dropout                 {:class :elementwise :in #{0}} ;; [x mask n], mask frozen
+   'raster.dl.array-ops/scale-clamp-exp  {:class :elementwise :in #{0}} ;; [x scale clamp-bound n], scale rule-frozen
+   ;; --- (a′) symmetric: J = diag(s) − ssᵀ = Jᵀ ---
+   'raster.nn/softmax                    {:class :symmetric :in #{0}}   ;; [x]
+   'raster.dl.nn/softmax-1d              {:class :symmetric :in #{0}}   ;; [x n]
+   ;; --- (b) linear: frule = the op on the tangent(s) ---
+   'raster.dl.nn/residual-add            {:class :linear :in #{0 1}}    ;; [a b n]
+   'raster.dl.array-ops/array-add        {:class :linear :in #{0 1}}    ;; [a b n]
+   'raster.dl.array-ops/broadcast-add    {:class :linear :in #{0 1}}    ;; [h t batch dim]
+   'raster.dl.nn/transpose-2d            {:class :linear :in #{0}}      ;; [a rows cols]
+   'raster.dl.array-ops/pack-heads       {:class :linear :in #{0}}      ;; [x seq-len n-heads head-dim]
+   'raster.dl.array-ops/unpack-heads     {:class :linear :in #{0}}      ;; [x seq-len n-heads head-dim]
+   'raster.dl.array-ops/slice-strided-2d {:class :linear :in #{0}}      ;; [src rows row-stride col-offset n-cols]
+   'raster.dl.array-ops/scatter-strided-2d {:class :linear :in #{0}}    ;; [packed rows row-stride col-offset n-cols]
+   'raster.dl.array-ops/gather           {:class :linear :in #{0}}      ;; [src indices n-src n-pairs stride]
+   'raster.dl.array-ops/scatter-add      {:class :linear :in #{0}}      ;; [vals indices n-dst n-pairs stride]
+   'raster.dl.array-ops/reduce-axis      {:class :linear :in #{0}}      ;; [src n-rows n-cols]
+   'raster.dl.nn/embedding               {:class :linear :in #{0}}      ;; [table indices n vocab dim]
+   'raster.dl.attention/rope             {:class :linear :in #{0}}      ;; [x seq-len heads head-dim theta] — orthogonal rotation
+   'raster.dl.einsum/rearrange           {:class :linear :in #{0}}      ;; [tensor pattern axis-lengths?] — permutation
+   'raster.dl.diffusion/forward-noise    {:class :linear :in #{0 1}}    ;; [x0 noise alpha-t n], alpha-t rule-frozen
+   'raster.quant.train/qlinear-q8        {:class :linear :in #{0}}      ;; [x codes scales m in out] — codes frozen
+   'clojure.core/aget                    {:class :linear :in #{0}}      ;; [arr i] — one-hot read
+   ;; --- (c) bilinear: frule = op(Δx,·) ⊕ op(·,ΔW) ---
+   'raster.dl.nn/matmul          {:class :bilinear :args [0 1]}                   ;; [A B m k n]
+   'raster.dl.nn/linear          {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [x W b batch in-f out-f]
+   'raster.dl.nn/linear-nb       {:class :bilinear :args [0 1]}                   ;; [x W batch in-f out-f]
+   'raster.nn/dense              {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [W x b]
+   'raster.dl.nn/hadamard        {:class :bilinear :args [0 1]}                   ;; [a b n]
+   'raster.dl.array-ops/dot-rows {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [h W bias n-rows dim]
+   'raster.dl.array-ops/indexed-dot     {:class :bilinear :args [0 1]}            ;; [A B idx-a idx-b ...]
+   'raster.dl.array-ops/scatter-mul-add {:class :bilinear :args [0 1]}            ;; [coeffs src ...]
+   'raster.dl.nn/conv1d          {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [x W b batch ...]
+   'raster.dl.nn/conv2d          {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [x W b batch ...]
+   ;; --- (d) scalar losses: frule = ⟨grads-fn(1̄), v⟩ ---
+   'raster.dl.loss/mse-loss             {:class :scalar-loss} ;; [pred target n], target rule-frozen
+   'raster.dl.loss/l1-loss              {:class :scalar-loss} ;; [pred target n]
+   'raster.dl.loss/huber-loss           {:class :scalar-loss} ;; [pred target n delta]
+   'raster.dl.array-ops/masked-mse-loss {:class :scalar-loss} ;; [pred target states n]
+   'raster.dl.loss/cross-entropy-loss   {:class :scalar-loss} ;; [logits target batch classes]
+   'raster.nn/cross-entropy             {:class :scalar-loss} ;; [p t], t rule-frozen
+   'raster.nn/softmax-cross-entropy     {:class :scalar-loss} ;; [logits t] → [loss s] tuple (see note)
+   ;; --- scalar primitives: frule = Σᵢ grads(dy:=Δxᵢ) (mechanical, §2) ---
+   '+          {:class :elementwise :in #{0 1}}
+   '-          {:class :elementwise :in #{0 1}}
+   '*          {:class :elementwise :in #{0 1}}
+   '/          {:class :elementwise :in #{0 1}}
+   'raster.ad.reverse/grad-acc {:class :elementwise :in #{0 1}}
+   'Math/sin   {:class :elementwise :in #{0}}
+   'Math/cos   {:class :elementwise :in #{0}}
+   'Math/exp   {:class :elementwise :in #{0}}
+   'Math/log   {:class :elementwise :in #{0}}
+   'Math/sqrt  {:class :elementwise :in #{0}}
+   'Math/pow   {:class :elementwise :in #{0 1}}
+   'Math/abs   {:class :elementwise :in #{0}}
+   'Math/tan   {:class :elementwise :in #{0}}
+   'Math/asin  {:class :elementwise :in #{0}}
+   'Math/acos  {:class :elementwise :in #{0}}
+   'Math/atan  {:class :elementwise :in #{0}}
+   'Math/atan2 {:class :elementwise :in #{0 1}}
+   'Math/min   {:class :elementwise :in #{0 1}}
+   'Math/max   {:class :elementwise :in #{0 1}}
+   'Math/fma   {:class :elementwise :in #{0 1 2}}
+   'Math/sinh  {:class :elementwise :in #{0}}
+   'Math/cosh  {:class :elementwise :in #{0}}
+   'Math/tanh  {:class :elementwise :in #{0}}
+   'Math/log1p {:class :elementwise :in #{0}}
+   'Math/expm1 {:class :elementwise :in #{0}}
+   'Math/cbrt  {:class :elementwise :in #{0}}
+   'Math/log10 {:class :elementwise :in #{0}}
+   'Math/hypot {:class :elementwise :in #{0 1}}
+   'double     {:class :elementwise :in #{0}}
+   'float      {:class :elementwise :in #{0}}
+   'long       {:class :elementwise :in #{0}}   ;; grads 0.0 → zero tangent (cast kills derivative)
+   'int        {:class :elementwise :in #{0}}
+   'raster.sci.special/lgamma   {:class :elementwise :in #{0}}
+   'raster.sci.special/digamma  {:class :elementwise :in #{0}}
+   'raster.sci.special/erf      {:class :elementwise :in #{0}}
+   'raster.sci.special/erfinv   {:class :elementwise :in #{0}}
+   'raster.sci.special/expit    {:class :elementwise :in #{0}}
+   'raster.sci.special/logit    {:class :elementwise :in #{0}}
+   'raster.sci.special/log1pexp {:class :elementwise :in #{0}}
+   'raster.sci.special/besselj0 {:class :elementwise :in #{0}}
+   'raster.sci.special/besselj1 {:class :elementwise :in #{0}}
+   'raster.sci.special/betainc  {:class :elementwise :in #{2}}})
+
+;; Merge structure facets into the registry. merge-into-template! is
+;; order-independent: ops whose :grads-fn is registered by a later-loaded ns
+;; (raster.dl.*, raster.nn, …) get a partial {:structure …} entry here that
+;; the later merge fills in. Ops registered by register-template! ABOVE in
+;; this file are merged after their registration (this block is at the end).
+(doseq [[op st] op-structures]
+  (merge-into-template! op {:structure st}))
+
+(defn- jvp-zero-like
+  "Typed zero tangent shaped/dtyped like the PRIMAL arg (tangent protocol):
+  used for :in / :linear-extra slots whose tangent is absent in a term where
+  substituting the primal would be WRONG (linear ⇒ f(Δa,b) ≠ df)."
+  [primal-arg]
+  (list 'raster.arrays/zeros-like primal-arg
+        (list 'raster.arrays/alength primal-arg)))
+
+(defn- sum-tangent-contribs
+  "Bind the ⊕-sum of tangent contribution exprs; returns [ctx' sym].
+  ⊕ is raster.ad.reverse/grad-acc — polymorphic scalar/array, the same
+  accumulator the reverse pass uses."
+  [ctx contribs gensym-fn]
+  (let [t-sym (gensym-fn "jt")
+        expr (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b)) contribs)]
+    [(update ctx :bindings into [t-sym expr]) t-sym]))
+
+(defn- derive-jvp-fn
+  "Synthesize the :jvp-fn facet from the op's :structure tag + its EXISTING
+  gradient representation (one rule source). Returns
+    (fn [ctx args tangent-args result-sym gensym-fn] -> [ctx' tangent-sym])
+  emitting FLAT bindings (BindCtx style, like grads-fn). tangent-args is
+  aligned with args; nil = no tangent flowing into that slot."
+  [canonical-op template {:keys [class in args linear-extra]}]
+  (case class
+    ;; Diagonal / symmetric / scalar Jacobian: reuse grads-fn with dy:=Δxᵢ.
+    (:elementwise :symmetric)
+    (let [in-idxs (vec (sort (or in #{0})))]
+      (when-not (:grads-fn template)
+        (throw (ex-info (str "derive-jvp-fn: " canonical-op " tagged " class
+                             " but has no :grads-fn to reuse")
+                        {:op canonical-op :class class})))
+      (fn [ctx call-args tangent-args result-sym gensym-fn]
+        (let [[ctx contribs]
+              (reduce
+               (fn [[ctx contribs] i]
+                 (if-let [tv (and (< i (count call-args)) (nth tangent-args i nil))]
+                   (let [[ctx' gsyms] (instantiate-template-ctx
+                                       template (vec call-args) result-sym tv ctx)
+                         g (nth gsyms i nil)]
+                     (if (some? g) [ctx' (conj contribs g)] [ctx' contribs]))
+                   [ctx contribs]))
+               [ctx []] in-idxs)]
+          (when (empty? contribs)
+            (throw (ex-info (str "derive-jvp-fn: no active tangent reached " canonical-op)
+                            {:op canonical-op :tangent-args tangent-args})))
+          (sum-tangent-contribs ctx contribs gensym-fn))))
+
+    ;; Jointly-linear: run the op itself with ALL :in slots replaced by their
+    ;; tangents (typed zero where a slot's tangent is absent — linearity makes
+    ;; the simultaneous substitution exactly the pushforward; a one-at-a-time
+    ;; sum with primal in the other slot would be wrong for additive ops).
+    :linear
+    (let [in-set (set in)]
+      (fn [ctx call-args tangent-args _result-sym gensym-fn]
+        (when-not (some #(nth tangent-args % nil) in-set)
+          (throw (ex-info (str "derive-jvp-fn: no active tangent reached " canonical-op)
+                          {:op canonical-op})))
+        (let [args' (map-indexed
+                     (fn [i a]
+                       (if (contains? in-set i)
+                         (or (nth tangent-args i nil) (jvp-zero-like a))
+                         a))
+                     call-args)
+              t-sym (gensym-fn "jt")]
+          [(update ctx :bindings into [t-sym (cons canonical-op args')]) t-sym])))
+
+    ;; Bilinear(i,j) + affine extras: op(Δxᵢ, xⱼ, extras…) ⊕ op(xᵢ, Δxⱼ, 0ₑ).
+    ;; Extras (biases) are AFFINE offsets: they must be ZEROED in every term,
+    ;; except the first emitted term routes the extras' own tangents (linear).
+    :bilinear
+    (let [[bi bj] args
+          extras (set (or linear-extra #{}))]
+      (fn [ctx call-args tangent-args _result-sym gensym-fn]
+        (let [ti (nth tangent-args bi nil)
+              tj (nth tangent-args bj nil)
+              extra-active? (some #(nth tangent-args % nil) extras)
+              subst (fn [swap-idx zero-i? route-extras?]
+                      (map-indexed
+                       (fn [k a]
+                         (cond
+                           (= k swap-idx) (nth tangent-args swap-idx)
+                           (contains? extras k)
+                           (if route-extras?
+                             (or (nth tangent-args k nil) (jvp-zero-like a))
+                             (jvp-zero-like a))
+                           (and zero-i? (= k bi)) (jvp-zero-like a)
+                           :else a))
+                       call-args))
+              terms (cond-> []
+                      ti (conj (cons canonical-op (subst bi false true)))
+                      tj (conj (cons canonical-op (subst bj false (not ti))))
+                      ;; extras-only tangent: op(0ᵢ, xⱼ, Δextras) = Δextras' image
+                      (and (not ti) (not tj) extra-active?)
+                      (conj (cons canonical-op
+                                  (map-indexed
+                                   (fn [k a]
+                                     (cond
+                                       (= k bi) (jvp-zero-like a)
+                                       (contains? extras k)
+                                       (or (nth tangent-args k nil) (jvp-zero-like a))
+                                       :else a))
+                                   call-args))))]
+          (when (empty? terms)
+            (throw (ex-info (str "derive-jvp-fn: no active tangent reached " canonical-op)
+                            {:op canonical-op})))
+          (let [[ctx term-syms]
+                (reduce (fn [[ctx syms] term]
+                          (let [s (gensym-fn "jbt")]
+                            [(update ctx :bindings into [s term]) (conj syms s)]))
+                        [ctx []] terms)]
+            (sum-tangent-contribs ctx term-syms gensym-fn)))))
+
+    ;; Scalar loss: frule = ⟨grads-fn(dy := typed 1̄), Δactive⟩ per active arg,
+    ;; summed. Dot kernel: raster.par/dot-product ((All [T]) → Double), reused.
+    :scalar-loss
+    (do
+      (when-not (:grads-fn template)
+        (throw (ex-info (str "derive-jvp-fn: " canonical-op
+                             " tagged :scalar-loss but has no :grads-fn to reuse")
+                        {:op canonical-op})))
+      (fn [ctx call-args tangent-args result-sym gensym-fn]
+        (let [seed-sym (gensym-fn "jseed")
+              ;; typed unit adjoint from the RESULT's tag (tangent protocol);
+              ;; untagged falls back to 1.0 (loss is scalar by contract).
+              seed (tangent/seed-expr (:raster.type/tag (meta result-sym)))
+              ctx (update ctx :bindings into [seed-sym seed])
+              [ctx gsyms] (instantiate-template-ctx
+                           template (vec call-args) result-sym seed-sym ctx)
+              contribs (vec (keep-indexed
+                             (fn [i g]
+                               (when-let [tv (and (some? g) (nth tangent-args i nil))]
+                                 (list 'raster.par/dot-product g tv)))
+                             gsyms))]
+          (if (empty? contribs)
+            ;; every tangent-bearing arg is rule-frozen (e.g. mse target):
+            ;; the rule's pushforward is exactly 0 — mirror the reverse rule.
+            (let [t-sym (gensym-fn "jt")]
+              [(update ctx :bindings into [t-sym 0.0]) t-sym])
+            (sum-tangent-contribs ctx contribs gensym-fn)))))
+
+    (throw (ex-info (str "derive-jvp-fn: unknown :structure class " class
+                         " on " canonical-op)
+                    {:op canonical-op :class class}))))
+
+(defn op-jvp-fn
+  "The op's forward-mode (JVP) rule: an explicit :jvp-fn facet, or one derived
+  (and cached) from its :structure tag. Returns nil when the op has neither —
+  the transform (raster.ad.jvp) fails loud naming the op in that case.
+
+  Alias chasing: qualified alias entries (raster.numeric/+, clojure.core/sin
+  variants, …) were value-copied at registration BEFORE structure tagging, so
+  a structureless alias falls back to its canonical base key."
+  [op]
+  (when-let [[template canonical] (resolve-template op)]
+    (or (:jvp-fn template)
+        (when-let [st (:structure template)]
+          (let [f (derive-jvp-fn canonical template st)]
+            (swap! template-registry assoc-in [canonical :jvp-fn] f)
+            f))
+        ;; alias → base fallbacks
+        (when-let [base (get qualified->base-op canonical)]
+          (op-jvp-fn base))
+        (when (and (qualified-symbol? canonical)
+                   (= "raster.math" (namespace canonical)))
+          (let [interop (symbol "Math" (name canonical))]
+            (when (get-template interop) (op-jvp-fn interop))))
+        (when (and (qualified-symbol? canonical)
+                   (= "clojure.core" (namespace canonical))
+                   (not= canonical (symbol (name canonical))))
+          (let [bare (symbol (name canonical))]
+            (when (get-template bare) (op-jvp-fn bare)))))))
