@@ -17,6 +17,7 @@
             [raster.math :as m]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
+            [raster.ad.tangent :as tangent]
             [raster.ad.forward :as fwd]
             [raster.ad.jet :as jet]
             [raster.ad.templates :as tmpl]
@@ -288,6 +289,117 @@
     (let [x (fa 8 1) W (fa 12 2) tgt (fa 6 3)
           res ((rev/value+grad #'laws-lnb-mse) x W tgt 2 4 3)]
       (is (every? nil? (drop 4 res)) "batch/in/out Long slots are nil"))))
+
+;; ================================================================
+;; O3b — Π (tangent-type protocol): per-param dtype preservation
+;; (framework §5, task #44). Every cotangent lives in the tangent space
+;; of ITS OWN primal — dtype derives from each param's type tag, and
+;; the seed from the RESULT's type, never from a global binary switch.
+;; ================================================================
+
+;; Mixed scalars: Double × Float. d_x must stay Double, d_y must be Float.
+(deftm laws-pi-scalar [x :- Double, y :- Float] :- Double
+  (n/* x y))
+
+;; THE mixed acceptance shape: float array params + a Double scalar param
+;; + Long ⊥ slots, Double loss. loss = w * mse(linear-nb(x,W), tgt).
+(deftm laws-pi-mixed-d [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                        w :- Double batch :- Long in :- Long out :- Long] :- Double
+  (n/* w (loss/mse-loss (nn/linear-nb x W batch in out) tgt (clojure.core/* batch out))))
+
+;; Same but w :- Float: d_w must come back Float (Π projects the Double
+;; cotangent dy·mse into Float32 — the daxpy-diff!-class bug direction).
+(deftm laws-pi-mixed-f [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                        w :- Float batch :- Long in :- Long out :- Long] :- Double
+  (n/* w (loss/mse-loss (nn/linear-nb x W batch in out) tgt (clojure.core/* batch out))))
+
+;; Double-array twin of laws-lnb-mse for the double[] regression direction.
+(deftm laws-pi-darr [x :- (Array double) W :- (Array double) tgt :- (Array double)
+                     batch :- Long in :- Long out :- Long] :- Double
+  (loss/mse-loss (nn/linear-nb x W batch in out) tgt (clojure.core/* batch out)))
+
+(defn- da
+  "Deterministic Gaussian double array."
+  ^doubles [n seed]
+  (let [r (java.util.Random. (long seed)) a (double-array n)]
+    (dotimes [i n] (aset a i (.nextGaussian r))) a))
+
+(deftest o3b-tangent-type-protocol-law
+  (testing "mixed scalar dtypes: each grad in its own primal's tangent space"
+    (let [[v dx dy] ((rev/value+grad #'laws-pi-scalar) 2.0 (float 3.0))]
+      (is (instance? Double v))
+      (is (instance? Double dx) "d_x: Double primal → Double cotangent")
+      (is (instance? Float dy) "d_y: Float primal → Float cotangent (Π projects)")
+      (is (close? dx 3.0 tol-double))
+      (is (close? dy 2.0 tol-float))))
+
+  (testing "mixed array/scalar fn: per-param dtypes preserved in ONE fn"
+    (let [x (fa 8 11) W (fa 12 12) tgt (fa 6 13)
+          [v gx gW gtgt gw & longs] ((rev/value+grad #'laws-pi-mixed-d) x W tgt 2.0 2 4 3)
+          mse (loss/mse-loss (nn/linear-nb x W 2 4 3) tgt 6)]
+      (is (instance? Double v) "Double loss")
+      (is (instance? (Class/forName "[F") gx) "grad-x is float[]")
+      (is (instance? (Class/forName "[F") gW) "grad-W is float[]")
+      (is (instance? (Class/forName "[F") gtgt) "grad-tgt is float[] (typed zero default)")
+      (is (instance? Double gw) "grad-w is Double, not Float")
+      (is (every? nil? longs) "Long slots stay ⊥/nil")
+      (is (close? gw mse tol-double) "d(w·L)/dw = L")))
+
+  (testing "Float scalar param in a Double-loss fn: grad projected to Float"
+    (let [x (fa 8 21) W (fa 12 22) tgt (fa 6 23)
+          [v gx _gW _gtgt gw] ((rev/value+grad #'laws-pi-mixed-f) x W tgt (float 2.0) 2 4 3)
+          mse (loss/mse-loss (nn/linear-nb x W 2 4 3) tgt 6)]
+      (is (instance? Double v))
+      (is (instance? (Class/forName "[F") gx))
+      (is (instance? Float gw) "d_w: Float primal → Float cotangent")
+      (is (close? gw mse tol-float))))
+
+  (testing "float-only fn still yields float[] grads (regression)"
+    (let [x (fa 8 1) W (fa 12 2) tgt (fa 6 3)
+          [v gx gW gtgt] ((rev/value+grad #'laws-lnb-mse) x W tgt 2 4 3)]
+      (is (instance? Double v))
+      (is (instance? (Class/forName "[F") gx))
+      (is (instance? (Class/forName "[F") gW))
+      (is (instance? (Class/forName "[F") gtgt))))
+
+  (testing "double-only fn yields Double/double[] grads with no projection churn"
+    (let [[v dx dy] ((rev/value+grad #'laws-f6) 0.8 1.2)]
+      (is (instance? Double v))
+      (is (instance? Double dx))
+      (is (instance? Double dy)))
+    (let [x (da 8 31) W (da 12 32) tgt (da 6 33)
+          [v gx gW gtgt] ((rev/value+grad #'laws-pi-darr) x W tgt 2 4 3)]
+      (is (instance? Double v))
+      (is (instance? (Class/forName "[D") gx) "grad-x is double[]")
+      (is (instance? (Class/forName "[D") gW) "grad-W is double[]")
+      (is (instance? (Class/forName "[D") gtgt) "grad-tgt is double[]")))
+
+  (testing "materialized zeros are typed or fail loud (unit: the protocol + helper)"
+    ;; The protocol ns directly:
+    (is (= {:kind :array :dtype :float} (tangent/tangent-kind 'floats)))
+    (is (= {:kind :scalar :dtype :double} (tangent/tangent-kind 'double)))
+    (is (= {:kind :none} (tangent/tangent-kind 'long)))
+    (is (= {:kind :none} (tangent/tangent-kind nil)) "untagged = statically unknown = ⊥")
+    (is (= (list 'float-array 'n) (tangent/zero-expr 'floats 'n)))
+    (is (= 0.0 (tangent/zero-expr 'double 'n)))
+    (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-expr nil 'n))
+        "unknown tangent space cannot materialize a zero")
+    (is (thrown? clojure.lang.ExceptionInfo (tangent/zero-expr 'long 'n))
+        "⊥ has no zero — NoTangent ≠ ZeroTangent")
+    ;; nil-safe runtime projection (0̄ passes through):
+    (is (nil? (tangent/project-double nil)))
+    (is (instance? Float (tangent/project-float 1.5)))
+    ;; zero-like: the dynamic fallback derives dtype+shape from the value.
+    (is (instance? (Class/forName "[F") (tangent/zero-like (float-array 3))))
+    (is (instance? Float (tangent/zero-like (float 2.0))))
+    (is (nil? (tangent/zero-like nil)))
+    ;; array-zero-of-shape (private helper): tag-reading path emits typed
+    ;; ctors; untagged throws instead of the old silent scalar 0.0.
+    (let [azos @#'rev/array-zero-of-shape]
+      (is (= (list 'float-array (list 'raster.arrays/alength 'xs))
+             (azos (with-meta 'xs {:raster.type/tag 'floats}))))
+      (is (thrown? clojure.lang.ExceptionInfo (azos 'untagged))
+          "untagged array slot fails loud, no scalar-0.0 mis-shape"))))
 
 ;; ================================================================
 ;; O4 — composition: HVP = FD(grad); Jet-k coeffs = k-th derivatives

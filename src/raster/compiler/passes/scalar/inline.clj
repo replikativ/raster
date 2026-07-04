@@ -4,6 +4,7 @@
 	This namespace owns cross-function inlining, pre-AD lowering, and
 	post-AD backend expansion. It does not perform buffer reuse."
   (:require [clojure.string :as str]
+            [raster.ad.tangent :as tangent]
             [raster.ad.templates :as rt]
             [raster.compiler.ad.flatten :as flatten]
             [raster.compiler.core.types :as types]
@@ -725,8 +726,9 @@
             ;; are constants for AD — passing them as active forces AD to look
             ;; for rules on integer ops like (quot d-model n-heads), which
             ;; don't exist (and shouldn't, since the result is non-diff).
-            ;; Same rule as raster.ad.reverse/build-grad-walked-body.
-            differentiable-tag? '#{doubles floats double float}
+            ;; Same rule as raster.ad.reverse/build-grad-walked-body —
+            ;; delegates to the tangent protocol's type-level ⊥ test.
+            differentiable-tag? tangent/differentiable?
             tags-vec (or tags (vec (repeat (count all-params) 'double)))
             active-params (vec (keep-indexed
                                 (fn [i p]

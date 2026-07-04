@@ -24,7 +24,8 @@
   2. Extracts and inlines the reverse-pass bindings with dy=1.0
   3. Names the gradient outputs (one per active param)
   4. Appends SGD weight update calls: (nc/axpy! (- lr) d_Wi Wi)"
-  (:require [raster.compiler.ir.form :as form]))
+  (:require [raster.ad.tangent :as tangent]
+            [raster.compiler.ir.form :as form]))
 
 (def ^:dynamic *flatten-dtype*
   "Pipeline dtype for type-appropriate AD seed values.
@@ -159,12 +160,17 @@
            :param-adj-syms [d_p1 d_p2 ...] gradient symbols}
   or nil if form doesn't match AD pattern."
   [form]
-  (when-let [{:keys [fwd-bindings result-sym dy-sym
+  (when-let [{:keys [fwd-bindings result-sym body-sym dy-sym
                      rev-bindings param-adj-syms]} (extract-ad-structure form)]
-    (let [;; Seed value: 1.0 in the pipeline's dtype.
-          ;; Float pipelines use (float 1.0) so the adjoint matches
-          ;; the parametric return type of the loss function.
-          seed (case *flatten-dtype* :float (list 'float 1.0) 1.0)
+    (let [;; Seed value: 1.0 typed by the RESULT's tangent space (Π): the
+          ;; seed is the cotangent of the loss, so its dtype derives from
+          ;; the result/body sym's :raster.type/tag when present. Falls
+          ;; back to the pipeline-wide *flatten-dtype* for untagged results.
+          result-tag (or (some-> result-sym meta :raster.type/tag)
+                         (some-> body-sym meta :raster.type/tag))
+          seed (if (= :scalar (:kind (tangent/tangent-kind result-tag)))
+                 (tangent/seed-expr result-tag)
+                 (case *flatten-dtype* :float (list 'float 1.0) 1.0))
           ;; Build flat bindings: fwd + [dy seed] + rev
           flat-bindings (vec (concat fwd-bindings
                                      [dy-sym seed]

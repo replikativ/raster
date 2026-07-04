@@ -28,6 +28,7 @@
             [raster.compiler.core.op-descriptor :as op]
             [raster.compiler.core.inference :as inf]
             [raster.ad.reverse.normalize :as anf]
+            [raster.ad.tangent :as tangent]
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.parallel.materialize :as materialize]
@@ -148,7 +149,9 @@
   (if (form/binding-form? body)
     body
     (with-ad-gensym
-      (let [r-sym (ad-gensym "adbody")
+      ;; Propagate the body form's type tag onto the wrapper sym so the
+      ;; tangent protocol can emit a statically-typed zero for it.
+      (let [r-sym (ad-gensym "adbody" (:raster.type/tag (meta body)))
             anf-b (anf-normalize-bindings [r-sym body])]
         (list 'let* anf-b r-sym)))))
 
@@ -160,8 +163,9 @@
 
 (def ^:private differentiable-tag?
   "Param tags that carry gradient. Floating-point arrays and scalars only —
-  Long/long, longs (indices), Boolean, Object, etc. are never differentiated."
-  #{'doubles 'floats 'double 'float})
+  Long/long, longs (indices), Boolean, Object, etc. are never differentiated.
+  Delegates to the tangent-type protocol (Π) — the type-level ⊥ test."
+  tangent/differentiable?)
 
 (defn- auto-make-deftm-rule
   "Create a transient AD rule for a deftm op that has no explicit template.
@@ -441,12 +445,14 @@
    (partition 2 norm-bindings)))
 
 (defn- array-zero-of-shape
-  "Form for a zero adjoint array shaped like `arr-sym` (doubles/floats), else 0.0."
+  "Form for a typed zero adjoint shaped like `arr-sym`, derived from its
+  :raster.type/tag (Π). doubles/floats → typed array ctor; double/float →
+  typed scalar zero. FAIL-LOUD on untagged/⊥ tags: the old scalar-0.0
+  fallback could silently mis-shape an array slot. Callers must only
+  materialize this zero when it is actually consumed (compute lazily)."
   [arr-sym]
-  (case (:raster.type/tag (meta arr-sym))
-    doubles (list 'double-array (list 'raster.arrays/alength arr-sym))
-    floats  (list 'float-array  (list 'raster.arrays/alength arr-sym))
-    0.0))
+  (tangent/zero-expr (:raster.type/tag (meta arr-sym))
+                     (list 'raster.arrays/alength arr-sym)))
 
 (defn- wire-read-adjoints
   "Append the per-read-array and per-scalar gradient syms into adj-env (the SOAC
@@ -497,12 +503,19 @@
   [{:keys [sym branch then else]} adj-sym activity {:keys [adj-env rev-ctx]}]
   ;; Route the adjoint to the taken branch; the other branch gets a SHAPE-matched
   ;; zero (a scalar 0.0 where an array is expected crashes array-add-backward).
-  (let [zero (array-zero-of-shape sym)
+  ;; Tagged syms get a STATIC typed zero (fail-loud for known-⊥ tags); untagged
+  ;; syms fall back to the runtime `zero-like` on the primal — dynamically
+  ;; typed Π, which unlike the old scalar 0.0 cannot mis-shape an array slot.
+  ;; `zero` is a delay so the fail-loud path only fires when a branch
+  ;; actually materializes the zero.
+  (let [zero (delay (if (some? (:raster.type/tag (meta sym)))
+                      (array-zero-of-shape sym)
+                      (list 'raster.ad.tangent/zero-like sym)))
         adj-env (cond-> adj-env
                   (and (symbol? then) (get activity then false))
-                  (update then (fnil conj []) (list 'if branch adj-sym zero))
+                  (update then (fnil conj []) (list 'if branch adj-sym @zero))
                   (and else (symbol? else) (get activity else false))
-                  (update else (fnil conj []) (list 'if branch zero adj-sym)))]
+                  (update else (fnil conj []) (list 'if branch @zero adj-sym)))]
     {:adj-env adj-env :rev-ctx rev-ctx}))
 
 (defmethod emit-backward :alias
@@ -521,10 +534,11 @@
         ;; adj-env[sym]; a direct buffer write lands in adj-env[out-arr]. SUM both
         ;; (grad-acc element-wise) — dropping either disconnects the gradient.
         rev-ctx (if-let [out-arr (first written-arrs)]
-                  (bindings-into rev-ctx
-                                 [d-out-sym (sum-contribs (concat (get adj-env sym)
-                                                                  (get adj-env out-arr))
-                                                          (array-zero-of-shape out-arr))])
+                  (let [contribs (concat (get adj-env sym) (get adj-env out-arr))
+                        ;; Materialize the typed zero (fail-loud on unknown
+                        ;; tangent space) only when there are no contributions.
+                        default (when (empty? contribs) (array-zero-of-shape out-arr))]
+                    (bindings-into rev-ctx [d-out-sym (sum-contribs contribs default)]))
                   rev-ctx)
         rev-ctx (reduce bindings-into rev-ctx backward-maps)
         rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
@@ -536,8 +550,14 @@
            shadow-allocs backward-maps backward-reduces d-acc-sym]}
    _adj-sym _activity {:keys [adj-env rev-ctx]}]
   (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
-        ;; par/reduce returns a SCALAR — 0.0 default is correct for the empty case.
-        rev-ctx (bindings-into rev-ctx [d-acc-sym (sum-contribs (get adj-env sym) 0.0)])
+        ;; par/reduce returns a SCALAR — a typed scalar zero (Π on the reduce
+        ;; result's tag) for the empty case; untagged stays the double 0.0
+        ;; (scalar slots cannot mis-shape, only mis-dtype).
+        acc-tag (:raster.type/tag (meta sym))
+        acc-zero (if (= :scalar (:kind (tangent/tangent-kind acc-tag)))
+                   (tangent/zero-expr acc-tag nil)
+                   0.0)
+        rev-ctx (bindings-into rev-ctx [d-acc-sym (sum-contribs (get adj-env sym) acc-zero)])
         rev-ctx (reduce bindings-into rev-ctx backward-maps)
         rev-ctx (reduce bindings-into rev-ctx backward-reduces)]
     {:rev-ctx rev-ctx
@@ -551,10 +571,9 @@
         ;; result sym aliases the buffer — sum consumer (adj-env[sym]) and direct
         ;; buffer (adj-env[out-arr]) contributions (see :par-map).
         rev-ctx (if-let [out-arr (first written-arrs)]
-                  (bindings-into rev-ctx
-                                 [d-out-sym (sum-contribs (concat (get adj-env sym)
-                                                                  (get adj-env out-arr))
-                                                          (array-zero-of-shape out-arr))])
+                  (let [contribs (concat (get adj-env sym) (get adj-env out-arr))
+                        default (when (empty? contribs) (array-zero-of-shape out-arr))]
+                    (bindings-into rev-ctx [d-out-sym (sum-contribs contribs default)]))
                   rev-ctx)
         rev-ctx (bindings-into rev-ctx [n-bwd-sym bound-expr])
         bwd-result-sym (ad-gensym "dt_bwd")
@@ -588,22 +607,45 @@
    {:adj-env seed-adj-env :rev-ctx (bind-ctx/make-ctx ad-gensym)}
    (reverse records)))
 
+(defn- param-zero-expr
+  "Typed zero default for a param's adjoint slot (Π): array params get a
+  shape-matched typed zero (zeros-like keeps the exemplar's dtype), scalar
+  params a typed scalar zero. Untagged params keep the scalar 0.0 double
+  default (the HVP path differentiates untagged double scalars)."
+  [p]
+  (let [tag (:raster.type/tag (meta p))]
+    (case (:kind (tangent/tangent-kind tag))
+      :array  (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
+      :scalar (tangent/zero-expr tag nil)
+      0.0)))
+
 (defn- collect-param-adjoints
   "Phase 3 (pure): bind a d_<param> for each active param (shape-matched zero when
-  no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}."
+  no contributions) into rev-ctx; return {:rev-ctx :param-adj-syms}.
+
+  Π at the boundary: each accumulated scalar adjoint is PROJECTED into the
+  primal param's tangent space — float params always (double contamination
+  via promotion is the default in raster.numeric), double params only when
+  float params are present (provably-double-only functions emit no cast).
+  Array adjoints are anchored by their typed shadow buffers — no cast."
   [active-params adj-env rev-ctx]
-  (reduce
-   (fn [{:keys [rev-ctx param-adj-syms]} p]
-     (let [tag (:raster.type/tag (meta p))
-           default (case tag
-                     doubles (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
-                     floats  (list 'raster.arrays/zeros-like p (list 'raster.arrays/alength p))
-                     0.0)
-           adj-sym (ad-gensym (str "d_" (name p)) tag)]
-       {:rev-ctx (bindings-into rev-ctx [adj-sym (sum-contribs (get adj-env p) default)])
-        :param-adj-syms (conj param-adj-syms adj-sym)}))
-   {:rev-ctx rev-ctx :param-adj-syms []}
-   active-params))
+  (let [param-dtype #(-> % meta :raster.type/tag tangent/tangent-kind :dtype)
+        mixed-float? (boolean (some #(= :float (param-dtype %)) active-params))]
+    (reduce
+     (fn [{:keys [rev-ctx param-adj-syms]} p]
+       (let [tag (:raster.type/tag (meta p))
+             {:keys [kind dtype]} (tangent/tangent-kind tag)
+             raw (sum-contribs (get adj-env p) (param-zero-expr p))
+             expr (if (and (= kind :scalar)
+                           (or (= dtype :float)
+                               (and (= dtype :double) mixed-float?)))
+                    (tangent/project-expr tag raw)
+                    raw)
+             adj-sym (ad-gensym (str "d_" (name p)) tag)]
+         {:rev-ctx (bindings-into rev-ctx [adj-sym expr])
+          :param-adj-syms (conj param-adj-syms adj-sym)}))
+     {:rev-ctx rev-ctx :param-adj-syms []}
+     active-params)))
 
 (defn- process-bindings
   "The shared engine: run Phases 1-3 over a NORMALIZED binding vector and return
@@ -1935,18 +1977,19 @@
         :else
         (let [body-expr (first body-exprs)]
           (cond
-            ;; Literal — zero gradient
+            ;; Literal — zero gradient (typed per param tag: a float-array
+            ;; param's slot must be a float[] zero, not a scalar 0.0)
             (or (number? body-expr) (nil? body-expr))
             (vector body-expr
                     (list 'fn* ['dy__rad]
-                          (vec (repeat (count active-params) 0.0))))
+                          (mapv param-zero-expr active-params)))
 
-            ;; Symbol — gradient is 1 for that param, 0 for others
+            ;; Symbol — gradient is 1 for that param, typed 0 for others
             (symbol? body-expr)
             (vector body-expr
                     (list 'fn* ['dy__rad]
-                          (vec (map (fn [p] (if (= p body-expr) 'dy__rad 0.0))
-                                    active-params))))
+                          (mapv (fn [p] (if (= p body-expr) 'dy__rad (param-zero-expr p)))
+                                active-params)))
 
             ;; If form — route through gen-reverse-let (normalization handles it)
             (and (seq? body-expr) (= 'if (first body-expr)))
@@ -2596,6 +2639,17 @@
                            [new-loop-form])
                     new-loop-form))))))))))
 
+(defn- body-tail-tag
+  "The :raster.type/tag of a walked body's TAIL expression — the type of the
+  actual primal the differentiated graph produces (which may be narrower than
+  the deftm's declared return type, e.g. a `:- Double` fn whose body is a
+  parametric T=float chain). Prefers the form's own tag, else descends
+  through binding forms to the final body expression."
+  [form]
+  (or (:raster.type/tag (meta form))
+      (when (and (seq? form) (form/binding-form? form) (seq (drop 2 form)))
+        (body-tail-tag (last form)))))
+
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
   Returns {:walked-body [form], :params [sym ...], :source-ns ns}
@@ -2627,8 +2681,18 @@
                                    (when (differentiable-tag? (nth tags i nil)) p))
                                  all-params))
         source-ns (or (:ns m) *ns*)
-        ;; Infer dtype from parameter tags for correct AD seed type
-        dtype (if (some #{'floats 'float} tags) :float :double)
+        ;; Π: the SEED is the cotangent of the RESULT of the differentiated
+        ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
+        ;; actual primal flowing) — not from a global binary any-param-is-float
+        ;; switch, and NOT from the declared return tag: a fn declared
+        ;; `:- Double` whose body is a parametric float chain (T=float
+        ;; cross-entropy) needs a FLOAT seed for its pullback; the Double is
+        ;; only the .invk interface boundary. The legacy binary inference
+        ;; remains as fallback for untagged tails.
+        dtype (case (body-tail-tag (first walked-body))
+                float  :float
+                double :double
+                (if (some #{'floats 'float} tags) :float :double))
         ;; Lower: ANF-normalize + inline compound deftm ops into primitives
         ;; before AD, to a fixpoint so BARE and multi-level composites fully
         ;; inline (see lower-composites).
