@@ -517,6 +517,16 @@
                                         (n/oftype x 1.0) (n/oftype x 0.0))
                         y)))
 
+;; Elementwise (Hadamard) product a ⊙ b, with an explicit AD rule. A raw
+;; (broadcast [a b] (* a b)) computes the same value but has NO AD template for
+;; TWO active inputs (the SOAC map differentiates only single-active), so gated
+;; MLPs need this dedicated op. Pullback: d_a = dy⊙b, d_b = dy⊙a.
+(deftm hadamard (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
+                    (broadcast [a b] (* a b))))
+
+(deftm hadamard-backward (All [T] [dy :- (Array T) other :- (Array T) n :- Long] :- (Array T)
+                             (broadcast [dy other] (* dy other))))
+
 ;; Gated MLP (GeGLU): down( gelu(x@gate^T) ⊙ (x@up^T) ), bias-free.
 ;; This is Gemma's / T5-v1.1's MLP. The SwiGLU variant (Llama/Qwen) is identical
 ;; with silu in place of gelu — see swiglu.
@@ -526,7 +536,7 @@
                   (let [g (linear-nb x gate-w rows d-model d-ff)
                         g (gelu g (* rows d-ff))
                         u (linear-nb x up-w rows d-model d-ff)
-                        h (broadcast [g u] (* g u))]
+                        h (hadamard g u (* rows d-ff))]
                     (linear-nb h down-w rows d-ff d-model))))
 
 ;; SwiGLU (Llama/Qwen gated MLP): down( silu(x@gate^T) ⊙ (x@up^T) ), bias-free.
@@ -536,7 +546,7 @@
                    (let [g (linear-nb x gate-w rows d-model d-ff)
                          g (silu g (* rows d-ff))
                          u (linear-nb x up-w rows d-model d-ff)
-                         h (broadcast [g u] (* g u))]
+                         h (hadamard g u (* rows d-ff))]
                      (linear-nb h down-w rows d-ff d-model))))
 
 ;; Elementwise residual add: out = a + b (parametric; for transformer residuals).
@@ -1790,6 +1800,21 @@
                                                     dw (list 'raster.dl.nn/rms-norm-backward-dweight
                                                              adjoint-sym x rows features eps)])
                                            [dx dw nil nil nil nil]]))})
+
+;; hadamard rrule — elementwise product (gated MLPs). d_a = dy⊙b, d_b = dy⊙a.
+(tmpl/merge-into-template! 'raster.dl.nn/hadamard
+                           {:pullback-factory (fn [_result a b n]
+                                                (fn [dy]
+                                                  [(hadamard-backward dy b n)
+                                                   (hadamard-backward dy a n)
+                                                   nil]))
+                            :params '[a b n] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [a b n] _result-sym adjoint-sym gensym-fn]
+                                        (let [da (gensym-fn "da") db (gensym-fn "db")]
+                                          [(update ctx :bindings into
+                                                   [da (list 'raster.dl.nn/hadamard-backward adjoint-sym b n)
+                                                    db (list 'raster.dl.nn/hadamard-backward adjoint-sym a n)])
+                                           [da db nil]]))})
 
 ;; linear-nb rrule — bias-free linear (Gemma/Qwen projections). Same as linear
 ;; minus the db term; reuses linear-dx / linear-dW. (linear-nb x W batch in-f out-f)
