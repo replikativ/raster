@@ -3730,6 +3730,28 @@
                      (fn [locs [[sym init] rt]]
                        (let [t (emit-form code init locs (dissoc ctx :void-context))
                              slot-t (widen-loop-type t rt)]
+                         ;; A2 differential: the walker stamps loop-var types
+                         ;; (TC-fed); this backend still derives its own via
+                         ;; LUB(init, recur). A PRIMITIVE mismatch between the
+                         ;; two is a front-half stamping bug OR a recur-widening
+                         ;; the stamp missed — surface it. (Ref types skipped:
+                         ;; stamps carry class names, slots carry :ref.)
+                         (when-let [stag (:raster.type/tag (meta sym))]
+                           (let [stamp-t ({'double :double 'float :float
+                                           'long :long 'int :int
+                                           'boolean :bool} stag)]
+                             (when (and stamp-t
+                                        ;; only CLASS mismatches (float vs int)
+                                        ;; are miscompile signals — width picks
+                                        ;; (int↔long, f32↔f64) are backend-legit
+                                        (not= (contains? #{:double :float} stamp-t)
+                                              (contains? #{:double :float} slot-t)))
+                               (binding [*out* *err*]
+                                 (println (str "WARNING: bytecode loop-var " sym
+                                               " stamped " stag " but derived "
+                                               slot-t " (LUB of init+recur) — "
+                                               "front-half stamp diverges from "
+                                               "backend derivation."))))))
                          (when (not= t slot-t) (emit-coerce code t slot-t))
                          (let [slot (alloc-slot! ctx slot-t)]
                            (case slot-t

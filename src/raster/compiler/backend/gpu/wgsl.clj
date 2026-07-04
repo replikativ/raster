@@ -14,7 +14,8 @@
    (inc i))) els)) shape the passes lower dotimes into, and the bare dotimes SoA
    shape) — one or more `(aset arr i pure)` stores whose value is aget@i / arith
    / Math / scalar. Reductions + i32 fixed-point atomic scatter are a follow-on."
-  (:require [raster.compiler.backend.intrinsics :as ix]
+  (:require [raster.compiler.ir.form :as form]
+            [raster.compiler.backend.intrinsics :as ix]
             [clojure.string :as str]))
 
 ;; ---------------------------------------------------------------------------
@@ -38,14 +39,14 @@
       (some find-counted-loop (drop 2 f))
       (and (seq? f) (= 'do (first f)))
       (some find-counted-loop (rest f))
-      (and (seq? f) (#{'loop 'loop* 'dotimes} (first f))) f
+      (and (seq? f) ((some-fn form/loop-head? #{'dotimes}) (first f))) f
       :else nil)))
 
 (defn- store? [x]
   (and (seq? x) (= 'clojure.core/aset (first x)) (= 4 (count x))))
 
 (defn- flatten-body [forms]
-  (mapcat (fn f [x] (if (and (seq? x) (#{'do 'let*} (first x)))
+  (mapcat (fn f [x] (if (and (seq? x) ((some-fn #{'do} form/let-head?) (first x)))
                       (mapcat f (if (= 'let* (first x)) (drop 2 x) (rest x))) [x]))
           forms))
 

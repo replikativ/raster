@@ -327,6 +327,15 @@
   [form]
   (= :binding (:kind (form-info form))))
 
+(defn let-head?
+  "True for the let-family heads (let, let*). Emitters and passes must use this
+   instead of local #{'let 'let*} sets — one place to extend, no drift."
+  [h] (contains? #{'let 'let*} h))
+
+(defn loop-head?
+  "True for the loop-family heads (loop, loop*)."
+  [h] (contains? #{'loop 'loop*} h))
+
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
   [form]

@@ -31,6 +31,29 @@
 (defn- vt3 [f64 f32 i32] (cond-> {} f64 (assoc :f64 f64) f32 (assoc :f32 f32) i32 (assoc :i32 i32)))
 (defn- math1 [f64 f32 cfn] {:arity 1 :kind :fn :wasm (vt3 f64 f32 nil) :c {:fn cfn} :wgsl {:fn cfn}})
 
+;; ---------------------------------------------------------------------------
+;; CROSS-BACKEND SEMANTICS DECISION TABLE (A2)
+;; Where backends could diverge on the same op, the CHOICE is recorded here —
+;; an emitter deviating from this table is a bug, not a preference.
+;;
+;; :round  Java semantics — floor(x+0.5) — everywhere possible. wasm lowers as
+;;         the floor(x+0.5) polynomial (NOT f64.nearest: round-half-EVEN).
+;;         KNOWN DEVIATION: the C backends emit native round() =
+;;         round-half-AWAY-from-zero, which differs from Java at NEGATIVE .5
+;;         ties (C round(-2.5) = -3, Java = -2). Exact half-ties are
+;;         measure-zero on real data; accepted for GPU speed. Fixing = emit
+;;         floor(x+0.5) in C too.
+;; :mod    floored (Julia/Clojure mod). C/WGSL lower via the :floored-mod
+;;         strategy; wasm computes a-floor(a/b)*b; JVM uses clojure.core/mod.
+;; :rem    truncated (C %, JVM rem, wasm i32.rem_s) — all agree natively.
+;; :i64    wasm v1 treats long/int scalars as i32 (loads reject 'longs arrays);
+;;         JVM keeps true :long; C widens integer arith to long. A kernel whose
+;;         values exceed i32 range is NOT portable to wasm — the emitter's
+;;         reject-guards are the enforcement.
+;; :div    integer division truncates toward zero on all backends (C, JVM,
+;;         wasm i32.div_s agree).
+;; ---------------------------------------------------------------------------
+
 (def table
   {;; binary arithmetic
    :+ {:arity 2 :kind :infix :wasm (vt3 :f64.add :f32.add :i32.add) :c "+" :wgsl "+"}
@@ -81,6 +104,25 @@
    ;; the vector lowering is a fixed intrinsic SEQUENCE per ISA (AVX2
    ;; maddubs→madd→add, wasm i32x4.dot_i16x8_s, GPU dp4a) — see simd-widen below.
    :wi8-dot {:arity 2 :kind :widening-mac :wasm {:i32 :i32x4.dot-i16x8-s}}
+   ;; dp4a(a, b, acc) = acc + Σₖ aₖ·bₖ over the 4 SIGNED bytes packed
+   ;; little-endian in each i32 — the scalar int8-MAC primitive (semantic op
+   ;; raster.par/dp4a, JVM reference impl in raster.par). ONE canonical entry;
+   ;; every backend spelling lives HERE as data:
+   ;;   :c    — portable helper name; :c-helper-src is its OpenCL/C source
+   ;;           (as_char4 idiom, pattern-matched to hardware dp4a by IGC/NV/AMD)
+   ;;   :cuda/:hip (Phase B) — __dp4a / __builtin_amdgcn_sdot4 go HERE, not in
+   ;;           an emitter table
+   ;;   :wasm — :scalar-lanes (shift/mask lane extraction; emitter-local emit fn)
+   ;; The VECTOR schedules (AVX2 maddubs, wasm i32x4.dot) are :wi8-dot above.
+   :dp4a {:arity 3 :kind :dp4a
+          :c {:fn "rstr_dp4a"}
+          :c-helper-src (str "inline int rstr_dp4a(int a, int b, int acc) {\n"
+                             "    char4 va = as_char4(a);\n"
+                             "    char4 vb = as_char4(b);\n"
+                             "    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y\n"
+                             "               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;\n"
+                             "}\n")
+          :wasm :scalar-lanes}
    ;; broader elementary set — all wasm via composition/polynomial (see
    ;; backend.wasm.transcendental); GPU facet set only where it's a builtin (else
    ;; omitted → GPU keeps its generated-helper fallback, no regression).
@@ -129,7 +171,7 @@
    "cbrt" :cbrt "log2" :log2 "log10" :log10 "exp2" :exp2 "exp10" :exp10
    "expm1" :expm1 "log1p" :log1p "hypot" :hypot "deg2rad" :deg2rad "rad2deg" :rad2deg
    "clamp" :clamp "signum" :signum "copysign" :copysign "copySign" :copysign
-   "flipsign" :flipsign "wi8-dot" :wi8-dot})
+   "flipsign" :flipsign "wi8-dot" :wi8-dot "dp4a" :dp4a})
 
 ;; mangled devirtualized prefix → canonical key (e.g. _plus__m_double_double)
 (def ^:private mangled-prefix->key

@@ -10,7 +10,8 @@
   Usage:
     (opencl-pass form :device-id :ze:0)
     ;; Returns {:form new-form :stats {...} :kernels [...]}"
-  (:require [raster.compiler.ir.par :as par]
+  (:require [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.ir.par :as par]
             [raster.runtime.hardware :as hw]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
@@ -37,15 +38,9 @@
 }\n")
 
 (def ^:private rstr-dp4a-helper
-  "Portable int8 4-way dot-accumulate. `as_char4` reinterprets each int32's 4 bytes
-  (little-endian: .x = low byte) as signed int8 lanes; the OpenCL compiler (Intel IGC,
-  NVIDIA, AMD) pattern-matches this idiom to a hardware dp4a instruction."
-  "inline int rstr_dp4a(int a, int b, int acc) {
-    char4 va = as_char4(a);
-    char4 vb = as_char4(b);
-    return acc + (int)va.x*(int)vb.x + (int)va.y*(int)vb.y
-               + (int)va.z*(int)vb.z + (int)va.w*(int)vb.w;
-}\n")
+  "Portable int8 4-way dot-accumulate helper SOURCE — canonical home is the
+   intrinsics registry (:dp4a :c-helper-src); this def just reads it."
+  (:c-helper-src (intrinsics/descriptor 'dp4a)))
 
 (defn- body-uses-dp4a?
   "True if the kernel body calls the dp4a int8-dot primitive (any spelling)."
