@@ -1451,6 +1451,58 @@
                                         dbeta)))
 
 ;; ----------------------------------------------------------------
+;; RMS-norm backward: dx, dweight
+;;   y_i = x_i · inv · (g0 + w_i),  inv = 1/sqrt(mean_j(x_j²) + eps)
+;;   c   = Σ_i (g0+w_i)·x_i·dy_i   (per row)
+;;   dx_j = inv·(g0+w_j)·dy_j − (inv³/F)·x_j·c
+;;   dw_i = Σ_rows dy_i·x_i·inv   (independent of the gain offset g0)
+;; ----------------------------------------------------------------
+
+(deftm rms-norm-backward-dx (All [T] [dy :- (Array T) x :- (Array T) weight :- (Array T)
+                                      rows :- Long features :- Long
+                                      eps :- Double gain-offset :- Double] :- (Array T)
+                                (let [dx (alloc-like dy (* rows features))]
+                                  (dotimes [r rows]
+                                    (let [offset (* r (int features))
+                                          ms (loop [i 0 s 0.0]
+                                               (if (< i features)
+                                                 (let [v (aget x (+ offset i))]
+                                                   (recur (inc i) (+ s (* v v))))
+                                                 (/ s features)))
+                                          inv (/ 1.0 (n/sqrt (+ ms eps)))
+                                          c (loop [i 0 s 0.0]
+                                              (if (< i features)
+                                                (let [gi (+ gain-offset (aget weight i))]
+                                                  (recur (inc i)
+                                                         (+ s (* gi (* (aget x (+ offset i))
+                                                                       (aget dy (+ offset i)))))))
+                                                s))
+                                          inv3f (/ (* inv (* inv inv)) features)]
+                                      (dotimes [i features]
+                                        (let [gi (+ gain-offset (aget weight i))]
+                                          (aset dx (+ offset i)
+                                                (- (* inv (* gi (aget dy (+ offset i))))
+                                                   (* inv3f (* (aget x (+ offset i)) c))))))))
+                                  dx)))
+
+(deftm rms-norm-backward-dweight (All [T] [dy :- (Array T) x :- (Array T)
+                                           rows :- Long features :- Long eps :- Double] :- (Array T)
+                                     (let [dw (alloc-like dy features)]
+                                       (dotimes [r rows]
+                                         (let [offset (* r (int features))
+                                               ms (loop [i 0 s 0.0]
+                                                    (if (< i features)
+                                                      (let [v (aget x (+ offset i))]
+                                                        (recur (inc i) (+ s (* v v))))
+                                                      (/ s features)))
+                                               inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                                           (dotimes [i features]
+                                             (aset dw i (+ (aget dw i)
+                                                           (* (aget dy (+ offset i))
+                                                              (* (aget x (+ offset i)) inv)))))))
+                                       dw)))
+
+;; ----------------------------------------------------------------
 ;; Group-norm backward: dx, dgamma, dbeta
 ;; ----------------------------------------------------------------
 
@@ -1718,6 +1770,42 @@
                                                    (layer-norm-backward-dgamma dy x batch features eps)
                                                    (layer-norm-backward-dbeta dy batch features)
                                                    nil nil nil]))})
+
+;; rms-norm rrule — runtime pullback + compiled grads-fn (dx, dweight; frozen
+;; gain-offset/dims -> nil). The QK-norm and the 6 sandwich norms per Gemma layer
+;; all differentiate through this. (rms-norm x weight rows features eps gain-offset)
+(tmpl/merge-into-template! 'raster.dl.nn/rms-norm
+                           {:pullback-factory (fn [_result x weight rows features eps gain-offset]
+                                                (fn [dy]
+                                                  [(rms-norm-backward-dx dy x weight rows features eps gain-offset)
+                                                   (rms-norm-backward-dweight dy x rows features eps)
+                                                   nil nil nil nil]))
+                            :params '[x weight rows features eps gain-offset] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [x weight rows features eps gain-offset]
+                                           _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx") dw (gensym-fn "dw")]
+                                          [(update ctx :bindings into
+                                                   [dx (list 'raster.dl.nn/rms-norm-backward-dx
+                                                             adjoint-sym x weight rows features eps gain-offset)
+                                                    dw (list 'raster.dl.nn/rms-norm-backward-dweight
+                                                             adjoint-sym x rows features eps)])
+                                           [dx dw nil nil nil nil]]))})
+
+;; linear-nb rrule — bias-free linear (Gemma/Qwen projections). Same as linear
+;; minus the db term; reuses linear-dx / linear-dW. (linear-nb x W batch in-f out-f)
+(tmpl/merge-into-template! 'raster.dl.nn/linear-nb
+                           {:pullback-factory (fn [_result x W batch in-f out-f]
+                                                (fn [dy]
+                                                  [(linear-dx dy W batch in-f out-f)
+                                                   (linear-dW dy x batch in-f out-f)
+                                                   nil nil nil]))
+                            :params '[x W batch in-f out-f] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [x W batch in-f out-f] _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx") dW (gensym-fn "dW")]
+                                          [(update ctx :bindings into
+                                                   [dx (list 'raster.dl.nn/linear-dx adjoint-sym W batch in-f out-f)
+                                                    dW (list 'raster.dl.nn/linear-dW adjoint-sym x batch in-f out-f)])
+                                           [dx dW nil nil nil]]))})
 
 ;; group-norm rrule — per-gradient deftms (parametric)
 (tmpl/merge-into-template! 'raster.dl.nn/group-norm
