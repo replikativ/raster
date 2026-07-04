@@ -202,6 +202,8 @@
         (.equals c Void/TYPE) :void
         :else :ref))
 
+(declare infer-arg-stack-type-structural)
+
 (defn- infer-arg-stack-type
   "Infer the stack type of a form WITHOUT emitting bytecode.
   Used to select the correct overloaded method (e.g. Math.abs(int) vs Math.abs(double))."
@@ -223,18 +225,41 @@
     (let [h (first form)]
       (cond
         (not (symbol? h)) nil
+        :else
+        (or
+         ;; Tags first (A1): the walker stamps composed forms (.invk ret-tags,
+         ;; casts, control-form results) — read the stamp before any structural
+         ;; guessing. Kills the conservative :double guess on opaque-but-tagged
+         ;; calls (e.g. int8->long chains in integer reductions).
+         (when-let [tag (:raster.type/tag (meta form))]
+           (get {'double :double 'long :long 'int :int 'float :float
+                 'boolean :bool 'byte :int 'short :int} tag))
+         (infer-arg-stack-type-structural form h locals))))
+    :else nil))
+
+(defn- infer-arg-stack-type-structural
+  "Structural fallback of infer-arg-stack-type for UNTAGGED seq forms."
+  [form h locals]
+  (cond
         ;; Cast expressions
         (= (name h) "double") :double
         (= (name h) "long")   :long
         (= (name h) "int")    :int
         (= (name h) "float")  :float
-        ;; Arithmetic: float×float→float, otherwise→double
-        ;; (matches emit-arithmetic behavior)
+        ;; Arithmetic: JVM numeric promotion — all-float → float, all-integer
+        ;; → int/long (any long ⇒ long), anything unknown/mixed-float → double.
+        ;; The old rule hard-defaulted every non-float case to :double, typing
+        ;; genuinely integer loops (e.g. fft's (recur (* size 2)) with
+        ;; bit-shift-right in the body) into double slots — the false-positive
+        ;; class of the A2 stamp-vs-LUB census, where the STAMP (long) was
+        ;; right and this guess was wrong.
         (contains? #{"+" "-" "*" "/"} (name h))
-        (let [args (rest form)]
-          (if (every? #(= :float (infer-arg-stack-type % locals)) args)
-            :float
-            :double))
+        (let [ts (mapv #(infer-arg-stack-type % locals) (rest form))]
+          (cond
+            (and (seq ts) (every? #(= :float %) ts)) :float
+            (and (seq ts) (every? #(contains? #{:int :long} %) ts))
+            (if (some #(= :long %) ts) :long :int)
+            :else :double))
         ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
         (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
@@ -295,7 +320,6 @@
              (catch Exception _ nil))
         ;; Default: unknown
         :else nil))
-    :else nil))
 
 (defn- resolve-static-call
   "Given a deftm walked body that is a single static method call,
@@ -3751,7 +3775,8 @@
                                                " stamped " stag " but derived "
                                                slot-t " (LUB of init+recur) — "
                                                "front-half stamp diverges from "
-                                               "backend derivation."))))))
+                                               "backend derivation. init=" (pr-str init)
+                                               " recur-types=" (pr-str rt)))))))
                          (when (not= t slot-t) (emit-coerce code t slot-t))
                          (let [slot (alloc-slot! ctx slot-t)]
                            (case slot-t
