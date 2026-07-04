@@ -497,6 +497,87 @@
 ;; Branch: let/let*/loop
 ;; ================================================================
 
+(def ^:private numeric-tag-rank
+  "Widening order for the recur-LUB: a loop var must hold every iteration's
+   value, so its type is LUB(init, recur args) — not the init's class alone.
+   A wrong (narrower) stamp is not just a slot-type issue: the walker CASTS
+   variables to their stamped type, and (long acc) on a double-carrying
+   accumulator TRUNCATES the value every iteration — silent numerical
+   corruption (found live: (loop [acc 0] (+ acc <double>)) summed 3.5 not 4.5)."
+  {'int 1 'long 2 'float 3 'double 4})
+
+(defn- walked-value-tag
+  "Numeric tag of a walked form, promotion-aware: stamped meta first, then
+   casts, clojure.core arithmetic (LUB of args — mirrors JVM promotion),
+   aget element types, symbols via type-env, literal classes. nil = unknown
+   (never widen on a guess)."
+  [x type-env]
+  (cond
+    (and (instance? clojure.lang.IObj x) (:raster.type/tag (meta x)))
+    (:raster.type/tag (meta x))
+    (symbol? x) (inf/type-env-tag type-env x)
+    (instance? Double x) 'double
+    (instance? Long x) 'long
+    (seq? x)
+    (let [h (first x)]
+      (cond
+        (contains? '#{long int double float} h) h
+        (contains? '#{clojure.core/long clojure.core/int
+                      clojure.core/double clojure.core/float} h)
+        (symbol (name h))
+        ;; arithmetic: numeric promotion = rank-LUB of the args
+        (contains? '#{+ - * / clojure.core/+ clojure.core/- clojure.core/*
+                      clojure.core// raster.numeric/+ raster.numeric/-
+                      raster.numeric/* raster.numeric//} h)
+        (let [ranks (map #(get numeric-tag-rank (walked-value-tag % type-env))
+                         (rest x))]
+          (when (every? some? ranks)
+            (some (fn [[t r]] (when (= r (apply max ranks)) t)) numeric-tag-rank)))
+        ;; array read: element type off the array's type-env entry
+        (contains? '#{clojure.core/aget raster.arrays/aget} h)
+        (get-in type-env [(second x) :element])
+        :else nil))
+    :else nil))
+
+(defn- collect-recur-args
+  "Arg vectors of every `recur` belonging to THIS loop in walked body forms —
+   does not descend into nested recur targets (loop/loop*/fn*/ftm/reify*)."
+  [forms]
+  (let [out (volatile! [])]
+    (letfn [(scan [f]
+              (when (seq? f)
+                (let [h (first f)]
+                  (cond
+                    (= h 'recur) (vswap! out conj (vec (rest f)))
+                    (contains? '#{loop loop* fn* ftm reify*} h) nil
+                    :else (run! scan f)))))]
+      (run! scan forms)
+      @out)))
+
+(defn- recur-widened-types
+  "Map of binding-sym → widened tag for loop vars whose recur args carry a
+   WIDER numeric type than the stamped tag. Empty when nothing widens."
+  [new-bindings walked-body type-env]
+  (let [recurs (collect-recur-args walked-body)
+        pairs  (vec (partition 2 new-bindings))]
+    (if (or (empty? recurs) (some #(not= (count %) (count pairs)) recurs))
+      {}
+      (into {}
+            (keep-indexed
+             (fn [i [sym _]]
+               (let [stag (:raster.type/tag (meta sym))
+                     srank (get numeric-tag-rank stag)]
+                 (when srank
+                   (let [lub (reduce (fn [r args]
+                                       (let [t (walked-value-tag (nth args i) type-env)
+                                             tr (get numeric-tag-rank t)]
+                                         (if (and tr (> tr r)) tr r)))
+                                     srank recurs)]
+                     (when (> lub srank)
+                       [sym (some (fn [[t r]] (when (= r lub) t))
+                                  numeric-tag-rank)]))))))
+            pairs))))
+
 (defmethod walk-form :let [form ctx]
   (let [[let-sym bindings & body] form
         [new-bindings new-ctx]
@@ -549,7 +630,28 @@
                 elem-tag (update-in [:type-env sym] assoc :element elem-tag))]))
          [[] ctx]
          (partition 2 bindings))]
-    (list* let-sym (vec new-bindings) (walk-forms body new-ctx))))
+    (let [walked-body (walk-forms body new-ctx)]
+      (if-not (contains? '#{loop loop*} let-sym)
+        (list* let-sym (vec new-bindings) walked-body)
+        ;; recur-LUB fixpoint: if a recur passes a wider numeric type than a
+        ;; binding's stamp, REWALK the body with the widened types — the walk
+        ;; inserts casts from the stamps, so a narrow stamp doesn't just
+        ;; mistype the slot, it TRUNCATES the value ((long acc) per iteration).
+        ;; Numeric ranks are a 4-level lattice → terminates in ≤3 rewalks.
+        (loop [bindings new-bindings ctx' new-ctx wb walked-body guard 0]
+          (let [widened (recur-widened-types bindings wb (:type-env ctx'))]
+            (if (or (empty? widened) (>= guard 3))
+              (list* let-sym (vec bindings) wb)
+              (let [bindings' (vec (mapcat
+                                    (fn [[sym init]]
+                                      [(if-let [t (get widened sym)]
+                                         (stamp-type-meta sym t nil)
+                                         sym)
+                                       init])
+                                    (partition 2 bindings)))
+                    ctx'' (reduce (fn [c [sym t]] (ctx-assoc-type c sym t))
+                                  ctx' widened)]
+                (recur bindings' ctx'' (walk-forms body ctx'') (inc guard))))))))))
 
 ;; ================================================================
 ;; Branch: fn/fn*
