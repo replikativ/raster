@@ -260,6 +260,13 @@
             (and (seq ts) (every? #(contains? #{:int :long} %) ts))
             (if (some #(= :long %) ts) :long :int)
             :else :double))
+        ;; Bitwise / shifts: integer-typed (any long operand ⇒ long). Without
+        ;; this rule they inferred nil and poisoned enclosing arithmetic to the
+        ;; :double guess (the quant int8 dot's (* (long ..) (bit-and ..))).
+        (contains? #{"bit-and" "bit-or" "bit-xor" "bit-not"
+                     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"}
+                   (name h))
+        (if (some #(= :long (infer-arg-stack-type % locals)) (rest form)) :long :int)
         ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
         (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
@@ -279,6 +286,27 @@
         (contains? #{"let" "let*"} (name h))
         (when-let [last-form (last (nnext form))]
           (infer-arg-stack-type last-form locals))
+        ;; loop/loop* → type of the non-recur branch (a nested reduction used
+        ;; as a recur arg is common — without this rule it fell to nil and the
+        ;; caller guessed :double, mistyping all-integer tile kernels)
+        (contains? #{"loop" "loop*"} (name h))
+        (let [locals' (reduce (fn [ls [sym init]]
+                                (if-let [t (infer-arg-stack-type init ls)]
+                                  (assoc ls sym {:type t})
+                                  ls))
+                              locals (partition 2 (second form)))
+              tail (last (nnext form))]
+          (when (and (seq? tail) (= 4 (count tail))
+                     (= "if" (name (first tail))))
+            (let [[_ _ then els] tail
+                  recur? (fn r? [f] (and (seq? f)
+                                         (or (= 'recur (first f))
+                                             (and (contains? '#{do let let*} (first f))
+                                                  (r? (last f))))))]
+              (cond
+                (recur? then) (infer-arg-stack-type els locals')
+                (recur? els)  (infer-arg-stack-type then locals')
+                :else nil))))
         ;; inc/dec → preserves input type
         (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} (name h))
         (or (infer-arg-stack-type (second form) locals) :long)
@@ -3727,18 +3755,33 @@
         rank {:int 0 :long 1 :float 2 :double 3}
         widest (fn [a b] (cond (nil? a) b (nil? b) a
                                (>= (get rank a -1) (get rank b -1)) a :else b))]
-    (letfn [(scan [form]
+    (letfn [(scan [form ls]
               (cond
                 (and (seq? form) (= 'recur (first form)))
                 (doseq [[i a] (map-indexed vector (rest form))]
                   (when (< i n)
-                    (swap! acc update i widest (infer-arg-stack-type a locals))))
+                    (swap! acc update i widest (infer-arg-stack-type a ls))))
                 (and (seq? form) (symbol? (first form))
                      (contains? #{"loop*" "fn*"} (name (first form)))) nil
-                (seq? form) (run! scan (rest form))
-                (vector? form) (run! scan form)
+                ;; let/let*: extend the env with binding types (stamp first,
+                ;; else inferred init) so recur args referencing let-bound
+                ;; locals (e.g. (+ a (* act nib))) type instead of guessing
+                (and (seq? form) (symbol? (first form))
+                     (contains? #{"let" "let*"} (name (first form))))
+                (let [[_ bindings & bbody] form
+                      ls' (reduce (fn [m [sym init]]
+                                    (if-let [t (or (some->> (:raster.type/tag (meta sym))
+                                                            (get {'double :double 'long :long
+                                                                  'int :int 'float :float}))
+                                                   (infer-arg-stack-type init m))]
+                                      (assoc m sym {:type t})
+                                      m))
+                                  ls (partition 2 bindings))]
+                  (run! #(scan % ls') bbody))
+                (seq? form) (run! #(scan % ls) (rest form))
+                (vector? form) (run! #(scan % ls) form)
                 :else nil))]
-      (run! scan body))
+      (run! #(scan % locals) body))
     @acc))
 
 (defn- emit-loop*
@@ -3753,6 +3796,19 @@
         loop-locals (reduce
                      (fn [locs [[sym init] rt]]
                        (let [t (emit-form code init locs (dissoc ctx :void-context))
+                             ;; Trust the stamp over a boxed init: when the
+                             ;; walker stamped this var primitive but the init
+                             ;; emitted :ref (e.g. an if-branch merge boxed it),
+                             ;; unbox at loop entry so the LOOP runs primitively
+                             ;; — recur values are typed and coerce to the slot.
+                             stamp-t (some->> (:raster.type/tag (meta sym))
+                                              (get {'double :double 'float :float
+                                                    'long :long 'int :int}))
+                             t (if (and (= t :ref) stamp-t
+                                        (or (nil? rt) (= rt stamp-t)
+                                            (contains? #{:int :long :float :double} rt)))
+                                 (do (emit-unbox-to-prim code stamp-t) stamp-t)
+                                 t)
                              slot-t (widen-loop-type t rt)]
                          ;; A2 differential: the walker stamps loop-var types
                          ;; (TC-fed); this backend still derives its own via
