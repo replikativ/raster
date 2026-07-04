@@ -162,7 +162,7 @@
        (symbol? (second init))
        (not (contains? bound-syms (second init)))
        (or (.startsWith (name (first init)) ".")                  ; .field / .-field / (. obj field) — value-class field access (any interop form)
-           (contains? '#{aget clojure.core/aget raster.arrays/aget} (first init)))))
+           (descriptor/aget-op? (first init)))))
 
 (defn eliminate-dead-bindings
   "Remove dead bindings from a flat let* form.

@@ -12,7 +12,8 @@
   - Readable: each form handler is a separate, named function
   - Testable: handlers can be unit-tested with synthetic contexts
   - Extensible: new form types can be added via defmethod"
-  (:require [clojure.string :as str]
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.core.macroexpand :as mex]))
@@ -553,7 +554,7 @@
           (when (every? some? ranks)
             (some (fn [[t r]] (when (= r (apply max ranks)) t)) numeric-tag-rank)))
         ;; array read: element type off the array's type-env entry
-        (contains? '#{clojure.core/aget raster.arrays/aget} h)
+        (descriptor/aget-op? h)
         (get-in type-env [(second x) :element])
         :else nil))
     :else nil))
