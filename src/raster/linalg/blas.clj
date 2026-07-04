@@ -652,6 +652,27 @@
                                          (clojure.core/aget b i)))))
   out)
 
+;; Float overloads — the MSE-loss backward runs over whatever dtype the loss
+;; was computed in, so float training (e.g. LoRA over an f32/quantized base)
+;; needs these or reverse-AD's gradient step has no matching method.
+(deftm ^:no-inline daxpy-diff!
+  [a :- (Array float) b :- (Array float) scale :- Double n :- Long]
+  :- (Array float)
+  (let [out (float-array n)]
+    (dotimes [i n]
+      (clojure.core/aset out i (float (* scale (- (clojure.core/aget a i)
+                                                  (clojure.core/aget b i))))))
+    out))
+
+(deftm ^:no-inline daxpy-diff-into!
+  [a :- (Array float) b :- (Array float) scale :- Double n :- Long
+   out :- (Array float)]
+  :- (Array float)
+  (dotimes [i n]
+    (clojure.core/aset out i (float (* scale (- (clojure.core/aget a i)
+                                                (clojure.core/aget b i))))))
+  out)
+
 ;; ================================================================
 ;; Availability check
 ;; ================================================================

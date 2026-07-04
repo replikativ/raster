@@ -553,6 +553,14 @@
 (deftm residual-add (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
                          (broadcast [a b] (+ a b))))
 
+;; residual-add backward: d_a = d_b = dy (both copies — additive fan-out). A raw
+;; (broadcast [a b] (+ a b)) has no AD template for two active inputs, so the
+;; ubiquitous transformer residual (x + attn/mlp out) needs this explicit rule.
+(deftm residual-add-backward (All [T] [dy :- (Array T) n :- Long] :- (Array T)
+                                 (let [out (alloc-like dy n)]
+                                   (acopy! dy 0 out 0 n)
+                                   out)))
+
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
 (deftm group-norm (All [T] [x :- (Array T) gamma :- (Array T)
@@ -1800,6 +1808,21 @@
                                                     dw (list 'raster.dl.nn/rms-norm-backward-dweight
                                                              adjoint-sym x rows features eps)])
                                            [dx dw nil nil nil nil]]))})
+
+;; residual-add rrule — elementwise sum (transformer residuals, LoRA base+delta).
+(tmpl/merge-into-template! 'raster.dl.nn/residual-add
+                           {:pullback-factory (fn [_result _a _b n]
+                                                (fn [dy]
+                                                  [(residual-add-backward dy n)
+                                                   (residual-add-backward dy n)
+                                                   nil]))
+                            :params '[a b n] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [_a _b n] _result-sym adjoint-sym gensym-fn]
+                                        (let [da (gensym-fn "da") db (gensym-fn "db")]
+                                          [(update ctx :bindings into
+                                                   [da (list 'raster.dl.nn/residual-add-backward adjoint-sym n)
+                                                    db (list 'raster.dl.nn/residual-add-backward adjoint-sym n)])
+                                           [da db nil]]))})
 
 ;; hadamard rrule — elementwise product (gated MLPs). d_a = dy⊙b, d_b = dy⊙a.
 (tmpl/merge-into-template! 'raster.dl.nn/hadamard
