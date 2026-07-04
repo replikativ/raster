@@ -119,6 +119,12 @@
   (let [idx (seg-idx segred)
         bound (seg-bound segred)
         {:keys [acc init lambda]} (:reduce-op segred)
+        ;; #55 fix: normalize devirtualized array prims ((.invk aget-impl arr i)
+        ;; → canonical aget head) BEFORE any rewrapping, exactly as SegMap does.
+        ;; Without it, a parametric-array kernel (qlinear-k) emitted broken
+        ;; gpufn_aget helper calls while a typed-array kernel (decoder-gpu)
+        ;; emitted x[i] — same op, ns-sensitive lowering.
+        lambda (ce/normalize-array-prims lambda)
         dtype (or (:dtype segred) dtype)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
@@ -166,8 +172,11 @@
               (acc-at? a1) [:right a0]
               :else [nil nil])))
         ;; Re-wrap in let if there were bindings (preserves local variable scope)
+        ;; preserve the raw expr's metadata across the rewrap — dropping it
+        ;; severed :raster.op/original on .invk forms (part of #55)
         elem-expr (if (and elem-expr-raw (seq let-bindings))
-                    (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
+                    (with-meta (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
+                               (meta elem-expr-raw))
                     elem-expr-raw)
         adapted-elem (when elem-expr (ce/adapt-casts-for-dtype elem-expr dtype))
         idx-c-name (ce/c-symbol idx)
