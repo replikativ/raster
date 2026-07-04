@@ -51,15 +51,6 @@
     (acopy! dy 0 out 0 n)
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/array-add
-                           {:pullback-factory (fn [_result a b n]
-                                                (fn [dy]
-                                                  (let [n (long n)
-                                                        d-a (double-array n)
-                                                        d-b (double-array n)]
-                                                    (acopy! dy 0 d-a 0 n)
-                                                    (acopy! dy 0 d-b 0 n)
-                                                    [d-a d-b nil])))})
 
 ;; ================================================================
 ;; array-copy: utility for gradient copying
@@ -111,21 +102,6 @@
                    (aget dy idx))))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/broadcast-add
-                           {:pullback-factory (fn [_result h t batch dim]
-                                                (fn [dy]
-                                                  (let [batch (long batch) dim (long dim)
-                                                        n (* batch dim)
-                                                        d-h (double-array n)
-                                                        d-t (double-array dim)]
-                                                    (acopy! dy 0 d-h 0 n)
-                                                    (dotimes [b batch]
-                                                      (dotimes [d dim]
-                                                        (let [idx (+ (* b (int dim)) d)]
-                                                          (aset d-t d
-                                                                (+ (aget d-t d)
-                                                                   (aget dy idx))))))
-                                                    [d-h d-t nil nil])))})
 
 ;; ================================================================
 ;; GENERIC PRIMITIVES
@@ -215,9 +191,9 @@
               (aset out (+ dst d) (aget x (+ src d)))))))
       out)))
 
-;; pack ↔ unpack are duals (runtime-AD pullbacks; both are non-diff on the Long
-;; shape params). grads-fn (compile-aot training AD) can be added when needed —
-;; the fastembed inference path uses forward only.
+;; pack ↔ unpack are duals (both are non-diff on the Long shape params). No
+;; grads-fn exists for them, so the runtime pullback (each is the other's
+;; dual) is their sole gradient representation.
 (tmpl/merge-into-template! 'raster.dl.array-ops/pack-heads
                            {:pullback-factory
                             (fn [_result _x seq-len n-heads head-dim]
@@ -230,16 +206,8 @@
                                 [(pack-heads d-out seq-len n-heads head-dim) nil nil nil]))})
 
 ;; slice ↔ scatter are duals: gradient of slice goes through scatter, and
-;; vice versa. Both pullback-factory (runtime/lazy AD) and grads-fn
-;; (compile-aot flat codegen) are registered. Indices passed back as nil
-;; since they're non-differentiable Long params.
-(tmpl/merge-into-template! 'raster.dl.array-ops/slice-strided-2d
-                           {:pullback-factory
-                            (fn [_result _src rows row-stride col-offset n-cols]
-                              (fn [d-out]
-                                (let [d-src (scatter-strided-2d
-                                             d-out rows row-stride col-offset n-cols)]
-                                  [d-src nil nil nil nil])))})
+;; vice versa. A grads-fn (compile-aot flat codegen) is registered. Indices
+;; passed back as nil since they're non-differentiable Long params.
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/slice-strided-2d
                            {:params '[src rows row-stride col-offset n-cols]
@@ -253,13 +221,6 @@
                                                       adjoint-sym rows row-stride col-offset n-cols)])
                                  [d-src nil nil nil nil]]))})
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
-                           {:pullback-factory
-                            (fn [_result _packed rows row-stride col-offset n-cols]
-                              (fn [d-out]
-                                (let [d-packed (slice-strided-2d
-                                                d-out rows row-stride col-offset n-cols)]
-                                  [d-packed nil nil nil nil])))})
 
 (tmpl/merge-into-template! 'raster.dl.array-ops/scatter-strided-2d
                            {:params '[packed rows row-stride col-offset n-cols]
@@ -317,17 +278,7 @@
     out))
 
 ;; scatter-add backward = gather, gather backward = scatter-add
-(tmpl/merge-into-template! 'raster.dl.array-ops/scatter-add
-                           {:pullback-factory (fn [_result vals indices n-dst n-pairs stride]
-                                                (fn [dy]
-                                                  (let [d-vals (gather dy indices n-dst n-pairs stride)]
-                                                    [d-vals nil nil nil nil])))})
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/gather
-                           {:pullback-factory (fn [_result src indices n-src n-pairs stride]
-                                                (fn [dy]
-                                                  (let [d-src (scatter-add dy indices n-src n-pairs stride)]
-                                                    [d-src nil nil nil nil])))})
 
 ;; ================================================================
 ;; indexed-dot: batched indexed dot product (multi-head aware)
@@ -408,12 +359,6 @@
                          (* coeff (aget A a-idx))))))))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/indexed-dot
-                           {:pullback-factory (fn [_result A B idx-a idx-b n-a n-b n-pairs slice-dim total-dim n-slices]
-                                                (fn [dy]
-                                                  (let [dA (indexed-dot-dA dy B idx-a idx-b n-a n-pairs slice-dim total-dim n-slices)
-                                                        dB (indexed-dot-dB dy A idx-a idx-b n-b n-pairs slice-dim total-dim n-slices)]
-                                                    [dA dB nil nil nil nil nil nil nil nil])))})
 
 ;; ================================================================
 ;; scatter-mul-add: weighted scatter (multi-head aware)
@@ -493,15 +438,6 @@
                          (* w (aget dy dst-idx))))))))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/scatter-mul-add
-                           {:pullback-factory (fn [_result coeffs src dst-indices src-indices n-dst n-src n-pairs
-                                                   slice-dim total-dim n-slices]
-                                                (fn [dy]
-                                                  (let [d-coeffs (scatter-mul-add-d-coeffs dy src dst-indices src-indices
-                                                                                           n-pairs slice-dim total-dim n-slices)
-                                                        d-src (scatter-mul-add-d-src dy coeffs dst-indices src-indices
-                                                                                     n-src n-pairs slice-dim total-dim n-slices)]
-                                                    [d-coeffs d-src nil nil nil nil nil nil nil nil])))})
 
 ;; ================================================================
 ;; scale-clamp-exp: out[i] = exp(clamp(x[i]*scale, -bound, bound))
@@ -533,11 +469,6 @@
                  (* scale clamp-mask)))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/scale-clamp-exp
-                           {:pullback-factory (fn [result x scale clamp-bound n]
-                                                (fn [dy]
-                                                  (let [dx (scale-clamp-exp-backward dy x result scale clamp-bound n)]
-                                                    [dx nil nil nil])))})
 
 ;; ================================================================
 ;; reduce-axis: out[d] = Σ_b src[b*n-cols+d]
@@ -570,11 +501,6 @@
               (aget dy d))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/reduce-axis
-                           {:pullback-factory (fn [_result src n-rows n-cols]
-                                                (fn [dy]
-                                                  (let [d-src (reduce-axis-backward dy n-rows n-cols)]
-                                                    [d-src nil nil])))})
 
 ;; ================================================================
 ;; segment-div: out[n*d+h_off+j] = wV[n*d+h_off+j] / (Z[n*nh+h] + eps)
@@ -639,12 +565,6 @@
               (aset dZ z-idx (- (/ acc z2))))))))
     dZ))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/segment-div
-                           {:pullback-factory (fn [_result wV Z n-nodes emb-dim n-heads eps]
-                                                (fn [dy]
-                                                  (let [dwV (segment-div-dwV dy Z n-nodes emb-dim n-heads eps)
-                                                        dZ (segment-div-dZ dy wV Z n-nodes emb-dim n-heads eps)]
-                                                    [dwV dZ nil nil nil nil])))})
 
 ;; ================================================================
 ;; flat-embed-op: out[v*d+j] = values[v]*We[j] + be[j]
@@ -747,20 +667,6 @@
                      (aget dy (+ (* v (int emb-dim)) d))))))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/flat-embed-op
-                           {:pullback-factory
-                            (fn [_result values space-emb spaces state-emb states pos-emb
-                                 We be n-vars emb-dim n-spaces n-states]
-                              (fn [dy]
-                                (let [n-vars (long n-vars) emb-dim (long emb-dim)
-                                      n-spaces (long n-spaces) n-states (long n-states)
-                                      d-values (flat-embed-d-values dy We n-vars emb-dim)
-                                      d-space-emb (flat-embed-d-space-emb dy spaces n-vars emb-dim n-spaces)
-                                      d-state-emb (flat-embed-d-state-emb dy states n-vars emb-dim n-states)
-                                      d-We (flat-embed-dWe dy values n-vars emb-dim)
-                                      d-be (flat-embed-dbe dy n-vars emb-dim)]
-                                  ;; [values space-emb spaces state-emb states pos-emb We be n-vars emb-dim n-spaces n-states]
-                                  [d-values d-space-emb nil d-state-emb nil nil d-We d-be nil nil nil nil])))})
 
 ;; ================================================================
 ;; dot-rows: out[v] = h[v,:] · W + bias[0]
@@ -820,14 +726,6 @@
         (aset out 0 acc)))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/dot-rows
-                           {:pullback-factory (fn [_result h W bias n-rows dim]
-                                                (fn [dy]
-                                                  (let [n-rows (long n-rows) dim (long dim)
-                                                        d-h (dot-rows-dh dy W n-rows dim)
-                                                        d-W (dot-rows-dW dy h n-rows dim)
-                                                        d-bias (dot-rows-dbias dy n-rows)]
-                                                    [d-h d-W d-bias nil nil])))})
 
 ;; ================================================================
 ;; masked-mse-loss: loss = mean((pred[i]-target[i])² for i where states[i]!=1)
@@ -870,11 +768,6 @@
                               (aget target i))))))))
     out))
 
-(tmpl/merge-into-template! 'raster.dl.array-ops/masked-mse-loss
-                           {:pullback-factory (fn [_result pred target states n]
-                                                (fn [dy]
-                                                  (let [d-pred (masked-mse-loss-backward (double dy) pred target states n)]
-                                                    [d-pred nil nil nil])))})
 
 ;; ================================================================
 ;; Flat AD templates

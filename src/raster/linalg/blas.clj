@@ -709,24 +709,7 @@
     (object-array [dA dB])))
 
 ;; ================================================================
-;; Rrule for dgemm! — C = alpha * A @ B + beta * C
-;; ================================================================
-
-(tmpl/merge-into-template! 'raster.linalg.blas/dgemm!
-                           {:pullback-factory (fn [_result A B C m k n alpha beta]
-                                                (fn [dC]
-                                                  (let [m (long m) k (long k) n (long n)
-                                                        alpha (double alpha)
-                               ;; dA = alpha * dC @ B^T -> [m, k]
-                                                        dA (double-array (* m k))
-                                                        _ (dgemm-nt! dC B dA m n k alpha 0.0)
-                               ;; dB = alpha * A^T @ dC -> [k, n]
-                                                        dB (double-array (* k n))
-                                                        _ (dgemm-tn! A dC dB k m n alpha 0.0)]
-                                                    [dA dB nil nil nil nil nil nil])))})
-
-;; ================================================================
-;; Template registration for dgemm!
+;; Template registration for dgemm! — C = alpha * A @ B + beta * C
 ;; ================================================================
 
 (tmpl/merge-into-template! 'raster.linalg.blas/dgemm!

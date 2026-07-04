@@ -78,7 +78,7 @@
   (testing "forward noise gradient"
     (let [x0 (double-array [1.0 2.0 3.0])
           noise (double-array [0.1 0.2 0.3])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.diffusion/forward-noise)
+          rrfn (tmpl/template-pullback 'raster.dl.diffusion/forward-noise)
           xt (diff/forward-noise x0 noise 0.5 3)
           pb (rrfn xt x0 noise 0.5 3)
           dy (double-array [1 1 1])

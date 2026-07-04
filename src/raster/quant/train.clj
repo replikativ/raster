@@ -123,8 +123,16 @@
 ;; AD registration: only x gets a gradient; the quantized weight is frozen.
 ;; ---------------------------------------------------------------------------
 
+;; qlinear-q8 is a ^:no-inline opaque op (like nn/linear over BLAS dgemm): its
+;; body is never differentiated. The backward is the hand-written qlinear-q8-dx
+;; GEMM, emitted as a flat let-binding via :grads-fn — the same single
+;; representation every other op uses, so it fuses and lowers like a template op.
+;; Only x gets a gradient; the quantized weight is frozen (nil for the rest).
 (tmpl/merge-into-template! 'raster.quant.train/qlinear-q8
-  {:pullback-factory (fn [_y _x codes scales m in out]
-                        (fn [dy]
-                          [(qlinear-q8-dx dy codes scales m in out)
-                           nil nil nil nil nil]))})
+  {:params '[x codes scales m in out] :result nil :adjoint 'dy
+   :grads-fn (fn [ctx [_x codes scales m in out] _result-sym adjoint-sym gensym-fn]
+               (let [dx (gensym-fn "dx")]
+                 [(update ctx :bindings into
+                          [dx (list 'raster.quant.train/qlinear-q8-dx
+                                    adjoint-sym codes scales m in out)])
+                  [dx nil nil nil nil nil]]))})

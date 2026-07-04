@@ -6,9 +6,12 @@
   to splice gradient code directly into the backward pass as flat let*
   bindings, making all allocations visible to buffer fusion.
 
-  Templates coexist with runtime pullback factories (raster.ad.pullbacks).
-  The AD transform uses templates for code emission; runtime value+grad
-  uses pullback factories.
+  Templates are the single gradient representation: :grads (auto-compiled to
+  :grads-fn) or :grads-fn directly. Both the compiler AD transform and runtime
+  value+grad emit backward code from the same :grads-fn. Ops without a template
+  are differentiated by inlining their body; the only per-op runtime pullback
+  path (get-pullback-factory / closure fallback) is a generic net for
+  un-templated opaque calls and holds no registrations by default.
 
   Template structure:
     {:params  [x y]        ;; formal parameter symbols
@@ -308,6 +311,32 @@
   (when-let [canonical (normalize-op op)]
     (when-let [t (get-template canonical)]
       [t canonical])))
+
+(defn template-pullback
+  "Return a runtime pullback for an op from its single available gradient
+  representation. When the op has a :grads-fn, derive the pullback by
+  instantiating the SAME backward code the compiler emits and eval'ing it as a
+  closure (so interpreted AD and gradient tests exercise the one source of truth,
+  not a separately-maintained duplicate). When the op has only a hand-written
+  :pullback-factory (opaque/implicit ops with no static grads-fn — einsum,
+  rearrange, solve-effort, pack/unpack-heads), fall back to it. Returns
+  (fn [result & args] -> (fn [adjoint] -> [grad ...])) or nil if no rule exists."
+  [op]
+  (if-let [[template _] (resolve-template op)]
+    (if (:grads-fn template)
+      (fn [result & args]
+        (fn [adjoint]
+          (let [param-syms (mapv (fn [i] (gensym (str "tp_p" i "_"))) (range (count args)))
+                result-sym (gensym "tp_res_")
+                adj-sym    (gensym "tp_adj_")
+                ctx        {:bindings [] :gensym-fn (fn [p] (gensym (str p "_")))}
+                [ctx' grad-syms] (instantiate-template-ctx template param-syms result-sym adj-sym ctx)
+                f (eval (list 'fn (vec (concat param-syms [result-sym adj-sym]))
+                              (list 'let* (vec (:bindings ctx'))
+                                    (vec grad-syms))))]
+            (apply f (concat args [result adjoint])))))
+      (get-pullback-factory op))
+    (get-pullback-factory op)))
 
 ;; ================================================================
 ;; Arithmetic templates
@@ -627,33 +656,27 @@
 ;; alength: y = len(arr) → no gradient (integer result, not differentiable)
 (register-template! 'clojure.core/alength
                     {:params '[arr] :result nil :adjoint 'dy
-                     :grads '[nil]
-                     :pullback-factory (fn [_result arr] (fn [_dy] [nil]))})
+                     :grads '[nil]})
 
 ;; aset: arr[i] = v → no gradient through aset itself (mutation side-effect).
 ;; The gradient for mutation flows through the stored value's downstream reads.
 (register-template! 'clojure.core/aset
                     {:params '[arr i v] :result nil :adjoint 'dy
-                     :grads '[nil nil nil]
-                     :pullback-factory (fn [_result arr i v] (fn [_dy] [nil nil nil]))})
+                     :grads '[nil nil nil]})
 
 ;; Array allocation: creates new arrays, no gradient flow
 (register-template! 'clojure.core/double-array
                     {:params '[n] :result nil :adjoint 'dy
-                     :grads '[nil]
-                     :pullback-factory (fn [_result n] (fn [_dy] [nil]))})
+                     :grads '[nil]})
 (register-template! 'clojure.core/float-array
                     {:params '[n] :result nil :adjoint 'dy
-                     :grads '[nil]
-                     :pullback-factory (fn [_result n] (fn [_dy] [nil]))})
+                     :grads '[nil]})
 (register-template! 'clojure.core/long-array
                     {:params '[n] :result nil :adjoint 'dy
-                     :grads '[nil]
-                     :pullback-factory (fn [_result n] (fn [_dy] [nil]))})
+                     :grads '[nil]})
 (register-template! 'clojure.core/int-array
                     {:params '[n] :result nil :adjoint 'dy
-                     :grads '[nil]
-                     :pullback-factory (fn [_result n] (fn [_dy] [nil]))})
+                     :grads '[nil]})
 
 ;; aget: y = arr[i] → d_arr = scatter(dy, i, len(arr)), d_i = nil
 ;; The gradient w.r.t. the array is a one-hot: zeros except dy at position i.
@@ -664,12 +687,7 @@
                        (let [d-arr (gensym-fn "d_arr")]
                          [(update ctx :bindings into
                                   [d-arr (list 'raster.ad.reverse/aget-grad arr i adjoint-sym)])
-                          [d-arr nil]]))
-                     :pullback-factory
-                     (fn [_result arr i]
-                       (let [aget-grad-fn (requiring-resolve 'raster.ad.reverse/aget-grad)]
-                         (fn [dy]
-                           [(aget-grad-fn arr i dy) nil])))})
+                          [d-arr nil]]))})
 
 ;; ================================================================
 ;; Gradient control templates
@@ -678,14 +696,12 @@
 ;; stop-gradient: identity forward, zero gradient backward
 (register-template! 'raster.ad.forward/stop-gradient
                     {:params '[x] :result nil :adjoint 'dy
-                     :grads '[0.0]
-                     :pullback-factory (fn [_result x] (fn [_dy] [0.0]))})
+                     :grads '[0.0]})
 
 ;; straight-through: applies f to x forward, passes gradient through as identity
 (register-template! 'raster.ad.forward/straight-through
                     {:params '[f x] :result nil :adjoint 'dy
-                     :grads '[0.0 dy]
-                     :pullback-factory (fn [_result f x] (fn [dy] [0.0 dy]))})
+                     :grads '[0.0 dy]})
 
 ;; ================================================================
 ;; Deep learning array operation templates

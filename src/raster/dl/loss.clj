@@ -50,18 +50,6 @@
     (double (clojure.core/aget ^floats arr (int i)))
     (clojure.core/aget ^doubles arr (int i))))
 
-(tmpl/merge-into-template! 'raster.dl.loss/mse-loss
-                           {:pullback-factory (fn [_result pred target n]
-                                                (fn [dy]
-                                                  (let [n (long n)
-                                                        dy-val (double dy)
-                                                        scale (/ (* 2.0 dy-val) (double n))
-                                                        d-pred (alloc-like pred n)]
-                                                    (dotimes [i n]
-                                                      (aset-like! d-pred i
-                                                                  (* scale (- (aget-like pred i)
-                                                                              (aget-like target i)))))
-                                                    [d-pred nil nil])))})
 
 ;; ================================================================
 ;; Cross-entropy with logits (numerically stable)
@@ -115,10 +103,6 @@
             (clojure.core/aset d-logits idx (* dy (/ grad (double batch))))))))
     d-logits))
 
-(tmpl/merge-into-template! 'raster.dl.loss/cross-entropy-loss
-                           {:pullback-factory (fn [_result logits target batch classes]
-                                                (fn [dy]
-                                                  [(cross-entropy-loss-backward dy logits target batch classes) nil nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.loss/cross-entropy-loss
                            {:params '[logits target batch classes] :adjoint 'dy
@@ -154,10 +138,6 @@
         (clojure.core/aset d-pred i (* dy (/ grad (double n))))))
     d-pred))
 
-(tmpl/merge-into-template! 'raster.dl.loss/huber-loss
-                           {:pullback-factory (fn [_result pred target n delta]
-                                                (fn [dy]
-                                                  [(huber-loss-backward dy pred target n delta) nil nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.loss/huber-loss
                            {:params '[pred target n delta] :adjoint 'dy
@@ -187,10 +167,6 @@
         (clojure.core/aset d-pred i (* dy (/ grad (double n))))))
     d-pred))
 
-(tmpl/merge-into-template! 'raster.dl.loss/l1-loss
-                           {:pullback-factory (fn [_result pred target n]
-                                                (fn [dy]
-                                                  [(l1-loss-backward dy pred target n) nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.loss/l1-loss
                            {:params '[pred target n] :adjoint 'dy

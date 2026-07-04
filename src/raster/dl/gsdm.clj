@@ -430,11 +430,6 @@
                (recur (inc d) (+ acc grad-sin grad-cos)))
              acc)))))
 
-(tmpl/merge-into-template! 'raster.dl.gsdm/embed-timestep
-                           {:pullback-factory (fn [_result ref t dim]
-                                                (fn [dy]
-                                                  (let [d-t (sinusoidal-embed-backward dy (double t) (long dim))]
-                                                    [nil d-t nil])))})
 
 ;; ================================================================
 ;; TimestepMLP: sinusoidal → linear → SiLU → linear

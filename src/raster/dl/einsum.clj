@@ -479,7 +479,9 @@
     (t/register-tensor grad input-shape)))
 
 ;; einsum rrule: ∂L/∂T_p = einsum(dy + other tensors → T_p's subscript)
-;; Falls back to manual computation for repeated-index outputs (e.g. trace)
+;; Falls back to manual computation for repeated-index outputs (e.g. trace).
+;; einsum's body is not statically differentiable (dynamic subscript parsing),
+;; so the runtime pullback is its SOLE gradient representation (no grads-fn).
 (tmpl/merge-into-template! 'raster.dl.einsum/einsum
                            {:pullback-factory (fn [_result & args]
                                                 (let [subscript (first args)
@@ -513,6 +515,7 @@
                          (str "(" (str/join " " (map name (second tok))) ")")))
                      tokens)))
 
+;; rearrange's inverse-pattern gradient is likewise its sole (runtime) encoding.
 (tmpl/merge-into-template! 'raster.dl.einsum/rearrange
                            {:pullback-factory (fn [_result & args]
                                                 (let [tensor (first args)
@@ -531,3 +534,4 @@
                            ;; so resolve-axis-sizes can split them.
                            ;; Provide all resolved sizes — extra entries are harmless.
                                                     [(rearrange dy inv-pattern sizes) nil nil])))})
+

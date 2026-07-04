@@ -52,10 +52,6 @@
                           out))
 
 ;; transpose rrule: d_a = transpose(d_out, cols, rows)
-(tmpl/merge-into-template! 'raster.dl.nn/transpose-2d
-                           {:pullback-factory (fn [_result _a rows cols]
-                                                (fn [d-out]
-                                                  [(transpose-2d d-out cols rows) nil nil]))})
 
 ;; ================================================================
 ;; Matrix multiply: C = A @ B, A:[M,K], B:[K,N] -> C:[M,N]
@@ -107,12 +103,6 @@
 
 ;; matmul rrule: dA = dC @ B^T, dB = A^T @ dC
 ;; Delegates to backward deftms (parametric, float/double agnostic)
-(tmpl/merge-into-template! 'raster.dl.nn/matmul
-                           {:pullback-factory (fn [_result A B m k n]
-                                                (fn [dC]
-                                                  [(matmul-dA dC B m k n)
-                                                   (matmul-dB A dC m k n)
-                                                   nil nil nil]))})
 
 ;; ================================================================
 ;; Linear backward helpers (deftm — visible to compiler templates)
@@ -180,13 +170,6 @@
 ;; linear rrule:
 ;; dx = dy @ W, dW = dy^T @ x, db = sum(dy, dim=0)
 ;; Delegates to backward deftms (parametric, float/double agnostic)
-(tmpl/merge-into-template! 'raster.dl.nn/linear
-                           {:pullback-factory (fn [_result x W _b batch in-f out-f]
-                                                (fn [dy]
-                                                  [(linear-dx dy W batch in-f out-f)
-                                                   (linear-dW dy x batch in-f out-f)
-                                                   (linear-db dy batch out-f)
-                                                   nil nil nil]))})
 
 ;; ================================================================
 ;; Activations
@@ -198,10 +181,6 @@
 
 ;; silu': sigma(x) * (1 + x*(1-sigma(x)))
 ;; Delegates to backward deftm (parametric, float/double agnostic)
-(tmpl/merge-into-template! 'raster.dl.nn/silu
-                           {:pullback-factory (fn [_result x n]
-                                                (fn [dy]
-                                                  [(silu-backward dy x n) nil]))})
 
 ;; SwiGLU activation, fused: out = silu(gate) * up. par/map-void! !-variant (one work-item /
 ;; element) — the GPU-resident decode FFN form, and SIMD-vectorizes on CPU. The par index is the
@@ -291,10 +270,6 @@
                                 (aset dx i (* (aget dy i) grad))))
                             dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/gelu
-                           {:pullback-factory (fn [_result x n]
-                                                (fn [dy]
-                                                  [(gelu-backward dy x n) nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/gelu
                            {:params '[x n] :adjoint 'dy
@@ -317,10 +292,6 @@
                                    (aset dx i (* (aget dy i) si (- 1.0 si)))))
                                dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/sigmoid
-                           {:pullback-factory (fn [result x n]
-                                                (fn [dy]
-                                                  [(sigmoid-backward dy result n) nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/sigmoid
                            {:params '[x n] :adjoint 'dy
@@ -343,10 +314,6 @@
                                     (aset dx i (* (aget dy i) (- 1.0 (* ti ti))))))
                                 dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/tanh-act
-                           {:pullback-factory (fn [result x n]
-                                                (fn [dy]
-                                                  [(tanh-act-backward dy result n) nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/tanh-act
                            {:params '[x n] :adjoint 'dy
@@ -376,10 +343,6 @@
                                       (aset dx i (* (aget dy i) grad))))
                                   dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/leaky-relu
-                           {:pullback-factory (fn [_result x n alpha]
-                                                (fn [dy]
-                                                  [(leaky-relu-backward dy x n alpha) nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/leaky-relu
                            {:params '[x n alpha] :adjoint 'dy
@@ -1088,79 +1051,8 @@
                                                    db)))
 
 ;; conv2d rrule — uses dedicated in-place helpers for rearrange/gemm/bias
-(tmpl/merge-into-template! 'raster.dl.nn/conv2d
-                           {:pullback-factory (fn [_result x W _b batch c-in h w c-out kh kw stride-h stride-w pad-h pad-w]
-                                                (fn [dy]
-                                                  (let [batch (long batch) c-in (long c-in) h (long h) w (long w)
-                                                        c-out (long c-out) kh (long kh) kw (long kw)
-                                                        stride-h (long stride-h) stride-w (long stride-w)
-                                                        pad-h (long pad-h) pad-w (long pad-w)
-                                                        h-out (+ 1 (quot (+ h (* 2 pad-h) (- kh)) stride-h))
-                                                        w-out (+ 1 (quot (+ w (* 2 pad-w) (- kw)) stride-w))
-                                                        ckk (* c-in kh kw)
-                                                        bhw (* batch h-out w-out)
-                               ;; rearrange dy[B,c_out,h_out,w_out] -> dy_cols[c_out, bhw]
-                                                        dy-cols (alloc-like dy (* c-out bhw))
-                                                        _ (conv2d-rearrange-dy! dy dy-cols batch c-out h-out w-out)
-                               ;; im2col for dx computation
-                                                        cols (im2col-2d x batch c-in h w kh kw stride-h stride-w pad-h pad-w)
-                               ;; dW = dy_cols @ cols^T
-                                                        dW (alloc-like dy (* c-out ckk))
-                                                        _ (conv2d-backward-dW-into! dy-cols cols dW c-out bhw ckk)
-                               ;; d_cols = W^T @ dy_cols
-                                                        d-cols (alloc-like dy (* ckk bhw))
-                                                        _ (conv2d-backward-dcols-into! W dy-cols d-cols ckk c-out bhw)
-                               ;; col2im to get dx
-                                                        dx (col2im-2d d-cols batch c-in h w kh kw stride-h stride-w pad-h pad-w)
-                               ;; db = sum of dy over spatial dims
-                                                        db (alloc-like dy c-out)
-                                                        _ (conv2d-backward-db-into! dy db batch c-out h-out w-out)]
-                                                    [dx dW db nil nil nil nil nil nil nil nil nil nil])))})
 
 ;; maxpool2d rrule: scatter gradient to argmax positions
-(tmpl/merge-into-template! 'raster.dl.nn/maxpool2d
-                           {:pullback-factory (fn [_result x batch channels h w kh kw]
-                                                (fn [dy]
-                                                  (let [batch (long batch) channels (long channels)
-                                                        h (long h) w (long w) kh (long kh) kw (long kw)
-                                                        h-out (quot h kh)
-                                                        w-out (quot w kw)
-                                                        chw (* channels h w)
-                                                        hw (* h w)
-                                                        chw-out (* channels h-out w-out)
-                                                        hw-out (* h-out w-out)
-                                                        w-int (int w)
-                                                        kh-int (int kh)
-                                                        kw-int (int kw)
-                                                        w-out-int (int w-out)
-                                                        dx (alloc-like x (* batch chw))
-                               ;; Use volatiles for max tracking (type-agnostic)
-                                                        max-val (volatile! Double/NEGATIVE_INFINITY)
-                                                        max-idx (volatile! (long 0))]
-                                                    (dotimes [bi batch]
-                                                      (dotimes [ci channels]
-                                                        (let [base-in (+ (* bi (int chw)) (* ci (int hw)))
-                                                              base-out (+ (* bi (int chw-out)) (* ci (int hw-out)))]
-                                                          (dotimes [oh h-out]
-                                                            (dotimes [ow w-out]
-                                                              (let [ih0 (* oh kh-int)
-                                                                    iw0 (* ow kw-int)]
-                                       ;; Reset trackers
-                                                                (vreset! max-val Double/NEGATIVE_INFINITY)
-                                                                (vreset! max-idx 0)
-                                                                (dotimes [khi kh]
-                                                                  (dotimes [kwi kw]
-                                                                    (let [x-idx (+ base-in (* (+ ih0 khi) w-int) (+ iw0 kwi))
-                                                                          v (aget x x-idx)]
-                                                                      (when (> v @max-val)
-                                                                        (vreset! max-val v)
-                                                                        (vreset! max-idx (long x-idx))))))
-                                                                (let [out-idx (+ base-out (* oh w-out-int) ow)
-                                                                      grad (aget dy out-idx)
-                                                                      argmax-idx (long @max-idx)]
-                                                                  (aset dx argmax-idx
-                                                                        (+ (aget dx argmax-idx) grad)))))))))
-                                                    [dx nil nil nil nil nil nil])))})
 
 ;; ================================================================
 ;; Embedding
@@ -1190,10 +1082,6 @@
                                                 (aget dy (+ (* i (int dim)) d)))))))
                                  d-table)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/embedding
-                           {:pullback-factory (fn [_result table indices n vocab dim]
-                                                (fn [dy]
-                                                  [(embedding-backward dy indices n vocab dim) nil nil nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/embedding
                            {:params '[table indices n vocab dim] :adjoint 'dy
@@ -1224,10 +1112,6 @@
                                  (aset dx i (* (aget dy i) (aget mask i))))
                                dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/dropout
-                           {:pullback-factory (fn [_result x mask n]
-                                                (fn [dy]
-                                                  [(dropout-backward dy mask n) nil nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/dropout
                            {:params '[x mask n] :adjoint 'dy
@@ -1283,10 +1167,6 @@
                                              (- (aget dy i) s-dot-dy))))
                                   dx)))
 
-(tmpl/merge-into-template! 'raster.dl.nn/softmax-1d
-                           {:pullback-factory (fn [result x n]
-                                                (fn [dy]
-                                                  [(softmax-1d-backward dy result n) nil]))})
 
 (tmpl/merge-into-template! 'raster.dl.nn/softmax-1d
                            {:params '[x n] :adjoint 'dy
@@ -1781,24 +1661,12 @@
 ;; ================================================================
 
 ;; layer-norm rrule — per-gradient deftms (parametric)
-(tmpl/merge-into-template! 'raster.dl.nn/layer-norm
-                           {:pullback-factory (fn [_result x gamma _beta batch features eps]
-                                                (fn [dy]
-                                                  [(layer-norm-backward-dx dy x gamma batch features eps)
-                                                   (layer-norm-backward-dgamma dy x batch features eps)
-                                                   (layer-norm-backward-dbeta dy batch features)
-                                                   nil nil nil]))})
 
-;; rms-norm rrule — runtime pullback + compiled grads-fn (dx, dweight; frozen
+;; rms-norm rrule — compiled grads-fn (dx, dweight; frozen
 ;; gain-offset/dims -> nil). The QK-norm and the 6 sandwich norms per Gemma layer
 ;; all differentiate through this. (rms-norm x weight rows features eps gain-offset)
 (tmpl/merge-into-template! 'raster.dl.nn/rms-norm
-                           {:pullback-factory (fn [_result x weight rows features eps gain-offset]
-                                                (fn [dy]
-                                                  [(rms-norm-backward-dx dy x weight rows features eps gain-offset)
-                                                   (rms-norm-backward-dweight dy x rows features eps)
-                                                   nil nil nil nil]))
-                            :params '[x weight rows features eps gain-offset] :result nil :adjoint 'dy
+                           {:params '[x weight rows features eps gain-offset] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [x weight rows features eps gain-offset]
                                            _result-sym adjoint-sym gensym-fn]
                                         (let [dx (gensym-fn "dx") dw (gensym-fn "dw")]
@@ -1811,12 +1679,7 @@
 
 ;; residual-add rrule — elementwise sum (transformer residuals, LoRA base+delta).
 (tmpl/merge-into-template! 'raster.dl.nn/residual-add
-                           {:pullback-factory (fn [_result _a _b n]
-                                                (fn [dy]
-                                                  [(residual-add-backward dy n)
-                                                   (residual-add-backward dy n)
-                                                   nil]))
-                            :params '[a b n] :result nil :adjoint 'dy
+                           {:params '[a b n] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [_a _b n] _result-sym adjoint-sym gensym-fn]
                                         (let [da (gensym-fn "da") db (gensym-fn "db")]
                                           [(update ctx :bindings into
@@ -1826,12 +1689,7 @@
 
 ;; hadamard rrule — elementwise product (gated MLPs). d_a = dy⊙b, d_b = dy⊙a.
 (tmpl/merge-into-template! 'raster.dl.nn/hadamard
-                           {:pullback-factory (fn [_result a b n]
-                                                (fn [dy]
-                                                  [(hadamard-backward dy b n)
-                                                   (hadamard-backward dy a n)
-                                                   nil]))
-                            :params '[a b n] :result nil :adjoint 'dy
+                           {:params '[a b n] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [a b n] _result-sym adjoint-sym gensym-fn]
                                         (let [da (gensym-fn "da") db (gensym-fn "db")]
                                           [(update ctx :bindings into
@@ -1842,12 +1700,7 @@
 ;; linear-nb rrule — bias-free linear (Gemma/Qwen projections). Same as linear
 ;; minus the db term; reuses linear-dx / linear-dW. (linear-nb x W batch in-f out-f)
 (tmpl/merge-into-template! 'raster.dl.nn/linear-nb
-                           {:pullback-factory (fn [_result x W batch in-f out-f]
-                                                (fn [dy]
-                                                  [(linear-dx dy W batch in-f out-f)
-                                                   (linear-dW dy x batch in-f out-f)
-                                                   nil nil nil]))
-                            :params '[x W batch in-f out-f] :result nil :adjoint 'dy
+                           {:params '[x W batch in-f out-f] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [x W batch in-f out-f] _result-sym adjoint-sym gensym-fn]
                                         (let [dx (gensym-fn "dx") dW (gensym-fn "dW")]
                                           [(update ctx :bindings into
@@ -1856,31 +1709,10 @@
                                            [dx dW nil nil nil]]))})
 
 ;; group-norm rrule — per-gradient deftms (parametric)
-(tmpl/merge-into-template! 'raster.dl.nn/group-norm
-                           {:pullback-factory (fn [_result x gamma _beta batch channels spatial groups eps]
-                                                (fn [dy]
-                                                  [(group-norm-backward-dx dy x gamma batch channels spatial groups eps)
-                                                   (group-norm-backward-dgamma dy x batch channels spatial groups eps)
-                                                   (group-norm-backward-dbeta dy batch channels spatial)
-                                                   nil nil nil nil nil]))})
 
 ;; batch-norm rrule — per-gradient deftms (parametric)
-(tmpl/merge-into-template! 'raster.dl.nn/batch-norm
-                           {:pullback-factory (fn [_result x gamma _beta _running-mean _running-var batch features eps _momentum _training]
-                                                (fn [dy]
-                                                  [(batch-norm-backward-dx dy x gamma batch features eps)
-                                                   (batch-norm-backward-dgamma dy x batch features eps)
-                                                   (batch-norm-backward-dbeta dy batch features)
-                                                   nil nil nil nil nil nil nil]))})
 
 ;; conv1d rrule — per-gradient deftms (parametric)
-(tmpl/merge-into-template! 'raster.dl.nn/conv1d
-                           {:pullback-factory (fn [_result x W _b batch c-in length c-out kernel stride pad]
-                                                (fn [dy]
-                                                  [(conv1d-backward-dx dy x W batch c-in length c-out kernel stride pad)
-                                                   (conv1d-backward-dW dy x batch c-in length c-out kernel stride pad)
-                                                   (conv1d-backward-db dy batch c-out length kernel stride pad)
-                                                   nil nil nil nil nil nil]))})
 
 ;; ================================================================
 ;; Template registrations for complex ops
@@ -1953,4 +1785,5 @@
                                                              adjoint-sym x batch c-in length c-out kernel stride pad)
                                                     db (list 'raster.dl.nn/conv1d-backward-db
                                                              adjoint-sym batch c-out length kernel stride pad)])
-                                           [dx dW db nil nil nil nil nil nil]]))})
+                                           ;; 10 params: dx dW db + 7 nil (batch c-in length c-out kernel stride pad)
+                                           [dx dW db nil nil nil nil nil nil nil]]))})

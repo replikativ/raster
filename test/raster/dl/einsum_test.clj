@@ -302,7 +302,7 @@
   (testing "einsum matmul gradients vs finite diff"
     (let [A (t/tensor [0.1 0.2 0.3 0.4 0.5 0.6] [2 3])
           B (t/tensor [0.7 0.8 0.9 1.0 1.1 1.2] [3 2])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/einsum)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/einsum)
           C (ein/einsum "ij,jk->ik" A B)
           pb (rrfn C "ij,jk->ik" A B)
           ;; dy = ones (loss = sum of output)
@@ -320,7 +320,7 @@
   (testing "einsum outer product gradients vs finite diff"
     (let [a (t/tensor [1.0 2.0 3.0] [3])
           b (t/tensor [4.0 5.0] [2])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/einsum)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/einsum)
           C (ein/einsum "i,j->ij" a b)
           pb (rrfn C "i,j->ij" a b)
           dy (t/tensor (double-array (repeat 6 1.0)) [3 2])
@@ -335,7 +335,7 @@
 (deftest einsum-trace-gradient-test
   (testing "einsum trace gradient vs finite diff"
     (let [A (t/tensor [1.0 2.0 3.0 4.0] [2 2])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/einsum)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/einsum)
           tr (ein/einsum "ii->" A)
           pb (rrfn tr "ii->" A)
           dy (t/tensor [1.0] [])
@@ -347,7 +347,7 @@
 (deftest einsum-single-input-gradient-test
   (testing "einsum transpose gradient (single input)"
     (let [A (t/tensor [1.0 2.0 3.0 4.0 5.0 6.0] [2 3])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/einsum)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/einsum)
           At (ein/einsum "ij->ji" A)
           pb (rrfn At "ij->ji" A)
           dy (t/tensor (double-array (repeat 6 1.0)) [3 2])
@@ -359,7 +359,7 @@
 (deftest rearrange-transpose-gradient-test
   (testing "rearrange transpose gradient"
     (let [A (t/tensor [1.0 2.0 3.0 4.0 5.0 6.0] [2 3])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/rearrange)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/rearrange)
           At (ein/rearrange A "i j -> j i")
           pb (rrfn At A "i j -> j i")
           dy (t/tensor (double-array (repeat 6 1.0)) [3 2])
@@ -371,7 +371,7 @@
 (deftest rearrange-merge-gradient-test
   (testing "rearrange merge gradient"
     (let [A (t/tensor (double-array (map double (range 24))) [2 3 4])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/rearrange)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/rearrange)
           B (ein/rearrange A "b c w -> b (c w)")
           pb (rrfn B A "b c w -> b (c w)")
           dy (t/tensor (double-array (repeat 24 1.0)) [2 12])
@@ -383,7 +383,7 @@
 (deftest rearrange-4d-transpose-gradient-test
   (testing "rearrange NCHW->NHWC gradient"
     (let [A (t/tensor (double-array (map double (range 24))) [1 2 3 4])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.einsum/rearrange)
+          rrfn (tmpl/template-pullback 'raster.dl.einsum/rearrange)
           B (ein/rearrange A "b c h w -> b h w c")
           pb (rrfn B A "b c h w -> b h w c")
           dy (t/tensor (double-array (repeat 24 1.0)) [1 3 4 2])

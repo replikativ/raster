@@ -1,7 +1,6 @@
 (ns raster.nn-test
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.nn :as nn]
-            [raster.ad.templates :as tmpl]))
+            [raster.nn :as nn]))
 
 ;; ================================================================
 ;; Helpers
@@ -71,54 +70,3 @@
     (let [p (double-array [0.1 0.7 0.2])
           t (double-array [0 1 0])]
       (is (approx= (- (Math/log 0.7)) (nn/cross-entropy p t))))))
-
-(deftest relu-doubles-rrule-test
-  (testing "ReLU rrule works with double[]"
-    (let [x (double-array [-2 -1 0.5 1 2])
-          y (nn/relu x)
-          rrule-fn (tmpl/get-pullback-factory 'raster.nn/relu)
-          pb (rrule-fn y x)
-          dy (double-array [1 1 1 1 1])
-          [dx] (pb dy)]
-      (is (instance? (Class/forName "[D") dx))
-      (is (approx= 0.0 (aget ^doubles dx 0)))
-      (is (approx= 0.0 (aget ^doubles dx 1)))
-      (is (approx= 1.0 (aget ^doubles dx 2)))
-      (is (approx= 1.0 (aget ^doubles dx 3)))
-      (is (approx= 1.0 (aget ^doubles dx 4))))))
-
-(deftest softmax-doubles-rrule-test
-  (testing "Softmax rrule works with double[]"
-    (let [x (double-array [1.0 2.0 3.0])
-          s (nn/softmax x)
-          rrule-fn (tmpl/get-pullback-factory 'raster.nn/softmax)
-          pb (rrule-fn s x)
-          dy (double-array [1.0 0.0 0.0])
-          [dx] (pb dy)]
-      (is (instance? (Class/forName "[D") dx))
-      ;; Numerical check
-      (let [eps 1e-5
-            n (alength x)
-            num-dx (double-array n)]
-        (dotimes [i n]
-          (let [orig (aget x i)]
-            (aset x i (+ orig eps))
-            (let [s+ (nn/softmax x)
-                  f+ (aget ^doubles s+ 0)]
-              (aset x i orig)
-              (let [s0 (nn/softmax x)
-                    f0 (aget ^doubles s0 0)]
-                (aset num-dx i (/ (- f+ f0) eps))))))
-        (is (arr-approx= dx num-dx 1e-4))))))
-
-(deftest cross-entropy-doubles-rrule-test
-  (testing "Cross-entropy rrule works with double[]"
-    (let [p (double-array [0.2 0.5 0.3])
-          t (double-array [0 1 0])
-          loss (nn/cross-entropy p t)
-          rrule-fn (tmpl/get-pullback-factory 'raster.nn/cross-entropy)
-          pb (rrule-fn loss p t)
-          [dp _dt] (pb 1.0)]
-      (is (instance? (Class/forName "[D") dp))
-      ;; dp[1] should be -t[1]/p[1] = -1/0.5 = -2.0
-      (is (approx= -2.0 (aget ^doubles dp 1))))))

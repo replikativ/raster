@@ -67,7 +67,7 @@
           Q (double-array [0.1 0.2 0.3  0.4 0.5 0.6])
           K (double-array [0.7 0.8 0.9  1.0 1.1 1.2])
           V (double-array [0.3 0.2 0.1  0.6 0.5 0.4])
-          rrfn (tmpl/get-pullback-factory 'raster.dl.attention/scaled-dot-product-attn)
+          rrfn (tmpl/template-pullback 'raster.dl.attention/scaled-dot-product-attn)
           out (attn/scaled-dot-product-attn Q K V seq-len seq-len dk dv)
           pb (rrfn out Q K V seq-len seq-len dk dv)
           dy (double-array (repeat (* seq-len dv) 1.0))

@@ -58,22 +58,6 @@
                             (broadcast [x0 noise]
                                        (n/+ (n/* sqrt-alpha x0) (n/* sqrt-1ma noise))))))
 
-;; forward-noise rrule
-(tmpl/merge-into-template! 'raster.dl.diffusion/forward-noise
-                           {:pullback-factory (fn [_result x0 noise alpha-t n]
-                                                (fn [dy]
-                                                  (let [n (long n)
-                                                        alpha-t (double alpha-t)
-                                                        sqrt-alpha (n/sqrt alpha-t)
-                                                        sqrt-1ma (n/sqrt (- 1.0 alpha-t))
-                                                        dx0 (double-array n)
-                                                        d-noise (double-array n)]
-                                                    (dotimes [i n]
-                                                      (let [dyi (aget dy i)]
-                                                        (aset dx0 i (* dyi sqrt-alpha))
-                                                        (aset d-noise i (* dyi sqrt-1ma))))
-                                                    [dx0 d-noise nil nil])))})
-
 ;; ================================================================
 ;; Predict x0 from noise prediction
 ;; ================================================================
