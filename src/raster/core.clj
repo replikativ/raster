@@ -455,13 +455,29 @@
   [key]
   (get @walked-body-registry key))
 
+;; resolve-deftm-var is defined much later (it needs the parametric-monomorphize
+;; machinery); ensure-walked-body! forward-references it to resolve-first.
+(declare resolve-deftm-var)
+
 (clojure.core/defn ^:no-doc ensure-walked-body!
   "Lazily walk a deftm var's source body with TC. Returns walked body.
   Julia model: walking is deferred to first use. If the var already has
   a walked body, returns it immediately. Otherwise walks from source body
   with TC binding tags and caches the result on the var metadata.
-  Thread-safe via double-checked locking per var."
+  Thread-safe via double-checked locking per var.
+
+  Resolve-FIRST: the walked body lives on the backing (mangled) impl var, but
+  the DISPATCH var is the ergonomic handle. Handed a dispatch var, resolve it to
+  the impl var before reading the cache — otherwise this silently returned nil on
+  a dispatch var, the debug-tooling footgun that misdiagnosed #78 (task #53). An
+  already-resolved impl var (the hot path) skips the resolve entirely; a genuinely
+  non-deftm var, or an ambiguous multi-overload dispatch var with no dtype, falls
+  through to nil unchanged (preserving the 'not inlinable' contract of
+  inline/op_descriptor/pe callers)."
   [v]
+  (let [v (if (::deftm (meta v))
+            v
+            (or (try (resolve-deftm-var v nil) (catch Exception _ nil)) v))]
   (or (seq (::deftm-walked-body (meta v)))
       (locking v
         (or (seq (::deftm-walked-body (meta v)))
@@ -478,7 +494,7 @@
                                   (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
                                     (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
                 (alter-meta! v assoc ::deftm-walked-body (vec walked))
-                (vec walked)))))))
+                (vec walked))))))))
 
 ;; ================================================================
 ;; Public API: defn — Clojure defn with walked body for compiler inlining

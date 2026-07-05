@@ -59,16 +59,25 @@
 ;; ensure-walked-body! current behavior (pins the footgun S3 will fix)
 ;; ---------------------------------------------------------------------------
 
-(deftest ensure-walked-body-current-behavior
-  (testing "on a RESOLVED impl var: non-empty walked body"
+(deftest ensure-walked-body-resolve-first
+  (testing "on a RESOLVED impl var: non-empty walked body (hot path, skips resolve)"
     (let [impl (rcore/resolve-deftm-var #'wbc-sq nil)
           wb (rcore/ensure-walked-body! impl)]
       (is (seq wb) "resolved impl var yields a non-empty walked body")))
-  (testing "on a DISPATCH var: currently returns nil (silent-nil footgun)"
-    ;; This is the REPL footgun R1 targets. S3 makes this fail-loud (throw with a
-    ;; 'resolve first' message). Pinned here so that behavior change is explicit.
-    (is (nil? (rcore/ensure-walked-body! #'wbc-sq))
-        "PRE-S3: dispatch var silently yields nil (to become fail-loud in S3)")))
+  (testing "on a DISPATCH var: resolve-first yields the body (S2 footgun fix)"
+    ;; Was the REPL debug-tooling footgun that misdiagnosed #78 (task #53): a
+    ;; dispatch var silently returned nil because the body lives on the backing
+    ;; impl var. S2 resolves-first, so the dispatch var now yields the SAME body.
+    (let [impl (rcore/resolve-deftm-var #'wbc-sq nil)]
+      (is (seq (rcore/ensure-walked-body! #'wbc-sq))
+          "dispatch var yields a non-empty walked body")
+      (is (= (rcore/ensure-walked-body! #'wbc-sq)
+             (rcore/ensure-walked-body! impl))
+          "dispatch var body == impl var body")))
+  (testing "contract preserved: non-deftm / ambiguous dispatch var fall through to nil"
+    ;; the inline/op_descriptor/pe callers treat nil as 'not inlinable' — must hold.
+    (is (nil? (rcore/ensure-walked-body! #'clojure.core/+))
+        "genuinely non-deftm var -> nil (not a crash)")))
 
 ;; ---------------------------------------------------------------------------
 ;; hasch content-key mechanism — the S2 memo key, validated on real bodies
