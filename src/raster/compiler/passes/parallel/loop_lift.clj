@@ -133,14 +133,88 @@
      :cast cast-fn
      :body value-expr}))
 
-(defn- contains-sym?
-  "True if `sym` occurs anywhere in `form` (as a value, not just head)."
-  [form sym]
+(def ^:private contains-sym?
+  "True if `sym` occurs anywhere in `form` (shared helper in patterns)."
+  patterns/contains-sym?)
+
+(defn- reduce-init-elem-type
+  "Element type of a reduce accumulator init, or nil when it cannot be
+  proven: a (float x)/(double x) cast, a typed numeric literal, or a
+  symbol carrying a :raster.type/tag (the walked/AD-prep dialect stamps
+  binding symbols). nil = the lift DECLINES (conservative bail — a missed
+  optimization, never a throw mid-pass)."
+  [init]
   (cond
-    (= form sym)   true
-    (seq? form)    (boolean (some #(contains-sym? % sym) form))
-    (vector? form) (boolean (some #(contains-sym? % sym) form))
-    :else          false))
+    (and (seq? init) (contains? #{'float 'clojure.core/float} (first init))) :float
+    (and (seq? init) (contains? #{'double 'clojure.core/double} (first init))) :double
+    (number? init) (condp instance? init
+                     Double :double
+                     Float :float
+                     Long :long
+                     Integer :int
+                     nil)
+    (symbol? init) (case (or (:raster.type/tag (meta init)) (:tag (meta init)))
+                     float :float
+                     double :double
+                     long :long
+                     int :int
+                     nil)
+    :else nil))
+
+(defn- form-tag-elem-type
+  "Element type from a form's :raster.type/tag stamp (walked dialect), or
+  nil when unstamped. Emitters/passes READ stamps, never re-infer."
+  [form]
+  (case (:raster.type/tag (meta form))
+    float :float
+    double :double
+    long :long
+    int :int
+    nil))
+
+(defn- acc-cast-elem-type
+  "Element type evidenced by a cast on the accumulator reference inside the
+  update body — recur-LUB widening spells the accumulator as (double acc) /
+  (float acc) even when the init literal is integer. nil when the acc is
+  referenced bare (or not found)."
+  [update-expr acc-sym]
+  (let [found (atom nil)
+        casts {'double :double 'clojure.core/double :double
+               'float :float 'clojure.core/float :float}
+        walk (fn walk [e]
+               (when (seq? e)
+                 (if (and (contains? casts (first e))
+                          (= 2 (count e))
+                          (= acc-sym (second e)))
+                   (reset! found (get casts (first e)))
+                   (run! walk (descriptor/call-args e)))))]
+    (walk update-expr)
+    @found))
+
+(def ^:private read-array-elem-types
+  "Element types of the arrays READ inside a body (shared helper in patterns)."
+  patterns/read-array-elem-types)
+
+(defn- reduce-elem-type
+  "The provable accumulator element type of a reduce loop, or nil to DECLINE.
+  Independent evidence sources — the body's :raster.type/tag stamp, an
+  accumulator cast in the update ((double acc), recur-LUB spelling), the
+  init expression, and the element types of the arrays the body READS —
+  must AGREE wherever known:
+    - under recur-LUB widening (init 0, double accumulation) or parametric
+      :dtype narrowing (init 0.0 in a T=float kernel) the init literal alone
+      is NOT authoritative — lifting with a contradicted type truncates or
+      miscasts (integer-init-accumulator / jit-aot-differential regressions);
+    - a MIXED-precision reduce (double accumulator over float[] reads) must
+      decline outright: the SIMD segred loads arrays at the accumulator
+      dtype ([F→[D ClassCastException)."
+  [update-expr acc-sym acc-init]
+  (let [known (remove nil? (concat [(form-tag-elem-type update-expr)
+                                    (acc-cast-elem-type update-expr acc-sym)
+                                    (reduce-init-elem-type acc-init)]
+                                   (read-array-elem-types update-expr)))]
+    (when (and (seq known) (apply = known))
+      (first known))))
 
 (defn- reduction-update-ok?
   "The update body must be (⊕ acc e) / (⊕ e acc) where ⊕ is a registered
@@ -211,12 +285,19 @@
                (body-element-wise? update-expr index-sym nil)
                ;; (6) the exit value depends only on acc + invariants, never the
                ;;     index (which would otherwise escape its loop scope).
-               (not (contains-sym? else-expr index-sym)))
+               (not (contains-sym? else-expr index-sym))
+               ;; (7) the accumulator element type is provable AND consistent
+               ;;     across body tag / acc cast / init (reduce-elem-type) —
+               ;;     emission needs it for the par/reduce elem-type metadata,
+               ;;     and a contradicted init (recur-LUB widening, parametric
+               ;;     narrowing) must decline, not truncate.
+               (some? (reduce-elem-type update-expr acc-sym acc-init)))
           {:acc acc-sym
            :init acc-init
            :idx index-sym
            :bound bound-expr
            :body update-expr
+           :elem-type (reduce-elem-type update-expr acc-sym acc-init)
            :post-fn (when (not= else-expr acc-sym) else-expr)}))
 
       (contains? #{'let 'let*} (first form))
@@ -314,23 +395,15 @@
     (if et (with-meta form {:raster.type/elem-type et}) form)))
 
 (defn- reduce-lift-form
-  [{:keys [acc init idx bound body post-fn]}]
+  [{:keys [acc init idx bound body elem-type post-fn]}]
   (let [reduce-form (list 'raster.par/reduce acc init idx bound body)
-        ;; Infer elem-type from init expression
-        et (cond
-             (and (seq? init) (= 'float (first init))) :float
-             (and (seq? init) (= 'double (first init))) :double
-             (number? init) (condp instance? init
-                              Double :double
-                              Float :float
-                              Long :long
-                              Integer :int
-                              (throw (ex-info (str "loop-lift: cannot infer element type for reduce init `"
-                                                   (pr-str init) "` of type " (type init))
-                                              {:init init})))
-             :else (throw (ex-info (str "loop-lift: cannot infer element type for reduce init `"
-                                        (pr-str init) "`. Use a typed cast like (double 0).")
-                                   {:init init})))
+        ;; Elem-type is provable by construction: loop-reduce-pattern? gate (7)
+        ;; declined any loop reduce-elem-type cannot classify consistently.
+        et (or elem-type
+               (throw (ex-info (str "loop-lift: unreachable — reduce init `"
+                                    (pr-str init) "` passed the pattern gate "
+                                    "but has no inferable element type.")
+                               {:init init})))
         reduce-form (with-meta reduce-form {:raster.type/elem-type et})]
     (if post-fn
       (clojure.walk/postwalk-replace {acc reduce-form} post-fn)

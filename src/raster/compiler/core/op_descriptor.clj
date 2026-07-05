@@ -620,16 +620,31 @@
   (when (aset-call? form)
     (unwrap-array-arg (first (call-args form)))))
 
+(defn- unwrap-int-cast
+  "Unwrap an integer cast around an induction-variable reference —
+   (long i) / (int i) → i. The walked/AD-prep dialect wraps loop indices in
+   long casts ((inc (long i))), so step matching must see through them just
+   like idx-matches?/test-index+bound do. Non-cast forms pass through."
+  [expr]
+  (if (and (seq? expr)
+           (contains? #{'long 'int 'clojure.core/long 'clojure.core/int}
+                      (first expr))
+           (= 2 (count expr)))
+    (second expr)
+    expr))
+
 (defn affine-step
   "If `expr` is an affine step of the induction variable `idx-sym` — i.e.
    (inc idx), (unchecked-inc idx), or (+ idx c) / (+ c idx) with a constant
    integer c — return the constant stride as a long. Otherwise nil.
    Works on both bare ops and walker-devirtualized (.invk impl ...) forms via
-   semantic-op/call-args, so no form rewriting is needed for matching."
+   semantic-op/call-args, so no form rewriting is needed for matching. The
+   idx reference may be cast-wrapped ((inc (long i))) — walked-dialect loops
+   emit that shape."
   [expr idx-sym]
   (when (seq? expr)
     (let [op   (semantic-op expr)
-          args (vec (call-args expr))]
+          args (vec (map unwrap-int-cast (call-args expr)))]
       (cond
         (and (increment-op? op)
              (= 1 (count args))

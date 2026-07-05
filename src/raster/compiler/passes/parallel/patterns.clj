@@ -645,6 +645,17 @@
            (= 2 (count expr))
            (= (second expr) acc-sym))))
 
+(defn contains-sym?
+  "True if `sym` occurs anywhere in `form` (as a value, not just head).
+  Shared soundness helper for loop-invariance gates (loop-lift and the AD
+  carry->scan materializer both gate bounds on it)."
+  [form sym]
+  (cond
+    (= form sym)   true
+    (seq? form)    (boolean (some #(contains-sym? % sym) form))
+    (vector? form) (boolean (some #(contains-sym? % sym) form))
+    :else          false))
+
 (defn find-recur-form
   "Find the recur form in a then-branch. Handles direct, do-wrapped, and
 	let-wrapped recur forms."
@@ -830,3 +841,65 @@
                    :then-branch then-branch
                    :aset-form aset-form
                    :recur-form recur-form})))))))))
+
+(defn read-array-elem-types
+  "Element types of the arrays READ (aget) inside a loop/SOAC body,
+  recovered from the array symbols' :raster.type/tag stamps (floats/doubles/
+  longs/ints). Unstamped arrays contribute nothing (raw dialect). Shared
+  dtype-consistency evidence for loop-lift's reduce gate and the AD
+  carry->scan materializer (a mixed-precision rewrite miscompiles: SIMD
+  segred loads arrays at the accumulator dtype; scan backward scatters
+  accumulator-dtype adjoints into read-array shadows)."
+  [body-expr]
+  (let [ets (atom [])
+        walk (fn walk [e]
+               (when (seq? e)
+                 (when (descriptor/aget-call? e)
+                   (let [arr (first (descriptor/call-args e))]
+                     (when (symbol? arr)
+                       (when-let [et (case (or (:raster.type/tag (meta arr))
+                                               (:tag (meta arr)))
+                                       floats :float
+                                       doubles :double
+                                       longs :long
+                                       ints :int
+                                       nil)]
+                         (swap! ets conj et)))))
+                 (run! walk (descriptor/call-args e))))]
+    (walk body-expr)
+    @ets))
+
+(defn match-carry-loop
+  "Matcher for PURE-carry recurrence loops — a chained accumulator with NO
+  per-step store:
+
+    (loop [i 0 acc init] (if (< i n) (recur (inc i) BODY) acc))
+
+  This is match-scan-loop minus the aset requirement: it reuses the exact
+  induction-variable machinery (match-reduce-loop: test-identified index,
+  0-start, (< i n) contiguous bound, +1 affine step) plus the soundness
+  gates the rewrite needs:
+    - the consequent is a DIRECT recur (a do/let then-branch could carry
+      side effects that a carry->scan rewrite would drop or reorder)
+    - the exit value is exactly the carry (acc-ref) — the loop RESULT is
+      the final accumulator state
+    - the bound is loop-invariant w.r.t. BOTH index and carry: a
+      data-dependent trip count (bound reads the accumulator) declines
+      here, keeping while/convergence loops on the fail-loud ladder that
+      points at the fixed-point rule.
+
+  Returns {:acc-sym :acc-init :index-sym :bound-expr :body} or nil."
+  [loop-form]
+  (when-let [{:keys [acc-sym acc-init index-sym then-branch else-expr
+                     bound-expr update-expr]}
+             (match-reduce-loop loop-form)]
+    (when (and (seq? then-branch)
+               (= 'recur (first then-branch))
+               (acc-ref? else-expr acc-sym)
+               (not (contains-sym? bound-expr index-sym))
+               (not (contains-sym? bound-expr acc-sym)))
+      {:acc-sym acc-sym
+       :acc-init acc-init
+       :index-sym index-sym
+       :bound-expr bound-expr
+       :body update-expr})))
