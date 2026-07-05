@@ -5,7 +5,10 @@
                                             :git/sha "42ef524fb5482a2e2429f3732a6ad88d80529690"
                                             :deps/root "typed/clj.checker"}
         org.replikativ/pattern {:mvn/version "1.0.449"}
-        org.replikativ/beichte {:mvn/version "0.2.7"}}
+        org.replikativ/beichte {:mvn/version "0.2.7"}
+        ;; content-addressed hashing of deftm source bodies (R1 walked-body memo);
+        ;; cross-platform (JVM+cljs) keeps the browser port open.
+        org.replikativ/hasch {:mvn/version "0.4.99"}}
  :aliases
  {:test {:extra-paths ["test"]
          :extra-deps {io.github.cognitect-labs/test-runner
