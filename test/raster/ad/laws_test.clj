@@ -25,6 +25,7 @@
             [raster.sym.core :as sym]
             [raster.sym.diff :as sdiff]
             [raster.sci.special :as special]
+            [raster.nn :as rnn]
             [raster.dl.nn :as nn]
             [raster.dl.loss :as loss]
             [raster.dl.attention :as attn]))
@@ -699,6 +700,136 @@
             "W-seed: tangent of ∇ₓf = FD-of-grad (cross block)")
         (is (farr-close? (nth hv 1) (fd-diff gW+ gW- h) tol-hvp)
             "W-seed: tangent of ∇_W f = FD-of-grad")))))
+
+;; ================================================================
+;; O4c — double backward (#72 RoR closure): value+grad THROUGH a gradient
+;; program. The backward kernels emitted by first-order rules (linear-dx/dW,
+;; daxpy-diff!, silu/relu-backward, dot-product/scale) now carry their own
+;; DERIVED reverse rules (adjoint of a linear op = its transpose, spelled
+;; with existing kernels — raster.ad.templates op-adjoints), closing the
+;; reverse engine under its own output (grad-of-grad, L2(∇f), MAML shapes).
+;;
+;; Composition shape that works: (value+grad (rev/reified-grad #'f 'p)) —
+;; the reified SCALAR-tail gradient program. value+grad-of-value+grad does
+;; NOT compose: value+grad's walked body ends in the VECTOR [primal grads…],
+;; and seeding a vector tail silently yields zero gradients (documented on
+;; reified-grad; same reason grad-of-hvp doesn't fall out).
+;; ================================================================
+
+;; x³ — the canonical grad-of-grad sanity: g = ∂f/∂x = 3x², g′ = f″ = 6x.
+(deftm laws-cube [x :- Double] :- Double
+  (n/* x (n/* x x)))
+
+;; Float-only relu wrapper (same devirt-hazard dodge as laws-jvp-silu).
+(deftm laws-dbb-relu-act [x :- (Array float)] :- (Array float)
+  (rnn/relu x))
+
+;; THE double-backward target: mse ∘ silu ∘ linear-nb (float). Its gradient
+;; program is daxpy-diff! → silu-backward → linear-dx/dW — every #72 kernel.
+(deftm laws-dbb [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                 batch :- Long in :- Long out :- Long] :- Double
+  (loss/mse-loss (laws-jvp-silu (nn/linear-nb x W batch in out)
+                                (clojure.core/* batch out))
+                 tgt (clojure.core/* batch out)))
+
+;; relu variant — exercises relu-backward's self-adjoint derived rule.
+(deftm laws-dbb-relu [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                      batch :- Long in :- Long out :- Long] :- Double
+  (loss/mse-loss (laws-dbb-relu-act (nn/linear-nb x W batch in out))
+                 tgt (clojure.core/* batch out)))
+
+(deftest o4c-act-second-deriv-kernels
+  (testing "silu″/gelu″ closed forms = central FD of the backward kernels (double)"
+    ;; silu-backward(1̄, x)ᵢ = silu′(xᵢ), so d/dxᵢ of it is silu″(xᵢ) —
+    ;; the act″ kernels must match the FD of the very kernels whose reverse
+    ;; rules consume them. Points span both tails and the active region.
+    (let [n 7
+          x (double-array [-2.3 -0.9 -0.1 0.0 0.4 1.3 2.7])
+          ones (double-array (repeat n 1.0))
+          h 1e-6
+          shift (fn [s] (let [x2 (aclone x)]
+                          (dotimes [i n]
+                            (aset x2 i (clojure.core/+ (clojure.core/aget x2 i) (double s))))
+                          x2))
+          fd-of (fn [bwd]
+                  (let [y+ ^doubles (bwd ones (shift h) n)
+                        y- ^doubles (bwd ones (shift (- h)) n)]
+                    (mapv #(/ (- (clojure.core/aget y+ %) (clojure.core/aget y- %))
+                              (* 2.0 h))
+                          (range n))))]
+      (is (every? true? (map #(close? %1 %2 1e-8)
+                             (nn/silu-second-deriv x n) (fd-of nn/silu-backward)))
+          "silu″ = FD of silu-backward")
+      (is (every? true? (map #(close? %1 %2 1e-8)
+                             (nn/gelu-second-deriv x n) (fd-of nn/gelu-backward)))
+          "gelu″ = FD of gelu-backward"))))
+
+(deftest o4c-double-backward-law
+  (testing "scalar grad-of-grad: x³ → g = 3x², ∇g = 6x (exact)"
+    (let [vg-g (rev/value+grad (rev/reified-grad #'laws-cube 'x))]
+      (doseq [x [0.7 1.5 -2.0]]
+        (let [[g dg] (vg-g x)]
+          (is (close? g (* 3.0 x x) 1e-12) (str "g = f′ at " x))
+          (is (close? dg (* 6.0 x) 1e-12) (str "∇g = f″ at " x))))))
+
+  (testing "scalar 2-param: quad Hessian row via grad-of-grad (exact)"
+    ;; laws-quad = x² + xy, ∇ₓ = 2x + y, so ∇(∇ₓ) = [2 1] — the x-row of H.
+    (let [vg-g (rev/value+grad (rev/reified-grad #'laws-quad 'x))]
+      (let [[g dgx dgy] (vg-g 3.0 2.0)]
+        (is (== 8.0 g) "g = ∂f/∂x = 2x+y")
+        (is (== 2.0 dgx) "H[x,x]")
+        (is (== 1.0 dgy) "H[x,y]"))))
+
+  (testing "NN block double backward: ∇ₓ⟨∇ₓf, c⟩ = Hₓₓ·c vs FD-of-grad
+            (mse∘silu∘linear-nb float — daxpy-diff!, silu-backward(+act″),
+            linear-dx/dW, dot-product/scale second-order rules)"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 61) W (fa (* out in) 62) tgt (fa (* batch out) 63)
+          c (fa (* batch in) 64)
+          g-fn (rev/reified-grad #'laws-dbb 'x)
+          vg-f (rev/value+grad #'laws-dbb)
+          vg-g (rev/value+grad g-fn)
+          gx (nth (vg-f x W tgt batch in out) 1)
+          [g d-x d-W _d-tgt _ _ _ d-c] (vg-g x W tgt batch in out c)
+          h 1e-2]
+      ;; primal of the gradient program = ⟨∇ₓf, c⟩
+      (is (close? g (fdot gx c) tol-float) "g = ⟨∇ₓf, c⟩")
+      ;; ∂g/∂c = ∇ₓf itself (g is linear in c) — exact same array values
+      (is (farr-close? d-c gx tol-float) "∇_c g = ∇ₓf")
+      ;; ∂g/∂x = Hₓₓ·c, refereed by central FD OF THE GRADIENT along c
+      (let [gx+ (nth (vg-f (faxpy x h c) W tgt batch in out) 1)
+            gx- (nth (vg-f (faxpy x (- h) c) W tgt batch in out) 1)]
+        (is (farr-close? d-x (fd-diff gx+ gx- h) 5e-3)
+            "∇ₓ⟨∇ₓf,c⟩ = FD-of-grad (Hₓₓ·c)"))
+      ;; ∂g/∂W (the mixed block H_Wx·c): directional FD of g itself
+      (let [u (fa (* out in) 77)
+            g+ (g-fn x (faxpy W h u) tgt batch in out c)
+            g- (g-fn x (faxpy W (- h) u) tgt batch in out c)]
+        (is (close? (fdot d-W u) (/ (- (double g+) (double g-)) (* 2.0 h)) 1e-3)
+            "⟨∇_W g, u⟩ = directional FD (mixed second derivative)"))
+      ;; Cross-route: forward-over-reverse hvp with v = c must give the SAME
+      ;; Hₓₓ·c. This is also the o1b FLIP (#72): the silu-backward x-slot
+      ;; tangent used to FAIL LOUD (act″ pending) — hvp through a silu chain
+      ;; now works, and the two independent second-order routes agree.
+      (let [hf (jvp/hvp #'laws-dbb)
+            zW (float-array (* out in)) ztgt (float-array (* batch out))
+            [grads hv] (hf x W tgt batch in out c zW ztgt)]
+        (is (farr-close? (nth grads 0) gx tol-float) "hvp grads = ∇f")
+        (is (farr-close? (nth hv 0) d-x tol-float)
+            "reverse-over-reverse = forward-over-reverse (Hₓₓ·c)"))))
+
+  (testing "relu chain double backward: relu-backward's self-adjoint rule"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 61) W (fa (* out in) 62) tgt (fa (* batch out) 63)
+          c (fa (* batch in) 64)
+          vg-f (rev/value+grad #'laws-dbb-relu)
+          [_ d-x & _] ((rev/value+grad (rev/reified-grad #'laws-dbb-relu 'x))
+                       x W tgt batch in out c)
+          h 1e-2
+          gx+ (nth (vg-f (faxpy x h c) W tgt batch in out) 1)
+          gx- (nth (vg-f (faxpy x (- h) c) W tgt batch in out) 1)]
+      (is (farr-close? d-x (fd-diff gx+ gx- h) 5e-3)
+          "∇ₓ⟨∇ₓf,c⟩ = FD-of-grad through the relu mask"))))
 
 ;; SDPA JVP law (A3 attention frule, double kernels): directional FD referee.
 (deftest o1b-sdpa-jvp-law

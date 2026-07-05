@@ -2365,6 +2365,121 @@
      :pullback pullback
      :reified reified}))
 
+;; ================================================================
+;; Reified gradient program as a first-class deftm-style fn (#72)
+;; ================================================================
+
+(declare ^:private make-runtime-value+grad-fn)
+
+(defonce ^:private ror-rename-counter (atom 0))
+
+(defn- alpha-rename-bound
+  "α-rename every let*-bound symbol in a FLAT binding vector to a globally
+  unique name (\"__gp<N>\" suffix, monotonic defonce counter), preserving
+  each binding sym's :raster.type/tag on all occurrences.
+
+  Why: a reified gradient program FREEZES symbols minted under one
+  `with-ad-gensym` scope (counter starts at 0). A LATER AD pass over the
+  frozen program starts a fresh counter, and its ANF lifts mint the same
+  names — silently REBINDING inner syms mid-program (e.g. a float[] anf__2
+  rebound to a Double ANF temp → ClassCastException, or worse a silent
+  wrong gradient). Globally-unique renames make the frozen program safe to
+  re-enter with any gensym state."
+  [bindings tail]
+  (let [bound (vec (take-nth 2 bindings))
+        smap (into {}
+                   (map (fn [s]
+                          [s (with-meta
+                               (symbol (str (name s) "__gp" (swap! ror-rename-counter inc)))
+                               (meta s))]))
+                   bound)
+        rename (fn [form] (walk/postwalk-replace smap form))]
+    [(vec (mapcat (fn [[s init]] [(get smap s s) (rename init)])
+                  (partition 2 bindings)))
+     (rename tail)]))
+
+(defn ^clojure.lang.IFn reified-grad
+  "Reify ∂f/∂param of a scalar deftm as a deftm-style meta-fn — the
+  double-backward (reverse-over-reverse) composition surface (#72).
+
+  The result's walked body IS the flat gradient program (reify-pullback
+  assembled with the unit adjoint, as hvp does), so `value+grad` of the
+  result differentiates THROUGH the gradient computation — grad-of-grad,
+  L2(∇f) regularization, MAML-class meta-objectives — using the backward
+  kernels' own derived reverse rules (raster.ad.templates op-adjoints).
+
+  param: symbol naming one differentiable param of f.
+  - SCALAR param p → (fn [args…] -> ∂f/∂p), a scalar-valued program.
+  - ARRAY  param p → (fn [args… c] -> ⟨∂f/∂p, c⟩) with a cotangent array
+    `c` appended after f's params (value+grad w.r.t. an array-valued
+    gradient needs a scalar contraction; ∇ₓ⟨∇ₓf, c⟩ = Hₓₓ·c).
+
+  NOTE value+grad-of-value+grad does NOT compose: value+grad's walked body
+  ends in the VECTOR [primal grads…]; seeding a vector-valued tail silently
+  yields zero gradients. This assembly (scalar tail) is the shape that
+  composes."
+  [f-var param]
+  (let [resolved (resolve-deftm-var f-var)
+        m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "reified-grad requires a deftm var" {:var f-var})))
+        walked-body (or (rcore/ensure-walked-body! resolved)
+                        (throw (ex-info "No walked body on var" {:var f-var})))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        all-params (vec (map-indexed
+                         (fn [i p]
+                           (let [base (if (symbol? p) p (symbol (name p)))
+                                 tag (nth tags i nil)]
+                             (if tag
+                               (with-meta base {:raster.type/tag tag})
+                               (with-meta base nil))))
+                         params))
+        diff-params (vec (filter #(differentiable-tag? (:raster.type/tag (meta %)))
+                                 all-params))
+        param-sym (symbol (name param))
+        slot-idx (or (first (keep-indexed
+                             (fn [i p] (when (= p param-sym) i)) diff-params))
+                     (throw (ex-info (str "reified-grad: `" param "` is not a "
+                                          "differentiable param of " f-var)
+                                     {:param param :diff-params diff-params})))
+        param-tag (:raster.type/tag (meta (nth diff-params slot-idx)))
+        array-param? (= :array (:kind (tangent/tangent-kind param-tag)))
+        ;; The gradient program, assembled exactly as hvp does.
+        prepared (ad-prepare (first walked-body))
+        {:keys [fwd-bindings result-sym body-sym pullback-form]}
+        (reify-pullback prepared diff-params)
+        [_ rev-bindings grad-slots] pullback-form
+        grad-slot (nth (vec grad-slots) slot-idx)
+        c-sym (when array-param?
+                (with-meta (symbol (str "c__ror" (swap! ror-rename-counter inc)))
+                  {:raster.type/tag param-tag}))
+        tail-bindings (if array-param?
+                        [(symbol (str "gdot__ror" (swap! ror-rename-counter inc)))
+                         (list 'raster.par/dot-product grad-slot c-sym)]
+                        [])
+        tail (if array-param? (first tail-bindings) grad-slot)
+        bindings (vec (concat fwd-bindings
+                              [result-sym body-sym]
+                              ['dy__rad 1.0]
+                              rev-bindings
+                              tail-bindings))
+        ;; α-rename: the frozen program must survive a fresh-countered
+        ;; second AD pass (see alpha-rename-bound).
+        [bindings' tail'] (alpha-rename-bound bindings tail)
+        form (list 'let* bindings' tail')
+        fn-params (cond-> all-params array-param? (conj c-sym))
+        source-ns (or (:ns m) *ns*)
+        qualified (inf/qualify-body-symbols form source-ns (set fn-params))
+        runtime-fn (make-runtime-value+grad-fn [qualified] fn-params)
+        out-tags (cond-> (vec (take (count params) (concat tags (repeat nil))))
+                   array-param? (conj param-tag))]
+    (with-meta (fn [& args] (apply runtime-fn args))
+      {::reified-grad true
+       :raster.core/deftm true
+       :raster.core/deftm-walked-body [qualified]
+       :raster.core/deftm-params fn-params
+       :raster.core/deftm-tags out-tags})))
+
 (defn compile-hvp-fn
   "Compile a Hessian-vector product function for a scalar deftm var.
 
