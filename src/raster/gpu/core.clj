@@ -86,18 +86,12 @@
 ;; ================================================================
 
 (defn resolve-deftm-var
-  "Resolve a deftm var through dispatch table to the mangled backing var.
-   Returns the var that carries :raster.core/deftm metadata."
+  "Resolve a deftm var through dispatch table to the mangled backing var. Thin
+   wrapper over the canonical raster.core/resolve-deftm-var with the GPU policy:
+   any concrete overload's par-forms suffice, so pick the first (:ambiguity
+   :first); returns nil when v is not a deftm/dispatch var."
   [v]
-  (if (:raster.core/deftm (meta v))
-    v
-    (when-let [dt (:raster.core/dispatch-table (meta v))]
-      (let [entries (vals @dt)
-            method (first (first entries))
-            ns-obj (:ns (meta v))
-            mangled-name (symbol (str (:name (meta v)) "_m_"
-                                      (clojure.string/join "_" (:tags method))))]
-        (ns-resolve ns-obj mangled-name)))))
+  (rcore/resolve-deftm-var v {:ambiguity :first}))
 
 (defn get-walked-body
   "Get the walker-processed body from a deftm var.

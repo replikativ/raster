@@ -2300,43 +2300,16 @@
 ;; ================================================================
 
 (defn ^:no-doc resolve-deftm-var
-  "Resolve a deftm dispatch var to its backing mangled var with walked body.
-  Checks (in order):
-  1. Direct metadata on f-var (mangled method vars, value+grad/grad results)
-  2. Deref'd value metadata (for vars pointing to value+grad/grad IFn objects)
-  3. Dispatch table lookup (for generic dispatch vars → mangled method vars)"
+  "Resolve a deftm dispatch var to its backing mangled var for value+grad. Thin
+  wrapper over the canonical raster.core/resolve-deftm-var with the AD policy:
+  also accept vars pointing to a value+grad/grad IFn result (:deref-value?),
+  throw on ambiguous dispatch, and return f-var unchanged when it is not a
+  dispatch var (:on-miss :self)."
   [f-var]
-  (cond
-    ;; Direct metadata (mangled vars, IFn with metadata)
-    (:raster.core/deftm (meta f-var))
-    f-var
-
-    ;; Deref'd value: var pointing to a value+grad/grad result
-    (and (instance? clojure.lang.Var f-var)
-         (let [val-meta (try (meta @f-var) (catch Exception _ nil))]
-           (:raster.core/deftm val-meta)))
-    @f-var
-
-    ;; Dispatch table: generic var → mangled method
-    :else
-    (let [resolved (when-let [dt (:raster.core/dispatch-table (meta f-var))]
-                     (let [all-methods (mapcat identity (vals @dt))
-                           ns-obj (:ns (meta f-var))
-                           fn-name (:name (meta f-var))]
-                       (if (= 1 (count all-methods))
-                         ;; Single method: unambiguous
-                         (let [method (first all-methods)
-                               mangled-name (symbol (str fn-name "_m_"
-                                                         (clojure.string/join "_" (:tags method))))]
-                           (ns-resolve ns-obj mangled-name))
-                         ;; Multiple methods: cannot auto-resolve for AD
-                         (throw (ex-info (str "Ambiguous dispatch for value+grad on `" fn-name
-                                              "`: " (count all-methods) " overloads. "
-                                              "Use the mangled var directly, e.g. #'"
-                                              (ns-name ns-obj) "/" fn-name "_m_<tags>")
-                                         {:var f-var
-                                          :overloads (mapv :tags all-methods)})))))]
-      (or resolved f-var))))
+  (rcore/resolve-deftm-var
+   f-var {:deref-value? true
+          :on-miss :self
+          :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."}))
 
 (def ^:private vjp-cache (atom {}))
 
