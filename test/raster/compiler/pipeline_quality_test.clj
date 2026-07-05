@@ -10,6 +10,8 @@
             [raster.ad.reverse :as rev]
             [raster.arrays :as arrays]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.scalar.pe :as pe]
+            [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.tooling.inspect :as inspect]))
 
 (use-fixtures :once
@@ -293,3 +295,76 @@
           got (double (f a b n))]
       (is (< (Math/abs (- got (double expected))) 1e-9)
           (str "lifted=" got " scalar=" expected)))))
+
+;; ================================================================
+;; Task #78 regression: pe must not propagate a stale :raster.op/original
+;; across a rewrite that changed the node's operator.
+;; ================================================================
+
+(defn- count-name
+  "Count symbols in `form` whose name contains substring `s`."
+  [form ^String s]
+  (count (filter #(and (symbol? %) (.contains (str %) s))
+                 (tree-seq #(or (seq? %) (vector? %)) seq form))))
+
+;; cross-entropy-backward-dp = (broadcast [p t] (* (- (/ t (max 1e-15 p))) dy)).
+;; With a LITERAL 1.0 adjoint (the f64 loss seed), mul-by-one folds (* X 1.0)->X;
+;; pe then re-stamped the surviving (- X) with the *'s :raster.op/original,
+;; normalize rewrote the head - -> * and single-arg-mul deleted the negation ->
+;; dp = +t/p -> exact gradient sign flip -> MLP-f64 training divergence.
+(deftm ce-bwd-literal-seed [p :- (Array double) t :- (Array double)] :- (Array double)
+  (nn/cross-entropy-backward-dp 1.0 p t))
+
+(deftest cross-entropy-backward-literal-seed-keeps-negation-issue-78
+  (let [fx (:fixpointed (pipeline/show-pipeline #'ce-bwd-literal-seed :dtype :double))]
+    (is (>= (count-name fx "_minus__m_double-impl") 1)
+        (str "task #78: a LITERAL 1.0 f64 adjoint must NOT delete the -t/p "
+             "negation in cross-entropy-backward-dp (gradient sign flip)"))))
+
+;; Direct invariant on pe-pass: a rewrite that changes a node's operator must not
+;; leave the surviving node claiming the parent's :raster.op/original.
+(deftest pe-drops-stale-op-original-on-rewrite-issue-78
+  (let [node (with-meta
+               (list '.invk 'raster.numeric/_star__m_double_double-impl
+                     (with-meta (list '.invk 'raster.numeric/_minus__m_double-impl 'x)
+                       {:raster.op/original 'raster.numeric/-})
+                     1.0)
+               {:raster.op/original 'raster.numeric/*})
+        out (pe/pe-pass node {})]
+    (is (not= 'raster.numeric/* (:raster.op/original (meta out)))
+        "surviving (- x) must not inherit the *'s :raster.op/original after mul-by-one")))
+
+;; ================================================================
+;; Cross-cutting gate (task #78): a .invk node's :raster.op/original must never
+;; contradict the op-family of its impl name. A violation is the pe/normalize
+;; provenance corruption that flipped #78's gradient sign — normalize trusts
+;; :raster.op/original, so a stale one silently rewrites the head.
+;; ================================================================
+
+(defn- op-original-violations
+  "Seq of .invk nodes whose :raster.op/original contradicts the impl's op-family
+   (per normalize's canonical demangler)."
+  [form]
+  (let [demangle @#'normalize/direct-op-for-impl
+        v (atom [])]
+    ((fn walk [f]
+       (when (coll? f)
+         (when (and (seq? f) (= '.invk (first f)) (symbol? (second f)))
+           (let [o (:raster.op/original (meta f))
+                 o2 (demangle (name (second f)))]
+             (when (and o o2 (not= o o2))
+               (swap! v conj {:claimed o :impl-op o2 :impl (second f)}))))
+         (doseq [x f] (walk x))))
+     form)
+    @v))
+
+(deftest op-original-agrees-with-head-invariant-issue-78
+  (doseq [v [#'nn/predict-fn #'nn/loss-fn #'ce-bwd-literal-seed]]
+    (let [sp (pipeline/show-pipeline v :dtype :double)]
+      (doseq [stage [:walked :fixpointed :materialized :lowered]]
+        (when-let [form (get sp stage)]
+          (is (empty? (op-original-violations form))
+              (str v " @ " stage
+                   " has :raster.op/original contradicting its .invk head "
+                   "(the #78 pe/normalize corruption class): "
+                   (pr-str (first (op-original-violations form))))))))))

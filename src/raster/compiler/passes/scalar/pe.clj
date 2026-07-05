@@ -227,6 +227,23 @@
 ;; Main PE pass
 ;; ================================================================
 
+(defn- reattach-meta
+  "Reattach `form`'s metadata to a rewritten `result`. When the rewrite CHANGED
+  the form, `:raster.op/original` is DROPPED — a simplification can change the
+  surviving node's operator (e.g. `(* (- x) 1.0)` → `(- x)`), and propagating the
+  parent's `:raster.op/original` onto the survivor stamps it with a head-op that
+  contradicts its actual head. `normalize` trusts `:raster.op/original` as ground
+  truth and would then rewrite the head (`- → *`), collapsing `(* x) → x` and
+  silently deleting the negation — the task #78 gradient sign-flip. `normalize`
+  already recovers the correct op from the `.invk` impl name when the tag is
+  absent, so dropping it on a changed node is safe. Type tags are preserved."
+  [form result changed?]
+  (if-let [m (meta form)]
+    (if (instance? clojure.lang.IMeta result)
+      (with-meta result (if changed? (dissoc m :raster.op/original) m))
+      result)
+    result))
+
 (defn pe-pass
   "Single pass of partial evaluation.
   const-env: {symbol -> constant-value} for known bindings."
@@ -350,10 +367,10 @@
           (if (= simplified normalized)
             ;; Simplification didn't help — keep the .invk form with metadata
             invk-form
-            ;; Simplification reduced something — use simplified result
-            (if-let [m (meta form)]
-              (if (instance? clojure.lang.IMeta simplified) (with-meta simplified m) simplified)
-              simplified)))
+            ;; Simplification reduced something — reattach meta, but drop the now-
+            ;; possibly-stale :raster.op/original (the rewrite may have changed the
+            ;; node's operator — see reattach-meta / task #78).
+            (reattach-meta form simplified true)))
 
         ;; new — PE the constructor args
         (= head 'new)
@@ -394,10 +411,10 @@
         ;; General call — PE args, then try constant folding
         :else
         (let [pe-children (map #(pe-pass % const-env) form)
-              r (simp/simplify-1 (apply list pe-children))]
-          (if-let [m (meta form)]
-            (if (instance? clojure.lang.IMeta r) (with-meta r m) r)
-            r))))
+              called (apply list pe-children)
+              r (simp/simplify-1 called)]
+          ;; drop stale :raster.op/original iff simplify changed the head (task #78)
+          (reattach-meta form r (not= r called)))))
 
     ;; Vector
     (vector? form)
