@@ -212,25 +212,25 @@
 (deftm skip-layer-norm
   (All [T] [a :- (Array T) b :- (Array T) gamma :- (Array T) beta :- (Array T)
             batch :- Long features :- Long eps :- Double] :- (Array T)
-    (let [out  (alloc-like a (* batch features))
-          finv (/ 1.0 (double features))]
-      (dotimes [r batch]
-        (let [offset (* r (int features))
-              mean (loop [i 0 s 0.0]
-                     (if (< i features)
-                       (recur (inc i) (+ s (+ (aget a (+ offset i)) (aget b (+ offset i)))))
-                       (* s finv)))
-              var  (loop [i 0 s 0.0]
-                     (if (< i features)
-                       (let [d (- (+ (aget a (+ offset i)) (aget b (+ offset i))) mean)]
-                         (recur (inc i) (+ s (* d d))))
-                       (* s finv)))
-              inv-std (/ 1.0 (n/sqrt (+ var eps)))]
-          (dotimes [i features]
-            (let [v (+ (aget a (+ offset i)) (aget b (+ offset i)))]
-              (aset out (+ offset i)
-                    (+ (* (aget gamma i) (* (- v mean) inv-std)) (aget beta i)))))))
-      out)))
+       (let [out  (alloc-like a (* batch features))
+             finv (/ 1.0 (double features))]
+         (dotimes [r batch]
+           (let [offset (* r (int features))
+                 mean (loop [i 0 s 0.0]
+                        (if (< i features)
+                          (recur (inc i) (+ s (+ (aget a (+ offset i)) (aget b (+ offset i)))))
+                          (* s finv)))
+                 var  (loop [i 0 s 0.0]
+                        (if (< i features)
+                          (let [d (- (+ (aget a (+ offset i)) (aget b (+ offset i))) mean)]
+                            (recur (inc i) (+ s (* d d))))
+                          (* s finv)))
+                 inv-std (/ 1.0 (n/sqrt (+ var eps)))]
+             (dotimes [i features]
+               (let [v (+ (aget a (+ offset i)) (aget b (+ offset i)))]
+                 (aset out (+ offset i)
+                       (+ (* (aget gamma i) (* (- v mean) inv-std)) (aget beta i)))))))
+         out)))
 
 ;; --- GELU: x * Phi(x) (tanh approximation) ---
 ;; The tanh is inlined as a vectorizable odd-rational approximation (Eigen ptanh:
@@ -239,21 +239,21 @@
 (deftm gelu (All [T] [x :- (Array T) n :- Long] :- (Array T)
                  (let [c (n/sqrt (/ 2.0 n/pi))]
                    (broadcast [x]
-                     (let [u  (n/min 9.0 (n/max -9.0 (* c (+ x (* 0.044715 x x x)))))
-                           u2 (* u u)
-                           np (+ 4.89352455891786e-3
-                                 (* u2 (+ 6.37261928875436e-4
-                                          (* u2 (+ 1.48572235717979e-5
-                                                   (* u2 (+ 5.12229709037114e-8
-                                                            (* u2 (+ -8.60467152213735e-11
-                                                                     (* u2 (+ 2.00018790482477e-13
-                                                                              (* u2 -2.76076847742355e-16))))))))))))
-                           dp (+ 4.89352518554385e-3
-                                 (* u2 (+ 2.268434632439e-3
-                                          (* u2 (+ 1.18534705686654e-4
-                                                   (* u2 1.19825839466702e-6))))))
-                           th (/ (* u np) dp)]
-                       (* 0.5 x (+ 1.0 th)))))))
+                              (let [u  (n/min 9.0 (n/max -9.0 (* c (+ x (* 0.044715 x x x)))))
+                                    u2 (* u u)
+                                    np (+ 4.89352455891786e-3
+                                          (* u2 (+ 6.37261928875436e-4
+                                                   (* u2 (+ 1.48572235717979e-5
+                                                            (* u2 (+ 5.12229709037114e-8
+                                                                     (* u2 (+ -8.60467152213735e-11
+                                                                              (* u2 (+ 2.00018790482477e-13
+                                                                                       (* u2 -2.76076847742355e-16))))))))))))
+                                    dp (+ 4.89352518554385e-3
+                                          (* u2 (+ 2.268434632439e-3
+                                                   (* u2 (+ 1.18534705686654e-4
+                                                            (* u2 1.19825839466702e-6))))))
+                                    th (/ (* u np) dp)]
+                                (* 0.5 x (+ 1.0 th)))))))
 
 ;; gelu': 0.5*(1+tanh(inner)) + 0.5*x*sech^2(inner)*c*(1+3*0.044715*x^2)
 (deftm gelu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long]
@@ -269,7 +269,6 @@
                                             (* 0.5 xi sech2 c (+ 1.0 (* 3.0 0.044715 xi xi))))]
                                 (aset dx i (* (aget dy i) grad))))
                             dx)))
-
 
 (tmpl/merge-into-template! 'raster.dl.nn/gelu
                            {:params '[x n] :adjoint 'dy
@@ -292,7 +291,6 @@
                                    (aset dx i (* (aget dy i) si (- 1.0 si)))))
                                dx)))
 
-
 (tmpl/merge-into-template! 'raster.dl.nn/sigmoid
                            {:params '[x n] :adjoint 'dy
                             :grads-fn (fn [ctx [x n] result adjoint gensym-fn]
@@ -313,7 +311,6 @@
                                   (let [ti (aget result i)]
                                     (aset dx i (* (aget dy i) (- 1.0 (* ti ti))))))
                                 dx)))
-
 
 (tmpl/merge-into-template! 'raster.dl.nn/tanh-act
                            {:params '[x n] :adjoint 'dy
@@ -342,7 +339,6 @@
                                           grad (if (>= xi 0.0) 1.0 alpha)]
                                       (aset dx i (* (aget dy i) grad))))
                                   dx)))
-
 
 (tmpl/merge-into-template! 'raster.dl.nn/leaky-relu
                            {:params '[x n alpha] :adjoint 'dy
@@ -390,42 +386,42 @@
 (deftm layer-norm! (All [T] [x :- (Array T) gamma :- (Array T) beta :- (Array T)
                              out :- (Array T) rows :- Long features :- Long
                              eps :- Double] :- Void
-  (raster.par/map-void! r rows
-    (let [offset (clojure.core/* r features)
-          mean (loop [i 0 s 0.0]
-                 (if (< i features)
-                   (recur (inc i) (+ s (aget x (clojure.core/+ offset i))))
-                   (/ s (double features))))
-          var (loop [i 0 s 0.0]
-                (if (< i features)
-                  (let [dv (- (aget x (clojure.core/+ offset i)) mean)]
-                    (recur (inc i) (+ s (* dv dv))))
-                  (/ s (double features))))
-          inv (/ 1.0 (n/sqrt (+ var eps)))]
-      (loop [i 0]
-        (if (< i features)
-          (do (aset out (clojure.core/+ offset i)
-                    (+ (* (aget gamma i)
-                          (* (- (aget x (clojure.core/+ offset i)) mean) inv))
-                       (aget beta i)))
-              (recur (inc i)))
-          nil))))))
+                        (raster.par/map-void! r rows
+                                              (let [offset (clojure.core/* r features)
+                                                    mean (loop [i 0 s 0.0]
+                                                           (if (< i features)
+                                                             (recur (inc i) (+ s (aget x (clojure.core/+ offset i))))
+                                                             (/ s (double features))))
+                                                    var (loop [i 0 s 0.0]
+                                                          (if (< i features)
+                                                            (let [dv (- (aget x (clojure.core/+ offset i)) mean)]
+                                                              (recur (inc i) (+ s (* dv dv))))
+                                                            (/ s (double features))))
+                                                    inv (/ 1.0 (n/sqrt (+ var eps)))]
+                                                (loop [i 0]
+                                                  (if (< i features)
+                                                    (do (aset out (clojure.core/+ offset i)
+                                                              (+ (* (aget gamma i)
+                                                                    (* (- (aget x (clojure.core/+ offset i)) mean) inv))
+                                                                 (aget beta i)))
+                                                        (recur (inc i)))
+                                                    nil))))))
 
 ;; !-variant elementwise GELU (tanh approximation, matches `gelu`/gelu-mul!).
 (deftm gelu! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
-  (raster.par/map-void! i n
-    (let [v (aget x i)]
-      (aset out i (* 0.5 v
-                     (+ 1.0 (m/tanh (* 0.7978845608028654
-                                       (+ v (* 0.044715 v v v)))))))))))
+                  (raster.par/map-void! i n
+                                        (let [v (aget x i)]
+                                          (aset out i (* 0.5 v
+                                                         (+ 1.0 (m/tanh (* 0.7978845608028654
+                                                                           (+ v (* 0.044715 v v v)))))))))))
 
 ;; Broadcast row-bias add in place semantics via separate out (resident-graph
 ;; friendly): out[r,j] = x[r,j] + b[j]. Follows every biased linear in
 ;; encoder-family layers (AuT, BERT) — the quantized GEMM kernels are bias-free.
 (deftm add-bias-rows! (All [T] [x :- (Array T) b :- (Array T) out :- (Array T)
                                 rows :- Long features :- Long] :- Void
-  (raster.par/map-void! i (* rows features)
-    (aset out i (+ (aget x i) (aget b (clojure.core/rem i features)))))))
+                           (raster.par/map-void! i (* rows features)
+                                                 (aset out i (+ (aget x i) (aget b (clojure.core/rem i features)))))))
 
 ;; layer-norm rrule — pullback registered after backward deftm (below)
 
@@ -485,10 +481,10 @@
 ;; TWO active inputs (the SOAC map differentiates only single-active), so gated
 ;; MLPs need this dedicated op. Pullback: d_a = dy⊙b, d_b = dy⊙a.
 (deftm hadamard (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
-                    (broadcast [a b] (* a b))))
+                     (broadcast [a b] (* a b))))
 
 (deftm hadamard-backward (All [T] [dy :- (Array T) other :- (Array T) n :- Long] :- (Array T)
-                             (broadcast [dy other] (* dy other))))
+                              (broadcast [dy other] (* dy other))))
 
 ;; Gated MLP (GeGLU): down( gelu(x@gate^T) ⊙ (x@up^T) ), bias-free.
 ;; This is Gemma's / T5-v1.1's MLP. The SwiGLU variant (Llama/Qwen) is identical
@@ -520,9 +516,9 @@
 ;; (broadcast [a b] (+ a b)) has no AD template for two active inputs, so the
 ;; ubiquitous transformer residual (x + attn/mlp out) needs this explicit rule.
 (deftm residual-add-backward (All [T] [dy :- (Array T) n :- Long] :- (Array T)
-                                 (let [out (alloc-like dy n)]
-                                   (acopy! dy 0 out 0 n)
-                                   out)))
+                                  (let [out (alloc-like dy n)]
+                                    (acopy! dy 0 out 0 n)
+                                    out)))
 
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
@@ -1082,7 +1078,6 @@
                                                 (aget dy (+ (* i (int dim)) d)))))))
                                  d-table)))
 
-
 (tmpl/merge-into-template! 'raster.dl.nn/embedding
                            {:params '[table indices n vocab dim] :adjoint 'dy
                             :grads-fn (fn [ctx [table indices n vocab dim] _result adjoint gensym-fn]
@@ -1111,7 +1106,6 @@
                                (dotimes [i n]
                                  (aset dx i (* (aget dy i) (aget mask i))))
                                dx)))
-
 
 (tmpl/merge-into-template! 'raster.dl.nn/dropout
                            {:params '[x mask n] :adjoint 'dy
@@ -1166,7 +1160,6 @@
                                           (* (aget result i)
                                              (- (aget dy i) s-dot-dy))))
                                   dx)))
-
 
 (tmpl/merge-into-template! 'raster.dl.nn/softmax-1d
                            {:params '[x n] :adjoint 'dy
@@ -1349,6 +1342,50 @@
                                         dbeta)))
 
 ;; ----------------------------------------------------------------
+;; Layer-norm forward tangent (JVP, §13 A3) — the x-directional differential:
+;;   x̂ = (x−μ)·inv,  inv = 1/σ = 1/sqrt(var+eps)
+;;   dx̂ = (dx − mean(dx) − x̂·mean(x̂⊙dx))·inv
+;;   d  = γ⊙dx̂
+;; The γ/β tangent terms are NOT here: layer-norm is JOINTLY LINEAR in
+;; (γ, β), so their pushforward is the op itself with (dγ, dβ) — see the
+;; :jvp-fn registration below.
+;; ----------------------------------------------------------------
+
+(deftm layer-norm-jvp-dx (All [T] [dx :- (Array T) x :- (Array T)
+                                   gamma :- (Array T)
+                                   batch :- Long features :- Long eps :- Double]
+                              :- (Array T)
+                              (let [out (alloc-like dx (* batch features))]
+                                (dotimes [b batch]
+                                  (let [offset (* b (int features))
+                                        mean (loop [i 0 s 0.0]
+                                               (if (< i features)
+                                                 (recur (inc i) (+ s (aget x (+ offset i))))
+                                                 (/ s features)))
+                                        var (loop [i 0 s 0.0]
+                                              (if (< i features)
+                                                (let [d (- (aget x (+ offset i)) mean)]
+                                                  (recur (inc i) (+ s (* d d))))
+                                                (/ s features)))
+                                        inv-std (/ 1.0 (n/sqrt (+ var eps)))
+                                        dmean (loop [i 0 s 0.0]
+                                                (if (< i features)
+                                                  (recur (inc i) (+ s (aget dx (+ offset i))))
+                                                  (/ s features)))
+                                        m2 (loop [i 0 s 0.0]
+                                             (if (< i features)
+                                               (let [x-hat (* (- (aget x (+ offset i)) mean) inv-std)]
+                                                 (recur (inc i) (+ s (* x-hat (aget dx (+ offset i))))))
+                                               (/ s features)))]
+                                    (dotimes [i features]
+                                      (let [x-hat (* (- (aget x (+ offset i)) mean) inv-std)]
+                                        (aset out (+ offset i)
+                                              (* (aget gamma i)
+                                                 (* inv-std
+                                                    (- (aget dx (+ offset i)) (+ dmean (* x-hat m2))))))))))
+                                out)))
+
+;; ----------------------------------------------------------------
 ;; RMS-norm backward: dx, dweight
 ;;   y_i = x_i · inv · (g0 + w_i),  inv = 1/sqrt(mean_j(x_j²) + eps)
 ;;   c   = Σ_i (g0+w_i)·x_i·dy_i   (per row)
@@ -1359,46 +1396,81 @@
 (deftm rms-norm-backward-dx (All [T] [dy :- (Array T) x :- (Array T) weight :- (Array T)
                                       rows :- Long features :- Long
                                       eps :- Double gain-offset :- Double] :- (Array T)
-                                (let [dx (alloc-like dy (* rows features))]
-                                  (dotimes [r rows]
-                                    (let [offset (* r (int features))
-                                          ms (loop [i 0 s 0.0]
+                                 (let [dx (alloc-like dy (* rows features))]
+                                   (dotimes [r rows]
+                                     (let [offset (* r (int features))
+                                           ms (loop [i 0 s 0.0]
+                                                (if (< i features)
+                                                  (let [v (aget x (+ offset i))]
+                                                    (recur (inc i) (+ s (* v v))))
+                                                  (/ s features)))
+                                           inv (/ 1.0 (n/sqrt (+ ms eps)))
+                                           c (loop [i 0 s 0.0]
                                                (if (< i features)
-                                                 (let [v (aget x (+ offset i))]
-                                                   (recur (inc i) (+ s (* v v))))
-                                                 (/ s features)))
-                                          inv (/ 1.0 (n/sqrt (+ ms eps)))
-                                          c (loop [i 0 s 0.0]
-                                              (if (< i features)
-                                                (let [gi (+ gain-offset (aget weight i))]
-                                                  (recur (inc i)
-                                                         (+ s (* gi (* (aget x (+ offset i))
-                                                                       (aget dy (+ offset i)))))))
-                                                s))
-                                          inv3f (/ (* inv (* inv inv)) features)]
-                                      (dotimes [i features]
-                                        (let [gi (+ gain-offset (aget weight i))]
-                                          (aset dx (+ offset i)
-                                                (- (* inv (* gi (aget dy (+ offset i))))
-                                                   (* inv3f (* (aget x (+ offset i)) c))))))))
-                                  dx)))
+                                                 (let [gi (+ gain-offset (aget weight i))]
+                                                   (recur (inc i)
+                                                          (+ s (* gi (* (aget x (+ offset i))
+                                                                        (aget dy (+ offset i)))))))
+                                                 s))
+                                           inv3f (/ (* inv (* inv inv)) features)]
+                                       (dotimes [i features]
+                                         (let [gi (+ gain-offset (aget weight i))]
+                                           (aset dx (+ offset i)
+                                                 (- (* inv (* gi (aget dy (+ offset i))))
+                                                    (* inv3f (* (aget x (+ offset i)) c))))))))
+                                   dx)))
 
 (deftm rms-norm-backward-dweight (All [T] [dy :- (Array T) x :- (Array T)
                                            rows :- Long features :- Long eps :- Double] :- (Array T)
-                                     (let [dw (alloc-like dy features)]
-                                       (dotimes [r rows]
-                                         (let [offset (* r (int features))
-                                               ms (loop [i 0 s 0.0]
-                                                    (if (< i features)
-                                                      (let [v (aget x (+ offset i))]
-                                                        (recur (inc i) (+ s (* v v))))
-                                                      (/ s features)))
-                                               inv (/ 1.0 (n/sqrt (+ ms eps)))]
-                                           (dotimes [i features]
-                                             (aset dw i (+ (aget dw i)
-                                                           (* (aget dy (+ offset i))
-                                                              (* (aget x (+ offset i)) inv)))))))
-                                       dw)))
+                                      (let [dw (alloc-like dy features)]
+                                        (dotimes [r rows]
+                                          (let [offset (* r (int features))
+                                                ms (loop [i 0 s 0.0]
+                                                     (if (< i features)
+                                                       (let [v (aget x (+ offset i))]
+                                                         (recur (inc i) (+ s (* v v))))
+                                                       (/ s features)))
+                                                inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                                            (dotimes [i features]
+                                              (aset dw i (+ (aget dw i)
+                                                            (* (aget dy (+ offset i))
+                                                               (* (aget x (+ offset i)) inv)))))))
+                                        dw)))
+
+;; ----------------------------------------------------------------
+;; RMS-norm forward tangent (JVP, §13 A3) — the x-directional differential:
+;;   r = sqrt(mean(x²)+eps),  c = ⟨x,dx⟩ per row
+;;   d_i = (g0+w_i)·(dx_i/r − x_i·c/(F·r³))
+;; The weight-tangent term dw⊙x/r is NOT here: rms-norm is LINEAR in
+;; (g0 + w), so its pushforward is rms-norm(x, dw, …, gain-offset 0.0) —
+;; see the :jvp-fn registration below.
+;; ----------------------------------------------------------------
+
+(deftm rms-norm-jvp-dx (All [T] [dx :- (Array T) x :- (Array T) weight :- (Array T)
+                                 rows :- Long features :- Long
+                                 eps :- Double gain-offset :- Double] :- (Array T)
+                            (let [out (alloc-like dx (* rows features))]
+                              (dotimes [r rows]
+                                (let [offset (* r (int features))
+                                      ms (loop [i 0 s 0.0]
+                                           (if (< i features)
+                                             (let [v (aget x (+ offset i))]
+                                               (recur (inc i) (+ s (* v v))))
+                                             (/ s features)))
+                                      inv (/ 1.0 (n/sqrt (+ ms eps)))
+                                      c (loop [i 0 s 0.0]
+                                          (if (< i features)
+                                            (recur (inc i)
+                                                   (+ s (* (aget x (+ offset i))
+                                                           (aget dx (+ offset i)))))
+                                            s))
+                                      inv3f (/ (* inv (* inv inv)) features)]
+                                  (dotimes [i features]
+                                    (aset out (+ offset i)
+                                          (* (+ gain-offset (aget weight i))
+                                             (- (* inv (aget dx (+ offset i)))
+                                                (* inv3f (* (aget x (+ offset i)) c))))))))
+                              out)))
 
 ;; ----------------------------------------------------------------
 ;; Group-norm backward: dx, dgamma, dbeta
@@ -1522,6 +1594,77 @@
                                         dbeta)))
 
 ;; ----------------------------------------------------------------
+;; Group-norm forward tangent (JVP, §13 A3) — layer-norm JVP per group,
+;; iterating groups exactly like group-norm-backward-dx:
+;;   per (b,g): x̂ = (x−μ_g)·inv_g
+;;              dx̂ = (dx − mean_g(dx) − x̂·mean_g(x̂⊙dx))·inv_g
+;;              d = γ_ch⊙dx̂
+;; γ/β tangent terms: group-norm is jointly LINEAR in (γ, β) → the op
+;; itself with (dγ, dβ); see the :jvp-fn registration below.
+;; ----------------------------------------------------------------
+
+(deftm group-norm-jvp-dx (All [T] [dx :- (Array T) x :- (Array T)
+                                   gamma :- (Array T)
+                                   batch :- Long channels :- Long
+                                   spatial :- Long groups :- Long eps :- Double]
+                              :- (Array T)
+                              (let [cpg (quot channels groups)
+                                    group-size (* cpg spatial)
+                                    out (alloc-like dx (* batch channels spatial))]
+                                (dotimes [b batch]
+                                  (dotimes [g groups]
+                                    (let [mean (loop [c 0 acc 0.0]
+                                                 (if (< c cpg)
+                                                   (let [ch (+ (* g (int cpg)) c)
+                                                         acc (loop [sp 0 inner-acc acc]
+                                                               (if (< sp spatial)
+                                                                 (recur (inc sp)
+                                                                        (+ inner-acc
+                                                                           (aget x (+ (* b (int (* channels spatial)))
+                                                                                      (* ch (int spatial)) sp))))
+                                                                 inner-acc))]
+                                                     (recur (inc c) acc))
+                                                   (/ acc group-size)))
+                                          var (loop [c 0 acc 0.0]
+                                                (if (< c cpg)
+                                                  (let [ch (+ (* g (int cpg)) c)
+                                                        acc (loop [sp 0 inner-acc acc]
+                                                              (if (< sp spatial)
+                                                                (let [idx (+ (* b (int (* channels spatial)))
+                                                                             (* ch (int spatial)) sp)
+                                                                      d (- (aget x idx) mean)]
+                                                                  (recur (inc sp) (+ inner-acc (* d d))))
+                                                                inner-acc))]
+                                                    (recur (inc c) acc))
+                                                  (/ acc group-size)))
+                                          inv-std (/ 1.0 (n/sqrt (+ var eps)))
+              ;; group means of dx and x̂⊙dx (double-array accumulator — same
+              ;; vector-return workaround as group-norm-backward-dx)
+                                          sums-buf (double-array 2)
+                                          _ (dotimes [c cpg]
+                                              (let [ch (+ (* g (int cpg)) c)]
+                                                (dotimes [sp spatial]
+                                                  (let [idx (+ (* b (int (* channels spatial)))
+                                                               (* ch (int spatial)) sp)
+                                                        x-hat (* (- (aget x idx) mean) inv-std)]
+                                                    (aset sums-buf 0 (+ (aget sums-buf 0) (aget dx idx)))
+                                                    (aset sums-buf 1 (+ (aget sums-buf 1)
+                                                                        (* x-hat (aget dx idx))))))))
+                                          dmean (/ (aget sums-buf 0) group-size)
+                                          m2 (/ (aget sums-buf 1) group-size)]
+                                      (dotimes [c cpg]
+                                        (let [ch (+ (* g (int cpg)) c)]
+                                          (dotimes [sp spatial]
+                                            (let [idx (+ (* b (int (* channels spatial)))
+                                                         (* ch (int spatial)) sp)
+                                                  x-hat (* (- (aget x idx) mean) inv-std)]
+                                              (aset out idx
+                                                    (* (aget gamma ch)
+                                                       (* inv-std
+                                                          (- (aget dx idx) (+ dmean (* x-hat m2)))))))))))))
+                                out)))
+
+;; ----------------------------------------------------------------
 ;; Batch-norm backward: dx, dgamma, dbeta
 ;; ----------------------------------------------------------------
 
@@ -1593,6 +1736,53 @@
                                           (dotimes [j features]
                                             (aset dbeta j (+ (aget dbeta j) (aget dy (+ (* i (int features)) j))))))
                                         dbeta)))
+
+;; ----------------------------------------------------------------
+;; Batch-norm forward tangent (JVP, §13 A3) — the standard TRAINING-MODE
+;; differential (batch statistics; mirrors batch-norm-backward-dx, which
+;; has the same training-only structure), per feature column j over batch:
+;;   x̂ = (x−μ_j)·inv_j
+;;   dx̂ = (dx − mean_i(dx) − x̂·mean_i(x̂⊙dx))·inv_j
+;;   d = γ_j⊙dx̂
+;; γ/β tangent terms: batch-norm is jointly LINEAR in (γ, β) → the op
+;; itself with (dγ, dβ) over CLONED running stats (the primal call already
+;; updated them; the tangent call must not double-update) — see :jvp-fn.
+;; ----------------------------------------------------------------
+
+(deftm batch-norm-jvp-dx (All [T] [dx :- (Array T) x :- (Array T)
+                                   gamma :- (Array T)
+                                   batch :- Long features :- Long eps :- Double]
+                              :- (Array T)
+                              (let [out (alloc-like dx (* batch features))]
+                                (dotimes [j features]
+                                  (let [mean (loop [i 0 s 0.0]
+                                               (if (< i batch)
+                                                 (recur (inc i) (+ s (aget x (+ (* i (int features)) j))))
+                                                 (/ s batch)))
+                                        var (loop [i 0 s 0.0]
+                                              (if (< i batch)
+                                                (let [d (- (aget x (+ (* i (int features)) j)) mean)]
+                                                  (recur (inc i) (+ s (* d d))))
+                                                (/ s batch)))
+                                        inv-std (/ 1.0 (n/sqrt (+ var eps)))
+                                        dmean (loop [i 0 s 0.0]
+                                                (if (< i batch)
+                                                  (recur (inc i) (+ s (aget dx (+ (* i (int features)) j))))
+                                                  (/ s batch)))
+                                        m2 (loop [i 0 s 0.0]
+                                             (if (< i batch)
+                                               (let [idx (+ (* i (int features)) j)
+                                                     x-hat (* (- (aget x idx) mean) inv-std)]
+                                                 (recur (inc i) (+ s (* x-hat (aget dx idx)))))
+                                               (/ s batch)))]
+                                    (dotimes [i batch]
+                                      (let [idx (+ (* i (int features)) j)
+                                            x-hat (* (- (aget x idx) mean) inv-std)]
+                                        (aset out idx
+                                              (* (aget gamma j)
+                                                 (* inv-std
+                                                    (- (aget dx idx) (+ dmean (* x-hat m2))))))))))
+                                out)))
 
 ;; ----------------------------------------------------------------
 ;; Conv1d backward: dx, dW, db
@@ -1787,3 +1977,149 @@
                                                              adjoint-sym batch c-out length kernel stride pad)])
                                            ;; 10 params: dx dW db + 7 nil (batch c-in length c-out kernel stride pad)
                                            [dx dW db nil nil nil nil nil nil nil]]))})
+
+;; ================================================================
+;; Forward (JVP) rules — §13 A3 hand frules for the norm residue.
+;;
+;; Each norm's differential splits into
+;;   (1) the x-direction (the *-jvp-dx kernels above — textbook forms,
+;;       mirroring the corresponding backward kernel's iteration), and
+;;   (2) the (γ, β) / weight direction: every norm is JOINTLY LINEAR in its
+;;       affine parameters, so that pushforward is the op ITSELF on the
+;;       parameter tangents (typed zeros where a tangent is absent — exact
+;;       by linearity).
+;; Terms combine via grad-acc (the same ⊕ the reverse pass uses); emitted
+;; calls are fully qualified; flat bindings (BindCtx), matching
+;; derive-jvp-fn output conventions.
+;; ================================================================
+
+;; rms-norm [x weight rows features eps gain-offset]:
+;;   d = rms-norm-jvp-dx(dx, …) ⊕ rms-norm(x, dw, …, gain-offset 0.0)
+;; (weight enters only as (g0 + w) — linear; the tangent of the g0 offset
+;;  is 0, hence gain-offset 0.0 in the weight-tangent term.)
+(tmpl/merge-into-template!
+ 'raster.dl.nn/rms-norm
+ {:jvp-fn
+  (fn [ctx [x weight rows features eps gain-offset] tangent-args _result-sym gensym-fn]
+    (let [dx (nth tangent-args 0 nil)
+          dw (nth tangent-args 1 nil)]
+      (when-not (or dx dw)
+        (throw (ex-info "rms-norm jvp: no active tangent reached the call"
+                        {:op 'raster.dl.nn/rms-norm})))
+      (let [[ctx terms]
+            (if dx
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jrms_dx"
+                                                 (list 'raster.dl.nn/rms-norm-jvp-dx
+                                                       dx x weight rows features eps gain-offset))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if dw
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jrms_dw"
+                                                 (list 'raster.dl.nn/rms-norm
+                                                       x dw rows features eps 0.0))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (tmpl/sum-tangent-contribs ctx terms gensym-fn))))})
+
+;; layer-norm [x gamma beta batch features eps]:
+;;   d = layer-norm-jvp-dx(dx, …) ⊕ layer-norm(x, dγ|0, dβ|0, …)
+(tmpl/merge-into-template!
+ 'raster.dl.nn/layer-norm
+ {:jvp-fn
+  (fn [ctx [x gamma beta batch features eps] tangent-args _result-sym gensym-fn]
+    (let [dx (nth tangent-args 0 nil)
+          dgamma (nth tangent-args 1 nil)
+          dbeta (nth tangent-args 2 nil)]
+      (when-not (or dx dgamma dbeta)
+        (throw (ex-info "layer-norm jvp: no active tangent reached the call"
+                        {:op 'raster.dl.nn/layer-norm})))
+      (let [[ctx terms]
+            (if dx
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jln_dx"
+                                                 (list 'raster.dl.nn/layer-norm-jvp-dx
+                                                       dx x gamma batch features eps))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if (or dgamma dbeta)
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jln_gb"
+                                                 (list 'raster.dl.nn/layer-norm
+                                                       x
+                                                       (or dgamma (tmpl/jvp-zero-like gamma))
+                                                       (or dbeta (tmpl/jvp-zero-like beta))
+                                                       batch features eps))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (tmpl/sum-tangent-contribs ctx terms gensym-fn))))})
+
+;; group-norm [x gamma beta batch channels spatial groups eps]:
+;;   d = group-norm-jvp-dx(dx, …) ⊕ group-norm(x, dγ|0, dβ|0, …)
+(tmpl/merge-into-template!
+ 'raster.dl.nn/group-norm
+ {:jvp-fn
+  (fn [ctx [x gamma beta batch channels spatial groups eps] tangent-args _result-sym gensym-fn]
+    (let [dx (nth tangent-args 0 nil)
+          dgamma (nth tangent-args 1 nil)
+          dbeta (nth tangent-args 2 nil)]
+      (when-not (or dx dgamma dbeta)
+        (throw (ex-info "group-norm jvp: no active tangent reached the call"
+                        {:op 'raster.dl.nn/group-norm})))
+      (let [[ctx terms]
+            (if dx
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jgn_dx"
+                                                 (list 'raster.dl.nn/group-norm-jvp-dx
+                                                       dx x gamma batch channels spatial groups eps))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if (or dgamma dbeta)
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jgn_gb"
+                                                 (list 'raster.dl.nn/group-norm
+                                                       x
+                                                       (or dgamma (tmpl/jvp-zero-like gamma))
+                                                       (or dbeta (tmpl/jvp-zero-like beta))
+                                                       batch channels spatial groups eps))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (tmpl/sum-tangent-contribs ctx terms gensym-fn))))})
+
+;; batch-norm [x gamma beta running-mean running-var batch features eps momentum training]:
+;;   d = batch-norm-jvp-dx(dx, …)                        (training-mode, like the backward)
+;;     ⊕ batch-norm(x, dγ|0, dβ|0, clone(rm), clone(rv), …)
+;; Running stats are CLONED for the tangent term: the primal call already
+;; applied the momentum update; re-running the op must not update them again.
+;; Their tangents are rule-frozen (the reverse rule gives rm/rv nil grads).
+(tmpl/merge-into-template!
+ 'raster.dl.nn/batch-norm
+ {:jvp-fn
+  (fn [ctx [x gamma beta running-mean running-var batch features eps momentum training]
+       tangent-args _result-sym gensym-fn]
+    (let [dx (nth tangent-args 0 nil)
+          dgamma (nth tangent-args 1 nil)
+          dbeta (nth tangent-args 2 nil)]
+      (when-not (or dx dgamma dbeta)
+        (throw (ex-info "batch-norm jvp: no active tangent reached the call"
+                        {:op 'raster.dl.nn/batch-norm})))
+      (let [[ctx terms]
+            (if dx
+              (let [[ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jbn_dx"
+                                                 (list 'raster.dl.nn/batch-norm-jvp-dx
+                                                       dx x gamma batch features eps))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if (or dgamma dbeta)
+              (let [[ctx rmc] (tmpl/bind-jvp-term ctx gensym-fn "jbn_rmc"
+                                                  (list 'raster.arrays/aclone running-mean))
+                    [ctx rvc] (tmpl/bind-jvp-term ctx gensym-fn "jbn_rvc"
+                                                  (list 'raster.arrays/aclone running-var))
+                    [ctx' s] (tmpl/bind-jvp-term ctx gensym-fn "jbn_gb"
+                                                 (list 'raster.dl.nn/batch-norm
+                                                       x
+                                                       (or dgamma (tmpl/jvp-zero-like gamma))
+                                                       (or dbeta (tmpl/jvp-zero-like beta))
+                                                       rmc rvc batch features eps momentum training))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (tmpl/sum-tangent-contribs ctx terms gensym-fn))))})

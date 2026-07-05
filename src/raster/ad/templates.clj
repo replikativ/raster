@@ -1059,7 +1059,14 @@
      JVP is the tangent of the LOSS component (mirrors the reverse rule,
      whose scalar adjoint dy also addresses only the loss slot);
    - forward-noise is JOINTLY linear in {x0, noise} (alpha-t rule-frozen);
-   - maxpool2d, einsum, dgemm! deliberately untagged (A3/kernel gaps)."
+   - A3 residue landed as hand :jvp-fn facets at the op's home ns (rms-norm,
+     layer-norm, group-norm, batch-norm in raster.dl.nn; segment-div in
+     raster.dl.array-ops; scaled-dot-product-attn / causal-… / gqa-causal-mha
+     in raster.dl.attention);
+   - STILL fail-loud (documented A3 skips): solve, array-det,
+     fixed-point-solve, solve-effort (forward-IFT needs a linear solve —
+     separate phase), embed-timestep (needs a small kernel), maxpool2d,
+     einsum, dgemm! (effectful β-accumulate)."
   {;; --- (a) elementwise: diagonal Jacobian, frule = backward(tangent) ---
    'raster.nn/relu                       {:class :elementwise :in #{0}} ;; [x]
    'raster.dl.nn/gelu                    {:class :elementwise :in #{0}} ;; [x n]
@@ -1090,6 +1097,8 @@
    'raster.dl.diffusion/forward-noise    {:class :linear :in #{0 1}}    ;; [x0 noise alpha-t n], alpha-t rule-frozen
    'raster.quant.train/qlinear-q8        {:class :linear :in #{0}}      ;; [x codes scales m in out] — codes frozen
    'clojure.core/aget                    {:class :linear :in #{0}}      ;; [arr i] — one-hot read
+   'raster.arrays/aclone                 {:class :linear :in #{0}}      ;; [arr] — copy (tangent = aclone of tangent)
+   'clojure.core/aclone                  {:class :linear :in #{0}}      ;; [arr] — copy
    ;; --- (c) bilinear: frule = op(Δx,·) ⊕ op(·,ΔW) ---
    'raster.dl.nn/matmul          {:class :bilinear :args [0 1]}                   ;; [A B m k n]
    'raster.dl.nn/linear          {:class :bilinear :args [0 1] :linear-extra #{2}} ;; [x W b batch in-f out-f]
@@ -1109,6 +1118,22 @@
    'raster.dl.loss/cross-entropy-loss   {:class :scalar-loss} ;; [logits target batch classes]
    'raster.nn/cross-entropy             {:class :scalar-loss} ;; [p t], t rule-frozen
    'raster.nn/softmax-cross-entropy     {:class :scalar-loss} ;; [logits t] → [loss s] tuple (see note)
+   ;; --- A4 RoR-closure seeds (#72): backward kernels appearing as CALLS in
+   ;; gradient programs. Forward-over-reverse HVP jvp-folds the reified
+   ;; pullback, so each backward kernel needs its OWN structure tag.
+   ;; Linearity justifications (per kernel):
+   ;;   linear-dx  (dy,W)→dy@W        — bilinear in (dy, W)
+   ;;   linear-dW  (dy,x)→dyᵀ@x       — bilinear in (dy, x)
+   ;;   linear-db  (dy)→colsum(dy)    — linear in dy
+   ;;   relu-backward (dy,x)→dy⊙1[x>0] — linear in dy; the x-derivative is
+   ;;     0 a.e. (relu″ = 0 away from the kink), so dropping an x-tangent is
+   ;;     the exact a.e. rule, same convention as the primal relu kink.
+   ;; (silu/gelu-backward and daxpy-diff! have explicit :jvp-fn below:
+   ;;  their structure is not a single class.) ---
+   'raster.dl.nn/linear-dx  {:class :bilinear :args [0 1]} ;; [dy W batch in-f out-f]
+   'raster.dl.nn/linear-dW  {:class :bilinear :args [0 1]} ;; [dy x batch in-f out-f]
+   'raster.dl.nn/linear-db  {:class :linear :in #{0}}      ;; [dy batch out-f]
+   'raster.nn/relu-backward {:class :linear :in #{0}}      ;; [dy x]
    ;; --- scalar primitives: frule = Σᵢ grads(dy:=Δxᵢ) (mechanical, §2) ---
    '+          {:class :elementwise :in #{0 1}}
    '-          {:class :elementwise :in #{0 1}}
@@ -1161,22 +1186,32 @@
 (doseq [[op st] op-structures]
   (merge-into-template! op {:structure st}))
 
-(defn- jvp-zero-like
+(defn jvp-zero-like
   "Typed zero tangent shaped/dtyped like the PRIMAL arg (tangent protocol):
   used for :in / :linear-extra slots whose tangent is absent in a term where
-  substituting the primal would be WRONG (linear ⇒ f(Δa,b) ≠ df)."
+  substituting the primal would be WRONG (linear ⇒ f(Δa,b) ≠ df).
+  Public: hand-written :jvp-fn facets (§13 A3) use the same convention."
   [primal-arg]
   (list 'raster.arrays/zeros-like primal-arg
         (list 'raster.arrays/alength primal-arg)))
 
-(defn- sum-tangent-contribs
+(defn sum-tangent-contribs
   "Bind the ⊕-sum of tangent contribution exprs; returns [ctx' sym].
   ⊕ is raster.ad.reverse/grad-acc — polymorphic scalar/array, the same
-  accumulator the reverse pass uses."
+  accumulator the reverse pass uses.
+  Public: hand-written :jvp-fn facets (§13 A3) use the same convention."
   [ctx contribs gensym-fn]
   (let [t-sym (gensym-fn "jt")
         expr (reduce (fn [a b] (list 'raster.ad.reverse/grad-acc a b)) contribs)]
     [(update ctx :bindings into [t-sym expr]) t-sym]))
+
+(defn bind-jvp-term
+  "Bind `expr` as one fresh flat tangent-term binding (BindCtx convention,
+  same shape as derive-jvp-fn output); returns [ctx' sym]. Helper for
+  hand-written :jvp-fn facets (§13 A3)."
+  [ctx gensym-fn prefix expr]
+  (let [s (gensym-fn prefix)]
+    [(update ctx :bindings into [s expr]) s]))
 
 (defn- derive-jvp-fn
   "Synthesize the :jvp-fn facet from the op's :structure tag + its EXISTING
@@ -1333,3 +1368,61 @@
                    (not= canonical (symbol (name canonical))))
           (let [bare (symbol (name canonical))]
             (when (get-template bare) (op-jvp-fn bare)))))))
+
+;; ================================================================
+;; §13 A4 — explicit :jvp-fn for backward kernels whose Jacobian structure
+;; is NOT a single class (the rest of the RoR-closure seed, task #72).
+;; ================================================================
+
+;; daxpy-diff!: out = scale·(a−b) — jointly LINEAR in (a,b) and BILINEAR
+;; with scale. Product rule, both terms the op itself:
+;;   d = scale·(da−db) ⊕ dscale·(a−b)
+(merge-into-template!
+ 'raster.linalg.blas/daxpy-diff!
+ {:jvp-fn
+  (fn [ctx [a b scale n] tangent-args _result-sym gensym-fn]
+    (let [da (nth tangent-args 0 nil)
+          db (nth tangent-args 1 nil)
+          dscale (nth tangent-args 2 nil)]
+      (when-not (or da db dscale)
+        (throw (ex-info "daxpy-diff! jvp: no active tangent reached the call"
+                        {:op 'raster.linalg.blas/daxpy-diff!})))
+      (let [[ctx terms]
+            (if (or da db)
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jdaxpy_ab"
+                                            (list 'raster.linalg.blas/daxpy-diff!
+                                                  (or da (jvp-zero-like a))
+                                                  (or db (jvp-zero-like b))
+                                                  scale n))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if dscale
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jdaxpy_s"
+                                            (list 'raster.linalg.blas/daxpy-diff!
+                                                  a b dscale n))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (sum-tangent-contribs ctx terms gensym-fn))))})
+
+;; silu/gelu-backward (dy, x, n) → dy⊙act′(x): LINEAR in dy (that term is the
+;; kernel itself on the dy-tangent); the x-slot derivative is dy⊙act″(x)⊙dx —
+;; a GENUINE second-order elementwise rule that does not exist yet (#72).
+;; Fail LOUD if an x-tangent flows in — never silently drop it (unlike relu,
+;; whose act″ is 0 a.e., these have smooth nonzero act″).
+(doseq [op ['raster.dl.nn/silu-backward 'raster.dl.nn/gelu-backward]]
+  (merge-into-template!
+   op
+   {:jvp-fn
+    (let [op op]
+      (fn [ctx [_dy x n] tangent-args _result-sym gensym-fn]
+        (when (nth tangent-args 1 nil)
+          (throw (ex-info (str "jvp: `" op "` received a tangent on its x slot — "
+                               "the second-order elementwise frule (act″) is not "
+                               "implemented yet (§13 A4 / #72 pending). Only the "
+                               "dy slot is linear.")
+                          {:op op})))
+        (let [t-dy (or (nth tangent-args 0 nil)
+                       (throw (ex-info (str "jvp: no active tangent reached " op)
+                                       {:op op})))]
+          (bind-jvp-term ctx gensym-fn "jactb" (list op t-dy x n)))))}))

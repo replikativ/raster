@@ -2251,8 +2251,10 @@
   [bindings-vec]
   (set (take-nth 2 bindings-vec)))
 
-(defn- reify-pullback
+(defn ^:no-doc reify-pullback
   "Transform a walked body into a reified pullback suitable for composition.
+  Public (^:no-doc) consumer: raster.ad.jvp/hvp jvp-folds the reified
+  gradient program (forward-over-reverse, §13 A4).
 
   Instead of the standard [primal, (fn* [dy] ...)] output, returns a map:
     {:primal-form     S-expr that computes the primal value
@@ -2385,7 +2387,25 @@
                      (throw (ex-info "compile-hvp-fn requires a deftm var" {:var f-var})))
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body" {:var f-var})))
-          active-params (vec (map #(with-meta (if (symbol? %) % (symbol (name %))) nil) params))
+          tags (or (:raster.core/deftm-tags m)
+                   (vec (repeat (count params) 'double)))
+          ;; KEEP each param's :raster.type/tag (§13 A4 fix): the tangent
+          ;; protocol reads it to type seeds/zeros — stripping it forced
+          ;; untyped zeros downstream.
+          all-params (vec (map-indexed
+                           (fn [i p]
+                             (let [base (if (symbol? p) p (symbol (name p)))
+                                   tag (nth tags i nil)]
+                               (if tag
+                                 (with-meta base {:raster.type/tag tag})
+                                 (with-meta base nil))))
+                           params))
+          ;; Differentiate only w.r.t. params WITH a tangent space (⊥ slots —
+          ;; Long dims etc. — get no v slot and no Hv row). All-double scalar
+          ;; fns are unchanged: every param stays active.
+          active-params (vec (filter #(differentiable-tag?
+                                       (:raster.type/tag (meta %)))
+                                     all-params))
           n (count active-params)
 
         ;; Phase 1: Reify the pullback
@@ -2412,13 +2432,26 @@
         ;; (let* [...fwd... dy__rad 1.0 ...rev...
         ;;        vdg (+ (* v0 d_p1) (* v1 d_p2) ...)]
         ;;   vdg)
-          v-syms (mapv #(symbol (str "v__" (name %))) active-params)
+          v-syms (mapv #(with-meta (symbol (str "v__" (name %))) (meta %))
+                       active-params)
           [_ rev-bindings-vec rev-body] pullback-form
         ;; rev-body is the [d_p1 d_p2 ...] vector
           grad-syms (vec rev-body)
 
-        ;; Build dot product: v^T * grad
-          dot-terms (mapv (fn [vi gi] (list 'raster.numeric/* vi gi))
+        ;; Build v·grad — PER-PARAM contraction (§13 A4 fix): scalar params
+        ;; contract with numeric/*, ARRAY params with par/dot-product; after
+        ;; contraction every term is a scalar, folded with numeric/+.
+          array-param? (fn [p]
+                         (= :array (:kind (tangent/tangent-kind
+                                           (:raster.type/tag (meta p))))))
+          _ (when (some array-param? active-params)
+              ;; par/dot-product must be loadable when the compiled form
+              ;; evals (requiring lazily avoids a reverse→par ns cycle).
+              (require 'raster.par))
+          dot-terms (mapv (fn [vi gi]
+                            (if (array-param? vi)
+                              (list 'raster.par/dot-product vi gi)
+                              (list 'raster.numeric/* vi gi)))
                           v-syms grad-syms)
           dot-expr (if (= 1 (count dot-terms))
                      (first dot-terms)
@@ -2441,11 +2474,14 @@
           hvp-transformed (transform-body combined-form active-params)
 
         ;; Phase 4: Build the compiled function
-        ;; Parameters: [x1 x2 ... v1 v2 ...]
-          all-params (vec (concat active-params v-syms))
-          compiled-fn (eval (list 'fn all-params hvp-transformed))]
+        ;; Parameters: [p1 p2 ... v_a v_b ...] — ALL original params (⊥ dims
+        ;; are still needed to evaluate) + one v per differentiable param.
+          fn-params (vec (concat all-params v-syms))
+          compiled-fn (eval (list 'fn fn-params hvp-transformed))]
 
     ;; Return a function that takes [args-vec v-vec] -> [value Hv-vec]
+    ;; (args-vec: all params; v-vec: one entry per DIFFERENTIABLE param;
+    ;;  Hv rows align with the differentiable params.)
       (fn [args-vec v-vec]
         (let [all-args (vec (concat args-vec v-vec))
               [_vdg_value pullback] (apply compiled-fn all-args)
@@ -2790,16 +2826,16 @@
   [form]
   (let [acc (volatile! #{})]
     (letfn [(go [f]
-              (cond
-                (seq? f)
-                (do (when-let [h (if (= '.invk (first f))
+                (cond
+                  (seq? f)
+                  (do (when-let [h (if (= '.invk (first f))
                                    ;; same recovery order as undevirtualize
-                                   (or (:raster.op/original (meta f)) (:op (meta f)))
-                                   (op/semantic-op f))]
-                      (when (symbol? h) (vswap! acc conj h)))
-                    (doseq [x f] (go x)))
-                (vector? f) (doseq [x f] (go x))
-                (map? f) (doseq [[k v] f] (go k) (go v))))]
+                                     (or (:raster.op/original (meta f)) (:op (meta f)))
+                                     (op/semantic-op f))]
+                        (when (symbol? h) (vswap! acc conj h)))
+                      (doseq [x f] (go x)))
+                  (vector? f) (doseq [x f] (go x))
+                  (map? f) (doseq [[k v] f] (go k) (go v))))]
       (go form))
     @acc))
 

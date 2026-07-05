@@ -26,7 +26,8 @@
             [raster.sym.diff :as sdiff]
             [raster.sci.special :as special]
             [raster.dl.nn :as nn]
-            [raster.dl.loss :as loss]))
+            [raster.dl.loss :as loss]
+            [raster.dl.attention :as attn]))
 
 ;; ================================================================
 ;; Tolerances (per-dtype, scaled) and FD referee
@@ -73,6 +74,14 @@
 (defn- fadd ^floats [^floats a ^floats b]
   (let [len (alength a) out (float-array len)]
     (dotimes [i len] (aset out i (float (+ (aget a i) (aget b i))))) out))
+
+(defn- fd-diff
+  "Elementwise central-difference quotient (a − b)/2h as a float array —
+  the FD referee for array-valued directional derivatives / FD-of-grad."
+  ^floats [^floats a ^floats b ^double h]
+  (let [len (alength a) out (float-array len)]
+    (dotimes [i len] (aset out i (float (/ (- (aget a i) (aget b i)) (* 2.0 h)))))
+    out))
 
 (defn- fscale ^floats [^double c ^floats a]
   (let [len (alength a) out (float-array len)]
@@ -181,11 +190,30 @@
                      batch :- Long in :- Long out :- Long] :- (Array float)
   (nn/linear-nb x W batch in out))
 
-;; Class-(d) residue op (rms-norm: reverse template, NO structure tag / frule
-;; yet — §13 A3): jvp over it must FAIL LOUD naming the op.
+;; Class-(d) residue ops with HAND :jvp-fn frules (§13 A3 LANDED): rms-norm
+;; and layer-norm — array-valued outputs, tangents checked against
+;; elementwise directional FD in o1b.
 (deftm laws-jvp-rms [x :- (Array float) w :- (Array float)
                      rows :- Long feats :- Long] :- (Array float)
   (nn/rms-norm x w rows feats 1.0e-6 0.0))
+
+(deftm laws-jvp-ln [x :- (Array float) g :- (Array float) b :- (Array float)
+                    batch :- Long feats :- Long] :- (Array float)
+  (nn/layer-norm x g b batch feats 1.0e-6))
+
+;; Class-(d) residue op still PENDING after A3 (documented skip): maxpool2d
+;; has a reverse template but no :structure/:jvp-fn (its forward tangent
+;; needs a gather-at-argmax kernel) — jvp over it must FAIL LOUD naming the
+;; op, never silently drop a tangent.
+(deftm laws-jvp-maxpool [x :- (Array float) batch :- Long channels :- Long
+                         h :- Long w :- Long] :- (Array float)
+  (nn/maxpool2d x batch channels h w 2 2))
+
+;; SDPA (double kernels): the A3 attention frule (standard form
+;; dS = softmax-JVP(s·(dQ·Kᵀ + Q·dKᵀ)); dOut = dS·V + S·dV).
+(deftm laws-jvp-sdpa [Q :- (Array double) K :- (Array double) V :- (Array double)
+                      sq :- Long sk :- Long dk :- Long dv :- Long] :- (Array double)
+  (attn/scaled-dot-product-attn Q K V sq sk dk dv))
 
 ;; g(x) = <f(x), w> for O7 (w passed as a param array)
 (deftm laws-lnb-dotw [x :- (Array float) W :- (Array float) w :- (Array float)
@@ -375,13 +403,57 @@
         (is (close? tj (+ (double t1) (double t2) (double t3)) tol-float)
             "joint tangent = Σ single-seed tangents (linearity)"))))
 
-  (testing "unsupported forward forms fail LOUD naming the op (A3 pending)"
-    ;; rms-norm has a reverse template but sits in the class-(d) residue —
-    ;; no :structure tag, no :jvp-fn: the transform must throw, never drop
-    ;; a tangent silently.
+  (testing "rms-norm JVP (A3 hand frule): tangent = directional FD, x and w seeds"
+    (let [rows 3 feats 4
+          x (fa (* rows feats) 81) w (fa feats 82)
+          jf (jvp/jvp #'laws-jvp-rms)
+          zx (float-array (* rows feats)) zw (float-array feats)
+          h 1e-2 tol-fd 5e-3
+          run-fd (fn [slot v]
+                   (let [args [x w rows feats]
+                         shift (fn [s] (update args slot faxpy s v))
+                         y+ (apply laws-jvp-rms (shift h))
+                         y- (apply laws-jvp-rms (shift (- h)))]
+                     (fd-diff y+ y- h)))]
+      (is (farr-close? (nth (jf x w rows feats zx zw) 0)
+                       (laws-jvp-rms x w rows feats) tol-float)
+          "jvp primal = forward evaluation")
+      (let [v (fa (* rows feats) 83)
+            [_ t] (jf x w rows feats v zw)]
+        (is (farr-close? t (run-fd 0 v) tol-fd) "x-seeded rms tangent = FD"))
+      (let [v (fa feats 84)
+            [_ t] (jf x w rows feats zx v)]
+        (is (farr-close? t (run-fd 1 v) tol-fd) "w-seeded rms tangent = FD"))))
+
+  (testing "layer-norm JVP (A3 hand frule): tangent = directional FD, x/γ/β seeds"
+    (let [batch 3 feats 4
+          x (fa (* batch feats) 85) g (fa feats 86) b (fa feats 87)
+          jf (jvp/jvp #'laws-jvp-ln)
+          zx (float-array (* batch feats)) zf (float-array feats)
+          h 1e-2 tol-fd 5e-3
+          run-fd (fn [slot v]
+                   (let [args [x g b batch feats]
+                         shift (fn [s] (update args slot faxpy s v))
+                         y+ (apply laws-jvp-ln (shift h))
+                         y- (apply laws-jvp-ln (shift (- h)))]
+                     (fd-diff y+ y- h)))]
+      (let [v (fa (* batch feats) 88)
+            [_ t] (jf x g b batch feats v zf zf)]
+        (is (farr-close? t (run-fd 0 v) tol-fd) "x-seeded layer-norm tangent = FD"))
+      (let [v (fa feats 89)
+            [_ t] (jf x g b batch feats zx v zf)]
+        (is (farr-close? t (run-fd 1 v) tol-fd) "γ-seeded layer-norm tangent = FD"))
+      (let [v (fa feats 90)
+            [_ t] (jf x g b batch feats zx zf v)]
+        (is (farr-close? t (run-fd 2 v) tol-fd) "β-seeded layer-norm tangent = FD"))))
+
+  (testing "unsupported forward forms fail LOUD naming the op (A3 documented skip)"
+    ;; maxpool2d has a reverse template but stays in the class-(d) residue
+    ;; (forward tangent needs a gather-at-argmax kernel) — the transform must
+    ;; throw, never drop a tangent silently.
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"rms-norm.*§13 A3"
-         (jvp/jvp #'laws-jvp-rms)))))
+         clojure.lang.ExceptionInfo #"maxpool2d.*§13 A3"
+         (jvp/jvp #'laws-jvp-maxpool)))))
 
 ;; ================================================================
 ;; O3 — tangent-algebra laws: ⊕ accumulation, 0̄, ⊥ slots
@@ -566,6 +638,92 @@
       (is (close? (nth d 1) -1.0 1e-12) "cos(pi)")
       (is (close? (nth d 2) 0.0 1e-12) "-sin(pi)")
       (is (close? (nth d 3) 1.0 1e-12) "-cos(pi)"))))
+
+;; ================================================================
+;; O4b — HVP-through-layers (§13 A4): forward-over-reverse (jvp-fold over
+;; the reified gradient program, Pearlmutter 1994). FD-of-grad is the
+;; external referee: hvp(v) = (∇f(p+hv) − ∇f(p−hv))/2h.
+;; ================================================================
+
+(defn- daxpy-d ^doubles [^doubles a ^double h ^doubles v]
+  (let [len (alength a) out (double-array len)]
+    (dotimes [i len] (aset out i (+ (aget a i) (* h (aget v i))))) out))
+
+(defn- fd-diff-d ^doubles [^doubles a ^doubles b ^double h]
+  (let [len (alength a) out (double-array len)]
+    (dotimes [i len] (aset out i (/ (- (aget a i) (aget b i)) (* 2.0 h)))) out))
+
+(defn- darr-close? [^doubles a ^doubles b tol]
+  (and (= (alength a) (alength b))
+       (every? true? (map #(close? %1 %2 tol) a b))))
+
+(deftest o4b-hvp-through-layers-law
+  (testing "hvp (forward-over-reverse) subsumes the scalar case: exact quad Hessian"
+    (let [hf (jvp/hvp #'laws-quad)
+          [g hv1] (hf 3.0 2.0 1.0 0.0)
+          [_ hv2] (hf 3.0 2.0 0.0 1.0)]
+      (is (= [8.0 3.0] g) "gradient slots of the folded program = ∇f")
+      (is (= [2.0 1.0] hv1) "H·e1 exact")
+      (is (= [1.0 0.0] hv2) "H·e2 exact")))
+
+  (testing "MLP-style HVP: mse∘linear-nb (float), seeds on x and W vs FD-of-grad"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 91) W (fa (* out in) 92) tgt (fa (* batch out) 93)
+          zx (float-array (* batch in)) zW (float-array (* out in))
+          ztgt (float-array (* batch out))
+          hf (jvp/hvp #'laws-lnb-mse)
+          vg (rev/value+grad #'laws-lnb-mse)
+          grad-of (fn [x' W'] (let [r (vg x' W' tgt batch in out)]
+                                [(nth r 1) (nth r 2)]))
+          h 1e-2 tol-hvp 5e-3]
+      ;; the gradient slots of the hvp program = value+grad's gradients
+      (let [[g _] (hf x W tgt batch in out zx zW ztgt)
+            [gx gW] (grad-of x W)]
+        (is (farr-close? (nth g 0) gx tol-float) "hvp grad-x = value+grad")
+        (is (farr-close? (nth g 1) gW tol-float) "hvp grad-W = value+grad"))
+      ;; seed on x: H·v columns vs central FD of the gradient
+      (let [v (fa (* batch in) 94)
+            [_ hv] (hf x W tgt batch in out v zW ztgt)
+            [gx+ gW+] (grad-of (faxpy x h v) W)
+            [gx- gW-] (grad-of (faxpy x (- h) v) W)]
+        (is (farr-close? (nth hv 0) (fd-diff gx+ gx- h) tol-hvp)
+            "x-seed: tangent of ∇ₓf = FD-of-grad")
+        (is (farr-close? (nth hv 1) (fd-diff gW+ gW- h) tol-hvp)
+            "x-seed: tangent of ∇_W f = FD-of-grad (cross block)"))
+      ;; seed on W
+      (let [v (fa (* out in) 95)
+            [_ hv] (hf x W tgt batch in out zx v ztgt)
+            [gx+ gW+] (grad-of x (faxpy W h v))
+            [gx- gW-] (grad-of x (faxpy W (- h) v))]
+        (is (farr-close? (nth hv 0) (fd-diff gx+ gx- h) tol-hvp)
+            "W-seed: tangent of ∇ₓf = FD-of-grad (cross block)")
+        (is (farr-close? (nth hv 1) (fd-diff gW+ gW- h) tol-hvp)
+            "W-seed: tangent of ∇_W f = FD-of-grad")))))
+
+;; SDPA JVP law (A3 attention frule, double kernels): directional FD referee.
+(deftest o1b-sdpa-jvp-law
+  (testing "scaled-dot-product-attn: jvp tangent = directional FD per seeded slot"
+    (let [sq 3 sk 4 dk 5 dv 2
+          Q (da (* sq dk) 51) K (da (* sk dk) 52) V (da (* sk dv) 53)
+          jf (jvp/jvp #'laws-jvp-sdpa)
+          zQ (double-array (* sq dk)) zK (double-array (* sk dk))
+          zV (double-array (* sk dv))
+          h 1e-6 tol 1e-6
+          run-fd (fn [slot v]
+                   (let [args [Q K V sq sk dk dv]
+                         shift (fn [s] (update args slot daxpy-d s v))
+                         y+ (apply laws-jvp-sdpa (shift h))
+                         y- (apply laws-jvp-sdpa (shift (- h)))]
+                     (fd-diff-d y+ y- h)))]
+      (is (darr-close? (nth (jf Q K V sq sk dk dv zQ zK zV) 0)
+                       (laws-jvp-sdpa Q K V sq sk dk dv) 1e-12)
+          "jvp primal = forward evaluation")
+      (let [v (da (* sq dk) 54) [_ t] (jf Q K V sq sk dk dv v zK zV)]
+        (is (darr-close? t (run-fd 0 v) tol) "Q-seeded SDPA tangent = FD"))
+      (let [v (da (* sk dk) 55) [_ t] (jf Q K V sq sk dk dv zQ v zV)]
+        (is (darr-close? t (run-fd 1 v) tol) "K-seeded SDPA tangent = FD"))
+      (let [v (da (* sk dv) 56) [_ t] (jf Q K V sq sk dk dv zQ zK v)]
+        (is (darr-close? t (run-fd 2 v) tol) "V-seeded SDPA tangent = FD")))))
 
 ;; ================================================================
 ;; O5 — boundaries: unsupported forms throw (never silent), ⊥ never seeds,
