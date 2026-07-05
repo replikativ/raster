@@ -240,3 +240,31 @@
       (is (pos? (:bytes-saved stats)) "Should merge non-overlapping buffers")
       (is (== 40.0 result-before) "Original: 1+2+3+4 + 10+20 = 40")
       (is (== 40.0 result-after) "Merged must also be 40 (zero-fill prevents stale data)"))))
+
+;; ================================================================
+;; Type-safe zero-fill (regression for the LeNet-f32 [J->[S cast)
+;; ================================================================
+
+(deftest zero-fill-type-safety
+  ;; A mem-merged long[]/int[] buffer must be zero-filled with (a) a :tag-typed
+  ;; array symbol and (b) an UNEVALUATED cast value form. Otherwise the JVM
+  ;; bytecode backend resolves Arrays/fill to fill(short[],short) — an untyped
+  ;; array + literal-int 0 both stack-type ambiguously toward short[] — emitting
+  ;; a `[J -> [S` runtime cast (the LeNet-f32 maxpool-argmax crash). closure.clj
+  ;; guards the identical hazard for hoisted buffers.
+  (testing "long-array: tagged sym + UNEVALUATED (long 0), never a literal int"
+    (let [[head sym val] (#'mem-merge/zero-fill-expr 'buf :long-array)]
+      (is (= 'java.util.Arrays/fill head))
+      (is (= 'longs (:tag (meta sym))) "array sym carries :tag longs")
+      (is (seq? val) "fill value is an unevaluated form, not a collapsed literal")
+      (is (= '(long 0) val))))
+  (testing "int-array: tagged sym + UNEVALUATED (int 0)"
+    (let [[_ sym val] (#'mem-merge/zero-fill-expr 'buf :int-array)]
+      (is (= 'ints (:tag (meta sym))))
+      (is (seq? val))
+      (is (= '(int 0) val))))
+  (testing "double/float remain unambiguous (value type alone pins the overload)"
+    (let [[_ _ dval] (#'mem-merge/zero-fill-expr 'buf :double-array)
+          [_ _ fval] (#'mem-merge/zero-fill-expr 'buf :float-array)]
+      (is (= 0.0 dval))
+      (is (= '(float 0.0) fval)))))

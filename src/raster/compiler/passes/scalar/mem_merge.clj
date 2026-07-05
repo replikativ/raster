@@ -275,14 +275,32 @@
     (list 'double-array size-expr)))
 
 (defn- zero-fill-expr
-  "Generate a zero-fill expression for a shared buffer."
+  "Generate a TYPE-SAFE zero-fill expression for a shared buffer.
+
+  Two invariants, both required, or the JVM bytecode backend's Arrays/fill
+  overload resolution mis-selects `Arrays.fill(short[],short)` and emits a
+  `[J -> [S` (or `[I -> [S`) runtime cast — the exact hazard closure.clj already
+  guards against for hoisted buffers (see closure.clj comment ~219):
+    1. the array symbol carries its element :tag, so the backend resolves the
+       array parameter class (`long[]`/`int[]` — value type alone does NOT pin
+       these, since a literal-int fill value collides with short[]/byte[]/char[]);
+    2. the fill value is an UNEVALUATED cast form — `(list 'long 0)` / `(list 'int
+       0)`, not the EVALUATED `(long 0)`/`(int 0)` which collapse to a literal int
+       `0` that stack-types to :int and excludes `fill(long[],long)`."
   [shared-sym alloc-type]
-  (list 'java.util.Arrays/fill shared-sym
-        (case alloc-type
-          :double-array 0.0
-          :float-array  (list 'float 0.0)
-          :long-array   (long 0)
-          :int-array    (int 0))))
+  (let [arr-tag (case alloc-type
+                  :double-array 'doubles
+                  :float-array  'floats
+                  :long-array   'longs
+                  :int-array    'ints
+                  nil)
+        typed-sym (if arr-tag (vary-meta shared-sym assoc :tag arr-tag) shared-sym)]
+    (list 'java.util.Arrays/fill typed-sym
+          (case alloc-type
+            :double-array 0.0
+            :float-array  (list 'float 0.0)
+            :long-array   (list 'long 0)
+            :int-array    (list 'int 0)))))
 
 ;; ================================================================
 ;; Main pass
