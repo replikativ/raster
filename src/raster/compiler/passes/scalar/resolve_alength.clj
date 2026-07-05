@@ -153,7 +153,6 @@
           ;; Forward pass: build size map and rewrite simultaneously
           size-map (atom {})
           resolved-count (atom 0)
-          hoistable-alloc-syms (atom #{})
 
           new-pairs
           (mapv
@@ -169,39 +168,47 @@
                 ;; locally-allocated arrays must be resolved to the original
                 ;; size expression before mem-merge runs.
                (when-let [size (alloc-size init')]
-                 (swap! size-map assoc sym size)
-                 (when (:raster.buffer/hoistable (meta sym))
-                   (swap! hoistable-alloc-syms conj sym)))
+                 (swap! size-map assoc sym size))
 
                 ;; Track aliases: sym = known-size-sym (direct alias).
-                ;; Check size-map (not just hoistable-alloc-syms) to handle
-                ;; transitive alias chains like d_out = dx__5 = dx (alloc).
+                ;; Check size-map to handle transitive alias chains like
+                ;; d_out = dx__5 = dx (alloc).
                (when (and (symbol? init')
                           (contains? @size-map init'))
                  (when-let [size (get @size-map init')]
                    (swap! size-map assoc sym size)))
 
-                ;; Track call-through aliases: sym = (f ... buf ...) where
-                ;; buf is a hoistable allocation. The into-variant writes into
-                ;; buf and returns it. Convention: the output buffer is the
-                ;; LAST argument. Only match actual hoistable-alloc-syms, not
-                ;; general size-map entries — opaque calls like conv2d/maxpool
-                ;; return differently-sized arrays than their inputs.
-                ;; Skip if sym already has a known size (from alloc-size above)
-                ;; to avoid overwriting correct allocation sizes — e.g.,
-                ;; (zeros-like ref 8) has its own size 8, even though ref may
-                ;; be a larger hoistable buffer that appears as an argument.
+                ;; Track call-through aliases: sym = (f ... out-buf ...) where an
+                ;; into-variant writes into and RETURNS one of its argument
+                ;; buffers, so (alength sym) must resolve to that buffer's logical
+                ;; size before mem-merge resizes it.
+                ;;
+                ;; Identify the output buffer AUTHORITATIVELY from the op-descriptor
+                ;; buffer-semantics (:in-place-arg) — never by guessing "the last
+                ;; hoistable argument". That heuristic mis-identified the DY *input*
+                ;; as the output for into-variants like conv2d-backward-db-into!
+                ;; [dy db ...] (whose output db is arg 1, and is often allocated
+                ;; out-of-scope so it is the only NON-tracked buffer). It then
+                ;; aliased (alength result) to the wrong, larger input buffer,
+                ;; overrunning every later reduce/scale loop bound — a runtime OOB
+                ;; when the mis-aliased buffer is larger, and a SILENT wrong-count
+                ;; miscompile when it is smaller or equal.
+                ;;
+                ;; SAFE FALLBACK: only pure into-variants (:allocates? false with a
+                ;; concrete :in-place-arg) alias, and only when that arg's size is
+                ;; already known. Otherwise DO NOT alias — leaving (alength result)
+                ;; intact returns the true runtime length, which is always correct
+                ;; (the aliased buffer, if any, is then not a mem-merge target).
                (when (and (not (contains? @size-map sym))
-                          (form/call-form? init')
-                          (not (descriptor/alloc-op? (form/effective-op init'))))
-                 (let [args (vec (form/effective-args init'))
-                       last-buf (last (filter (fn [a]
-                                                (and (symbol? a)
-                                                     (contains? @hoistable-alloc-syms a)))
-                                              args))]
-                   (when last-buf
-                     (when-let [size (get @size-map last-buf)]
-                       (swap! size-map assoc sym size)))))
+                          (form/call-form? init'))
+                 (when-let [[bs _] (descriptor/resolve-buffer-semantics
+                                    (form/effective-op init'))]
+                   (when (and (not (:allocates? bs)) (:in-place-arg bs))
+                     (let [args    (vec (form/effective-args init'))
+                           out-idx (:in-place-arg bs)
+                           out-arg (when (< out-idx (count args)) (nth args out-idx))]
+                       (when (and (symbol? out-arg) (contains? @size-map out-arg))
+                         (swap! size-map assoc sym (get @size-map out-arg)))))))
 
                 ;; Track loop/let return aliases: sym = (let* [...] (loop* [...]
                 ;; (if ... (recur ...) buf))). When the expanded par/map! loop

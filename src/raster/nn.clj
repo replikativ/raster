@@ -308,6 +308,20 @@
 ;; dense-backward-db-into!: acopy!(dy→out) — overwrite
 (descriptor/register-buffer-write! 'raster.nn/dense-backward-db-into! :overwrite 1)
 
+;; Buffer-SEMANTICS for the dense into-variants (distinct facet from write-mode
+;; above): :in-place-arg is the authoritative output-buffer index resolve-alength
+;; uses to size-alias (alength result) to the correct returned buffer instead of
+;; guessing. :allocates? false so buffer_fuse leaves them untouched.
+;; dense-backward-dW-into! [dy-cols/... dW ...] -> dW  (arg 2)
+;; dense-backward-dx-into! [dy W dx]            -> dx  (arg 2)
+;; dense-backward-db-into! [dy out]            -> out (arg 1)
+(descriptor/register-buffer-semantics! 'raster.nn/dense-backward-dW-into!
+                                       {:allocates? false :in-place-arg 2})
+(descriptor/register-buffer-semantics! 'raster.nn/dense-backward-dx-into!
+                                       {:allocates? false :in-place-arg 2})
+(descriptor/register-buffer-semantics! 'raster.nn/dense-backward-db-into!
+                                       {:allocates? false :in-place-arg 1})
+
 ;; ================================================================
 ;; Reverse-mode AD rules (rrules)
 ;; ================================================================

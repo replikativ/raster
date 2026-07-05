@@ -1279,6 +1279,20 @@
                                        {:allocates? true
                                         :in-place-arg nil})
 
+;; Backward into-variants: write into and RETURN one argument buffer (no fresh
+;; alloc). :allocates? false so buffer_fuse leaves them untouched; :in-place-arg
+;; is the AUTHORITATIVE output-buffer index resolve-alength uses to size-alias
+;; (alength result) to the correct buffer (never guessed from arg position).
+;; conv2d-backward-db-into!    [dy db ...]           -> db     (arg 1)
+;; conv2d-backward-dcols-into! [W dy-cols d-cols ...] -> d-cols (arg 2)
+;; conv2d-backward-dW-into!    [dy-cols cols dW ...]  -> dW     (arg 2)
+(descriptor/register-buffer-semantics! 'raster.dl.nn/conv2d-backward-db-into!
+                                       {:allocates? false :in-place-arg 1})
+(descriptor/register-buffer-semantics! 'raster.dl.nn/conv2d-backward-dcols-into!
+                                       {:allocates? false :in-place-arg 2})
+(descriptor/register-buffer-semantics! 'raster.dl.nn/conv2d-backward-dW-into!
+                                       {:allocates? false :in-place-arg 2})
+
 ;; Dim rules for shape propagation through conv/pool layers
 ;; conv2d: output length = batch * c_out * h_out * w_out
 (descriptor/register-dim-rule! 'raster.dl.nn/conv2d
