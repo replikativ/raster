@@ -1,8 +1,8 @@
 {:paths ["src"]
  :deps {org.clojure/clojure {:mvn/version "1.12.0"}
         org.clojure/data.json {:mvn/version "2.5.1"}
-        org.typedclojure/typed.clj.checker {:git/url "https://github.com/whilo/typedclojure"
-                                            :git/sha "ea66226f7e998f88e779b6ec3bb7332049728438"
+        org.typedclojure/typed.clj.checker {:git/url "https://github.com/typedclojure/typedclojure"
+                                            :git/sha "42ef524fb5482a2e2429f3732a6ad88d80529690"
                                             :deps/root "typed/clj.checker"}
         org.replikativ/pattern {:mvn/version "1.0.449"}
         org.replikativ/beichte {:mvn/version "0.2.7"}}
