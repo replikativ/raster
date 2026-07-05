@@ -1,13 +1,11 @@
 (ns raster.compiler.walked-body-canonical-test
-  "R1 characterization — pins the walked-body / resolver invariants that the
-  content-addressed rewrite (S2+) must preserve, and validates the hasch
-  content-key mechanism on REAL raster deftm bodies.
+  "R1 characterization — pins the resolver + walked-body invariants that the
+  reconciliation must preserve: one canonical dispatch->impl resolver (S1) and
+  ensure-walked-body! that resolves-first so a dispatch var yields its body
+  rather than nil (S2, the debug-tooling footgun that misdiagnosed #78).
 
-  These are deliberately GREEN on the pre-S2 code: they capture what already
-  works (so S2 cannot silently regress it) plus the properties the S2 memo key
-  relies on. The fail-loud read-API tests (dispatch-var must throw, not return
-  nil) arrive WITH S3, when that behavior change lands — today the silent-nil
-  footgun is pinned as `current behavior` so the S3 flip is visible in the diff."
+  The fail-loud read-API distinction (genuinely-non-deftm vs is-deftm-but-walk-
+  failed) arrives with S3."
   (:refer-clojure :exclude [+ - * / aget aset alength])
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :as rcore :refer [deftm]]
@@ -16,8 +14,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.gpu.core :as gc]
             [raster.ad.reverse :as rev]
-            [raster.compiler.core.types :as types]
-            [hasch.core :as hasch]))
+            [raster.compiler.core.types :as types]))
 
 ;; A controlled, non-parametric deftm so meta keys are concrete and stable.
 (deftm wbc-sq [x :- (Array Double) n :- Long] :- (Array Double)
@@ -78,44 +75,3 @@
     ;; the inline/op_descriptor/pe callers treat nil as 'not inlinable' — must hold.
     (is (nil? (rcore/ensure-walked-body! #'clojure.core/+))
         "genuinely non-deftm var -> nil (not a crash)")))
-
-;; ---------------------------------------------------------------------------
-;; hasch content-key mechanism — the S2 memo key, validated on real bodies
-;; ---------------------------------------------------------------------------
-
-(defn- content-key
-  "The S2 memo key: pure fn of (source-body, params, tags, annotations,
-  source-ns, dtype). Uses hasch's DEFAULT hash — the de-risking finding is that
-  raster source bodies carry no load-bearing symbol metadata, so the default
-  (which drops symbol metadata) is exactly right."
-  [impl-var dtype]
-  (let [m (meta impl-var)]
-    (hasch/uuid [(:raster.core/deftm-source-body m)
-                 (:raster.core/deftm-params m)
-                 (:raster.core/deftm-tags m)
-                 (:raster.core/deftm-annotations m)
-                 (:raster.core/deftm-source-ns m)
-                 dtype])))
-
-(deftest hasch-content-key
-  (let [impl (rcore/resolve-deftm-var #'wbc-sq nil)]
-    (testing "stable across calls (deterministic)"
-      (is (= (content-key impl :double) (content-key impl :double))))
-    (testing "dtype is part of the key"
-      (is (not= (content-key impl :double) (content-key impl :float))))
-    (testing "source-body drives the key (different body => different key)"
-      (let [k1 (content-key impl :double)
-            k2 (hasch/uuid ['(different body form) (:raster.core/deftm-params (meta impl))
-                            (:raster.core/deftm-tags (meta impl))
-                            (:raster.core/deftm-annotations (meta impl))
-                            (:raster.core/deftm-source-ns (meta impl)) :double])]
-        (is (not= k1 k2))))
-    (testing "de-risking finding: incidental symbol metadata (:line/:column) does NOT change the key"
-      ;; two structurally-identical bodies differing only in symbol position meta
-      ;; must hash the same — walking does not depend on source position.
-      (let [body-a '(let [y (* x x)] y)
-            body-b (clojure.walk/postwalk
-                    (fn [f] (if (symbol? f) (with-meta f {:line 99 :column 7}) f))
-                    '(let [y (* x x)] y))]
-        (is (= (hasch/uuid body-a) (hasch/uuid body-b))
-            "hasch default drops symbol metadata => position-independent memo key")))))
