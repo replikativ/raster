@@ -920,23 +920,35 @@
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
                      cbuf (buf-of (:C step) :gemm-C)
-                     a16 (mkbuf-fn (* m k) :half)]
-                 (case (:variant step)
-                   ;; C = A[m,k] · B[k,n]
-                   :nn
-                   (let [b16 (mkbuf-fn (* k n) :half)]
-                     (swap! gemm-scratch conj a16 b16)
-                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
-                      (gemm-fn a16 b16 cbuf m n k :float)])
-                   ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
-                   ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
-                   :nt
-                   (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
-                     (swap! gemm-scratch conj a16 b16 bt16)
-                     [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
-                      (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
-                   (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
-                                        " (only :nn / :nt)") {:variant (:variant step)}))))
+                     a16 (mkbuf-fn (* m k) :half)
+                     ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
+                     ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
+                     raw
+                     (case (:variant step)
+                       ;; C = A[m,k] · B[k,n]
+                       :nn
+                       (let [b16 (mkbuf-fn (* k n) :half)]
+                         (swap! gemm-scratch conj a16 b16)
+                         [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
+                          (gemm-fn a16 b16 cbuf m n k :float)])
+                       ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
+                       ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
+                       :nt
+                       (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
+                         (swap! gemm-scratch conj a16 b16 bt16)
+                         [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
+                          (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                       ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
+                       ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
+                       ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
+                       :tn
+                       (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
+                         (swap! gemm-scratch conj a16 at16 b16)
+                         [(conv-fn abuf a16 (* k m)) (trans-fn a16 at16 k m :half)
+                          (conv-fn bbuf b16 (* k n)) (gemm-fn at16 b16 cbuf m n k :float)])
+                       (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
+                                            " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
+                 (mapv (fn [b] {:bound b}) raw))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).

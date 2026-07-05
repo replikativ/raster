@@ -1718,9 +1718,9 @@
          :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :double}
          :as info} (ensure-kernel-loaded! kernel-name)
         combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
-                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
-                           "*"    (fn ^double [^double a ^double b] (* a b))
-                           (fn ^double [^double a ^double b] (+ a b)))
+                      "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                      "*"    (fn ^double [^double a ^double b] (* a b))
+                      (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))
@@ -2039,23 +2039,23 @@
   Re-record only if the kernel sequence or any buffer is reallocated."
   ([prepareds] (record-graph! prepareds {:barriers? true}))
   ([prepareds {:keys [barriers?] :or {barriers? true}}]
-  (ensure-init!)
-  (let [{:keys [arena context device]} @state
-        cq-desc (.allocate ^Arena arena 40)
-        _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until the list completes
-        q-out (ptr-seg arena)
-        _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
-                    [context device cq-desc q-out])
-        queue (read-ptr q-out)
-        cl-desc (.allocate ^Arena arena 24)
-        _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
-        l-out (ptr-seg arena)
-        _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate
-                    [context device cl-desc l-out])
-        lst (read-ptr l-out)
-        h-launch @h-zeCommandListAppendLaunchKernel
-        h-barrier @h-zeCommandListAppendBarrier]
+   (ensure-init!)
+   (let [{:keys [arena context device]} @state
+         cq-desc (.allocate ^Arena arena 40)
+         _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
+         _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until the list completes
+         q-out (ptr-seg arena)
+         _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
+                     [context device cq-desc q-out])
+         queue (read-ptr q-out)
+         cl-desc (.allocate ^Arena arena 24)
+         _ (.set cl-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC))
+         l-out (ptr-seg arena)
+         _ (ze-call! "zeCommandListCreate" @h-zeCommandListCreate
+                     [context device cl-desc l-out])
+         lst (read-ptr l-out)
+         h-launch @h-zeCommandListAppendLaunchKernel
+         h-barrier @h-zeCommandListAppendBarrier]
     ;; append each bound kernel's launch (args already live on its dedicated handle; the
     ;; group-count value is captured into the recorded command at append time). A barrier
     ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
@@ -2063,18 +2063,21 @@
     ;; each is memory-bound so overlap buys little; correctness first. (Measured: an IN_ORDER
     ;; command list with no barriers is the same replay time — the ~50µs/kernel floor on this
     ;; iGPU is per-dispatch overhead, not the barrier. Fewer/bigger kernels is the lever.)
-    (doseq [{:keys [bound group-count]} prepareds]
-      (let [^MemorySegment gc (:gc-seg bound)]
-        (.set gc I32 0 (int group-count))
-        (ze-call! "zeCommandListAppendLaunchKernel" h-launch
-                  [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
-        (when barriers?
-          (ze-call! "zeCommandListAppendBarrier" h-barrier
-                    [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
-    (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
-    (let [lists-arr (ptr-seg arena)]
-      (.set lists-arr PTR 0 ^MemorySegment lst)
-      {:queue queue :list lst :lists-arr lists-arr}))))
+     (doseq [{:keys [bound group-count]} prepareds]
+       (let [^MemorySegment gc (:gc-seg bound)]
+        ;; A 1D map/map-void carries its X-grid as group-count (Y=Z=1 pre-filled). A GEMM /
+        ;; convert / transpose expansion pre-bakes its FULL (2D) gc-seg at bind time and passes
+        ;; group-count = nil — leave its X/Y/Z untouched (overwriting X would break the 2D grid).
+         (when (some? group-count) (.set gc I32 0 (int group-count)))
+         (ze-call! "zeCommandListAppendLaunchKernel" h-launch
+                   [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
+         (when barriers?
+           (ze-call! "zeCommandListAppendBarrier" h-barrier
+                     [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
+     (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
+     (let [lists-arr (ptr-seg arena)]
+       (.set lists-arr PTR 0 ^MemorySegment lst)
+       {:queue queue :list lst :lists-arr lists-arr}))))
 
 (defn replay-graph!
   "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."
@@ -2420,9 +2423,9 @@
          :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :float}
          :as info} (ensure-kernel-loaded! kernel-name)
         combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
-                           "fmin" (fn ^double [^double a ^double b] (Math/min a b))
-                           "*"    (fn ^double [^double a ^double b] (* a b))
-                           (fn ^double [^double a ^double b] (+ a b)))
+                      "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                      "*"    (fn ^double [^double a ^double b] (* a b))
+                      (fn ^double [^double a ^double b] (+ a b)))
         n (long n)
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))

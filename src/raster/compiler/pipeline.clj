@@ -665,18 +665,18 @@
         :cuda
         (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
 
-      :opencl
+        :opencl
       ;; Attach the declared scalar/array types (from opts) onto the form so opencl-pass's
       ;; generators read declared types instead of guessing. The materialized form preserves
       ;; the original param symbols, so a name-keyed type map still applies.
-      (let [form (cond-> form
-                   (or (:scalar-types opts) (:array-types opts))
-                   (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
-            result (opencl-pass/opencl-pass form
-                                            :device-id target-device
-                                            :dtype (:dtype opts))]
-        (register-gpu-kernels! (:kernels result) target-device)
-        {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
+        (let [form (cond-> form
+                     (or (:scalar-types opts) (:array-types opts))
+                     (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
+              result (opencl-pass/opencl-pass form
+                                              :device-id target-device
+                                              :dtype (:dtype opts))]
+          (register-gpu-kernels! (:kernels result) target-device)
+          {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
 
         :simd
         (let [clean-form (strip-compound-markers form)
@@ -985,6 +985,52 @@
      clojure.core/double-array clojure.core/float-array
      clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
 
+(def ^:private blas-gemm-ops
+  "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
+   .invk form). dgemm! = C=A·B (:nn); -nt! = A·Bᵀ; -tn! = AᵀB. A backward matmul (linear-dx =
+   dgemm! :nn, linear-dW = dgemm-tn! :tn) is just another GEMM — recognizing it here is what
+   lets an AD-expanded train step lower to a resident graph."
+  {'raster.linalg.blas/dgemm! :nn
+   'raster.linalg.blas/dgemm-nt! :nt
+   'raster.linalg.blas/dgemm-tn! :tn})
+
+(defn- gemm-invk?
+  "True if form is a devirtualized BLAS GEMM .invk (carries :raster.op/original in
+   blas-gemm-ops). Metadata-based — the walker stamps the op, opencl-pass preserves it."
+  [form]
+  (and (seq? form) (= '.invk (first form))
+       (contains? blas-gemm-ops (:raster.op/original (meta form)))))
+
+(def ^:private gpu-alloc-ops
+  "Array-allocating ops that appear as devirtualized .invk (not a bare `float-array` head): a
+   deftm's `(alloc-like x n)` / `(zeros-like x n)` output buffer. On the resident path these are
+   device scratch buffers sized by the second (n) arg. Recognized so a GEMM output buffer —
+   allocated via zeros-like in a matmul/backward deftm — becomes a resident :alloc, not a
+   host scalar-let referencing a device buffer that never gets allocated."
+  '#{raster.arrays/zeros-like raster.arrays/alloc-like})
+
+(defn- alloc-invk?
+  "True if form is a devirtualized array-alloc .invk (:raster.op/original in gpu-alloc-ops).
+   Returns [sym-form size-expr] via alloc-invk-size when matched."
+  [form]
+  (and (seq? form) (= '.invk (first form))
+       (contains? gpu-alloc-ops (:raster.op/original (meta form)))))
+
+(defn- alloc-invk-size
+  "The length expr of an alloc .invk: (.invk impl ref n) → n (the 4th element)."
+  [form]
+  (nth form 3))
+
+(def ^:private array-tags
+  "Walker :tag values that denote a JVM primitive array (an array-VALUED binding). Used to detect
+   an unlowered device-array op that leaked into the scalar-let bucket of extract-gpu-program."
+  '#{floats doubles ints longs bytes shorts chars objects})
+
+(defn- array-tag?
+  "True if sym carries an array-valued :tag stamped by the walker."
+  [sym]
+  (contains? array-tags (:tag (meta sym))))
+
 ;; --- Stage A: functional reduce → resident-buffer fusion ------------------------------------
 ;; A par/reduce result is a SCALAR in the materialized IR, but on the resident GPU path it must
 ;; live in device memory (a 1-element buffer) so the per-token graph never syncs to host. This
@@ -1079,6 +1125,17 @@
         (let [[_ kname inputs n] expr]
           {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
            :convention :reduce :returns sym}))
+      ;; devirtualized BLAS GEMM: (.invk dgemm*-impl A B C m k n alpha beta). BLAS arg order is
+      ;; (A B C m k n) — note m,k,n (NOT m,n,k). C (out) is written in place. This is how a
+      ;; forward matmul (linear-nb → dgemm-nt!) AND its backward (linear-dx → dgemm!, linear-dW →
+      ;; dgemm-tn!) lower to resident GEMM steps.
+      (gemm-invk? expr)
+      (let [args (vec (drop 2 expr))]
+        {:convention :gemm
+         :variant (get blas-gemm-ops (:raster.op/original (meta expr)))
+         :A (nth args 0) :B (nth args 1) :C (nth args 2)
+         :m-expr (nth args 3) :k-expr (nth args 4) :n-expr (nth args 5)
+         :out-buf (nth args 2) :returns sym})
       :else nil)))
 
 (defn- contains-gpu-invoke?
@@ -1113,10 +1170,26 @@
         (cond
           (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
           (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          ;; devirtualized array alloc (alloc-like/zeros-like .invk) — a GEMM/kernel output buffer.
+          (alloc-invk? expr)
+          (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
           (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
           (if-let [s (parse-gpu-step sym expr)]
             (vswap! steps conj s)
             (vreset! ok false))
+          ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
+          (gemm-invk? expr)
+          (if-let [s (parse-gpu-step sym expr)]
+            (vswap! steps conj s)
+            (vreset! ok false))
+          ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
+          ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
+          ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
+          ;; caller falls back to the staging fn (rather than eval'ing an array .invk as a scalar
+          ;; size closure). E.g. an AD-emitted daxpy-diff-into! or a raw loss reduction that did
+          ;; not lower to a par kernel in this composed path.
+          (array-tag? sym)
+          (vreset! ok false)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
           (not (contains-gpu-invoke? expr))
           (vswap! scalar-lets into [sym expr])
@@ -1223,8 +1296,11 @@
         reg-entry (when prog (requiring-resolve 'raster.gpu.ze-runtime/kernel-registry-entry))
         written-params (when prog
                          (reduce (fn [acc s]
-                                   (let [ki (reg-entry (:kernel-name s))]
-                                     (into acc (map (comp symbol name) (:written-arrays ki)))))
+                                   (if (= :gemm (:convention s))
+                                     ;; a GEMM writes its C (out-buf) in place
+                                     (conj acc (symbol (name (:out-buf s))))
+                                     (let [ki (reg-entry (:kernel-name s))]
+                                       (into acc (map (comp symbol name) (:written-arrays ki))))))
                                  #{} (:steps prog)))
         array-roles (when prog
                       (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
@@ -1238,24 +1314,36 @@
        :allocs (mapv (fn [{:keys [sym size-expr]}]
                        {:sym sym :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
                      (:allocs prog))
-       :steps (mapv (fn [i {:keys [kernel-name arrays scalars n-expr convention output]}]
-                      {:kernel-name kernel-name
-                       :arrays arrays
-                       ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
-                       ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
-                       :output (when output (keyword (name output)))
-                       :n-fn (expr->arg-fn all-params scalar-lets n-expr)
-                       ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
-                       ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
-                       ;; `features`) is bound as :int, not mis-typed float (→ launch error).
-                       :scalar-specs (mapv (fn [s]
-                                             {:type (or (and (symbol? s)
-                                                             (get (:scalar-types gpu-param-types) s))
-                                                        (if (= effective-dtype :double) :double :float))
-                                              :value-fn (expr->arg-fn all-params scalar-lets s)})
-                                           scalars)
-                       :convention convention
-                       :phase (keyword (str "gpu-step-" i))})
+       :steps (mapv (fn [i step]
+                      (if (= :gemm (:convention step))
+                        ;; GEMM: carries the A/B/C buffer syms + m/n/k size closures (BLAS arg
+                        ;; order is A B C m k n → keep m/n/k separate). bind-program! expands this
+                        ;; into [convert A→f16][convert B→f16][(transpose)][fp16 XMX gemm → f32 C].
+                        {:convention :gemm
+                         :variant (:variant step)
+                         :A (:A step) :B (:B step) :C (:C step)
+                         :m-fn (expr->arg-fn all-params scalar-lets (:m-expr step))
+                         :n-fn (expr->arg-fn all-params scalar-lets (:n-expr step))
+                         :k-fn (expr->arg-fn all-params scalar-lets (:k-expr step))
+                         :phase (keyword (str "gpu-step-" i))}
+                        (let [{:keys [kernel-name arrays scalars n-expr convention output]} step]
+                          {:kernel-name kernel-name
+                           :arrays arrays
+                           ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
+                           ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
+                           :output (when output (keyword (name output)))
+                           :n-fn (expr->arg-fn all-params scalar-lets n-expr)
+                           ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
+                           ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
+                           ;; `features`) is bound as :int, not mis-typed float (→ launch error).
+                           :scalar-specs (mapv (fn [s]
+                                                 {:type (or (and (symbol? s)
+                                                                 (get (:scalar-types gpu-param-types) s))
+                                                            (if (= effective-dtype :double) :double :float))
+                                                  :value-fn (expr->arg-fn all-params scalar-lets s)})
+                                               scalars)
+                           :convention convention
+                           :phase (keyword (str "gpu-step-" i))})))
                     (range) (:steps prog))
        :result-sym (:result prog)})))
 
