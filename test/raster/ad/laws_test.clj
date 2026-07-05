@@ -16,6 +16,7 @@
             [raster.numeric :as n]
             [raster.math :as m]
             [raster.arrays :as ra]
+            [raster.par :as par]
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
             [raster.ad.tangent :as tangent]
@@ -1191,3 +1192,129 @@
     (is (thrown-with-msg? Exception #"tuple-valued"
                           (rev/value+grad (rev/value+grad #'o4d-cube)))
         "value+grad of value+grad is ill-typed — was a silent zero before")))
+
+;; ================================================================
+;; O9 — par/scan: the differentiable RECURRENCE primitive.
+;;
+;; out[i] = acc_i, so THE OUTPUT ARRAY IS THE CARRY TAPE — no closure tape,
+;; no ArrayList, no separate residual stack (Griewank store-the-carry
+;; checkpointing at every step, zero recompute depth). The reverse walks
+;; i = n-1..0 with a running carry cotangent δacc, re-deriving step i's
+;; inputs from out[i-1] (init at i=0) and the array reads at the scan index:
+;;   total_i = δout[i] ⊕ δacc;  grads = pullback_i(total_i);
+;;   δacc ← grads[∂/∂acc];  d_x scatter-adds;  scalar frees accumulate;
+;;   the carry after step 0 is δinit.
+;; FD is the referee; the linear RNN also has an ANALYTIC closed form.
+;; ================================================================
+
+;; linear RNN: h_i = w·h_{i-1} + x_i, h_{-1} = h0. Closed form:
+;;   h_{n-1} = w^n·h0 + Σ_{k=0}^{n-1} w^{n-1-k}·x_k
+;;   ∂h_{n-1}/∂x_k = w^{n-1-k};  ∂h_{n-1}/∂h0 = w^n
+;;   ∂h_{n-1}/∂w   = n·w^{n-1}·h0 + Σ_{k=0}^{n-2} (n-1-k)·w^{n-2-k}·x_k
+(deftm laws-scan-lin [w :- Double, h0 :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc h0 i sn double
+                    (n/+ (n/* w acc) (ra/aget x i)))]
+    (ra/aget h (dec sn))))
+
+;; nonlinear recurrence — no closed form, FD referee only
+(deftm laws-scan-tanh [w :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (m/tanh (n/+ (n/* w acc) (ra/aget x i))))]
+    (ra/aget h (dec sn))))
+
+;; composition with a REGISTERED op downstream of the scan: mse over out[]
+;; (every out[i] carries an adjoint — the full δout vector feeds the reverse
+;; scan, not just the last element).
+(deftm laws-scan-mse [w :- Double, x :- (Array double), tgt :- (Array double),
+                      sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (m/tanh (n/+ (n/* w acc) (ra/aget x i))))]
+    (loss/mse-loss h tgt sn)))
+
+;; let*-bound reads at a SHIFTED index: the backward scatter-ADDS at each
+;; read's own index expression (x_k contributes through step k AND step k+1).
+(deftm laws-scan-shift [w :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (let [xc (ra/aget x i)
+                          xp (ra/aget x (if (> i 0) (dec i) 0))]
+                      (n/+ (n/* w acc) (n/+ xc (n/* 0.1 xp)))))]
+    (ra/aget h (dec sn))))
+
+(defn- fd-wrt-slot
+  "Central FD of scalar-valued f in one array slot k."
+  ^double [f ^doubles x k]
+  (let [h 1e-6
+        xp (aclone x) xm (aclone x)]
+    (aset xp (int k) (+ (aget x (int k)) h))
+    (aset xm (int k) (- (aget x (int k)) h))
+    (/ (- (double (f xp)) (double (f xm))) (* 2.0 h))))
+
+(deftest o9-scan-recurrence-law
+  (let [w 0.6 h0 0.8 sn 4
+        x (double-array [0.7 -1.3 0.4 0.9])]
+    (testing "linear RNN: grads w.r.t. w, h0 and x = ANALYTIC closed form"
+      (let [[v dw dh0 dx] ((rev/value+grad #'laws-scan-lin) w h0 x sn)
+            a-v (+ (* (Math/pow w sn) h0)
+                   (reduce + (map-indexed
+                              (fn [k xk] (* (Math/pow w (- sn 1 k)) xk)) x)))
+            a-dw (+ (* sn (Math/pow w (dec sn)) h0)
+                    (reduce + (map-indexed
+                               (fn [k xk] (* (- sn 1 k) (Math/pow w (- sn 2 k)) xk))
+                               (butlast (vec x)))))
+            a-dx (double-array (map #(Math/pow w (- sn 1 %)) (range sn)))]
+        (is (close? v a-v tol-double) "primal = closed form")
+        (is (close? dw a-dw tol-double) "∂/∂w = Σ over steps of powers of w")
+        (is (close? dh0 (Math/pow w sn) tol-double) "∂/∂h0 = w^n (δinit chain)")
+        (is (darr-close? dx a-dx tol-double) "∂/∂x_k = w^{n-1-k}")))
+
+    (testing "linear RNN: same grads vs FD referee"
+      (let [[_ dw dh0 dx] ((rev/value+grad #'laws-scan-lin) w h0 x sn)]
+        (is (close? dw (central-fd #(laws-scan-lin % h0 x sn) w 1e-6) tol-double))
+        (is (close? dh0 (central-fd #(laws-scan-lin w % x sn) h0 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-lin w h0 % sn) x k) tol-double)
+              (str "∂/∂x_" k " vs FD")))))
+
+    (testing "nonlinear (tanh) recurrence vs FD"
+      (let [[_ dw dx] ((rev/value+grad #'laws-scan-tanh) w x sn)]
+        (is (close? dw (central-fd #(laws-scan-tanh % x sn) w 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-tanh w % sn) x k) tol-double)))))
+
+    (testing "loss = mse over the WHOLE scan out array (registered op downstream)"
+      (let [tgt (double-array [0.1 -0.2 0.3 0.2])
+            [_ dw dx _dtgt] ((rev/value+grad #'laws-scan-mse) w x tgt sn)]
+        (is (close? dw (central-fd #(laws-scan-mse % x tgt sn) w 1e-6) tol-double)
+            "∂mse/∂w vs FD — δout[i] ≠ 0 at every i")
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-mse w % tgt sn) x k) tol-double)))))
+
+    (testing "shifted let*-bound reads: scatter-ADD at the read's own index"
+      (let [[_ dw dx] ((rev/value+grad #'laws-scan-shift) w x sn)]
+        (is (close? dw (central-fd #(laws-scan-shift % x sn) w 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-shift w % sn) x k) tol-double)
+              (str "x_" k " accumulates via steps k and k+1")))))
+
+    (testing "the raw-loop reject points at par/scan as the sanctioned recurrence"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"par/scan"
+           (rev/value+grad #'laws-loop-fn)))
+      (is (thrown-with-msg?
+           Exception #"par/scan"
+           (rev/value+grad #'laws-tail-loop-fn))))
+
+    (testing "forward mode (jvp) on scan fails LOUD — no forward SOAC fold yet"
+      ;; When the scan jvp lands (a second scan over the linearized
+      ;; recurrence), FLIP this to a jvp-vs-directional-FD law.
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"raster\.par/scan"
+           ((jvp/jvp #'laws-scan-lin) [w h0 x sn] [1.0 0.0 (double-array sn) nil]))))))
