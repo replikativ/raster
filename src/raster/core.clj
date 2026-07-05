@@ -455,13 +455,29 @@
   [key]
   (get @walked-body-registry key))
 
+;; resolve-deftm-var is defined much later (it needs the parametric-monomorphize
+;; machinery); ensure-walked-body! forward-references it to resolve-first.
+(declare resolve-deftm-var)
+
 (clojure.core/defn ^:no-doc ensure-walked-body!
   "Lazily walk a deftm var's source body with TC. Returns walked body.
   Julia model: walking is deferred to first use. If the var already has
   a walked body, returns it immediately. Otherwise walks from source body
   with TC binding tags and caches the result on the var metadata.
-  Thread-safe via double-checked locking per var."
+  Thread-safe via double-checked locking per var.
+
+  Resolve-FIRST: the walked body lives on the backing (mangled) impl var, but
+  the DISPATCH var is the ergonomic handle. Handed a dispatch var, resolve it to
+  the impl var before reading the cache — otherwise this silently returned nil on
+  a dispatch var, the debug-tooling footgun that misdiagnosed #78 (task #53). An
+  already-resolved impl var (the hot path) skips the resolve entirely; a genuinely
+  non-deftm var, or an ambiguous multi-overload dispatch var with no dtype, falls
+  through to nil unchanged (preserving the 'not inlinable' contract of
+  inline/op_descriptor/pe callers)."
   [v]
+  (let [v (if (::deftm (meta v))
+            v
+            (or (try (resolve-deftm-var v nil) (catch Exception _ nil)) v))]
   (or (seq (::deftm-walked-body (meta v)))
       (locking v
         (or (seq (::deftm-walked-body (meta v)))
@@ -478,7 +494,7 @@
                                   (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
                                     (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
                 (alter-meta! v assoc ::deftm-walked-body (vec walked))
-                (vec walked)))))))
+                (vec walked))))))))
 
 ;; ================================================================
 ;; Public API: defn — Clojure defn with walked body for compiler inlining
@@ -1805,3 +1821,72 @@
 ;; the concrete method (compile-time devirtualization, no invoke).
 (dispatch/set-parametric-specializer! parametric-specialize!)
 (dispatch/set-parametric-register! register-parametric-specialization!)
+
+(defn resolve-deftm-var
+  "Canonical `dispatch var → backing mangled impl var` resolution — the single
+  source of truth. The impl var is the one that carries ::deftm metadata (params,
+  tags, source/walked body); a dispatch (generic) var only carries a
+  ::dispatch-table. Three call sites (pipeline compile-aot, ad/reverse
+  value+grad, gpu kernel compile) previously each hand-rolled this with divergent
+  mangling — manual `_m_`-join vs `types/mangle`, the latter being what DEFINITION
+  time uses (core.clj:719/1558). The manual join is wrong for operator-named
+  (`+` → `_plus_`) or compound/flattenable-tag deftms, a latent miscompile in the
+  AD and GPU paths. This unifies mangling on `types/mangle` while keeping each
+  caller's genuinely-distinct policy explicit via opts.
+
+  opts (a map, or nil for defaults):
+    :dtype          :float|:double — select that overload; if no concrete overload
+                    exists yet, MONOMORPHIZE a parametric (All [T]) deftm to that
+                    element type via ensure-dtype-specialization!. nil = agnostic.
+    :ambiguity      :throw (default) — throw on >1 overload when no :dtype pins one;
+                    :first — pick the first overload (GPU kernel compile: any
+                    concrete overload's par-forms suffice).
+    :ambiguity-hint string appended to the throw message — caller-specific
+                    remediation (\"Specify :dtype\" vs \"use the mangled var\").
+    :deref-value?   when true, also accept f-var if @f-var carries ::deftm meta
+                    (value+grad / grad IFn results — ad/reverse only).
+    :on-miss        :nil (default) — return nil when f-var is neither a deftm nor a
+                    dispatch var; :self — return f-var unchanged (ad/reverse).
+
+  Returns the backing var (::deftm on its meta), or per :on-miss."
+  ([f-var] (resolve-deftm-var f-var nil))
+  ([f-var {:keys [dtype ambiguity ambiguity-hint deref-value? on-miss]
+           :or {ambiguity :throw on-miss :nil}}]
+   (cond
+     ;; already the backing var
+     (::deftm (meta f-var)) f-var
+
+     ;; value+grad / grad result: ::deftm meta lives on the deref'd IFn
+     (and deref-value?
+          (instance? clojure.lang.Var f-var)
+          (::deftm (try (meta @f-var) (catch Exception _ nil))))
+     @f-var
+
+     :else
+     (if-let [dt (::dispatch-table (meta f-var))]
+       (let [all-methods (mapcat val @dt)
+             ns-obj (:ns (meta f-var))
+             fn-name (:name (meta f-var))
+             dtype-tag (case dtype :float 'floats :double 'doubles nil)
+             direct (when dtype-tag
+                      (first (filter #(some #{dtype-tag} (:tags %)) all-methods)))]
+         (if (and dtype-tag (nil? direct))
+           ;; dtype requested but no concrete overload: monomorphize the parametric
+           ;; template (narrows T for the whole compile pass), else fall back to any
+           ;; registered method (legacy non-parametric behavior).
+           (or (ensure-dtype-specialization! f-var dtype)
+               (ns-resolve ns-obj (types/mangle fn-name (:tags (first all-methods)))))
+           (let [method (or direct
+                            (if (= 1 (count all-methods))
+                              (first all-methods)
+                              (case ambiguity
+                                :first (first all-methods)
+                                (throw (ex-info
+                                        (str "Ambiguous overload for `" fn-name "`: "
+                                             (count all-methods) " overloads"
+                                             (when ambiguity-hint (str ". " ambiguity-hint))
+                                             "\nAvailable: " (mapv :tags all-methods))
+                                        {:var f-var :methods (mapv :tags all-methods)})))))]
+             (ns-resolve ns-obj (types/mangle fn-name (:tags method))))))
+       ;; no dispatch table
+       (case on-miss :self f-var nil)))))
