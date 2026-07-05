@@ -243,8 +243,10 @@
               (if (< i 3) (recur (inc i) nxt) acc)))]
     (n/* a a)))
 
-;; body IS a canonical tail-accumulation loop — the shape that used to yield a
-;; silent broken IFn from value+grad (flatten nil, unguarded). Now fails loud.
+;; body IS a canonical tail-accumulation loop — historically: silent broken
+;; IFn (pre-2026-07-04) → fail-loud guard → NOW (§15.2 loop canonicalization)
+;; it lifts to par/reduce in ad-prepare and simply DIFFERENTIATES.
+;; f(x) = 4·x², f'(x) = 8x — asserted exactly in o10.
 (deftm laws-tail-loop-fn [x :- Double] :- Double
   (loop [i 0 acc 0.0]
     (if (< i 4)
@@ -875,15 +877,15 @@
          #"Cannot differentiate through raw `loop`"
          (rev/value+grad #'laws-loop-fn))))
 
-  (testing "tail-loop body: value+grad fails LOUDLY (never a broken IFn)"
-    ;; Laws-suite finding 2026-07-04: a body that IS (or tail-lifts to) a raw
-    ;; loop produced flatten nil → an unguarded broken IFn (wrong-arity at call
-    ;; time). Now guarded: clear ex-info at construction time. The compiled /
-    ;; inline path handles these loops; the runtime assembler does not yet.
-    (is (thrown-with-msg?
-         Exception
-         #"cannot assemble a runtime gradient"
-         (rev/value+grad #'laws-tail-loop-fn))))
+  (testing "tail-loop body: canonicalizes to par/reduce and differentiates"
+    ;; History: silent broken IFn → fail-loud guard (2026-07-04) → §15.2 loop
+    ;; canonicalization (ad-prepare runs lift-parallel-forms), so the canonical
+    ;; tail-accumulation shape is no longer a boundary at all. The boundary
+    ;; moved to shapes the soundness gates decline (see laws-loop-fn above and
+    ;; the o10 data-dependent-bound law).
+    (let [[v dx] ((rev/value+grad #'laws-tail-loop-fn) 3.0)]
+      (is (== 36.0 v) "f(3) = 4·9")
+      (is (== 24.0 dx) "f'(3) = 8·3, exact")))
 
   (testing ":auto is admissibility-constrained (§11): erf goes forward AND is correct"
     ;; FLIPPED 2026-07-04 (was the KNOWN-GAP ':auto trap'): erf now has a
@@ -1305,12 +1307,11 @@
               (str "x_" k " accumulates via steps k and k+1")))))
 
     (testing "the raw-loop reject points at par/scan as the sanctioned recurrence"
+      ;; (laws-tail-loop-fn used to be the second witness here — §15.2
+      ;; canonicalization differentiates it now; see o5 + o10.)
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"par/scan"
-           (rev/value+grad #'laws-loop-fn)))
-      (is (thrown-with-msg?
-           Exception #"par/scan"
-           (rev/value+grad #'laws-tail-loop-fn))))
+           (rev/value+grad #'laws-loop-fn))))
 
     (testing "forward mode (jvp) on scan fails LOUD — no forward SOAC fold yet"
       ;; When the scan jvp lands (a second scan over the linearized
@@ -1318,3 +1319,139 @@
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"raster\.par/scan"
            ((jvp/jvp #'laws-scan-lin) [w h0 x sn] [1.0 0.0 (double-array sn) nil]))))))
+
+;; ================================================================
+;; Corpus — O10 loop canonicalization (framework §15.2)
+;;
+;; ad-prepare now runs the SIMD loop-lift (dotimes+aset → par/map!,
+;; tail-accumulation → par/reduce, carry+aset → par/scan) plus the AD-only
+;; carry→scan materializer (pure carry / carry+aset-returning-carry →
+;; par/scan whose out buffer IS the tape). Raw loops differentiate
+;; invisibly — same §14 syntax-transparency guarantee — and shapes the
+;; soundness gates decline stay on the fail-loud ladder.
+;; ================================================================
+
+;; loop-WRITTEN linear RNN (per-step aset, returns the final carry) — the
+;; syntactic twin of laws-scan-lin (par/scan-written). Same recurrence,
+;; same params, same result.
+(deftm laws-o10-rnn-loop [w :- Double, h0 :- Double, x :- (Array double),
+                          sn :- Long] :- Double
+  (let [out (double-array sn)]
+    (loop [i 0 h h0]
+      (if (< i sn)
+        (let [h2 (n/+ (n/* w h) (ra/aget x i))]
+          (ra/aset out i h2)
+          (recur (inc i) h2))
+        h))))
+
+;; PURE carry (no per-step store): tanh chain. Was fail-loud — the §15.2
+;; materializer synthesizes the out buffer (explicit store-the-carry
+;; checkpointing) and differentiates it.
+(deftm laws-o10-tanh-carry [x0 :- Double, w :- Double, cn :- Long] :- Double
+  (loop [i 0 h x0]
+    (if (< i cn)
+      (recur (inc i) (m/tanh (n/* w h)))
+      h)))
+
+;; ... and the same computation written as scan + aget-last, for the
+;; commuting check (post-canon they are the same computation).
+(deftm laws-o10-tanh-scan [x0 :- Double, w :- Double, cn :- Long] :- Double
+  (let [out (double-array cn)
+        h (par/scan out acc x0 i cn double (m/tanh (n/* w acc)))]
+    (ra/aget h (dec cn))))
+
+;; tail-accumulation with array reads (sum of squares) → par/reduce rule.
+(deftm laws-o10-ssq [xs :- (Array double), rn :- Long] :- Double
+  (loop [i 0 acc 0.0]
+    (if (< i rn)
+      (recur (inc i) (n/+ acc (n/* (ra/aget xs i) (ra/aget xs i))))
+      acc)))
+
+;; dotimes + aset (SGD-ish elementwise shape) — regression on the map! path.
+(deftm laws-o10-scale [xs :- (Array double), a :- Double, mn :- Long] :- Double
+  (let [out (double-array mn)]
+    (dotimes [i mn]
+      (ra/aset out i (n/* a (ra/aget xs i))))
+    (ra/aget out (dec mn))))
+
+;; DATA-DEPENDENT trip count: the bound reads the carry. Every gate on the
+;; soundness ladder must decline (lift, materializer), leaving the loud
+;; reject that points at par/scan and the fixed-point rule.
+(deftm laws-o10-datadep [x :- Double] :- Double
+  (loop [i 0 acc x]
+    (if (< i (long acc))
+      (recur (inc i) (n/+ acc x))
+      acc)))
+
+(deftest o10-loop-canonicalization-law
+  (let [w 0.6 h0 0.8 sn 4
+        x (double-array [0.7 -1.3 0.4 0.9])]
+    (testing "THE commuting law: loop-written RNN ≡ par/scan-written RNN, EXACT =="
+      ;; Post-canonicalization both are the same par/scan computation, so
+      ;; the gradients are bit-identical — not merely within tolerance.
+      (let [[v1 dw1 dh01 dx1] ((rev/value+grad #'laws-o10-rnn-loop) w h0 x sn)
+            [v2 dw2 dh02 dx2] ((rev/value+grad #'laws-scan-lin) w h0 x sn)]
+        (is (== v1 v2) "primal commutes")
+        (is (== dw1 dw2) "δw commutes exactly")
+        (is (== dh01 dh02) "δh0 commutes exactly")
+        (dotimes [k sn]
+          (is (== (ra/aget dx1 k) (ra/aget dx2 k))
+              (str "δx_" k " commutes exactly")))))
+
+    (testing "pure-carry loop (no store) differentiates — was fail-loud"
+      (let [x0 0.5 wc 0.8 cn 6
+            [v dx0 dwc] ((rev/value+grad #'laws-o10-tanh-carry) x0 wc cn)]
+        (is (close? v (laws-o10-tanh-carry x0 wc cn) 0.0) "primal unchanged")
+        (is (close? dx0 (central-fd #(laws-o10-tanh-carry % wc cn) x0 1e-6)
+                    1e-6) "δx0 vs FD")
+        (is (close? dwc (central-fd #(laws-o10-tanh-carry x0 % cn) wc 1e-6)
+                    1e-6) "δw vs FD")
+        ;; ... and commutes EXACTLY with the scan+aget-last spelling.
+        (let [[v2 dx02 dwc2] ((rev/value+grad #'laws-o10-tanh-scan) x0 wc cn)]
+          (is (== v v2))
+          (is (== dx0 dx02))
+          (is (== dwc dwc2)))))
+
+    (testing "tail-accumulation loop → par/reduce rule: Σx² grad = 2x EXACT"
+      (let [xs (double-array [1.0 2.0 3.0])
+            [v dxs] ((rev/value+grad #'laws-o10-ssq) xs 3)]
+        (is (== 14.0 v))
+        (dotimes [k 3]
+          (is (== (* 2.0 (ra/aget xs k)) (ra/aget dxs k))
+              (str "2·x_" k " exact")))))
+
+    (testing "dotimes+aset (map! path) still differentiates"
+      (let [xs (double-array [0.3 -0.7 1.1]) a 2.5
+            [v dxs da] ((rev/value+grad #'laws-o10-scale) xs a 3)]
+        (is (== (* a 1.1) v))
+        (is (== 0.0 (ra/aget dxs 0)))
+        (is (== 0.0 (ra/aget dxs 1)))
+        (is (== a (ra/aget dxs 2)) "δxs_last = a exact")
+        (is (== 1.1 da) "δa = xs_last exact")))
+
+    (testing "n = 0: canonicalized carry loop returns init with δinit = 1"
+      ;; The guard binds the result through an :if record — value AND
+      ;; adjoint route to init when the trip count is zero.
+      (let [[v dx0 dwc] ((rev/value+grad #'laws-o10-tanh-carry) 0.5 0.8 0)]
+        (is (== 0.5 v))
+        (is (== 1.0 dx0))
+        (is (or (nil? dwc) (== 0.0 dwc)) "δw is the (dynamic) zero")))
+
+    (testing "data-dependent trip count FAILS LOUD, pointing at par/scan + fixed-point"
+      ;; The soundness ladder: gates decline (bound reads the carry), the
+      ;; runtime path rejects with modeling guidance — never a silent
+      ;; unrolled tape.
+      (is (thrown-with-msg?
+           Exception #"par/scan"
+           (rev/value+grad #'laws-o10-datadep)))
+      (is (thrown-with-msg?
+           Exception #"fixed-point"
+           (rev/value+grad #'laws-o10-datadep))))
+
+    (testing "Item 3 status: canonicalization is PREFERRED, ArrayList path retained"
+      ;; Matched shapes never reach lift-loop-to-tail/gen-reverse-loop-with-let
+      ;; anymore (ad-prepare rewrites them to SOACs first — witnessed by the
+      ;; runtime value+grad successes above, which the ArrayList path never
+      ;; served). The path itself stays: multi-carry loops (loop [i a b])
+      ;; still need it on the compiled/inline path (rad_test multi-var laws).
+      (is true))))

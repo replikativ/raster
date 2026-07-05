@@ -32,6 +32,8 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.passes.scalar.inline :as inline]
             [raster.compiler.passes.parallel.materialize :as materialize]
+            [raster.compiler.passes.parallel.loop-lift :as loop-lift]
+            [raster.compiler.passes.parallel.patterns :as patterns]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.support.mangled :as mangled]
@@ -348,10 +350,14 @@
 (defmethod ad-record :loop [_ sym _init-expr _activity]
   (throw (ex-info
           (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
+               "Canonical loops ((< i n) test, +1 step, single carry) are lifted "
+               "to SOACs automatically; this one declined the soundness gates. "
                "Use `par/reduce` for differentiable reductions, `par/scan` for "
                "differentiable recurrences (a chained carry whose per-step values "
-               "you keep — out[i] = acc_i is its own tape), or wrap "
-               "the loop in a deftm with an AD template.")
+               "you keep — out[i] = acc_i is its own tape), a fixed-point solve "
+               "for data-dependent trip counts (while/convergence loops — the "
+               "adjoint-of-fixed-point rule differentiates the converged state), "
+               "or wrap the loop in a deftm with an AD template.")
           {:sym sym :form-head 'loop})))
 
 (defmethod ad-record :par-map [_ sym init-expr activity]
@@ -458,7 +464,16 @@
            activity (assoc activity sym active?)
            fwd      (conj fwd-bindings sym (qualify-fwd-expr init-expr))
            {:keys [record fwd-patch]} (ad-record (ad-form-kind init-expr active? sym)
-                                                 sym init-expr activity)]
+                                                 sym init-expr activity)
+           ;; A SOAC whose body carries gradient makes its WRITTEN buffers
+           ;; gradient-carrying too: a downstream DIRECT read (aget out k)
+           ;; must scatter into adj-env[out] (emit-backward already sums the
+           ;; buffer's contributions into d_out alongside the result sym's).
+           ;; Without this, statement-position map!/scan followed by a direct
+           ;; buffer read silently drops the adjoint (zero gradients).
+           activity (if (and active? (seq (:written-arrs record)))
+                      (reduce #(assoc %1 %2 true) activity (:written-arrs record))
+                      activity)]
        {:activity activity
         :fwd-bindings (if fwd-patch (fwd-patch fwd) fwd)
         :records (if record (conj records record) records)}))
@@ -1748,11 +1763,17 @@
 
 (defn- analyze-par-reduce-body
   "Analyze a par/reduce body for aget references and free scalars.
-  Similar to analyze-par-map-body but for reduce body context."
+  Similar to analyze-par-map-body but for reduce body context — including
+  its INLINE-aget lift (source (2) there): a bare `(aget arr i)` sitting in
+  the body result (the shape the §15.2 loop canonicalization emits, since a
+  tail-accumulation loop body is one expression) is lifted to a synthetic
+  aget binding so it joins the array-input machinery. Without the lift, the
+  aget would be re-emitted inside the forward loop, which alpha-renames the
+  index (fi__N) — leaving the original index symbol free/unresolved."
   [body-expr idx-sym acc-sym]
   (let [agets (atom [])
         scalar-bindings (atom [])
-        [bindings body-result]
+        [bindings body-result0]
         (if (and (seq? body-expr) (#{'let 'let*} (first body-expr)))
           [(partition 2 (second body-expr)) (last (drop 2 body-expr))]
           [[] body-expr])]
@@ -1761,17 +1782,37 @@
                (op/aget-op? (first init)))
         (swap! agets conj {:sym sym :arr (nth init 1) :idx (nth init 2)})
         (swap! scalar-bindings conj [sym init])))
-    (let [aget-syms (set (map :sym @agets))
-          bound-syms (set (list* idx-sym acc-sym (concat (map first @scalar-bindings) aget-syms)))
-          free-syms (free-syms-excluding body-result bound-syms)
-          all-free (reduce into free-syms
-                           (map (fn [[_ init]]
-                                  (free-syms-excluding init bound-syms))
-                                @scalar-bindings))]
-      {:agets @agets
-       :scalar-bindings @scalar-bindings
-       :body-result body-result
-       :free-syms (disj all-free idx-sym acc-sym)})))
+    ;; Lift inline (aget arr idx-sym) reads to synthetic aget bindings (dedup
+    ;; by array — idx is fixed = the reduce index, so a repeated read shares
+    ;; one sym; e.g. sum-of-squares reads xs[i] twice).
+    (let [seen (atom {})
+          lift (fn lift [form]
+                 (cond
+                   (and (seq? form) (op/aget-op? (first form))
+                        (= 3 (count form)) (= idx-sym (nth form 2)))
+                   (let [arr (nth form 1)
+                         k (if (symbol? arr) arr form)]
+                     (or (get @seen k)
+                         (let [s (ad-gensym (str "ag_" (if (symbol? arr) (name arr) "arr")))]
+                           (swap! seen assoc k s)
+                           (swap! agets conj {:sym s :arr arr :idx idx-sym})
+                           s)))
+                   (seq? form) (with-meta (apply list (map lift form)) (meta form))
+                   (vector? form) (mapv lift form)
+                   :else form))
+          body-result (lift body-result0)
+          scalar-bindings* (mapv (fn [[s init]] [s (lift init)]) @scalar-bindings)]
+      (let [aget-syms (set (map :sym @agets))
+            bound-syms (set (list* idx-sym acc-sym (concat (map first scalar-bindings*) aget-syms)))
+            free-syms (free-syms-excluding body-result bound-syms)
+            all-free (reduce into free-syms
+                             (map (fn [[_ init]]
+                                    (free-syms-excluding init bound-syms))
+                                  scalar-bindings*))]
+        {:agets @agets
+         :scalar-bindings scalar-bindings*
+         :body-result body-result
+         :free-syms (disj all-free idx-sym acc-sym)}))))
 
 (defn- gen-reverse-par-reduce
   "Generate reverse-mode AD code for a raster.par/reduce form.
@@ -1839,7 +1880,13 @@
                                     pb-sym (list 'nth vpb-sym 1)]
                 store-binding [(ad-gensym "_store") (list 'aset tape-sym fwd-idx-sym pb-sym)]
                 all-bindings (vec (concat aget-bindings transform-bindings store-binding))]
-            (list 'let* all-bindings val-result-sym)))
+            ;; The forward loop binds the ALPHA-RENAMED index (fwd-idx-sym) —
+            ;; rewrite any surviving reference to the original reduce index
+            ;; (aget-binding index exprs, index refs in scalar-binding inits)
+            ;; onto it, capture-avoidingly. Without this the emitted loop body
+            ;; references an unbound symbol.
+            (util/subst-syms {idx-sym fwd-idx-sym}
+                             (list 'let* all-bindings val-result-sym))))
 
         ;; Forward code packs [tape, reduce-result] in an object-array pair.
         ;; The caller (gen-reverse-let) unpacks tape and result from the pair.
@@ -2405,25 +2452,200 @@
                                       {:body body}))
             :else (recur relifted (inc i))))))))
 
+;; ================================================================
+;; Loop canonicalization (framework §15.2) — carry→scan materializer
+;;
+;; The SIMD loop-lift (`lift-parallel-forms`) recovers dotimes+aset → par/map!,
+;; tail-accumulation → par/reduce, and carry+aset-returning-out → par/scan.
+;; What it cannot lift is the PURE-carry recurrence (no per-step store) and the
+;; carry+aset loop that returns the FINAL CARRY instead of the out array —
+;; par/scan needs an out buffer, and the loop's value is a scalar. This AD-only
+;; materializer closes that gap: it synthesizes the out buffer (which IS the
+;; tape — explicit Griewank store-the-carry checkpointing at every step, §15.2)
+;; and rebinds the loop's value as the guarded last element. It runs only in
+;; ad-prepare because materializing the carry history is pure waste for a
+;; non-differentiated primal.
+;; ================================================================
+
+(defn- carry-scan-dtype
+  "The scalar dtype (:double/:float) of a carry expression, proven from a
+  cast wrapper, a typed literal, a tag-stamped symbol, or a tag-stamped call
+  form (the walker stamps :raster.type/tag on typed calls — emitters/passes
+  READ stamps, never re-infer). nil when it cannot be proven → the
+  materializer declines (the loop falls through to the fail-loud :loop
+  ladder)."
+  [expr]
+  (cond
+    (and (seq? expr) (contains? #{'float 'clojure.core/float} (first expr))
+         (= 2 (count expr))) :float
+    (and (seq? expr) (contains? #{'double 'clojure.core/double} (first expr))
+         (= 2 (count expr))) :double
+    (instance? Double expr) :double
+    (instance? Float expr) :float
+    (or (symbol? expr) (seq? expr))
+    (let [{:keys [kind dtype]} (tangent/tangent-kind
+                                (or (:raster.type/tag (meta expr))
+                                    (:tag (meta expr))))]
+      (when (= kind :scalar) dtype))
+    :else nil))
+
+(defn- emit-carry-scan
+  "Emit the canonical scan form for a carry loop. Returns a let* expression
+  whose value is the loop's value (the final carry).
+
+  RESULT-BINDING CHOICE: par/scan RETURNS the out array (and the :par-scan
+  ad-record depends on that — `sym` aliases the buffer, out-as-tape), so the
+  final carry must be READ BACK as (aget out (dec n)), exactly the shape the
+  o9 scan laws differentiate. The n=0 guard cannot be a lazy branch around the
+  aget — flat ANF evaluates binding inits eagerly — so instead BOTH the read
+  index and (for the synthesized buffer) the allocation length are clamped to
+  keep the eager aget in bounds, and the RESULT is selected by an :if record
+  over two symbols: (if (< 0 n) last init). Values and adjoints are exact in
+  both cases: for n=0 the aget reads a clamped dummy slot whose adjoint is
+  gated to zero by the same branch, and δinit flows through the :if route;
+  for n>0 the else-route contributes the branch-gated zero and δinit flows
+  through the scan's carry chain."
+  [{:keys [out dtype cast acc idx bound init body]}]
+  (with-ad-gensym
+    (let [scalar-tag (case dtype :float 'float :double 'double nil)
+          array-tag  (case dtype :float 'floats :double 'doubles nil)
+          alloc-fn   (case dtype :float 'clojure.core/float-array
+                                 :double 'clojure.core/double-array nil)
+          init-sym   (ad-gensym "carry_init" scalar-tag)
+          n-sym      (ad-gensym "carry_n" 'long)
+          pos-sym    (ad-gensym "carry_pos")
+          out-sym    (or out (ad-gensym "carry_out" array-tag))
+          scan-sym   (ad-gensym "carry_scan" array-tag)
+          li-sym     (ad-gensym "carry_lastidx" 'long)
+          last-sym   (ad-gensym "carry_last" scalar-tag)
+          bindings   (-> []
+                         (into [init-sym init
+                                n-sym bound
+                                pos-sym (list 'clojure.core/< 0 n-sym)])
+                         (into (if out
+                                 []   ;; loop already owns the out buffer
+                                 [out-sym (list alloc-fn
+                                                (list 'if pos-sym n-sym 1))]))
+                         (into [scan-sym (list 'raster.par/scan out-sym acc
+                                               init-sym idx n-sym cast body)
+                                li-sym (list 'if pos-sym
+                                             (list 'clojure.core/dec n-sym) 0)
+                                last-sym (list 'raster.arrays/aget
+                                               scan-sym li-sym)]))]
+      (list 'let* (vec bindings)
+            (list 'if pos-sym last-sym init-sym)))))
+
+(defn- carry-dtype-consistent?
+  "The carry dtype must agree with every KNOWN element type of the arrays the
+  step body reads: a mixed-precision scan (double carry over float[] reads)
+  would scatter carry-dtype adjoints into read-dtype shadow buffers in the
+  backward (typed-aset dispatch CCE). Mixed recurrences decline — they fall
+  through to the pre-canonicalization paths, exactly as before."
+  [dtype body]
+  (every? #(= dtype %) (patterns/read-array-elem-types body)))
+
+(defn- carry-loop->scan
+  "Rewrite a carry loop into its canonical par/scan form, or nil when the
+  soundness gates decline (see patterns/match-carry-loop). Two shapes:
+
+  (a) carry + per-step aset, loop returns the FINAL CARRY (a scan the lift
+      declines because its value is the carry, not out): reuse the loop's
+      own out buffer. The n=0 read-guard requires a non-empty out — which
+      the loop's own aset contract already implies for n>0; for n=0 an
+      empty out throws (degenerate: a zero-trip loop over an empty buffer).
+
+  (b) PURE carry (no store): synthesize the out buffer — the synthesized
+      out IS the tape (explicit store-the-carry checkpointing, §15.2)."
+  [loop-form]
+  (or
+   ;; (a) carry + aset returning the carry
+   (when-let [{:keys [out-sym acc-sym acc-init index-sym bound-expr cast-fn
+                      acc-next-expr else-expr]}
+              (patterns/match-scan-loop loop-form)]
+     (let [dtype (or (carry-scan-dtype acc-init)
+                     (carry-scan-dtype acc-next-expr))]
+       (when (and (patterns/acc-ref? else-expr acc-sym)
+                  (not (patterns/contains-sym? bound-expr index-sym))
+                  (not (patterns/contains-sym? bound-expr acc-sym))
+                  (some? dtype)
+                  (carry-dtype-consistent? dtype acc-next-expr))
+         (emit-carry-scan {:out out-sym
+                           :dtype dtype
+                           :cast cast-fn
+                           :acc acc-sym :idx index-sym
+                           :bound bound-expr :init acc-init
+                           :body acc-next-expr}))))
+   ;; (b) pure carry — dtype from the init or (fallback) the tag-stamped
+   ;; step body: the scan stores cast(body), so the body's stamp IS the
+   ;; out-buffer dtype.
+   (when-let [{:keys [acc-sym acc-init index-sym bound-expr body]}
+              (patterns/match-carry-loop loop-form)]
+     (let [dtype (or (carry-scan-dtype acc-init)
+                     (carry-scan-dtype body))]
+       (when (and (some? dtype)
+                  (carry-dtype-consistent? dtype body))
+         (emit-carry-scan {:out nil
+                           :dtype dtype
+                           :cast (case dtype :float 'float :double 'double)
+                           :acc acc-sym :idx index-sym
+                           :bound bound-expr :init acc-init
+                           :body body}))))))
+
+(defn- canonicalize-carry-loops
+  "Walk a (post-lift) prep form and materialize surviving carry loops as
+  par/scan (carry-loop->scan). Descends let* binding inits and body exprs —
+  the positions loops occupy after lower-composites' ANF — and leaves par
+  forms and unmatched loops untouched (those fall through to the existing
+  paths: gen-reverse-loop-with-let on the inline path, the fail-loud ladder
+  on the runtime path)."
+  [form]
+  (cond
+    (and (seq? form) (contains? #{'loop 'loop*} (first form)))
+    (or (carry-loop->scan form) form)
+
+    (and (seq? form) (form/binding-form? form))
+    (let [[head bindings & body] form
+          new-bindings (into []
+                             (mapcat (fn [[s e]]
+                                       [s (canonicalize-carry-loops e)]))
+                             (partition 2 bindings))
+          new-body (map canonicalize-carry-loops body)]
+      (with-meta (apply list head new-bindings new-body) (meta form)))
+
+    :else form))
+
 (defn ^:no-doc ad-prepare
   "The ONE shared pre-AD preparation, used by the reverse path
   (`build-grad-walked-body`, `grad-expr`) AND the forward/JVP path
-  (`raster.ad.jvp/jvp`). Exactly the order the reverse path has always used:
+  (`raster.ad.jvp/jvp`):
 
     anf-wrap-bare-body → lower-composites (inline un-templated composites to
-    a fixpoint) → materialize-pass (pure par/map → alloc + par/map!) →
+    a fixpoint) → lift-parallel-forms (loop → SOAC canonicalization, §15.2)
+    → canonicalize-carry-loops (AD-only carry → scan materializer) →
+    materialize-pass (pure par/map → alloc + par/map!) →
     hoist-nested-lets (flat ANF).
 
-  Behavior-identical refactor of the duplicated prep — the laws suite is the
-  regression net."
+  The loop canonicalization runs AFTER lower-composites (inlining exposes
+  callee loops) and BEFORE materialize/hoist. It is a PHASE-ORDERING fix:
+  the pipeline's :loop-lift pass runs too late (post-fixpoint) for AD and
+  never on the runtime path, so ad-prepare runs the same pure form→form fn
+  here. Loops the gates decline are left untouched for the existing paths."
   [body]
   (let [;; ANF-normalize + inline composite deftm calls to a fixpoint so BARE
         ;; and multi-level composites fully lower before AD (lower-composites
         ;; runs anf-wrap-bare-body itself).
         lowered (lower-composites body)
+        ;; §15.2 (1): recover SOAC structure from raw loop syntax — dotimes →
+        ;; par/map!, tail-accumulation → par/reduce, carry+aset → par/scan —
+        ;; with the lift's proven-soundness gates (stats are discarded here;
+        ;; matched loops simply become differentiable SOACs).
+        lifted (:form (loop-lift/lift-parallel-forms lowered))
+        ;; §15.2 (2): materialize surviving pure-carry recurrences as par/scan
+        ;; (the synthesized out IS the tape — store-the-carry checkpointing).
+        canonical (canonicalize-carry-loops lifted)
         ;; Materialize pure par/map (broadcast → par/pmap) into alloc + par/map!
         ;; before AD — the pure pmap has no reverse rule; the mutating map! does.
-        materialized (:form (materialize/materialize-pass lowered nil))]
+        materialized (:form (materialize/materialize-pass canonical nil))]
     ;; Hoist nested lets out of call args into flat ANF for AD.
     (hoist-nested-lets materialized)))
 
@@ -2951,7 +3173,21 @@
                   []
                   (partition 2 bindings))
           hoisted-body (map hoist-nested-lets body)]
-      (apply list let-sym flat-bindings hoisted-body))
+      ;; A SINGLE let*-tail merges into this let* (same flat-ANF invariant as
+      ;; binding inits): (let* B1 (let* B2 e)) ≡ (let* B1+B2 e) — sequential
+      ;; binding semantics are preserved exactly. Loop canonicalization
+      ;; produces this shape when a TAIL-position loop rewrites to a let*-
+      ;; wrapped par/scan; without the merge the inner let* reaches
+      ;; gen-reverse-let as an opaque tail expression (dropped adjoints).
+      ;; Only the single-expr case merges: with statement exprs before the
+      ;; tail, splicing would move the inner bindings BEFORE the statements'
+      ;; effects (e.g. an aset the bindings read).
+      (if (and (= 1 (count hoisted-body))
+               (seq? (first hoisted-body))
+               (contains? #{'let 'let*} (ffirst hoisted-body)))
+        (let [[_ inner-binds & inner-body] (util/alpha-convert (first hoisted-body))]
+          (apply list let-sym (into flat-bindings (vec inner-binds)) inner-body))
+        (apply list let-sym flat-bindings hoisted-body)))
 
     ;; Scope-introducing forms — recurse but don't hoist across scope boundaries.
     ;; This includes every par/* SOAC (form/introduces-scope?): their bodies
@@ -3346,12 +3582,17 @@
                (throw (ex-info
                        (str "value+grad: cannot assemble a runtime gradient for `"
                             f-var "` — the body reduces to a loop form the runtime "
-                            "flattener does not support. Express the reduction via "
+                            "flattener does not support (canonical fixed-trip loops "
+                            "are lifted to SOACs automatically; this one declined "
+                            "the soundness gates, e.g. a data-dependent trip count "
+                            "or a multi-carry body). Express the reduction via "
                             "`par/reduce`, the recurrence via `par/scan` (the "
                             "sanctioned differentiable recurrence — out[i] = acc_i "
-                            "is its own tape), or a registered op (e.g. a loss deftm "
-                            "with an AD template), or use the compiled path "
-                            "(compile-aot of a deftm calling value+grad).")
+                            "is its own tape), a data-dependent/convergence loop via "
+                            "a fixed-point solve (adjoint-of-fixed-point rule), or a "
+                            "registered op (e.g. a loss deftm with an AD template), "
+                            "or use the compiled path (compile-aot of a deftm "
+                            "calling value+grad).")
                        {:var f-var :reason :flatten-failed})))
            {:keys [walked-body params tags source-ns]} bgw
            runtime-fn (make-runtime-value+grad-fn walked-body params)
