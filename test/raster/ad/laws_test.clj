@@ -1155,3 +1155,39 @@
       (is (< elapsed-ms 5000.0)
           (str "value+grad under fan-out must be linear-time, took "
                elapsed-ms "ms")))))
+
+;; ================================================================
+;; O4d — transparent composition of gradient operators (framework §14)
+;; The design guarantee: nesting happens through ORDINARY PROGRAM USE —
+;; the same syntax works nested or not. The only rejected spelling is
+;; operator-directly-on-operator over a tuple-valued output (ill-typed;
+;; fails loud, #74). For 1-param scalar fns, grad returns a bare scalar
+;; (JAX semantics), so the textbook (grad (grad f)) composes literally.
+;; ================================================================
+
+(deftm o4d-cube [x :- Double] :- Double (n/* x (n/* x x)))
+(deftm o4d-quad2 [x :- Double, y :- Double] :- Double (n/+ (n/* x x) (n/* x y)))
+
+;; outer deftm USES the inner gradient — same syntax as un-nested code
+(deftm o4d-outer [x :- Double] :- Double
+  (let [vg ((rev/value+grad #'o4d-cube) x)
+        g  (double (nth vg 1))]      ; g = 3x^2
+    (n/* g g)))                       ; 9x^4 -> d/dx = 36x^3
+
+(deftest o4d-transparent-composition-law
+  (testing "USE-shape nesting: value+grad of a deftm that uses an inner value+grad"
+    (let [[v g] ((rev/value+grad #'o4d-outer) 2.0)]
+      (is (= 144.0 v) "primal: (3*4)^2")
+      (is (= 288.0 g) "outer grad: 36x^3 at 2")))
+
+  (testing "textbook grad-of-grad for 1-param scalar fns (bare-scalar tail)"
+    (is (= 12.0 ((rev/grad #'o4d-cube) 2.0)) "1-param grad is a bare scalar: 3x^2")
+    (is (= 12.0 ((rev/grad (rev/grad #'o4d-cube)) 2.0)) "f'' = 6x composes literally"))
+
+  (testing "multi-param grad stays vector-valued"
+    (is (= [10.0 3.0] (vec ((rev/grad #'o4d-quad2) 3.0 4.0)))))
+
+  (testing "operator-on-operator over a tuple output fails LOUD (#74)"
+    (is (thrown-with-msg? Exception #"tuple-valued"
+                          (rev/value+grad (rev/value+grad #'o4d-cube)))
+        "value+grad of value+grad is ill-typed — was a silent zero before")))

@@ -2829,6 +2829,29 @@
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
+        ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
+        ;; only defined for SCALAR-valued functions — a vector tail (e.g. the
+        ;; [primal grads...] of a value+grad result, or a tuple-returning
+        ;; deftm) has a PRODUCT cotangent space with no canonical seed, and
+        ;; the reverse fold would silently return zero gradients. Fail loud.
+        ;; The transparent-composition idiom is to USE the components in a
+        ;; scalar program: (let [vg ((value+grad #'f) x)] ...scalar of (nth vg i)...).
+        _ (let [wb-form (first walked-body)
+                tail (if (and (seq? wb-form)
+                              (contains? #{'let 'let*} (first wb-form)))
+                       (last wb-form)
+                       wb-form)]
+            (when (vector? tail)
+              (throw (ex-info
+                      (str "Cannot differentiate the tuple-valued function `" f-var
+                           "` — its output is a vector, which has no canonical "
+                           "cotangent seed (this is what value+grad returns; "
+                           "value+grad of value+grad is ill-typed). Compose "
+                           "transparently instead: call the inner gradient in a "
+                           "scalar deftm and differentiate that, e.g. "
+                           "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
+                           "For 1-param scalar fns, (grad (grad f)) composes directly.")
+                      {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
         all-params (vec (map-indexed
                          (fn [i p]
@@ -3184,14 +3207,21 @@
 (defn grad
   "Composable gradient operator.
 
-  (grad f) returns a function that computes [grad1, ..., gradN].
-  Like value+grad but drops the primal value.
+  (grad f) returns a function that computes [grad1, ..., gradN] — or, for a
+  SINGLE-param scalar function, the bare scalar derivative g (JAX semantics).
+  The 1-param scalar tail is what makes the textbook composition
+  (grad (grad f)) = f'' well-typed: grad of f : R -> R IS f' : R -> R, so it
+  can be differentiated again directly (framework §14). Multi-param grads
+  remain vector-valued; re-differentiating those requires using the components
+  in a scalar program (the transparent-composition idiom).
 
   Options:
     :mode  - :reverse (default), :forward, or :auto
 
   Usage:
-    ((grad #'my-loss) 3.0 4.0)  ;; => [6.0 8.0]"
+    ((grad #'my-loss) 3.0 4.0)   ;; => [6.0 8.0]
+    ((grad #'square) 3.0)        ;; => 6.0        (1-param: bare scalar)
+    ((grad (grad #'cube)) 2.0)   ;; => 12.0       (f'' composes directly)"
   ([f-var] (grad f-var :mode :reverse))
   ([f-var & {:keys [mode] :or {mode :reverse}}]
    (let [vg-fn (value+grad f-var :mode mode)
@@ -3200,15 +3230,19 @@
      (if-let [wb (:raster.core/deftm-walked-body vg-meta)]
        (let [params (:raster.core/deftm-params vg-meta)
              tags (:raster.core/deftm-tags vg-meta)
-             ;; Rewrite walked body: [primal g1 g2 ...] → [g1 g2 ...]
+             ;; Rewrite walked body: [primal g1 g2 ...] → [g1 g2 ...], and for
+             ;; the 1-param case → the bare scalar g1 (scalar tail: composable).
              grad-wb (mapv (fn [form]
                              (if (and (seq? form) (#{'let 'let*} (first form)))
                                (let [[let-sym bindings & body-exprs] form
                                      last-body (last body-exprs)]
                                  (if (vector? last-body)
-                                   (list* let-sym bindings
-                                          (concat (butlast body-exprs)
-                                                  [(vec (rest last-body))]))
+                                   (let [grads (vec (rest last-body))
+                                         tail (if (= 1 (count grads))
+                                                (first grads)
+                                                grads)]
+                                     (list* let-sym bindings
+                                            (concat (butlast body-exprs) [tail])))
                                    form))
                                form))
                            wb)
