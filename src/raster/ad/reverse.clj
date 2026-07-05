@@ -236,6 +236,7 @@
 (declare ^:private gen-reverse-dotimes)
 (declare ^:private gen-reverse-par-map)
 (declare ^:private gen-reverse-par-reduce)
+(declare ^:private gen-reverse-par-scan)
 
 (defn- init-active?
   "Decide whether a binding init carries gradient (is active), given the current
@@ -268,6 +269,12 @@
         (let [[_ _acc _init _idx _bound body] init-expr]
           (boolean (some #(get activity % false) (free-syms-excluding body #{_idx _acc}))))
 
+        (= 'raster.par/scan head)
+        (let [[_ _out _acc init _idx _bound _cast body] init-expr]
+          (boolean (some #(get activity % false)
+                         (into (free-syms-excluding body #{_idx _acc})
+                               (free-syms-excluding init #{})))))
+
         ;; Loop: active iff any init or body references an active symbol
         (contains? #{'loop 'loop*} head)
         (let [[_ bindings-vec & body-forms] init-expr
@@ -299,6 +306,7 @@
   (cond
     (and (seq? init-expr) (= 'raster.par/map!   (first init-expr))) :par-map
     (and (seq? init-expr) (= 'raster.par/reduce (first init-expr))) :par-reduce
+    (and (seq? init-expr) (= 'raster.par/scan   (first init-expr))) :par-scan
     (and (seq? init-expr) (= 'dotimes           (first init-expr))) :dotimes
     (not active?)                                                   :inactive
     (and (seq? init-expr) (= 'if (first init-expr)))                :if
@@ -340,7 +348,9 @@
 (defmethod ad-record :loop [_ sym _init-expr _activity]
   (throw (ex-info
           (str "Cannot differentiate through raw `loop` form bound to `" sym "`. "
-               "Use `par/reduce` for differentiable reductions, or wrap "
+               "Use `par/reduce` for differentiable reductions, `par/scan` for "
+               "differentiable recurrences (a chained carry whose per-step values "
+               "you keep — out[i] = acc_i is its own tape), or wrap "
                "the loop in a deftm with an AD template.")
           {:sym sym :form-head 'loop})))
 
@@ -370,6 +380,16 @@
                                  [pair-sym (:forward-code pr-info)
                                   tape-sym (list 'aget pair-sym 0)
                                   sym (list 'aget pair-sym 1)]))))}))
+
+(defmethod ad-record :par-scan [_ sym init-expr activity]
+  ;; NO :fwd-patch — this is the point of scan-as-recurrence: out[i] = acc_i,
+  ;; so THE OUTPUT ARRAY IS THE CARRY TAPE. The forward binding runs completely
+  ;; unpatched (the scan macro returns `out`, so `sym` IS the buffer), and the
+  ;; backward reconstructs every step's inputs from out[] — no closure tape,
+  ;; no ArrayList, no separate residual stack (Griewank store-the-carry
+  ;; checkpointing at every step; zero recompute depth).
+  (let [active-set (vec (keys (filter val activity)))]
+    {:record (assoc (gen-reverse-par-scan init-expr active-set) :sym sym)}))
 
 (defmethod ad-record :dotimes [_ sym init-expr activity]
   (let [active-set (vec (keys (filter val activity)))
@@ -565,6 +585,42 @@
     {:rev-ctx rev-ctx
      :adj-env (wire-read-adjoints adj-env read-arrs d-read-arr-syms active-free d-scalar-syms)}))
 
+(defmethod emit-backward :par-scan
+  [{:keys [sym written-arrs read-arrs active-free shadow-allocs backward-loop
+           d-out-sym n-bwd-sym bound-expr init-expr]}
+   _adj-sym activity {:keys [adj-env rev-ctx]}]
+  ;; out-as-tape: NO tape unpack — the forward scan ran unpatched; out[] holds
+  ;; every carry. The result sym aliases the out buffer, so sum consumer
+  ;; (adj-env[sym]) and direct buffer (adj-env[out-arr]) contributions
+  ;; (see :par-map) into d_out, the per-step δout[i] source.
+  (let [rev-ctx (bindings-into rev-ctx (vec shadow-allocs))
+        out-arr (first written-arrs)
+        contribs (concat (get adj-env sym) (get adj-env out-arr))
+        default (when (empty? contribs) (array-zero-of-shape out-arr))
+        rev-ctx (bindings-into rev-ctx [d-out-sym (sum-contribs contribs default)])
+        rev-ctx (bindings-into rev-ctx [n-bwd-sym bound-expr])
+        bwd-result-sym (ad-gensym "scan_bwd")
+        rev-ctx (bindings-into rev-ctx [bwd-result-sym backward-loop])
+        ;; backward-loop returns [d_read_arr_0 ... d_scalar_0 ... d_init-carry]
+        n-reads (count read-arrs)
+        n-scalars (count active-free)
+        adj-env (reduce (fn [ae [i arr]]
+                          (update ae arr (fnil conj []) (list 'nth bwd-result-sym i)))
+                        adj-env (map-indexed vector read-arrs))
+        adj-env (reduce (fn [ae [i p]]
+                          (update ae p (fnil conj [])
+                                  (list 'nth bwd-result-sym (clojure.core/+ n-reads i))))
+                        adj-env (map-indexed vector active-free))
+        ;; δinit: the carry cotangent remaining after step 0 is ∂loss/∂init —
+        ;; wire it to the init symbol when it is active (h0-style learnable
+        ;; initial states). Compound active inits are rejected loudly at
+        ;; record-construction time (gen-reverse-par-scan).
+        adj-env (if (and (symbol? init-expr) (get activity init-expr false))
+                  (update adj-env init-expr (fnil conj [])
+                          (list 'nth bwd-result-sym (clojure.core/+ n-reads n-scalars)))
+                  adj-env)]
+    {:adj-env adj-env :rev-ctx rev-ctx}))
+
 (defmethod emit-backward :dotimes
   [{:keys [sym written-arrs read-arrs active-free shadow-allocs backward-loop
            d-out-sym n-bwd-sym bound-expr]}
@@ -596,7 +652,7 @@
   [records activity seed-adj-env]
   (reduce
    (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
-     (let [array-type? (contains? #{:dotimes :par-map :par-reduce} type)
+     (let [array-type? (contains? #{:dotimes :par-map :par-reduce :par-scan} type)
            adj-contribs (when-not array-type? (get adj-env sym))
            adj-sym (when-not array-type?
                      (ad-gensym (str "d_" (name sym)) (:raster.type/tag (meta sym))))
@@ -1928,6 +1984,182 @@
      :result-pair-sym result-pair-sym}))
 
 ;; ================================================================
+;; Par scan reverse-mode AD — the differentiable RECURRENCE primitive
+;; ================================================================
+
+(defn- gen-reverse-par-scan
+  "Generate reverse-mode AD code for a raster.par/scan form — the sanctioned
+  differentiable recurrence (the carry chains across steps AND every per-step
+  value is kept).
+
+  Forward form: (raster.par/scan out acc init idx bound cast body)
+    acc = init; for idx in 0..bound: acc = body; out[idx] = acc; return out.
+
+  KEY INSIGHT (out-as-tape): out[i] = acc_i, so THE OUTPUT ARRAY IS THE CARRY
+  TAPE — no closure tape, no ArrayList, no separate residual stack. This is
+  Griewank's store-the-carry checkpointing at EVERY step (zero recompute
+  depth): the forward binding runs completely unpatched, and the backward
+  reconstructs step i's body inputs from the tape — acc_{i-1} = out[i-1]
+  (init for i=0) — plus the original array reads at the scan index.
+  Body-internal values re-derive from the carry (recompute-from-carry; cheap
+  for scalar-carry bodies). Flat-buffer/GPU-ready by construction.
+
+  Backward: one reversed loop, i from bound-1 downto 0, threading the running
+  carry cotangent δacc:
+    total_i = δout[i] ⊕ δacc          (the out[i] store + step i+1's body)
+    grads   = pullback_i(total_i)      (pullback evaluated at acc_{i-1}, x[i])
+    δacc    = grads[∂body/∂acc]        (chains to step i-1)
+    d_x[·] ⊕= grads[∂body/∂aget_r]     (scatter-ADD at each read's index)
+    d_w_s  ⊕= grads[∂body/∂w_s]        (accumulate across steps, loop-carried)
+  The carry remaining after step 0 is δinit.
+
+  Cast note: the forward chains the UNCAST acc while out stores cast(acc);
+  reconstruction reads the stored value — exact identity for the `double`
+  cast, standard checkpoint rounding for narrowing casts (float).
+
+  Returns a record map for the reverse-pass engine (emit-backward :par-scan)."
+  [par-scan-form active-params]
+  (let [[_ out-sym acc-sym init-expr idx-sym bound-expr _cast-fn body-expr] par-scan-form
+        ;; Same body analysis as par/map!: let*-bound agets + inline agets at
+        ;; the scan index join the scatter path. acc-sym lands in :free-syms
+        ;; but is never an active param, so it cannot leak into active-free.
+        {:keys [agets scalar-bindings body-result free-syms]}
+        (analyze-par-map-body body-expr idx-sym)
+
+        read-arrs (vec (distinct (map :arr agets)))
+        active-free (filterv (fn [p] (contains? free-syms p)) active-params)
+
+        ;; Fail loud: an ACTIVE array referenced outside the recognized aget
+        ;; reads would be mis-treated as a free SCALAR (mis-shaped gradient —
+        ;; the par/map `No promotion rule` class of bug). Never miscompile.
+        _ (doseq [p active-free]
+            (when (= :array (:kind (tangent/tangent-kind (:raster.type/tag (meta p)))))
+              (throw (ex-info
+                      (str "par/scan AD: active array `" p "` is referenced in the "
+                           "scan body outside an `(aget " p " <idx>)` read. Only "
+                           "aget reads have a scatter gradient path — bind the "
+                           "needed element to a let sym inside the body.")
+                      {:array p :body body-expr}))))
+        ;; Fail loud: a compound init that DEPENDS on active params would
+        ;; reconstruct the value correctly but silently drop δinit (the final
+        ;; carry only wires to a SYMBOL). Bind it outside the scan first.
+        _ (when (and (seq? init-expr)
+                     (some (set active-params) (free-syms-excluding init-expr #{})))
+            (throw (ex-info
+                    (str "par/scan AD: the scan init `" (pr-str init-expr)
+                         "` depends on active params. Bind it to a let symbol "
+                         "before the scan so its gradient (δinit, the final "
+                         "carry cotangent) has a symbol to flow to.")
+                    {:init init-expr})))
+
+        aget-syms (mapv :sym agets)
+        ;; Pullback grads layout: [∂body/∂acc, ∂body/∂aget..., ∂body/∂free...]
+        iter-active (vec (distinct (concat [acc-sym] aget-syms active-free)))
+
+        pure-scalar-bindings (vec (mapcat identity
+                                          (remove (fn [[sym _]]
+                                                    (contains? (set aget-syms) sym))
+                                                  scalar-bindings)))
+
+        ;; Per-step scalar transform (primal recompute + pullback closure) —
+        ;; evaluated in the BACKWARD loop at the reconstructed inputs. This is
+        ;; recompute-from-carry: no forward-time tape stores it.
+        val-result-sym (ad-gensym "val")
+        scalar-transform
+        (let [binds (if (seq pure-scalar-bindings)
+                      (vec (concat pure-scalar-bindings [val-result-sym body-result]))
+                      [val-result-sym body-result])]
+          (gen-reverse-let binds [val-result-sym] iter-active))
+
+        ;; === Backward code ===
+        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        d-out-sym (ad-gensym "d_out" out-array-tag)
+        d-read-arr-syms (mapv (fn [arr]
+                                (ad-gensym (str "d_" (name arr))
+                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                              read-arrs)
+        arr->d-sym (zipmap read-arrs d-read-arr-syms)
+        d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
+        n-bwd-sym (ad-gensym "n_bwd")
+        d-carry-sym (ad-gensym "d_carry")
+        vpb-sym (ad-gensym "vpb")
+        pb-sym (ad-gensym "pb")
+        grads-sym (ad-gensym "grads")
+        total-sym (ad-gensym "d_total")
+        n-agets (count agets)
+
+        shadow-allocs (vec (mapcat (fn [d-arr-sym arr-sym]
+                                     [d-arr-sym (list 'raster.arrays/zeros-like arr-sym
+                                                      (list 'clojure.core/alength arr-sym))])
+                                   d-read-arr-syms read-arrs))
+
+        ;; Step-i reconstruction + pullback. The backward loop counter IS
+        ;; idx-sym, so any body sub-expression that still references the scan
+        ;; index (index arithmetic, non-lifted reads) sees the right value.
+        bwd-body-bindings
+        (vec (concat
+              ;; acc_{i-1} from the carry tape: out[i-1], init at i=0.
+              [acc-sym (list 'if (list 'clojure.core/== idx-sym 0)
+                             init-expr
+                             (list 'aget out-sym (list 'clojure.core/- idx-sym 1)))]
+              ;; Re-bind the body's array reads at their ORIGINAL indices.
+              (mapcat (fn [{:keys [sym arr idx]}] [sym (list 'aget arr idx)]) agets)
+              [total-sym (list 'raster.ad.reverse/grad-acc
+                               (list 'aget d-out-sym idx-sym) d-carry-sym)
+               vpb-sym scalar-transform
+               pb-sym (list 'nth vpb-sym 1)
+               grads-sym (list pb-sym total-sym)]
+              ;; Scatter-ADD each read's cotangent at the read's own index
+              ;; (read-modify-write: correct for repeated reads of one array
+              ;; and for shifted indices like (aget x (- idx 1))).
+              (mapcat (fn [k {:keys [arr idx]}]
+                        (let [d-arr (arr->d-sym arr)]
+                          [(ad-gensym "_scatter")
+                           (list 'aset d-arr idx
+                                 (list 'raster.ad.reverse/grad-acc
+                                       (list 'aget d-arr idx)
+                                       (list 'nth grads-sym (clojure.core/+ 1 k))))]))
+                      (range) agets)))
+
+        bwd-recur-args
+        (list* (list 'clojure.core/- idx-sym 1)
+               ;; the carry cotangent chains: δacc_{i-1} = grads[∂body/∂acc]
+               (list 'nth grads-sym 0)
+               (map-indexed (fn [i d-s]
+                              (list 'raster.ad.reverse/grad-acc d-s
+                                    (list 'nth grads-sym
+                                          (clojure.core/+ 1 n-agets i))))
+                            d-scalar-syms))
+
+        bwd-loop-init
+        (vec (concat [idx-sym (list 'clojure.core/- n-bwd-sym 1)
+                      d-carry-sym 0.0]
+                     (mapcat (fn [s] [s nil]) d-scalar-syms)))
+
+        ;; Loop value: [d_read_arr_0 ... d_scalar_0 ... d_init-carry]
+        bwd-return (conj (vec (concat d-read-arr-syms d-scalar-syms)) d-carry-sym)
+
+        backward-loop
+        (list 'loop* bwd-loop-init
+              (list 'if (list 'clojure.core/>= idx-sym 0)
+                    (list 'let* bwd-body-bindings (cons 'recur bwd-recur-args))
+                    bwd-return))]
+
+    {:type :par-scan
+     ;; no :forward-code / :tape-sym — the forward binding IS the tape build.
+     :written-arrs [out-sym]
+     :read-arrs read-arrs
+     :d-read-arr-syms d-read-arr-syms
+     :d-scalar-syms d-scalar-syms
+     :active-free active-free
+     :shadow-allocs shadow-allocs
+     :backward-loop backward-loop
+     :d-out-sym d-out-sym
+     :n-bwd-sym n-bwd-sym
+     :bound-expr bound-expr
+     :init-expr init-expr}))
+
+;; ================================================================
 ;; Top-level transform
 ;; ================================================================
 
@@ -2365,6 +2597,121 @@
      :pullback pullback
      :reified reified}))
 
+;; ================================================================
+;; Reified gradient program as a first-class deftm-style fn (#72)
+;; ================================================================
+
+(declare ^:private make-runtime-value+grad-fn)
+
+(defonce ^:private ror-rename-counter (atom 0))
+
+(defn- alpha-rename-bound
+  "α-rename every let*-bound symbol in a FLAT binding vector to a globally
+  unique name (\"__gp<N>\" suffix, monotonic defonce counter), preserving
+  each binding sym's :raster.type/tag on all occurrences.
+
+  Why: a reified gradient program FREEZES symbols minted under one
+  `with-ad-gensym` scope (counter starts at 0). A LATER AD pass over the
+  frozen program starts a fresh counter, and its ANF lifts mint the same
+  names — silently REBINDING inner syms mid-program (e.g. a float[] anf__2
+  rebound to a Double ANF temp → ClassCastException, or worse a silent
+  wrong gradient). Globally-unique renames make the frozen program safe to
+  re-enter with any gensym state."
+  [bindings tail]
+  (let [bound (vec (take-nth 2 bindings))
+        smap (into {}
+                   (map (fn [s]
+                          [s (with-meta
+                               (symbol (str (name s) "__gp" (swap! ror-rename-counter inc)))
+                               (meta s))]))
+                   bound)
+        rename (fn [form] (walk/postwalk-replace smap form))]
+    [(vec (mapcat (fn [[s init]] [(get smap s s) (rename init)])
+                  (partition 2 bindings)))
+     (rename tail)]))
+
+(defn ^clojure.lang.IFn reified-grad
+  "Reify ∂f/∂param of a scalar deftm as a deftm-style meta-fn — the
+  double-backward (reverse-over-reverse) composition surface (#72).
+
+  The result's walked body IS the flat gradient program (reify-pullback
+  assembled with the unit adjoint, as hvp does), so `value+grad` of the
+  result differentiates THROUGH the gradient computation — grad-of-grad,
+  L2(∇f) regularization, MAML-class meta-objectives — using the backward
+  kernels' own derived reverse rules (raster.ad.templates op-adjoints).
+
+  param: symbol naming one differentiable param of f.
+  - SCALAR param p → (fn [args…] -> ∂f/∂p), a scalar-valued program.
+  - ARRAY  param p → (fn [args… c] -> ⟨∂f/∂p, c⟩) with a cotangent array
+    `c` appended after f's params (value+grad w.r.t. an array-valued
+    gradient needs a scalar contraction; ∇ₓ⟨∇ₓf, c⟩ = Hₓₓ·c).
+
+  NOTE value+grad-of-value+grad does NOT compose: value+grad's walked body
+  ends in the VECTOR [primal grads…]; seeding a vector-valued tail silently
+  yields zero gradients. This assembly (scalar tail) is the shape that
+  composes."
+  [f-var param]
+  (let [resolved (resolve-deftm-var f-var)
+        m (meta resolved)
+        params (or (:raster.core/deftm-params m)
+                   (throw (ex-info "reified-grad requires a deftm var" {:var f-var})))
+        walked-body (or (rcore/ensure-walked-body! resolved)
+                        (throw (ex-info "No walked body on var" {:var f-var})))
+        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+        all-params (vec (map-indexed
+                         (fn [i p]
+                           (let [base (if (symbol? p) p (symbol (name p)))
+                                 tag (nth tags i nil)]
+                             (if tag
+                               (with-meta base {:raster.type/tag tag})
+                               (with-meta base nil))))
+                         params))
+        diff-params (vec (filter #(differentiable-tag? (:raster.type/tag (meta %)))
+                                 all-params))
+        param-sym (symbol (name param))
+        slot-idx (or (first (keep-indexed
+                             (fn [i p] (when (= p param-sym) i)) diff-params))
+                     (throw (ex-info (str "reified-grad: `" param "` is not a "
+                                          "differentiable param of " f-var)
+                                     {:param param :diff-params diff-params})))
+        param-tag (:raster.type/tag (meta (nth diff-params slot-idx)))
+        array-param? (= :array (:kind (tangent/tangent-kind param-tag)))
+        ;; The gradient program, assembled exactly as hvp does.
+        prepared (ad-prepare (first walked-body))
+        {:keys [fwd-bindings result-sym body-sym pullback-form]}
+        (reify-pullback prepared diff-params)
+        [_ rev-bindings grad-slots] pullback-form
+        grad-slot (nth (vec grad-slots) slot-idx)
+        c-sym (when array-param?
+                (with-meta (symbol (str "c__ror" (swap! ror-rename-counter inc)))
+                  {:raster.type/tag param-tag}))
+        tail-bindings (if array-param?
+                        [(symbol (str "gdot__ror" (swap! ror-rename-counter inc)))
+                         (list 'raster.par/dot-product grad-slot c-sym)]
+                        [])
+        tail (if array-param? (first tail-bindings) grad-slot)
+        bindings (vec (concat fwd-bindings
+                              [result-sym body-sym]
+                              ['dy__rad 1.0]
+                              rev-bindings
+                              tail-bindings))
+        ;; α-rename: the frozen program must survive a fresh-countered
+        ;; second AD pass (see alpha-rename-bound).
+        [bindings' tail'] (alpha-rename-bound bindings tail)
+        form (list 'let* bindings' tail')
+        fn-params (cond-> all-params array-param? (conj c-sym))
+        source-ns (or (:ns m) *ns*)
+        qualified (inf/qualify-body-symbols form source-ns (set fn-params))
+        runtime-fn (make-runtime-value+grad-fn [qualified] fn-params)
+        out-tags (cond-> (vec (take (count params) (concat tags (repeat nil))))
+                   array-param? (conj param-tag))]
+    (with-meta (fn [& args] (apply runtime-fn args))
+      {::reified-grad true
+       :raster.core/deftm true
+       :raster.core/deftm-walked-body [qualified]
+       :raster.core/deftm-params fn-params
+       :raster.core/deftm-tags out-tags})))
+
 (defn compile-hvp-fn
   "Compile a Hessian-vector product function for a scalar deftm var.
 
@@ -2606,8 +2953,14 @@
           hoisted-body (map hoist-nested-lets body)]
       (apply list let-sym flat-bindings hoisted-body))
 
-    ;; Scope-introducing forms — recurse but don't hoist across scope boundaries
-    (and (seq? form) (contains? #{'if 'loop 'loop* 'fn* 'do 'when 'recur 'dotimes} (first form)))
+    ;; Scope-introducing forms — recurse but don't hoist across scope boundaries.
+    ;; This includes every par/* SOAC (form/introduces-scope?): their bodies
+    ;; close over the loop index/accumulator, so splicing a body let* out into
+    ;; the wrapping let would free those scoped vars (unresolvable `i` after
+    ;; alpha-conversion) — and the SOAC reverse analyzers expect the body's
+    ;; let*-bound agets IN PLACE (analyze-par-map-body).
+    (and (seq? form) (or (contains? #{'if 'loop 'loop* 'fn* 'do 'when 'recur 'dotimes} (first form))
+                         (form/introduces-scope? form)))
     (with-meta (apply list (first form) (map hoist-nested-lets (rest form))) (meta form))
 
     ;; Function call — check for let expressions in arguments
@@ -2714,6 +3067,29 @@
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
         walked-body (or (rcore/ensure-walked-body! resolved)
                         (throw (ex-info "No walked body on var" {:var f-var})))
+        ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
+        ;; only defined for SCALAR-valued functions — a vector tail (e.g. the
+        ;; [primal grads...] of a value+grad result, or a tuple-returning
+        ;; deftm) has a PRODUCT cotangent space with no canonical seed, and
+        ;; the reverse fold would silently return zero gradients. Fail loud.
+        ;; The transparent-composition idiom is to USE the components in a
+        ;; scalar program: (let [vg ((value+grad #'f) x)] ...scalar of (nth vg i)...).
+        _ (let [wb-form (first walked-body)
+                tail (if (and (seq? wb-form)
+                              (contains? #{'let 'let*} (first wb-form)))
+                       (last wb-form)
+                       wb-form)]
+            (when (vector? tail)
+              (throw (ex-info
+                      (str "Cannot differentiate the tuple-valued function `" f-var
+                           "` — its output is a vector, which has no canonical "
+                           "cotangent seed (this is what value+grad returns; "
+                           "value+grad of value+grad is ill-typed). Compose "
+                           "transparently instead: call the inner gradient in a "
+                           "scalar deftm and differentiate that, e.g. "
+                           "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
+                           "For 1-param scalar fns, (grad (grad f)) composes directly.")
+                      {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
         tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
         all-params (vec (map-indexed
                          (fn [i p]
@@ -2971,9 +3347,11 @@
                        (str "value+grad: cannot assemble a runtime gradient for `"
                             f-var "` — the body reduces to a loop form the runtime "
                             "flattener does not support. Express the reduction via "
-                            "`par/reduce` or a registered op (e.g. a loss deftm with "
-                            "an AD template), or use the compiled path (compile-aot "
-                            "of a deftm calling value+grad).")
+                            "`par/reduce`, the recurrence via `par/scan` (the "
+                            "sanctioned differentiable recurrence — out[i] = acc_i "
+                            "is its own tape), or a registered op (e.g. a loss deftm "
+                            "with an AD template), or use the compiled path "
+                            "(compile-aot of a deftm calling value+grad).")
                        {:var f-var :reason :flatten-failed})))
            {:keys [walked-body params tags source-ns]} bgw
            runtime-fn (make-runtime-value+grad-fn walked-body params)
@@ -3069,14 +3447,21 @@
 (defn grad
   "Composable gradient operator.
 
-  (grad f) returns a function that computes [grad1, ..., gradN].
-  Like value+grad but drops the primal value.
+  (grad f) returns a function that computes [grad1, ..., gradN] — or, for a
+  SINGLE-param scalar function, the bare scalar derivative g (JAX semantics).
+  The 1-param scalar tail is what makes the textbook composition
+  (grad (grad f)) = f'' well-typed: grad of f : R -> R IS f' : R -> R, so it
+  can be differentiated again directly (framework §14). Multi-param grads
+  remain vector-valued; re-differentiating those requires using the components
+  in a scalar program (the transparent-composition idiom).
 
   Options:
     :mode  - :reverse (default), :forward, or :auto
 
   Usage:
-    ((grad #'my-loss) 3.0 4.0)  ;; => [6.0 8.0]"
+    ((grad #'my-loss) 3.0 4.0)   ;; => [6.0 8.0]
+    ((grad #'square) 3.0)        ;; => 6.0        (1-param: bare scalar)
+    ((grad (grad #'cube)) 2.0)   ;; => 12.0       (f'' composes directly)"
   ([f-var] (grad f-var :mode :reverse))
   ([f-var & {:keys [mode] :or {mode :reverse}}]
    (let [vg-fn (value+grad f-var :mode mode)
@@ -3085,15 +3470,19 @@
      (if-let [wb (:raster.core/deftm-walked-body vg-meta)]
        (let [params (:raster.core/deftm-params vg-meta)
              tags (:raster.core/deftm-tags vg-meta)
-             ;; Rewrite walked body: [primal g1 g2 ...] → [g1 g2 ...]
+             ;; Rewrite walked body: [primal g1 g2 ...] → [g1 g2 ...], and for
+             ;; the 1-param case → the bare scalar g1 (scalar tail: composable).
              grad-wb (mapv (fn [form]
                              (if (and (seq? form) (#{'let 'let*} (first form)))
                                (let [[let-sym bindings & body-exprs] form
                                      last-body (last body-exprs)]
                                  (if (vector? last-body)
-                                   (list* let-sym bindings
-                                          (concat (butlast body-exprs)
-                                                  [(vec (rest last-body))]))
+                                   (let [grads (vec (rest last-body))
+                                         tail (if (= 1 (count grads))
+                                                (first grads)
+                                                grads)]
+                                     (list* let-sym bindings
+                                            (concat (butlast body-exprs) [tail])))
                                    form))
                                form))
                            wb)

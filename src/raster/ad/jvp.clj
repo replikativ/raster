@@ -16,8 +16,11 @@
   resolve-deftm-var, grad-acc as the ⊕ kernel).
 
   Not yet supported (fail loud, forward loop rules are follow-up work):
-  par/map!, par/reduce, dotimes, loop — the differentiable loop forms have
-  reverse orchestrators but no forward fold yet."
+  par/map!, par/reduce, par/scan, dotimes, loop — the differentiable loop
+  forms have reverse orchestrators but no forward fold yet. (par/scan's JVP
+  is itself a scan over the linearized recurrence — δout[i] = ∂body/∂acc ·
+  δacc_{i-1} ⊕ Σ ∂body/∂free · δfree — a natural follow-up once the SOAC
+  forward-fold family lands as a group.)"
   (:require [raster.ad.reverse :as rev]
             [raster.ad.templates :as tmpl]
             [raster.ad.tangent :as tangent]
@@ -83,8 +86,8 @@
 (def ^:private unsupported-forward-heads
   "Differentiable-in-reverse forms with NO forward fold yet (follow-up):
   fail loud when they carry an active value, never silently drop a tangent."
-  '#{loop loop* dotimes raster.par/map! raster.par/reduce fn* do case case*
-     try letfn letfn* new monitor-enter monitor-exit})
+  '#{loop loop* dotimes raster.par/map! raster.par/reduce raster.par/scan
+     fn* do case case* try letfn letfn* new monitor-enter monitor-exit})
 
 (defn- fold-call
   "Emit the paired tangent bindings for one active :call binding.

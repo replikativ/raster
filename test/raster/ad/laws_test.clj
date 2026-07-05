@@ -16,6 +16,7 @@
             [raster.numeric :as n]
             [raster.math :as m]
             [raster.arrays :as ra]
+            [raster.par :as par]
             [raster.ad.reverse :as rev]
             [raster.ad.jvp :as jvp]
             [raster.ad.tangent :as tangent]
@@ -25,6 +26,7 @@
             [raster.sym.core :as sym]
             [raster.sym.diff :as sdiff]
             [raster.sci.special :as special]
+            [raster.nn :as rnn]
             [raster.dl.nn :as nn]
             [raster.dl.loss :as loss]
             [raster.dl.attention :as attn]))
@@ -700,6 +702,136 @@
         (is (farr-close? (nth hv 1) (fd-diff gW+ gW- h) tol-hvp)
             "W-seed: tangent of ∇_W f = FD-of-grad")))))
 
+;; ================================================================
+;; O4c — double backward (#72 RoR closure): value+grad THROUGH a gradient
+;; program. The backward kernels emitted by first-order rules (linear-dx/dW,
+;; daxpy-diff!, silu/relu-backward, dot-product/scale) now carry their own
+;; DERIVED reverse rules (adjoint of a linear op = its transpose, spelled
+;; with existing kernels — raster.ad.templates op-adjoints), closing the
+;; reverse engine under its own output (grad-of-grad, L2(∇f), MAML shapes).
+;;
+;; Composition shape that works: (value+grad (rev/reified-grad #'f 'p)) —
+;; the reified SCALAR-tail gradient program. value+grad-of-value+grad does
+;; NOT compose: value+grad's walked body ends in the VECTOR [primal grads…],
+;; and seeding a vector tail silently yields zero gradients (documented on
+;; reified-grad; same reason grad-of-hvp doesn't fall out).
+;; ================================================================
+
+;; x³ — the canonical grad-of-grad sanity: g = ∂f/∂x = 3x², g′ = f″ = 6x.
+(deftm laws-cube [x :- Double] :- Double
+  (n/* x (n/* x x)))
+
+;; Float-only relu wrapper (same devirt-hazard dodge as laws-jvp-silu).
+(deftm laws-dbb-relu-act [x :- (Array float)] :- (Array float)
+  (rnn/relu x))
+
+;; THE double-backward target: mse ∘ silu ∘ linear-nb (float). Its gradient
+;; program is daxpy-diff! → silu-backward → linear-dx/dW — every #72 kernel.
+(deftm laws-dbb [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                 batch :- Long in :- Long out :- Long] :- Double
+  (loss/mse-loss (laws-jvp-silu (nn/linear-nb x W batch in out)
+                                (clojure.core/* batch out))
+                 tgt (clojure.core/* batch out)))
+
+;; relu variant — exercises relu-backward's self-adjoint derived rule.
+(deftm laws-dbb-relu [x :- (Array float) W :- (Array float) tgt :- (Array float)
+                      batch :- Long in :- Long out :- Long] :- Double
+  (loss/mse-loss (laws-dbb-relu-act (nn/linear-nb x W batch in out))
+                 tgt (clojure.core/* batch out)))
+
+(deftest o4c-act-second-deriv-kernels
+  (testing "silu″/gelu″ closed forms = central FD of the backward kernels (double)"
+    ;; silu-backward(1̄, x)ᵢ = silu′(xᵢ), so d/dxᵢ of it is silu″(xᵢ) —
+    ;; the act″ kernels must match the FD of the very kernels whose reverse
+    ;; rules consume them. Points span both tails and the active region.
+    (let [n 7
+          x (double-array [-2.3 -0.9 -0.1 0.0 0.4 1.3 2.7])
+          ones (double-array (repeat n 1.0))
+          h 1e-6
+          shift (fn [s] (let [x2 (aclone x)]
+                          (dotimes [i n]
+                            (aset x2 i (clojure.core/+ (clojure.core/aget x2 i) (double s))))
+                          x2))
+          fd-of (fn [bwd]
+                  (let [y+ ^doubles (bwd ones (shift h) n)
+                        y- ^doubles (bwd ones (shift (- h)) n)]
+                    (mapv #(/ (- (clojure.core/aget y+ %) (clojure.core/aget y- %))
+                              (* 2.0 h))
+                          (range n))))]
+      (is (every? true? (map #(close? %1 %2 1e-8)
+                             (nn/silu-second-deriv x n) (fd-of nn/silu-backward)))
+          "silu″ = FD of silu-backward")
+      (is (every? true? (map #(close? %1 %2 1e-8)
+                             (nn/gelu-second-deriv x n) (fd-of nn/gelu-backward)))
+          "gelu″ = FD of gelu-backward"))))
+
+(deftest o4c-double-backward-law
+  (testing "scalar grad-of-grad: x³ → g = 3x², ∇g = 6x (exact)"
+    (let [vg-g (rev/value+grad (rev/reified-grad #'laws-cube 'x))]
+      (doseq [x [0.7 1.5 -2.0]]
+        (let [[g dg] (vg-g x)]
+          (is (close? g (* 3.0 x x) 1e-12) (str "g = f′ at " x))
+          (is (close? dg (* 6.0 x) 1e-12) (str "∇g = f″ at " x))))))
+
+  (testing "scalar 2-param: quad Hessian row via grad-of-grad (exact)"
+    ;; laws-quad = x² + xy, ∇ₓ = 2x + y, so ∇(∇ₓ) = [2 1] — the x-row of H.
+    (let [vg-g (rev/value+grad (rev/reified-grad #'laws-quad 'x))]
+      (let [[g dgx dgy] (vg-g 3.0 2.0)]
+        (is (== 8.0 g) "g = ∂f/∂x = 2x+y")
+        (is (== 2.0 dgx) "H[x,x]")
+        (is (== 1.0 dgy) "H[x,y]"))))
+
+  (testing "NN block double backward: ∇ₓ⟨∇ₓf, c⟩ = Hₓₓ·c vs FD-of-grad
+            (mse∘silu∘linear-nb float — daxpy-diff!, silu-backward(+act″),
+            linear-dx/dW, dot-product/scale second-order rules)"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 61) W (fa (* out in) 62) tgt (fa (* batch out) 63)
+          c (fa (* batch in) 64)
+          g-fn (rev/reified-grad #'laws-dbb 'x)
+          vg-f (rev/value+grad #'laws-dbb)
+          vg-g (rev/value+grad g-fn)
+          gx (nth (vg-f x W tgt batch in out) 1)
+          [g d-x d-W _d-tgt _ _ _ d-c] (vg-g x W tgt batch in out c)
+          h 1e-2]
+      ;; primal of the gradient program = ⟨∇ₓf, c⟩
+      (is (close? g (fdot gx c) tol-float) "g = ⟨∇ₓf, c⟩")
+      ;; ∂g/∂c = ∇ₓf itself (g is linear in c) — exact same array values
+      (is (farr-close? d-c gx tol-float) "∇_c g = ∇ₓf")
+      ;; ∂g/∂x = Hₓₓ·c, refereed by central FD OF THE GRADIENT along c
+      (let [gx+ (nth (vg-f (faxpy x h c) W tgt batch in out) 1)
+            gx- (nth (vg-f (faxpy x (- h) c) W tgt batch in out) 1)]
+        (is (farr-close? d-x (fd-diff gx+ gx- h) 5e-3)
+            "∇ₓ⟨∇ₓf,c⟩ = FD-of-grad (Hₓₓ·c)"))
+      ;; ∂g/∂W (the mixed block H_Wx·c): directional FD of g itself
+      (let [u (fa (* out in) 77)
+            g+ (g-fn x (faxpy W h u) tgt batch in out c)
+            g- (g-fn x (faxpy W (- h) u) tgt batch in out c)]
+        (is (close? (fdot d-W u) (/ (- (double g+) (double g-)) (* 2.0 h)) 1e-3)
+            "⟨∇_W g, u⟩ = directional FD (mixed second derivative)"))
+      ;; Cross-route: forward-over-reverse hvp with v = c must give the SAME
+      ;; Hₓₓ·c. This is also the o1b FLIP (#72): the silu-backward x-slot
+      ;; tangent used to FAIL LOUD (act″ pending) — hvp through a silu chain
+      ;; now works, and the two independent second-order routes agree.
+      (let [hf (jvp/hvp #'laws-dbb)
+            zW (float-array (* out in)) ztgt (float-array (* batch out))
+            [grads hv] (hf x W tgt batch in out c zW ztgt)]
+        (is (farr-close? (nth grads 0) gx tol-float) "hvp grads = ∇f")
+        (is (farr-close? (nth hv 0) d-x tol-float)
+            "reverse-over-reverse = forward-over-reverse (Hₓₓ·c)"))))
+
+  (testing "relu chain double backward: relu-backward's self-adjoint rule"
+    (let [batch 2 in 4 out 3
+          x (fa (* batch in) 61) W (fa (* out in) 62) tgt (fa (* batch out) 63)
+          c (fa (* batch in) 64)
+          vg-f (rev/value+grad #'laws-dbb-relu)
+          [_ d-x & _] ((rev/value+grad (rev/reified-grad #'laws-dbb-relu 'x))
+                       x W tgt batch in out c)
+          h 1e-2
+          gx+ (nth (vg-f (faxpy x h c) W tgt batch in out) 1)
+          gx- (nth (vg-f (faxpy x (- h) c) W tgt batch in out) 1)]
+      (is (farr-close? d-x (fd-diff gx+ gx- h) 5e-3)
+          "∇ₓ⟨∇ₓf,c⟩ = FD-of-grad through the relu mask"))))
+
 ;; SDPA JVP law (A3 attention frule, double kernels): directional FD referee.
 (deftest o1b-sdpa-jvp-law
   (testing "scaled-dot-product-attn: jvp tangent = directional FD per seeded slot"
@@ -1024,3 +1156,165 @@
       (is (< elapsed-ms 5000.0)
           (str "value+grad under fan-out must be linear-time, took "
                elapsed-ms "ms")))))
+
+;; ================================================================
+;; O4d — transparent composition of gradient operators (framework §14)
+;; The design guarantee: nesting happens through ORDINARY PROGRAM USE —
+;; the same syntax works nested or not. The only rejected spelling is
+;; operator-directly-on-operator over a tuple-valued output (ill-typed;
+;; fails loud, #74). For 1-param scalar fns, grad returns a bare scalar
+;; (JAX semantics), so the textbook (grad (grad f)) composes literally.
+;; ================================================================
+
+(deftm o4d-cube [x :- Double] :- Double (n/* x (n/* x x)))
+(deftm o4d-quad2 [x :- Double, y :- Double] :- Double (n/+ (n/* x x) (n/* x y)))
+
+;; outer deftm USES the inner gradient — same syntax as un-nested code
+(deftm o4d-outer [x :- Double] :- Double
+  (let [vg ((rev/value+grad #'o4d-cube) x)
+        g  (double (nth vg 1))]      ; g = 3x^2
+    (n/* g g)))                       ; 9x^4 -> d/dx = 36x^3
+
+(deftest o4d-transparent-composition-law
+  (testing "USE-shape nesting: value+grad of a deftm that uses an inner value+grad"
+    (let [[v g] ((rev/value+grad #'o4d-outer) 2.0)]
+      (is (= 144.0 v) "primal: (3*4)^2")
+      (is (= 288.0 g) "outer grad: 36x^3 at 2")))
+
+  (testing "textbook grad-of-grad for 1-param scalar fns (bare-scalar tail)"
+    (is (= 12.0 ((rev/grad #'o4d-cube) 2.0)) "1-param grad is a bare scalar: 3x^2")
+    (is (= 12.0 ((rev/grad (rev/grad #'o4d-cube)) 2.0)) "f'' = 6x composes literally"))
+
+  (testing "multi-param grad stays vector-valued"
+    (is (= [10.0 3.0] (vec ((rev/grad #'o4d-quad2) 3.0 4.0)))))
+
+  (testing "operator-on-operator over a tuple output fails LOUD (#74)"
+    (is (thrown-with-msg? Exception #"tuple-valued"
+                          (rev/value+grad (rev/value+grad #'o4d-cube)))
+        "value+grad of value+grad is ill-typed — was a silent zero before")))
+
+;; ================================================================
+;; O9 — par/scan: the differentiable RECURRENCE primitive.
+;;
+;; out[i] = acc_i, so THE OUTPUT ARRAY IS THE CARRY TAPE — no closure tape,
+;; no ArrayList, no separate residual stack (Griewank store-the-carry
+;; checkpointing at every step, zero recompute depth). The reverse walks
+;; i = n-1..0 with a running carry cotangent δacc, re-deriving step i's
+;; inputs from out[i-1] (init at i=0) and the array reads at the scan index:
+;;   total_i = δout[i] ⊕ δacc;  grads = pullback_i(total_i);
+;;   δacc ← grads[∂/∂acc];  d_x scatter-adds;  scalar frees accumulate;
+;;   the carry after step 0 is δinit.
+;; FD is the referee; the linear RNN also has an ANALYTIC closed form.
+;; ================================================================
+
+;; linear RNN: h_i = w·h_{i-1} + x_i, h_{-1} = h0. Closed form:
+;;   h_{n-1} = w^n·h0 + Σ_{k=0}^{n-1} w^{n-1-k}·x_k
+;;   ∂h_{n-1}/∂x_k = w^{n-1-k};  ∂h_{n-1}/∂h0 = w^n
+;;   ∂h_{n-1}/∂w   = n·w^{n-1}·h0 + Σ_{k=0}^{n-2} (n-1-k)·w^{n-2-k}·x_k
+(deftm laws-scan-lin [w :- Double, h0 :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc h0 i sn double
+                    (n/+ (n/* w acc) (ra/aget x i)))]
+    (ra/aget h (dec sn))))
+
+;; nonlinear recurrence — no closed form, FD referee only
+(deftm laws-scan-tanh [w :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (m/tanh (n/+ (n/* w acc) (ra/aget x i))))]
+    (ra/aget h (dec sn))))
+
+;; composition with a REGISTERED op downstream of the scan: mse over out[]
+;; (every out[i] carries an adjoint — the full δout vector feeds the reverse
+;; scan, not just the last element).
+(deftm laws-scan-mse [w :- Double, x :- (Array double), tgt :- (Array double),
+                      sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (m/tanh (n/+ (n/* w acc) (ra/aget x i))))]
+    (loss/mse-loss h tgt sn)))
+
+;; let*-bound reads at a SHIFTED index: the backward scatter-ADDS at each
+;; read's own index expression (x_k contributes through step k AND step k+1).
+(deftm laws-scan-shift [w :- Double, x :- (Array double), sn :- Long] :- Double
+  (let [out (double-array sn)
+        h (par/scan out acc 0.0 i sn double
+                    (let [xc (ra/aget x i)
+                          xp (ra/aget x (if (> i 0) (dec i) 0))]
+                      (n/+ (n/* w acc) (n/+ xc (n/* 0.1 xp)))))]
+    (ra/aget h (dec sn))))
+
+(defn- fd-wrt-slot
+  "Central FD of scalar-valued f in one array slot k."
+  ^double [f ^doubles x k]
+  (let [h 1e-6
+        xp (aclone x) xm (aclone x)]
+    (aset xp (int k) (+ (aget x (int k)) h))
+    (aset xm (int k) (- (aget x (int k)) h))
+    (/ (- (double (f xp)) (double (f xm))) (* 2.0 h))))
+
+(deftest o9-scan-recurrence-law
+  (let [w 0.6 h0 0.8 sn 4
+        x (double-array [0.7 -1.3 0.4 0.9])]
+    (testing "linear RNN: grads w.r.t. w, h0 and x = ANALYTIC closed form"
+      (let [[v dw dh0 dx] ((rev/value+grad #'laws-scan-lin) w h0 x sn)
+            a-v (+ (* (Math/pow w sn) h0)
+                   (reduce + (map-indexed
+                              (fn [k xk] (* (Math/pow w (- sn 1 k)) xk)) x)))
+            a-dw (+ (* sn (Math/pow w (dec sn)) h0)
+                    (reduce + (map-indexed
+                               (fn [k xk] (* (- sn 1 k) (Math/pow w (- sn 2 k)) xk))
+                               (butlast (vec x)))))
+            a-dx (double-array (map #(Math/pow w (- sn 1 %)) (range sn)))]
+        (is (close? v a-v tol-double) "primal = closed form")
+        (is (close? dw a-dw tol-double) "∂/∂w = Σ over steps of powers of w")
+        (is (close? dh0 (Math/pow w sn) tol-double) "∂/∂h0 = w^n (δinit chain)")
+        (is (darr-close? dx a-dx tol-double) "∂/∂x_k = w^{n-1-k}")))
+
+    (testing "linear RNN: same grads vs FD referee"
+      (let [[_ dw dh0 dx] ((rev/value+grad #'laws-scan-lin) w h0 x sn)]
+        (is (close? dw (central-fd #(laws-scan-lin % h0 x sn) w 1e-6) tol-double))
+        (is (close? dh0 (central-fd #(laws-scan-lin w % x sn) h0 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-lin w h0 % sn) x k) tol-double)
+              (str "∂/∂x_" k " vs FD")))))
+
+    (testing "nonlinear (tanh) recurrence vs FD"
+      (let [[_ dw dx] ((rev/value+grad #'laws-scan-tanh) w x sn)]
+        (is (close? dw (central-fd #(laws-scan-tanh % x sn) w 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-tanh w % sn) x k) tol-double)))))
+
+    (testing "loss = mse over the WHOLE scan out array (registered op downstream)"
+      (let [tgt (double-array [0.1 -0.2 0.3 0.2])
+            [_ dw dx _dtgt] ((rev/value+grad #'laws-scan-mse) w x tgt sn)]
+        (is (close? dw (central-fd #(laws-scan-mse % x tgt sn) w 1e-6) tol-double)
+            "∂mse/∂w vs FD — δout[i] ≠ 0 at every i")
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-mse w % tgt sn) x k) tol-double)))))
+
+    (testing "shifted let*-bound reads: scatter-ADD at the read's own index"
+      (let [[_ dw dx] ((rev/value+grad #'laws-scan-shift) w x sn)]
+        (is (close? dw (central-fd #(laws-scan-shift % x sn) w 1e-6) tol-double))
+        (dotimes [k sn]
+          (is (close? (ra/aget dx k)
+                      (fd-wrt-slot #(laws-scan-shift w % sn) x k) tol-double)
+              (str "x_" k " accumulates via steps k and k+1")))))
+
+    (testing "the raw-loop reject points at par/scan as the sanctioned recurrence"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"par/scan"
+           (rev/value+grad #'laws-loop-fn)))
+      (is (thrown-with-msg?
+           Exception #"par/scan"
+           (rev/value+grad #'laws-tail-loop-fn))))
+
+    (testing "forward mode (jvp) on scan fails LOUD — no forward SOAC fold yet"
+      ;; When the scan jvp lands (a second scan over the linearized
+      ;; recurrence), FLIP this to a jvp-vs-directional-FD law.
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"raster\.par/scan"
+           ((jvp/jvp #'laws-scan-lin) [w h0 x sn] [1.0 0.0 (double-array sn) nil]))))))

@@ -141,6 +141,18 @@
                                                   grad (* si (+ 1.0 (* x (- 1.0 si))))]
                                               (* dy grad)))))
 
+;; SiLU second derivative (act″) — the RoR-closure kernel (#72).
+;; silu(x) = x·σ(x); σ′ = σ(1−σ); σ″ = σ′(1−2σ) = σ(1−σ)(1−2σ)
+;;   silu′(x) = σ + x·σ′
+;;   silu″(x) = σ′ + σ′ + x·σ″ = 2σ′ + x·σ″ = σ(x)(1−σ(x))·(2 + x·(1−2σ(x)))
+;; Consumed by silu-backward's own reverse/forward rules (raster.ad.templates):
+;; the x-direction of d(dy⊙silu′(x)) is dy⊙silu″(x)⊙Δx. FD-validated against
+;; the silu-backward kernel in the o4c double-backward law.
+(deftm silu-second-deriv (All [T] [x :- (Array T) n :- Long] :- (Array T)
+                              (broadcast [x] (let [si (/ 1.0 (+ 1.0 (m/exp (- x))))]
+                                               (* (* si (- 1.0 si))
+                                                  (+ 2.0 (* x (- 1.0 (* 2.0 si)))))))))
+
 ;; ================================================================
 ;; Linear: y = x @ W^T + b
 ;; x:[batch, in_f], W:[out_f, in_f], b:[out_f] -> y:[batch, out_f]
@@ -269,6 +281,28 @@
                                             (* 0.5 xi sech2 c (+ 1.0 (* 3.0 0.044715 xi xi))))]
                                 (aset dx i (* (aget dy i) grad))))
                             dx)))
+
+;; GELU second derivative (act″) — the RoR-closure kernel (#72).
+;; With u = c(x + a·x³), a = 0.044715, c = √(2/π), t = tanh u,
+;; s2 = 1 − t² (= sech²u), u′ = c(1 + 3a·x²), u″ = 6·a·c·x:
+;;   gelu′(x) = 0.5(1+t) + 0.5·x·s2·u′            (= gelu-backward's grad)
+;;   gelu″(x) = 0.5·s2·u′ + 0.5·[s2·u′ + x·(ds2/dx·u′ + s2·u″)]
+;;            = s2·u′ + 0.5·x·s2·(u″ − 2·t·(u′)²)  (ds2/dx = −2·t·s2·u′)
+;; Same exact-tanh spelling as gelu-backward, so FD of that kernel validates
+;; this one directly (o4c double-backward law).
+(deftm gelu-second-deriv (All [T] [x :- (Array T) n :- Long] :- (Array T)
+                              (let [dd (alloc-like x n)
+                                    c (n/sqrt (/ 2.0 n/pi))]
+                                (dotimes [i n]
+                                  (let [xi (aget x i)
+                                        u (* c (+ xi (* 0.044715 xi xi xi)))
+                                        up (* c (+ 1.0 (* 3.0 0.044715 xi xi)))
+                                        upp (* 6.0 0.044715 c xi)
+                                        t (raster.math/tanh u)
+                                        s2 (- 1.0 (* t t))]
+                                    (aset dd i (+ (* s2 up)
+                                                  (* 0.5 xi s2 (- upp (* 2.0 t up up)))))))
+                                dd)))
 
 (tmpl/merge-into-template! 'raster.dl.nn/gelu
                            {:params '[x n] :adjoint 'dy

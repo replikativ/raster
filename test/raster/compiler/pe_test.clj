@@ -178,6 +178,59 @@
       (is (#{'fn 'fn*} (first result))))))
 
 ;; ================================================================
+;; Alias propagation soundness under sequential shadowing (#72 find)
+;; ================================================================
+
+(deftest alias-shadowed-rhs-test
+  (testing "a symbol alias whose RHS is REBOUND later must be kept"
+    ;; Kh := out, then out is rebound; the closure and the later call must
+    ;; keep reading the FIRST out. Dropping Kh + env substitution would make
+    ;; them read the rebound out (silent wrong value) — PE must keep Kh.
+    (let [form '(let* [out (clojure.core/double-array 3)
+                       Kh out
+                       out (clojure.core/double-array 4)
+                       r (some.ns/f Kh out)]
+                      r)
+          result (pe/pe form)
+          bindings (partition 2 (second result))]
+      (is (some #(= 'Kh (first %)) bindings)
+          "alias with later-shadowed RHS survives")
+      (is (= '(some.ns/f Kh out) (second (last bindings)))
+          "use site still references the alias, not the rebound RHS")))
+
+  (testing "a symbol alias with a STABLE RHS is still propagated"
+    (let [form '(let* [a b
+                       r (some.ns/f a)]
+                      r)
+          result (pe/pe form)]
+      (is (not (some #{'a} (flatten result)))
+          "stable alias is inlined away")))
+
+  (testing "kept rebinding invalidates a previously propagated constant"
+    ;; x := 1.0 propagates; then x is REBOUND to a call — later refs must
+    ;; use the new x, not the stale constant.
+    (let [form '(let* [x 1.0
+                       x (some.ns/g)
+                       r (some.ns/f x)]
+                      r)
+          result (pe/pe form)
+          bindings (partition 2 (second result))]
+      (is (= '(some.ns/f x) (second (last bindings)))
+          "post-rebind reference is NOT replaced by the stale constant"))))
+
+(deftest fn*-wrapped-arity-substitution-test
+  (testing "env substitution reaches (fn* ([params] body)) — the reified
+            AD pullback shape (dangling-ref regression, #72 find)"
+    ;; h := x is droppable (x never rebound); the closure body must get the
+    ;; substitution — otherwise its h is a dangling symbol at bytecode emit.
+    (let [form '(let* [h x
+                       pb (fn* ([dy] (some.ns/f h dy)))]
+                      pb)
+          result (pe/pe form)]
+      (is (not (some #{'h} (flatten result)))
+          "alias substituted inside the wrapped-arity closure body"))))
+
+;; ================================================================
 ;; Specialize-var API on real deftm
 ;; ================================================================
 

@@ -170,17 +170,26 @@
               (constant? pe-init)
               (recur (next pairs) new-bindings (assoc env sym pe-init))
 
-              ;; Single-use trivial expression — inline
+              ;; Single-use trivial expression — inline.
+              ;; SOUNDNESS: a symbol alias (sym := rhs-sym) may only be
+              ;; dropped when rhs-sym is never REBOUND by a later binding in
+              ;; this let* — under sequential shadowing the env substitution
+              ;; would make later use sites (including AD pullback closures
+              ;; capturing sliced buffers) read the WRONG (latest) rhs value.
               (and (trivial? pe-init)
+                   (or (not (symbol? pe-init))
+                       (not-any? #(= pe-init (first %)) (next pairs)))
                    (let [uses (reduce + 0 (map #(count-uses sym %) body))]
                      (<= uses 1)))
               (recur (next pairs) new-bindings (assoc env sym pe-init))
 
-              ;; Keep the binding
+              ;; Keep the binding. A kept binding REBINDS sym for everything
+              ;; downstream — any previously propagated value for that name
+              ;; is now stale and must leave the env (sequential let*).
               :else
               (recur (next pairs)
                      (conj new-bindings [sym pe-init])
-                     env))))))))
+                     (dissoc env sym)))))))))
 
 (defn- pe-if
   "Partially evaluate an if form.
@@ -285,7 +294,24 @@
                                              [params]
                                              pe-body))]
               (if-let [m (meta form)] (with-meta r m) r))
-            ;; Multi-arity or unrecognized — leave alone
+            ;; Wrapped/multi arities: (fn* name? ([params] body…) …) — the
+            ;; reified AD pullback shape. Substitute per arity: without this,
+            ;; an env-dropped alias leaves DANGLING refs inside the closure
+            ;; (bytecode emit: "Unresolved symbol"), while count-uses (which
+            ;; IS arity-aware) says the binding is droppable.
+            (every? #(and (seq? %) (vector? (first %))) rest-tail)
+            (let [pe-arities (map (fn [arity]
+                                    (let [params (first arity)
+                                          abody (rest arity)
+                                          shadowed (set (filter symbol? params))
+                                          body-env (if (seq shadowed)
+                                                     (apply dissoc const-env shadowed)
+                                                     const-env)]
+                                      (cons params (map #(pe-pass % body-env) abody))))
+                                  rest-tail)
+                  r (apply list head (concat (when name? [name?]) pe-arities))]
+              (if-let [m (meta form)] (with-meta r m) r))
+            ;; Unrecognized — leave alone
             :else form))
 
         ;; ftm — leave alone

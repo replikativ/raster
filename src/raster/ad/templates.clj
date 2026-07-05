@@ -659,6 +659,19 @@
                     {:params '[arr] :result nil :adjoint 'dy
                      :grads '[nil]})
 
+;; Polymorphic spelling: gradient programs reference arrays through
+;; raster.arrays (shape reads on active arrays are shape REFERENCES, not
+;; differentiable dependence — the RoR path hits these on the typed-zero
+;; adjoint slots the reverse pass itself emits, #72).
+(register-template! 'raster.arrays/alength (get-template 'clojure.core/alength))
+
+;; zeros-like: a fresh zero buffer — the exemplar arg only supplies
+;; dtype/shape, no differentiable dependence (aclone, the COPY, has a real
+;; :linear rule below).
+(register-template! 'raster.arrays/zeros-like
+                    {:params '[ref n] :result nil :adjoint 'dy
+                     :grads '[nil nil]})
+
 ;; aset: arr[i] = v → no gradient through aset itself (mutation side-effect).
 ;; The gradient for mutation flows through the stored value's downstream reads.
 (register-template! 'clojure.core/aset
@@ -1134,6 +1147,9 @@
    'raster.dl.nn/linear-dW  {:class :bilinear :args [0 1]} ;; [dy x batch in-f out-f]
    'raster.dl.nn/linear-db  {:class :linear :in #{0}}      ;; [dy batch out-f]
    'raster.nn/relu-backward {:class :linear :in #{0}}      ;; [dy x]
+   ;; contraction kernels appearing in gradient programs (#72): ⟨a,b⟩ and α·x
+   'raster.par/dot-product  {:class :bilinear :args [0 1]} ;; [a b] → Double
+   'raster.par/scale        {:class :bilinear :args [0 1]} ;; [alpha x] → α·x
    ;; --- scalar primitives: frule = Σᵢ grads(dy:=Δxᵢ) (mechanical, §2) ---
    '+          {:class :elementwise :in #{0 1}}
    '-          {:class :elementwise :in #{0 1}}
@@ -1406,23 +1422,191 @@
         (sum-tangent-contribs ctx terms gensym-fn))))})
 
 ;; silu/gelu-backward (dy, x, n) → dy⊙act′(x): LINEAR in dy (that term is the
-;; kernel itself on the dy-tangent); the x-slot derivative is dy⊙act″(x)⊙dx —
-;; a GENUINE second-order elementwise rule that does not exist yet (#72).
-;; Fail LOUD if an x-tangent flows in — never silently drop it (unlike relu,
-;; whose act″ is 0 a.e., these have smooth nonzero act″).
-(doseq [op ['raster.dl.nn/silu-backward 'raster.dl.nn/gelu-backward]]
+;; kernel itself on the dy-tangent); the x-direction is the SECOND-ORDER
+;; elementwise rule (#72, act″ LANDED): d/dx[dy⊙act′(x)]·Δx = dy⊙act″(x)⊙Δx,
+;; with act″ the closed-form silu/gelu-second-deriv kernels (FD-validated
+;; against the backward kernels in the o4c double-backward law). The 3-way
+;; elementwise product is spelled as two hadamards (both RoR-closed).
+(doseq [[op dd-op] {'raster.dl.nn/silu-backward 'raster.dl.nn/silu-second-deriv
+                    'raster.dl.nn/gelu-backward 'raster.dl.nn/gelu-second-deriv}]
   (merge-into-template!
    op
    {:jvp-fn
-    (let [op op]
-      (fn [ctx [_dy x n] tangent-args _result-sym gensym-fn]
-        (when (nth tangent-args 1 nil)
-          (throw (ex-info (str "jvp: `" op "` received a tangent on its x slot — "
-                               "the second-order elementwise frule (act″) is not "
-                               "implemented yet (§13 A4 / #72 pending). Only the "
-                               "dy slot is linear.")
-                          {:op op})))
-        (let [t-dy (or (nth tangent-args 0 nil)
-                       (throw (ex-info (str "jvp: no active tangent reached " op)
-                                       {:op op})))]
-          (bind-jvp-term ctx gensym-fn "jactb" (list op t-dy x n)))))}))
+    (let [op op dd-op dd-op]
+      (fn [ctx [dy x n] tangent-args _result-sym gensym-fn]
+        (let [t-dy (nth tangent-args 0 nil)
+              t-x  (nth tangent-args 1 nil)]
+          (when-not (or t-dy t-x)
+            (throw (ex-info (str "jvp: no active tangent reached " op) {:op op})))
+          (let [[ctx terms]
+                (if t-dy
+                  (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jactb_dy"
+                                                (list op t-dy x n))]
+                    [ctx' [s]])
+                  [ctx []])
+                [ctx terms]
+                (if t-x
+                  ;; dy⊙act″(x)⊙Δx
+                  (let [[ctx' dd] (bind-jvp-term ctx gensym-fn "jactb_dd"
+                                                 (list dd-op x n))
+                        [ctx'' s] (bind-jvp-term ctx' gensym-fn "jactb_x"
+                                                 (list 'raster.dl.nn/hadamard
+                                                       (list 'raster.dl.nn/hadamard dy t-x n)
+                                                       dd n))]
+                    [ctx'' (conj terms s)])
+                  [ctx terms])]
+            (sum-tangent-contribs ctx terms gensym-fn)))))}))
+
+;; ================================================================
+;; #72 — RoR closure, reverse side: DERIVED reverse rules for the backward
+;; kernels themselves (double backward / grad-of-grad / MAML-class shapes).
+;;
+;; The kernels emitted by first-order grads-fns are linear (or bilinear) maps,
+;; so their own rrules are mechanically derivable from the same :structure
+;; tags: the adjoint of a linear op is its TRANSPOSE, spelled with EXISTING
+;; kernels. The :adjoint facet is that spelling — {arg-idx (fn [call-args
+;; adjoint-sym] expr)}, one cotangent expression per differentiable slot —
+;; and derive-rrule-from-structure turns it into a standard :grads-fn.
+;; ================================================================
+
+(defn- derive-rrule-from-structure
+  "Synthesize the :grads-fn facet for a :structure-tagged op from its
+  :adjoint facet (#72 RoR closure). Sound because for :linear/:bilinear ops
+  each partial Jacobian is CONSTANT in the differentiated slot: d_argᵢ =
+  adjointᵢ(cotangent) with the other args as frozen coefficients (bilinear
+  gives two different partial adjoints, both spelled with existing kernels).
+  Slots without an :adjoint entry are ⊥ (nil grad). Returns a standard
+  grads-fn (BindCtx convention, one flat binding per adjoint expression)."
+  [_canonical-op adjoint-map]
+  (fn [ctx actual-params _result-sym adjoint-sym gensym-fn]
+    (let [args (vec actual-params)
+          [ctx grads]
+          (reduce
+           (fn [[ctx grads] i]
+             (if-let [adj-f (get adjoint-map i)]
+               (let [g (gensym-fn (str "dadj_" i))]
+                 [(update ctx :bindings into [g (adj-f args adjoint-sym)])
+                  (conj grads g)])
+               [ctx (conj grads nil)]))
+           [ctx []] (range (count args)))]
+      [ctx grads])))
+
+(def ^:private op-adjoints
+  "#72: per-slot adjoint spellings for structure-tagged kernels WITHOUT a
+  reverse rule of their own. Each entry is {arg-idx (fn [args c] expr)} with
+  c the incoming cotangent. The math, per kernel (shapes cited):
+
+  linear-dx(dy,W,b,i,o) = dy@W          dy:[B,out] W:[out,in] → [B,in]
+    ⟨c, dy@W⟩ with c:[B,in]:
+    d_dy[b,o] = Σᵢ c[b,i]·W[o,i] = (c@Wᵀ)[b,o]  = linear-nb(c, W, B, in, out)
+    d_W[o,i]  = Σ_b dy[b,o]·c[b,i] = (dyᵀ@c)[o,i] = linear-dW(dy, c, B, in, out)
+
+  linear-dW(dy,x,b,i,o) = dyᵀ@x         dy:[B,out] x:[B,in] → [out,in]
+    ⟨c, dyᵀ@x⟩ with c:[out,in]:
+    d_dy[b,o] = Σᵢ c[o,i]·x[b,i] = (x@cᵀ)[b,o]  = linear-nb(x, c, B, in, out)
+    d_x[b,i]  = Σ_o dy[b,o]·c[o,i] = (dy@c)[b,i] = linear-dx(dy, c, B, in, out)
+    ({linear-nb, linear-dx, linear-dW} is CLOSED under partial adjoints.)
+
+  linear-db(dy,b,o) = colsum(dy)        dy:[B,out] → [out]
+    adjoint of colsum = tile c:[out] across the B rows
+    = ones[B,1] @ c[1,out] = matmul(fill(zeros[B],1), c, B, 1, out)
+
+  relu-backward(dy,x) = dy⊙1[x>0]: diagonal 0/1 mask = its own transpose →
+    d_dy = relu-backward(c, x); d_x = 0 a.e. (relu″, same kink convention)
+
+  silu/gelu-backward(dy,x,n) = dy⊙act′(x):
+    d_dy = c⊙act′(x) = the kernel itself on c (diagonal, self-adjoint)
+    d_x  = c⊙dy⊙act″(x) — hadamard twice with the act″ kernel (#72)
+
+  daxpy-diff!(a,b,scale,n) = scale·(a−b):
+    d_a = scale·c      = daxpy-diff!(c, 0ⁿ, scale, n)
+    d_b = −scale·c     = daxpy-diff!(0ⁿ, c, scale, n)
+    d_scale = ⟨c, a−b⟩ = dot-product(c, daxpy-diff!(a, b, 1.0, n))
+
+  dot-product(a,b) = ⟨a,b⟩ (scalar out, c is a scalar):
+    d_a = c·b = scale(c, b);  d_b = c·a = scale(c, a)
+
+  scale(α,x) = α·x:
+    d_α = ⟨c,x⟩ = dot-product(c, x);  d_x = α·c = scale(α, c)
+
+  aclone(arr): identity copy → d_arr = aclone(c) (fresh copy so downstream
+    accumulation can never alias the incoming cotangent)."
+  {'raster.dl.nn/linear-dx
+   {0 (fn [[_dy W batch in-f out-f] c]
+        (list 'raster.dl.nn/linear-nb c W batch in-f out-f))
+    1 (fn [[dy _W batch in-f out-f] c]
+        (list 'raster.dl.nn/linear-dW dy c batch in-f out-f))}
+
+   'raster.dl.nn/linear-dW
+   {0 (fn [[_dy x batch in-f out-f] c]
+        (list 'raster.dl.nn/linear-nb x c batch in-f out-f))
+    1 (fn [[dy _x batch in-f out-f] c]
+        (list 'raster.dl.nn/linear-dx dy c batch in-f out-f))}
+
+   'raster.dl.nn/linear-db
+   {0 (fn [[_dy batch out-f] c]
+        (list 'raster.dl.nn/matmul
+              (list 'raster.par/fill (list 'raster.arrays/zeros-like c batch) 1.0)
+              c batch 1 out-f))}
+
+   'raster.nn/relu-backward
+   {0 (fn [[_dy x] c] (list 'raster.nn/relu-backward c x))}
+
+   'raster.dl.nn/silu-backward
+   {0 (fn [[_dy x n] c] (list 'raster.dl.nn/silu-backward c x n))
+    1 (fn [[dy x n] c]
+        (list 'raster.dl.nn/hadamard
+              (list 'raster.dl.nn/hadamard c dy n)
+              (list 'raster.dl.nn/silu-second-deriv x n) n))}
+
+   'raster.dl.nn/gelu-backward
+   {0 (fn [[_dy x n] c] (list 'raster.dl.nn/gelu-backward c x n))
+    1 (fn [[dy x n] c]
+        (list 'raster.dl.nn/hadamard
+              (list 'raster.dl.nn/hadamard c dy n)
+              (list 'raster.dl.nn/gelu-second-deriv x n) n))}
+
+   'raster.linalg.blas/daxpy-diff!
+   {0 (fn [[_a _b scale n] c]
+        (list 'raster.linalg.blas/daxpy-diff!
+              c (list 'raster.arrays/zeros-like c n) scale n))
+    1 (fn [[_a _b scale n] c]
+        (list 'raster.linalg.blas/daxpy-diff!
+              (list 'raster.arrays/zeros-like c n) c scale n))
+    2 (fn [[a b _scale n] c]
+        (list 'raster.par/dot-product
+              c (list 'raster.linalg.blas/daxpy-diff! a b 1.0 n)))}
+
+   'raster.par/dot-product
+   ;; c is a SCALAR cotangent; scale's alpha is annotated Double, so widen
+   ;; explicitly (a float-typed seed dispatches [Float floats] otherwise —
+   ;; exact widening, the array dtype is preserved by scale's (All [T])).
+   {0 (fn [[_a b] c] (list 'raster.par/scale (list 'double c) b))
+    1 (fn [[a _b] c] (list 'raster.par/scale (list 'double c) a))}
+
+   'raster.par/scale
+   {0 (fn [[_alpha x] c] (list 'raster.par/dot-product c x))
+    1 (fn [[alpha _x] c] (list 'raster.par/scale alpha c))}
+
+   'raster.arrays/aclone
+   {0 (fn [[_arr] c] (list 'raster.arrays/aclone c))}
+
+   'clojure.core/aclone
+   {0 (fn [[_arr] c] (list 'raster.arrays/aclone c))}})
+
+;; Install: the :adjoint facet always; a derived :grads-fn only where no
+;; HAND reverse rule exists (never clobber one — transpose-2d etc. already
+;; have theirs). Eager so has-ad-rule? (the compiler-inliner gate and the
+;; reverse engine's record-time check) sees these ops as AD primitives.
+;; The ::derived-grads-fn marker makes re-registration idempotent under
+;; :reload (the defonce registry survives; a previously DERIVED fn must be
+;; refreshed, a hand-written one must not be touched).
+(doseq [[op adjoint-map] op-adjoints]
+  (let [t (get-template op)]
+    (merge-into-template!
+     op
+     (cond-> {:adjoint adjoint-map}
+       (or (::derived-grads-fn t)
+           (not (or (:grads t) (:grads-fn t))))
+       (assoc :grads-fn (derive-rrule-from-structure op adjoint-map)
+              ::derived-grads-fn true)))))
