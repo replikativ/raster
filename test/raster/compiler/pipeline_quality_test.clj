@@ -11,6 +11,7 @@
             [raster.arrays :as arrays]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.scalar.pe :as pe]
+            [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.tooling.inspect :as inspect]))
 
 (use-fixtures :once
@@ -332,3 +333,38 @@
         out (pe/pe-pass node {})]
     (is (not= 'raster.numeric/* (:raster.op/original (meta out)))
         "surviving (- x) must not inherit the *'s :raster.op/original after mul-by-one")))
+
+;; ================================================================
+;; Cross-cutting gate (task #78): a .invk node's :raster.op/original must never
+;; contradict the op-family of its impl name. A violation is the pe/normalize
+;; provenance corruption that flipped #78's gradient sign — normalize trusts
+;; :raster.op/original, so a stale one silently rewrites the head.
+;; ================================================================
+
+(defn- op-original-violations
+  "Seq of .invk nodes whose :raster.op/original contradicts the impl's op-family
+   (per normalize's canonical demangler)."
+  [form]
+  (let [demangle @#'normalize/direct-op-for-impl
+        v (atom [])]
+    ((fn walk [f]
+       (when (coll? f)
+         (when (and (seq? f) (= '.invk (first f)) (symbol? (second f)))
+           (let [o (:raster.op/original (meta f))
+                 o2 (demangle (name (second f)))]
+             (when (and o o2 (not= o o2))
+               (swap! v conj {:claimed o :impl-op o2 :impl (second f)}))))
+         (doseq [x f] (walk x))))
+     form)
+    @v))
+
+(deftest op-original-agrees-with-head-invariant-issue-78
+  (doseq [v [#'nn/predict-fn #'nn/loss-fn #'ce-bwd-literal-seed]]
+    (let [sp (pipeline/show-pipeline v :dtype :double)]
+      (doseq [stage [:walked :fixpointed :materialized :lowered]]
+        (when-let [form (get sp stage)]
+          (is (empty? (op-original-violations form))
+              (str v " @ " stage
+                   " has :raster.op/original contradicting its .invk head "
+                   "(the #78 pe/normalize corruption class): "
+                   (pr-str (first (op-original-violations form))))))))))
