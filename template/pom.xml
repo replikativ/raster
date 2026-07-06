@@ -13,9 +13,16 @@
             <url>https://opensource.org/licenses/MIT</url>
         </license>
     </licenses>
+    <developers>
+        <developer>
+            <id>whilo</id>
+            <name>Christian Weilbach</name>
+            <email>christian@weilbach.name</email>
+        </developer>
+    </developers>
     <scm>
         <connection>scm:git:git@github.com:replikativ/raster.git</connection>
-        <developerConnection>scm:git:git@github.com/replikativ/raster.git</developerConnection>
+        <developerConnection>scm:git:git@github.com:replikativ/raster.git</developerConnection>
         <url>https://github.com/replikativ/raster</url>
     </scm>
 </project>
