@@ -262,8 +262,6 @@
 
 (defn tc-analyze-deftm-body
   "Analyze a deftm body once with Typed Clojure.
-  Forces tc-extensions/ensure-core-ann-overrides! first (late registration of
-  the unchecked-* precise overloads — see tc_extensions.clj for why late).
 
   Returns a map with:
     :ret-tag           — inferred return type tag
@@ -278,7 +276,6 @@
   definition) *ns* must be bound to the source ns or every refer'd op fails to
   resolve — yielding a TCError return and discarding ALL inferred binding types."
   [fn-name params annotations body & [source-ns]]
-  @raster.compiler.core.tc-extensions/ensure-core-ann-overrides!
   (try
     ;; Skip TC analysis for fully-untyped methods (all Object/Any params).
     ;; These are polymorphic fallbacks where TC can't add value — every operation

@@ -34,56 +34,11 @@
 (t/ann ^:no-check clojure.core/object-array [(t/U Long (t/Seqable t/Any)) :-> (Array Object)])
 (t/ann ^:no-check clojure.core/long-array [(t/U Long (t/Seqable Long)) :-> (Array long)])
 (t/ann ^:no-check clojure.core/float-array [(t/U Long (t/Seqable t/Num)) :-> (Array float)])
-;; Precise unchecked-* arithmetic overloads. Upstream TC annotates these as
-;; AnyInteger -> AnyInteger, which makes BARE `(dotimes [b 4] b)` fail to check:
-;; dotimes expands to (loop [b 0] ... (recur (unchecked-inc b))), upstream #257
-;; widens the loop init to Long, and AnyInteger </: Long at the recur — one
-;; spurious delayed error per dotimes, which (via the load-bearing all-or-
-;; nothing error gate) discards every binding tag in the deftm. These overrides
-;; replace the last load-bearing commit of the whilo/typedclojure fork, letting
-;; raster run on UPSTREAM TC main. Upstreaming the fix (one annotation change)
-;; is proposed to TC with the (dotimes [b 4] b) repro.
-;;
-;; REGISTRATION MUST BE LATE: TC's base type env initializes lazily at the
-;; first check and clobbers load-time user annotations for clojure.core vars
-;; (verified: load-time ann ineffective, post-init ann effective). So the
-;; overrides live in a delay forced by inference.clj before each analysis.
-(defonce ^{:doc "Force before TC analysis: registers the unchecked-* overloads
-  AFTER TC's base env exists so they take precedence. Idempotent."}
-  ensure-core-ann-overrides!
-  (delay
-    (eval
-     '(do
-        ;; Force TC's lazy base-env initialization FIRST (a trivial check), so
-        ;; the anns below land AFTER it and are not clobbered by it. Without
-        ;; this, forcing the delay before the first real check would register
-        ;; into a pre-init env and be lost — with no second chance (defonce).
-        ((requiring-resolve 'typed.clj.checker/check-form-info) 1)
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-inc
-          (typed.clojure/IFn [Long :-> Long] [Double :-> Double]
-                             [typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num :-> typed.clojure/Num]))
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-dec
-          (typed.clojure/IFn [Long :-> Long] [Double :-> Double]
-                             [typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num :-> typed.clojure/Num]))
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-negate
-          (typed.clojure/IFn [Long :-> Long] [Double :-> Double]
-                             [typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num :-> typed.clojure/Num]))
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-add
-          (typed.clojure/IFn [Long Long :-> Long] [Double Double :-> Double]
-                             [typed.clojure/AnyInteger typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num typed.clojure/Num :-> typed.clojure/Num]))
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-subtract
-          (typed.clojure/IFn [Long Long :-> Long] [Double Double :-> Double]
-                             [typed.clojure/AnyInteger typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num typed.clojure/Num :-> typed.clojure/Num]))
-        (typed.clojure/ann ^:no-check clojure.core/unchecked-multiply
-          (typed.clojure/IFn [Long Long :-> Long] [Double Double :-> Double]
-                             [typed.clojure/AnyInteger typed.clojure/AnyInteger :-> typed.clojure/AnyInteger]
-                             [typed.clojure/Num typed.clojure/Num :-> typed.clojure/Num]))
-        :registered))))
+;; NOTE: the precise unchecked-* overloads (Long/Double arms so BARE
+;; `(dotimes [b 4] b)` checks) that raster used to register here via a late-forced
+;; `ensure-core-ann-overrides!` delay now ship natively in Typed Clojure ≥1.4.0
+;; (upstream #265 "Add unchecked-* overloads", verbatim the same arms). The
+;; workaround is therefore removed; the base env carries them from init.
 
 (t/ann ^:no-check clojure.core/conj! (t/All [x] [(t/Transient x) x :-> (t/Transient x)]))
 (t/ann ^:no-check clojure.core/transient (t/All [x] [(t/Coll x) :-> (t/Transient x)]))
