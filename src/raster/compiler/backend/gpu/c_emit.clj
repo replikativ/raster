@@ -255,12 +255,24 @@
    7-way-duplicated cond where only an explicit :int short-circuited)."
   [sym scalar-types ctype]
   (let [sname (name sym)
-        explicit (get scalar-types sym (get scalar-types (symbol sname)))]
+        explicit (get scalar-types sym (get scalar-types (symbol sname)))
+        m (meta sym)
+        ;; Compiler-canonical tag first: :raster.type/tag is stamped for EVERY typed
+        ;; binding incl. primitives (a `long` local never gets Clojure :tag —
+        ;; compute-binding-hint drops bare primitives). Clojure :tag as a fallback
+        ;; for non-primitive hints. This is the reliable signal; the name regex is a
+        ;; fragile last-resort heuristic for untagged locals (e.g. a scalar whose
+        ;; binder the inliner alpha-renamed `nb`→`nb_α_7`, which the regex misses).
+        mtag (or (:raster.type/tag m) (:tag m))]
     (cond
       (contains? #{:float :double :half} explicit) ctype
       (contains? #{:int :long :byte} explicit) "int"
-      (or (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname)
-          (contains? #{'long 'int} (:tag (meta sym)))) "int"
+      ;; Stamped tag is authoritative — it OUTRANKS the name regex so a float named
+      ;; `len`/`count` isn't truncated to int and an int renamed away from an int-ish
+      ;; name still declares int.
+      (contains? #{'long 'int 'byte} mtag) "int"
+      (contains? #{'float 'double 'half} mtag) ctype
+      (re-find #"(?i)n[-_]|size|count|len|idx|offset" sname) "int"
       :else ctype)))
 
 (defn fn-style-reduction-op?

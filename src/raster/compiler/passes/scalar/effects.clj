@@ -62,7 +62,27 @@
               (binding [*out* *err*]
                 (println "WARNING: effects.clj failed to load raster.dl.loss -" (.getMessage e)))
               {}))
-          raster-entries (merge pure-entries array-entries loss-entries)
+          ;; Register raster.ad.reverse/grad-acc as :pure. It is the AD gradient-
+          ;; accumulation primitive (nil-safe a+b): it ALWAYS returns a fresh value —
+          ;; a passed-through input, a fresh clone it mutates locally, or numeric/+ —
+          ;; and NEVER mutates a caller-owned buffer, so it is externally pure. beichte
+          ;; can't see through the (.isArray)/aclone branches and defaults it to :io,
+          ;; which wrongly pins a DEAD gradient (e.g. the unused input gradient dx in a
+          ;; single LoRA/QLoRA train step: value+grad computes every arg's gradient, but
+          ;; the step only consumes dA/dB — the dx grad-acc is dead) so DCE can't drop
+          ;; it, and it then defeats resident GPU extraction (a non-kernel array op).
+          ad-entries
+          (try
+            (require 'raster.ad.reverse)
+            (let [publics (ns-publics (the-ns 'raster.ad.reverse))]
+              (into {} (keep (fn [[sym v]]
+                               (when (= 'grad-acc sym) [v :pure]))
+                             publics)))
+            (catch Exception e
+              (binding [*out* *err*]
+                (println "WARNING: effects.clj failed to load raster.ad.reverse -" (.getMessage e)))
+              {}))
+          raster-entries (merge pure-entries array-entries loss-entries ad-entries)
           reg (b/extend-registry (b/default-registry) raster-entries)]
       (b/make-context {:registry reg}))))
 

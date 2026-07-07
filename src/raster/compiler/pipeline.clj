@@ -1174,13 +1174,29 @@
           ;; receives the host arrays, so `(alength W)` on a param stays a valid
           ;; host size expr.
           device-buffers (volatile! #{})
+          ;; Array aliases: bindings of the form `sym = <bare array symbol>` (e.g. a
+          ;; fused-buffer alias `db = hfuse_out`, or a residual/broadcast copy result
+          ;; the SOAC fuser rewired to an existing buffer). These carry NO computation —
+          ;; they are pure renames. We copy-propagate them: record sym → target and
+          ;; subst into every subsequent binding + the body, so a later kernel step that
+          ;; references `db` resolves to the real device buffer. Without this the alias
+          ;; binding reaches the array-tag?/reads-device-buffer rejects and defeats an
+          ;; otherwise-straight-line resident program (e.g. QLoRA residual base+delta
+          ;; backward, where residual-add's two grad copies fuse to one buffer).
+          aliases (volatile! {})
           ok (volatile! true)
           reason (volatile! nil)
           reject! (fn [why sym expr]
                     (vreset! ok false)
                     (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
-      (doseq [[sym expr] bindings]
+      (doseq [[sym expr0] bindings]
+        (let [expr (if (seq @aliases) (util/subst-syms @aliases expr0) expr0)]
         (cond
+          ;; pure array-alias binding (`sym = other-array-symbol`) → copy-propagate.
+          (and (symbol? expr)
+               (or (contains? @device-buffers expr) (array-tag? sym)))
+          (do (vswap! aliases assoc sym expr)
+              (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
           (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
           (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
               (vswap! device-buffers conj sym))
@@ -1222,11 +1238,12 @@
           (not (contains-gpu-invoke? expr))
           (vswap! scalar-lets into [sym expr])
           ;; control flow / kernel-result-into-scalar → not straight-line.
-          :else (reject! :control-flow-or-host-scalar sym expr)))
-      (cond
-        (not @ok)      {::non-resident @reason}
-        (empty? @steps) {::non-resident {:why :no-kernel-steps}}
-        :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+          :else (reject! :control-flow-or-host-scalar sym expr))))
+      (let [body (if (seq @aliases) (util/subst-syms @aliases body) body)]
+        (cond
+          (not @ok)      {::non-resident @reason}
+          (empty? @steps) {::non-resident {:why :no-kernel-steps}}
+          :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body})))))
 
 (defn- strip-meta
   "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
@@ -1322,6 +1339,22 @@
               (println "=== POST-FUSE ===") (println (pr-str form-soa))
               (println "=== END-FUSE-DUMP ===")))
         form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
+        ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
+        ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes
+        ;; every parameter gradient look live. By here the vector is gone and only the
+        ;; gradients the caller actually consumed (dA, dB via SGD) reach the result —
+        ;; so an UNUSED input/other-arg gradient (e.g. the input gradient dx in a single
+        ;; training step: qlinear-q8-dx + the x-path GEMMs + their grad-acc) is now
+        ;; provably dead. eliminate-dead-bindings drops the pure grad-acc and cascades
+        ;; through the dead GEMM/kernel stores (their outputs are read only by the dead
+        ;; grad-acc), leaving a lean straight-line program. Without this, that dead
+        ;; grad-acc (a non-kernel array op) defeats resident extraction.
+        form (if (and (seq? form) (#{'let* 'let} (first form)))
+               (:form (dce/eliminate-dead-bindings form))
+               form)
+        _ (when (System/getProperty "raster.debug.preextract")
+            (binding [*out* *err*]
+              (println "=== PRE-EXTRACT ===") (println (pr-str form)) (println "=== END-PRE-EXTRACT ===")))
         extracted (extract-gpu-program form)
         prog (if-let [nr (::non-resident extracted)]
                (if (= on-non-resident :throw)

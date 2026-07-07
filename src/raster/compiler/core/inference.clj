@@ -910,6 +910,26 @@
               (get types/primitive-array-element-types (:tag (meta arr-sym)))
               (get @types/soa-reverse-registry env-tag)))))))
 
+(def long-returning-core-ops
+  "clojure.core ops whose result is a primitive long — integer index/counter
+   arithmetic (quot/rem/mod/bit-*/unchecked-*/count/alength). Both fully-qualified
+   and bare spellings, since the walker sees either. Single source of truth for
+   'this binding/expr is a long scalar', consumed by infer-expr-tag AND
+   infer-binding-tag so a `(quot in 32)` block-count local is stamped
+   :raster.type/tag long — which the GPU C emitter needs to declare it `int`
+   instead of defaulting an untagged scalar to the kernel float element type."
+  '#{clojure.core/quot clojure.core/rem clojure.core/mod
+     clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
+     clojure.core/bit-not clojure.core/bit-shift-left
+     clojure.core/bit-shift-right clojure.core/unsigned-bit-shift-right
+     clojure.core/unchecked-add clojure.core/unchecked-subtract
+     clojure.core/unchecked-multiply clojure.core/unchecked-negate
+     clojure.core/unchecked-inc clojure.core/unchecked-dec
+     clojure.core/count clojure.core/alength
+     quot rem mod bit-and bit-or bit-xor bit-not
+     bit-shift-left bit-shift-right unsigned-bit-shift-right
+     count alength})
+
 (defn infer-expr-tag
   "Infer the type tag of an arbitrary expression given type-env.
   Handles symbols, literals, casts, aget, and deftm calls recursively.
@@ -937,18 +957,7 @@
         (descriptor/aget-op? head)
         (infer-aget-type expr type-env)
         ;; Clojure core fns with known long return type
-        (contains? '#{clojure.core/quot clojure.core/rem clojure.core/mod
-                      clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
-                      clojure.core/bit-not clojure.core/bit-shift-left
-                      clojure.core/bit-shift-right clojure.core/unsigned-bit-shift-right
-                      clojure.core/unchecked-add clojure.core/unchecked-subtract
-                      clojure.core/unchecked-multiply clojure.core/unchecked-negate
-                      clojure.core/unchecked-inc clojure.core/unchecked-dec
-                      clojure.core/count clojure.core/alength
-                      quot rem mod bit-and bit-or bit-xor bit-not
-                      bit-shift-left bit-shift-right unsigned-bit-shift-right
-                      count alength}
-                   head)
+        (contains? long-returning-core-ops head)
         'long
         ;; deftm generic call: resolve dispatch and get return tag
         (and (symbol? head) (generic-fn?* source-ns head))
@@ -1422,6 +1431,15 @@
    (when-let [t (when (and (seq? init) (contains? types/primitive-info (first init)))
                   (first init))]
      (trace-inferred sym t :cast))
+   ;; Long-returning clojure.core op (quot/rem/mod/bit-*/count/alength) — an
+   ;; integer index/counter binding. infer-expr-tag already classifies these; the
+   ;; binder must too, else a `(quot in 32)` block-count local stays untagged and
+   ;; the GPU C emitter defaults it to the kernel's float element type (wrong for
+   ;; index arithmetic). Stamps :raster.type/tag long (never Clojure :tag —
+   ;; compute-binding-hint drops primitives).
+   (when-let [t (when (and (seq? init) (contains? long-returning-core-ops (first init)))
+                  'long)]
+     (trace-inferred sym t :long-op))
    ;; Array allocation — cheap structural check
    (when-let [t (when (and (seq? init) (contains? alloc-sym->array-tag (first init)))
                   (get alloc-sym->array-tag (first init)))]

@@ -15,11 +15,15 @@
     scales : float[out*nb]  per-row per-block scale (nb = in/32)
     W[o,i] = scales[o*nb + i/32] * codes[o,i]
 
-  The forward/backward kernels are ^:no-inline opaque ops: their bodies are never
-  differentiated (the derivative relationship is the hand-written pullback below,
-  the same contract as raster.dl.nn/linear over BLAS dgemm). Both use the identical
-  dequant, so the analytic dx is the exact gradient of the forward and a finite-
-  difference check matches to float precision."
+  The forward is a template-backed op: its :grads-fn (below) keeps it symbolic
+  through the AD transform, so its body is never differentiated (the derivative
+  relationship is the hand-written pullback qlinear-q8-dx, the same contract as
+  raster.dl.nn/linear over BLAS dgemm). Both use the identical dequant, so the
+  analytic dx is the exact gradient of the forward and a finite-difference check
+  matches to float precision. Neither is ^:no-inline: opacity to differentiation
+  comes from the template, and dropping the inline barrier lets the post-AD backend
+  expansion inline the `par/map-void!` bodies so they lower to RESIDENT GPU kernel
+  steps (the int8-resident QLoRA training path), just like the decode quant GEMVs."
   (:require [raster.core :refer [deftm]]
             [raster.ad.templates :as tmpl]))
 
@@ -70,9 +74,17 @@
 ;; Differentiable op: forward + backward-data kernels (dequant on the fly)
 ;; ---------------------------------------------------------------------------
 
-(deftm ^:no-inline qlinear-q8
+(deftm qlinear-q8
   "Forward: y[M,out] = X[M,in] @ dequant(codes,scales)^T over a frozen row-major
-   Q8_0 weight. y[m,o] = Σ_i scales[o,i/32]·codes[o,i]·x[m,i]."
+   Q8_0 weight. y[m,o] = Σ_i scales[o,i/32]·codes[o,i]·x[m,i].
+
+   NOT ^:no-inline: the :grads-fn template below keeps this op SYMBOLIC through the
+   AD transform (pre-AD lowering skips template-backed ops; interpreted value+grad
+   uses the template pullback), so opacity to differentiation is provided by the
+   template, not by an inline barrier. Post-AD `expand-for-backends` then inlines
+   the body so its `par/map-void!` lowers to a resident GPU :map-void kernel step —
+   the memory-fit win of keeping the int8 weight resident. Structurally identical to
+   the decode quant GEMV kernels (raster.quant.kernels-k) which lower the same way."
   [x :- (Array float) codes :- (Array byte) scales :- (Array float)
    m :- Long in :- Long out :- Long] :- (Array float)
   (let [y  (float-array (clojure.core/* (long m) (long out)))
@@ -95,9 +107,14 @@
                 acc))))))
     y))
 
-(deftm ^:no-inline qlinear-q8-dx
+(deftm qlinear-q8-dx
   "Backward-data: dx[M,in] = dY[M,out] @ dequant(codes,scales). The dequant-transpose
-   GEMM. dx[m,i] = Σ_o scales[o,i/32]·codes[o,i]·dy[m,o]. No weight gradient (frozen)."
+   GEMM. dx[m,i] = Σ_o scales[o,i/32]·codes[o,i]·dy[m,o]. No weight gradient (frozen).
+
+   NOT ^:no-inline: this is the backward kernel emitted by qlinear-q8's :grads-fn. It
+   only appears in the IR AFTER the AD transform (never differentiated itself), so it
+   carries no template — it just needs to inline post-AD so its `par/map-void!` lowers
+   to a resident GPU :map-void step, exactly like the forward."
   [dy :- (Array float) codes :- (Array byte) scales :- (Array float)
    m :- Long in :- Long out :- Long] :- (Array float)
   (let [dx (float-array (clojure.core/* (long m) (long in)))
