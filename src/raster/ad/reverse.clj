@@ -3270,7 +3270,16 @@
   where form is a flat let* returning [primal grad1 ... gradN].
   Returns nil if AD transform fails."
   [f-var]
-  (let [resolved (resolve-deftm-var f-var)
+  ;; ONE shared gensym counter across the whole reverse lowering. ad-prepare
+  ;; (lower-composites) and transform-body each open their OWN with-ad-gensym;
+  ;; without this enclosing scope each RESETS *gensym-counter* to 0 and re-emits
+  ;; anf__1/anf__2/anf__3…, so a binding-position ANF temp (e.g. linear-nb's
+  ;; `(* nq hd)` out arg) and a tail-position ANF temp collide on the SAME name
+  ;; in the flat let* → the second SHADOWS the first → a template backward reads
+  ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
+  ;; monotonic counter keeps every generated name globally unique.
+  (with-ad-gensym
+   (let [resolved (resolve-deftm-var f-var)
         m (meta resolved)
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
@@ -3359,7 +3368,7 @@
        :tags tags
        :source-ns source-ns
        :result-sym (:result-sym flat)
-       :param-adj-syms (:param-adj-syms flat)})))
+       :param-adj-syms (:param-adj-syms flat)}))))
 
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.
