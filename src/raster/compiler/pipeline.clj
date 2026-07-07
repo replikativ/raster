@@ -37,6 +37,7 @@
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -1418,14 +1419,20 @@
                            ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
                            :output (when output (keyword (name output)))
                            :n-fn (expr->arg-fn all-params scalar-lets n-expr)
-                           ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
-                           ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
-                           ;; `features`) is bound as :int, not mis-typed float (→ launch error).
+                           ;; Type each scalar arg with the SAME `scalar-native-type` the kernel
+                           ;; DECLARATION uses (par_opencl), so the host arg encoding always matches
+                           ;; the kernel's C param type — single source of truth. A deftm PARAM is in
+                           ;; scalar-types; a HOISTED LOCAL scalar (e.g. `nb (quot in 32)`, not a
+                           ;; param) is typed from its `:raster.type/tag` stamp. The old code only
+                           ;; consulted the param map and DEFAULTED locals to :float — so an int local
+                           ;; like `nb` was declared `int` in the kernel but encoded `:float` on the
+                           ;; host → float-bits into an int slot → garbage index → OOB → device-lost.
                            :scalar-specs (mapv (fn [s]
-                                                 {:type (or (and (symbol? s)
-                                                                 (get (:scalar-types gpu-param-types) s))
-                                                            (if (= effective-dtype :double) :double :float))
-                                                  :value-fn (expr->arg-fn all-params scalar-lets s)})
+                                                 (let [ct (c-emit/scalar-native-type
+                                                           s (:scalar-types gpu-param-types)
+                                                           (if (= effective-dtype :double) "double" "float"))]
+                                                   {:type (case ct "int" :int "double" :double :float)
+                                                    :value-fn (expr->arg-fn all-params scalar-lets s)}))
                                                scalars)
                            :convention convention
                            :phase (keyword (str "gpu-step-" i))})))
