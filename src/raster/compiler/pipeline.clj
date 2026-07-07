@@ -454,6 +454,18 @@
     (vector? form) (reduce + 0 (map count-undevirtualized form))
     :else 0))
 
+(defn- collect-undevirtualized
+  "Collect the surviving undevirtualized dispatch call FORMS in a form (for
+  diagnostics — the whole `(op arg…)` so the offending kernel/operands are
+  identifiable, not just the op name)."
+  [form]
+  (cond
+    (seq? form)
+    (concat (when (undevirtualized-dispatch-call? (first form)) [form])
+            (mapcat collect-undevirtualized form))
+    (vector? form) (mapcat collect-undevirtualized form)
+    :else nil))
+
 (defn- pass-late-cleanup
   "Late CSE + DCE + dispatch resolution after buffer fusion and backward inlining.
   Eliminates aliases and dead bindings, re-tags binding types (new bindings
@@ -470,14 +482,31 @@
           tagged (tag-binding-types (:form dce-result) (:param-env opts))
           ;; Resolve any remaining generic dispatch calls
           resolved (inline/resolve-generic-deftm-calls tagged (:param-env opts))
-          ;; Warn about surviving undevirtualized calls — these cause massive
-          ;; performance degradation (270ns dispatch vs 4ns .invk per call)
-          remaining (count-undevirtualized resolved)]
+          ;; Warn about surviving undevirtualized calls — on CPU these fall back to
+          ;; slow IFn.invoke (270ns dispatch vs 4ns .invk); on GPU they CANNOT lower
+          ;; to C and produce garbage. Name the ops so the type-inference gap is
+          ;; findable.
+          surviving (collect-undevirtualized resolved)
+          remaining (count surviving)
+          op-freq (frequencies (map first surviving))
+          examples (mapv (fn [f] (let [s (pr-str f)] (subs s 0 (min 200 (count s)))))
+                         (take 3 (distinct surviving)))]
       (when (pos? remaining)
-        (binding [*out* *err*]
-          (println (str "WARNING: " remaining " undevirtualized dispatch call(s) survive "
-                        "late-cleanup — expect ~100x slowdown in hot loops. "
-                        "Check type inference in gradient/backward code."))))
+        (if (device/gpu-target? (:target-device opts))
+          ;; GPU cannot fall back to IFn.invoke — a surviving dispatch emits a call
+          ;; to a nonexistent OpenCL function → silent garbage output. Fail loud so
+          ;; a mistyped kernel (e.g. double literals/params in a float kernel) is a
+          ;; compile error, not wrong tokens at runtime.
+          (throw (ex-info (str remaining " undevirtualized dispatch call(s) cannot lower to GPU C "
+                               "(would miscompile to garbage). Make the kernel type-consistent — "
+                               "cast double literals/params to the element dtype. Surviving ops: "
+                               (pr-str op-freq) " e.g. " (pr-str examples))
+                          {:surviving op-freq :examples examples
+                           :target-device (:target-device opts)}))
+          (binding [*out* *err*]
+            (println (str "WARNING: " remaining " undevirtualized dispatch call(s) survive "
+                          "late-cleanup — CPU ~100x slowdown, GPU miscompile. "
+                          "Surviving ops: " (pr-str op-freq) " e.g. " (pr-str examples))))))
       {:form resolved
        :stats {:cse-aliases (:cse-aliases (:stats cse-result))
                :bindings-removed (:bindings-removed (:stats dce-result))

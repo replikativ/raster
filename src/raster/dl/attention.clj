@@ -409,7 +409,7 @@
                                       [q :- (Array T) k :- (Array T) v :- (Array T)
                                        out :- (Array T) sc :- (Array T)
                                        clenbuf :- (Array long) n-q :- Long group :- Long
-                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- Double] :- Void
+                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- T] :- Void
                                       (do
   ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
                                         (raster.par/map-void! ij (clojure.core/* n-q maxpos)
@@ -427,6 +427,9 @@
                                                                                        (+ acc (* (aget q (clojure.core/+ qb d))
                                                                                                  (aget k (clojure.core/+ kb d)))))
                                                                                 acc))]
+                                                                    ;; scale is :- T (element-typed), so dot*scale is T×T and devirtualizes
+                                                                    ;; for every T — no hard-coded precision (a Double scale here would not
+                                                                    ;; lower to GPU C: float×double has no monomorphic overload).
                                                                     (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
   ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
                                         (raster.par/map-void! hq n-q

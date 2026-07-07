@@ -313,6 +313,21 @@ through binding metadata or canonical effect nodes — not inferred by scanning 
 `aset` calls inside nested forms. DCE and other passes rely on correct effect
 classification; implicit effects cause silent miscompilation.
 
+**Never hard-type precision in polymorphic kernels; type scalars to the element
+type.** Inside an `(All [T])` deftm, do NOT write `(float x)`/`(double x)` casts or
+`0.0f` literals to force a dtype — that silently narrows for the other `T` and breaks
+polymorphism. A scalar that participates in `T`-typed arithmetic must be declared
+`:- T` (e.g. `scale :- T`, `eps :- T`), NOT `:- Double`. A `T`-value × a `Double`
+scalar has **no monomorphic overload** (and GPU can't promote to double), so
+`raster.numeric/*` stays **undevirtualized**: on CPU it falls back to slow
+`IFn.invoke` (correct but ~100× slower); **on GPU it cannot lower to OpenCL C and
+emits a garbage kernel → wrong output.** `:- T` monomorphizes to float on GPU /
+double on CPU with zero hard-coding (validated clean for both). Concrete
+`(Array float)` kernels may cast literals type-consistently, but prefer promoting
+them to `(All [T])`. Backstop: `pass-late-cleanup` **throws on GPU targets** when an
+undevirtualized `raster.*` dispatch survives (naming the op + example form) — a loud
+compile error instead of silent GPU garbage; CPU still warns.
+
 ## Performance Baselines (2026-03-24)
 
 ### ODE: DP5 Lorenz attractor (t=[0,100], atol=1e-8, rtol=1e-6)
