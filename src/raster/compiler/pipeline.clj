@@ -1167,6 +1167,13 @@
           allocs (volatile! [])
           steps (volatile! [])
           scalar-lets (volatile! [])
+          ;; Intermediate array BINDINGS produced in this program: allocs and
+          ;; kernel/GEMM step outputs. These are device-only buffers — a host
+          ;; scalar/size-let may NOT read them (see the scalar-let guard below).
+          ;; Array PARAMS are deliberately NOT tracked here: the per-call arg-fn
+          ;; receives the host arrays, so `(alength W)` on a param stays a valid
+          ;; host size expr.
+          device-buffers (volatile! #{})
           ok (volatile! true)
           reason (volatile! nil)
           reject! (fn [why sym expr]
@@ -1175,18 +1182,20 @@
       (doseq [[sym expr] bindings]
         (cond
           (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
-          (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
+              (vswap! device-buffers conj sym))
           ;; devirtualized array alloc (alloc-like/zeros-like .invk) — a GEMM/kernel output buffer.
           (alloc-invk? expr)
-          (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
+          (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
+              (vswap! device-buffers conj sym))
           (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
           (if-let [s (parse-gpu-step sym expr)]
-            (vswap! steps conj s)
+            (do (vswap! steps conj s) (vswap! device-buffers conj sym))
             (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
           (gemm-invk? expr)
           (if-let [s (parse-gpu-step sym expr)]
-            (vswap! steps conj s)
+            (do (vswap! steps conj s) (vswap! device-buffers conj sym))
             (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
@@ -1196,6 +1205,19 @@
           ;; not lower to a par kernel in this composed path.
           (array-tag? sym)
           (reject! :unlowered-array-op sym expr)
+          ;; A SCALAR binding whose init READS an intermediate device buffer is a
+          ;; reduction (device array → scalar), NOT a host size-let — e.g. the
+          ;; primal `(.invk mse-loss-impl pred tgt n)` reducing the pred buffer to
+          ;; the loss value. Its result tag is scalar, so array-tag? above misses
+          ;; it, and its `.invk` head isn't a gpu-invoke, so it would otherwise be
+          ;; kept as a scalar-let and handed to expr->arg-fn — which then fails to
+          ;; resolve the device-buffer operand on the host (unbound-symbol throw).
+          ;; A device-side reduction needs a resident reduction kernel (task #42);
+          ;; until then, reject so the caller falls back cleanly (non-resident)
+          ;; rather than throwing. Reading an array PARAM (host-available, e.g.
+          ;; alength) is fine — only intermediate buffers are tracked.
+          (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
+          (reject! :scalar-let-reads-device-buffer sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
           (not (contains-gpu-invoke? expr))
           (vswap! scalar-lets into [sym expr])

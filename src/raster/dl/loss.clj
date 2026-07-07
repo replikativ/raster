@@ -9,7 +9,7 @@
     huber-loss         - smooth L1 / Huber loss
     l1-loss            - mean absolute error"
   (:refer-clojure :exclude [aget aset alength aclone])
-  (:require [raster.core :refer [deftm ftm reduce!]]
+  (:require [raster.core :refer [deftm ftm reduce! broadcast]]
             [raster.arrays :refer [aget aset alength aclone]]
             [raster.par]
             [raster.math :as m]
@@ -27,6 +27,18 @@
                                  (let [d (- pred target)]
                                    (+ sum (* d d))))
                         (double n))))
+
+;; d_pred[i] = scale*(pred[i]-target[i]); the elementwise mse-loss backward,
+;; written as a broadcast SOAC so it lowers to a GPU kernel (resident training)
+;; AND SIMD-vectorizes on CPU — replacing the CPU-era ^:no-inline BLAS helper
+;; (raster.linalg.blas/daxpy-diff!) that the resident GPU path cannot lower.
+;; `scale` is a declared kernel scalar param (a uniform), so at :float dtype it
+;; is emitted as a float scalar in the OpenCL C kernel (exactly like rms-norm!'s
+;; `eps`/`gain-offset` Double params) — float×float, no T×Double garbage. It
+;; lowers to its own par/map kernel step (not inlined as a double intermediate).
+(deftm mse-grad (All [T] [pred :- (Array T) target :- (Array T)
+                          scale :- Double n :- Long] :- (Array T)
+                     (broadcast [pred target] (n/* scale (n/- pred target)))))
 
 ;; d_pred = 2*(pred - target)/n
 (defn- alloc-like

@@ -732,17 +732,20 @@
                      :grads-fn
                      (fn [ctx [pred target n] _result-sym adjoint-sym gensym-fn]
                        (let [d-pred (gensym-fn "d_pred")
-           ;; Emit: d_pred = (let [out (double-array n)]
-           ;;                  (dotimes [i n]
-           ;;                    (aset out i (* (/ (* 2.0 dy) n) (- pred[i] target[i]))))
-           ;;                  out)
-           ;; But as flat S-expressions the compiler can see through
+           ;; d_pred[i] = (2*dy/n)*(pred[i]-target[i]). Emitted as the inlinable
+           ;; (All [T]) mse-grad SOAC (a broadcast), NOT the CPU-era ^:no-inline
+           ;; BLAS helper daxpy-diff! — so the fused backward lowers to a resident
+           ;; GPU kernel (on-device LoRA training) and SIMD-vectorizes on CPU. The
+           ;; scale is a plain Double — it becomes mse-grad's declared scalar
+           ;; kernel param (a uniform, emitted float at :float dtype), so it does
+           ;; not drag the forward array into a host size/scalar closure and does
+           ;; not become a double intermediate in the float kernel.
                              scale (gensym-fn "mse_scale")
                              n-long (gensym-fn "mse_n")
                              ctx1 (update ctx :bindings into
                                           [n-long (list 'long n)
                                            scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'double n-long))
-                                           d-pred (list 'raster.linalg.blas/daxpy-diff! pred target scale n-long)])]
+                                           d-pred (list 'raster.dl.loss/mse-grad pred target scale n-long)])]
                          [ctx1 [d-pred nil nil]]))})
 
 ;; transpose-2d: out[j*rows+i] = a[i*cols+j]
@@ -1421,6 +1424,38 @@
               [ctx terms])]
         (sum-tangent-contribs ctx terms gensym-fn))))})
 
+;; mse-grad(pred,target,scale,n) = scale·(pred−target) — structurally IDENTICAL
+;; to daxpy-diff! (it is the mse-loss backward SOAC that replaced it for GPU
+;; lowering), so it carries the same second-order facets: jointly LINEAR in
+;; (pred,target) and BILINEAR with scale. Product rule, both terms the op itself.
+(merge-into-template!
+ 'raster.dl.loss/mse-grad
+ {:jvp-fn
+  (fn [ctx [pred target scale n] tangent-args _result-sym gensym-fn]
+    (let [dpred   (nth tangent-args 0 nil)
+          dtarget (nth tangent-args 1 nil)
+          dscale  (nth tangent-args 2 nil)]
+      (when-not (or dpred dtarget dscale)
+        (throw (ex-info "mse-grad jvp: no active tangent reached the call"
+                        {:op 'raster.dl.loss/mse-grad})))
+      (let [[ctx terms]
+            (if (or dpred dtarget)
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jmseg_ab"
+                                            (list 'raster.dl.loss/mse-grad
+                                                  (or dpred (jvp-zero-like pred))
+                                                  (or dtarget (jvp-zero-like target))
+                                                  scale n))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if dscale
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jmseg_s"
+                                            (list 'raster.dl.loss/mse-grad
+                                                  pred target dscale n))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (sum-tangent-contribs ctx terms gensym-fn))))})
+
 ;; silu/gelu-backward (dy, x, n) → dy⊙act′(x): LINEAR in dy (that term is the
 ;; kernel itself on the dy-tangent); the x-direction is the SECOND-ORDER
 ;; elementwise rule (#72, act″ LANDED): d/dx[dy⊙act′(x)]·Δx = dy⊙act″(x)⊙Δx,
@@ -1576,6 +1611,19 @@
     2 (fn [[a b _scale n] c]
         (list 'raster.par/dot-product
               c (list 'raster.linalg.blas/daxpy-diff! a b 1.0 n)))}
+
+   ;; mse-grad(pred,target,scale,n) = scale·(pred−target): same linear/bilinear
+   ;; structure as daxpy-diff! (its GPU-lowering twin, the mse-loss backward).
+   'raster.dl.loss/mse-grad
+   {0 (fn [[_pred _target scale n] c]
+        (list 'raster.dl.loss/mse-grad
+              c (list 'raster.arrays/zeros-like c n) scale n))
+    1 (fn [[_pred _target scale n] c]
+        (list 'raster.dl.loss/mse-grad
+              (list 'raster.arrays/zeros-like c n) c scale n))
+    2 (fn [[pred target _scale n] c]
+        (list 'raster.par/dot-product
+              c (list 'raster.dl.loss/mse-grad pred target 1.0 n)))}
 
    'raster.par/dot-product
    ;; c is a SCALAR cotangent; scale's alpha is annotated Double, so widen

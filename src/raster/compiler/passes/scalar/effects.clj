@@ -40,7 +40,29 @@
               (binding [*out* *err*]
                 (println "WARNING: effects.clj failed to load raster.arrays -" (.getMessage e)))
               {}))
-          raster-entries (merge pure-entries array-entries)
+          ;; Register the pure FORWARD loss reductions as :pure. Each is a
+          ;; reduce over pred/target with no IO or buffer mutation, but beichte
+          ;; cannot see through the (All [T]) dispatch var to its reduce! body,
+          ;; so it conservatively defaults them to :io — which wrongly pins the
+          ;; DEAD value+grad primal (e.g. the mse-loss forward emitted alongside
+          ;; the gradients but unused when the caller computes its own loss) so
+          ;; DCE can't drop it, and it then leaks a resident forward array into a
+          ;; host scalar closure on the GPU-resident path. Only the forward
+          ;; reductions are registered — the *-backward helpers allocate + aset
+          ;; (:local), so they are intentionally excluded.
+          loss-entries
+          (try
+            (require 'raster.dl.loss)
+            (let [publics (ns-publics (the-ns 'raster.dl.loss))]
+              (into {} (keep (fn [[sym v]]
+                               (when (contains? '#{mse-loss cross-entropy-loss huber-loss l1-loss} sym)
+                                 [v :pure]))
+                             publics)))
+            (catch Exception e
+              (binding [*out* *err*]
+                (println "WARNING: effects.clj failed to load raster.dl.loss -" (.getMessage e)))
+              {}))
+          raster-entries (merge pure-entries array-entries loss-entries)
           reg (b/extend-registry (b/default-registry) raster-entries)]
       (b/make-context {:registry reg}))))
 
