@@ -742,7 +742,12 @@
     {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
      :rev-ctx rev-ctx :param-adj-syms param-adj-syms}))
 
-(defn- gen-reverse-let
+(declare gen-reverse-loop-with-let lift-loop-to-tail)
+
+(defn- loop-init? [init]
+  (and (seq? init) (contains? #{'loop 'loop*} (first init))))
+
+(defn- gen-reverse-let-core
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
@@ -755,6 +760,54 @@
         result-sym    (ad-gensym "result")
         augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
     (list 'let* augmented-bindings (vector result-sym pullback-fn))))
+
+(defn- gen-reverse-let
+  "Generate reverse-mode AD code for a let* form.
+
+  A raw `loop` bound to a let* binding is not recordable by the per-binding
+  engine (`ad-record :loop` fails loud): only a loop in TAIL position is
+  differentiable (via `lift-loop-to-tail` → `gen-reverse-loop-with-let`).
+  `transform-body` applies that lift once at the top level, but a SECOND raw
+  loop composed in series lands as a mid-let binding inside the FIRST loop's
+  result-branch continuation (gen-reverse-loop*'s compound-result path funnels
+  that continuation here) — where the tail-lift was never re-applied.
+
+  So when a binding init is an ACTIVE raw loop, lift the first such loop to
+  tail (inlining the following bindings + body into its result branch) and
+  delegate to `gen-reverse-loop-with-let` — exactly the routing `transform-body`
+  uses for a tail loop. The loop-with-let continuation recurses back through
+  here, so any number of raw-loop ops compose in series (e.g. N attention
+  blocks). Inactive loops and loop-free lets take the core path unchanged."
+  [bindings body-exprs active-params]
+  (let [pairs (vec (partition 2 bindings))]
+    (if-not (some (fn [[_ init]] (loop-init? init)) pairs)
+      (gen-reverse-let-core bindings body-exprs active-params)
+      ;; Thread activity across the bindings (init-active?, same rule the engine
+      ;; uses) WITHOUT running ad-record (which would throw on the active loop).
+      ;; Only route when the FIRST loop binding — the one lift-loop-to-tail
+      ;; targets — is active; otherwise preserve the core path (and its
+      ;; fail-loud behavior for a genuinely un-liftable active loop).
+      (let [activity (reduce (fn [act [s init]] (assoc act s (init-active? init act)))
+                             (into {} (map (fn [p] [p true]) active-params))
+                             pairs)
+            first-loop-sym (ffirst (filter (fn [[_ init]] (loop-init? init)) pairs))]
+        (if-not (get activity first-loop-sym)
+          (gen-reverse-let-core bindings body-exprs active-params)
+          (let [lifted (lift-loop-to-tail (apply list 'let* (vec bindings) body-exprs))]
+            (cond
+              ;; lift-loop-to-tail → bare tail loop (no bindings preceded it)
+              (and (seq? lifted) (contains? #{'loop 'loop*} (first lifted)))
+              (gen-reverse-loop-with-let [] lifted active-params)
+
+              ;; lift-loop-to-tail → (let* [pre...] (loop ...))
+              (and (seq? lifted) (contains? #{'let 'let*} (first lifted))
+                   (let [tail (drop 2 lifted)]
+                     (and (= 1 (count tail)) (loop-init? (first tail)))))
+              (let [[_ pre-bindings loop-form] lifted]
+                (gen-reverse-loop-with-let (vec pre-bindings) loop-form active-params))
+
+              ;; lift declined (non-canonical loop body) — preserve fail-loud.
+              :else (gen-reverse-let-core bindings body-exprs active-params))))))))
 
 ;; ================================================================
 ;; Loop/recur reverse-mode AD
@@ -1086,9 +1139,16 @@
           (let [;; Gensyms for the final loop var values (accessible in pullback)
                 final-lv-syms (mapv (fn [lv] (ad-gensym (str "final_" (name lv))))
                                     loop-syms)
-                ;; Substitute loop-var names in result-expr with final-lv gensyms
+                ;; Substitute loop-var names in result-expr with final-lv gensyms.
+                ;; CAPTURE-AVOIDING (util/subst-syms, not walk/postwalk-replace):
+                ;; the result branch may contain a NESTED loop that rebinds the
+                ;; same loop-var names (two inlined copies of the same deftm — e.g.
+                ;; two attention blocks — share `[hq acc]`). A blind postwalk would
+                ;; rewrite the inner loop's own binders/refs → variable capture →
+                ;; corrupt backward (IndexOutOfBounds / wrong grads). subst-syms
+                ;; respects shadowing: the inner rebinding stops the substitution.
                 lv-subst (zipmap loop-syms final-lv-syms)
-                subst-result (walk/postwalk-replace lv-subst result-expr)
+                subst-result (util/subst-syms lv-subst result-expr)
                 ;; Differentiate the substituted result-expr w.r.t. iter-active
                 ;; (active loop vars + active params), using final-lv names
                 subst-iter-active (mapv #(get lv-subst % %) iter-active)
