@@ -1153,15 +1153,25 @@
 
    :scalar-lets is the ordered [sym expr ...] of pure scalar bindings; size/count/scalar exprs
    are evaluated in an env that binds the deftm params AND these lets (so an intermediate sized
-   `(* rows feat)` resolves)."
+   `(* rows feat)` resolves).
+
+   On success returns the descriptor map (with :steps). On failure returns
+   `{::non-resident {:why <kw> :sym <sym> :form <expr>}}` naming the FIRST binding that defeated
+   straight-line extraction — so the caller can fail loud with an actionable message instead of a
+   bare nil (the silent-empty-graph footgun)."
   [form]
-  (when (and (seq? form) (#{'let* 'let} (first form)))
+  (if-not (and (seq? form) (#{'let* 'let} (first form)))
+    {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
     (let [bindings (partition 2 (second form))
           body (last form)
           allocs (volatile! [])
           steps (volatile! [])
           scalar-lets (volatile! [])
-          ok (volatile! true)]
+          ok (volatile! true)
+          reason (volatile! nil)
+          reject! (fn [why sym expr]
+                    (vreset! ok false)
+                    (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
       (doseq [[sym expr] bindings]
         (cond
           (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
@@ -1172,12 +1182,12 @@
           (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
           (if-let [s (parse-gpu-step sym expr)]
             (vswap! steps conj s)
-            (vreset! ok false))
+            (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
           (gemm-invk? expr)
           (if-let [s (parse-gpu-step sym expr)]
             (vswap! steps conj s)
-            (vreset! ok false))
+            (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
           ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
@@ -1185,14 +1195,16 @@
           ;; size closure). E.g. an AD-emitted daxpy-diff-into! or a raw loss reduction that did
           ;; not lower to a par kernel in this composed path.
           (array-tag? sym)
-          (vreset! ok false)
+          (reject! :unlowered-array-op sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
           (not (contains-gpu-invoke? expr))
           (vswap! scalar-lets into [sym expr])
           ;; control flow / kernel-result-into-scalar → not straight-line.
-          :else (vreset! ok false)))
-      (when (and @ok (seq @steps))
-        {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+          :else (reject! :control-flow-or-host-scalar sym expr)))
+      (cond
+        (not @ok)      {::non-resident @reason}
+        (empty? @steps) {::non-resident {:why :no-kernel-steps}}
+        :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
 
 (defn- strip-meta
   "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
@@ -1224,8 +1236,16 @@
       :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
       :steps  [{:kernel-name str :arrays [syms] :n-fn (fn [args] int)
                 :scalar-fns [(fn [args] v) ...] :convention :map-void|:map :phase kw}]
-      :result-sym sym}"
-  [f-var device-id & {:keys [dtype]}]
+      :result-sym sym}
+
+   :on-non-resident controls what happens when the fused IR is NOT a straight-line resident
+   program (control flow, a kernel result feeding host scalar compute, or an unlowered array op):
+     :throw (default) — throw an ex-info naming the offending binding + reason. This is the
+                        correct default: a caller that binds the result to a session graph would
+                        otherwise silently record an EMPTY graph (all-zero output). See #42.
+     :nil             — return nil, for probing callers that legitimately fall back to the
+                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test)."
+  [f-var device-id & {:keys [dtype on-non-resident] :or {on-non-resident :throw}}]
   (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
@@ -1280,7 +1300,21 @@
               (println "=== POST-FUSE ===") (println (pr-str form-soa))
               (println "=== END-FUSE-DUMP ===")))
         form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
-        prog (extract-gpu-program form)
+        extracted (extract-gpu-program form)
+        prog (if-let [nr (::non-resident extracted)]
+               (if (= on-non-resident :throw)
+                 (throw (ex-info
+                         (str "compile-gpu-program: " f-var " is not a straight-line resident GPU "
+                              "program (" (name (:why nr)) ")"
+                              (when (:sym nr) (str " at binding `" (:sym nr) " = " (pr-str (:form nr)) "`"))
+                              ". A resident program must be a flat sequence of kernel steps — no "
+                              "host control flow, no kernel result feeding host scalar compute, and "
+                              "every array op must lower to a resident kernel. Fix the deftm, use "
+                              "compile-aot with :target-device for the per-call staging fn, or pass "
+                              ":on-non-resident :nil to fall back explicitly.")
+                         {:var f-var :device device-id :non-resident nr}))
+                 nil)                       ; :nil policy — probing caller
+               extracted)
         scalar-lets (:scalar-lets prog)
         ;; Default buffer roles for the residency layer: an array param WRITTEN by any kernel
         ;; (its name is in some kernel's :written-arrays) defaults to :output (downloaded after

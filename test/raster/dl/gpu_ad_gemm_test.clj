@@ -101,5 +101,6 @@
                          (raster.dl.optim/sgd-step! W dW (raster.arrays/alength W) lr)
                          loss)))]
     (testing "full AD train step is not yet a fully-resident program (documents the gap)"
-      (is (nil? (pl/compile-gpu-program train :ze:0 :dtype :float))
+      ;; :on-non-resident :nil = probe the boundary without throwing (default is :throw now)
+      (is (nil? (pl/compile-gpu-program train :ze:0 :dtype :float :on-non-resident :nil))
           "mse reduction + daxpy elementwise gradient have no resident kernel yet"))))
