@@ -477,7 +477,11 @@
                                                  _ (blas/dgemm-nt! Q K scores seq-len dk seq-len
                                                                    (n/oftype Q 1.0) (n/oftype Q 0.0))
         ;; Scale + causal mask: set scores[i,j] = -inf for j > i
-                                                 neg-inf (n/neg-inf-val (aget scores 0))
+                                                 ;; T-typed mask sentinel via oftype (NO aget) — a
+                                                 ;; device-buffer read (neg-inf-val (aget scores 0))
+                                                 ;; defeats resident-GPU extraction. -1e38 exp()s to 0
+                                                 ;; like -inf; mirrors the decode kernels' literal.
+                                                 neg-inf (n/oftype scores -1.0e38)
                                                  _ (dotimes [i seq-len]
                                                      (let [offset (* i (int seq-len))]
                                                        (dotimes [j seq-len]
@@ -521,7 +525,7 @@
     (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
           one   (n/oftype Q 1.0)
           z0    (n/oftype Q 0.0)
-          neg-inf (n/neg-inf-val (aget Q 0))
+          neg-inf (n/oftype Q -1.0e38)   ; T-typed sentinel, no device-buffer read (see forward)
           scores  (alloc-like Q (* seq-len seq-len))
           weights (alloc-like Q (* seq-len seq-len))]
       ;; Forward recomputation with causal mask (masked entries = neg-inf so
@@ -620,7 +624,7 @@
     (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
           one   (n/oftype Q 1.0)
           z0    (n/oftype Q 0.0)
-          neg-inf (n/neg-inf-val (aget Q 0))
+          neg-inf (n/oftype Q -1.0e38)   ; T-typed sentinel, no device-buffer read (see forward)
           ;; Recompute causal softmax weights (same as the backward)
           weights (alloc-like Q (* seq-len seq-len))
           _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale z0)
