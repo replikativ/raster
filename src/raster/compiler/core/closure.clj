@@ -299,7 +299,15 @@
                      (if (extractable-binding? expr)
                        ;; Extract to a separate method
                        (let [method-name (symbol (str "helper_" (swap! helper-counter inc)))
-                             free (disj (free-syms expr) '.invk)
+                             ;; Declare the compute params as shadowing-locals so a
+                             ;; param whose name collides with a clojure.core fn (e.g.
+                             ;; `seq`, `first`, `count`) is still captured into the
+                             ;; helper — otherwise free-syms drops it as a core var and
+                             ;; the helper body resolves it to the global fn (→ CCE).
+                             free (disj (binding [util/*shadowing-locals*
+                                                  (set all-compute-params)]
+                                          (free-syms expr))
+                                        '.invk)
                              ;; Order free vars deterministically, params first
                              ordered-free (vec (concat
                                                 (filter free all-compute-params)

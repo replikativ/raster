@@ -23,17 +23,29 @@
         (map? e)    (apply set/union #{} (map free-syms-flat (apply concat e)))
         :else       #{}))
 
+(def ^:dynamic *shadowing-locals*
+  "Set of symbols the caller KNOWS are locals (deftm params / hoisted bindings)
+   in the enclosing scope, even when they collide with a clojure.core name
+   (e.g. a param literally named `seq`, `first`, `count`). free-leaf? treats
+   these as free-variable references despite resolving to a core var, so a
+   loop/closure helper that captures them receives them as helper params
+   instead of resolving to the global core fn (which then ClassCasts). Defaults
+   empty → no effect on any caller that doesn't bind it."
+  #{})
+
 (defn- free-leaf?
   "True if a bare symbol is a free local-variable reference: unqualified, not
    bound, not a method call (.foo), and not a clojure.core var (cast intrinsics
-   like double/long/int appear bare in walked IR but are never local vars)."
+   like double/long/int appear bare in walked IR but are never local vars) —
+   UNLESS the symbol is a known shadowing local (see *shadowing-locals*)."
   [e bound]
   (and (symbol? e)
        (not (namespace e))
        (not (contains? bound e))
        (not (.startsWith (name e) "."))
-       (not (when-let [v (try (ns-resolve 'clojure.core e) (catch Exception _ nil))]
-              (var? v)))))
+       (or (contains? *shadowing-locals* e)
+           (not (when-let [v (try (ns-resolve 'clojure.core e) (catch Exception _ nil))]
+                  (var? v))))))
 
 (defn free-syms
   "Collect unqualified free symbols from a (possibly nested) S-expression,

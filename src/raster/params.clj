@@ -463,7 +463,7 @@
   pre-flatten pass converts all (:k w) / (:k m) / (:k v) accesses to flat args
   and compile-aot fuses value+grad with the per-leaf optimizer updates."
   ([loss-var] (compile-train-step loss-var {}))
-  ([loss-var {:keys [optimizer] :or {optimizer :adam}}]
+  ([loss-var {:keys [optimizer target-device dtype] :or {optimizer :adam}}]
    (ensure-train-step-deps!)
    (when-not (#{:adam :sgd} optimizer)
      (throw (ex-info "Unknown optimizer (expected :adam or :sgd)"
@@ -515,7 +515,13 @@
          train-var     (binding [*ns* target-ns]
                          (eval form)
                          (find-var (symbol (str (.name target-ns)) (str train-name))))
-         compiled      (pipeline/compile-aot train-var)
+         ;; Thread :target-device / :dtype so the fused forward+backward+optimizer
+         ;; step can be lowered to a GPU program (D2). The container is a
+         ;; GPU-explodable SoA (per-field array kernel args); at :dtype :float the
+         ;; (All [T]) kernels monomorphize to float for the device.
+         compiled      (apply pipeline/compile-aot train-var
+                              (concat (when target-device [:target-device target-device])
+                                      (when dtype [:dtype dtype])))
          cinfo         (@container-class-cache cont-sym)
          mk            (fn [s tree] (build-container cinfo s tree))
          train-fn      (case optimizer
