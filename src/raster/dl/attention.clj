@@ -794,65 +794,14 @@
           (recur (inc hq) (ops/array-add acc out-h n)))
         acc))))
 
-;; GQA backward: per query head, run the single-head causal-SDPA backward, then
-;; scatter dQ into head hq's slab and ACCUMULATE dK/dV into head hkv's slab
-;; (each kv head is read by `group` query heads). Returns object-array [dQ dK dV].
-;; A registered op (raw loops here are never differentiated) so the forward stays
-;; symbolic — needed because the compose-from-primitives forward returns the bare
-;; accumulator (no baked output projection), which the loop-inlining reverse pass
-;; can't handle as a let-bound/argument loop result.
-(deftm gqa-causal-mha-backward
-  [dY :- (Array double) Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array Object)
-  (let [group    (quot n-q n-kv)
-        qstride  (* n-q head-dim)
-        kvstride (* n-kv head-dim)
-        dQ (double-array (clojure.core/* seq-len qstride))
-        dK (double-array (clojure.core/* seq-len kvstride))
-        dV (double-array (clojure.core/* seq-len kvstride))]
-    (dotimes [hq n-q]
-      (let [hkv (clojure.core/quot hq (int group))
-            Qh  (ops/slice-strided-2d Q seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
-            Kh  (ops/slice-strided-2d K seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
-            Vh  (ops/slice-strided-2d V seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
-            dYh (ops/slice-strided-2d dY seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
-            b   (causal-scaled-dot-product-attn-backward dYh Qh Kh Vh seq-len head-dim head-dim)
-            dQh (clojure.core/aget ^objects b 0)
-            dKh (clojure.core/aget ^objects b 1)
-            dVh (clojure.core/aget ^objects b 2)]
-        (dotimes [r seq-len]
-          (let [qoff  (clojure.core/+ (clojure.core/* r (int qstride)) (clojure.core/* hq (int head-dim)))
-                kvoff (clojure.core/+ (clojure.core/* r (int kvstride)) (clojure.core/* hkv (int head-dim)))
-                hoff  (clojure.core/* r (int head-dim))]
-            (dotimes [c head-dim]
-              (clojure.core/aset ^doubles dQ (clojure.core/+ qoff c)
-                                 (double (clojure.core/aget ^doubles dQh (clojure.core/+ hoff c))))
-              (clojure.core/aset ^doubles dK (clojure.core/+ kvoff c)
-                                 (clojure.core/+ (clojure.core/aget ^doubles dK (clojure.core/+ kvoff c))
-                                                 (clojure.core/aget ^doubles dKh (clojure.core/+ hoff c))))
-              (clojure.core/aset ^doubles dV (clojure.core/+ kvoff c)
-                                 (clojure.core/+ (clojure.core/aget ^doubles dV (clojure.core/+ kvoff c))
-                                                 (clojure.core/aget ^doubles dVh (clojure.core/+ hoff c)))))))))
-    (let [out (object-array 3)]
-      (clojure.core/aset out 0 dQ)
-      (clojure.core/aset out 1 dK)
-      (clojure.core/aset out 2 dV)
-      out)))
-
-(tmpl/merge-into-template! 'raster.dl.attention/gqa-causal-mha
-                           {:params '[Q K V seq-len n-q n-kv head-dim] :result nil :adjoint 'dy
-                            :grads-fn
-                            (fn [ctx [Q K V seq-len n-q n-kv head-dim] _result-sym adjoint-sym gensym-fn]
-                              (let [b (gensym-fn "gqa_b") dQ (gensym-fn "dQ")
-                                    dK (gensym-fn "dK") dV (gensym-fn "dV")]
-                                [(update ctx :bindings into
-                                         [b (list 'raster.dl.attention/gqa-causal-mha-backward
-                                                  adjoint-sym Q K V seq-len n-q n-kv head-dim)
-                                          dQ (list 'clojure.core/aget b 0)
-                                          dK (list 'clojure.core/aget b 1)
-                                          dV (list 'clojure.core/aget b 2)])
-                                 [dQ dK dV nil nil nil nil]]))})
+;; gqa-causal-mha has NO hand-written reverse rule: the forward is composed purely from
+;; AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
+;; scatter-strided-2d → array-add tail-loop), so value+grad inlines and differentiates it
+;; automatically. The former explicit `gqa-causal-mha-backward` + :grads-fn were removed
+;; (2026-07-07) once the reverse-AD gensym-counter collision was fixed (6848279): with that
+;; fix the auto-diff gradient is FD-verified bit-identical to the old hand-written backward
+;; (incl. MQA kv-head fan-in dK/dV accumulation). The :jvp-fn (forward mode) is KEPT below —
+;; its removability is a separate forward-mode audit.
 
 ;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention — mirrors
 ;; gqa-causal-mha-backward's head iteration: per query head hq, slice the
