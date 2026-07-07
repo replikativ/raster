@@ -672,6 +672,16 @@
                     {:params '[ref n] :result nil :adjoint 'dy
                      :grads '[nil nil]})
 
+;; alloc-like: the parametric zero allocator (Julia `similar`) — like zeros-like
+;; and double-array/float-array, the exemplar arg only supplies dtype/shape, so
+;; there is no differentiable dependence. Without this, a differentiated loop
+;; whose carry is initialized with `(alloc-like active-arr n)` (e.g. gqa-causal-mha's
+;; per-head accumulator, promoted to (All [T])) tries to trace the allocation and
+;; the carry-init pullback comes back nil.
+(register-template! 'raster.arrays/alloc-like
+                    {:params '[ref n] :result nil :adjoint 'dy
+                     :grads '[nil nil]})
+
 ;; aset: arr[i] = v → no gradient through aset itself (mutation side-effect).
 ;; The gradient for mutation flows through the stored value's downstream reads.
 (register-template! 'clojure.core/aset

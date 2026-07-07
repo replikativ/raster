@@ -511,89 +511,75 @@
 ;; backprop + d_V/dQ/dK gemms), but as a regular deftm so :grads-fn can splice
 ;; a single call into the AD body's flat let* (compile-aot needs flat IR).
 (deftm causal-scaled-dot-product-attn-backward
-  [d-out :- (Array double) Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long dk :- Long dv :- Long]
-  :- (Array Object)
-  (let [scale (/ 1.0 (n/sqrt (double dk)))
-        neg-inf-c Double/NEGATIVE_INFINITY
-        scores  (double-array (clojure.core/* seq-len seq-len))
-        weights (double-array (clojure.core/* seq-len seq-len))]
-    ;; Forward recomputation with causal mask
-    (dotimes [i seq-len]
-      (dotimes [j seq-len]
-        (let [dot (loop [d 0 acc 0.0]
-                    (if (< d dk)
-                      (recur (clojure.core/inc d)
-                             (clojure.core/+ acc
-                                             (clojure.core/* (clojure.core/aget ^doubles Q
-                                                                                (clojure.core/+ (clojure.core/* i (clojure.core/int dk)) d))
-                                                             (clojure.core/aget ^doubles K
-                                                                                (clojure.core/+ (clojure.core/* j (clojure.core/int dk)) d)))))
-                      acc))]
-          (clojure.core/aset ^doubles scores
-                             (clojure.core/+ (clojure.core/* i (clojure.core/int seq-len)) j)
-                             (if (clojure.core/> j i) neg-inf-c (clojure.core/* dot scale))))))
-    (dotimes [i seq-len]
-      (let [offset (clojure.core/* i (clojure.core/int seq-len))
-            max-s (loop [j 0 m neg-inf-c]
-                    (if (clojure.core/< j seq-len)
-                      (recur (clojure.core/inc j)
-                             (n/max m (clojure.core/aget ^doubles scores
-                                                         (clojure.core/+ offset j))))
-                      m))
-            sum-exp (loop [j 0 s 0.0]
-                      (if (clojure.core/< j seq-len)
-                        (let [s-ij (clojure.core/aget ^doubles scores
-                                                      (clojure.core/+ offset j))
-                              e (if (clojure.core/== s-ij neg-inf-c)
-                                  0.0
-                                  (m/exp (clojure.core/- s-ij max-s)))]
-                          (clojure.core/aset ^doubles weights
-                                             (clojure.core/+ offset j) e)
-                          (recur (clojure.core/inc j) (clojure.core/+ s e)))
-                        s))
-            inv-sum (if (clojure.core/zero? sum-exp) 0.0 (clojure.core// 1.0 sum-exp))]
-        (dotimes [j seq-len]
-          (clojure.core/aset ^doubles weights
-                             (clojure.core/+ offset j)
-                             (clojure.core/* (clojure.core/aget ^doubles weights
-                                                                (clojure.core/+ offset j))
-                                             inv-sum)))))
-    (let [d-weights (double-array (clojure.core/* seq-len seq-len))
-          _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len 1.0 0.0)
-          dV (double-array (clojure.core/* seq-len dv))
-          _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv 1.0 0.0)
-          d-scores (double-array (clojure.core/* seq-len seq-len))]
+  (All [T]
+    [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+     seq-len :- Long dk :- Long dv :- Long]
+    :- (Array Object)
+    ;; scale is :- T (element-typed) so dot*scale and scale*(weights·…) devirtualize
+    ;; for every T — a Double scale would be T×Double (no monomorphic overload → GPU
+    ;; garbage). one/z0 likewise element-typed for the BLAS alpha/beta and masked grad.
+    (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
+          one   (n/oftype Q 1.0)
+          z0    (n/oftype Q 0.0)
+          neg-inf (n/neg-inf-val (aget Q 0))
+          scores  (alloc-like Q (* seq-len seq-len))
+          weights (alloc-like Q (* seq-len seq-len))]
+      ;; Forward recomputation with causal mask (masked entries = neg-inf so
+      ;; exp(neg-inf - max) = 0; no explicit branch — mirrors the forward softmax).
       (dotimes [i seq-len]
-        (let [offset (clojure.core/* i (clojure.core/int seq-len))
-              dot-wdw (loop [j 0 acc 0.0]
-                        (if (clojure.core/< j seq-len)
-                          (recur (clojure.core/inc j)
-                                 (clojure.core/+ acc
-                                                 (clojure.core/* (clojure.core/aget ^doubles weights
-                                                                                    (clojure.core/+ offset j))
-                                                                 (clojure.core/aget ^doubles d-weights
-                                                                                    (clojure.core/+ offset j)))))
-                          acc))]
+        (dotimes [j seq-len]
+          (let [dot (loop [d 0 acc 0.0]
+                      (if (< d dk)
+                        (recur (inc d)
+                               (+ acc (* (aget Q (+ (* i (int dk)) d))
+                                         (aget K (+ (* j (int dk)) d)))))
+                        acc))]
+            (aset scores (+ (* i (int seq-len)) j)
+                  (if (> j i) neg-inf (* dot scale))))))
+      (dotimes [i seq-len]
+        (let [offset (* i (int seq-len))
+              max-s (loop [j 0 mm neg-inf]
+                      (if (< j seq-len)
+                        (recur (inc j) (n/max mm (aget scores (+ offset j))))
+                        mm))
+              sum-exp (loop [j 0 s 0.0]
+                        (if (< j seq-len)
+                          (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                            (aset weights (+ offset j) e)
+                            (recur (inc j) (+ s e)))
+                          s))
+              inv-sum (/ one sum-exp)]
           (dotimes [j seq-len]
-            (clojure.core/aset ^doubles d-scores
-                               (clojure.core/+ offset j)
-                               (if (clojure.core/> j i)
-                                 0.0
-                                 (clojure.core/* scale
-                                                 (clojure.core/aget ^doubles weights
-                                                                    (clojure.core/+ offset j))
-                                                 (clojure.core/- (clojure.core/aget ^doubles d-weights
-                                                                                    (clojure.core/+ offset j))
-                                                                 dot-wdw)))))))
-      (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
-            dK (double-array (clojure.core/* seq-len dk))
-            _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk 1.0 0.0)
-            out (object-array 3)]
-        (clojure.core/aset out 0 dQ)
-        (clojure.core/aset out 1 dK)
-        (clojure.core/aset out 2 dV)
-        out))))
+            (aset weights (+ offset j)
+                  (* (aget weights (+ offset j)) inv-sum)))))
+      (let [d-weights (alloc-like Q (* seq-len seq-len))
+            _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len one z0)
+            dV (alloc-like Q (* seq-len dv))
+            _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv one z0)
+            d-scores (alloc-like Q (* seq-len seq-len))]
+        (dotimes [i seq-len]
+          (let [offset (* i (int seq-len))
+                dot-wdw (loop [j 0 acc 0.0]
+                          (if (< j seq-len)
+                            (recur (inc j)
+                                   (+ acc (* (aget weights (+ offset j))
+                                             (aget d-weights (+ offset j)))))
+                            acc))]
+            (dotimes [j seq-len]
+              (aset d-scores (+ offset j)
+                    (if (> j i)
+                      z0
+                      (* scale
+                         (aget weights (+ offset j))
+                         (- (aget d-weights (+ offset j)) dot-wdw)))))))
+        (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
+              dK (alloc-like Q (* seq-len dk))
+              _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk one z0)
+              out (object-array 3)]
+          (clojure.core/aset out 0 dQ)
+          (clojure.core/aset out 1 dK)
+          (clojure.core/aset out 2 dV)
+          out)))))
 
 ;; grads-fn (compile-aot flat codegen): calls the backward deftm above and
 ;; extracts the three gradients via aget — a single flat let-binding shape
@@ -624,60 +610,62 @@
 ;;                                             masked j>i have W=0 ⇒ dW=0)
 ;;   dO = dW·V + W·dV
 (deftm causal-scaled-dot-product-attn-jvp
-  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
-   Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long dk :- Long dv :- Long]
-  :- (Array double)
-  (let [scale (/ 1.0 (n/sqrt (double dk)))
-        neg-inf-c Double/NEGATIVE_INFINITY
-        ;; Recompute causal softmax weights (same as the backward)
-        weights (double-array (* seq-len seq-len))
-        _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale 0.0)
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))]
-              (dotimes [j seq-len]
-                (when (> j i)
-                  (aset weights (+ offset j) neg-inf-c)))))
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))
-                  max-s (loop [j 0 m neg-inf-c]
-                          (if (< j seq-len)
-                            (recur (inc j) (n/max m (aget weights (+ offset j))))
-                            m))
-                  sum-exp (loop [j 0 s 0.0]
+  (All [T]
+    [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
+     Q :- (Array T) K :- (Array T) V :- (Array T)
+     seq-len :- Long dk :- Long dv :- Long]
+    :- (Array T)
+    ;; scale/one/z0 element-typed (see the backward) — a Double scalar × T has no
+    ;; monomorphic overload and would emit GPU garbage.
+    (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
+          one   (n/oftype Q 1.0)
+          z0    (n/oftype Q 0.0)
+          neg-inf (n/neg-inf-val (aget Q 0))
+          ;; Recompute causal softmax weights (same as the backward)
+          weights (alloc-like Q (* seq-len seq-len))
+          _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale z0)
+          _ (dotimes [i seq-len]
+              (let [offset (* i (int seq-len))]
+                (dotimes [j seq-len]
+                  (when (> j i)
+                    (aset weights (+ offset j) neg-inf)))))
+          _ (dotimes [i seq-len]
+              (let [offset (* i (int seq-len))
+                    max-s (loop [j 0 mm neg-inf]
                             (if (< j seq-len)
-                              (let [s-ij (aget weights (+ offset j))
-                                    e (if (== s-ij neg-inf-c)
-                                        0.0
-                                        (m/exp (- s-ij max-s)))]
-                                (aset weights (+ offset j) e)
-                                (recur (inc j) (+ s e)))
-                              s))
-                  inv-sum (if (== sum-exp 0.0) 0.0 (/ 1.0 sum-exp))]
-              (dotimes [j seq-len]
-                (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
-        ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
-        dZ (double-array (* seq-len seq-len))
-        _ (blas/dgemm-nt! dQ K dZ seq-len dk seq-len scale 0.0)
-        _ (blas/dgemm-nt! Q dK dZ seq-len dk seq-len scale 1.0)
-        ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
-        dW (double-array (* seq-len seq-len))
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))
-                  wdz (loop [j 0 s 0.0]
-                        (if (< j seq-len)
-                          (recur (inc j) (+ s (* (aget weights (+ offset j))
-                                                 (aget dZ (+ offset j)))))
-                          s))]
-              (dotimes [j seq-len]
-                (aset dW (+ offset j)
-                      (* (aget weights (+ offset j))
-                         (- (aget dZ (+ offset j)) wdz))))))
-        ;; dO = dW·V + W·dV
-        dO (double-array (* seq-len dv))
-        _ (blas/dgemm! dW V dO seq-len seq-len dv 1.0 0.0)
-        _ (blas/dgemm! weights dV dO seq-len seq-len dv 1.0 1.0)]
-    dO))
+                              (recur (inc j) (n/max mm (aget weights (+ offset j))))
+                              mm))
+                    sum-exp (loop [j 0 s 0.0]
+                              (if (< j seq-len)
+                                (let [e (m/exp (- (aget weights (+ offset j)) max-s))]
+                                  (aset weights (+ offset j) e)
+                                  (recur (inc j) (+ s e)))
+                                s))
+                    inv-sum (/ one sum-exp)]
+                (dotimes [j seq-len]
+                  (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
+          ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
+          dZ (alloc-like Q (* seq-len seq-len))
+          _ (blas/dgemm-nt! dQ K dZ seq-len dk seq-len scale z0)
+          _ (blas/dgemm-nt! Q dK dZ seq-len dk seq-len scale one)
+          ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
+          dW (alloc-like Q (* seq-len seq-len))
+          _ (dotimes [i seq-len]
+              (let [offset (* i (int seq-len))
+                    wdz (loop [j 0 s 0.0]
+                          (if (< j seq-len)
+                            (recur (inc j) (+ s (* (aget weights (+ offset j))
+                                                   (aget dZ (+ offset j)))))
+                            s))]
+                (dotimes [j seq-len]
+                  (aset dW (+ offset j)
+                        (* (aget weights (+ offset j))
+                           (- (aget dZ (+ offset j)) wdz))))))
+          ;; dO = dW·V + W·dV
+          dO (alloc-like Q (* seq-len dv))
+          _ (blas/dgemm! dW V dO seq-len seq-len dv one z0)
+          _ (blas/dgemm! weights dV dO seq-len seq-len dv one one)]
+      dO)))
 
 ;; causal SDPA :jvp-fn — one kernel call; absent tangents get typed zeros
 ;; (the pushforward is jointly linear in (dQ,dK,dV), so zeros are exact).
@@ -776,14 +764,15 @@
   projection is a separate linear-nb in the model forward. Scale is 1/sqrt(hd)
   (correct for Llama/Qwen, and Gemma when query_pre_attn_scalar = head_dim; a
   custom-scale variant is a follow-up)."
-  [Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array double)
+  (All [T]
+    [Q :- (Array T) K :- (Array T) V :- (Array T)
+     seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+    :- (Array T)
   (let [group    (quot n-q n-kv)
         qstride  (* n-q head-dim)
         kvstride (* n-kv head-dim)
         n        (* seq-len qstride)]
-    (loop [hq 0 acc (double-array n)]
+    (loop [hq 0 acc (alloc-like Q n)]
       (if (< hq n-q)
         (let [hkv      (quot hq group)
               Qh       (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
@@ -792,7 +781,7 @@
               head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len head-dim head-dim)
               out-h    (ops/scatter-strided-2d head-out seq-len qstride (* hq (int head-dim)) head-dim)]
           (recur (inc hq) (ops/array-add acc out-h n)))
-        acc))))
+        acc)))))
 
 ;; gqa-causal-mha has NO hand-written reverse rule: the forward is composed purely from
 ;; AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
@@ -810,14 +799,15 @@
 ;; no accumulation on the output side; the kv-head fan-IN that forces dK/dV
 ;; accumulation in the backward has no forward counterpart).
 (deftm gqa-causal-mha-jvp
-  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
-   Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array double)
+  (All [T]
+    [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
+     Q :- (Array T) K :- (Array T) V :- (Array T)
+     seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+    :- (Array T)
   (let [group (quot n-q n-kv)
         qstride (* n-q head-dim)
         kvstride (* n-kv head-dim)
-        dOut (double-array (* seq-len qstride))]
+        dOut (alloc-like Q (* seq-len qstride))]
     (dotimes [hq n-q]
       (let [hkv (quot hq (int group))
             Qh (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
@@ -833,7 +823,7 @@
                 hoff (* r (int head-dim))]
             (dotimes [c head-dim]
               (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))
-    dOut))
+    dOut)))
 
 ;; gqa-causal-mha :jvp-fn — one kernel call; absent tangents get typed zeros
 ;; (jointly linear pushforward in (dQ,dK,dV)).

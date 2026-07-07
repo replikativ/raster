@@ -38,18 +38,15 @@
 ;; 3. Has both a closure rrule and a colocated flat AD template
 ;; ================================================================
 
-(deftm array-add
-  [a :- (Array double) b :- (Array double) n :- Long]
-  :- (Array double)
-  (broadcast [a b] (+ a b)))
+(deftm array-add (All [T] [a :- (Array T) b :- (Array T) n :- Long] :- (Array T)
+                      (broadcast [a b] (n/+ a b))))
 
 (deftm array-add-backward
-  "Backward for array-add: d_a = dy, d_b = dy (both copies)."
-  [dy :- (Array double) n :- Long]
-  :- (Array double)
-  (let [out (double-array n)]
-    (acopy! dy 0 out 0 n)
-    out))
+  "Backward for array-add: d_a = dy, d_b = dy (both copies). Expressed as a pure
+  `broadcast` copy (the same SOAC the forward uses) so it lowers to a resident
+  :map kernel on GPU and stays SIMD-vectorizable on CPU — see residual-add-backward."
+  (All [T] [dy :- (Array T) n :- Long] :- (Array T)
+       (broadcast [dy] dy)))
 
 ;; ================================================================
 ;; array-copy: utility for gradient copying
@@ -124,33 +121,33 @@
   "Read a packed [rows × n-cols] block from src starting at column col-offset
   with row stride row-stride. Returns a freshly allocated array of length
   (rows * n-cols)."
-  [src :- (Array double)
-   rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
-  :- (Array double)
-  (let [out (double-array (* rows n-cols))]
-    (dotimes [r rows]
-      (let [src-off (+ (* r (int row-stride)) (int col-offset))
-            dst-off (* r (int n-cols))]
-        (dotimes [c n-cols]
-          (aset out (+ dst-off c)
-                (aget src (+ src-off c))))))
-    out))
+  (All [T] [src :- (Array T)
+            rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
+       :- (Array T)
+       (let [out (alloc-like src (* rows n-cols))]
+         (dotimes [r rows]
+           (let [src-off (+ (* r (int row-stride)) (int col-offset))
+                 dst-off (* r (int n-cols))]
+             (dotimes [c n-cols]
+               (aset out (+ dst-off c)
+                     (aget src (+ src-off c))))))
+         out)))
 
 (deftm scatter-strided-2d
   "Write a packed [rows × n-cols] block into a freshly allocated
   [rows × row-stride] dst at column offset col-offset, with the rest left as
   zero. Returns a freshly allocated array of length (rows * row-stride)."
-  [packed :- (Array double)
-   rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
-  :- (Array double)
-  (let [out (double-array (* rows row-stride))]
-    (dotimes [r rows]
-      (let [src-off (* r (int n-cols))
-            dst-off (+ (* r (int row-stride)) (int col-offset))]
-        (dotimes [c n-cols]
-          (aset out (+ dst-off c)
-                (aget packed (+ src-off c))))))
-    out))
+  (All [T] [packed :- (Array T)
+            rows :- Long row-stride :- Long col-offset :- Long n-cols :- Long]
+       :- (Array T)
+       (let [out (alloc-like packed (* rows row-stride))]
+         (dotimes [r rows]
+           (let [src-off (* r (int n-cols))
+                 dst-off (+ (* r (int row-stride)) (int col-offset))]
+             (dotimes [c n-cols]
+               (aset out (+ dst-off c)
+                     (aget packed (+ src-off c))))))
+         out)))
 
 ;; ================================================================
 ;; pack-heads / unpack-heads: multi-head attention layout combinators.
