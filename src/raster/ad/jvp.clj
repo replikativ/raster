@@ -336,9 +336,14 @@
                             {:var f-var :tags tags})))
         ;; The gradient program: shared prep → reified pullback → flat
         ;; fwd + (dy = 1.0) + rev bindings, outputs [g_a … g_k].
-        prepared (rev/ad-prepare (first walked-body))
+        ;; ad-prepare (lower-composites) and reify-pullback each open their OWN
+        ;; with-ad-gensym; run BOTH under one shared counter (like
+        ;; compile-hvp-fn's enclosing binding) so reify-pullback continues from
+        ;; ad-prepare's high-water mark instead of resetting *gensym-counter* to
+        ;; 0 and re-minting colliding anf__ temps across the phase boundary.
         {:keys [fwd-bindings result-sym body-sym pullback-form]}
-        (rev/reify-pullback prepared diff-params)
+        (rev/call-with-shared-ad-gensym
+         (fn [] (rev/reify-pullback (rev/ad-prepare (first walked-body)) diff-params)))
         [_ rev-bindings grad-vec] pullback-form
         grad-slots (vec grad-vec)
         ;; ANF-normalize: the reverse engine's grad-acc chains nest calls in
