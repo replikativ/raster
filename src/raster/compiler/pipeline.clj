@@ -975,7 +975,8 @@
 (def ^:private gpu-invoke-heads
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
-     raster.gpu.ze-runtime/invoke-reduction-kernel})
+     raster.gpu.ze-runtime/invoke-reduction-kernel
+     raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
   '#{double-array float-array int-array long-array byte-array
@@ -1113,6 +1114,24 @@
       (let [[_ kname inputs out scalars n] expr]
         {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
          :convention :map :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
+      ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
+      ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
+      ;; The resident bind zeroes it each replay (a zero-fill kernel prepended to the
+      ;; scatter). :arrays is the kernel C-sig order (out src index); the extra scalar
+      ;; (stride) is a :scalar (n stays :n-expr, and n precedes stride in the C-sig — the
+      ;; scatter bind places n before the scalars, unlike the map-void arrays,scalars,n order).
+      (let [[_ kname out src index n stride] expr
+            ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
+            ;; (scalar-native-type keys on the name, and the value-fn still evaluates
+            ;; the raw symbol — it is an int stride/index param either way).
+            strip-cast (fn [x] (if (and (seq? x)
+                                        (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
+                                 (second x) x))]
+        {:kernel-name kname :arrays [out src index]
+         :scalars (if stride [(strip-cast stride)] [])
+         :n-expr n :convention :scatter :accumulator out :returns sym})
+
       (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
       ;; 3-arg legacy (host-scalar return) vs 4-arg resident (writes out-buf, stays on device).
       (if (= 5 (count expr))
@@ -1412,12 +1431,16 @@
                          :n-fn (expr->arg-fn all-params scalar-lets (:n-expr step))
                          :k-fn (expr->arg-fn all-params scalar-lets (:k-expr step))
                          :phase (keyword (str "gpu-step-" i))}
-                        (let [{:keys [kernel-name arrays scalars n-expr convention output]} step]
+                        (let [{:keys [kernel-name arrays scalars n-expr convention output accumulator]} step]
                           {:kernel-name kernel-name
                            :arrays arrays
                            ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
                            ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
                            :output (when output (keyword (name output)))
+                           ;; :scatter steps carry the accumulator buffer sym so bind-program! can
+                           ;; zero it (a zero-fill kernel prepended to the atomic-add scatter) each
+                           ;; replay — the zeros-like semantics of scatter-add's output.
+                           :accumulator (when accumulator (keyword (name accumulator)))
                            :n-fn (expr->arg-fn all-params scalar-lets n-expr)
                            ;; Type each scalar arg with the SAME `scalar-native-type` the kernel
                            ;; DECLARATION uses (par_opencl), so the host arg encoding always matches

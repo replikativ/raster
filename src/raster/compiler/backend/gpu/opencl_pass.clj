@@ -305,6 +305,26 @@
                   (list 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel
                         (:kernel-name k) out src index n (when stride stride)))))
 
+            ;; par/gather — out[e*stride+d] = src[index[e]*stride+d]. Writes every
+            ;; output element once (no atomics/accumulation), so it lowers to a map-void
+            ;; kernel and binds through the existing resident map path.
+            (par/par-gather-form? form)
+            (let [{:keys [n stride]} (par/extract-par-gather-info form)]
+              (if (and (number? n) (< n min-elements))
+                (do (swap! stats update :fallback inc)
+                    (par/expand-par-gather! form))
+                (let [k (register-kernel!
+                         (legacy/generate-par-gather-kernel form
+                                                            :dtype dtype :device-id device-id)
+                         :ze-maps)
+                      {:keys [out src index]} (par/extract-par-gather-info form)
+                      strip-cast (fn [x] (if (and (seq? x)
+                                                  (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
+                                           (second x) x))]
+                  (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+                        (:kernel-name k) (vec [out src index])
+                        (if stride [(strip-cast stride)] []) n))))
+
             ;; par/reduce-by-key
             (par/par-reduce-by-key-form? form)
             (let [{:keys [n]} (par/extract-par-reduce-by-key-info form)]

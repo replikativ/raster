@@ -808,6 +808,51 @@
      :strided? strided?
      :dtype dtype}))
 
+(defn generate-par-gather-kernel
+  "Generate an OpenCL C kernel from a raster.par/gather form.
+  Gather: out[e*stride+d] = src[index[e]*stride+d] — one work-item per gathered pair
+  e (inner loop over stride). A gather writes every output element exactly once (no
+  atomics, no accumulation), so it uses the map-void calling convention
+  (out, src, index, [stride,] int _n_bound) and binds through
+  bind-registered-map-void-kernel — `out` is just another resident buffer.
+
+  Returns {:kernel-name str :source str :array-params [out src index]
+           :scalar-params [...] :written-arrays [out] :dtype kw :strided? bool}."
+  [form & {:keys [dtype kernel-name-prefix]
+           :or {dtype :float kernel-name-prefix "par_gather"}}]
+  (let [info (par/extract-par-gather-info form)
+        {:keys [out src index stride]} info
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        ctype (get codegen/opencl-type-map dtype "float")
+        use-fp64? (= dtype :double)
+        strided? (some? stride)
+        out-c (ce/c-symbol out)
+        src-c (ce/c-symbol src)
+        index-c (ce/c-symbol index)
+        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                    "__kernel void " kernel-name
+                    "(__global " ctype "* " out-c
+                    ", __global const " ctype "* restrict " src-c
+                    ", __global const int* restrict " index-c
+                    (if strided? ", int stride, int _n_bound" ", int _n_bound")
+                    ") {\n"
+                    "    for (int e = get_global_id(0); e < _n_bound; e += get_global_size(0)) {\n"
+                    "        int src_idx = " index-c "[e];\n"
+                    (if strided?
+                      (str "        for (int d = 0; d < stride; d++) {\n"
+                           "            " out-c "[e * stride + d] = " src-c "[src_idx * stride + d];\n"
+                           "        }\n")
+                      (str "        " out-c "[e] = " src-c "[src_idx];\n"))
+                    "    }\n"
+                    "}\n")]
+    {:kernel-name kernel-name
+     :source source
+     :array-params [out src index]
+     :scalar-params (if strided? [{:name 'stride :type :int}] [])
+     :written-arrays [out]
+     :strided? strided?
+     :dtype dtype}))
+
 ;; ================================================================
 ;; Reduce-by-key kernel generator
 ;; ================================================================

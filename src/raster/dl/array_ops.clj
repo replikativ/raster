@@ -28,6 +28,7 @@
             [raster.arrays :refer [aget aset alength aclone acopy! alloc-like]]
             [raster.math :as m]
             [raster.numeric :as n]
+            [raster.par :as par]
             [raster.ad.templates :as tmpl]))
 
 ;; ================================================================
@@ -236,17 +237,17 @@
 (deftm gather
   "Gather values from indexed positions.
   out[e*stride+s] = src[indices[e]*stride+s] for e∈[0,n-pairs), s∈[0,stride).
-  n-src: number of source entities (for backward scatter allocation)."
-  [src :- (Array double) indices :- (Array long)
-   n-src :- Long n-pairs :- Long stride :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-pairs stride))]
-    (dotimes [e n-pairs]
-      (let [src-idx (aget indices e)]
-        (dotimes [s stride]
-          (aset out (+ (* e (int stride)) s)
-                (aget src (+ (* src-idx (int stride)) s))))))
-    out))
+  n-src: number of source entities (for backward scatter allocation).
+
+  Expressed over the par/gather primitive so it lowers to a resident GPU gather
+  kernel (and stays a plain vectorizable loop on CPU). (All [T]): T=double on CPU,
+  T=float on GPU — no hard-typed precision."
+  (All [T] [src :- (Array T) indices :- (Array long)
+            n-src :- Long n-pairs :- Long stride :- Long]
+       :- (Array T)
+       (let [out (alloc-like src (* n-pairs stride))]
+         (par/gather out src indices n-pairs stride)
+         out)))
 
 ;; ================================================================
 ;; scatter-add: out[indices[e]*stride+s] += vals[e*stride+s]
@@ -256,20 +257,18 @@
 (deftm scatter-add
   "Scatter-add values to indexed destinations.
   out[indices[e]*stride+s] += vals[e*stride+s] for e∈[0,n-pairs), s∈[0,stride).
-  n-dst: number of destination entities (output size = n-dst*stride)."
-  [vals :- (Array double) indices :- (Array long)
-   n-dst :- Long n-pairs :- Long stride :- Long]
-  :- (Array double)
-  (let [out (double-array (* n-dst stride))]
-    (dotimes [e n-pairs]
-      (let [dst-idx (aget indices e)]
-        (dotimes [s stride]
-          (let [out-idx (+ (* dst-idx (int stride)) s)
-                val-idx (+ (* e (int stride)) s)]
-            (aset out out-idx
-                  (+ (aget out out-idx)
-                     (aget vals val-idx)))))))
-    out))
+  n-dst: number of destination entities (output size = n-dst*stride).
+
+  Expressed over the par/scatter! primitive so it lowers to a resident GPU
+  scatter-add kernel (atomic += for concurrent fan-in) and stays a plain loop on
+  CPU. The output accumulator is alloc-like (zero-initialized). (All [T]):
+  T=double on CPU, T=float on GPU — no hard-typed precision."
+  (All [T] [vals :- (Array T) indices :- (Array long)
+            n-dst :- Long n-pairs :- Long stride :- Long]
+       :- (Array T)
+       (let [out (alloc-like vals (* n-dst stride))]
+         (par/scatter! out vals indices n-pairs stride)
+         out)))
 
 ;; scatter-add backward = gather, gather backward = scatter-add
 

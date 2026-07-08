@@ -694,6 +694,19 @@
             {:out out :src src :index index :n n :stride stride})
         nil))))
 
+(defn extract-par-gather-info
+  "Extract structured info from a par/gather form.
+  (par/gather output src index n [stride]). Returns {:out :src :index :n :stride} or nil."
+  [form]
+  (when (par-gather-form? form)
+    (let [args (rest form)]
+      (case (count args)
+        4 (let [[out src index n] args]
+            {:out out :src src :index index :n n :stride nil})
+        5 (let [[out src index n stride] args]
+            {:out out :src src :index index :n n :stride stride})
+        nil))))
+
 (defn extract-par-reduce-by-key-info
   "Extract structured info from a par/reduce-by-key form."
   [form]
