@@ -1165,7 +1165,12 @@
      (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
-           has-rule? (and preserve-templates? (first (rt/resolve-template impl-sym)))
+           ;; Keep an op symbolic for reverse-AD only if it has a REVERSE rule
+           ;; (:grads/:grads-fn/:pullback-factory). A jvp-only op (forward-mode
+           ;; template, e.g. gqa-causal-mha) has no reverse rule and MUST inline so
+           ;; its composed body differentiates to flat IR — otherwise it falls back
+           ;; to the opaque get-pullback-factory closure (not GPU-lowerable).
+           has-rule? (and preserve-templates? (rt/has-reverse-rule? impl-sym))
            ;; recursive callee (already being inlined) → keep as a call, don't recurse
            deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
                         (try-resolve-deftm impl-sym))]

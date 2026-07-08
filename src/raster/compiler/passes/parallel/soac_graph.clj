@@ -359,12 +359,23 @@
      (or (instance? raster.compiler.ir.soac.SoacMap producer)
          (and (instance? raster.compiler.ir.soac.SoacScan producer)
               (instance? raster.compiler.ir.soac.SoacMap consumer)))
-      ;; 6. Ordering safety
-     ;; Multi-consumer: producer stays alive (not removed), always safe.
-     ;; Sole consumer: producer will be removed. Safe because sole consumer
-     ;; means no other node depends on producer's output, so removing it
-     ;; cannot break any ordering.
-     true
+      ;; 6. Value-flow ordering: the producer must PRECEDE the consumer in the
+     ;; original program order (`:id` = the sequential let*-binding index). A
+     ;; genuine read-after-write `:dep` (the consumer reads a value the producer
+     ;; computed) is ALWAYS producer-before-consumer in an SSA-ish let* — you
+     ;; cannot read a value before it is bound. A BACKWARDS `:dep` edge
+     ;; (producer-id > consumer-id) is an artifact of `build-producer-map`
+     ;; registering an IN-PLACE writer (a non-pure `par/map!` whose output buffer
+     ;; is a pre-existing param / earlier binding, e.g. an SGD `w -= lr*dW`
+     ;; update) as the SSA producer of that array — but a reader scheduled
+     ;; earlier reads the ORIGINAL value, so this is a write-after-read
+     ;; anti-dependency, not a value flow. Inlining such a "producer" into the
+     ;; earlier consumer both miscompiles (reader sees the post-mutation value)
+     ;; and hoists the mutator's own inputs above their definitions (a
+     ;; forward-reference that the :soac-fused dialect validator rejects loudly).
+     ;; This guard is domain-agnostic — it queries only node identity/order, no
+     ;; op names — and declines exactly the spurious backwards fusions.
+     (< (:id producer) (:id consumer))
       ;; 7. The producer must NOT be a reduce-broadcast node (see depends-on-reduce?).
       ;; Pinning it keeps the reduce→broadcast→map boundary materialized — without this,
       ;; introducing a par/reduce (matching the element bound) lets the broadcast map smear

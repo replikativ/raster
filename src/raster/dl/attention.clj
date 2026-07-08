@@ -757,44 +757,127 @@
 ;; Differentiable GQA/MQA causal attention (Llama/Qwen/Gemma decoders)
 ;; ================================================================
 
+;; ----------------------------------------------------------------
+;; batched-causal-sdpa: run the flat GEMM-based causal SDPA over `batch`
+;; contiguous [seq,hd] head slabs (Q,K,V all packed [batch,seq,hd]). Opaque to AD
+;; (its own flat :grads-fn below calls the batched backward) so the head iteration
+;; NEVER enters the reverse-AD tape — that is what keeps gqa-causal-mha's gradient
+;; a straight-line let* (no fn* pullback closure / ArrayList tape). The runtime
+;; body loops over batches calling the tested single-head causal-scaled-dot-
+;; product-attn(+backward); (All [T]), all scalars element-typed inside SDPA.
+;; ----------------------------------------------------------------
+(deftm batched-causal-sdpa
+  (All [T]
+       [Q :- (Array T) K :- (Array T) V :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array T)
+       (let [slab (* seq-len head-dim)
+             out  (alloc-like Q (* batch slab))]
+         (dotimes [b batch]
+           (let [boff (* b (int slab))
+                 Qb (alloc-like Q slab) Kb (alloc-like Q slab) Vb (alloc-like Q slab)]
+             (dotimes [i slab]
+               (aset Qb i (aget Q (+ boff i)))
+               (aset Kb i (aget K (+ boff i)))
+               (aset Vb i (aget V (+ boff i))))
+             (let [ob (causal-scaled-dot-product-attn Qb Kb Vb seq-len head-dim head-dim)]
+               (dotimes [i slab]
+                 (aset out (+ boff i) (aget ob i))))))
+         out)))
+
+(deftm batched-causal-sdpa-backward
+  "Backward for batched-causal-sdpa. Returns Object[3] = [dQ dK dV]. Batches own
+  disjoint slabs (no cross-batch accumulation — the GQA kv-head fan-in is handled
+  by sum-kv-heads OUTSIDE this op, since K/V are already broadcast to `batch=n_q`)."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array Object)
+       (let [slab (* seq-len head-dim)
+             dQ (alloc-like Q (* batch slab))
+             dK (alloc-like Q (* batch slab))
+             dV (alloc-like Q (* batch slab))]
+         (dotimes [b batch]
+           (let [boff (* b (int slab))
+                 Qb (alloc-like Q slab) Kb (alloc-like Q slab)
+                 Vb (alloc-like Q slab) dOb (alloc-like Q slab)]
+             (dotimes [i slab]
+               (aset Qb i (aget Q (+ boff i)))
+               (aset Kb i (aget K (+ boff i)))
+               (aset Vb i (aget V (+ boff i)))
+               (aset dOb i (aget d-out (+ boff i))))
+             (let [g   (causal-scaled-dot-product-attn-backward
+                        dOb Qb Kb Vb seq-len head-dim head-dim)
+                   dQb (clojure.core/aget g 0)
+                   dKb (clojure.core/aget g 1)
+                   dVb (clojure.core/aget g 2)]
+               ;; dQb/dKb/dVb are (Array T) but extracted from an Object[] so their
+               ;; compile-time tag is Object — scatter through the typed blit-slab!
+               ;; helper (not a direct raster.arrays/aget) so element access
+               ;; devirtualizes to the real double[]/float[] under compile-aot.
+               (ops/blit-slab! dQ boff dQb slab)
+               (ops/blit-slab! dK boff dKb slab)
+               (ops/blit-slab! dV boff dVb slab))))
+         (let [o (object-array 3)]
+           (clojure.core/aset o 0 dQ)
+           (clojure.core/aset o 1 dK)
+           (clojure.core/aset o 2 dV)
+           o))))
+
+(tmpl/merge-into-template! 'raster.dl.attention/batched-causal-sdpa
+                           {:params '[Q K V batch seq-len head-dim]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [Q K V batch seq-len head-dim]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [bundle (gensym-fn "bcspa_grads")
+                                    dQ (gensym-fn "dQ")
+                                    dK (gensym-fn "dK")
+                                    dV (gensym-fn "dV")]
+                                [(update ctx :bindings into
+                                         [bundle (list 'raster.dl.attention/batched-causal-sdpa-backward
+                                                       adjoint-sym Q K V batch seq-len head-dim)
+                                          dQ (list 'clojure.core/aget bundle 0)
+                                          dK (list 'clojure.core/aget bundle 1)
+                                          dV (list 'clojure.core/aget bundle 2)])
+                                 [dQ dK dV nil nil nil]]))})
+
 (deftm gqa-causal-mha
   "Differentiable grouped/multi-query causal self-attention over PRE-PROJECTED,
   PRE-ROPED Q:[seq,n_q·hd] and K/V:[seq,n_kv·hd] (n_kv divides n_q; n_kv<n_q = GQA,
-  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Composed only from
-  AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
-  scatter-strided-2d → array-add) in the tail-loop-with-let shape, so value+grad
-  inlines it cleanly — no explicit pullback (the training-forward twin of the
-  inference-only gqa-causal-attention above). Returns [seq, n_q·hd]; the output
-  projection is a separate linear-nb in the model forward. Scale is 1/sqrt(hd)
-  (correct for Llama/Qwen, and Gemma when query_pre_attn_scalar = head_dim; a
-  custom-scale variant is a follow-up)."
+  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Returns [seq, n_q·hd].
+
+  FLAT decomposition (no per-head carry loop): pack Q/K/V to per-head-contiguous
+  layout, BROADCAST the n_kv kv heads up to the n_q query heads (broadcast-kv-heads),
+  run a batched causal SDPA over the n_q head slabs, then unpack the disjoint
+  per-head outputs back to [seq, n_q·hd]. Every step is an AD-registered primitive
+  with a FLAT grads-fn (pack↔unpack, broadcast-kv-heads↔sum-kv-heads,
+  batched-causal-sdpa↔its backward), so value+grad differentiates it as a
+  straight-line let* — NO fn* pullback / ArrayList tape (the old raw carry loop
+  emitted one, which cannot lower to GPU). The MQA/GQA dK/dV fan-in (the `group`
+  query heads sharing one kv head) falls out exactly as sum-kv-heads (the
+  broadcast dual). Scale is 1/sqrt(hd) (Llama/Qwen; Gemma when
+  query_pre_attn_scalar = head_dim). The output projection is a separate linear-nb."
   (All [T]
     [Q :- (Array T) K :- (Array T) V :- (Array T)
      seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
     :- (Array T)
-  (let [group    (quot n-q n-kv)
-        qstride  (* n-q head-dim)
-        kvstride (* n-kv head-dim)
-        n        (* seq-len qstride)]
-    (loop [hq 0 acc (alloc-like Q n)]
-      (if (< hq n-q)
-        (let [hkv      (quot hq group)
-              Qh       (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
-              Kh       (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
-              Vh       (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
-              head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len head-dim head-dim)
-              out-h    (ops/scatter-strided-2d head-out seq-len qstride (* hq (int head-dim)) head-dim)]
-          (recur (inc hq) (ops/array-add acc out-h n)))
-        acc)))))
+  (let [group (quot n-q n-kv)
+        slab  (* seq-len head-dim)
+        Qp (ops/pack-heads Q seq-len n-q head-dim)
+        Kp (ops/pack-heads K seq-len n-kv head-dim)
+        Vp (ops/pack-heads V seq-len n-kv head-dim)
+        Ke (ops/broadcast-kv-heads Kp n-kv group slab)
+        Ve (ops/broadcast-kv-heads Vp n-kv group slab)
+        Op (batched-causal-sdpa Qp Ke Ve n-q seq-len head-dim)]
+    (ops/unpack-heads Op seq-len n-q head-dim))))
 
-;; gqa-causal-mha has NO hand-written reverse rule: the forward is composed purely from
-;; AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
-;; scatter-strided-2d → array-add tail-loop), so value+grad inlines and differentiates it
-;; automatically. The former explicit `gqa-causal-mha-backward` + :grads-fn were removed
-;; (2026-07-07) once the reverse-AD gensym-counter collision was fixed (6848279): with that
-;; fix the auto-diff gradient is FD-verified bit-identical to the old hand-written backward
-;; (incl. MQA kv-head fan-in dK/dV accumulation). The :jvp-fn (forward mode) is KEPT below —
-;; its removability is a separate forward-mode audit.
+;; gqa-causal-mha has NO hand-written reverse rule of its own: it is composed
+;; entirely from AD-registered primitives with flat grads-fn templates
+;; (pack-heads/unpack-heads, broadcast-kv-heads/sum-kv-heads, batched-causal-sdpa),
+;; so value+grad inlines and differentiates it into a straight-line let* — flat,
+;; GPU-lowerable IR with no closures-as-tape. The :jvp-fn (forward mode) is KEPT
+;; below — its removability is a separate forward-mode audit.
 
 ;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention — mirrors
 ;; gqa-causal-mha-backward's head iteration: per query head hq, slice the

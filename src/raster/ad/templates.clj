@@ -339,6 +339,17 @@
       (get-pullback-factory op))
     (get-pullback-factory op)))
 
+(defn has-reverse-rule?
+  "True if op has a REVERSE-mode AD rule: a static :grads/:grads-fn template OR a
+  runtime :pullback-factory/:closure. A jvp-only template (forward mode) does NOT
+  count — an op with only a :jvp-fn has no reverse rule, so reverse-AD must INLINE
+  its composed body to differentiate it (rather than keep it symbolic and fall
+  back to the opaque get-pullback-factory closure, which cannot lower to GPU).
+  Keys on the resolved (mangled-name aware) template."
+  [op]
+  (when-let [[t _] (resolve-template op)]
+    (or (:grads t) (:grads-fn t) (:pullback-factory t) (:closure t))))
+
 ;; ================================================================
 ;; Arithmetic templates
 ;; ================================================================
@@ -1668,3 +1679,28 @@
            (not (or (:grads t) (:grads-fn t))))
        (assoc :grads-fn (derive-rrule-from-structure op adjoint-map)
               ::derived-grads-fn true)))))
+
+;; --- Load-time fail-loud guard for the has-reverse-rule? inliner gate ---
+;; The op-adjoints entries above are the structure-tagged BACKWARD kernels that
+;; appear as opaque calls inside gradient programs (linear-dx/dW/db, relu/silu/
+;; gelu-backward, daxpy-diff!, dot-product, scale, aclone, mse-grad). Each derives
+;; a :jvp-fn from its :structure tag, so it is "jvp-capable"; but for REVERSE-AD it
+;; must stay SYMBOLIC — `has-reverse-rule?` (raster.compiler...scalar.inline, the
+;; inliner gate) keeps an op symbolic ONLY when it has a reverse rule
+;; (:grads/:grads-fn/:pullback-factory). Without one, the gate treats the kernel as
+;; jvp-only and INLINES it — silently mis-differentiating an opaque backward kernel
+;; (and defeating GPU lowering). This assert makes that failure mode LOUD at load
+;; time: every op-adjoints kernel must actually carry an installed reverse rule
+;; after the derivation above. A future structure-tagged backward kernel added
+;; here (or whose derivation regresses) that ends up without a reverse rule fails
+;; the require instead of miscompiling at runtime.
+(doseq [op (keys op-adjoints)]
+  (when-not (has-reverse-rule? op)
+    (throw (ex-info
+            (str "AD registry invariant violated: structure-tagged backward kernel "
+                 op " has an op-adjoints entry but NO installed reverse rule "
+                 "(:grads/:grads-fn/:pullback-factory). `has-reverse-rule?` would "
+                 "treat it as jvp-only and let the inliner silently inline + "
+                 "mis-differentiate it. derive-rrule-from-structure must install a "
+                 ":grads-fn for every op-adjoints kernel.")
+            {:op op :template-keys (keys (get-template op))}))))

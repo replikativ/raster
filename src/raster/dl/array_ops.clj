@@ -187,19 +187,127 @@
                  (aset out (+ dst d) (aget x (+ src d)))))))
          out)))
 
-;; pack ↔ unpack are duals (both are non-diff on the Long shape params). No
-;; grads-fn exists for them, so the runtime pullback (each is the other's
-;; dual) is their sole gradient representation.
+(deftm blit-slab!
+  "Copy `len` contiguous elements from `src[0..len)` into `dst[dst-off .. dst-off+len)`.
+  Both are typed (Array T), so the element aget/aset devirtualize under compile-aot.
+  Used to scatter object-array-bundled per-batch gradients — extracted from an Object[]
+  via clojure.core/aget, hence UNTYPED (compile-time Object) — back into a strided output
+  WITHOUT an Object[]-element re-index. A `(raster.arrays/aget <Object> i)` would
+  mis-devirtualize to the Object overload and ClassCast a double[]/float[] at runtime;
+  routing the untyped source through this (Array T) param makes compile-aot insert the
+  checkcast to the monomorphized element array. Returns dst."
+  (All [T] [dst :- (Array T) dst-off :- Long src :- (Array T) len :- Long] :- (Array T)
+       (do (dotimes [i len]
+             (aset dst (+ dst-off i) (aget src i)))
+           dst)))
+
+;; pack ↔ unpack are duals (both are non-diff on the Long shape params). Each has
+;; a pullback-factory (interpreted AD) AND a flat grads-fn (compile-aot / resident
+;; codegen): pack's gradient is unpack of the adjoint, and vice versa — a single
+;; flat let-binding so the reverse pass stays straight-line (no fn* tape closure).
 (tmpl/merge-into-template! 'raster.dl.array-ops/pack-heads
                            {:pullback-factory
                             (fn [_result _x seq-len n-heads head-dim]
                               (fn [d-out]
-                                [(unpack-heads d-out seq-len n-heads head-dim) nil nil nil]))})
+                                [(unpack-heads d-out seq-len n-heads head-dim) nil nil nil]))
+                            :params '[x seq-len n-heads head-dim]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_x seq-len n-heads head-dim]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [dx (gensym-fn "d_x")]
+                                [(update ctx :bindings into
+                                         [dx (list 'raster.dl.array-ops/unpack-heads
+                                                   adjoint-sym seq-len n-heads head-dim)])
+                                 [dx nil nil nil]]))})
 (tmpl/merge-into-template! 'raster.dl.array-ops/unpack-heads
                            {:pullback-factory
                             (fn [_result _x seq-len n-heads head-dim]
                               (fn [d-out]
-                                [(pack-heads d-out seq-len n-heads head-dim) nil nil nil]))})
+                                [(pack-heads d-out seq-len n-heads head-dim) nil nil nil]))
+                            :params '[x seq-len n-heads head-dim]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_x seq-len n-heads head-dim]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [dx (gensym-fn "d_x")]
+                                [(update ctx :bindings into
+                                         [dx (list 'raster.dl.array-ops/pack-heads
+                                                   adjoint-sym seq-len n-heads head-dim)])
+                                 [dx nil nil nil]]))})
+
+;; ================================================================
+;; broadcast-kv-heads / sum-kv-heads: GQA/MQA key-value head fan-out and its
+;; dual (fan-in / segment reduce over the query-head group).
+;;
+;; A grouped/multi-query decoder shares one KV head across `group` query heads
+;; (group = n_q / n_kv). Given a packed [n_kv, slab] KV tensor (slab = seq·hd),
+;; broadcast-kv-heads REPEATS each kv head `group` times to align with the
+;; n_q = n_kv·group query heads:  out[(g·group+r)·slab + i] = src[g·slab + i].
+;; Its exact dual sum-kv-heads SUMS the `group` query-head contributions back
+;; onto each kv head — this is the MQA dK/dV fan-in gradient. Both are (All [T])
+;; and each other's pullback (flat grads-fn, no index array, no loop-carry), so
+;; the reverse pass stays straight-line and GPU-lowerable (fan-out = a resident
+;; broadcast/map, fan-in = a resident segment reduce).
+;; ================================================================
+
+(deftm broadcast-kv-heads
+  "Repeat each of n-kv contiguous [slab] KV-head blocks `group` times:
+  out[(g*group+r)*slab + i] = src[g*slab + i], for g<n-kv, r<group, i<slab.
+  Output length = n-kv*group*slab. Used to align KV heads with query heads in GQA/MQA."
+  (All [T] [src :- (Array T) n-kv :- Long group :- Long slab :- Long] :- (Array T)
+       (let [out (alloc-like src (* n-kv group slab))]
+         (dotimes [g n-kv]
+           (dotimes [r group]
+             (let [soff (* g (int slab))
+                   doff (* (+ (* g (int group)) r) (int slab))]
+               (dotimes [i slab]
+                 (aset out (+ doff i) (aget src (+ soff i)))))))
+         out)))
+
+(deftm sum-kv-heads
+  "Dual of broadcast-kv-heads: sum each group of `group` query-head blocks back
+  onto its kv head. out[g*slab + i] = Σ_{r<group} src[(g*group+r)*slab + i].
+  Output length = n-kv*slab. This is the GQA/MQA dK/dV fan-in accumulation."
+  (All [T] [src :- (Array T) n-kv :- Long group :- Long slab :- Long] :- (Array T)
+       (let [out (alloc-like src (* n-kv slab))]
+         (dotimes [g n-kv]
+           (dotimes [r group]
+             (let [soff (* (+ (* g (int group)) r) (int slab))
+                   doff (* g (int slab))]
+               (dotimes [i slab]
+                 (aset out (+ doff i)
+                       (n/+ (aget out (+ doff i)) (aget src (+ soff i))))))))
+         out)))
+
+;; broadcast-kv-heads ↔ sum-kv-heads duals. Flat grads-fn (each other) + a
+;; pullback-factory for interpreted AD. Long shape params are non-diff (nil grads).
+(tmpl/merge-into-template! 'raster.dl.array-ops/broadcast-kv-heads
+                           {:pullback-factory
+                            (fn [_result _src n-kv group slab]
+                              (fn [d-out]
+                                [(sum-kv-heads d-out n-kv group slab) nil nil nil]))
+                            :params '[src n-kv group slab] :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_src n-kv group slab] _result-sym adjoint-sym gensym-fn]
+                              (let [d-src (gensym-fn "d_src")]
+                                [(update ctx :bindings into
+                                         [d-src (list 'raster.dl.array-ops/sum-kv-heads
+                                                      adjoint-sym n-kv group slab)])
+                                 [d-src nil nil nil]]))})
+(tmpl/merge-into-template! 'raster.dl.array-ops/sum-kv-heads
+                           {:pullback-factory
+                            (fn [_result _src n-kv group slab]
+                              (fn [d-out]
+                                [(broadcast-kv-heads d-out n-kv group slab) nil nil nil]))
+                            :params '[src n-kv group slab] :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [_src n-kv group slab] _result-sym adjoint-sym gensym-fn]
+                              (let [d-src (gensym-fn "d_src")]
+                                [(update ctx :bindings into
+                                         [d-src (list 'raster.dl.array-ops/broadcast-kv-heads
+                                                      adjoint-sym n-kv group slab)])
+                                 [d-src nil nil nil]]))})
 
 ;; slice ↔ scatter are duals: gradient of slice goes through scatter, and
 ;; vice versa. A grads-fn (compile-aot flat codegen) is registered. Indices
