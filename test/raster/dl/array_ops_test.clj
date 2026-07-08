@@ -116,6 +116,35 @@
                   s))]
       (is (approx= lhs rhs 1e-10)))))
 
+(deftest layout-ops-test
+  (testing "pack-heads / unpack-heads are exact inverse permutations"
+    ;; [seq, nh*hd] row-major → [nh, seq, hd] and back
+    (let [sl 3 nh 2 hd 4 n (* sl nh hd)
+          x (double-array (map double (range n)))
+          p (ops/pack-heads x sl nh hd)]
+      (is (= n (alength p)))
+      ;; out[h*sl*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d]
+      (is (approx= (aget p (+ (* 1 sl hd) (* 2 hd) 3))
+                   (aget x (+ (* 2 (* nh hd)) (* 1 hd) 3))))
+      ;; round-trip identity
+      (is (arr-approx= (ops/unpack-heads p sl nh hd) x))
+      (is (arr-approx= (ops/pack-heads (ops/unpack-heads x sl nh hd) sl nh hd) x))))
+  (testing "broadcast-kv-heads / sum-kv-heads are duals (fan-out ↔ fan-in)"
+    ;; gemma-style MQA: n-kv=1 group=4, plus a general 2:group case
+    (doseq [[nkv grp slab] [[1 4 5] [2 4 3]]]
+      (let [src (double-array (map double (range (* nkv slab))))
+            bc (ops/broadcast-kv-heads src nkv grp slab)]
+        (is (= (* nkv grp slab) (alength bc)))
+        ;; each of the `group` replicas equals the source block
+        (dotimes [g nkv]
+          (dotimes [r grp]
+            (dotimes [i slab]
+              (is (approx= (aget bc (+ (* (+ (* g grp) r) slab) i))
+                           (aget src (+ (* g slab) i)))))))
+        ;; sum-kv-heads(broadcast(v)) = group * v
+        (is (arr-approx= (ops/sum-kv-heads bc nkv grp slab)
+                         (double-array (map #(* grp (double %)) (seq src)))))))))
+
 (deftest indexed-dot-test
   (testing "indexed-dot on simple multi-head case"
     (let [n-nodes 3 n-edges 2 emb-dim 4 n-heads 2

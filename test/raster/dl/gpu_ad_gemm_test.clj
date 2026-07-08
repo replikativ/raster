@@ -15,6 +15,7 @@
    Level-Zero / Intel-XMX only (the fp16 DPAS GEMM kernel). Skips cleanly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
+            [raster.dl.array-ops :as ops]
             [raster.dl.nn :as nn]))
 
 (def ^:private gpu-available?
@@ -76,6 +77,39 @@
               "weight-gradient lowers to a :tn resident GEMM step (transpose-A path)")
           (is (< (rel-err out cpu) tol)
               (str "linear-dW relerr " (rel-err out cpu))))))))
+
+(deftest gpu-attention-layout-ops-resident
+  ;; The four dense-attention LAYOUT ops (pack/unpack heads + broadcast/sum KV heads)
+  ;; used inside the flat gqa-causal-mha are strided permutation/broadcast/segment-reduce
+  ;; copies re-expressed over par/map-void!, so each lowers to a SINGLE resident :map-void
+  ;; kernel on device (no raw loop / host-scalar fallback) and matches the CPU reference.
+  (if-not @gpu-available?
+    (println "  [SKIP] gpu-attention-layout: no Level Zero GPU")
+    (let [tol 1e-5]
+      (testing "pack-heads lowers to a resident :map-void kernel and matches CPU"
+        (let [sl 6 nh 4 hd 8 x (rnd (* sl nh hd) 21)
+              cpu (ops/pack-heads x sl nh hd)
+              {:keys [descriptor out]} (run-resident #'ops/pack-heads [x sl nh hd])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "pack-heads relerr " (rel-err out cpu)))))
+      (testing "unpack-heads lowers to a resident :map-void kernel and matches CPU"
+        (let [sl 6 nh 4 hd 8 x (rnd (* sl nh hd) 22)
+              cpu (ops/unpack-heads x sl nh hd)
+              {:keys [descriptor out]} (run-resident #'ops/unpack-heads [x sl nh hd])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "unpack-heads relerr " (rel-err out cpu)))))
+      (testing "broadcast-kv-heads (MQA fan-out) lowers resident and matches CPU"
+        (let [nkv 2 grp 4 slab 48 src (rnd (* nkv slab) 23)
+              cpu (ops/broadcast-kv-heads src nkv grp slab)
+              {:keys [descriptor out]} (run-resident #'ops/broadcast-kv-heads [src nkv grp slab])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "broadcast-kv relerr " (rel-err out cpu)))))
+      (testing "sum-kv-heads (fan-in segment reduce) lowers resident and matches CPU"
+        (let [nkv 2 grp 4 slab 48 big (rnd (* nkv grp slab) 24)
+              cpu (ops/sum-kv-heads big nkv grp slab)
+              {:keys [descriptor out]} (run-resident #'ops/sum-kv-heads [big nkv grp slab])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "sum-kv relerr " (rel-err out cpu))))))))
 
 (deftest gpu-ad-full-train-step-residency-boundary
   ;; This test does NOT need a GPU — it pins the CURRENT residency boundary at the IR level.

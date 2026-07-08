@@ -152,39 +152,54 @@
 
 ;; ================================================================
 ;; pack-heads / unpack-heads: multi-head attention layout combinators.
-;; Both are parametric (All [T]) and allocation-free per element (one contiguous
-;; pass), so the compiler vectorizes the inner head-dim copy. They replace the
-;; per-head nested-dotimes scalar Qh/Kh/Vh extraction + copy-back in
-;; multi-head-attention (the ~1.1M scalar aget/aset/forward that dominate the
-;; naive attention). pack-heads and unpack-heads are exact duals.
+;; Both are parametric (All [T]) and expressed as a resident strided copy:
+;; a `par/map-void!` over the n-heads*seq-len output BLOCKS (one work-item per
+;; [head, seq] block), each copying `head-dim` contiguous elements from the
+;; permuted source offset. Index math is clojure.core integer arithmetic
+;; (quot/rem/*/+ — the flat block coordinate → source/dest offsets), so it
+;; lowers in-kernel; the inner contiguous copy vectorizes on CPU and becomes a
+;; resident :map-void OpenCL kernel on GPU (same shape as par/gather /
+;; kv-append! / the decode kernels). No index table, no atomics — a pure
+;; permutation. pack-heads and unpack-heads are exact duals (the AD templates
+;; below reference each other by name, so the resident rewrite leaves them
+;; untouched).
 ;; ================================================================
 
 (deftm pack-heads
   "Reshape [seq-len, n-heads*head-dim] (row-major) → [n-heads, seq-len, head-dim]
-  so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d]."
+  so each head slab is contiguous: out[h*seq*hd + s*hd + d] = x[s*(nh*hd) + h*hd + d].
+  Resident strided copy: work-item e = h*seq-len + s copies a head-dim slab."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-       (let [d-model (* n-heads head-dim)
-             out (alloc-like x (* seq-len d-model))]
-         (dotimes [h n-heads]
-           (dotimes [s seq-len]
-             (let [src (+ (* s d-model) (* h head-dim))
-                   dst (+ (* h seq-len head-dim) (* s head-dim))]
-               (dotimes [d head-dim]
-                 (aset out (+ dst d) (aget x (+ src d)))))))
+       (let [out (alloc-like x (* seq-len n-heads head-dim))]
+         (par/map-void! e (clojure.core/* n-heads seq-len)
+                        (let [h (quot e seq-len)
+                              s (rem e seq-len)
+                              dst (clojure.core/* e head-dim)
+                              src (clojure.core/+ (clojure.core/* s (clojure.core/* n-heads head-dim))
+                                                  (clojure.core/* h head-dim))]
+                          (loop [d 0]
+                            (if (< d head-dim)
+                              (do (aset out (clojure.core/+ dst d) (aget x (clojure.core/+ src d)))
+                                  (recur (inc d)))
+                              nil))))
          out)))
 
 (deftm unpack-heads
   "Dual of pack-heads: [n-heads, seq-len, head-dim] → [seq-len, n-heads*head-dim]:
-  out[s*(nh*hd) + h*hd + d] = x[h*seq*hd + s*hd + d]."
+  out[s*(nh*hd) + h*hd + d] = x[h*seq*hd + s*hd + d].
+  Resident strided copy: work-item e = s*n-heads + h copies a head-dim slab."
   (All [T] [x :- (Array T) seq-len :- Long n-heads :- Long head-dim :- Long] :- (Array T)
-       (let [d-model (* n-heads head-dim)
-             out (alloc-like x (* seq-len d-model))]
-         (dotimes [h n-heads]
-           (dotimes [s seq-len]
-             (let [src (+ (* h seq-len head-dim) (* s head-dim))
-                   dst (+ (* s d-model) (* h head-dim))]
-               (dotimes [d head-dim]
-                 (aset out (+ dst d) (aget x (+ src d)))))))
+       (let [out (alloc-like x (* seq-len n-heads head-dim))]
+         (par/map-void! e (clojure.core/* seq-len n-heads)
+                        (let [s (quot e n-heads)
+                              h (rem e n-heads)
+                              dst (clojure.core/* e head-dim)
+                              src (clojure.core/* (clojure.core/+ (clojure.core/* h seq-len) s) head-dim)]
+                          (loop [d 0]
+                            (if (< d head-dim)
+                              (do (aset out (clojure.core/+ dst d) (aget x (clojure.core/+ src d)))
+                                  (recur (inc d)))
+                              nil))))
          out)))
 
 (deftm blit-slab!
@@ -254,30 +269,48 @@
 (deftm broadcast-kv-heads
   "Repeat each of n-kv contiguous [slab] KV-head blocks `group` times:
   out[(g*group+r)*slab + i] = src[g*slab + i], for g<n-kv, r<group, i<slab.
-  Output length = n-kv*group*slab. Used to align KV heads with query heads in GQA/MQA."
+  Output length = n-kv*group*slab. Used to align KV heads with query heads in GQA/MQA.
+  Resident broadcast: `par/map-void!` over the n-kv*group output blocks (work-item
+  e = g*group+r), each copying the slab of source kv-head g = e/group. In-kernel
+  integer index math (clojure.core) → resident :map-void kernel; a pure fan-out
+  copy (no atomics)."
   (All [T] [src :- (Array T) n-kv :- Long group :- Long slab :- Long] :- (Array T)
        (let [out (alloc-like src (* n-kv group slab))]
-         (dotimes [g n-kv]
-           (dotimes [r group]
-             (let [soff (* g (int slab))
-                   doff (* (+ (* g (int group)) r) (int slab))]
-               (dotimes [i slab]
-                 (aset out (+ doff i) (aget src (+ soff i)))))))
+         (par/map-void! e (clojure.core/* n-kv group)
+                        (let [g (quot e group)
+                              dst (clojure.core/* e slab)
+                              soff (clojure.core/* g slab)]
+                          (loop [i 0]
+                            (if (< i slab)
+                              (do (aset out (clojure.core/+ dst i) (aget src (clojure.core/+ soff i)))
+                                  (recur (inc i)))
+                              nil))))
          out)))
 
 (deftm sum-kv-heads
   "Dual of broadcast-kv-heads: sum each group of `group` query-head blocks back
   onto its kv head. out[g*slab + i] = Σ_{r<group} src[(g*group+r)*slab + i].
-  Output length = n-kv*slab. This is the GQA/MQA dK/dV fan-in accumulation."
+  Output length = n-kv*slab. This is the GQA/MQA dK/dV fan-in accumulation.
+  Resident fan-in as an OUTPUT-PARALLEL segment reduce: `par/map-void!` over the
+  n-kv*slab output elements (work-item o = g*slab+i), each summing its `group`
+  contributing source elements with an in-kernel loop. Because the reduction is
+  per output element (disjoint writes) it needs NO atomics — a resident :map-void
+  kernel. The accumulator is seeded with the r=0 element (a T-typed aget, not a
+  Double literal) so the sum stays polymorphic; n/+ adds T+T (devirtualizes on
+  both CPU and GPU)."
   (All [T] [src :- (Array T) n-kv :- Long group :- Long slab :- Long] :- (Array T)
        (let [out (alloc-like src (* n-kv slab))]
-         (dotimes [g n-kv]
-           (dotimes [r group]
-             (let [soff (* (+ (* g (int group)) r) (int slab))
-                   doff (* g (int slab))]
-               (dotimes [i slab]
-                 (aset out (+ doff i)
-                       (n/+ (aget out (+ doff i)) (aget src (+ soff i))))))))
+         (par/map-void! o (clojure.core/* n-kv slab)
+                        (let [g (quot o slab)
+                              i (rem o slab)
+                              gg (clojure.core/* g group)]
+                          (aset out o
+                                (loop [r 1
+                                       acc (aget src (clojure.core/+ (clojure.core/* gg slab) i))]
+                                  (if (< r group)
+                                    (recur (inc r)
+                                           (n/+ acc (aget src (clojure.core/+ (clojure.core/* (clojure.core/+ gg r) slab) i))))
+                                    acc)))))
          out)))
 
 ;; broadcast-kv-heads ↔ sum-kv-heads duals. Flat grads-fn (each other) + a
