@@ -334,6 +334,23 @@
 
 (declare walk-form)
 
+(defn- loop-result-terminal-sym
+  "The bare symbol a loop*/let* body evaluates to when it exits — walking through
+   if/when/do/let* to the terminal value, skipping `recur` branches. nil when the
+   terminal isn't a plain symbol. Used to type a reduction loop's RESULT from its
+   accumulator binder when the terminal reference itself carries no tag."
+  [form]
+  (cond
+    (symbol? form) form
+    (not (seq? form)) nil
+    (= 'recur (first form)) nil
+    (= 'if (first form))   (or (loop-result-terminal-sym (nth form 2 nil))
+                               (loop-result-terminal-sym (nth form 3 nil)))
+    (= 'when (first form)) (loop-result-terminal-sym (last form))
+    (= 'do (first form))   (loop-result-terminal-sym (last form))
+    (contains? #{'let 'let*} (first form)) (loop-result-terminal-sym (last form))
+    :else nil))
+
 (defn- resolve-aliased-symbol
   "Resolve a namespace-aliased symbol to its fully qualified name.
    e.g., n/neg-inf in raster.nn → raster.numeric/neg-inf.
@@ -395,7 +412,7 @@
                    form
                    (with-meta (cons (if-let [m (meta h)] (with-meta h' m) h')
                                     (rest form))
-                              (meta form))))
+                     (meta form))))
                form)
         result (walk-form form ctx)
         ;; Preserve metadata from original form
@@ -443,6 +460,22 @@
                                              (inf/type-env-tag type-env w))
                              :else       (inf/literal-tag w)))]
           (cond
+            ;; oftype coerces its value to the REF array's ELEMENT type (float at
+            ;; :float, double at :double). The impl's ret-tag is the generic T, so the
+            ;; plain .invk arm below can't supply it — stamp the ref's element type here
+            ;; so oftype-seeded scalars (a reduction's neg-inf/zero seed, an attention
+            ;; scale) are typed. Without it, a downstream `(- score mx)` / `(* exp inv)`
+            ;; can't devirtualize on the composed/inlined re-walk → a bare raster.numeric
+            ;; op that pass-late-cleanup rejects on GPU.
+            (and (= '.invk head)
+                 (= 'raster.numeric/oftype (:raster.op/original (meta result)))
+                 (symbol? (nth result 2 nil)))
+            (let [ref (nth result 2)
+                  tg  (get-in type-env [ref :tag])
+                  et  (or (get-in type-env [ref :element])          ; array ref → element
+                          (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int} tg)
+                          (when (contains? '#{double float long int} tg) tg))] ; scalar ref
+              (if et (vary-meta result assoc :raster.type/tag et) result))
             ;; .invk — read ret-tag from impl-sym metadata
             (and (= '.invk head) (symbol? (second result)))
             (if-let [ret-tag (:raster.type/ret-tag (meta (second result)))]
@@ -472,7 +505,22 @@
             (contains? '#{let* loop* do} head)
             (if-let [t (walked-tag (last result))]
               (vary-meta result assoc :raster.type/tag t)
-              result)
+              ;; Fallback for let*/loop*: when the terminal is a bound symbol whose
+              ;; own reference carries no tag (a reduction returning its accumulator
+              ;; as `(if test (recur …) acc)`), read the tag off the BINDER — it is
+              ;; stamped even though the terminal reference and the post-stamp ctx are
+              ;; not. Without this a composed/inlined reduction's result stays untyped,
+              ;; so its consumer `(- score mx)`/`(* exp inv)` can't devirtualize → a
+              ;; bare raster.numeric op that fails resident GPU lowering.
+              (if (contains? '#{let* loop*} head)
+                (let [binder-tag (some (fn [[s _]]
+                                         (when (= s (loop-result-terminal-sym (last result)))
+                                           (:raster.type/tag (meta s))))
+                                       (partition 2 (second result)))]
+                  (if binder-tag
+                    (vary-meta result assoc :raster.type/tag binder-tag)
+                    result))
+                result))
             ;; case — result type is the (agreeing) type of all clause results
             ;; (every 2nd clause element) plus the optional trailing default.
             (= 'case head)

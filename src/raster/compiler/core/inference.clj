@@ -1773,6 +1773,21 @@
                 (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
                       'bytes 'byte 'shorts 'short 'chars 'char 'booleans 'boolean}
                      arr-tag)))
+            ;; oftype coerces its value to the ELEMENT type of its ref array (first
+            ;; arg) — `(n/oftype Q x)` is a float at :float (Q a float[]), a double at
+            ;; :double. Without this, oftype-seeded scalars (a reduction's neg-inf/zero
+            ;; seed, an attention scale) stay untyped, so a downstream `(- score mx)` /
+            ;; `(* exp inv)` can't devirtualize on the composed/inlined re-walk → a bare
+            ;; raster.numeric op that pass-late-cleanup rejects on GPU. The impl's own
+            ;; return-tag is the generic T, so the `.invk` branch below can't supply it.
+            (= 'raster.numeric/oftype
+               (or (:raster.op/original (meta expr)) (form/effective-op expr)))
+            (let [args (if (= '.invk head) (nnext expr) (rest expr))
+                  arr-tag (infer-arg-tag (first args) env)]
+              (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
+                    'double 'double 'float 'float 'long 'long 'int 'int}
+                   arr-tag))
+
             (= '.invk head)
             (when-let [impl-sym (second expr)]
               (try (when-let [v (resolve impl-sym)]

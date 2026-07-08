@@ -224,7 +224,15 @@
   ([form] (alpha-convert {} form))
   ([env form]
    (cond
-     (symbol? form) (get env form form)
+     ;; Preserve the reference's metadata (esp. :raster.type/tag) onto the fresh
+     ;; name — else a re-walk after inlining can't re-devirtualize arithmetic whose
+     ;; operand type lived only on the renamed symbol (e.g. an inlined SDPA's
+     ;; `(- (* dot scale) mx)` loses mx's element type → bare raster.numeric/- that
+     ;; pass-late-cleanup rejects on GPU). Mirrors subst-sym-leaf.
+     (symbol? form) (let [r (get env form form)]
+                      (if (and (not (identical? r form)) (symbol? r) (meta form))
+                        (with-meta r (merge (meta r) (meta form)))
+                        r))
      (and (seq? form) (= 'quote (first form))) form
      (seq? form)
      (if-let [{:keys [scopes outer rebuild sequential? rec?]} (form/scope-info form)]
