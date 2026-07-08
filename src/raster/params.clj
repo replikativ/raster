@@ -399,22 +399,42 @@
   the leaf arrays in place (kept alive by the DCE alias-liveness fix). The same
   container is an SoA the GPU backend explodes into per-field array kernel args."
   [loss-flat-var loss-args weights-arg leaves optimizer]
-  (let [data-args (vec (remove #(= % weights-arg) loss-args))
-        fld   (fn [cont l] (list (symbol (str "." (:sym l))) cont))
+  ;; Fail loud if the weights arg is missing from the loss signature: the
+  ;; in-place splice below relies on locating its slot, and without it the
+  ;; value+grad args would silently rotate (the block-loss miscompile).
+  (when-not (some #(= % weights-arg) loss-args)
+    (throw (ex-info "compile-train-step: weights arg not found in loss args"
+                    {:weights-arg weights-arg :loss-args loss-args})))
+  (let [fld   (fn [cont l] (list (symbol (str "." (:sym l))) cont))
         ;; Unpack ALL leaves from w-cont (typed field access; canonical order =
         ;; loss-flat positional arg order). Bind each to its leaf sym.
         w-syms  (mapv :sym leaves)
         unpacks (vec (mapcat (fn [l] [(:sym l) (fld 'w-cont l)]) leaves))
+        ;; value+grad is POSITIONAL: its args must line up with the --flat var's
+        ;; parameter order. prepare-deftm-shape expands the weights tree arg
+        ;; IN PLACE (the leaves replace `weights-arg` at its original position;
+        ;; every other arg keeps its slot). So splice w-syms where weights-arg
+        ;; sits — do NOT append them first. Appending weights-first rotates the
+        ;; param↔arg zip in inline-value+grad-call whenever the weights arg is
+        ;; not the leading parameter (e.g. block-loss takes `x` before `layer`),
+        ;; mis-pairing every param up to that slot — a silent-miscompile that
+        ;; surfaced as an rms-norm gain (weight) being read from the WRONG norm.
+        vg-args (vec (mapcat (fn [a] (if (= a weights-arg) w-syms [a])) loss-args))
         vg-call `((raster.ad.reverse/value+grad
                    (var ~(symbol (str (.ns ^clojure.lang.Var loss-flat-var))
                                  (str (.sym ^clojure.lang.Var loss-flat-var)))))
-                  ~@w-syms ~@data-args)
+                  ~@vg-args)
+        ;; value+grad returns [loss g0 g1 ...] where gk is the gradient of the
+        ;; flat param at position k — so a leaf's gradient slot is (inc <its
+        ;; index in vg-args>), NOT (inc <its index among leaves>). These differ
+        ;; exactly when non-weight args precede the leaves (the block-loss case).
+        leaf->slot (into {} (map-indexed (fn [k s] [s (inc k)]) vg-args))
         ;; Per-Param leaf: grad d__i (tagged so f32/f64 dispatch is correct),
         ;; clip, optimizer step in place; m/v read from their containers by field.
         param-pairs (keep-indexed (fn [i l] (when (= :param (:kind l)) [i l])) leaves)
         d-sym  (fn [i l] (let [t (leaf->arr-tag l) s (symbol (str "d__" i))]
                            (if t (with-meta s {:tag t}) s)))
-        grad-binds (vec (mapcat (fn [[i l]] [(d-sym i l) `(clojure.core/nth ~'__vg-out ~(inc i))])
+        grad-binds (vec (mapcat (fn [[i l]] [(d-sym i l) `(clojure.core/nth ~'__vg-out ~(leaf->slot (:sym l)))])
                                 param-pairs))
         clip-effs  (map (fn [[i l]] `(raster.dl.optim/clip-grad-norm!
                                       ~(d-sym i l) (raster.arrays/alength ~(:sym l)) ~'max-grad-norm))
