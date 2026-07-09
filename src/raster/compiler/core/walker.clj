@@ -16,6 +16,7 @@
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.macroexpand :as mex]))
 
 (defn- warn-boxed-dispatch?
@@ -334,23 +335,6 @@
 
 (declare walk-form)
 
-(defn- loop-result-terminal-sym
-  "The bare symbol a loop*/let* body evaluates to when it exits — walking through
-   if/when/do/let* to the terminal value, skipping `recur` branches. nil when the
-   terminal isn't a plain symbol. Used to type a reduction loop's RESULT from its
-   accumulator binder when the terminal reference itself carries no tag."
-  [form]
-  (cond
-    (symbol? form) form
-    (not (seq? form)) nil
-    (= 'recur (first form)) nil
-    (= 'if (first form))   (or (loop-result-terminal-sym (nth form 2 nil))
-                               (loop-result-terminal-sym (nth form 3 nil)))
-    (= 'when (first form)) (loop-result-terminal-sym (last form))
-    (= 'do (first form))   (loop-result-terminal-sym (last form))
-    (contains? #{'let 'let*} (first form)) (loop-result-terminal-sym (last form))
-    :else nil))
-
 (defn- resolve-aliased-symbol
   "Resolve a namespace-aliased symbol to its fully qualified name.
    e.g., n/neg-inf in raster.nn → raster.numeric/neg-inf.
@@ -460,21 +444,25 @@
                                              (inf/type-env-tag type-env w))
                              :else       (inf/literal-tag w)))]
           (cond
-            ;; oftype coerces its value to the REF array's ELEMENT type (float at
-            ;; :float, double at :double). The impl's ret-tag is the generic T, so the
-            ;; plain .invk arm below can't supply it — stamp the ref's element type here
-            ;; so oftype-seeded scalars (a reduction's neg-inf/zero seed, an attention
-            ;; scale) are typed. Without it, a downstream `(- score mx)` / `(* exp inv)`
-            ;; can't devirtualize on the composed/inlined re-walk → a bare raster.numeric
-            ;; op that pass-late-cleanup rejects on GPU.
+            ;; :result-type facet — an op whose result tag derives from its ARG types
+            ;; via a registry rule (oftype → the REF's ELEMENT type: float at :float,
+            ;; double at :double). The impl's ret-tag is the generic T, so the plain
+            ;; .invk arm below can't supply it — stamp from the first arg's env type
+            ;; (incl. the :element key for parametric array refs) so oftype-seeded
+            ;; scalars (a reduction's neg-inf/zero seed, an attention scale) are typed.
+            ;; Without it, a downstream `(- score mx)` / `(* exp inv)` can't
+            ;; devirtualize on the composed/inlined re-walk → a bare raster.numeric
+            ;; op that pass-late-cleanup rejects on GPU. Register new ops in
+            ;; op-descriptor (:result-type), not here.
             (and (= '.invk head)
-                 (= 'raster.numeric/oftype (:raster.op/original (meta result)))
+                 (some? (descriptor/result-type-rule (:raster.op/original (meta result))))
                  (symbol? (nth result 2 nil)))
-            (let [ref (nth result 2)
-                  tg  (get-in type-env [ref :tag])
-                  et  (or (get-in type-env [ref :element])          ; array ref → element
-                          (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int} tg)
-                          (when (contains? '#{double float long int} tg) tg))] ; scalar ref
+            (let [op   (:raster.op/original (meta result))
+                  rule (descriptor/result-type-rule op)
+                  ref  (nth result 2)
+                  et   (or (when (= :element-of-first-arg rule)
+                             (get-in type-env [ref :element]))     ; parametric array ref → element
+                           (descriptor/result-tag op [(get-in type-env [ref :tag])]))]
               (if et (vary-meta result assoc :raster.type/tag et) result))
             ;; .invk — read ret-tag from impl-sym metadata
             (and (= '.invk head) (symbol? (second result)))
@@ -513,10 +501,13 @@
               ;; so its consumer `(- score mx)`/`(* exp inv)` can't devirtualize → a
               ;; bare raster.numeric op that fails resident GPU lowering.
               (let [binder-tag (when (contains? '#{let* loop*} head)
-                                 (some (fn [[s _]]
-                                         (when (= s (loop-result-terminal-sym (last result)))
-                                           (:raster.type/tag (meta s))))
-                                       (partition 2 (second result))))]
+                                 (let [t (form/terminal-value-expr (last result))
+                                       term-sym (when (symbol? t) t)]
+                                   (when term-sym
+                                     (some (fn [[s _]]
+                                             (when (= s term-sym)
+                                               (:raster.type/tag (meta s))))
+                                           (partition 2 (second result))))))]
                 (cond
                   binder-tag
                   (vary-meta result assoc :raster.type/tag binder-tag)

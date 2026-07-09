@@ -1748,16 +1748,22 @@
         (let [head (first expr)]
           (cond
             (contains? #{'double 'float 'long 'int 'byte 'short 'char 'boolean} head) head
-            ;; par/reduce returns the accumulator type, inferred from init
-            (contains? #{'raster.par/reduce 'par/reduce} head)
-            (let [[_ _acc init] expr]
-              (infer-arg-tag init env))
-            ;; par/scan returns the output array (first arg)
+            ;; par/reduce needs no arm here — the :result-type facet arm below
+            ;; types it ([:arg 1], the init accumulator; see op-descriptor).
+            ;; par/scan stays inline: it returns its OUT array (arg 0) looked up
+            ;; via env/:tag only — a bespoke rule that also SHADOWS the generic
+            ;; form-info :return-type-arg arm near the end of this cond (whose
+            ;; non-mutating default of arg 1 would be wrong for scan).
             (contains? #{'raster.par/scan 'par/scan} head)
             (let [out-sym (second expr)]
               (when (symbol? out-sym) (or (get env out-sym) (:tag (meta out-sym)))))
             ;; Allocations: handle both direct (double-array size)
-            ;; and devirtualized (.invk zeros-like_m_...-impl ref size) forms
+            ;; and devirtualized (.invk zeros-like_m_...-impl ref size) forms.
+            ;; Stays inline rather than a :result-type facet entry: the rule is a
+            ;; COMPOUND (fixed constructor tag from alloc-sym->array-tag — data
+            ;; that already lives in op-descriptor — else same-as-first-arg for
+            ;; dynamic allocators) resolved over mangled deftm names via
+            ;; alloc-op?/name-stripping, which exact-symbol facet lookup can't do.
             (let [op (form/effective-op expr)]
               (and (symbol? op) (descriptor/alloc-op? op)))
             (let [op (form/effective-op expr)
@@ -1767,26 +1773,32 @@
                   ;; return the same array type as their first argument
                   (when-let [ref-arg (first args)]
                     (infer-arg-tag ref-arg env))))
+            ;; aget stays inline rather than :element-of-first-arg: its element
+            ;; map covers short/char/boolean arrays, which have no dtype-info row
+            ;; (the facet derives from dtype-info), and its array tag is looked up
+            ;; via env/:tag only — routing through the facet would narrow it.
             (descriptor/aget-op? head)
             (when (symbol? (second expr))
               (let [arr-tag (or (get env (second expr)) (:tag (meta (second expr))))]
                 (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
                       'bytes 'byte 'shorts 'short 'chars 'char 'booleans 'boolean}
                      arr-tag)))
-            ;; oftype coerces its value to the ELEMENT type of its ref array (first
-            ;; arg) — `(n/oftype Q x)` is a float at :float (Q a float[]), a double at
-            ;; :double. Without this, oftype-seeded scalars (a reduction's neg-inf/zero
-            ;; seed, an attention scale) stay untyped, so a downstream `(- score mx)` /
-            ;; `(* exp inv)` can't devirtualize on the composed/inlined re-walk → a bare
-            ;; raster.numeric op that pass-late-cleanup rejects on GPU. The impl's own
-            ;; return-tag is the generic T, so the `.invk` branch below can't supply it.
-            (= 'raster.numeric/oftype
-               (or (:raster.op/original (meta expr)) (form/effective-op expr)))
-            (let [args (if (= '.invk head) (nnext expr) (rest expr))
-                  arr-tag (infer-arg-tag (first args) env)]
-              (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
-                    'double 'double 'float 'float 'long 'long 'int 'int}
-                   arr-tag))
+            ;; :result-type facet — ops whose result tag derives from their arg
+            ;; tags via a registry rule (op-descriptor): oftype → the ELEMENT
+            ;; type of its ref (first arg) — `(n/oftype Q x)` is a float at
+            ;; :float (Q a float[]), a double at :double; par/reduce → its init
+            ;; accumulator; grad-acc → its first typed arg. Without the oftype
+            ;; rule, oftype-seeded scalars (a reduction's neg-inf/zero seed, an
+            ;; attention scale) stay untyped, so a downstream `(- score mx)` /
+            ;; `(* exp inv)` can't devirtualize on the composed/inlined re-walk
+            ;; → a bare raster.numeric op that pass-late-cleanup rejects on GPU.
+            ;; The impl's own return-tag is the generic T, so the `.invk` branch
+            ;; below can't supply it. Register new ops in op-descriptor, not here.
+            (some? (descriptor/result-type-rule
+                    (or (:raster.op/original (meta expr)) (form/effective-op expr))))
+            (let [op (or (:raster.op/original (meta expr)) (form/effective-op expr))]
+              (descriptor/result-tag
+               op (map #(infer-arg-tag % env) (form/effective-args expr))))
 
             (= '.invk head)
             (when-let [impl-sym (second expr)]
@@ -1801,10 +1813,6 @@
                                                          (symbol base))]
                                  (:raster.core/return-tag (meta bv))))))))
                    (catch Exception _ nil)))
-            ;; grad-acc returns the type of its args (nil-safe +)
-            (= 'raster.ad.reverse/grad-acc head)
-            (let [arg-tags (keep #(infer-arg-tag % env) (rest expr))]
-              (first arg-tags))
             (and (symbol? head) (namespace head)
                  (.contains ^String (name head) "_m_"))
             (try (when-let [v (resolve head)]

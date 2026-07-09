@@ -9,7 +9,8 @@
 
   Compiler passes and op libraries should register and query metadata directly
   through this registry."
-  (:require [raster.compiler.support.mangled :as mangled]))
+  (:require [raster.compiler.support.mangled :as mangled]
+            [raster.compiler.core.dtype :as dtype]))
 
 (defonce ^:private descriptor-registry (atom {}))
 
@@ -769,6 +770,78 @@
             (contains? #{:int :long :byte} dtype) id
             float?    (list 'float (double id))
             :else     (double id)))))))
+
+;; --- Result-type inference (:result-type facet) ---
+
+(def ^:private array-tag->element-tag
+  "Primitive-array dispatch tag → element scalar tag ('floats → 'float), derived
+   from the dtype registry (dtype/dtype-info) — the single dtype source of truth,
+   NOT another hardcoded array-tag map. Dtypes without a JVM-primitive scalar
+   are absent (:half → 'shorts has :scalar-tag nil)."
+  (into {}
+        (keep (fn [[_dt {:keys [array-tag scalar-tag]}]]
+                (when (and array-tag scalar-tag)
+                  [array-tag scalar-tag])))
+        dtype/dtype-info))
+
+(def ^:private element-tags
+  "The scalar element tags (values of array-tag->element-tag) — accepted as
+   passthrough by :element-of-first-arg (the ref may itself be a scalar)."
+  (set (vals array-tag->element-tag)))
+
+(defn register-result-type!
+  "Register the :result-type facet for an op — the rule deriving the op's result
+   TYPE TAG from its argument tags. `rule` is one of
+     :element-of-first-arg — element tag of the first arg's array tag
+                             ('floats → 'float); an already-scalar first-arg
+                             tag passes through ('float → 'float)
+     :same-as-first-arg    — the first arg's tag, unchanged
+     :first-typed-arg      — the first non-nil arg tag (nil-safe accumulators)
+     [:arg n]              — the tag of the (0-based) nth arg
+   or a fixed result tag symbol (e.g. 'long)."
+  [op-sym rule]
+  (register-op-descriptor! op-sym {:result-type {:rule rule}}))
+
+(defn result-type-rule
+  "The registered :result-type rule for op-sym, or nil. Exact-symbol lookup:
+   callers query with the SEMANTIC op (:raster.op/original / form/effective-op),
+   never a mangled impl name."
+  [op-sym]
+  (get-in (get-op-descriptor op-sym) [:result-type :rule]))
+
+(defn result-tag
+  "Result type tag of `op-sym` applied to arguments whose inferred tags are
+   `arg-tags` (a seq of dispatch-tag symbols or nils; may be lazy — rules force
+   only the prefix they need), per the :result-type facet. nil when no rule is
+   registered or the rule yields no tag."
+  [op-sym arg-tags]
+  (when-let [rule (result-type-rule op-sym)]
+    (cond
+      (= :element-of-first-arg rule) (let [t (first arg-tags)]
+                                       (or (get array-tag->element-tag t)
+                                           (when (contains? element-tags t) t)))
+      (= :same-as-first-arg rule)    (first arg-tags)
+      (= :first-typed-arg rule)      (some identity arg-tags)
+      (and (vector? rule)
+           (= :arg (first rule)))    (nth arg-tags (second rule) nil)
+      ;; a fixed result tag symbol
+      (symbol? rule)                 rule)))
+
+;; oftype coerces its value to the ELEMENT type of its ref (first arg): a float
+;; at :float (ref a float[]), a double at :double. The registry rule lets the
+;; walker and late inference stamp oftype-seeded scalars (reduction seeds, an
+;; attention scale) without per-op arms in either.
+(register-result-type! 'raster.numeric/oftype :element-of-first-arg)
+
+;; grad-acc (reverse-AD nil-safe +) returns the type of its (first typed) arg.
+(register-result-type! 'raster.ad.reverse/grad-acc :first-typed-arg)
+
+;; par/reduce returns its accumulator type — arg 1, the init value (matches
+;; form-info's :return-type-arg for :par forms; registered for the defensive
+;; bare alias spelling too, which form-info's raster.par-namespace matcher
+;; doesn't classify).
+(register-result-type! 'raster.par/reduce [:arg 1])
+(register-result-type! 'par/reduce [:arg 1])
 
 ;; --- Devirtualization detection ---
 

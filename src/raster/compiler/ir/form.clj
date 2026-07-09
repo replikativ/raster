@@ -366,6 +366,31 @@
                              (tail-symbol (nth expr 2 nil)))
     :else nil))
 
+(defn terminal-value-expr
+  "The terminal VALUE expression a body evaluates to at exit — walks through
+   do/let*/loop* to the last body form and if to its non-recur branch
+   (then-branch first; nil when both branches recur). A `recur` yields nil
+   (a jump, not a value). Returns ANY expression (symbol, literal, call), not
+   just symbols — callers narrow as needed (the walker keeps only symbols to
+   match binders; the GPU emitter drops void terminals via its own void-form?
+   check, a codegen concept that does not belong here).
+
+   Input must be CLOSED-CORE IR (post macroexpand-core — invariant I4 in
+   ir/invariants): `when` and bare `let`/`loop` cannot survive the walker and
+   are deliberately NOT handled.
+
+   Distinct from tail-symbol above: tail-symbol answers ALIASING (which symbol
+   does this expression pass through, else-first, par/map! out-array aware);
+   this answers TYPING (which expression's type is the body's result)."
+  [expr]
+  (cond
+    (not (seq? expr)) expr
+    (= 'recur (first expr)) nil
+    (= 'if (first expr)) (or (terminal-value-expr (nth expr 2 nil))
+                             (terminal-value-expr (nth expr 3 nil)))
+    (contains? #{'do 'let* 'loop*} (first expr)) (terminal-value-expr (last expr))
+    :else expr))
+
 (defn effective-op
   "Extract the effective operator symbol from any call expression.
    For (.invk impl-sym args...) returns impl-sym (the devirtualized op).

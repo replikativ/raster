@@ -17,6 +17,7 @@
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.types :as types]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.core :as rcore]))
@@ -543,7 +544,7 @@
 
 (declare emit-expr emit-stmt emit-stmts-with-result
          emit-loop-body emit-loop-expr try-inline-deftm
-         resolve-gpu-inlinable-var loop-terminal-expr loop-value-ctype)
+         resolve-gpu-inlinable-var loop-value-ctype)
 
 (defn emit-stmt
   "Emit an S-expression as a C statement (with trailing semicolon)."
@@ -757,21 +758,15 @@
     :else
     (str result-var " = " (emit-expr expr idx-sym array-syms opencl-idx) ";")))
 
-(defn- loop-terminal-expr
-  "Find a loop body's terminal (non-recur) value expression — the value the loop
-  evaluates to when it exits. Walks if/when/do/let to the first value leaf; nil
-  if the body only recurs or ends in a void op."
-  [form]
-  (cond
-    (not (seq? form)) form
-    (= 'recur (first form)) nil
-    (= 'if (first form))   (or (loop-terminal-expr (nth form 2 nil))
-                               (loop-terminal-expr (nth form 3 nil)))
-    (= 'when (first form)) (loop-terminal-expr (last form))
-    (= 'do (first form))   (loop-terminal-expr (last form))
-    (contains? #{'let 'let*} (first form)) (loop-terminal-expr (last form))
-    (void-form? form) nil
-    :else form))
+(defn- loop-terminal
+  "Terminal (non-recur) value expression of a loop BODY (a seq of body forms) —
+  the value the loop evaluates to when it exits, via form/terminal-value-expr
+  over the implicit do. A VOID terminal (a body ending in a statement-only op
+  like aset) yields nil, so callers fall back to *scalar-type*; void-form? is a
+  GPU-emission concept, so that check lives here, not in ir/form."
+  [body]
+  (let [t (form/terminal-value-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
+    (when-not (void-form? t) t)))
 
 (defn- loop-value-ctype
   "C type of a form used as a BOUND VALUE. For a loop form, the type is that of its
@@ -792,7 +787,7 @@
   [form]
   (if (and (seq? form) (contains? #{'loop 'loop*} (first form)))
     (let [[_ _binds & body] form
-          terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))
+          terminal (loop-terminal body)
           ct (if terminal (infer-c-type terminal) *scalar-type*)
           stamped (:raster.type/tag (meta form))]
       (when (and stamped terminal
@@ -1143,7 +1138,7 @@
            int-loop-vars (set (keep (fn [[sym typ]]
                                       (when (contains? #{"int" "uint" "long"} typ) sym))
                                     (map vector var-names var-types)))
-           terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
+           terminal (loop-terminal body)]
        (binding [*int-vars* (into *int-vars* int-loop-vars)]
          (if (supports-stmt-expr?)
            ;; Reduction result: a dedicated var typed from the loop's terminal
