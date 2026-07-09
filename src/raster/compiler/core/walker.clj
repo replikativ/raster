@@ -512,15 +512,24 @@
               ;; not. Without this a composed/inlined reduction's result stays untyped,
               ;; so its consumer `(- score mx)`/`(* exp inv)` can't devirtualize → a
               ;; bare raster.numeric op that fails resident GPU lowering.
-              (if (contains? '#{let* loop*} head)
-                (let [binder-tag (some (fn [[s _]]
+              (let [binder-tag (when (contains? '#{let* loop*} head)
+                                 (some (fn [[s _]]
                                          (when (= s (loop-result-terminal-sym (last result)))
                                            (:raster.type/tag (meta s))))
-                                       (partition 2 (second result)))]
-                  (if binder-tag
-                    (vary-meta result assoc :raster.type/tag binder-tag)
-                    result))
-                result))
+                                       (partition 2 (second result))))]
+                (cond
+                  binder-tag
+                  (vary-meta result assoc :raster.type/tag binder-tag)
+                  ;; UNDERIVABLE: strip any pre-existing tag rather than keep it.
+                  ;; On the specialization rewalk the form may carry the GENERIC
+                  ;; phase's tag (a loop tagged double whose accumulator narrowed
+                  ;; to float) — a stale tag the walker cannot re-derive would be
+                  ;; trusted by metadata-first emitters and miscompile. No tag is
+                  ;; recoverable downstream (inference/loud default); a wrong tag
+                  ;; is silent corruption.
+                  (:raster.type/tag (meta result))
+                  (vary-meta result dissoc :raster.type/tag)
+                  :else result)))
             ;; case — result type is the (agreeing) type of all clause results
             ;; (every 2nd clause element) plus the optional trailing default.
             (= 'case head)

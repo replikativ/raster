@@ -782,12 +782,28 @@
   then mixes with a float (e.g. a float running max) in `fmax` → an AMBIGUOUS OpenCL
   overload. Deriving from the terminal keeps the binding's declared type equal to the
   stmt-expr result the loop actually emits (see the loop-in-expr result-var typing).
-  Non-loop forms: plain infer-c-type."
+  Non-loop forms: plain infer-c-type.
+
+  DELETION CANDIDATE: the walker now STRIPS let*/loop* tags it cannot re-derive
+  (instead of keeping stale generic-phase tags), so infer-c-type's metadata-first
+  path should agree with the terminal-derived type. The warn below gathers the
+  evidence; once it stays quiet across the suite this fn collapses to infer-c-type
+  (emitters read stamps, never re-infer)."
   [form]
   (if (and (seq? form) (contains? #{'loop 'loop*} (first form)))
     (let [[_ _binds & body] form
-          terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
-      (if terminal (infer-c-type terminal) *scalar-type*))
+          terminal (loop-terminal-expr (if (= 1 (count body)) (first body) (cons 'do body)))
+          ct (if terminal (infer-c-type terminal) *scalar-type*)
+          stamped (:raster.type/tag (meta form))]
+      (when (and stamped terminal
+                 (not= ct (infer-c-type form)))
+        (binding [*out* *err*]
+          (println "WARN loop-value-ctype: stamped tag" stamped
+                   "disagrees with terminal-derived C type" ct
+                   "— KNOWN gap: dtype/remap-env remaps env tags but not FORM tags,"
+                   "so un-rewalked loop forms keep generic-phase tags (A11 unification"
+                   "closes this; until then this fn guards the emission)")))
+      ct)
     (infer-c-type form)))
 
 (defn- emit-loop-body
