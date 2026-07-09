@@ -202,18 +202,21 @@
   true)
 
 (def ^:dynamic *validate-deep?*
-  "Deep SEMANTIC invariants (qualify-upfront, type-tag presence, op
-  classification) at pass boundaries. Cross-cutting properties a dialect grammar
-  cannot express. Currently WARN-only; default off (enable in CI / tests).
-  Independent of how a pass is implemented — runs at the same boundary seam
-  whether the pass is direct-walking or a pattern `defpass`."
+  "Deep SEMANTIC invariants (qualify-upfront, dtype closure, binder tag
+  consistency) at pass boundaries. Cross-cutting properties a dialect grammar
+  cannot express. I-T3 (dtype closure under :float) THROWS; I3 and I-T2-lite
+  are WARN-only until their corpora are clean. Default off (enable in CI /
+  tests). Independent of how a pass is implemented — runs at the same boundary
+  seam whether the pass is direct-walking or a pattern `defpass`."
   false)
 
 (defn- validate-dialect!
   "Validate form against dialect at a pass boundary. Throws on a structural
-  violation (dialect shape or always-on structural invariant); warns on a deep
-  semantic invariant when *validate-deep?* is set. `opts` carries :active-params
-  (the deftm params), needed to exclude them from the qualify-upfront check."
+  violation (dialect shape or always-on structural invariant); when
+  *validate-deep?* is set, also runs the semantic invariants (I-T3 dtype
+  closure throws; I3/I-T2 warn). `opts` carries :active-params (the deftm
+  params, excluded from the qualify-upfront check), :dtype (gates I-T3), and
+  :param-env (double-tagged params seed I-T3's exempt set)."
   [dialect-key form pass-key opts]
   (when *validate-dialects?*
     (when-let [[valid? validate-fn] (get dialects/dialect-checkers dialect-key)]
@@ -228,7 +231,10 @@
                                                    form))})))))
     (invariants/check-structural! dialect-key form pass-key))
   (when *validate-deep?*
-    (invariants/check-deep! dialect-key form pass-key (:active-params opts))))
+    (invariants/check-deep! dialect-key form pass-key
+                            {:params (:active-params opts)
+                             :dtype (:dtype opts)
+                             :param-env (:param-env opts)})))
 
 ;; ================================================================
 ;; Pass functions — each takes (form, opts) → form or {:form :stats}
