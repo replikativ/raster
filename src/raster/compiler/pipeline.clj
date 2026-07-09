@@ -103,8 +103,18 @@
 (defn walk-body-with-tc
   "Walk a deftm body with TC type inference. Used at compilation time
   (compile-aot, lazy JIT) when concrete types are known.
-  Uses build-param-type-env — single source of truth for type-env."
-  [body params tags annotations source-ns]
+  Uses build-param-type-env — single source of truth for type-env.
+
+  `element-dtype` (:float/:double, or nil) is the dtype this body is
+  monomorphized to — threaded to the walker so CONTEXTUAL literal typing
+  narrows untyped floating literals (e.g. a `0.0` loop-accumulator init in a
+  float body → float, not double). ALL monomorphized walk seams must thread
+  it: the definition-time specialization walk (core.clj parametric-specialize!)
+  and the post-AD pe-rewalk (rewalk.clj) already do; omitting it HERE walked
+  float bodies with double accumulator/loop tags that downstream passes then
+  stamped onto loop* forms — silent double/float divergence inside one compile
+  (the GPU emitters' `WARN loop-value-ctype` firings)."
+  [body params tags annotations source-ns element-dtype]
   (let [type-env (inf/build-param-type-env params tags annotations)
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
@@ -115,7 +125,8 @@
                                 (println (str "WARNING: TC analysis failed at compile time: " (.getMessage e))))
                               nil)))
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
-                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                    (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
 (defn get-walked-body [f-var & [dtype]]
@@ -133,7 +144,13 @@
                                 (when tags (mapv (fn [t] (if (= t 'Object) nil t)) tags)))
                 src-ns-sym (:raster.core/deftm-source-ns m)
                 src-ns (when src-ns-sym (try (the-ns src-ns-sym) (catch Exception _ *ns*)))
-                walked (try (walk-body-with-tc (vec raw-body) params tags annotations src-ns)
+                ;; Element dtype of the body actually walked: the requested
+                ;; dtype, else the RESOLVED var's own FP tags (a float
+                ;; specialization resolved without an explicit :dtype is still
+                ;; a float body). Same effective-dtype rule the pass pipeline
+                ;; (pe-rewalk) applies to its re-walks of this body.
+                element-dtype (or dtype (infer-dtype resolved))
+                walked (try (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)
                             (catch Throwable t
                               (binding [*out* *err*]
                                 (println "WARNING: walker re-walk failed for" f-var
@@ -1211,36 +1228,36 @@
                     (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
       (doseq [[sym expr0] bindings]
         (let [expr (if (seq @aliases) (util/subst-syms @aliases expr0) expr0)]
-        (cond
+          (cond
           ;; pure array-alias binding (`sym = other-array-symbol`) → copy-propagate.
-          (and (symbol? expr)
-               (or (contains? @device-buffers expr) (array-tag? sym)))
-          (do (vswap! aliases assoc sym expr)
-              (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
-          (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
-          (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
-              (vswap! device-buffers conj sym))
+            (and (symbol? expr)
+                 (or (contains? @device-buffers expr) (array-tag? sym)))
+            (do (vswap! aliases assoc sym expr)
+                (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
+            (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+            (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
+                (vswap! device-buffers conj sym))
           ;; devirtualized array alloc (alloc-like/zeros-like .invk) — a GEMM/kernel output buffer.
-          (alloc-invk? expr)
-          (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
-              (vswap! device-buffers conj sym))
-          (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
-          (if-let [s (parse-gpu-step sym expr)]
-            (do (vswap! steps conj s) (vswap! device-buffers conj sym))
-            (reject! :unparseable-kernel-invoke sym expr))
+            (alloc-invk? expr)
+            (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
+                (vswap! device-buffers conj sym))
+            (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+            (if-let [s (parse-gpu-step sym expr)]
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
-          (gemm-invk? expr)
-          (if-let [s (parse-gpu-step sym expr)]
-            (do (vswap! steps conj s) (vswap! device-buffers conj sym))
-            (reject! :unparseable-gemm sym expr))
+            (gemm-invk? expr)
+            (if-let [s (parse-gpu-step sym expr)]
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
           ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
           ;; caller falls back to the staging fn (rather than eval'ing an array .invk as a scalar
           ;; size closure). E.g. an AD-emitted daxpy-diff-into! or a raw loss reduction that did
           ;; not lower to a par kernel in this composed path.
-          (array-tag? sym)
-          (reject! :unlowered-array-op sym expr)
+            (array-tag? sym)
+            (reject! :unlowered-array-op sym expr)
           ;; A SCALAR binding whose init READS an intermediate device buffer is a
           ;; reduction (device array → scalar), NOT a host size-let — e.g. the
           ;; primal `(.invk mse-loss-impl pred tgt n)` reducing the pred buffer to
@@ -1252,13 +1269,13 @@
           ;; until then, reject so the caller falls back cleanly (non-resident)
           ;; rather than throwing. Reading an array PARAM (host-available, e.g.
           ;; alength) is fine — only intermediate buffers are tracked.
-          (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
-          (reject! :scalar-let-reads-device-buffer sym expr)
+            (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
+            (reject! :scalar-let-reads-device-buffer sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
-          (not (contains-gpu-invoke? expr))
-          (vswap! scalar-lets into [sym expr])
+            (not (contains-gpu-invoke? expr))
+            (vswap! scalar-lets into [sym expr])
           ;; control flow / kernel-result-into-scalar → not straight-line.
-          :else (reject! :control-flow-or-host-scalar sym expr))))
+            :else (reject! :control-flow-or-host-scalar sym expr))))
       (let [body (if (seq @aliases) (util/subst-syms @aliases body) body)]
         (cond
           (not @ok)      {::non-resident @reason}

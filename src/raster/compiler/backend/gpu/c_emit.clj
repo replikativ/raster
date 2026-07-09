@@ -544,7 +544,7 @@
 
 (declare emit-expr emit-stmt emit-stmts-with-result
          emit-loop-body emit-loop-expr try-inline-deftm
-         resolve-gpu-inlinable-var loop-value-ctype)
+         resolve-gpu-inlinable-var)
 
 (defn emit-stmt
   "Emit an S-expression as a C statement (with trailing semicolon)."
@@ -649,7 +649,7 @@
                            prev-count (get seen-names base-name 0)
                            c-name (if (> prev-count 0) (str base-name "_" prev-count) base-name)
                            c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                           c-type (loop-value-ctype val-subst)]
+                           c-type (infer-c-type val-subst)]
                        {:env (assoc env sym (symbol c-name))
                         :locals (conj locals [c-name c-expr c-type])
                         :loop-stmts loop-stmts
@@ -768,39 +768,6 @@
   (let [t (form/terminal-value-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
     (when-not (void-form? t) t)))
 
-(defn- loop-value-ctype
-  "C type of a form used as a BOUND VALUE. For a loop form, the type is that of its
-  terminal (accumulator) expression — the value the loop evaluates to — NOT the loop
-  form's :raster.type/tag. An over-approximating inference pass can stamp a float
-  reduction's loop double (its float array reads make the body float, but the tag says
-  double), which would declare `double x = ({ ... float acc ... })`; that double result
-  then mixes with a float (e.g. a float running max) in `fmax` → an AMBIGUOUS OpenCL
-  overload. Deriving from the terminal keeps the binding's declared type equal to the
-  stmt-expr result the loop actually emits (see the loop-in-expr result-var typing).
-  Non-loop forms: plain infer-c-type.
-
-  DELETION CANDIDATE: the walker now STRIPS let*/loop* tags it cannot re-derive
-  (instead of keeping stale generic-phase tags), so infer-c-type's metadata-first
-  path should agree with the terminal-derived type. The warn below gathers the
-  evidence; once it stays quiet across the suite this fn collapses to infer-c-type
-  (emitters read stamps, never re-infer)."
-  [form]
-  (if (and (seq? form) (contains? #{'loop 'loop*} (first form)))
-    (let [[_ _binds & body] form
-          terminal (loop-terminal body)
-          ct (if terminal (infer-c-type terminal) *scalar-type*)
-          stamped (:raster.type/tag (meta form))]
-      (when (and stamped terminal
-                 (not= ct (infer-c-type form)))
-        (binding [*out* *err*]
-          (println "WARN loop-value-ctype: stamped tag" stamped
-                   "disagrees with terminal-derived C type" ct
-                   "— KNOWN gap: dtype/remap-env remaps env tags but not FORM tags,"
-                   "so un-rewalked loop forms keep generic-phase tags (A11 unification"
-                   "closes this; until then this fn guards the emission)")))
-      ct)
-    (infer-c-type form)))
-
 (defn- emit-loop-body
   "Emit the body of a loop as C while-body statements. var-types parallels var-names — the
   DECLARED C type of each loop variable, used to type recur temps (a recur value feeds back
@@ -872,7 +839,7 @@
                (let [base (c-symbol sym)
                      prev (get seen base 0)
                      c-name (if (> prev 0) (str base "_" prev) base)
-                     c-type (loop-value-ctype val)]
+                     c-type (infer-c-type val)]
                  {:decl-strs (conj decl-strs
                                    (str (remap-type c-type) " " c-name " = "
                                         (emit-expr val idx-sym array-syms opencl-idx) ";"))
@@ -1003,7 +970,7 @@
                                    (str base-name "_" prev-count)
                                    base-name)
                           c-expr (emit-expr val-subst idx-sym array-syms opencl-idx)
-                          c-type (remap-type (loop-value-ctype val-subst))]
+                          c-type (remap-type (infer-c-type val-subst))]
                       {:env (assoc env sym (symbol c-name))
                        :locals (conj locals [c-name c-expr c-type])
                        :seen-names (assoc seen-names base-name (inc prev-count))

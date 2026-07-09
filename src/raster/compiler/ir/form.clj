@@ -13,6 +13,25 @@
    All passes will automatically handle it correctly."
   (:require [raster.compiler.ir.par :as par]))
 
+;; ── Canonical head spellings ────────────────────────────────────────────────
+;; The SINGLE definition of which head symbols spell a let/loop form. IR
+;; stages differ in spelling — OPEN source IR (pre mex/macroexpand-core, what
+;; the walker consumes) uses `let`/`loop` (or backtick-qualified
+;; `clojure.core/let`/`clojure.core/loop`); CLOSED core IR only `let*`/`loop*`.
+;; Anything that classifies forms by head (form-info, tail-symbol,
+;; terminal-value-expr, the walker's result stamping) derives from these sets;
+;; no other file may define its own spelling set.
+
+(def let-heads
+  "Every spelling of a let binding form: open-IR `let`/`clojure.core/let`,
+   closed-IR `let*`."
+  #{'let 'clojure.core/let 'let*})
+
+(def loop-heads
+  "Every spelling of a loop form: open-IR `loop`/`clojure.core/loop`,
+   closed-IR `loop*`."
+  #{'loop 'clojure.core/loop 'loop*})
+
 (defn form-info
   "Classify a compiler IR form and return its properties.
 
@@ -40,11 +59,11 @@
     (let [head (first form)]
       (cond
         ;; Binding forms — liftable, no scope
-        (contains? #{'let 'let*} head)
+        (contains? let-heads head)
         {:kind :binding :introduces-scope? false :liftable? true :head head}
 
         ;; Scope-introducing iteration — NOT liftable
-        (contains? #{'dotimes 'loop 'loop*} head)
+        (or (= 'dotimes head) (contains? loop-heads head))
         {:kind :scope :introduces-scope? true :liftable? false :head head}
 
         ;; Conditionals — NOT liftable (arms may not execute)
@@ -328,13 +347,19 @@
   (= :binding (:kind (form-info form))))
 
 (defn let-head?
-  "True for the let-family heads (let, let*). Emitters and passes must use this
-   instead of local #{'let 'let*} sets — one place to extend, no drift."
-  [h] (contains? #{'let 'let*} h))
+  "True for the let-family heads across ALL IR stages. Emitters and passes must
+   use this instead of local #{'let 'let*} sets — one place to extend, no drift.
+   OPEN source IR (pre mex/macroexpand-core — what the walker itself sees)
+   spells it `let` or, in macroexpanded/backtick input, `clojure.core/let`;
+   CLOSED core IR only `let*`. Closed-IR callers (backends, passes) never see
+   the source spellings, so accepting them here is free — and walker-side
+   callers MUST accept them or source-spelled forms silently miss stamping."
+  [h] (contains? let-heads h))
 
 (defn loop-head?
-  "True for the loop-family heads (loop, loop*)."
-  [h] (contains? #{'loop 'loop*} h))
+  "True for the loop-family heads across ALL IR stages (`loop`,
+   `clojure.core/loop`, `loop*`) — same open/closed IR rationale as let-head?."
+  [h] (contains? loop-heads h))
 
 (defn scope-form?
   "True if the form introduces a new scope (dotimes, loop, fn, par)."
@@ -355,8 +380,8 @@
   (cond
     (symbol? expr) expr
     (not (seq? expr)) nil
-    (contains? #{'let* 'let} (first expr)) (tail-symbol (last expr))
-    (contains? #{'loop* 'loop} (first expr)) (tail-symbol (nth expr 2 nil)) ; loop body
+    (contains? let-heads (first expr)) (tail-symbol (last expr))
+    (contains? loop-heads (first expr)) (tail-symbol (nth expr 2 nil)) ; loop body
     ;; raster.par/map! writes AND returns its out array (arg 1) → that IS its tail value,
     ;; so a binding r = (par/map! out ..) aliases out (buffer-loop classification +
     ;; copy-prop + result-buffer resolution), same as the expanded (let* ..out) form.
@@ -375,9 +400,13 @@
    match binders; the GPU emitter drops void terminals via its own void-form?
    check, a codegen concept that does not belong here).
 
-   Input must be CLOSED-CORE IR (post macroexpand-core — invariant I4 in
-   ir/invariants): `when` and bare `let`/`loop` cannot survive the walker and
-   are deliberately NOT handled.
+   Handles ALL let/loop head spellings (let-heads/loop-heads): the WALKER's
+   result-stamping calls this mid-walk, BEFORE mex/macroexpand-core
+   normalizes — a source-spelled `(if test (let [..] (recur ..)) acc)` loop
+   body must still descend to `acc` or the loop form goes unstamped (and a
+   monomorphized binding then falls back to dtype-blind TC). Closed-IR callers
+   never see the source spellings. `when` still cannot survive the walker and
+   is deliberately NOT handled.
 
    Distinct from tail-symbol above: tail-symbol answers ALIASING (which symbol
    does this expression pass through, else-first, par/map! out-array aware);
@@ -388,7 +417,10 @@
     (= 'recur (first expr)) nil
     (= 'if (first expr)) (or (terminal-value-expr (nth expr 2 nil))
                              (terminal-value-expr (nth expr 3 nil)))
-    (contains? #{'do 'let* 'loop*} (first expr)) (terminal-value-expr (last expr))
+    (or (= 'do (first expr))
+        (contains? let-heads (first expr))
+        (contains? loop-heads (first expr)))
+    (terminal-value-expr (last expr))
     :else expr))
 
 (defn effective-op

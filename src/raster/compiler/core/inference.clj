@@ -453,6 +453,30 @@
   (when (and element-dtype (instance? Double form))
     (dtype/scalar-tag-for-dtype element-dtype)))
 
+(defn walked-init-monomorphized-tag
+  "The walked init's own re-derived :raster.type/tag IFF it equals the ambient
+   monomorphization `element-dtype`'s scalar tag and TC's dtype-blind tag would
+   widen it (nil, or 'double/'Double under :float). The transitive case of the
+   floating-literal-narrowed-tag policy above: TC types a loop-valued binding
+   like `dot = (loop [acc 0.0] …)` as Double (correct for the SOURCE), but the
+   walker has already narrowed the accumulator inside the walked init to the
+   element dtype and stamped the form bottom-up — the stamp is the truth of the
+   TRANSFORMED code. Without this override the binding enters the type-env as
+   double, every consumer (`(/ dot …)`, `(n/oftype dot …)`, `(- score mx)`)
+   devirtualizes to the DOUBLE overloads inside a float body, and the recur-LUB
+   fixpoint then widens the consuming float accumulator back to double — a
+   float kernel silently computing (and GPU-emitting) double.
+   Returns nil when no element-dtype is in scope, the init carries no stamp,
+   the stamp is not the element scalar tag, or TC asserts a non-FP type."
+  [rewritten-init tc-tag element-dtype]
+  (when element-dtype
+    (let [it (when (instance? clojure.lang.IObj rewritten-init)
+               (:raster.type/tag (meta rewritten-init)))]
+      (when (and it
+                 (= it (dtype/scalar-tag-for-dtype element-dtype))
+                 (or (nil? tc-tag) (contains? #{'double 'Double} tc-tag)))
+        it))))
+
 (defn hint-tag [form]
   (when-let [m (meta form)]
     (or (:raster.type/tag m)

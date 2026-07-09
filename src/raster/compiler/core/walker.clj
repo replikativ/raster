@@ -151,9 +151,11 @@
   Returns a keyword identifying which defmethod should handle it."
   [form ctx]
   (cond
-    ;; Binding forms — backtick `let expands to clojure.core/let,
-    ;; which appears in macroexpanded input before the walker normalizes to let*
-    (and (seq? form) (#{`let 'let 'let* 'loop 'loop*} (first form)))
+    ;; Binding forms — ALL let/loop spellings (form/let-heads + loop-heads):
+    ;; backtick `let expands to clojure.core/let, which appears in
+    ;; macroexpanded input before the walker normalizes to let*.
+    (and (seq? form) (or (form/let-head? (first form))
+                         (form/loop-head? (first form))))
     :let
 
     (and (seq? form) (#{`fn 'fn 'fn*} (first form)))
@@ -489,8 +491,16 @@
                          (and et (recur? then))     et
                          :else nil)]              ; one-arm/ambiguous → leave untyped
               (if rtag (vary-meta result assoc :raster.type/tag rtag) result))
-            ;; let*/loop*/do — result type is the last body form's type.
-            (contains? '#{let* loop* do} head)
+            ;; let/loop (all spellings, form/let-heads+loop-heads) and do —
+            ;; result type is the last body form's type. Must accept the OPEN-IR
+            ;; spellings, not just the normalized ones: the walker runs BEFORE
+            ;; mex/macroexpand-core normalizes let→let*/loop→loop* (walk-body),
+            ;; so a SOURCE-spelled `loop` reaches here with head 'loop — skipping
+            ;; it leaves the form permanently unstamped (macroexpand-core
+            ;; preserves meta but derives none), and a downstream monomorphized
+            ;; consumer falls back to dtype-blind TC (a float reduction typed
+            ;; double).
+            (or (= 'do head) (form/let-head? head) (form/loop-head? head))
             (if-let [t (walked-tag (last result))]
               (vary-meta result assoc :raster.type/tag t)
               ;; Fallback for let*/loop*: when the terminal is a bound symbol whose
@@ -500,7 +510,7 @@
               ;; not. Without this a composed/inlined reduction's result stays untyped,
               ;; so its consumer `(- score mx)`/`(* exp inv)` can't devirtualize → a
               ;; bare raster.numeric op that fails resident GPU lowering.
-              (let [binder-tag (when (contains? '#{let* loop*} head)
+              (let [binder-tag (when (or (form/let-head? head) (form/loop-head? head))
                                  (let [t (form/terminal-value-expr (last result))
                                        term-sym (when (symbol? t) t)]
                                    (when term-sym
@@ -683,8 +693,14 @@
                  tc-tag (get (:tc-binding-tags ctx) sym)
                  ;; A bare floating-literal init narrows to the element dtype and
                  ;; OVERRIDES TC's `double` (monomorphization policy above TC), so a
-                 ;; `0.0` accumulator in a T=float body stays devirtualized.
+                 ;; `0.0` accumulator in a T=float body stays devirtualized. The
+                 ;; walked-init stamp is the TRANSITIVE case of the same policy: a
+                 ;; loop/if-valued init whose accumulator the walk just narrowed
+                 ;; carries the element scalar tag bottom-up — it beats TC's
+                 ;; dtype-blind Double for the same reason the literal does.
                  tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
+                         (inf/walked-init-monomorphized-tag rewritten-init tc-tag
+                                                            (:element-dtype ctx))
                          tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)
@@ -699,7 +715,7 @@
          [[] ctx]
          (partition 2 bindings))]
     (let [walked-body (walk-forms body new-ctx)]
-      (if-not (contains? '#{loop loop*} let-sym)
+      (if-not (form/loop-head? let-sym)
         (list* let-sym (vec new-bindings) walked-body)
         ;; recur-LUB fixpoint: if a recur passes a wider numeric type than a
         ;; binding's stamp, REWALK the body with the widened types — the walk

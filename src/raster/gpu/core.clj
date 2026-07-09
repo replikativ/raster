@@ -28,6 +28,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
 
 ;; ================================================================
@@ -94,11 +95,18 @@
   (rcore/resolve-deftm-var v {:ambiguity :first}))
 
 (defn get-walked-body
-  "Get the walker-processed body from a deftm var.
+  "Get the walker-processed body from a deftm var, walked FOR the kernel's
+   dtype. Delegates to the pipeline's dtype-directed walk (the single
+   monomorphized-walk seam): the definition-time walked body is a JVM walk —
+   dtype-blind, so a concrete-float kernel's `0.0` accumulators carry double
+   stamps that disagree with the float code the GPU backend emits. Falls back
+   to the stored definition-time body when the source body is unavailable.
    Throws if the var has no walked body."
-  [v]
+  [v dtype]
   (let [resolved (or (resolve-deftm-var v) v)]
-    (or (:raster.core/deftm-walked-body (meta resolved))
+    (or (try (pl/get-walked-body v dtype)
+             (catch Exception _ nil))
+        (:raster.core/deftm-walked-body (meta resolved))
         (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body" {:var v})))))
 
@@ -110,7 +118,7 @@
   "Compile a deftm var's par forms to GPU kernels and register them.
    Returns vector of kernel-info maps."
   [v device-id {:keys [dtype min-elements] :or {dtype :float min-elements 0}}]
-  (let [walked-body (get-walked-body v)
+  (let [walked-body (get-walked-body v dtype)
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
