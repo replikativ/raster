@@ -229,9 +229,13 @@
      ;; operand type lived only on the renamed symbol (e.g. an inlined SDPA's
      ;; `(- (* dot scale) mx)` loses mx's element type → bare raster.numeric/- that
      ;; pass-late-cleanup rejects on GPU). Mirrors subst-sym-leaf.
+     ;; MERGE ORDER: the fresh name's own meta wins — it comes from the (possibly
+     ;; re-stamped) binder, which is more current than the reference. A reference
+     ;; carrying a stale generic-phase tag must not overwrite a binder tag that a
+     ;; monomorphizing rewalk just narrowed (double → float).
      (symbol? form) (let [r (get env form form)]
                       (if (and (not (identical? r form)) (symbol? r) (meta form))
-                        (with-meta r (merge (meta r) (meta form)))
+                        (with-meta r (merge (meta form) (meta r)))
                         r))
      (and (seq? form) (= 'quote (first form))) form
      (seq? form)
