@@ -268,7 +268,19 @@
           (when (or (contains? @array-like-registry elem)
                     (contains? @array-like-registry simple))
             (or simple elem)))
-        'objects)
+        ;; Boxed-primitive element spelling — almost always a typo for the
+        ;; primitive: (Array Float) would silently become Object[] and compile
+        ;; a boxed, undevirtualizable pipeline (GPU: late-cleanup throw) where
+        ;; (Array float) compiles primitive float[]. Warn loudly.
+        (do (when-let [prim (get '{Double double, Float float, Long long,
+                                   Integer int, Byte byte, Short short,
+                                   Character char, Boolean boolean}
+                                 (second annotation))]
+              (binding [*out* *err*]
+                (println "WARNING: (Array" (str (second annotation) ")")
+                         "is a BOXED element type -> Object[] (boxed, undevirtualizable)."
+                         "Did you mean (Array" (str prim ")?") (str "param: " param))))
+            'objects))
 
     ;; (Fn [...]) -> fn interface name
     (and (sequential? annotation) (= 'Fn (first annotation)))

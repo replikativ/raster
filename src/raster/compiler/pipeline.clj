@@ -20,6 +20,7 @@
   compiled function with lazy buffer allocation."
   (:require [clojure.string]
             [clojure.pprint :as pp]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.scalar.cse :as cse]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -88,17 +89,11 @@
                                    :ambiguity-hint "Specify :dtype to disambiguate."})))
 
 (defn- infer-dtype
-  "Infer dtype from a resolved deftm var's parameter tags.
-   Checks array tags first (floats/doubles), then scalar tags (float/double).
-   Returns :float, :double, or nil (integer-only functions)."
+  "Infer dtype from a resolved deftm var's parameter tags — delegates to the
+   shared effective-dtype rule (dtype/infer-dtype-from-tags) so all
+   monomorphized walk seams agree."
   [resolved-var]
-  (when-let [tags (:raster.core/deftm-tags (meta resolved-var))]
-    (cond
-      (some #{'floats} tags) :float
-      (some #{'doubles} tags) :double
-      (some #{'float} tags) :float
-      (some #{'double} tags) :double
-      :else nil)))
+  (dtype/infer-dtype-from-tags (:raster.core/deftm-tags (meta resolved-var))))
 
 (defn walk-body-with-tc
   "Walk a deftm body with TC type inference. Used at compilation time

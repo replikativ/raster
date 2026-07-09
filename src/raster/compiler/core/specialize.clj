@@ -6,6 +6,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.walker :as walker]))
 
 (def ^:dynamic *specializing*
@@ -139,11 +140,19 @@
                       tags (mapv #(or (:tag (meta %)) 'Object) (remove #{'&} source-params))
                       annotations (mapv (fn [t] (if (= t 'Object) nil t)) tags)]
                   (inf/safe-tc-binding-tags '<specialize> params annotations source-body source-ns))
-            ;; Walk the body with unified type-env + TC binding tags
+            ;; Walk the body with unified type-env + TC binding tags.
+            ;; element-dtype: the concrete specialization tags are known here —
+            ;; same effective-dtype rule as all other monomorphized walk seams,
+            ;; so bare 0.0 accumulator inits narrow to the element dtype.
+                element-dtype (dtype/infer-dtype-from-tags
+                               (mapv #(or (:tag (meta %)) 'Object)
+                                     (remove #{'&} source-params)))
                 walked-body (binding [*ns* source-ns]
                               (mapv #(walk-body % (cond-> {:type-env type-env :source-ns source-ns}
                                                     (seq tc-binding-tags)
-                                                    (assoc :tc-binding-tags tc-binding-tags)))
+                                                    (assoc :tc-binding-tags tc-binding-tags)
+                                                    (#{:float :double} element-dtype)
+                                                    (assoc :element-dtype element-dtype)))
                                     source-body))
             ;; Apply fn-bindings: replace calls to bound params with specialized targets
                 walked-body (if (seq fn-bindings)
