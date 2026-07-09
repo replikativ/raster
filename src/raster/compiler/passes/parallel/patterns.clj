@@ -4,8 +4,8 @@
             [raster.compiler.ir.form :as form]))
 
 (def ^:private loop-heads
-  "All forms that represent loops."
-  #{'loop* 'loop 'clojure.core/loop})
+  "All forms that represent loops — the canonical spelling set (ir/form)."
+  form/loop-heads)
 
 (def ^:private aget-syms
   "All symbols that represent aget."

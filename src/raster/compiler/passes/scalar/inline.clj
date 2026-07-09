@@ -195,14 +195,24 @@
                                 (symbol (.getName ^Class cls))
                                 t)
                               t)))
-                        tags))]
-            (if source-ns
+                        tags))
+            ;; Alpha-rename the callee body's INTERNAL binders (let/loop/par
+            ;; induction vars, accumulators) to fresh names on EVERY resolve, so a
+            ;; splice into a caller cannot capture — or be captured by — a same-named
+            ;; caller variable. Without this, e.g. rms-norm!'s `(par/map-void! r ...)`
+            ;; row-index collides with a caller param `r` (LoRA rank) → the lowered
+            ;; loop binder becomes the captured `r` → malformed `(dotimes [(long r) …])`
+            ;; → the index never advances → infinite hang. util/alpha-convert renames
+            ;; only bound vars (params stay free for subst); fresh-like preserves the
+            ;; name prefix + tags, so name-based heuristics and dtype tags survive.
+            hygienic-wb (mapv util/alpha-convert effective-wb)]
+        (if source-ns
               {:params params
                :tags (or qualified-tags tags)
                :return-tag return-tag
                :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set)
-                                  effective-wb)}
-              {:params params :tags tags :return-tag return-tag :walked-body effective-wb})))))))
+                                  hygienic-wb)}
+              {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
 
 (defn- try-resolve-deftm
   "Try to resolve a symbol to a deftm var with an inlinable walked body.
@@ -1155,7 +1165,12 @@
      (and (seq? form) (= '.invk (first form)) (>= (count form) 3))
      (let [impl-sym (second form)
            rkey (recursion-key impl-sym)
-           has-rule? (and preserve-templates? (first (rt/resolve-template impl-sym)))
+           ;; Keep an op symbolic for reverse-AD only if it has a REVERSE rule
+           ;; (:grads/:grads-fn/:pullback-factory). A jvp-only op (forward-mode
+           ;; template, e.g. gqa-causal-mha) has no reverse rule and MUST inline so
+           ;; its composed body differentiates to flat IR — otherwise it falls back
+           ;; to the opaque get-pullback-factory closure (not GPU-lowerable).
+           has-rule? (and preserve-templates? (rt/has-reverse-rule? impl-sym))
            ;; recursive callee (already being inlined) → keep as a call, don't recurse
            deftm-info (when (and (not has-rule?) (not (contains? *inlining* rkey)))
                         (try-resolve-deftm impl-sym))]

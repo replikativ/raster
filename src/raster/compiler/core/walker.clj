@@ -16,6 +16,7 @@
             [clojure.string :as str]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.macroexpand :as mex]))
 
 (defn- warn-boxed-dispatch?
@@ -150,9 +151,11 @@
   Returns a keyword identifying which defmethod should handle it."
   [form ctx]
   (cond
-    ;; Binding forms — backtick `let expands to clojure.core/let,
-    ;; which appears in macroexpanded input before the walker normalizes to let*
-    (and (seq? form) (#{`let 'let 'let* 'loop 'loop*} (first form)))
+    ;; Binding forms — ALL let/loop spellings (form/let-heads + loop-heads):
+    ;; backtick `let expands to clojure.core/let, which appears in
+    ;; macroexpanded input before the walker normalizes to let*.
+    (and (seq? form) (or (form/let-head? (first form))
+                         (form/loop-head? (first form))))
     :let
 
     (and (seq? form) (#{`fn 'fn 'fn*} (first form)))
@@ -395,7 +398,7 @@
                    form
                    (with-meta (cons (if-let [m (meta h)] (with-meta h' m) h')
                                     (rest form))
-                              (meta form))))
+                     (meta form))))
                form)
         result (walk-form form ctx)
         ;; Preserve metadata from original form
@@ -443,6 +446,26 @@
                                              (inf/type-env-tag type-env w))
                              :else       (inf/literal-tag w)))]
           (cond
+            ;; :result-type facet — an op whose result tag derives from its ARG types
+            ;; via a registry rule (oftype → the REF's ELEMENT type: float at :float,
+            ;; double at :double). The impl's ret-tag is the generic T, so the plain
+            ;; .invk arm below can't supply it — stamp from the first arg's env type
+            ;; (incl. the :element key for parametric array refs) so oftype-seeded
+            ;; scalars (a reduction's neg-inf/zero seed, an attention scale) are typed.
+            ;; Without it, a downstream `(- score mx)` / `(* exp inv)` can't
+            ;; devirtualize on the composed/inlined re-walk → a bare raster.numeric
+            ;; op that pass-late-cleanup rejects on GPU. Register new ops in
+            ;; op-descriptor (:result-type), not here.
+            (and (= '.invk head)
+                 (some? (descriptor/result-type-rule (:raster.op/original (meta result))))
+                 (symbol? (nth result 2 nil)))
+            (let [op   (:raster.op/original (meta result))
+                  rule (descriptor/result-type-rule op)
+                  ref  (nth result 2)
+                  et   (or (when (= :element-of-first-arg rule)
+                             (get-in type-env [ref :element]))     ; parametric array ref → element
+                           (descriptor/result-tag op [(get-in type-env [ref :tag])]))]
+              (if et (vary-meta result assoc :raster.type/tag et) result))
             ;; .invk — read ret-tag from impl-sym metadata
             (and (= '.invk head) (symbol? (second result)))
             (if-let [ret-tag (:raster.type/ret-tag (meta (second result)))]
@@ -468,11 +491,46 @@
                          (and et (recur? then))     et
                          :else nil)]              ; one-arm/ambiguous → leave untyped
               (if rtag (vary-meta result assoc :raster.type/tag rtag) result))
-            ;; let*/loop*/do — result type is the last body form's type.
-            (contains? '#{let* loop* do} head)
+            ;; let/loop (all spellings, form/let-heads+loop-heads) and do —
+            ;; result type is the last body form's type. Must accept the OPEN-IR
+            ;; spellings, not just the normalized ones: the walker runs BEFORE
+            ;; mex/macroexpand-core normalizes let→let*/loop→loop* (walk-body),
+            ;; so a SOURCE-spelled `loop` reaches here with head 'loop — skipping
+            ;; it leaves the form permanently unstamped (macroexpand-core
+            ;; preserves meta but derives none), and a downstream monomorphized
+            ;; consumer falls back to dtype-blind TC (a float reduction typed
+            ;; double).
+            (or (= 'do head) (form/let-head? head) (form/loop-head? head))
             (if-let [t (walked-tag (last result))]
               (vary-meta result assoc :raster.type/tag t)
-              result)
+              ;; Fallback for let*/loop*: when the terminal is a bound symbol whose
+              ;; own reference carries no tag (a reduction returning its accumulator
+              ;; as `(if test (recur …) acc)`), read the tag off the BINDER — it is
+              ;; stamped even though the terminal reference and the post-stamp ctx are
+              ;; not. Without this a composed/inlined reduction's result stays untyped,
+              ;; so its consumer `(- score mx)`/`(* exp inv)` can't devirtualize → a
+              ;; bare raster.numeric op that fails resident GPU lowering.
+              (let [binder-tag (when (or (form/let-head? head) (form/loop-head? head))
+                                 (let [t (form/terminal-value-expr (last result))
+                                       term-sym (when (symbol? t) t)]
+                                   (when term-sym
+                                     (some (fn [[s _]]
+                                             (when (= s term-sym)
+                                               (:raster.type/tag (meta s))))
+                                           (partition 2 (second result))))))]
+                (cond
+                  binder-tag
+                  (vary-meta result assoc :raster.type/tag binder-tag)
+                  ;; UNDERIVABLE: strip any pre-existing tag rather than keep it.
+                  ;; On the specialization rewalk the form may carry the GENERIC
+                  ;; phase's tag (a loop tagged double whose accumulator narrowed
+                  ;; to float) — a stale tag the walker cannot re-derive would be
+                  ;; trusted by metadata-first emitters and miscompile. No tag is
+                  ;; recoverable downstream (inference/loud default); a wrong tag
+                  ;; is silent corruption.
+                  (:raster.type/tag (meta result))
+                  (vary-meta result dissoc :raster.type/tag)
+                  :else result)))
             ;; case — result type is the (agreeing) type of all clause results
             ;; (every 2nd clause element) plus the optional trailing default.
             (= 'case head)
@@ -635,8 +693,14 @@
                  tc-tag (get (:tc-binding-tags ctx) sym)
                  ;; A bare floating-literal init narrows to the element dtype and
                  ;; OVERRIDES TC's `double` (monomorphization policy above TC), so a
-                 ;; `0.0` accumulator in a T=float body stays devirtualized.
+                 ;; `0.0` accumulator in a T=float body stays devirtualized. The
+                 ;; walked-init stamp is the TRANSITIVE case of the same policy: a
+                 ;; loop/if-valued init whose accumulator the walk just narrowed
+                 ;; carries the element scalar tag bottom-up — it beats TC's
+                 ;; dtype-blind Double for the same reason the literal does.
                  tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
+                         (inf/walked-init-monomorphized-tag rewritten-init tc-tag
+                                                            (:element-dtype ctx))
                          tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)
@@ -651,7 +715,7 @@
          [[] ctx]
          (partition 2 bindings))]
     (let [walked-body (walk-forms body new-ctx)]
-      (if-not (contains? '#{loop loop*} let-sym)
+      (if-not (form/loop-head? let-sym)
         (list* let-sym (vec new-bindings) walked-body)
         ;; recur-LUB fixpoint: if a recur passes a wider numeric type than a
         ;; binding's stamp, REWALK the body with the widened types — the walk

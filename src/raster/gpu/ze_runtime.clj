@@ -2026,6 +2026,59 @@
   [prepared]
   (launch-bound! (:bound prepared) (long (:group-count prepared))))
 
+(defn ensure-zero-fill-kernel!
+  "Register (idempotently) a zero-fill kernel `out[i]=0` for the given dtype and
+   return its name. Used by the resident scatter step to re-zero the accumulator
+   buffer each replay (scatter-add's output has zeros-like semantics; the atomic
+   `+=` kernel must start from a cleared buffer). C-sig: (out, int n) — matches the
+   (array, _n_bound) layout bind-registered-map-void-kernel expects, so the zero-fill
+   binds through that same path. Idempotency is keyed on the actual kernel-registry
+   (not a side atom) so it survives ns reload."
+  [dtype]
+  (let [dtype (if (= dtype :double) :double :float)
+        ctype (if (= dtype :double) "double" "float")
+        kname (str "zero_fill_" (name dtype))]
+    (when-not (get @kernel-registry kname)
+      (register-kernel! kname
+                        {:source (str "__kernel void " kname
+                                      "(__global " ctype "* out, int n) {\n"
+                                      "  for (int i = get_global_id(0); i < n; i += get_global_size(0))\n"
+                                      "    out[i] = 0;\n}\n")
+                         :array-params ['out]
+                         :scalar-params []
+                         :written-arrays ['out]
+                         :dtype dtype}))
+    kname))
+
+(defn bind-registered-scatter-kernel!
+  "Pre-bind a registered scatter-add kernel over RESIDENT buffers for the replayable
+   program graph. arrays = [out src index] (DeviceBuffer/MemorySegment); the index
+   buffer is int32. Kernel C-sig: (out, src, index, int n [, int stride]) — n precedes
+   stride (NOT the arrays,scalars,n order of a map-void). One work-item per source pair,
+   grid = ceil(n/wg); the atomic `+=` fans overlapping indices in safely. `out` must be
+   pre-zeroed (the resident binder prepends a zero-fill). Returns {:bound :group-count}."
+  ([^String kernel-name arrays n] (bind-registered-scatter-kernel! kernel-name arrays n nil))
+  ([^String kernel-name arrays n stride]
+   (let [{:keys [module workgroup-size]
+          :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
+         kernel-handle (create-kernel-fresh module kernel-name)
+         wg (long workgroup-size)
+         n (long n)
+         seg-of (fn [arr]
+                  (cond
+                    (device-buffer? arr) (:segment ^DeviceBuffer arr)
+                    (instance? MemorySegment arr) arr
+                    :else (throw (ex-info "bind-registered-scatter-kernel! requires resident buffers (DeviceBuffer/MemorySegment)"
+                                          {:arr-type (type arr)}))))
+         dev-segs (mapv seg-of arrays)
+         all-args (vec (concat dev-segs
+                               [{:type :int :value (int n)}]
+                               (when stride [{:type :int :value (int stride)}])))
+         group-count (long (Math/ceil (/ (double n) wg)))]
+     {:bound (bind-kernel! kernel-handle wg all-args (:cmd-list @state))
+      :group-count group-count
+      :kernel-name kernel-name})))
+
 (defn record-graph!
   "Record a FIXED ordered sequence of pre-bound kernels into a regular (replayable) command
   list — a 'command graph'. The per-launch host-append cost (FFI + driver, ~75µs each) is paid
@@ -2599,8 +2652,23 @@
                           s (MemorySegment/ofArray arr)]
                       (MemorySegment/copy s 0 seg 0 byte-count)
                       seg)))
-        out-elems (if (device-buffer? output) n
-                      (if stride (* n (long stride)) (alength output)))
+        ;; Output size is the DESTINATION buffer length (n-dst*stride), NOT the
+        ;; source pair count. For a JVM array the array length is authoritative;
+        ;; the old (* n stride) sized it as n-pairs*stride and overran the output
+        ;; whenever n-pairs > n-dst (the overlapping-index case). For a device
+        ;; buffer copy-to ignores byte-count (it returns the segment directly),
+        ;; so out-elems is unused there.
+        out-elems (if (device-buffer? output) n (alength output))
+        ;; GPU index buffer is int32. scatter-add/gather use (Array long) indices
+        ;; on the CPU; narrow a long-array to int here so the byte copy is coherent
+        ;; (copying n*4 bytes of an 8-byte-per-element long[] reinterprets pairs of
+        ;; longs as ints and silently corrupts the indices).
+        index (if (and (not (device-buffer? index))
+                       (instance? (Class/forName "[J") index))
+                (let [li ^longs index m (alength li) ia (int-array m)]
+                  (dotimes [k m] (aset ia k (int (aget li k))))
+                  ia)
+                index)
         out-seg (copy-to output :scatter-out (* out-elems dtype-size))
         src-seg (copy-to src :scatter-src (* n (if stride (* (long stride) dtype-size) dtype-size)))
         idx-seg (copy-to index :scatter-idx (* n 4))

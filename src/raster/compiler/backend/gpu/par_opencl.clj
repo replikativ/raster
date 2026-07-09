@@ -70,7 +70,6 @@
         {:keys [out idx cast body]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         array-syms (ce/collect-arrays-in-body body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
         arr-params (vec (sort-by name array-syms))
@@ -92,7 +91,7 @@
                            ce/*scalar-type* ctype]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast (str "(" (name cast) ")(" body-str ")") body-str)
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -128,7 +127,6 @@
         body (ce/normalize-array-prims (:body info))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         default-ctype (get codegen/opencl-type-map dtype "float")
-        use-fp64? (= dtype :double)
         ;; Auto-collect array types from walker :tag metadata, merge with explicit
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
@@ -220,10 +218,9 @@
         ;; Enable fp64 whenever double appears in the emitted kernel or its helpers — a float
         ;; kernel can still carry double from (double ...) casts or raster.numeric helpers, and
         ;; using double WITHOUT the extension is undefined (garbage) on the GPU.
-        needs-fp64? (or use-fp64?
-                        (str/includes? body-str "double")
+        needs-fp64? (or (str/includes? body-str "double")
                         (str/includes? helper-sources "double"))
-        source (str (when needs-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype (when needs-fp64? :double))
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
@@ -271,7 +268,6 @@
                      (or dtype :int))
         ctype (get {:int "int" :long "long" :float "float" :double "double"}
                    scan-dtype "int")
-        use-fp64? (= scan-dtype :double)
         ;; Extract combining op and element expression (same pattern as reduce)
         [let-bindings inner-body]
         (if (and (seq? body) (contains? #{'let* 'let} (first body)))
@@ -333,7 +329,7 @@
         half-block (/ block-size 2)
         ;; Generate source with two kernels
         source (str
-                (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                (codegen/extension-pragmas scan-dtype)
                 "\n"
                  ;; Kernel 1: Block-level exclusive scan (Blelloch)
                 "__kernel void " block-kn "(\n"
@@ -436,7 +432,6 @@
         {:keys [init idx bound body]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         ;; Detect reduction op: the body is (op acc element-expr)
         ;; We need to extract the element expression and the combining op
         [let-bindings inner-body]
@@ -496,7 +491,7 @@
                                                    [(or adapted-element 'input)])]
                                (ce/emit-expr let-body idx array-sym-names "i"))
                              element-str))
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
@@ -700,7 +695,6 @@
         {:keys [out radius boundary cast idx body]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         ;; Collect arrays from body (includes in-arrays references)
         array-syms (ce/collect-arrays-in-body body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
@@ -724,7 +718,7 @@
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast (str "(" (name cast) ")(" body-str ")") body-str)
         out-c (ce/c-symbol out)
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -766,14 +760,13 @@
         {:keys [out src index stride]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "float")
-        use-fp64? (= dtype :double)
         strided? (some? stride)
         out-c (ce/c-symbol out)
         src-c (ce/c-symbol src)
         index-c (ce/c-symbol index)
         ;; Scatter needs float atomic CAS for float types, native atomic for int
         needs-float-atomic? (contains? #{:float :double} dtype)
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     (when needs-float-atomic? atomic-add-float-helper)
                     "__kernel void " kernel-name
@@ -808,6 +801,50 @@
      :strided? strided?
      :dtype dtype}))
 
+(defn generate-par-gather-kernel
+  "Generate an OpenCL C kernel from a raster.par/gather form.
+  Gather: out[e*stride+d] = src[index[e]*stride+d] — one work-item per gathered pair
+  e (inner loop over stride). A gather writes every output element exactly once (no
+  atomics, no accumulation), so it uses the map-void calling convention
+  (out, src, index, [stride,] int _n_bound) and binds through
+  bind-registered-map-void-kernel — `out` is just another resident buffer.
+
+  Returns {:kernel-name str :source str :array-params [out src index]
+           :scalar-params [...] :written-arrays [out] :dtype kw :strided? bool}."
+  [form & {:keys [dtype kernel-name-prefix]
+           :or {dtype :float kernel-name-prefix "par_gather"}}]
+  (let [info (par/extract-par-gather-info form)
+        {:keys [out src index stride]} info
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        ctype (get codegen/opencl-type-map dtype "float")
+        strided? (some? stride)
+        out-c (ce/c-symbol out)
+        src-c (ce/c-symbol src)
+        index-c (ce/c-symbol index)
+        source (str (codegen/extension-pragmas dtype)
+                    "__kernel void " kernel-name
+                    "(__global " ctype "* " out-c
+                    ", __global const " ctype "* restrict " src-c
+                    ", __global const int* restrict " index-c
+                    (if strided? ", int stride, int _n_bound" ", int _n_bound")
+                    ") {\n"
+                    "    for (int e = get_global_id(0); e < _n_bound; e += get_global_size(0)) {\n"
+                    "        int src_idx = " index-c "[e];\n"
+                    (if strided?
+                      (str "        for (int d = 0; d < stride; d++) {\n"
+                           "            " out-c "[e * stride + d] = " src-c "[src_idx * stride + d];\n"
+                           "        }\n")
+                      (str "        " out-c "[e] = " src-c "[src_idx];\n"))
+                    "    }\n"
+                    "}\n")]
+    {:kernel-name kernel-name
+     :source source
+     :array-params [out src index]
+     :scalar-params (if strided? [{:name 'stride :type :int}] [])
+     :written-arrays [out]
+     :strided? strided?
+     :dtype dtype}))
+
 ;; ================================================================
 ;; Reduce-by-key kernel generator
 ;; ================================================================
@@ -824,13 +861,12 @@
         {:keys [out keys vals]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "float")
-        use-fp64? (= dtype :double)
         out-c (ce/c-symbol out)
         keys-c (ce/c-symbol keys)
         vals-c (ce/c-symbol vals)
         needs-float-atomic? (contains? #{:float :double} dtype)
         ;; Only + is supported for atomic reduce-by-key (most common case)
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     (when needs-float-atomic? atomic-add-float-helper)
                     "__kernel void " kernel-name
@@ -895,7 +931,6 @@
   (let [{:keys [inputs outputs scratch phases scalars]} metadata
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         ;; All arrays involved in phases
         all-arrays (concat inputs outputs scratch)
         ;; Parameter lists
@@ -952,7 +987,7 @@
                                                                (set (map symbol (map name all-arrays)))
                                                                ctype)
                                     non-reduce-phases))
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        source (str (codegen/extension-pragmas dtype)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    int i = get_local_id(0);\n"
@@ -983,8 +1018,7 @@
   [metadata & {:keys [dtype kernel-name-prefix]
                :or {dtype :double kernel-name-prefix "compound_global"}}]
   (let [{:keys [phases]} metadata
-        ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)]
+        ctype (get codegen/opencl-type-map dtype "double")]
     (vec
      (keep-indexed
       (fn [idx phase]
@@ -1025,7 +1059,7 @@
                   (str "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
                        "        " (ce/c-symbol out) "[idx] = " body-str ";\n"
                        "    }\n"))
-                source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                source (str (codegen/extension-pragmas dtype)
                             "__kernel void " kernel-name
                             "(" all-params ") {\n"
                             kernel-body

@@ -46,9 +46,23 @@
 ;; OpenCL pragmas
 ;; ================================================================
 
-(def ^:private fp64-pragma
-  "Enable double precision (required for OpenCL)."
-  "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+(defn extension-pragmas
+  "OpenCL extension-enable pragmas required by the given dtypes.
+
+  Derived from the dtype-info `:needs-pragma` facet (:double → cl_khr_fp64,
+  :half → cl_khr_fp16 — new dtypes get their pragma for free). Emits one
+  guarded `#pragma OPENCL EXTENSION <ext> : enable` block per distinct
+  required extension; nil dtypes are ignored. Returns \"\" when none needed."
+  [& dtypes]
+  (->> dtypes
+       (keep dtype/needs-pragma-for)
+       distinct
+       (map (fn [ext]
+              (let [e (name ext)]
+                (str "#if defined(" e ")\n"
+                     "#pragma OPENCL EXTENSION " e " : enable\n"
+                     "#endif\n"))))
+       (apply str)))
 
 (def ^:private subgroup-pragma
   "Enable Intel subgroup extensions for shuffle ops."
@@ -69,7 +83,6 @@
   Returns an OpenCL C source string."
   [kernel-name dtype body-expr & {:keys [n-arrays] :or {n-arrays 1}}]
   (let [ctype (get opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         var-names ["x" "y" "z" "w"]
         array-params (str/join ", "
                                (map (fn [i] (str "__global const " ctype "* restrict arr" i))
@@ -79,7 +92,7 @@
                                (str "        " ctype " " (get var-names i (str "v" i))
                                     " = arr" i "[idx];"))
                              (range n-arrays)))]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          "__kernel void " kernel-name "("
          array-params ", __global " ctype "* restrict out, int n) {\n"
          "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
@@ -98,13 +111,12 @@
   Returns OpenCL C source string."
   [kernel-name dtype ops]
   (let [ctype (get opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         body-lines (mapv (fn [{:keys [op result-sym arg-syms]}]
                            (str "        " ctype " "
                                 (emit-expr result-sym)
                                 " = " (emit-expr (cons op arg-syms)) ";"))
                          ops)]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          "__kernel void " kernel-name
          "(__global const double* restrict in, __global double* restrict out, int n) {\n"
          "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
@@ -128,7 +140,6 @@
   Returns OpenCL C source string."
   [kernel-name dtype op identity-val & {:keys [workgroup-size] :or {workgroup-size 256}}]
   (let [ctype (get opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         reduce-op (condp = op
                     '+ "+"
                     '* "*"
@@ -136,7 +147,7 @@
                     'Math/min "fmin"
                     "+")
         combine (ce/combine-fn reduce-op (ce/fn-style-reduction-op? op))]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          subgroup-pragma
          "__kernel void " kernel-name
          "(__global const " ctype "* restrict input, "
@@ -180,7 +191,6 @@
   Returns OpenCL C source string."
   [kernel-name dtype body-expr array-params scalar-params]
   (let [ctype (get opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         arr-params-str (str/join ", "
                                  (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s)))
                                       array-params))
@@ -193,7 +203,7 @@
                                       (str "__global " ctype "* restrict out")
                                       scalar-params-str
                                       "int n"]))]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          "__kernel void " kernel-name "("
          all-params ") {\n"
          "    for (int idx = get_global_id(0); idx < n; idx += get_global_size(0)) {\n"
@@ -243,7 +253,7 @@
   (let [ctype (get opencl-type-map dtype "double")
         use-fp64? (= dtype :double)
         neg-inf (if use-fp64? "-1.0e308" "-1.0e38f")]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          subgroup-pragma
          "\n"
          "// Row-wise softmax: one workgroup per row\n"
@@ -313,9 +323,8 @@
     :eps           — epsilon for stability (default 1e-5)"
   [kernel-name dtype & {:keys [workgroup-size eps] :or {workgroup-size 256 eps 1e-5}}]
   (let [ctype (get opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         eps-str (str eps)]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          "\n"
          "// GroupNorm: normalize within groups of channels\n"
          "// Layout: x[batch, channels], gamma[channels], beta[channels]\n"
@@ -387,9 +396,8 @@
   dtype: :double or :float (default :float)
   Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
-        use-fp64? (= dtype :double)]
-    (str (when use-fp64? fp64-pragma)
+  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))]
+    (str (extension-pragmas dtype)
          "__kernel void " kernel-name
          "(__global const " ctype "* restrict in,"
          " __global " ctype "* restrict out,"
@@ -415,9 +423,8 @@
   dtype: :double or :float (default :float)
   Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (get opencl-type-map dtype "float")
-        use-fp64? (= dtype :double)]
-    (str (when use-fp64? fp64-pragma)
+  (let [ctype (get opencl-type-map dtype "float")]
+    (str (extension-pragmas dtype)
          "__kernel void " kernel-name
          "(__global " ctype "* restrict y,"
          " __global const " ctype "* restrict x,"
@@ -462,7 +469,7 @@
         use-fp64? (= dtype :double)]
     (case variant
       :atomic
-      (str (when use-fp64? fp64-pragma)
+      (str (extension-pragmas dtype)
            "#pragma OPENCL EXTENSION cl_khr_global_int64_base_atomics : enable\n"
            "\n"
            "// Scatter-reduce (atomic): out[dst[e]] += w[e] * data[src[e]*stride+d]\n"
@@ -501,7 +508,7 @@
 
       :sorted
       ;; Sorted-segment: edges grouped by dst, each workgroup processes one dst node
-      (str (when use-fp64? fp64-pragma)
+      (str (extension-pragmas dtype)
            "\n"
            "// Scatter-reduce (sorted): edges sorted by dst, one workgroup per dst segment\n"
            "__kernel void " kernel-name "(\n"
@@ -537,7 +544,7 @@
   [kernel-name dtype]
   (let [ctype (get opencl-type-map dtype "double")
         use-fp64? (= dtype :double)]
-    (str (when use-fp64? fp64-pragma)
+    (str (extension-pragmas dtype)
          (when use-fp64?
            "#pragma OPENCL EXTENSION cl_khr_global_int64_base_atomics : enable\n")
          "\n"

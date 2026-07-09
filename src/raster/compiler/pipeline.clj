@@ -20,6 +20,7 @@
   compiled function with lazy buffer allocation."
   (:require [clojure.string]
             [clojure.pprint :as pp]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.passes.scalar.dce :as dce]
             [raster.compiler.passes.scalar.cse :as cse]
             [raster.compiler.passes.scalar.inline :as inline]
@@ -37,6 +38,7 @@
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
@@ -87,23 +89,27 @@
                                    :ambiguity-hint "Specify :dtype to disambiguate."})))
 
 (defn- infer-dtype
-  "Infer dtype from a resolved deftm var's parameter tags.
-   Checks array tags first (floats/doubles), then scalar tags (float/double).
-   Returns :float, :double, or nil (integer-only functions)."
+  "Infer dtype from a resolved deftm var's parameter tags — delegates to the
+   shared effective-dtype rule (dtype/infer-dtype-from-tags) so all
+   monomorphized walk seams agree."
   [resolved-var]
-  (when-let [tags (:raster.core/deftm-tags (meta resolved-var))]
-    (cond
-      (some #{'floats} tags) :float
-      (some #{'doubles} tags) :double
-      (some #{'float} tags) :float
-      (some #{'double} tags) :double
-      :else nil)))
+  (dtype/infer-dtype-from-tags (:raster.core/deftm-tags (meta resolved-var))))
 
 (defn walk-body-with-tc
   "Walk a deftm body with TC type inference. Used at compilation time
   (compile-aot, lazy JIT) when concrete types are known.
-  Uses build-param-type-env — single source of truth for type-env."
-  [body params tags annotations source-ns]
+  Uses build-param-type-env — single source of truth for type-env.
+
+  `element-dtype` (:float/:double, or nil) is the dtype this body is
+  monomorphized to — threaded to the walker so CONTEXTUAL literal typing
+  narrows untyped floating literals (e.g. a `0.0` loop-accumulator init in a
+  float body → float, not double). ALL monomorphized walk seams must thread
+  it: the definition-time specialization walk (core.clj parametric-specialize!)
+  and the post-AD pe-rewalk (rewalk.clj) already do; omitting it HERE walked
+  float bodies with double accumulator/loop tags that downstream passes then
+  stamped onto loop* forms — silent double/float divergence inside one compile
+  (the GPU emitters' `WARN loop-value-ctype` firings)."
+  [body params tags annotations source-ns element-dtype]
   (let [type-env (inf/build-param-type-env params tags annotations)
         ;; Run TC for per-binding type inference
         tc-binding-tags (when annotations
@@ -114,7 +120,8 @@
                                 (println (str "WARNING: TC analysis failed at compile time: " (.getMessage e))))
                               nil)))
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
-                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                    (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     (mapv #(walker/walk-body % walk-opts) body)))
 
 (defn get-walked-body [f-var & [dtype]]
@@ -132,7 +139,13 @@
                                 (when tags (mapv (fn [t] (if (= t 'Object) nil t)) tags)))
                 src-ns-sym (:raster.core/deftm-source-ns m)
                 src-ns (when src-ns-sym (try (the-ns src-ns-sym) (catch Exception _ *ns*)))
-                walked (try (walk-body-with-tc (vec raw-body) params tags annotations src-ns)
+                ;; Element dtype of the body actually walked: the requested
+                ;; dtype, else the RESOLVED var's own FP tags (a float
+                ;; specialization resolved without an explicit :dtype is still
+                ;; a float body). Same effective-dtype rule the pass pipeline
+                ;; (pe-rewalk) applies to its re-walks of this body.
+                element-dtype (or dtype (infer-dtype resolved))
+                walked (try (walk-body-with-tc (vec raw-body) params tags annotations src-ns element-dtype)
                             (catch Throwable t
                               (binding [*out* *err*]
                                 (println "WARNING: walker re-walk failed for" f-var
@@ -189,18 +202,21 @@
   true)
 
 (def ^:dynamic *validate-deep?*
-  "Deep SEMANTIC invariants (qualify-upfront, type-tag presence, op
-  classification) at pass boundaries. Cross-cutting properties a dialect grammar
-  cannot express. Currently WARN-only; default off (enable in CI / tests).
-  Independent of how a pass is implemented — runs at the same boundary seam
-  whether the pass is direct-walking or a pattern `defpass`."
+  "Deep SEMANTIC invariants (qualify-upfront, dtype closure, binder tag
+  consistency) at pass boundaries. Cross-cutting properties a dialect grammar
+  cannot express. I-T3 (dtype closure under :float) THROWS; I3 and I-T2-lite
+  are WARN-only until their corpora are clean. Default off (enable in CI /
+  tests). Independent of how a pass is implemented — runs at the same boundary
+  seam whether the pass is direct-walking or a pattern `defpass`."
   false)
 
 (defn- validate-dialect!
   "Validate form against dialect at a pass boundary. Throws on a structural
-  violation (dialect shape or always-on structural invariant); warns on a deep
-  semantic invariant when *validate-deep?* is set. `opts` carries :active-params
-  (the deftm params), needed to exclude them from the qualify-upfront check."
+  violation (dialect shape or always-on structural invariant); when
+  *validate-deep?* is set, also runs the semantic invariants (I-T3 dtype
+  closure throws; I3/I-T2 warn). `opts` carries :active-params (the deftm
+  params, excluded from the qualify-upfront check), :dtype (gates I-T3), and
+  :param-env (double-tagged params seed I-T3's exempt set)."
   [dialect-key form pass-key opts]
   (when *validate-dialects?*
     (when-let [[valid? validate-fn] (get dialects/dialect-checkers dialect-key)]
@@ -215,7 +231,10 @@
                                                    form))})))))
     (invariants/check-structural! dialect-key form pass-key))
   (when *validate-deep?*
-    (invariants/check-deep! dialect-key form pass-key (:active-params opts))))
+    (invariants/check-deep! dialect-key form pass-key
+                            {:params (:active-params opts)
+                             :dtype (:dtype opts)
+                             :param-env (:param-env opts)})))
 
 ;; ================================================================
 ;; Pass functions — each takes (form, opts) → form or {:form :stats}
@@ -454,6 +473,18 @@
     (vector? form) (reduce + 0 (map count-undevirtualized form))
     :else 0))
 
+(defn- collect-undevirtualized
+  "Collect the surviving undevirtualized dispatch call FORMS in a form (for
+  diagnostics — the whole `(op arg…)` so the offending kernel/operands are
+  identifiable, not just the op name)."
+  [form]
+  (cond
+    (seq? form)
+    (concat (when (undevirtualized-dispatch-call? (first form)) [form])
+            (mapcat collect-undevirtualized form))
+    (vector? form) (mapcat collect-undevirtualized form)
+    :else nil))
+
 (defn- pass-late-cleanup
   "Late CSE + DCE + dispatch resolution after buffer fusion and backward inlining.
   Eliminates aliases and dead bindings, re-tags binding types (new bindings
@@ -470,14 +501,31 @@
           tagged (tag-binding-types (:form dce-result) (:param-env opts))
           ;; Resolve any remaining generic dispatch calls
           resolved (inline/resolve-generic-deftm-calls tagged (:param-env opts))
-          ;; Warn about surviving undevirtualized calls — these cause massive
-          ;; performance degradation (270ns dispatch vs 4ns .invk per call)
-          remaining (count-undevirtualized resolved)]
+          ;; Warn about surviving undevirtualized calls — on CPU these fall back to
+          ;; slow IFn.invoke (270ns dispatch vs 4ns .invk); on GPU they CANNOT lower
+          ;; to C and produce garbage. Name the ops so the type-inference gap is
+          ;; findable.
+          surviving (collect-undevirtualized resolved)
+          remaining (count surviving)
+          op-freq (frequencies (map first surviving))
+          examples (mapv (fn [f] (let [s (pr-str f)] (subs s 0 (min 200 (count s)))))
+                         (take 3 (distinct surviving)))]
       (when (pos? remaining)
-        (binding [*out* *err*]
-          (println (str "WARNING: " remaining " undevirtualized dispatch call(s) survive "
-                        "late-cleanup — expect ~100x slowdown in hot loops. "
-                        "Check type inference in gradient/backward code."))))
+        (if (device/gpu-target? (:target-device opts))
+          ;; GPU cannot fall back to IFn.invoke — a surviving dispatch emits a call
+          ;; to a nonexistent OpenCL function → silent garbage output. Fail loud so
+          ;; a mistyped kernel (e.g. double literals/params in a float kernel) is a
+          ;; compile error, not wrong tokens at runtime.
+          (throw (ex-info (str remaining " undevirtualized dispatch call(s) cannot lower to GPU C "
+                               "(would miscompile to garbage). Make the kernel type-consistent — "
+                               "cast double literals/params to the element dtype. Surviving ops: "
+                               (pr-str op-freq) " e.g. " (pr-str examples))
+                          {:surviving op-freq :examples examples
+                           :target-device (:target-device opts)}))
+          (binding [*out* *err*]
+            (println (str "WARNING: " remaining " undevirtualized dispatch call(s) survive "
+                          "late-cleanup — CPU ~100x slowdown, GPU miscompile. "
+                          "Surviving ops: " (pr-str op-freq) " e.g. " (pr-str examples))))))
       {:form resolved
        :stats {:cse-aliases (:cse-aliases (:stats cse-result))
                :bindings-removed (:bindings-removed (:stats dce-result))
@@ -945,7 +993,8 @@
 (def ^:private gpu-invoke-heads
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
-     raster.gpu.ze-runtime/invoke-reduction-kernel})
+     raster.gpu.ze-runtime/invoke-reduction-kernel
+     raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
   '#{double-array float-array int-array long-array byte-array
@@ -1083,6 +1132,24 @@
       (let [[_ kname inputs out scalars n] expr]
         {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
          :convention :map :returns sym})
+      (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
+      ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
+      ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
+      ;; The resident bind zeroes it each replay (a zero-fill kernel prepended to the
+      ;; scatter). :arrays is the kernel C-sig order (out src index); the extra scalar
+      ;; (stride) is a :scalar (n stays :n-expr, and n precedes stride in the C-sig — the
+      ;; scatter bind places n before the scalars, unlike the map-void arrays,scalars,n order).
+      (let [[_ kname out src index n stride] expr
+            ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
+            ;; (scalar-native-type keys on the name, and the value-fn still evaluates
+            ;; the raw symbol — it is an int stride/index param either way).
+            strip-cast (fn [x] (if (and (seq? x)
+                                        (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
+                                 (second x) x))]
+        {:kernel-name kname :arrays [out src index]
+         :scalars (if stride [(strip-cast stride)] [])
+         :n-expr n :convention :scatter :accumulator out :returns sym})
+
       (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
       ;; 3-arg legacy (host-scalar return) vs 4-arg resident (writes out-buf, stays on device).
       (if (= 5 (count expr))
@@ -1124,46 +1191,97 @@
 
    :scalar-lets is the ordered [sym expr ...] of pure scalar bindings; size/count/scalar exprs
    are evaluated in an env that binds the deftm params AND these lets (so an intermediate sized
-   `(* rows feat)` resolves)."
+   `(* rows feat)` resolves).
+
+   On success returns the descriptor map (with :steps). On failure returns
+   `{::non-resident {:why <kw> :sym <sym> :form <expr>}}` naming the FIRST binding that defeated
+   straight-line extraction — so the caller can fail loud with an actionable message instead of a
+   bare nil (the silent-empty-graph footgun)."
   [form]
-  (when (and (seq? form) (#{'let* 'let} (first form)))
+  (if-not (and (seq? form) (#{'let* 'let} (first form)))
+    {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
     (let [bindings (partition 2 (second form))
           body (last form)
           allocs (volatile! [])
           steps (volatile! [])
           scalar-lets (volatile! [])
-          ok (volatile! true)]
-      (doseq [[sym expr] bindings]
-        (cond
-          (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
-          (vswap! allocs conj {:sym sym :size-expr (second expr)})
+          ;; Intermediate array BINDINGS produced in this program: allocs and
+          ;; kernel/GEMM step outputs. These are device-only buffers — a host
+          ;; scalar/size-let may NOT read them (see the scalar-let guard below).
+          ;; Array PARAMS are deliberately NOT tracked here: the per-call arg-fn
+          ;; receives the host arrays, so `(alength W)` on a param stays a valid
+          ;; host size expr.
+          device-buffers (volatile! #{})
+          ;; Array aliases: bindings of the form `sym = <bare array symbol>` (e.g. a
+          ;; fused-buffer alias `db = hfuse_out`, or a residual/broadcast copy result
+          ;; the SOAC fuser rewired to an existing buffer). These carry NO computation —
+          ;; they are pure renames. We copy-propagate them: record sym → target and
+          ;; subst into every subsequent binding + the body, so a later kernel step that
+          ;; references `db` resolves to the real device buffer. Without this the alias
+          ;; binding reaches the array-tag?/reads-device-buffer rejects and defeats an
+          ;; otherwise-straight-line resident program (e.g. QLoRA residual base+delta
+          ;; backward, where residual-add's two grad copies fuse to one buffer).
+          aliases (volatile! {})
+          ok (volatile! true)
+          reason (volatile! nil)
+          reject! (fn [why sym expr]
+                    (vreset! ok false)
+                    (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
+      (doseq [[sym expr0] bindings]
+        (let [expr (if (seq @aliases) (util/subst-syms @aliases expr0) expr0)]
+          (cond
+          ;; pure array-alias binding (`sym = other-array-symbol`) → copy-propagate.
+            (and (symbol? expr)
+                 (or (contains? @device-buffers expr) (array-tag? sym)))
+            (do (vswap! aliases assoc sym expr)
+                (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
+            (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+            (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
+                (vswap! device-buffers conj sym))
           ;; devirtualized array alloc (alloc-like/zeros-like .invk) — a GEMM/kernel output buffer.
-          (alloc-invk? expr)
-          (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
-          (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
-          (if-let [s (parse-gpu-step sym expr)]
-            (vswap! steps conj s)
-            (vreset! ok false))
+            (alloc-invk? expr)
+            (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
+                (vswap! device-buffers conj sym))
+            (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+            (if-let [s (parse-gpu-step sym expr)]
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
-          (gemm-invk? expr)
-          (if-let [s (parse-gpu-step sym expr)]
-            (vswap! steps conj s)
-            (vreset! ok false))
+            (gemm-invk? expr)
+            (if-let [s (parse-gpu-step sym expr)]
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
           ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
           ;; caller falls back to the staging fn (rather than eval'ing an array .invk as a scalar
           ;; size closure). E.g. an AD-emitted daxpy-diff-into! or a raw loss reduction that did
           ;; not lower to a par kernel in this composed path.
-          (array-tag? sym)
-          (vreset! ok false)
+            (array-tag? sym)
+            (reject! :unlowered-array-op sym expr)
+          ;; A SCALAR binding whose init READS an intermediate device buffer is a
+          ;; reduction (device array → scalar), NOT a host size-let — e.g. the
+          ;; primal `(.invk mse-loss-impl pred tgt n)` reducing the pred buffer to
+          ;; the loss value. Its result tag is scalar, so array-tag? above misses
+          ;; it, and its `.invk` head isn't a gpu-invoke, so it would otherwise be
+          ;; kept as a scalar-let and handed to expr->arg-fn — which then fails to
+          ;; resolve the device-buffer operand on the host (unbound-symbol throw).
+          ;; A device-side reduction needs a resident reduction kernel (task #42);
+          ;; until then, reject so the caller falls back cleanly (non-resident)
+          ;; rather than throwing. Reading an array PARAM (host-available, e.g.
+          ;; alength) is fine — only intermediate buffers are tracked.
+            (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
+            (reject! :scalar-let-reads-device-buffer sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
-          (not (contains-gpu-invoke? expr))
-          (vswap! scalar-lets into [sym expr])
+            (not (contains-gpu-invoke? expr))
+            (vswap! scalar-lets into [sym expr])
           ;; control flow / kernel-result-into-scalar → not straight-line.
-          :else (vreset! ok false)))
-      (when (and @ok (seq @steps))
-        {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))
+            :else (reject! :control-flow-or-host-scalar sym expr))))
+      (let [body (if (seq @aliases) (util/subst-syms @aliases body) body)]
+        (cond
+          (not @ok)      {::non-resident @reason}
+          (empty? @steps) {::non-resident {:why :no-kernel-steps}}
+          :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body})))))
 
 (defn- strip-meta
   "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
@@ -1195,8 +1313,16 @@
       :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
       :steps  [{:kernel-name str :arrays [syms] :n-fn (fn [args] int)
                 :scalar-fns [(fn [args] v) ...] :convention :map-void|:map :phase kw}]
-      :result-sym sym}"
-  [f-var device-id & {:keys [dtype]}]
+      :result-sym sym}
+
+   :on-non-resident controls what happens when the fused IR is NOT a straight-line resident
+   program (control flow, a kernel result feeding host scalar compute, or an unlowered array op):
+     :throw (default) — throw an ex-info naming the offending binding + reason. This is the
+                        correct default: a caller that binds the result to a session graph would
+                        otherwise silently record an EMPTY graph (all-zero output). See #42.
+     :nil             — return nil, for probing callers that legitimately fall back to the
+                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test)."
+  [f-var device-id & {:keys [dtype on-non-resident] :or {on-non-resident :throw}}]
   (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
@@ -1251,7 +1377,37 @@
               (println "=== POST-FUSE ===") (println (pr-str form-soa))
               (println "=== END-FUSE-DUMP ===")))
         form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
-        prog (extract-gpu-program form)
+        ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
+        ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes
+        ;; every parameter gradient look live. By here the vector is gone and only the
+        ;; gradients the caller actually consumed (dA, dB via SGD) reach the result —
+        ;; so an UNUSED input/other-arg gradient (e.g. the input gradient dx in a single
+        ;; training step: qlinear-q8-dx + the x-path GEMMs + their grad-acc) is now
+        ;; provably dead. eliminate-dead-bindings drops the pure grad-acc and cascades
+        ;; through the dead GEMM/kernel stores (their outputs are read only by the dead
+        ;; grad-acc), leaving a lean straight-line program. Without this, that dead
+        ;; grad-acc (a non-kernel array op) defeats resident extraction.
+        form (if (and (seq? form) (#{'let* 'let} (first form)))
+               (:form (dce/eliminate-dead-bindings form))
+               form)
+        _ (when (System/getProperty "raster.debug.preextract")
+            (binding [*out* *err*]
+              (println "=== PRE-EXTRACT ===") (println (pr-str form)) (println "=== END-PRE-EXTRACT ===")))
+        extracted (extract-gpu-program form)
+        prog (if-let [nr (::non-resident extracted)]
+               (if (= on-non-resident :throw)
+                 (throw (ex-info
+                         (str "compile-gpu-program: " f-var " is not a straight-line resident GPU "
+                              "program (" (name (:why nr)) ")"
+                              (when (:sym nr) (str " at binding `" (:sym nr) " = " (pr-str (:form nr)) "`"))
+                              ". A resident program must be a flat sequence of kernel steps — no "
+                              "host control flow, no kernel result feeding host scalar compute, and "
+                              "every array op must lower to a resident kernel. Fix the deftm, use "
+                              "compile-aot with :target-device for the per-call staging fn, or pass "
+                              ":on-non-resident :nil to fall back explicitly.")
+                         {:var f-var :device device-id :non-resident nr}))
+                 nil)                       ; :nil policy — probing caller
+               extracted)
         scalar-lets (:scalar-lets prog)
         ;; Default buffer roles for the residency layer: an array param WRITTEN by any kernel
         ;; (its name is in some kernel's :written-arrays) defaults to :output (downloaded after
@@ -1293,21 +1449,31 @@
                          :n-fn (expr->arg-fn all-params scalar-lets (:n-expr step))
                          :k-fn (expr->arg-fn all-params scalar-lets (:k-expr step))
                          :phase (keyword (str "gpu-step-" i))}
-                        (let [{:keys [kernel-name arrays scalars n-expr convention output]} step]
+                        (let [{:keys [kernel-name arrays scalars n-expr convention output accumulator]} step]
                           {:kernel-name kernel-name
                            :arrays arrays
                            ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
                            ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
                            :output (when output (keyword (name output)))
+                           ;; :scatter steps carry the accumulator buffer sym so bind-program! can
+                           ;; zero it (a zero-fill kernel prepended to the atomic-add scatter) each
+                           ;; replay — the zeros-like semantics of scatter-add's output.
+                           :accumulator (when accumulator (keyword (name accumulator)))
                            :n-fn (expr->arg-fn all-params scalar-lets n-expr)
-                           ;; Each scalar typed by the deftm's DECLARED type (the invoke scalars are
-                           ;; the kernel's scalar-param syms = deftm params), so an int param (e.g.
-                           ;; `features`) is bound as :int, not mis-typed float (→ launch error).
+                           ;; Type each scalar arg with the SAME `scalar-native-type` the kernel
+                           ;; DECLARATION uses (par_opencl), so the host arg encoding always matches
+                           ;; the kernel's C param type — single source of truth. A deftm PARAM is in
+                           ;; scalar-types; a HOISTED LOCAL scalar (e.g. `nb (quot in 32)`, not a
+                           ;; param) is typed from its `:raster.type/tag` stamp. The old code only
+                           ;; consulted the param map and DEFAULTED locals to :float — so an int local
+                           ;; like `nb` was declared `int` in the kernel but encoded `:float` on the
+                           ;; host → float-bits into an int slot → garbage index → OOB → device-lost.
                            :scalar-specs (mapv (fn [s]
-                                                 {:type (or (and (symbol? s)
-                                                                 (get (:scalar-types gpu-param-types) s))
-                                                            (if (= effective-dtype :double) :double :float))
-                                                  :value-fn (expr->arg-fn all-params scalar-lets s)})
+                                                 (let [ct (c-emit/scalar-native-type
+                                                           s (:scalar-types gpu-param-types)
+                                                           (if (= effective-dtype :double) "double" "float"))]
+                                                   {:type (case ct "int" :int "double" :double :float)
+                                                    :value-fn (expr->arg-fn all-params scalar-lets s)}))
                                                scalars)
                            :convention convention
                            :phase (keyword (str "gpu-step-" i))})))

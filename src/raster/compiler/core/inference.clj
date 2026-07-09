@@ -453,6 +453,30 @@
   (when (and element-dtype (instance? Double form))
     (dtype/scalar-tag-for-dtype element-dtype)))
 
+(defn walked-init-monomorphized-tag
+  "The walked init's own re-derived :raster.type/tag IFF it equals the ambient
+   monomorphization `element-dtype`'s scalar tag and TC's dtype-blind tag would
+   widen it (nil, or 'double/'Double under :float). The transitive case of the
+   floating-literal-narrowed-tag policy above: TC types a loop-valued binding
+   like `dot = (loop [acc 0.0] …)` as Double (correct for the SOURCE), but the
+   walker has already narrowed the accumulator inside the walked init to the
+   element dtype and stamped the form bottom-up — the stamp is the truth of the
+   TRANSFORMED code. Without this override the binding enters the type-env as
+   double, every consumer (`(/ dot …)`, `(n/oftype dot …)`, `(- score mx)`)
+   devirtualizes to the DOUBLE overloads inside a float body, and the recur-LUB
+   fixpoint then widens the consuming float accumulator back to double — a
+   float kernel silently computing (and GPU-emitting) double.
+   Returns nil when no element-dtype is in scope, the init carries no stamp,
+   the stamp is not the element scalar tag, or TC asserts a non-FP type."
+  [rewritten-init tc-tag element-dtype]
+  (when element-dtype
+    (let [it (when (instance? clojure.lang.IObj rewritten-init)
+               (:raster.type/tag (meta rewritten-init)))]
+      (when (and it
+                 (= it (dtype/scalar-tag-for-dtype element-dtype))
+                 (or (nil? tc-tag) (contains? #{'double 'Double} tc-tag)))
+        it))))
+
 (defn hint-tag [form]
   (when-let [m (meta form)]
     (or (:raster.type/tag m)
@@ -910,6 +934,26 @@
               (get types/primitive-array-element-types (:tag (meta arr-sym)))
               (get @types/soa-reverse-registry env-tag)))))))
 
+(def long-returning-core-ops
+  "clojure.core ops whose result is a primitive long — integer index/counter
+   arithmetic (quot/rem/mod/bit-*/unchecked-*/count/alength). Both fully-qualified
+   and bare spellings, since the walker sees either. Single source of truth for
+   'this binding/expr is a long scalar', consumed by infer-expr-tag AND
+   infer-binding-tag so a `(quot in 32)` block-count local is stamped
+   :raster.type/tag long — which the GPU C emitter needs to declare it `int`
+   instead of defaulting an untagged scalar to the kernel float element type."
+  '#{clojure.core/quot clojure.core/rem clojure.core/mod
+     clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
+     clojure.core/bit-not clojure.core/bit-shift-left
+     clojure.core/bit-shift-right clojure.core/unsigned-bit-shift-right
+     clojure.core/unchecked-add clojure.core/unchecked-subtract
+     clojure.core/unchecked-multiply clojure.core/unchecked-negate
+     clojure.core/unchecked-inc clojure.core/unchecked-dec
+     clojure.core/count clojure.core/alength
+     quot rem mod bit-and bit-or bit-xor bit-not
+     bit-shift-left bit-shift-right unsigned-bit-shift-right
+     count alength})
+
 (defn infer-expr-tag
   "Infer the type tag of an arbitrary expression given type-env.
   Handles symbols, literals, casts, aget, and deftm calls recursively.
@@ -937,18 +981,7 @@
         (descriptor/aget-op? head)
         (infer-aget-type expr type-env)
         ;; Clojure core fns with known long return type
-        (contains? '#{clojure.core/quot clojure.core/rem clojure.core/mod
-                      clojure.core/bit-and clojure.core/bit-or clojure.core/bit-xor
-                      clojure.core/bit-not clojure.core/bit-shift-left
-                      clojure.core/bit-shift-right clojure.core/unsigned-bit-shift-right
-                      clojure.core/unchecked-add clojure.core/unchecked-subtract
-                      clojure.core/unchecked-multiply clojure.core/unchecked-negate
-                      clojure.core/unchecked-inc clojure.core/unchecked-dec
-                      clojure.core/count clojure.core/alength
-                      quot rem mod bit-and bit-or bit-xor bit-not
-                      bit-shift-left bit-shift-right unsigned-bit-shift-right
-                      count alength}
-                   head)
+        (contains? long-returning-core-ops head)
         'long
         ;; deftm generic call: resolve dispatch and get return tag
         (and (symbol? head) (generic-fn?* source-ns head))
@@ -1422,6 +1455,15 @@
    (when-let [t (when (and (seq? init) (contains? types/primitive-info (first init)))
                   (first init))]
      (trace-inferred sym t :cast))
+   ;; Long-returning clojure.core op (quot/rem/mod/bit-*/count/alength) — an
+   ;; integer index/counter binding. infer-expr-tag already classifies these; the
+   ;; binder must too, else a `(quot in 32)` block-count local stays untagged and
+   ;; the GPU C emitter defaults it to the kernel's float element type (wrong for
+   ;; index arithmetic). Stamps :raster.type/tag long (never Clojure :tag —
+   ;; compute-binding-hint drops primitives).
+   (when-let [t (when (and (seq? init) (contains? long-returning-core-ops (first init)))
+                  'long)]
+     (trace-inferred sym t :long-op))
    ;; Array allocation — cheap structural check
    (when-let [t (when (and (seq? init) (contains? alloc-sym->array-tag (first init)))
                   (get alloc-sym->array-tag (first init)))]
@@ -1730,16 +1772,22 @@
         (let [head (first expr)]
           (cond
             (contains? #{'double 'float 'long 'int 'byte 'short 'char 'boolean} head) head
-            ;; par/reduce returns the accumulator type, inferred from init
-            (contains? #{'raster.par/reduce 'par/reduce} head)
-            (let [[_ _acc init] expr]
-              (infer-arg-tag init env))
-            ;; par/scan returns the output array (first arg)
+            ;; par/reduce needs no arm here — the :result-type facet arm below
+            ;; types it ([:arg 1], the init accumulator; see op-descriptor).
+            ;; par/scan stays inline: it returns its OUT array (arg 0) looked up
+            ;; via env/:tag only — a bespoke rule that also SHADOWS the generic
+            ;; form-info :return-type-arg arm near the end of this cond (whose
+            ;; non-mutating default of arg 1 would be wrong for scan).
             (contains? #{'raster.par/scan 'par/scan} head)
             (let [out-sym (second expr)]
               (when (symbol? out-sym) (or (get env out-sym) (:tag (meta out-sym)))))
             ;; Allocations: handle both direct (double-array size)
-            ;; and devirtualized (.invk zeros-like_m_...-impl ref size) forms
+            ;; and devirtualized (.invk zeros-like_m_...-impl ref size) forms.
+            ;; Stays inline rather than a :result-type facet entry: the rule is a
+            ;; COMPOUND (fixed constructor tag from alloc-sym->array-tag — data
+            ;; that already lives in op-descriptor — else same-as-first-arg for
+            ;; dynamic allocators) resolved over mangled deftm names via
+            ;; alloc-op?/name-stripping, which exact-symbol facet lookup can't do.
             (let [op (form/effective-op expr)]
               (and (symbol? op) (descriptor/alloc-op? op)))
             (let [op (form/effective-op expr)
@@ -1749,12 +1797,33 @@
                   ;; return the same array type as their first argument
                   (when-let [ref-arg (first args)]
                     (infer-arg-tag ref-arg env))))
+            ;; aget stays inline rather than :element-of-first-arg: its element
+            ;; map covers short/char/boolean arrays, which have no dtype-info row
+            ;; (the facet derives from dtype-info), and its array tag is looked up
+            ;; via env/:tag only — routing through the facet would narrow it.
             (descriptor/aget-op? head)
             (when (symbol? (second expr))
               (let [arr-tag (or (get env (second expr)) (:tag (meta (second expr))))]
                 (get {'doubles 'double 'floats 'float 'longs 'long 'ints 'int
                       'bytes 'byte 'shorts 'short 'chars 'char 'booleans 'boolean}
                      arr-tag)))
+            ;; :result-type facet — ops whose result tag derives from their arg
+            ;; tags via a registry rule (op-descriptor): oftype → the ELEMENT
+            ;; type of its ref (first arg) — `(n/oftype Q x)` is a float at
+            ;; :float (Q a float[]), a double at :double; par/reduce → its init
+            ;; accumulator; grad-acc → its first typed arg. Without the oftype
+            ;; rule, oftype-seeded scalars (a reduction's neg-inf/zero seed, an
+            ;; attention scale) stay untyped, so a downstream `(- score mx)` /
+            ;; `(* exp inv)` can't devirtualize on the composed/inlined re-walk
+            ;; → a bare raster.numeric op that pass-late-cleanup rejects on GPU.
+            ;; The impl's own return-tag is the generic T, so the `.invk` branch
+            ;; below can't supply it. Register new ops in op-descriptor, not here.
+            (some? (descriptor/result-type-rule
+                    (or (:raster.op/original (meta expr)) (form/effective-op expr))))
+            (let [op (or (:raster.op/original (meta expr)) (form/effective-op expr))]
+              (descriptor/result-tag
+               op (map #(infer-arg-tag % env) (form/effective-args expr))))
+
             (= '.invk head)
             (when-let [impl-sym (second expr)]
               (try (when-let [v (resolve impl-sym)]
@@ -1768,10 +1837,6 @@
                                                          (symbol base))]
                                  (:raster.core/return-tag (meta bv))))))))
                    (catch Exception _ nil)))
-            ;; grad-acc returns the type of its args (nil-safe +)
-            (= 'raster.ad.reverse/grad-acc head)
-            (let [arg-tags (keep #(infer-arg-tag % env) (rest expr))]
-              (first arg-tags))
             (and (symbol? head) (namespace head)
                  (.contains ^String (name head) "_m_"))
             (try (when-let [v (resolve head)]

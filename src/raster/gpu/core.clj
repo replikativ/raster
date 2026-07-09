@@ -28,6 +28,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
 
 ;; ================================================================
@@ -94,11 +95,18 @@
   (rcore/resolve-deftm-var v {:ambiguity :first}))
 
 (defn get-walked-body
-  "Get the walker-processed body from a deftm var.
+  "Get the walker-processed body from a deftm var, walked FOR the kernel's
+   dtype. Delegates to the pipeline's dtype-directed walk (the single
+   monomorphized-walk seam): the definition-time walked body is a JVM walk —
+   dtype-blind, so a concrete-float kernel's `0.0` accumulators carry double
+   stamps that disagree with the float code the GPU backend emits. Falls back
+   to the stored definition-time body when the source body is unavailable.
    Throws if the var has no walked body."
-  [v]
+  [v dtype]
   (let [resolved (or (resolve-deftm-var v) v)]
-    (or (:raster.core/deftm-walked-body (meta resolved))
+    (or (try (pl/get-walked-body v dtype)
+             (catch Exception _ nil))
+        (:raster.core/deftm-walked-body (meta resolved))
         (rcore/ensure-walked-body! resolved)
         (throw (ex-info "Var has no deftm walked body" {:var v})))))
 
@@ -110,7 +118,7 @@
   "Compile a deftm var's par forms to GPU kernels and register them.
    Returns vector of kernel-info maps."
   [v device-id {:keys [dtype min-elements] :or {dtype :float min-elements 0}}]
-  (let [walked-body (get-walked-body v)
+  (let [walked-body (get-walked-body v dtype)
         resolved (or (resolve-deftm-var v) v)
         params (:raster.core/deftm-params (meta resolved))
         tags   (:raster.core/deftm-tags (meta resolved))
@@ -896,6 +904,10 @@
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
+         alloc-size-of (fn [sym-kw]
+                         (some (fn [{:keys [sym size-fn]}]
+                                 (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
+                               allocs))
          gemm-scratch (atom [])]
      (alloc! sess (merge param-specs alloc-specs))
      (let [buffers (:buffers @sess)
@@ -904,7 +916,7 @@
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
                                         {:sym sym :ctx ctx :have (keys buffers)}))))
            step->bounds
-           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention] :as step}]
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator] :as step}]
              (case convention
                ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
                ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
@@ -953,8 +965,38 @@
                          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                                        scalar-specs)]
                      [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+               ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
+               ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
+               ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
+               ;; overlapping destination indices in safely. arrays = [out src index]; the extra
+               ;; scalar (if present) is `stride`.
+               :scatter
+               (do (when (not= :ze (backend-type device-id))
+                     (throw (ex-info "resident scatter steps are Level-Zero-only (no OpenCL implementation yet)"
+                                     {:backend (backend-type device-id)
+                                      :device-id device-id
+                                      :step kernel-name})))
+                   (or (info-fn kernel-name)
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
+                   (let [[out-sym src-sym idx-sym] arrays
+                         out-buf (buf-of out-sym :scatter-out)
+                         src-buf (buf-of src-sym :scatter-src)
+                         idx-buf (buf-of idx-sym :scatter-idx)
+                         n       (long (n-fn args))
+                         stride  (when (seq scalar-specs) (long ((:value-fn (first scalar-specs)) args)))
+                         out-size (or (alloc-size-of accumulator)
+                                      ;; fallback: accumulator is a param, use its length
+                                      (nel (get argmap (symbol (name accumulator)))))
+                         ;; Resolved lazily (only a program with a scatter step needs them),
+                         ;; so a non-scatter program on a runtime lacking these fns (OpenCL) still
+                         ;; binds — resident scatter is Level-Zero-only for now.
+                         zerofill-fn (rt-resolve device-id "ensure-zero-fill-kernel!")
+                         scatter-fn (rt-resolve device-id "bind-registered-scatter-kernel!")
+                         zk (zerofill-fn (if (= dtype :double) :double :float))]
+                     [(bind-fn zk [out-buf] [] (long out-size))
+                      (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)]))
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
-                                    ":map / :map-void / :gemm are wired on the resident path")
+                                    ":map / :map-void / :gemm / :scatter are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
            graph (record-fn bounds)]

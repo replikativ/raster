@@ -76,6 +76,17 @@
      (binding [*gensym-counter* (atom 0)]
        ~@body)))
 
+(defn ^:no-doc call-with-shared-ad-gensym
+  "Run `thunk` under ONE shared, monotonic *gensym-counter* scope (see
+  `with-ad-gensym`). Cross-namespace AD composers (e.g. `raster.ad.jvp/hvp`,
+  which chains `ad-prepare` + `reify-pullback`) call this so both phases share
+  ONE counter instead of each resetting to 0 and re-minting colliding `anf__`
+  temps — the same two-phase-counter hazard fixed inline in
+  `build-grad-walked-body`. Function form (not the macro) so it is callable
+  from other namespaces without exposing the private counter var."
+  [thunk]
+  (with-ad-gensym (thunk)))
+
 ;; ================================================================
 ;; Nil-safe gradient accumulation
 ;; ================================================================
@@ -731,7 +742,12 @@
     {:fwd-bindings fwd-bindings :records records :adj-env adj-env :activity activity
      :rev-ctx rev-ctx :param-adj-syms param-adj-syms}))
 
-(defn- gen-reverse-let
+(declare gen-reverse-loop-with-let lift-loop-to-tail)
+
+(defn- loop-init? [init]
+  (and (seq? init) (contains? #{'loop 'loop*} (first init))))
+
+(defn- gen-reverse-let-core
   "Generate reverse-mode AD code for a let* form: normalize → process-bindings →
   assemble [primal, pullback-fn]."
   [bindings body-exprs active-params]
@@ -744,6 +760,54 @@
         result-sym    (ad-gensym "result")
         augmented-bindings (vec (concat fwd-bindings [result-sym body-sym]))]
     (list 'let* augmented-bindings (vector result-sym pullback-fn))))
+
+(defn- gen-reverse-let
+  "Generate reverse-mode AD code for a let* form.
+
+  A raw `loop` bound to a let* binding is not recordable by the per-binding
+  engine (`ad-record :loop` fails loud): only a loop in TAIL position is
+  differentiable (via `lift-loop-to-tail` → `gen-reverse-loop-with-let`).
+  `transform-body` applies that lift once at the top level, but a SECOND raw
+  loop composed in series lands as a mid-let binding inside the FIRST loop's
+  result-branch continuation (gen-reverse-loop*'s compound-result path funnels
+  that continuation here) — where the tail-lift was never re-applied.
+
+  So when a binding init is an ACTIVE raw loop, lift the first such loop to
+  tail (inlining the following bindings + body into its result branch) and
+  delegate to `gen-reverse-loop-with-let` — exactly the routing `transform-body`
+  uses for a tail loop. The loop-with-let continuation recurses back through
+  here, so any number of raw-loop ops compose in series (e.g. N attention
+  blocks). Inactive loops and loop-free lets take the core path unchanged."
+  [bindings body-exprs active-params]
+  (let [pairs (vec (partition 2 bindings))]
+    (if-not (some (fn [[_ init]] (loop-init? init)) pairs)
+      (gen-reverse-let-core bindings body-exprs active-params)
+      ;; Thread activity across the bindings (init-active?, same rule the engine
+      ;; uses) WITHOUT running ad-record (which would throw on the active loop).
+      ;; Only route when the FIRST loop binding — the one lift-loop-to-tail
+      ;; targets — is active; otherwise preserve the core path (and its
+      ;; fail-loud behavior for a genuinely un-liftable active loop).
+      (let [activity (reduce (fn [act [s init]] (assoc act s (init-active? init act)))
+                             (into {} (map (fn [p] [p true]) active-params))
+                             pairs)
+            first-loop-sym (ffirst (filter (fn [[_ init]] (loop-init? init)) pairs))]
+        (if-not (get activity first-loop-sym)
+          (gen-reverse-let-core bindings body-exprs active-params)
+          (let [lifted (lift-loop-to-tail (apply list 'let* (vec bindings) body-exprs))]
+            (cond
+              ;; lift-loop-to-tail → bare tail loop (no bindings preceded it)
+              (and (seq? lifted) (contains? #{'loop 'loop*} (first lifted)))
+              (gen-reverse-loop-with-let [] lifted active-params)
+
+              ;; lift-loop-to-tail → (let* [pre...] (loop ...))
+              (and (seq? lifted) (contains? #{'let 'let*} (first lifted))
+                   (let [tail (drop 2 lifted)]
+                     (and (= 1 (count tail)) (loop-init? (first tail)))))
+              (let [[_ pre-bindings loop-form] lifted]
+                (gen-reverse-loop-with-let (vec pre-bindings) loop-form active-params))
+
+              ;; lift declined (non-canonical loop body) — preserve fail-loud.
+              :else (gen-reverse-let-core bindings body-exprs active-params))))))))
 
 ;; ================================================================
 ;; Loop/recur reverse-mode AD
@@ -1075,9 +1139,16 @@
           (let [;; Gensyms for the final loop var values (accessible in pullback)
                 final-lv-syms (mapv (fn [lv] (ad-gensym (str "final_" (name lv))))
                                     loop-syms)
-                ;; Substitute loop-var names in result-expr with final-lv gensyms
+                ;; Substitute loop-var names in result-expr with final-lv gensyms.
+                ;; CAPTURE-AVOIDING (util/subst-syms, not walk/postwalk-replace):
+                ;; the result branch may contain a NESTED loop that rebinds the
+                ;; same loop-var names (two inlined copies of the same deftm — e.g.
+                ;; two attention blocks — share `[hq acc]`). A blind postwalk would
+                ;; rewrite the inner loop's own binders/refs → variable capture →
+                ;; corrupt backward (IndexOutOfBounds / wrong grads). subst-syms
+                ;; respects shadowing: the inner rebinding stops the substitution.
                 lv-subst (zipmap loop-syms final-lv-syms)
-                subst-result (walk/postwalk-replace lv-subst result-expr)
+                subst-result (util/subst-syms lv-subst result-expr)
                 ;; Differentiate the substituted result-expr w.r.t. iter-active
                 ;; (active loop vars + active params), using final-lv names
                 subst-iter-active (mapv #(get lv-subst % %) iter-active)
@@ -2635,7 +2706,13 @@
   because the differentiator core only knows template-bearing primitives. Ops
   WITH a template stay symbolic for the transform."
   [form active-params]
-  (transform-body (ad-prepare form) (vec active-params)))
+  ;; ONE shared gensym counter across both lowering phases (same fix as
+  ;; build-grad-walked-body): ad-prepare (lower-composites) and transform-body
+  ;; each open their OWN with-ad-gensym; without this enclosing scope each
+  ;; RESETS *gensym-counter* to 0 and can re-mint colliding anf__ temps across
+  ;; the phase boundary → silent gradient miscompile.
+  (with-ad-gensym
+    (transform-body (ad-prepare form) (vec active-params))))
 
 (defn numerical-gradient
   "Compute gradient by finite differences (for testing).
@@ -2871,10 +2948,17 @@
                                      {:param param :diff-params diff-params})))
         param-tag (:raster.type/tag (meta (nth diff-params slot-idx)))
         array-param? (= :array (:kind (tangent/tangent-kind param-tag)))
-        ;; The gradient program, assembled exactly as hvp does.
-        prepared (ad-prepare (first walked-body))
+        ;; The gradient program, assembled exactly as hvp does. ad-prepare
+        ;; (lower-composites) and reify-pullback each open their OWN
+        ;; with-ad-gensym; run BOTH under one shared counter so reify-pullback
+        ;; continues from ad-prepare's high-water mark instead of resetting to 0
+        ;; and re-minting colliding anf__ temps. The alpha-rename-bound below
+        ;; assumes its input bindings are already unique — it collapses (not
+        ;; separates) any duplicate bound name — so the collision must be
+        ;; prevented HERE, upstream of the rename.
         {:keys [fwd-bindings result-sym body-sym pullback-form]}
-        (reify-pullback prepared diff-params)
+        (call-with-shared-ad-gensym
+         (fn [] (reify-pullback (ad-prepare (first walked-body)) diff-params)))
         [_ rev-bindings grad-slots] pullback-form
         grad-slot (nth (vec grad-slots) slot-idx)
         c-sym (when array-param?
@@ -3181,7 +3265,15 @@
           collected (reduce
                      (fn [{:keys [bindings clean-args]} arg]
                        (if (and (seq? arg) (contains? #{'let 'let*} (first arg)))
-                         (let [[_ inner-bindings & inner-body] arg]
+                         ;; HYGIENE: alpha-convert the inner let (fresh bound
+                         ;; names, scope-respecting) BEFORE splicing its bindings
+                         ;; into the shared outer let* — same rule as the
+                         ;; binding-init and let-tail branches above. Two sibling
+                         ;; let-args that reuse the same local name (e.g. repeated
+                         ;; unrolled fold iterations) would otherwise collide in
+                         ;; the outer let* and the reverse AD would conflate them
+                         ;; (later binding shadows the earlier → wrong gradients).
+                         (let [[_ inner-bindings & inner-body] (util/alpha-convert arg)]
                            {:bindings (into bindings (vec inner-bindings))
                             :clean-args (conj clean-args (last inner-body))})
                          {:bindings bindings
@@ -3264,13 +3356,67 @@
       (when (and (seq? form) (form/binding-form? form) (seq (drop 2 form)))
         (body-tail-tag (last form)))))
 
+(defn- anf-value-temp?
+  "True iff `sym` is an ANF *value* temp: a name of the exact form `anf__<N>`
+  minted by the ANF normalizer (`(gensym-fn \"anf\")`, reverse/normalize.clj).
+  These name single-assignment SSA subexpression values and MUST be globally
+  unique by construction.
+
+  Deliberately NARROW — the duplicate check is scoped to these only:
+    - USER-level names (which `let*` may legitimately shadow — two nested
+      `(let [t ...] ...)` flatten to two `t` bindings) are excluded.
+    - ADJOINT accumulators (`d_x__N`, `dg_x__N`, `d_out__N`, `d_anf__3__N`,
+      …) are LEGITIMATELY rebound by reverse-mode gradient accumulation
+      (`d ← (grad-acc d contribution)`) and are excluded by the `^anf__`
+      anchor (`d_anf__3__7` starts with `d_`, not `anf__`)."
+  [sym]
+  (boolean (re-matches #"anf__\d+" (name sym))))
+
+(defn- assert-unique-ad-minted-binds!
+  "Fail LOUD if any ANF value temp (`anf__N`) is bound twice in the flat `let*`
+  binding vector. Such a duplicate can only happen if two reverse lowering
+  phases reset *gensym-counter* to 0 and re-minted the same `anf__N` for two
+  UNRELATED subexpressions — the flat `let*` then silently SHADOWS the first
+  binding, so a template backward reads the wrong value/dimension and the
+  gradient is quietly miscompiled (the class of bug fixed by wrapping the whole
+  reverse lowering in ONE `with-ad-gensym`). Scoped to `anf__` value temps,
+  which are single-assignment by construction; legitimate user-level shadowing
+  and adjoint re-accumulation are left alone."
+  [bindings f-var]
+  (let [dups (->> (take-nth 2 bindings)
+                  (filter anf-value-temp?)
+                  frequencies
+                  (keep (fn [[s n]] (when (> n 1) s)))
+                  vec)]
+    (when (seq dups)
+      (throw (ex-info
+              (str "Reverse-AD lowering produced duplicate gensym-minted bound "
+                   "name(s) " dups " for " f-var " — this indicates a "
+                   "*gensym-counter* collision: two lowering phases (e.g. "
+                   "ad-prepare/lower-composites and transform-body) each reset "
+                   "the counter to 0 and re-minted the same anf__/adjoint temp. "
+                   "The flat let* silently shadows the first binding and "
+                   "miscompiles the gradient. The whole reverse lowering must run "
+                   "under ONE with-ad-gensym scope so every generated name is "
+                   "globally unique.")
+              {:var f-var :duplicates dups :kind :ad-gensym-counter-collision})))))
+
 (defn- build-grad-walked-body
   "Build the AD-transformed walked body for a deftm var.
   Returns {:walked-body [form], :params [sym ...], :source-ns ns}
   where form is a flat let* returning [primal grad1 ... gradN].
   Returns nil if AD transform fails."
   [f-var]
-  (let [resolved (resolve-deftm-var f-var)
+  ;; ONE shared gensym counter across the whole reverse lowering. ad-prepare
+  ;; (lower-composites) and transform-body each open their OWN with-ad-gensym;
+  ;; without this enclosing scope each RESETS *gensym-counter* to 0 and re-emits
+  ;; anf__1/anf__2/anf__3…, so a binding-position ANF temp (e.g. linear-nb's
+  ;; `(* nq hd)` out arg) and a tail-position ANF temp collide on the SAME name
+  ;; in the flat let* → the second SHADOWS the first → a template backward reads
+  ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
+  ;; monotonic counter keeps every generated name globally unique.
+  (with-ad-gensym
+   (let [resolved (resolve-deftm-var f-var)
         m (meta resolved)
         params (or (:raster.core/deftm-params m)
                    (throw (ex-info "grad requires a deftm var" {:var f-var})))
@@ -3352,6 +3498,11 @@
                                  all-params)
                 output-vec (vec (cons (:result-sym flat) grad-slots))
                 [op bindings _] (:form flat)]
+            ;; FAIL-LOUD backstop: the flat let* must have globally-unique
+            ;; gensym-minted bound names. A duplicate means a *gensym-counter*
+            ;; collision slipped through (the enclosing with-ad-gensym above is
+            ;; what prevents it) — would silently miscompile the gradient.
+            (assert-unique-ad-minted-binds! bindings f-var)
             (list op bindings output-vec)))]
     (when flat
       {:walked-body [padded-form]
@@ -3359,7 +3510,7 @@
        :tags tags
        :source-ns source-ns
        :result-sym (:result-sym flat)
-       :param-adj-syms (:param-adj-syms flat)})))
+       :param-adj-syms (:param-adj-syms flat)}))))
 
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.

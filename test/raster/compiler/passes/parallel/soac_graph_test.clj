@@ -153,6 +153,31 @@
           graph (make-graph pairs)]
       (is (not (sg/can-fuse-vertically? graph 0 1))))))
 
+(deftest cannot-fuse-backwards-inplace-writer-test
+  (testing "A backwards :dep edge (later in-place writer → earlier reader of the SAME
+            pre-existing array) is NOT vertically fusible."
+    ;; Regression for the ::soac-fuse forward-reference bug: a compiled SGD/optimizer
+    ;; train-step has an in-place `par/map!` that UPDATES a param `w` (w -= lr*g)
+    ;; scheduled LATE, and an earlier pure `par/pmap` that READS the ORIGINAL `w`.
+    ;; build-producer-map registers the in-place writer as the SSA "producer" of `w`,
+    ;; so an early reader gets a phantom BACKWARDS :dep edge (producer-id > consumer-id).
+    ;; Fusing it inlines the later mutator into the earlier reader — a write-after-read
+    ;; miscompile that also hoists the mutator's own inputs (g) above their definitions
+    ;; (the forward-reference the :soac-fused dialect validator rejects). A genuine
+    ;; value-flow producer is ALWAYS earlier, so can-fuse-vertically? must decline this.
+    (let [pairs '[[x1   (raster.par/pmap i n double (clojure.core/aget w i))]
+                  [_eff (raster.par/map! w i n double
+                          (raster.numeric/- (clojure.core/aget w i)
+                                            (clojure.core/aget g i)))]]
+          graph (make-graph pairs)]
+      ;; The in-place writer (node 1) is mis-registered as producer of `w`,
+      ;; yielding a backwards [1 0 :dep] edge from the late writer to the early reader.
+      (is (contains? (:edges graph) [1 0 :dep])
+          "in-place writer wrongly seen as producer of the pre-existing param")
+      ;; ...but it must NOT be fusible (producer 1 comes AFTER consumer 0).
+      (is (not (sg/can-fuse-vertically? graph 1 0))
+          "backwards :dep (later mutator → earlier reader) must not vertically fuse"))))
+
 (deftest fuse-vertical-scan-map-test
   (testing "Fuse scan→map: map body folded into scan loop"
     (let [pairs [['prefix '(raster.par/scan prefix acc 0.0 i n double (+ acc (aget a i)))]

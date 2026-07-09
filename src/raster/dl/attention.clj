@@ -409,7 +409,7 @@
                                       [q :- (Array T) k :- (Array T) v :- (Array T)
                                        out :- (Array T) sc :- (Array T)
                                        clenbuf :- (Array long) n-q :- Long group :- Long
-                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- Double] :- Void
+                                       n-kv :- Long head-dim :- Long maxpos :- Long scale :- T] :- Void
                                       (do
   ;; phase 1: sc[hq,j] = scale * dot(q[hq,:], k[j,hkv,:]) — one work-item per (hq, j)
                                         (raster.par/map-void! ij (clojure.core/* n-q maxpos)
@@ -427,6 +427,9 @@
                                                                                        (+ acc (* (aget q (clojure.core/+ qb d))
                                                                                                  (aget k (clojure.core/+ kb d)))))
                                                                                 acc))]
+                                                                    ;; scale is :- T (element-typed), so dot*scale is T×T and devirtualizes
+                                                                    ;; for every T — no hard-coded precision (a Double scale here would not
+                                                                    ;; lower to GPU C: float×double has no monomorphic overload).
                                                                     (aset sc (clojure.core/+ (clojure.core/* hq maxpos) j) (* dot scale))))))
   ;; phase 2: softmax per head (serial over cache-len — tiny); sc ← e * (1/sum)
                                         (raster.par/map-void! hq n-q
@@ -474,7 +477,11 @@
                                                  _ (blas/dgemm-nt! Q K scores seq-len dk seq-len
                                                                    (n/oftype Q 1.0) (n/oftype Q 0.0))
         ;; Scale + causal mask: set scores[i,j] = -inf for j > i
-                                                 neg-inf (n/neg-inf-val (aget scores 0))
+                                                 ;; T-typed mask sentinel via oftype (NO aget) — a
+                                                 ;; device-buffer read (neg-inf-val (aget scores 0))
+                                                 ;; defeats resident-GPU extraction. -1e38 exp()s to 0
+                                                 ;; like -inf; mirrors the decode kernels' literal.
+                                                 neg-inf (n/oftype scores -1.0e38)
                                                  _ (dotimes [i seq-len]
                                                      (let [offset (* i (int seq-len))]
                                                        (dotimes [j seq-len]
@@ -508,89 +515,75 @@
 ;; backprop + d_V/dQ/dK gemms), but as a regular deftm so :grads-fn can splice
 ;; a single call into the AD body's flat let* (compile-aot needs flat IR).
 (deftm causal-scaled-dot-product-attn-backward
-  [d-out :- (Array double) Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long dk :- Long dv :- Long]
-  :- (Array Object)
-  (let [scale (/ 1.0 (n/sqrt (double dk)))
-        neg-inf-c Double/NEGATIVE_INFINITY
-        scores  (double-array (clojure.core/* seq-len seq-len))
-        weights (double-array (clojure.core/* seq-len seq-len))]
-    ;; Forward recomputation with causal mask
-    (dotimes [i seq-len]
-      (dotimes [j seq-len]
-        (let [dot (loop [d 0 acc 0.0]
-                    (if (< d dk)
-                      (recur (clojure.core/inc d)
-                             (clojure.core/+ acc
-                                             (clojure.core/* (clojure.core/aget ^doubles Q
-                                                                                (clojure.core/+ (clojure.core/* i (clojure.core/int dk)) d))
-                                                             (clojure.core/aget ^doubles K
-                                                                                (clojure.core/+ (clojure.core/* j (clojure.core/int dk)) d)))))
-                      acc))]
-          (clojure.core/aset ^doubles scores
-                             (clojure.core/+ (clojure.core/* i (clojure.core/int seq-len)) j)
-                             (if (clojure.core/> j i) neg-inf-c (clojure.core/* dot scale))))))
-    (dotimes [i seq-len]
-      (let [offset (clojure.core/* i (clojure.core/int seq-len))
-            max-s (loop [j 0 m neg-inf-c]
-                    (if (clojure.core/< j seq-len)
-                      (recur (clojure.core/inc j)
-                             (n/max m (clojure.core/aget ^doubles scores
-                                                         (clojure.core/+ offset j))))
-                      m))
-            sum-exp (loop [j 0 s 0.0]
-                      (if (clojure.core/< j seq-len)
-                        (let [s-ij (clojure.core/aget ^doubles scores
-                                                      (clojure.core/+ offset j))
-                              e (if (clojure.core/== s-ij neg-inf-c)
-                                  0.0
-                                  (m/exp (clojure.core/- s-ij max-s)))]
-                          (clojure.core/aset ^doubles weights
-                                             (clojure.core/+ offset j) e)
-                          (recur (clojure.core/inc j) (clojure.core/+ s e)))
-                        s))
-            inv-sum (if (clojure.core/zero? sum-exp) 0.0 (clojure.core// 1.0 sum-exp))]
-        (dotimes [j seq-len]
-          (clojure.core/aset ^doubles weights
-                             (clojure.core/+ offset j)
-                             (clojure.core/* (clojure.core/aget ^doubles weights
-                                                                (clojure.core/+ offset j))
-                                             inv-sum)))))
-    (let [d-weights (double-array (clojure.core/* seq-len seq-len))
-          _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len 1.0 0.0)
-          dV (double-array (clojure.core/* seq-len dv))
-          _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv 1.0 0.0)
-          d-scores (double-array (clojure.core/* seq-len seq-len))]
-      (dotimes [i seq-len]
-        (let [offset (clojure.core/* i (clojure.core/int seq-len))
-              dot-wdw (loop [j 0 acc 0.0]
-                        (if (clojure.core/< j seq-len)
-                          (recur (clojure.core/inc j)
-                                 (clojure.core/+ acc
-                                                 (clojure.core/* (clojure.core/aget ^doubles weights
-                                                                                    (clojure.core/+ offset j))
-                                                                 (clojure.core/aget ^doubles d-weights
-                                                                                    (clojure.core/+ offset j)))))
-                          acc))]
-          (dotimes [j seq-len]
-            (clojure.core/aset ^doubles d-scores
-                               (clojure.core/+ offset j)
-                               (if (clojure.core/> j i)
-                                 0.0
-                                 (clojure.core/* scale
-                                                 (clojure.core/aget ^doubles weights
-                                                                    (clojure.core/+ offset j))
-                                                 (clojure.core/- (clojure.core/aget ^doubles d-weights
-                                                                                    (clojure.core/+ offset j))
-                                                                 dot-wdw)))))))
-      (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
-            dK (double-array (clojure.core/* seq-len dk))
-            _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk 1.0 0.0)
-            out (object-array 3)]
-        (clojure.core/aset out 0 dQ)
-        (clojure.core/aset out 1 dK)
-        (clojure.core/aset out 2 dV)
-        out))))
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long dk :- Long dv :- Long]
+       :- (Array Object)
+    ;; scale is :- T (element-typed) so dot*scale and scale*(weights·…) devirtualize
+    ;; for every T — a Double scale would be T×Double (no monomorphic overload → GPU
+    ;; garbage). one/z0 likewise element-typed for the BLAS alpha/beta and masked grad.
+       (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
+             one   (n/oftype Q 1.0)
+             z0    (n/oftype Q 0.0)
+             neg-inf (n/oftype Q -1.0e38)   ; T-typed sentinel, no device-buffer read (see forward)
+             scores  (alloc-like Q (* seq-len seq-len))
+             weights (alloc-like Q (* seq-len seq-len))]
+      ;; Forward recomputation with causal mask (masked entries = neg-inf so
+      ;; exp(neg-inf - max) = 0; no explicit branch — mirrors the forward softmax).
+         (dotimes [i seq-len]
+           (dotimes [j seq-len]
+             (let [dot (loop [d 0 acc 0.0]
+                         (if (< d dk)
+                           (recur (inc d)
+                                  (+ acc (* (aget Q (+ (* i (int dk)) d))
+                                            (aget K (+ (* j (int dk)) d)))))
+                           acc))]
+               (aset scores (+ (* i (int seq-len)) j)
+                     (if (> j i) neg-inf (* dot scale))))))
+         (dotimes [i seq-len]
+           (let [offset (* i (int seq-len))
+                 max-s (loop [j 0 mm neg-inf]
+                         (if (< j seq-len)
+                           (recur (inc j) (n/max mm (aget scores (+ offset j))))
+                           mm))
+                 sum-exp (loop [j 0 s 0.0]
+                           (if (< j seq-len)
+                             (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
+                               (aset weights (+ offset j) e)
+                               (recur (inc j) (+ s e)))
+                             s))
+                 inv-sum (/ one sum-exp)]
+             (dotimes [j seq-len]
+               (aset weights (+ offset j)
+                     (* (aget weights (+ offset j)) inv-sum)))))
+         (let [d-weights (alloc-like Q (* seq-len seq-len))
+               _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len one z0)
+               dV (alloc-like Q (* seq-len dv))
+               _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv one z0)
+               d-scores (alloc-like Q (* seq-len seq-len))]
+           (dotimes [i seq-len]
+             (let [offset (* i (int seq-len))
+                   dot-wdw (loop [j 0 acc 0.0]
+                             (if (< j seq-len)
+                               (recur (inc j)
+                                      (+ acc (* (aget weights (+ offset j))
+                                                (aget d-weights (+ offset j)))))
+                               acc))]
+               (dotimes [j seq-len]
+                 (aset d-scores (+ offset j)
+                       (if (> j i)
+                         z0
+                         (* scale
+                            (aget weights (+ offset j))
+                            (- (aget d-weights (+ offset j)) dot-wdw)))))))
+           (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
+                 dK (alloc-like Q (* seq-len dk))
+                 _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk one z0)
+                 out (object-array 3)]
+             (clojure.core/aset out 0 dQ)
+             (clojure.core/aset out 1 dK)
+             (clojure.core/aset out 2 dV)
+             out)))))
 
 ;; grads-fn (compile-aot flat codegen): calls the backward deftm above and
 ;; extracts the three gradients via aget — a single flat let-binding shape
@@ -621,60 +614,62 @@
 ;;                                             masked j>i have W=0 ⇒ dW=0)
 ;;   dO = dW·V + W·dV
 (deftm causal-scaled-dot-product-attn-jvp
-  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
-   Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long dk :- Long dv :- Long]
-  :- (Array double)
-  (let [scale (/ 1.0 (n/sqrt (double dk)))
-        neg-inf-c Double/NEGATIVE_INFINITY
-        ;; Recompute causal softmax weights (same as the backward)
-        weights (double-array (* seq-len seq-len))
-        _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale 0.0)
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))]
-              (dotimes [j seq-len]
-                (when (> j i)
-                  (aset weights (+ offset j) neg-inf-c)))))
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))
-                  max-s (loop [j 0 m neg-inf-c]
-                          (if (< j seq-len)
-                            (recur (inc j) (n/max m (aget weights (+ offset j))))
-                            m))
-                  sum-exp (loop [j 0 s 0.0]
-                            (if (< j seq-len)
-                              (let [s-ij (aget weights (+ offset j))
-                                    e (if (== s-ij neg-inf-c)
-                                        0.0
-                                        (m/exp (- s-ij max-s)))]
-                                (aset weights (+ offset j) e)
-                                (recur (inc j) (+ s e)))
-                              s))
-                  inv-sum (if (== sum-exp 0.0) 0.0 (/ 1.0 sum-exp))]
-              (dotimes [j seq-len]
-                (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
-        ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
-        dZ (double-array (* seq-len seq-len))
-        _ (blas/dgemm-nt! dQ K dZ seq-len dk seq-len scale 0.0)
-        _ (blas/dgemm-nt! Q dK dZ seq-len dk seq-len scale 1.0)
-        ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
-        dW (double-array (* seq-len seq-len))
-        _ (dotimes [i seq-len]
-            (let [offset (* i (int seq-len))
-                  wdz (loop [j 0 s 0.0]
-                        (if (< j seq-len)
-                          (recur (inc j) (+ s (* (aget weights (+ offset j))
-                                                 (aget dZ (+ offset j)))))
-                          s))]
-              (dotimes [j seq-len]
-                (aset dW (+ offset j)
-                      (* (aget weights (+ offset j))
-                         (- (aget dZ (+ offset j)) wdz))))))
-        ;; dO = dW·V + W·dV
-        dO (double-array (* seq-len dv))
-        _ (blas/dgemm! dW V dO seq-len seq-len dv 1.0 0.0)
-        _ (blas/dgemm! weights dV dO seq-len seq-len dv 1.0 1.0)]
-    dO))
+  (All [T]
+       [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
+        Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long dk :- Long dv :- Long]
+       :- (Array T)
+    ;; scale/one/z0 element-typed (see the backward) — a Double scalar × T has no
+    ;; monomorphic overload and would emit GPU garbage.
+       (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
+             one   (n/oftype Q 1.0)
+             z0    (n/oftype Q 0.0)
+             neg-inf (n/oftype Q -1.0e38)   ; T-typed sentinel, no device-buffer read (see forward)
+          ;; Recompute causal softmax weights (same as the backward)
+             weights (alloc-like Q (* seq-len seq-len))
+             _ (blas/dgemm-nt! Q K weights seq-len dk seq-len scale z0)
+             _ (dotimes [i seq-len]
+                 (let [offset (* i (int seq-len))]
+                   (dotimes [j seq-len]
+                     (when (> j i)
+                       (aset weights (+ offset j) neg-inf)))))
+             _ (dotimes [i seq-len]
+                 (let [offset (* i (int seq-len))
+                       max-s (loop [j 0 mm neg-inf]
+                               (if (< j seq-len)
+                                 (recur (inc j) (n/max mm (aget weights (+ offset j))))
+                                 mm))
+                       sum-exp (loop [j 0 s 0.0]
+                                 (if (< j seq-len)
+                                   (let [e (m/exp (- (aget weights (+ offset j)) max-s))]
+                                     (aset weights (+ offset j) e)
+                                     (recur (inc j) (+ s e)))
+                                   s))
+                       inv-sum (/ one sum-exp)]
+                   (dotimes [j seq-len]
+                     (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
+          ;; dZ = scale·(dQ·Kᵀ + Q·dKᵀ)
+             dZ (alloc-like Q (* seq-len seq-len))
+             _ (blas/dgemm-nt! dQ K dZ seq-len dk seq-len scale z0)
+             _ (blas/dgemm-nt! Q dK dZ seq-len dk seq-len scale one)
+          ;; softmax JVP per row: dW = W⊙(dZ − ⟨W,dZ⟩_row)
+             dW (alloc-like Q (* seq-len seq-len))
+             _ (dotimes [i seq-len]
+                 (let [offset (* i (int seq-len))
+                       wdz (loop [j 0 s 0.0]
+                             (if (< j seq-len)
+                               (recur (inc j) (+ s (* (aget weights (+ offset j))
+                                                      (aget dZ (+ offset j)))))
+                               s))]
+                   (dotimes [j seq-len]
+                     (aset dW (+ offset j)
+                           (* (aget weights (+ offset j))
+                              (- (aget dZ (+ offset j)) wdz))))))
+          ;; dO = dW·V + W·dV
+             dO (alloc-like Q (* seq-len dv))
+             _ (blas/dgemm! dW V dO seq-len seq-len dv one z0)
+             _ (blas/dgemm! weights dV dO seq-len seq-len dv one one)]
+         dO)))
 
 ;; causal SDPA :jvp-fn — one kernel call; absent tangents get typed zeros
 ;; (the pushforward is jointly linear in (dQ,dK,dV), so zeros are exact).
@@ -762,94 +757,210 @@
 ;; Differentiable GQA/MQA causal attention (Llama/Qwen/Gemma decoders)
 ;; ================================================================
 
+;; ----------------------------------------------------------------
+;; batched-causal-sdpa: causal SDPA over `batch` contiguous [seq,hd] head slabs
+;; (Q,K,V all packed [batch,seq,hd]). Opaque to AD (its own flat :grads-fn below
+;; calls the batched backward) so the head iteration NEVER enters the reverse-AD
+;; tape — that is what keeps gqa-causal-mha's gradient a straight-line let* (no
+;; fn* pullback closure / ArrayList tape).
+;;
+;; FORWARD = a SINGLE fused resident `par/map-void!` causal-attention kernel — the
+;; full-sequence causal-prefill sibling of the proven decode kernels
+;; gqa-decode-attention-gpu!/-buf!. One work-item per (batch b, query row i) at
+;; flat index bi = b*seq-len + i computes the whole output row out[b,i,0..hd):
+;;   pass 1  mx  = max_{j≤i}  scale·(Qb[i]·Kb[j])          (CAUSAL via the j≤i bound
+;;   pass 2  sum = Σ_{j≤i} exp(scale·(Qb[i]·Kb[j]) − mx)    — NO neg-inf sentinel, NO
+;;   pass 3  out[i,d] = Σ_{j≤i} (exp(…−mx)/sum)·Vb[j,d]     mask buffer, NO GEMM,
+;;                                                          NO per-batch dotimes).
+;; Each pass recomputes the QKᵀ dot once per key j (O(i·hd) per row); the score is
+;; dot/sqrt(head-dim); the output row is accumulated in-place in `out` (each work-item
+;; owns its disjoint hd slab), so no per-item scratch and no device-buffer scalar reads
+;; → lowers to one :map-void kernel. (All [T]), fully element-typed (float on GPU /
+;; double on CPU). Numerically equals the GEMM-based reference to GEMM-vs-naive-dot
+;; tolerance (~1e-6 f32 / ~1e-13 f64); the j>i terms of the reference contribute
+;; exp(-1e38-mx)=0 exactly.
+;; ----------------------------------------------------------------
+(deftm batched-causal-sdpa
+  (All [T]
+       [Q :- (Array T) K :- (Array T) V :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array T)
+       ;; Everything stays parametric in T with NO hard casts on T-data. Two mechanisms:
+       ;; (1) Reduction accumulator seeds are BARE floating literals inlined into the loop
+       ;;     heads (0.0 / -1.0e38 / 1.0): a bare floating-literal loop-var init NARROWS to
+       ;;     the element dtype (float at :float, double at :double — see walker :let
+       ;;     floating-literal-narrowed-tag), so mm/dot/sum/inv stay T-typed. A let-bound /
+       ;;     oftype seed of a CONSTANT gets folded to an untyped literal → mx/inv lose their
+       ;;     type → bare raster.numeric ops that fail resident GPU lowering.
+       ;; (2) The 1/sqrt(head-dim) scale is a DIVISION of dot by a `dot`-typed sqrt(head-dim)
+       ;;     — `(n/oftype dot …)` makes the divisor T. Typing off `dot` (a data-dependent
+       ;;     scalar) not an array/host-constant is what keeps it resident: an oftype whose
+       ;;     ref is an array param / a foldable constant gets alias-propagated to a device
+       ;;     buffer or hoisted to a host scalar-let reading one → non-resident.
+       ;; So every `(/ dot …)`, `(n/max mm …)`, `(- score mx)`, `(* exp inv)` DEVIRTUALIZES for
+       ;; BOTH dtypes, incl. on the composed/inlined re-walk inside gqa-causal-mha. `-1.0e38`
+       ;; is the OpenCL-safe -inf sentinel the decode kernels use (OpenCL has no NEG_INFINITY).
+       (let [slab  (* seq-len head-dim)
+             out   (alloc-like Q (* batch slab))]
+         (raster.par/map-void! bi (clojure.core/* batch seq-len)
+                               (let [b    (quot bi seq-len)
+                                     i    (rem bi seq-len)
+                                     boff (clojure.core/* b slab)
+                                     qrow (clojure.core/+ boff (clojure.core/* i head-dim))
+                 ;; Score = dot / sqrt(head-dim). The 1/sqrt scale is applied as a DIVISION
+                 ;; of `dot` by a `dot`-typed sqrt(head-dim): `(n/oftype dot …)` makes the
+                 ;; divisor T (float on GPU / double on CPU) so `(/ dot …)` is T÷T and stays
+                 ;; devirtualized (a Double scale would be T×Double = no monomorphic overload
+                 ;; → GPU garbage, polymorphic-kernel-scalar-dtype). Typing off `dot` (a
+                 ;; genuine data-dependent scalar) rather than an array/host constant is what
+                 ;; keeps it resident: an oftype whose ref is an array param / a foldable
+                 ;; constant gets alias-propagated to a device-buffer alloc or hoisted to a
+                 ;; host scalar-let reading one → non-resident.
+                 ;; pass 1: running max of the ≤i scaled QKᵀ dots
+                                     mx (loop [j 0 mm -1.0e38]
+                                          (if (<= j i)
+                                            (let [krow (clojure.core/+ boff (clojure.core/* j head-dim))
+                                                  dot (loop [d 0 acc 0.0]
+                                                        (if (< d head-dim)
+                                                          (recur (inc d)
+                                                                 (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                           (aget K (clojure.core/+ krow d)))))
+                                                          acc))]
+                                              (recur (inc j) (n/max mm (/ dot (n/oftype dot (n/sqrt (double head-dim)))))))
+                                            mm))
+                 ;; pass 2: softmax denominator Σ exp(score − mx) over ≤i keys
+                                     sum (loop [j 0 s 0.0]
+                                           (if (<= j i)
+                                             (let [krow (clojure.core/+ boff (clojure.core/* j head-dim))
+                                                   dot (loop [d 0 acc 0.0]
+                                                         (if (< d head-dim)
+                                                           (recur (inc d)
+                                                                  (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                            (aget K (clojure.core/+ krow d)))))
+                                                           acc))]
+                                               (recur (inc j) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double head-dim)))) mx)))))
+                                             s))
+                                     inv (/ 1.0 sum)]
+             ;; zero this row's output slab, then pass 3 accumulates weighted V
+                                 (loop [d 0]
+                                   (if (< d head-dim)
+                                     (do (aset out (clojure.core/+ qrow d) 0.0)
+                                         (recur (inc d)))
+                                     nil))
+                                 (loop [j 0]
+                                   (if (<= j i)
+                                     (let [krow (clojure.core/+ boff (clojure.core/* j head-dim))
+                                           dot (loop [d 0 acc 0.0]
+                                                 (if (< d head-dim)
+                                                   (recur (inc d)
+                                                          (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                    (aget K (clojure.core/+ krow d)))))
+                                                   acc))
+                                           w (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double head-dim)))) mx)) inv)]
+                                       (loop [d 0]
+                                         (if (< d head-dim)
+                                           (do (aset out (clojure.core/+ qrow d)
+                                                     (+ (aget out (clojure.core/+ qrow d))
+                                                        (* w (aget V (clojure.core/+ krow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc j)))
+                                     nil))))
+         out)))
+
+(deftm batched-causal-sdpa-backward
+  "Backward for batched-causal-sdpa. Returns Object[3] = [dQ dK dV]. Batches own
+  disjoint slabs (no cross-batch accumulation — the GQA kv-head fan-in is handled
+  by sum-kv-heads OUTSIDE this op, since K/V are already broadcast to `batch=n_q`)."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        batch :- Long seq-len :- Long head-dim :- Long]
+       :- (Array Object)
+       (let [slab (* seq-len head-dim)
+             dQ (alloc-like Q (* batch slab))
+             dK (alloc-like Q (* batch slab))
+             dV (alloc-like Q (* batch slab))]
+         (dotimes [b batch]
+           (let [boff (* b (int slab))
+                 Qb (alloc-like Q slab) Kb (alloc-like Q slab)
+                 Vb (alloc-like Q slab) dOb (alloc-like Q slab)]
+             (dotimes [i slab]
+               (aset Qb i (aget Q (+ boff i)))
+               (aset Kb i (aget K (+ boff i)))
+               (aset Vb i (aget V (+ boff i)))
+               (aset dOb i (aget d-out (+ boff i))))
+             (let [g   (causal-scaled-dot-product-attn-backward
+                        dOb Qb Kb Vb seq-len head-dim head-dim)
+                   dQb (clojure.core/aget g 0)
+                   dKb (clojure.core/aget g 1)
+                   dVb (clojure.core/aget g 2)]
+               ;; dQb/dKb/dVb are (Array T) but extracted from an Object[] so their
+               ;; compile-time tag is Object — scatter through the typed blit-slab!
+               ;; helper (not a direct raster.arrays/aget) so element access
+               ;; devirtualizes to the real double[]/float[] under compile-aot.
+               (ops/blit-slab! dQ boff dQb slab)
+               (ops/blit-slab! dK boff dKb slab)
+               (ops/blit-slab! dV boff dVb slab))))
+         (let [o (object-array 3)]
+           (clojure.core/aset o 0 dQ)
+           (clojure.core/aset o 1 dK)
+           (clojure.core/aset o 2 dV)
+           o))))
+
+(tmpl/merge-into-template! 'raster.dl.attention/batched-causal-sdpa
+                           {:params '[Q K V batch seq-len head-dim]
+                            :result nil :adjoint 'dy
+                            :grads-fn
+                            (fn [ctx [Q K V batch seq-len head-dim]
+                                 _result-sym adjoint-sym gensym-fn]
+                              (let [bundle (gensym-fn "bcspa_grads")
+                                    dQ (gensym-fn "dQ")
+                                    dK (gensym-fn "dK")
+                                    dV (gensym-fn "dV")]
+                                [(update ctx :bindings into
+                                         [bundle (list 'raster.dl.attention/batched-causal-sdpa-backward
+                                                       adjoint-sym Q K V batch seq-len head-dim)
+                                          dQ (list 'clojure.core/aget bundle 0)
+                                          dK (list 'clojure.core/aget bundle 1)
+                                          dV (list 'clojure.core/aget bundle 2)])
+                                 [dQ dK dV nil nil nil]]))})
+
 (deftm gqa-causal-mha
   "Differentiable grouped/multi-query causal self-attention over PRE-PROJECTED,
   PRE-ROPED Q:[seq,n_q·hd] and K/V:[seq,n_kv·hd] (n_kv divides n_q; n_kv<n_q = GQA,
-  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Composed only from
-  AD-registered primitives (slice-strided-2d → causal-scaled-dot-product-attn →
-  scatter-strided-2d → array-add) in the tail-loop-with-let shape, so value+grad
-  inlines it cleanly — no explicit pullback (the training-forward twin of the
-  inference-only gqa-causal-attention above). Returns [seq, n_q·hd]; the output
-  projection is a separate linear-nb in the model forward. Scale is 1/sqrt(hd)
-  (correct for Llama/Qwen, and Gemma when query_pre_attn_scalar = head_dim; a
-  custom-scale variant is a follow-up)."
-  [Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array double)
-  (let [group    (quot n-q n-kv)
-        qstride  (* n-q head-dim)
-        kvstride (* n-kv head-dim)
-        n        (* seq-len qstride)]
-    (loop [hq 0 acc (double-array n)]
-      (if (< hq n-q)
-        (let [hkv      (quot hq group)
-              Qh       (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
-              Kh       (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
-              Vh       (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
-              head-out (causal-scaled-dot-product-attn Qh Kh Vh seq-len head-dim head-dim)
-              out-h    (ops/scatter-strided-2d head-out seq-len qstride (* hq (int head-dim)) head-dim)]
-          (recur (inc hq) (ops/array-add acc out-h n)))
-        acc))))
+  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Returns [seq, n_q·hd].
 
-;; GQA backward: per query head, run the single-head causal-SDPA backward, then
-;; scatter dQ into head hq's slab and ACCUMULATE dK/dV into head hkv's slab
-;; (each kv head is read by `group` query heads). Returns object-array [dQ dK dV].
-;; A registered op (raw loops here are never differentiated) so the forward stays
-;; symbolic — needed because the compose-from-primitives forward returns the bare
-;; accumulator (no baked output projection), which the loop-inlining reverse pass
-;; can't handle as a let-bound/argument loop result.
-(deftm gqa-causal-mha-backward
-  [dY :- (Array double) Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array Object)
-  (let [group    (quot n-q n-kv)
-        qstride  (* n-q head-dim)
-        kvstride (* n-kv head-dim)
-        dQ (double-array (clojure.core/* seq-len qstride))
-        dK (double-array (clojure.core/* seq-len kvstride))
-        dV (double-array (clojure.core/* seq-len kvstride))]
-    (dotimes [hq n-q]
-      (let [hkv (clojure.core/quot hq (int group))
-            Qh  (ops/slice-strided-2d Q seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
-            Kh  (ops/slice-strided-2d K seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
-            Vh  (ops/slice-strided-2d V seq-len kvstride (clojure.core/* hkv (int head-dim)) head-dim)
-            dYh (ops/slice-strided-2d dY seq-len qstride (clojure.core/* hq (int head-dim)) head-dim)
-            b   (causal-scaled-dot-product-attn-backward dYh Qh Kh Vh seq-len head-dim head-dim)
-            dQh (clojure.core/aget ^objects b 0)
-            dKh (clojure.core/aget ^objects b 1)
-            dVh (clojure.core/aget ^objects b 2)]
-        (dotimes [r seq-len]
-          (let [qoff  (clojure.core/+ (clojure.core/* r (int qstride)) (clojure.core/* hq (int head-dim)))
-                kvoff (clojure.core/+ (clojure.core/* r (int kvstride)) (clojure.core/* hkv (int head-dim)))
-                hoff  (clojure.core/* r (int head-dim))]
-            (dotimes [c head-dim]
-              (clojure.core/aset ^doubles dQ (clojure.core/+ qoff c)
-                                 (double (clojure.core/aget ^doubles dQh (clojure.core/+ hoff c))))
-              (clojure.core/aset ^doubles dK (clojure.core/+ kvoff c)
-                                 (clojure.core/+ (clojure.core/aget ^doubles dK (clojure.core/+ kvoff c))
-                                                 (clojure.core/aget ^doubles dKh (clojure.core/+ hoff c))))
-              (clojure.core/aset ^doubles dV (clojure.core/+ kvoff c)
-                                 (clojure.core/+ (clojure.core/aget ^doubles dV (clojure.core/+ kvoff c))
-                                                 (clojure.core/aget ^doubles dVh (clojure.core/+ hoff c)))))))))
-    (let [out (object-array 3)]
-      (clojure.core/aset out 0 dQ)
-      (clojure.core/aset out 1 dK)
-      (clojure.core/aset out 2 dV)
-      out)))
+  FLAT decomposition (no per-head carry loop): pack Q/K/V to per-head-contiguous
+  layout, BROADCAST the n_kv kv heads up to the n_q query heads (broadcast-kv-heads),
+  run a batched causal SDPA over the n_q head slabs, then unpack the disjoint
+  per-head outputs back to [seq, n_q·hd]. Every step is an AD-registered primitive
+  with a FLAT grads-fn (pack↔unpack, broadcast-kv-heads↔sum-kv-heads,
+  batched-causal-sdpa↔its backward), so value+grad differentiates it as a
+  straight-line let* — NO fn* pullback / ArrayList tape (the old raw carry loop
+  emitted one, which cannot lower to GPU). The MQA/GQA dK/dV fan-in (the `group`
+  query heads sharing one kv head) falls out exactly as sum-kv-heads (the
+  broadcast dual). Scale is 1/sqrt(hd) (Llama/Qwen; Gemma when
+  query_pre_attn_scalar = head_dim). The output projection is a separate linear-nb."
+  (All [T]
+       [Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+       :- (Array T)
+       (let [group (quot n-q n-kv)
+             slab  (* seq-len head-dim)
+             Qp (ops/pack-heads Q seq-len n-q head-dim)
+             Kp (ops/pack-heads K seq-len n-kv head-dim)
+             Vp (ops/pack-heads V seq-len n-kv head-dim)
+             Ke (ops/broadcast-kv-heads Kp n-kv group slab)
+             Ve (ops/broadcast-kv-heads Vp n-kv group slab)
+             Op (batched-causal-sdpa Qp Ke Ve n-q seq-len head-dim)]
+         (ops/unpack-heads Op seq-len n-q head-dim))))
 
-(tmpl/merge-into-template! 'raster.dl.attention/gqa-causal-mha
-                           {:params '[Q K V seq-len n-q n-kv head-dim] :result nil :adjoint 'dy
-                            :grads-fn
-                            (fn [ctx [Q K V seq-len n-q n-kv head-dim] _result-sym adjoint-sym gensym-fn]
-                              (let [b (gensym-fn "gqa_b") dQ (gensym-fn "dQ")
-                                    dK (gensym-fn "dK") dV (gensym-fn "dV")]
-                                [(update ctx :bindings into
-                                         [b (list 'raster.dl.attention/gqa-causal-mha-backward
-                                                  adjoint-sym Q K V seq-len n-q n-kv head-dim)
-                                          dQ (list 'clojure.core/aget b 0)
-                                          dK (list 'clojure.core/aget b 1)
-                                          dV (list 'clojure.core/aget b 2)])
-                                 [dQ dK dV nil nil nil nil]]))})
+;; gqa-causal-mha has NO hand-written reverse rule of its own: it is composed
+;; entirely from AD-registered primitives with flat grads-fn templates
+;; (pack-heads/unpack-heads, broadcast-kv-heads/sum-kv-heads, batched-causal-sdpa),
+;; so value+grad inlines and differentiates it into a straight-line let* — flat,
+;; GPU-lowerable IR with no closures-as-tape. The :jvp-fn (forward mode) is KEPT
+;; below — its removability is a separate forward-mode audit.
 
 ;; Forward tangent (JVP, §13 A3) of GQA/MQA causal attention — mirrors
 ;; gqa-causal-mha-backward's head iteration: per query head hq, slice the
@@ -858,30 +969,31 @@
 ;; no accumulation on the output side; the kv-head fan-IN that forces dK/dV
 ;; accumulation in the backward has no forward counterpart).
 (deftm gqa-causal-mha-jvp
-  [dQ :- (Array double) dK :- (Array double) dV :- (Array double)
-   Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
-  :- (Array double)
-  (let [group (quot n-q n-kv)
-        qstride (* n-q head-dim)
-        kvstride (* n-kv head-dim)
-        dOut (double-array (* seq-len qstride))]
-    (dotimes [hq n-q]
-      (let [hkv (quot hq (int group))
-            Qh (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
-            Kh (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
-            Vh (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
-            dQh (ops/slice-strided-2d dQ seq-len qstride (* hq (int head-dim)) head-dim)
-            dKh (ops/slice-strided-2d dK seq-len kvstride (* hkv (int head-dim)) head-dim)
-            dVh (ops/slice-strided-2d dV seq-len kvstride (* hkv (int head-dim)) head-dim)
-            dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
-                                                    seq-len head-dim head-dim)]
-        (dotimes [r seq-len]
-          (let [qoff (+ (* r (int qstride)) (* hq (int head-dim)))
-                hoff (* r (int head-dim))]
-            (dotimes [c head-dim]
-              (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))
-    dOut))
+  (All [T]
+       [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
+        Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+       :- (Array T)
+       (let [group (quot n-q n-kv)
+             qstride (* n-q head-dim)
+             kvstride (* n-kv head-dim)
+             dOut (alloc-like Q (* seq-len qstride))]
+         (dotimes [hq n-q]
+           (let [hkv (quot hq (int group))
+                 Qh (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
+                 Kh (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
+                 Vh (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
+                 dQh (ops/slice-strided-2d dQ seq-len qstride (* hq (int head-dim)) head-dim)
+                 dKh (ops/slice-strided-2d dK seq-len kvstride (* hkv (int head-dim)) head-dim)
+                 dVh (ops/slice-strided-2d dV seq-len kvstride (* hkv (int head-dim)) head-dim)
+                 dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
+                                                         seq-len head-dim head-dim)]
+             (dotimes [r seq-len]
+               (let [qoff (+ (* r (int qstride)) (* hq (int head-dim)))
+                     hoff (* r (int head-dim))]
+                 (dotimes [c head-dim]
+                   (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))
+         dOut)))
 
 ;; gqa-causal-mha :jvp-fn — one kernel call; absent tangents get typed zeros
 ;; (jointly linear pushforward in (dQ,dK,dV)).

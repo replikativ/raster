@@ -339,6 +339,17 @@
       (get-pullback-factory op))
     (get-pullback-factory op)))
 
+(defn has-reverse-rule?
+  "True if op has a REVERSE-mode AD rule: a static :grads/:grads-fn template OR a
+  runtime :pullback-factory/:closure. A jvp-only template (forward mode) does NOT
+  count — an op with only a :jvp-fn has no reverse rule, so reverse-AD must INLINE
+  its composed body to differentiate it (rather than keep it symbolic and fall
+  back to the opaque get-pullback-factory closure, which cannot lower to GPU).
+  Keys on the resolved (mangled-name aware) template."
+  [op]
+  (when-let [[t _] (resolve-template op)]
+    (or (:grads t) (:grads-fn t) (:pullback-factory t) (:closure t))))
+
 ;; ================================================================
 ;; Arithmetic templates
 ;; ================================================================
@@ -672,6 +683,16 @@
                     {:params '[ref n] :result nil :adjoint 'dy
                      :grads '[nil nil]})
 
+;; alloc-like: the parametric zero allocator (Julia `similar`) — like zeros-like
+;; and double-array/float-array, the exemplar arg only supplies dtype/shape, so
+;; there is no differentiable dependence. Without this, a differentiated loop
+;; whose carry is initialized with `(alloc-like active-arr n)` (e.g. gqa-causal-mha's
+;; per-head accumulator, promoted to (All [T])) tries to trace the allocation and
+;; the carry-init pullback comes back nil.
+(register-template! 'raster.arrays/alloc-like
+                    {:params '[ref n] :result nil :adjoint 'dy
+                     :grads '[nil nil]})
+
 ;; aset: arr[i] = v → no gradient through aset itself (mutation side-effect).
 ;; The gradient for mutation flows through the stored value's downstream reads.
 (register-template! 'clojure.core/aset
@@ -732,17 +753,20 @@
                      :grads-fn
                      (fn [ctx [pred target n] _result-sym adjoint-sym gensym-fn]
                        (let [d-pred (gensym-fn "d_pred")
-           ;; Emit: d_pred = (let [out (double-array n)]
-           ;;                  (dotimes [i n]
-           ;;                    (aset out i (* (/ (* 2.0 dy) n) (- pred[i] target[i]))))
-           ;;                  out)
-           ;; But as flat S-expressions the compiler can see through
+           ;; d_pred[i] = (2*dy/n)*(pred[i]-target[i]). Emitted as the inlinable
+           ;; (All [T]) mse-grad SOAC (a broadcast), NOT the CPU-era ^:no-inline
+           ;; BLAS helper daxpy-diff! — so the fused backward lowers to a resident
+           ;; GPU kernel (on-device LoRA training) and SIMD-vectorizes on CPU. The
+           ;; scale is a plain Double — it becomes mse-grad's declared scalar
+           ;; kernel param (a uniform, emitted float at :float dtype), so it does
+           ;; not drag the forward array into a host size/scalar closure and does
+           ;; not become a double intermediate in the float kernel.
                              scale (gensym-fn "mse_scale")
                              n-long (gensym-fn "mse_n")
                              ctx1 (update ctx :bindings into
                                           [n-long (list 'long n)
                                            scale (list 'raster.numeric// (list 'raster.numeric/* 2.0 adjoint-sym) (list 'double n-long))
-                                           d-pred (list 'raster.linalg.blas/daxpy-diff! pred target scale n-long)])]
+                                           d-pred (list 'raster.dl.loss/mse-grad pred target scale n-long)])]
                          [ctx1 [d-pred nil nil]]))})
 
 ;; transpose-2d: out[j*rows+i] = a[i*cols+j]
@@ -1421,6 +1445,38 @@
               [ctx terms])]
         (sum-tangent-contribs ctx terms gensym-fn))))})
 
+;; mse-grad(pred,target,scale,n) = scale·(pred−target) — structurally IDENTICAL
+;; to daxpy-diff! (it is the mse-loss backward SOAC that replaced it for GPU
+;; lowering), so it carries the same second-order facets: jointly LINEAR in
+;; (pred,target) and BILINEAR with scale. Product rule, both terms the op itself.
+(merge-into-template!
+ 'raster.dl.loss/mse-grad
+ {:jvp-fn
+  (fn [ctx [pred target scale n] tangent-args _result-sym gensym-fn]
+    (let [dpred   (nth tangent-args 0 nil)
+          dtarget (nth tangent-args 1 nil)
+          dscale  (nth tangent-args 2 nil)]
+      (when-not (or dpred dtarget dscale)
+        (throw (ex-info "mse-grad jvp: no active tangent reached the call"
+                        {:op 'raster.dl.loss/mse-grad})))
+      (let [[ctx terms]
+            (if (or dpred dtarget)
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jmseg_ab"
+                                            (list 'raster.dl.loss/mse-grad
+                                                  (or dpred (jvp-zero-like pred))
+                                                  (or dtarget (jvp-zero-like target))
+                                                  scale n))]
+                [ctx' [s]])
+              [ctx []])
+            [ctx terms]
+            (if dscale
+              (let [[ctx' s] (bind-jvp-term ctx gensym-fn "jmseg_s"
+                                            (list 'raster.dl.loss/mse-grad
+                                                  pred target dscale n))]
+                [ctx' (conj terms s)])
+              [ctx terms])]
+        (sum-tangent-contribs ctx terms gensym-fn))))})
+
 ;; silu/gelu-backward (dy, x, n) → dy⊙act′(x): LINEAR in dy (that term is the
 ;; kernel itself on the dy-tangent); the x-direction is the SECOND-ORDER
 ;; elementwise rule (#72, act″ LANDED): d/dx[dy⊙act′(x)]·Δx = dy⊙act″(x)⊙Δx,
@@ -1577,6 +1633,19 @@
         (list 'raster.par/dot-product
               c (list 'raster.linalg.blas/daxpy-diff! a b 1.0 n)))}
 
+   ;; mse-grad(pred,target,scale,n) = scale·(pred−target): same linear/bilinear
+   ;; structure as daxpy-diff! (its GPU-lowering twin, the mse-loss backward).
+   'raster.dl.loss/mse-grad
+   {0 (fn [[_pred _target scale n] c]
+        (list 'raster.dl.loss/mse-grad
+              c (list 'raster.arrays/zeros-like c n) scale n))
+    1 (fn [[_pred _target scale n] c]
+        (list 'raster.dl.loss/mse-grad
+              (list 'raster.arrays/zeros-like c n) c scale n))
+    2 (fn [[pred target _scale n] c]
+        (list 'raster.par/dot-product
+              c (list 'raster.dl.loss/mse-grad pred target 1.0 n)))}
+
    'raster.par/dot-product
    ;; c is a SCALAR cotangent; scale's alpha is annotated Double, so widen
    ;; explicitly (a float-typed seed dispatches [Float floats] otherwise —
@@ -1610,3 +1679,28 @@
            (not (or (:grads t) (:grads-fn t))))
        (assoc :grads-fn (derive-rrule-from-structure op adjoint-map)
               ::derived-grads-fn true)))))
+
+;; --- Load-time fail-loud guard for the has-reverse-rule? inliner gate ---
+;; The op-adjoints entries above are the structure-tagged BACKWARD kernels that
+;; appear as opaque calls inside gradient programs (linear-dx/dW/db, relu/silu/
+;; gelu-backward, daxpy-diff!, dot-product, scale, aclone, mse-grad). Each derives
+;; a :jvp-fn from its :structure tag, so it is "jvp-capable"; but for REVERSE-AD it
+;; must stay SYMBOLIC — `has-reverse-rule?` (raster.compiler...scalar.inline, the
+;; inliner gate) keeps an op symbolic ONLY when it has a reverse rule
+;; (:grads/:grads-fn/:pullback-factory). Without one, the gate treats the kernel as
+;; jvp-only and INLINES it — silently mis-differentiating an opaque backward kernel
+;; (and defeating GPU lowering). This assert makes that failure mode LOUD at load
+;; time: every op-adjoints kernel must actually carry an installed reverse rule
+;; after the derivation above. A future structure-tagged backward kernel added
+;; here (or whose derivation regresses) that ends up without a reverse rule fails
+;; the require instead of miscompiling at runtime.
+(doseq [op (keys op-adjoints)]
+  (when-not (has-reverse-rule? op)
+    (throw (ex-info
+            (str "AD registry invariant violated: structure-tagged backward kernel "
+                 op " has an op-adjoints entry but NO installed reverse rule "
+                 "(:grads/:grads-fn/:pullback-factory). `has-reverse-rule?` would "
+                 "treat it as jvp-only and let the inliner silently inline + "
+                 "mis-differentiate it. derive-rrule-from-structure must install a "
+                 ":grads-fn for every op-adjoints kernel.")
+            {:op op :template-keys (keys (get-template op))}))))

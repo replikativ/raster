@@ -84,3 +84,19 @@
   (if (or (nil? dtype) (= dtype :double))
     env
     (into {} (map (fn [[k v]] [k (remap-tag v dtype)])) env)))
+
+(defn infer-dtype-from-tags
+  "Element dtype of a body given its parameter dispatch tags — the effective-
+   dtype rule shared by ALL monomorphized walk seams (compile-aot get-walked-body,
+   lazy-JIT jit-walk-with-tc, specialize-fn!): array tags first (floats/doubles),
+   then scalar tags (float/double). :float, :double, or nil (integer-only /
+   generic). A float-tagged body walked WITHOUT this dtype types its bare 0.0
+   accumulator inits double — the f64-in-f32 tier-divergence class."
+  [tags]
+  (when tags
+    (cond
+      (some #{'floats} tags) :float
+      (some #{'doubles} tags) :double
+      (some #{'float} tags) :float
+      (some #{'double} tags) :double
+      :else nil)))

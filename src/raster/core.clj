@@ -49,6 +49,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.dispatch :as dispatch]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.walker :as walker]
             [raster.compiler.core.specialize :as specialize]
             [raster.compiler.backend.jvm.valhalla :as valhalla]
@@ -309,8 +310,15 @@
   [source-body params tags annotations source-ns]
   (let [type-env (build-walker-type-env params annotations)
         tc-binding-tags (inf/safe-tc-binding-tags '<jit> params annotations source-body source-ns)
+        ;; Effective element dtype from the dispatch tags — the SAME rule as
+        ;; compile-aot's get-walked-body. Without it the lazy-JIT tier walked a
+        ;; float body dtype-blind: bare 0.0 accumulator inits typed double →
+        ;; the DEFAULT execution tier computed f64 where compile-aot computes
+        ;; f32 (numeric divergence between tiers + per-element widening casts).
+        element-dtype (dtype/infer-dtype-from-tags tags)
         walk-opts (cond-> {:type-env type-env :source-ns (or source-ns *ns*)}
-                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags))]
+                    (seq tc-binding-tags) (assoc :tc-binding-tags tc-binding-tags)
+                    (#{:float :double} element-dtype) (assoc :element-dtype element-dtype))]
     ;; walk-body closes the core (macroexpand-core) at its single canonical point.
     (mapv #(walker/walk-body % walk-opts) source-body)))
 
@@ -478,23 +486,23 @@
   (let [v (if (::deftm (meta v))
             v
             (or (try (resolve-deftm-var v nil) (catch Exception _ nil)) v))]
-  (or (seq (::deftm-walked-body (meta v)))
-      (locking v
-        (or (seq (::deftm-walked-body (meta v)))
-            (when-let [src (::deftm-source-body (meta v))]
-              (let [m (meta v)
-                    walked (try (jit-walk-with-tc (vec src)
-                                                  (::deftm-params m)
-                                                  (::deftm-tags m)
-                                                  (::deftm-annotations m)
-                                                  (try (the-ns (::deftm-source-ns m))
-                                                       (catch Exception _ *ns*)))
-                                (catch Throwable _
+    (or (seq (::deftm-walked-body (meta v)))
+        (locking v
+          (or (seq (::deftm-walked-body (meta v)))
+              (when-let [src (::deftm-source-body (meta v))]
+                (let [m (meta v)
+                      walked (try (jit-walk-with-tc (vec src)
+                                                    (::deftm-params m)
+                                                    (::deftm-tags m)
+                                                    (::deftm-annotations m)
+                                                    (try (the-ns (::deftm-source-ns m))
+                                                         (catch Exception _ *ns*)))
+                                  (catch Throwable _
                                   ;; Fallback: walk without TC
-                                  (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
-                                    (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
-                (alter-meta! v assoc ::deftm-walked-body (vec walked))
-                (vec walked))))))))
+                                    (let [te (build-walker-type-env (::deftm-params m) (::deftm-annotations m))]
+                                      (mapv #(walker/walk-body % {:type-env te :source-ns *ns*}) (vec src)))))]
+                  (alter-meta! v assoc ::deftm-walked-body (vec walked))
+                  (vec walked))))))))
 
 ;; ================================================================
 ;; Public API: defn — Clojure defn with walked body for compiler inlining

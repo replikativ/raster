@@ -17,7 +17,9 @@
             [raster.compiler.core.types :as types]))
 
 ;; A controlled, non-parametric deftm so meta keys are concrete and stable.
-(deftm wbc-sq [x :- (Array Double) n :- Long] :- (Array Double)
+;; ((Array double), primitive — the boxed (Array Double) spelling was a typo
+;; that silently compiled Object[]; caught by the annotation->tag warning.)
+(deftm wbc-sq [x :- (Array double) n :- Long] :- (Array double)
   (let [out (alloc-like x n)]
     (dotimes [i n]
       (aset out i (* (aget x i) (aget x i))))

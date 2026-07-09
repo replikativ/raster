@@ -15,6 +15,9 @@
    Level-Zero / Intel-XMX only (the fp16 DPAS GEMM kernel). Skips cleanly without a GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.pipeline :as pl]
+            [raster.dl.array-ops :as ops]
+            [raster.dl.attention :as attn]
+            [raster.arrays :as ra]
             [raster.dl.nn :as nn]))
 
 (def ^:private gpu-available?
@@ -77,6 +80,101 @@
           (is (< (rel-err out cpu) tol)
               (str "linear-dW relerr " (rel-err out cpu))))))))
 
+(deftest gpu-attention-layout-ops-resident
+  ;; The four dense-attention LAYOUT ops (pack/unpack heads + broadcast/sum KV heads)
+  ;; used inside the flat gqa-causal-mha are strided permutation/broadcast/segment-reduce
+  ;; copies re-expressed over par/map-void!, so each lowers to a SINGLE resident :map-void
+  ;; kernel on device (no raw loop / host-scalar fallback) and matches the CPU reference.
+  (if-not @gpu-available?
+    (println "  [SKIP] gpu-attention-layout: no Level Zero GPU")
+    (let [tol 1e-5]
+      (testing "pack-heads lowers to a resident :map-void kernel and matches CPU"
+        (let [sl 6 nh 4 hd 8 x (rnd (* sl nh hd) 21)
+              cpu (ops/pack-heads x sl nh hd)
+              {:keys [descriptor out]} (run-resident #'ops/pack-heads [x sl nh hd])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "pack-heads relerr " (rel-err out cpu)))))
+      (testing "unpack-heads lowers to a resident :map-void kernel and matches CPU"
+        (let [sl 6 nh 4 hd 8 x (rnd (* sl nh hd) 22)
+              cpu (ops/unpack-heads x sl nh hd)
+              {:keys [descriptor out]} (run-resident #'ops/unpack-heads [x sl nh hd])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "unpack-heads relerr " (rel-err out cpu)))))
+      (testing "broadcast-kv-heads (MQA fan-out) lowers resident and matches CPU"
+        (let [nkv 2 grp 4 slab 48 src (rnd (* nkv slab) 23)
+              cpu (ops/broadcast-kv-heads src nkv grp slab)
+              {:keys [descriptor out]} (run-resident #'ops/broadcast-kv-heads [src nkv grp slab])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "broadcast-kv relerr " (rel-err out cpu)))))
+      (testing "sum-kv-heads (fan-in segment reduce) lowers resident and matches CPU"
+        (let [nkv 2 grp 4 slab 48 big (rnd (* nkv grp slab) 24)
+              cpu (ops/sum-kv-heads big nkv grp slab)
+              {:keys [descriptor out]} (run-resident #'ops/sum-kv-heads [big nkv grp slab])]
+          (is (= [:map-void] (mapv :convention (:steps descriptor))))
+          (is (< (rel-err out cpu) tol) (str "sum-kv relerr " (rel-err out cpu))))))))
+
+;; ── Fused causal SDPA forward (dense-attention-on-GPU Phase 2+3) ─────────────────
+;; batched-causal-sdpa's FORWARD is a SINGLE resident par/map-void! causal-attention
+;; kernel (one work-item per (batch, query row)); its result equals the per-batch
+;; GEMM+softmax reference, and gqa-causal-mha (pack→broadcast→fused-sdpa→unpack)
+;; compiles to a FULLY resident program. The backward is unchanged (recomputes its own
+;; forward), covered by decoder-ad-test's FD checks.
+
+(defn- ref-batched-sdpa
+  "Per-batch causal SDPA via the tested single-head causal-scaled-dot-product-attn —
+   the pre-fusion GEMM+softmax semantics the fused kernel must match."
+  [Q K V batch seq-len hd]
+  (let [slab (* seq-len hd) out (float-array (* batch slab))]
+    (dotimes [b batch]
+      (let [boff (* b slab) Qb (float-array slab) Kb (float-array slab) Vb (float-array slab)]
+        (dotimes [i slab]
+          (aset Qb i (aget ^floats Q (+ boff i)))
+          (aset Kb i (aget ^floats K (+ boff i)))
+          (aset Vb i (aget ^floats V (+ boff i))))
+        (let [ob (attn/causal-scaled-dot-product-attn Qb Kb Vb seq-len hd hd)]
+          (dotimes [i slab] (aset out (+ boff i) (aget ^floats ob i))))))
+    out))
+
+(deftest fused-causal-sdpa-forward-equivalence
+  ;; CPU-only: the fused single-kernel forward is numerically equivalent to the
+  ;; GEMM+softmax reference (GEMM-vs-naive-dot tolerance for f32).
+  (let [batch 4 seq-len 6 hd 8 n (* batch seq-len hd)
+        Q (rnd n 71) K (rnd n 72) V (rnd n 73)
+        fused (attn/batched-causal-sdpa Q K V batch seq-len hd)
+        ref   (ref-batched-sdpa Q K V batch seq-len hd)]
+    (is (< (rel-err fused ref) 1e-5)
+        (str "fused batched-causal-sdpa vs GEMM reference relerr " (rel-err fused ref)))))
+
+(deftest fused-causal-sdpa-resident
+  ;; batched-causal-sdpa forward lowers to ONE resident :map-void kernel and matches CPU.
+  (if-not @gpu-available?
+    (println "  [SKIP] fused-causal-sdpa-resident: no Level Zero GPU")
+    (let [batch 4 seq-len 6 hd 8 n (* batch seq-len hd)
+          Q (rnd n 71) K (rnd n 72) V (rnd n 73)
+          cpu (attn/batched-causal-sdpa Q K V batch seq-len hd)
+          {:keys [descriptor out]} (run-resident #'attn/batched-causal-sdpa [Q K V batch seq-len hd])]
+      (is (= [:map-void] (mapv :convention (:steps descriptor)))
+          "fused causal SDPA is a single resident :map-void kernel (no GEMM, no host scalar-let)")
+      (is (< (rel-err out cpu) 1e-5) (str "fused-sdpa GPU relerr " (rel-err out cpu))))))
+
+(deftest gqa-causal-mha-forward-fully-resident
+  ;; THE Phase-2+3 milestone: the flat gqa-causal-mha forward (pack-heads →
+  ;; broadcast-kv-heads → fused batched-causal-sdpa → unpack-heads) compiles to a
+  ;; FULLY resident program — every step a :map-void kernel, no non-resident binding —
+  ;; and matches the CPU forward on the Arc.
+  (if-not @gpu-available?
+    (println "  [SKIP] gqa-causal-mha-fully-resident: no Level Zero GPU")
+    (let [seq-len 6 nq 4 nkv 1 hd 8
+          Q (rnd (* seq-len nq hd) 81) K (rnd (* seq-len nkv hd) 82) V (rnd (* seq-len nkv hd) 83)
+          cpu (attn/gqa-causal-mha Q K V seq-len nq nkv hd)
+          p (pl/compile-gpu-program #'attn/gqa-causal-mha :ze:0 :dtype :float :on-non-resident :nil)]
+      (is (some? p) "gqa-causal-mha forward compiles to a resident descriptor (no non-resident binding)")
+      (when p
+        (is (every? #(= :map-void %) (mapv :convention (:steps p)))
+            "every gqa-causal-mha forward step is a resident :map-void kernel")
+        (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V seq-len nq nkv hd])]
+          (is (< (rel-err out cpu) 1e-5) (str "gqa-causal-mha GPU relerr " (rel-err out cpu))))))))
+
 (deftest gpu-ad-full-train-step-residency-boundary
   ;; This test does NOT need a GPU — it pins the CURRENT residency boundary at the IR level.
   ;; The full mse∘linear-nb float train step (value+grad + SGD) is AD-transformed and its 3
@@ -101,5 +199,6 @@
                          (raster.dl.optim/sgd-step! W dW (raster.arrays/alength W) lr)
                          loss)))]
     (testing "full AD train step is not yet a fully-resident program (documents the gap)"
-      (is (nil? (pl/compile-gpu-program train :ze:0 :dtype :float))
+      ;; :on-non-resident :nil = probe the boundary without throwing (default is :throw now)
+      (is (nil? (pl/compile-gpu-program train :ze:0 :dtype :float :on-non-resident :nil))
           "mse reduction + daxpy elementwise gradient have no resident kernel yet"))))

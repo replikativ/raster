@@ -11,6 +11,7 @@
             [raster.arrays]
             [raster.compiler.pipeline :as pl]
             [raster.compiler.backend.wasm.emit :as we]
+            [raster.compiler.backend.wasm.node-util :as node]
             [raster.compiler.passes.scalar.inline :as inl])
   (:import [com.dylibso.chicory.wasm Parser]
            [com.dylibso.chicory.runtime Instance]))
@@ -715,32 +716,8 @@
 ;; a v128 module but cannot EXECUTE it, so validity is asserted here and
 ;; execution is asserted on V8 via node (guarded — skips where node is absent).
 
-(defn- node-available? []
-  (try
-    (let [p (-> (ProcessBuilder. ^java.util.List ["node" "--version"])
-                (.redirectErrorStream true) (.start))]
-      (.waitFor p) (zero? (.exitValue p)))
-    (catch Exception _ false)))
-
-(defn- run-idot-on-node
-  "Execute the SIMD idot .wasm on V8 for int8 vectors xs,ys (length n).
-   Returns the kernel's i32 result. Requires node."
-  [^bytes wasm xs ys n]
-  (let [dir  (java.nio.file.Files/createTempDirectory "idot" (make-array java.nio.file.attribute.FileAttribute 0))
-        wp   (str dir "/idot.wasm")
-        jp   (str dir "/run.mjs")]
-    (with-open [o (java.io.FileOutputStream. wp)] (.write o wasm))
-    (spit jp (str "import fs from 'fs';\n"
-                  "const b=fs.readFileSync('" wp "');\n"
-                  "const {instance}=await WebAssembly.instantiate(b,{});\n"
-                  "const m=new Int8Array(instance.exports.memory.buffer);\n"
-                  "const xs=[" (clojure.string/join "," xs) "],ys=[" (clojure.string/join "," ys) "];\n"
-                  "for(let i=0;i<" n ";i++){m[i]=xs[i];m[" n "+i]=ys[i];}\n"
-                  "console.log(instance.exports.idot(0," n "," n "));\n"))
-    (let [p (-> (ProcessBuilder. ^java.util.List ["node" jp]) (.redirectErrorStream true) (.start))
-          out (slurp (.getInputStream p))]
-      (.waitFor p)
-      (Integer/parseInt (clojure.string/trim out)))))
+;; node runner shared with wi8-dot-convergence-test — see node-util for the
+;; console.log-colorization trap that motivated it.
 
 (deftm idot-simd-k [x :- (Array byte), y :- (Array byte), n :- Long] :- Long
   (loop [i 0 acc 0]
@@ -766,13 +743,13 @@
 
 (deftest int8-dot-simd-executes-on-v8
   (testing "SIMD int8 dot executes bit-exactly on V8 across block boundaries"
-    (if-not (node-available?)
+    (if-not (node/node-available?)
       (println "SKIP int8-dot-simd-executes-on-v8: node not available")
       (let [m (pl/compile-wasm #'idot-simd-k :name "idot" :wasm-simd? true)]
         ;; n < 16 (all remainder), = 16 (one block), block+remainder, many blocks
         (doseq [n [15 16 17 64 70 256]]
           (let [xs  (mapv #(int (- (mod (* 7 %) 17) 8)) (range n))
                 ys  (mapv #(int (- (mod (* 3 %) 13) 6)) (range n))
-                got (run-idot-on-node (:bytes m) xs ys n)
+                got (node/run-wasm-idot-on-node (:bytes m) "idot" xs ys n)
                 exp (reduce + (map * xs ys))]
             (is (= got exp) (str "n=" n " got=" got " exp=" exp))))))))

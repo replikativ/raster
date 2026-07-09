@@ -549,10 +549,16 @@
 ;; residual-add backward: d_a = d_b = dy (both copies — additive fan-out). A raw
 ;; (broadcast [a b] (+ a b)) has no AD template for two active inputs, so the
 ;; ubiquitous transformer residual (x + attn/mlp out) needs this explicit rule.
+;; Expressed as a pure `broadcast` copy (the SAME SOAC the forward residual-add
+;; uses) — NOT an explicit alloc+acopy!+return. A bare `(let [out (alloc)] (copy)
+;; out)` leaves a trailing `result = out` alias binding that the resident GPU
+;; extractor rejects (a bare device-buffer symbol read); broadcast materializes to
+;; a par/map! whose output buffer is referenced directly, so it lowers to a resident
+;; :map kernel on the on-device backward path (QLoRA base+delta) and stays a simple
+;; SIMD-vectorizable copy loop on CPU. Distinct output buffer preserves the exact
+;; fan-out buffer semantics of the previous acopy!.
 (deftm residual-add-backward (All [T] [dy :- (Array T) n :- Long] :- (Array T)
-                                  (let [out (alloc-like dy n)]
-                                    (acopy! dy 0 out 0 n)
-                                    out)))
+                                  (broadcast [dy] dy)))
 
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
@@ -1916,14 +1922,18 @@
                                            [dx dw nil nil nil nil]]))})
 
 ;; residual-add rrule — elementwise sum (transformer residuals, LoRA base+delta).
+;; The additive fan-out backward is the IDENTITY: d_a = d_b = dy. Return the adjoint
+;; buffer DIRECTLY for both inputs — no copy. Aliasing both gradient slots to the same
+;; adjoint is safe because every downstream consumer of a gradient adjoint is READ-ONLY
+;; (backward kernels and grad-acc allocate fresh outputs; grad-acc never mutates its
+;; inputs), and reverse-mode accumulation of a fan-out just sums reads of dy. Emitting a
+;; copy (the old residual-add-backward) instead created two buffers the SOAC horizontal-
+;; fuser merged into one kernel that passed the second output in the SCALAR slot —
+;; unbindable on the resident GPU path. The identity return removes the copy entirely.
 (tmpl/merge-into-template! 'raster.dl.nn/residual-add
                            {:params '[a b n] :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [_a _b n] _result-sym adjoint-sym gensym-fn]
-                                        (let [da (gensym-fn "da") db (gensym-fn "db")]
-                                          [(update ctx :bindings into
-                                                   [da (list 'raster.dl.nn/residual-add-backward adjoint-sym n)
-                                                    db (list 'raster.dl.nn/residual-add-backward adjoint-sym n)])
-                                           [da db nil]]))})
+                            :grads-fn (fn [ctx [_a _b _n] _result-sym adjoint-sym _gensym-fn]
+                                        [ctx [adjoint-sym adjoint-sym nil]])})
 
 ;; hadamard rrule — elementwise product (gated MLPs). d_a = dy⊙b, d_b = dy⊙a.
 (tmpl/merge-into-template! 'raster.dl.nn/hadamard
