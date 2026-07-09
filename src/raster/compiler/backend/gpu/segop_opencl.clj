@@ -59,12 +59,8 @@
         ;; Use pre-computed inputs/scalars from SegOp
         arr-params (vec (sort-by name (:inputs segmap)))
         scl-params (vec (sort-by name (:scalars segmap)))
-        arr-type (fn [s]
-                   (let [t (get array-types s (get array-types (symbol (name s)) dtype))]
-                     (get codegen/opencl-type-map t default-ctype)))
-        ;; fp64 needed when the output OR any input array is double
-        use-fp64? (or (= out-dtype :double)
-                      (some #(= "double" (arr-type %)) arr-params))
+        arr-dtype (fn [s] (get array-types s (get array-types (symbol (name s)) dtype)))
+        arr-type (fn [s] (get codegen/opencl-type-map (arr-dtype s) default-ctype))
         arr-param-str (str/join ", "
                                 (map (fn [s] (str "__global const " (arr-type s) "* restrict "
                                                   (ce/c-symbol s)))
@@ -87,7 +83,8 @@
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
-        source (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+        ;; pragmas cover the output dtype AND every input array's dtype
+        source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
@@ -128,7 +125,6 @@
         dtype (or (:dtype segred) dtype)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "double")
-        use-fp64? (= dtype :double)
         arr-params (vec (sort-by name (:inputs segred)))
         scl-params (vec (sort-by name (:scalars segred)))
         ;; Detect reduction op from lambda — unwrap let to find op, keep let for elem
@@ -151,9 +147,9 @@
         ;; Unknown combine ops must FAIL LOUD — the old default silently combined with "+"
         ;; (a max reduce summed the per-lane maxima). Only associative ops are legal here.
         c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
-               (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
-                                    " — GPU reduction needs an associative op (+ * max min)")
-                               {:op op-sym :lambda lambda})))
+                    (throw (ex-info (str "SegRed: unsupported reduce combine op " op-sym
+                                         " — GPU reduction needs an associative op (+ * max min)")
+                                    {:op op-sym :lambda lambda})))
         c-identity-val ({"+" "0.0" "*" "1.0" "fmax" "-INFINITY" "fmin" "INFINITY"} c-op "0.0")
         identity-val ({"+" 0.0 "*" 1.0 "fmax" Double/NEGATIVE_INFINITY "fmin" Double/POSITIVE_INFINITY} c-op 0.0)
         ;; fmax/fmin are functions, not infix operators
@@ -176,7 +172,7 @@
         ;; severed :raster.op/original on .invk forms (part of #55)
         elem-expr (if (and elem-expr-raw (seq let-bindings))
                     (with-meta (list 'let* (vec (mapcat identity let-bindings)) elem-expr-raw)
-                               (meta elem-expr-raw))
+                      (meta elem-expr-raw))
                     elem-expr-raw)
         adapted-elem (when elem-expr (ce/adapt-casts-for-dtype elem-expr dtype))
         idx-c-name (ce/c-symbol idx)
@@ -200,7 +196,7 @@
                                       "int _n_bound"]))
         ;; Static shared memory — matches invoke-reduction-kernel (no __local arg)
         source (when elem-str
-                 (str (when use-fp64? "#if defined(cl_khr_fp64)\n#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n#endif\n")
+                 (str (codegen/extension-pragmas dtype)
                       "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
                       "__kernel void " kernel-name
                       "(" all-params ") {\n"

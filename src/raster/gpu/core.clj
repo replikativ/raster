@@ -963,7 +963,12 @@
                ;; overlapping destination indices in safely. arrays = [out src index]; the extra
                ;; scalar (if present) is `stride`.
                :scatter
-               (do (or (info-fn kernel-name)
+               (do (when (not= :ze (backend-type device-id))
+                     (throw (ex-info "resident scatter steps are Level-Zero-only (no OpenCL implementation yet)"
+                                     {:backend (backend-type device-id)
+                                      :device-id device-id
+                                      :step kernel-name})))
+                   (or (info-fn kernel-name)
                        (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
                    (let [[out-sym src-sym idx-sym] arrays
                          out-buf (buf-of out-sym :scatter-out)
