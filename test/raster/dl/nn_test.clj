@@ -361,7 +361,7 @@
       (let [x (double-array [1 2 3 4 5])
             W (double-array [1 1 1])
             b (double-array [0])
-            y (nn/conv1d x W b 1 1 5 1 3 1 0)]
+            y (nn/conv1d x W b 1 1 5 1 3 1 0 0)]
         (is (= 3 (alength y)))
         (is (approx= 6.0 (aget y 0)))
         (is (approx= 9.0 (aget y 1)))
@@ -375,22 +375,95 @@
             W (double-array [0.1 0.2 0.3])
             b (double-array [0.01])
             rrfn (tmpl/template-pullback 'raster.dl.nn/conv1d)
-            y (nn/conv1d x W b 1 1 5 1 3 1 0)
-            pb (rrfn y x W b 1 1 5 1 3 1 0)
+            y (nn/conv1d x W b 1 1 5 1 3 1 0 0)
+            pb (rrfn y x W b 1 1 5 1 3 1 0 0)
             dy (double-array (repeat (alength y) 1.0))
             [dx dW db _ _ _ _ _ _] (pb dy)
             num-dW (numerical-grad-array
-                    #(let [y (nn/conv1d x W b 1 1 5 1 3 1 0)]
+                    #(let [y (nn/conv1d x W b 1 1 5 1 3 1 0 0)]
                        (loop [i 0 s 0.0]
                          (if (< i (alength y)) (recur (inc i) (+ s (aget y i))) s)))
                     W 1e-5)
             num-dx (numerical-grad-array
-                    #(let [y (nn/conv1d x W b 1 1 5 1 3 1 0)]
+                    #(let [y (nn/conv1d x W b 1 1 5 1 3 1 0 0)]
                        (loop [i 0 s 0.0]
                          (if (< i (alength y)) (recur (inc i) (+ s (aget y i))) s)))
                     x 1e-5)]
         (is (arr-approx= dW num-dW 1e-3))
         (is (arr-approx= dx num-dx 1e-3))))))
+
+;; Naive direct conv1d reference: x:[length,c-in] channels-last (or [c-in,length]
+;; channel-first via cf?), W:[c-out, c-in, kernel] contiguous, split padding.
+(defn- naive-conv1d
+  "Returns [l-out, c-out] (channels-last) as a vector of doubles."
+  [x length c-in W b c-out kernel stride pad-left pad-right cl?]
+  (let [l-out (inc (quot (- (+ length pad-left pad-right) kernel) stride))]
+    (vec (for [t (range l-out), co (range c-out)]
+           (+ (nth b co)
+              (reduce + 0.0
+                      (for [c (range c-in), k (range kernel)
+                            :let [src (+ (- (* t stride) pad-left) k)]
+                            :when (and (>= src 0) (< src length))]
+                        (* (nth W (+ (* co c-in kernel) (* c kernel) k))
+                           (nth x (if cl? (+ (* src c-in) c) (+ (* c length) src)))))))))))
+
+(deftest conv1d-asymmetric-pad-test
+  (when-not (blas/available?) (println "  [SKIP] No BLAS library"))
+  (when (blas/available?)
+    (testing "causal conv1d (pad-left=k-1, pad-right=0, stride 2) vs naive reference"
+      (let [length 9 c-in 2 c-out 3 kernel 5 stride 2 pl (dec kernel) pr 0
+            xs (vec (for [i (range (* c-in length))] (/ (double (inc i)) 7.0)))
+            ws (vec (for [i (range (* c-out c-in kernel))] (Math/sin (double i))))
+            bs [0.1 -0.2 0.3]
+            ;; channel-first x:[1,c-in,length]
+            y (nn/conv1d (double-array xs) (double-array ws) (double-array bs)
+                         1 c-in length c-out kernel stride pl pr)
+            gold (naive-conv1d xs length c-in ws bs c-out kernel stride pl pr false)
+            l-out (inc (quot (- (+ length pl pr) kernel) stride))]
+        (is (= (* l-out c-out) (alength y)))
+        ;; nn/conv1d output is [1,c-out,l-out]; gold is [l-out,c-out]
+        (dotimes [t l-out]
+          (dotimes [co c-out]
+            (is (approx= (nth gold (+ (* t c-out) co))
+                         (aget y (+ (* co l-out) t)) 1e-9))))))
+    (testing "symmetric pad = old behavior sanity ([1,2,3,4,5]*[1,1,1] pad 1)"
+      (let [y (nn/conv1d (double-array [1 2 3 4 5]) (double-array [1 1 1])
+                         (double-array [0]) 1 1 5 1 3 1 1 1)]
+        (is (= [3.0 6.0 9.0 12.0 9.0] (vec y)))))))
+
+(deftest conv1d-cl-test
+  (when-not (blas/available?) (println "  [SKIP] No BLAS library"))
+  (when (blas/available?)
+    (testing "channels-last conv1d-cl vs naive reference (causal, stride 2)"
+      (let [length 11 c-in 3 c-out 2 kernel 5 stride 2 pl (dec kernel) pr 0
+            xs (vec (for [i (range (* length c-in))] (Math/cos (* 0.37 (double i)))))
+            ws (vec (for [i (range (* c-out c-in kernel))] (Math/sin (* 0.21 (double i)))))
+            bs [0.25 -0.5]
+            y (nn/conv1d-cl (double-array xs) (double-array ws) (double-array bs)
+                            length c-in c-out kernel stride pl pr)
+            gold (naive-conv1d xs length c-in ws bs c-out kernel stride pl pr true)
+            l-out (inc (quot (- (+ length pl pr) kernel) stride))]
+        (is (= (* l-out c-out) (alength y)))
+        (dotimes [i (* l-out c-out)]
+          (is (approx= (nth gold i) (aget y i) 1e-9)))))
+    (testing "channels-last agrees with channel-first conv1d (symmetric pad, stride 1)"
+      (let [length 7 c-in 2 c-out 2 kernel 3
+            xs (vec (for [i (range (* length c-in))] (/ (double (- i 5)) 3.0)))
+            ws (vec (for [i (range (* c-out c-in kernel))] (/ (double (inc i)) 11.0)))
+            bs [0.0 1.0]
+            ;; channels-last input
+            ycl (nn/conv1d-cl (double-array xs) (double-array ws) (double-array bs)
+                              length c-in c-out kernel 1 1 1)
+            ;; transpose x to [c-in,length] for channel-first
+            xcf (double-array (for [c (range c-in), t (range length)]
+                                (nth xs (+ (* t c-in) c))))
+            ycf (nn/conv1d xcf (double-array ws) (double-array bs)
+                           1 c-in length c-out kernel 1 1 1)
+            l-out length]
+        (dotimes [t l-out]
+          (dotimes [co c-out]
+            (is (approx= (aget ycf (+ (* co l-out) t))
+                         (aget ycl (+ (* t c-out) co)) 1e-9))))))))
 
 ;; ================================================================
 ;; MaxPool2d tests
