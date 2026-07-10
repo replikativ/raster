@@ -242,10 +242,10 @@
   [form h locals]
   (cond
         ;; Cast expressions
-        (= (name h) "double") :double
-        (= (name h) "long")   :long
-        (= (name h) "int")    :int
-        (= (name h) "float")  :float
+    (= (name h) "double") :double
+    (= (name h) "long")   :long
+    (= (name h) "int")    :int
+    (= (name h) "float")  :float
         ;; Arithmetic: JVM numeric promotion — all-float → float, all-integer
         ;; → int/long (any long ⇒ long), anything unknown/mixed-float → double.
         ;; The old rule hard-defaulted every non-float case to :double, typing
@@ -253,101 +253,101 @@
         ;; bit-shift-right in the body) into double slots — the false-positive
         ;; class of the A2 stamp-vs-LUB census, where the STAMP (long) was
         ;; right and this guess was wrong.
-        (contains? #{"+" "-" "*" "/"} (name h))
-        (let [ts (mapv #(infer-arg-stack-type % locals) (rest form))]
-          (cond
-            (and (seq ts) (every? #(= :float %) ts)) :float
-            (and (seq ts) (every? #(contains? #{:int :long} %) ts))
-            (if (some #(= :long %) ts) :long :int)
-            :else :double))
+    (contains? #{"+" "-" "*" "/"} (name h))
+    (let [ts (mapv #(infer-arg-stack-type % locals) (rest form))]
+      (cond
+        (and (seq ts) (every? #(= :float %) ts)) :float
+        (and (seq ts) (every? #(contains? #{:int :long} %) ts))
+        (if (some #(= :long %) ts) :long :int)
+        :else :double))
         ;; Bitwise / shifts: integer-typed (any long operand ⇒ long). Without
         ;; this rule they inferred nil and poisoned enclosing arithmetic to the
         ;; :double guess (the quant int8 dot's (* (long ..) (bit-and ..))).
-        (contains? #{"bit-and" "bit-or" "bit-xor" "bit-not"
-                     "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"}
-                   (name h))
-        (if (some #(= :long (infer-arg-stack-type % locals)) (rest form)) :long :int)
+    (contains? #{"bit-and" "bit-or" "bit-xor" "bit-not"
+                 "bit-shift-left" "bit-shift-right" "unsigned-bit-shift-right"}
+               (name h))
+    (if (some #(= :long (infer-arg-stack-type % locals)) (rest form)) :long :int)
         ;; Comparison ops produce primitive :bool (int 0/1) — see emit-comparison.
-        (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
+    (contains? #{"<" "<=" ">" ">=" "==" "not="} (name h)) :bool
         ;; if → infer from branches (enables skip-box for nested ifs)
         ;; Only returns a primitive type when BOTH branches are known
         ;; to produce the same primitive. Conservative: returns nil when
         ;; either branch is unknown, forcing the caller to box.
-        (= (name h) "if")
-        (let [[_ _pred then else] form
-              t1 (infer-arg-stack-type then locals)
-              t2 (infer-arg-stack-type else locals)]
-          (when (and t1 t2 (= t1 t2) (primitive? t1)) t1))
+    (= (name h) "if")
+    (let [[_ _pred then else] form
+          t1 (infer-arg-stack-type then locals)
+          t2 (infer-arg-stack-type else locals)]
+      (when (and t1 t2 (= t1 t2) (primitive? t1)) t1))
         ;; do → type of last form
-        (= (name h) "do")
-        (when-let [last-form (last (rest form))]
-          (infer-arg-stack-type last-form locals))
+    (= (name h) "do")
+    (when-let [last-form (last (rest form))]
+      (infer-arg-stack-type last-form locals))
         ;; let/let* → type of last body form
-        (contains? #{"let" "let*"} (name h))
-        (when-let [last-form (last (nnext form))]
-          (infer-arg-stack-type last-form locals))
+    (contains? #{"let" "let*"} (name h))
+    (when-let [last-form (last (nnext form))]
+      (infer-arg-stack-type last-form locals))
         ;; loop/loop* → type of the non-recur branch (a nested reduction used
         ;; as a recur arg is common — without this rule it fell to nil and the
         ;; caller guessed :double, mistyping all-integer tile kernels)
-        (contains? #{"loop" "loop*"} (name h))
-        (let [locals' (reduce (fn [ls [sym init]]
-                                (if-let [t (infer-arg-stack-type init ls)]
-                                  (assoc ls sym {:type t})
-                                  ls))
-                              locals (partition 2 (second form)))
-              tail (last (nnext form))]
-          (when (and (seq? tail) (= 4 (count tail))
-                     (= "if" (name (first tail))))
-            (let [[_ _ then els] tail
-                  recur? (fn r? [f] (and (seq? f)
-                                         (or (= 'recur (first f))
-                                             (and (contains? '#{do let let*} (first f))
-                                                  (r? (last f))))))]
-              (cond
-                (recur? then) (infer-arg-stack-type els locals')
-                (recur? els)  (infer-arg-stack-type then locals')
-                :else nil))))
+    (contains? #{"loop" "loop*"} (name h))
+    (let [locals' (reduce (fn [ls [sym init]]
+                            (if-let [t (infer-arg-stack-type init ls)]
+                              (assoc ls sym {:type t})
+                              ls))
+                          locals (partition 2 (second form)))
+          tail (last (nnext form))]
+      (when (and (seq? tail) (= 4 (count tail))
+                 (= "if" (name (first tail))))
+        (let [[_ _ then els] tail
+              recur? (fn r? [f] (and (seq? f)
+                                     (or (= 'recur (first f))
+                                         (and (contains? '#{do let let*} (first f))
+                                              (r? (last f))))))]
+          (cond
+            (recur? then) (infer-arg-stack-type els locals')
+            (recur? els)  (infer-arg-stack-type then locals')
+            :else nil))))
         ;; inc/dec → preserves input type
-        (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} (name h))
-        (or (infer-arg-stack-type (second form) locals) :long)
+    (contains? #{"inc" "dec" "unchecked-inc" "unchecked-dec"} (name h))
+    (or (infer-arg-stack-type (second form) locals) :long)
         ;; min/max → preserves first arg type
-        (contains? #{"min" "max"} (name h))
-        (or (infer-arg-stack-type (second form) locals) :double)
+    (contains? #{"min" "max"} (name h))
+    (or (infer-arg-stack-type (second form) locals) :double)
         ;; Unchecked int ops
-        (contains? #{"unchecked-add-int" "unchecked-inc-int" "unchecked-dec-int"
-                     "unchecked-subtract-int" "unchecked-multiply-int"} (name h)) :int
+    (contains? #{"unchecked-add-int" "unchecked-inc-int" "unchecked-dec-int"
+                 "unchecked-subtract-int" "unchecked-multiply-int"} (name h)) :int
         ;; .invk: return type from walker metadata on the impl symbol.
         ;; Handles both pre-expand (.invk impl args) and post-expand (. impl invk args).
-        (or (= (str h) ".invk")
-            (and (= (str h) ".") (= 'invk (nth form 2 nil))))
-        (let [impl-sym (if (= (str h) ".") (second form) (second form))]
-          (when (symbol? impl-sym)
-            (let [ret (or (:raster.type/ret-tag (meta impl-sym))
-                          (try (when-let [v (resolve impl-sym)]
-                                 (:raster.core/return-tag (meta v)))
-                               (catch Exception _ nil)))]
-              (case ret
-                (double Double) :double
-                (long Long) :long
-                (float Float) :float
-                (int Integer) :int
-                nil))))
+    (or (= (str h) ".invk")
+        (and (= (str h) ".") (= 'invk (nth form 2 nil))))
+    (let [impl-sym (if (= (str h) ".") (second form) (second form))]
+      (when (symbol? impl-sym)
+        (let [ret (or (:raster.type/ret-tag (meta impl-sym))
+                      (try (when-let [v (resolve impl-sym)]
+                             (:raster.core/return-tag (meta v)))
+                           (catch Exception _ nil)))]
+          (case ret
+            (double Double) :double
+            (long Long) :long
+            (float Float) :float
+            (int Integer) :int
+            nil))))
         ;; Math static methods — infer from the first arg type
         ;; (Math/abs, Math/sqrt, Math/fma all preserve arg type)
-        (let [s (str h)] (and (.contains s "/") (.startsWith s "Math")))
-        (or (infer-arg-stack-type (second form) locals) :double)
+    (let [s (str h)] (and (.contains s "/") (.startsWith s "Math")))
+    (or (infer-arg-stack-type (second form) locals) :double)
         ;; deftm calls: infer return type from var metadata
-        (namespace h)
-        (try (when-let [v (ns-resolve *ns* h)]
-               (when (var? v)
-                 (when-let [rt (:raster.core/return-tag (meta v))]
-                   (case rt
-                     Double :double Long :long Float :float
-                     (double) :double (long) :long (float) :float (int) :int
-                     nil))))
-             (catch Exception _ nil))
+    (namespace h)
+    (try (when-let [v (ns-resolve *ns* h)]
+           (when (var? v)
+             (when-let [rt (:raster.core/return-tag (meta v))]
+               (case rt
+                 Double :double Long :long Float :float
+                 (double) :double (long) :long (float) :float (int) :int
+                 nil))))
+         (catch Exception _ nil))
         ;; Default: unknown
-        :else nil))
+    :else nil))
 
 (defn- resolve-static-call
   "Given a deftm walked body that is a single static method call,
@@ -3486,7 +3486,7 @@
                                                        (.getParameterTypes m)))
                                                non-bridge))
                                     {:class (.getName cls) :method meth-str :arg-index i
-                                     :arg arg}))))))) ]
+                                     :arg arg})))))))]
             (if method
             ;; Method call — invokeinterface/invokevirtual.
             ;; For IFn__ .invk on LOCAL vars (Fn-typed params like `f`),
@@ -4536,6 +4536,12 @@
     (byte Byte)      {:class-desc (ClassDesc/ofDescriptor "B") :stack-type :int}
     (short Short)    {:class-desc (ClassDesc/ofDescriptor "S") :stack-type :int}
     (char Character) {:class-desc (ClassDesc/ofDescriptor "C") :stack-type :int}
+    ;; Void deftms must compile to a V-returning method — the $TI wrapper's
+    ;; invk already handles crd "V" (aconst_null). Without this case 'void
+    ;; fell to the Class/forName default → Object descriptor while emit-body
+    ;; produced :void → bare RETURN in an Object method (VerifyError on the
+    ;; first direct JVM call of a monomorphic Void deftm).
+    (void Void) {:class-desc V-cd :stack-type :void}
     boolean  {:class-desc (ClassDesc/ofDescriptor "Z") :stack-type :bool}
     objects  {:class-desc objarr-cd :stack-type :ref}
     doubles  {:class-desc dblarr-cd :stack-type :ref}
@@ -4738,6 +4744,9 @@
                               ;; Return according to method signature type
                                                    (when-not (#{:void :diverge} ret-type)
                                                      (case return-stack-type
+                                                       ;; void method, value-producing body: discard + RETURN
+                                                       :void (do (if (two-slot? ret-type) (.pop2 code) (.pop code))
+                                                                 (.return_ code))
                                                        :double (do (when (not= ret-type :double)
                                                                      (emit-coerce code ret-type :double))
                                                                    (.dreturn code))
@@ -4768,7 +4777,15 @@
                                                                         (= ret-type :ref))
                                                                (.checkcast code ret-cd)))
                                                            (.areturn code))))
-                                                   (when (= ret-type :void) (.return_ code)))))))
+                                                   (when (= ret-type :void)
+                                                     (case return-stack-type
+                                                       :void (.return_ code)
+                                                       ;; void body but ref-returning method: null
+                                                       (:double :long :int :bool :float)
+                                                       (throw (ex-info "void body for primitive-returning method"
+                                                                       {:method method-name
+                                                                        :return-stack-type return-stack-type}))
+                                                       (do (.aconst_null code) (.areturn code)))))))))
                     ;; Emit typed deftm methods as same-class siblings
                           (doseq [{:keys [method-name method-type params tags param-infos
                                           return-info walked-body source-ns]} deftm-method-specs]
