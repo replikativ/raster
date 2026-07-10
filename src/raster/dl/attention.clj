@@ -188,6 +188,33 @@
                                  (aset out (+ (+ base i) half) (+ (* x1 c) (* x0 s))))))))
                        out)))
 
+;; --- Partial INTERLEAVED RoPE at an absolute position (GPT-J convention) ---
+;; Rotates only the first rotary-dim dims of each head, pairing ADJACENT
+;; elements (2j, 2j+1) — the GPT-J/moonshine convention. NOT interchangeable
+;; with rope-pos above, which is NeoX HALF-SPLIT (i, i+half) over the full
+;; head_dim: different pairing AND partial coverage (THE moonshine port trap,
+;; validated against HF activations). x is ONE position [heads, head_dim]
+;; flattened; dims [rotary-dim, head_dim) pass through untouched. Frequencies
+;; via pow (theta^(-2j/rotary-dim)) to match reference implementations
+;; bit-exactly (exp/log recomposition differs in ulps). In place; returns x.
+(deftm rope-pos-partial! (All [T] [x :- (Array T) heads :- Long head-dim :- Long
+                                   rotary-dim :- Long theta :- Double pos :- Long]
+                              :- (Array T)
+                              (let [pairs (quot rotary-dim 2)
+                                    posd (double pos)]
+                                (dotimes [h heads]
+                                  (let [base (* h (int head-dim))]
+                                    (dotimes [j pairs]
+                                      (let [freq (n/pow theta (/ (* -2.0 (double j)) (double rotary-dim)))
+                                            ang (* posd freq)
+                                            c (m/cos ang) s (m/sin ang)
+                                            i0 (+ base (* 2 j))
+                                            i1 (inc i0)
+                                            x0 (aget x i0) x1 (aget x i1)]
+                                        (aset x i0 (- (* x0 c) (* x1 s)))
+                                        (aset x i1 (+ (* x1 c) (* x0 s)))))))
+                                x)))
+
 ;; --- Single-query attention over a KV cache (decode step) ---
 ;; q:[1, n_q, hd], k/v:[>=cache_len, n_kv, hd] (the cache; only first cache_len
 ;; positions are read). The single query attends ALL cache_len keys (all causal).
@@ -231,6 +258,58 @@
                                                                     (aget v (+ kvb d))))))
                                                    a))))))
                                    out)))
+
+;; --- Decode attention that also captures the attention-weight distribution ---
+;; Identical layout/scale semantics (and bit-identical output) to
+;; gqa-decode-attention above, plus ACCUMULATES the head-averaged softmax
+;; weights into wsink (length >= cache-len): wsink[j] += (1/n_q) * weight[hq,j].
+;; This is the cross-attention alignment signal for DTW word timestamps
+;; (whisper/moonshine style) — call with a zeroed wsink per decode step, or let
+;; it accumulate across layers for a layer+head average.
+(deftm gqa-decode-attention-weights! (All [T]
+                                          [q :- (Array T) k :- (Array T) v :- (Array T)
+                                           cache-len :- Long n-q :- Long n-kv :- Long
+                                           head-dim :- Long scale :- Double
+                                           wsink :- (Array T)] :- (Array T)
+                                          (let [out (alloc-like q (* n-q head-dim))
+                                                group (quot n-q n-kv)
+                                                havg (/ 1.0 (double n-q))
+                                                neg-inf (n/neg-inf-val (aget q 0))]
+                                            (dotimes [hq n-q]
+                                              (let [hkv (quot hq group)
+                                                    qb (* hq (int head-dim))
+                                                    sc (alloc-like q cache-len)
+                                                    _ (dotimes [j cache-len]
+                                                        (let [kb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))
+                                                              dot (loop [d 0 acc 0.0]
+                                                                    (if (< d head-dim)
+                                                                      (recur (inc d)
+                                                                             (+ acc (* (aget q (+ qb d))
+                                                                                       (aget k (+ kb d)))))
+                                                                      acc))]
+                                                          (aset sc j (* dot scale))))
+                                                    mx (loop [j 0 mm neg-inf]
+                                                         (if (< j cache-len) (recur (inc j) (n/max mm (aget sc j))) mm))
+                                                    sum (loop [j 0 s 0.0]
+                                                          (if (< j cache-len)
+                                                            (let [e (m/exp (- (aget sc j) mx))]
+                                                              (aset sc j e) (recur (inc j) (+ s e)))
+                                                            s))
+                                                    inv (/ 1.0 sum)
+                                                    ob (* hq (int head-dim))]
+                                                (dotimes [j cache-len]
+                                                  (aset wsink j (+ (aget wsink j)
+                                                                   (* havg (* (aget sc j) inv)))))
+                                                (dotimes [d head-dim]
+                                                  (aset out (+ ob d)
+                                                        (loop [j 0 a 0.0]
+                                                          (if (< j cache-len)
+                                                            (let [kvb (+ (* j (* n-kv head-dim)) (* hkv (int head-dim)))]
+                                                              (recur (inc j)
+                                                                     (+ a (* (* (aget sc j) inv)
+                                                                             (aget v (+ kvb d))))))
+                                                            a))))))
+                                            out)))
 
 (deftm gqa-decode-attention-heads! (All [T]
                                         [q :- (Array T) k :- (Array T) v :- (Array T) out :- (Array T)
