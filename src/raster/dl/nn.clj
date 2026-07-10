@@ -560,6 +560,42 @@
 (deftm residual-add-backward (All [T] [dy :- (Array T) n :- Long] :- (Array T)
                                   (broadcast [dy] dy)))
 
+;; ================================================================
+;; Sentence-embedding pooling (mean pool + L2 normalize)
+;; ================================================================
+
+;; The sentence-transformers pooling tail shared by the BERT-family encoders
+;; (MiniLM/MPNet/BGE: mean pool + L2) and the decoder embedders
+;; (Qwen3-Embedding last-token pool + L2, EmbeddingGemma mean pool + Dense + L2).
+
+(deftm mean-pool
+  "Mean pooling over rows: x [rows, dim] row-major -> out [dim],
+  out_d = mean_r x[r,d]. Returns a fresh array."
+  (All [T] [x :- (Array T) rows :- Long dim :- Long] :- (Array T)
+       (let [out (alloc-like x dim)
+             inv-n (/ 1.0 (double rows))]
+         (dotimes [r rows]
+           (dotimes [d dim]
+             (aset out d (+ (aget out d)
+                            (aget x (+ (* r (int dim)) d))))))
+         (dotimes [d dim]
+           (aset out d (* (aget out d) inv-n)))
+         out)))
+
+(deftm l2-normalize!
+  "In-place L2 normalization: v <- v / max(||v||_2, 1e-12). Returns v.
+  The 1e-12 floor only guards the all-zero vector (any real embedding norm
+  is far above it, where the result is exactly v/||v||)."
+  (All [T] [v :- (Array T) n :- Long] :- (Array T)
+       (let [norm (n/sqrt (loop [i 0 acc 0.0]
+                            (if (< i n)
+                              (recur (inc i) (+ acc (* (aget v i) (aget v i))))
+                              acc)))
+             inv-norm (/ 1.0 (n/max norm 1e-12))]
+         (dotimes [i n]
+           (aset v i (* (aget v i) inv-norm)))
+         v)))
+
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
 (deftm group-norm (All [T] [x :- (Array T) gamma :- (Array T)
