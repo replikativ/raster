@@ -323,11 +323,10 @@
                             4 [a0 a1 a2 a3] (vec args))
             qname (when dispatch-var
                     (let [m (meta dispatch-var)]
-                      (symbol (str (ns-name (:ns m))) (str (:name m)))))
-            parametric-result (when qname
-                                (try-parametric-dispatch qname full-args))]
-        (if (some? parametric-result)
-          parametric-result
+                      (symbol (str (ns-name (:ns m))) (str (:name m)))))]
+        (if-let [boxed (when qname
+                         (try-parametric-dispatch qname full-args))]
+          (::result boxed)
           (throw-no-method fn-name full-args dispatch-table)))
       (let [m (first ms)]
         (if (case n
@@ -379,10 +378,9 @@
               (let [full-args (case n 0 [] 1 [a0] 2 [a0 a1] 3 [a0 a1 a2]
                                     4 [a0 a1 a2 a3] (vec args))
                     qname (let [mv (meta dispatch-var)]
-                            (symbol (str (ns-name (:ns mv))) (str (:name mv))))
-                    parametric-result (try-parametric-dispatch qname full-args)]
-                (if (some? parametric-result)
-                  parametric-result
+                            (symbol (str (ns-name (:ns mv))) (str (:name mv))))]
+                (if-let [boxed (try-parametric-dispatch qname full-args)]
+                  (::result boxed)
                   (invoke-entry m a0 a1 a2 a3 args n)))
 
               :else
@@ -498,46 +496,50 @@
             (let [ms (get @table-atom 1)]
               (if ms
                 (dispatch-arity fn-name ms a0 nil nil nil nil 1 table-atom @dispatch-var-ref)
-                (or (when @dispatch-var-ref
-                      (try-parametric-dispatch
-                       (let [m (meta @dispatch-var-ref)]
-                         (symbol (str (ns-name (:ns m))) (str (:name m))))
-                       [a0]))
-                    (throw-no-method fn-name [a0] table-atom)))))
+                (if-let [boxed (when @dispatch-var-ref
+                                 (try-parametric-dispatch
+                                  (let [m (meta @dispatch-var-ref)]
+                                    (symbol (str (ns-name (:ns m))) (str (:name m))))
+                                  [a0]))]
+                  (::result boxed)
+                  (throw-no-method fn-name [a0] table-atom)))))
            ([a0 a1]
             (let [ms (get @table-atom 2)]
               (if ms
                 (dispatch-arity fn-name ms a0 a1 nil nil nil 2 table-atom @dispatch-var-ref)
-                (or (when @dispatch-var-ref
-                      (try-parametric-dispatch
-                       (let [m (meta @dispatch-var-ref)]
-                         (symbol (str (ns-name (:ns m))) (str (:name m))))
-                       [a0 a1]))
-                    (throw-no-method fn-name [a0 a1] table-atom)))))
+                (if-let [boxed (when @dispatch-var-ref
+                                 (try-parametric-dispatch
+                                  (let [m (meta @dispatch-var-ref)]
+                                    (symbol (str (ns-name (:ns m))) (str (:name m))))
+                                  [a0 a1]))]
+                  (::result boxed)
+                  (throw-no-method fn-name [a0 a1] table-atom)))))
            ([a0 a1 a2]
             (let [t @table-atom]
               (if-let [ms (get t 3)]
                 (dispatch-arity fn-name ms a0 a1 a2 nil nil 3 table-atom @dispatch-var-ref)
                 (if (and reducible? (get t 2))
                   (raster-dispatch (raster-dispatch a0 a1) a2)
-                  (or (when @dispatch-var-ref
-                        (try-parametric-dispatch
-                         (let [m (meta @dispatch-var-ref)]
-                           (symbol (str (ns-name (:ns m))) (str (:name m))))
-                         [a0 a1 a2]))
-                      (throw-no-method fn-name [a0 a1 a2] table-atom))))))
+                  (if-let [boxed (when @dispatch-var-ref
+                                   (try-parametric-dispatch
+                                    (let [m (meta @dispatch-var-ref)]
+                                      (symbol (str (ns-name (:ns m))) (str (:name m))))
+                                    [a0 a1 a2]))]
+                    (::result boxed)
+                    (throw-no-method fn-name [a0 a1 a2] table-atom))))))
            ([a0 a1 a2 a3]
             (let [t @table-atom]
               (if-let [ms (get t 4)]
                 (dispatch-arity fn-name ms a0 a1 a2 a3 [a0 a1 a2 a3] 4 table-atom @dispatch-var-ref)
                 (if (and reducible? (get t 2))
                   (raster-dispatch (raster-dispatch (raster-dispatch a0 a1) a2) a3)
-                  (or (when @dispatch-var-ref
-                        (try-parametric-dispatch
-                         (let [m (meta @dispatch-var-ref)]
-                           (symbol (str (ns-name (:ns m))) (str (:name m))))
-                         [a0 a1 a2 a3]))
-                      (throw-no-method fn-name [a0 a1 a2 a3] table-atom))))))
+                  (if-let [boxed (when @dispatch-var-ref
+                                   (try-parametric-dispatch
+                                    (let [m (meta @dispatch-var-ref)]
+                                      (symbol (str (ns-name (:ns m))) (str (:name m))))
+                                    [a0 a1 a2 a3]))]
+                    (::result boxed)
+                    (throw-no-method fn-name [a0 a1 a2 a3] table-atom))))))
            ([a0 a1 a2 a3 & more]
             (let [args (into [a0 a1 a2 a3] more)
                   n (count args)
@@ -546,12 +548,13 @@
                 (dispatch-arity fn-name ms a0 a1 a2 a3 args n table-atom @dispatch-var-ref)
                 (if (and reducible? (get t 2))
                   (reduce raster-dispatch args)
-                  (or (when @dispatch-var-ref
-                        (try-parametric-dispatch
-                         (let [m (meta @dispatch-var-ref)]
-                           (symbol (str (ns-name (:ns m))) (str (:name m))))
-                         args))
-                      (throw-no-method fn-name args table-atom)))))))]
+                  (if-let [boxed (when @dispatch-var-ref
+                                   (try-parametric-dispatch
+                                    (let [m (meta @dispatch-var-ref)]
+                                      (symbol (str (ns-name (:ns m))) (str (:name m))))
+                                    args))]
+                    (::result boxed)
+                    (throw-no-method fn-name args table-atom)))))))]
      dispatch)))
 
 ;; ================================================================
@@ -991,7 +994,12 @@
 (defn- try-parametric-with
   "Shared core of parametric dispatch/registration: unify the first matching
   template against `args` and hand off to `callback` (which either invokes or
-  just registers). Returns the callback's result or nil if no template matches."
+  just registers). Returns {::result r} (r = the callback's result) when a
+  template matched, or nil when no template matches. The box distinguishes a
+  matched method that legitimately returned nil — a Void deftm like
+  residual-add! — from no-match; an unboxed nil here made every (All [T]) Void
+  deftm throw no-matching-method on its FIRST eager dispatch for a fresh
+  element type (after already running its side effect)."
   [callback fn-name args]
   (let [;; Resolve namespace aliases: nn/linear → raster.dl.nn/linear
         resolved-name (if-let [v (resolve fn-name)]
@@ -1003,14 +1011,15 @@
               (when-let [bindings (unify-parametric
                                    (:annotations template) args
                                    (:type-vars template))]
-                (callback resolved-name template bindings args)))
+                {::result (callback resolved-name template bindings args)}))
             templates))))
 
 (defn try-parametric-dispatch
   "Try to dispatch via parametric specialization.
    If a parametric template matches, delegates to the specializer callback
    (provided by core.clj) to generate and register a concrete method,
-   then INVOKES it. Returns the result or nil if no match."
+   then INVOKES it. Returns {::result r} (r may be nil for Void methods)
+   when a template matched, nil if no match — unwrap with ::result."
   [fn-name args]
   (try-parametric-with @parametric-specializer fn-name args))
 
@@ -1021,4 +1030,5 @@
   degenerate trigger args. Returns a truthy registration result or nil if no
   template matches (throws if a template matches but compilation fails)."
   [fn-name args]
-  (try-parametric-with @parametric-register fn-name args))
+  (when-let [boxed (try-parametric-with @parametric-register fn-name args)]
+    (or (::result boxed) true)))

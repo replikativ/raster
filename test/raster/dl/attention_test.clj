@@ -137,3 +137,151 @@
           emb (attn/sinusoidal-embedding timesteps 2 8)]
       ;; First and second rows should differ
       (is (not (= (aget emb 0) (aget emb 8)))))))
+
+;; ================================================================
+;; Windowed prefill scores (moonshine-style sliding-window encoder)
+;; ================================================================
+
+(deftest attn-prefill-scores-windowed-test
+  (let [T 7 heads 2 hd 4
+        dim (* heads hd)
+        rng (java.util.Random. 42)
+        frand (fn [n] (let [a (float-array n)]
+                        (dotimes [i n] (aset a i (float (.nextGaussian rng)))) a))
+        q (frand (* T dim)) k (frand (* T dim)) v (frand (* T dim))
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        scores (fn [f & extra]
+                 (let [sc (float-array (* T heads T))]
+                   (apply f q k sc T heads 1 heads hd scale extra) sc))
+        composed (fn [left right]
+                   (let [sc (scores attn/attn-prefill-scores-windowed! left right)
+                         out (float-array (* T dim))]
+                     (attn/attn-prefill-softmax! sc T heads)
+                     (attn/attn-prefill-out! sc v out T heads 1 heads hd)
+                     out))
+        ;; naive double-precision windowed reference: query i attends
+        ;; j in [i-(left-1), i+max(0, right-1)] inclusive
+        naive (fn [left right]
+                (let [out (double-array (* T dim))]
+                  (dotimes [i T]
+                    (let [j0 (max 0 (- i (dec (long left))))
+                          j1 (min (dec T) (+ i (max 0 (dec (long right)))))]
+                      (dotimes [h heads]
+                        (let [qb (+ (* i dim) (* h hd))
+                              es (double-array T)
+                              mx (reduce max -1.0e30
+                                         (for [j (range j0 (inc j1))]
+                                           (* scale (reduce + (for [d (range hd)]
+                                                                (* (aget q (+ qb d))
+                                                                   (aget k (+ (* (long j) dim) (* h hd) d))))))))
+                              sum (reduce + (for [j (range j0 (inc j1))]
+                                              (let [s (* scale (reduce + (for [d (range hd)]
+                                                                           (* (aget q (+ qb d))
+                                                                              (aget k (+ (* (long j) dim) (* h hd) d))))))
+                                                    e (Math/exp (- s mx))]
+                                                (aset es (long j) e) e)))]
+                          (dotimes [d hd]
+                            (aset out (+ (* i dim) (* h hd) d)
+                                  (double (/ (reduce + (for [j (range j0 (inc j1))]
+                                                         (* (aget es (long j))
+                                                            (aget v (+ (* (long j) dim) (* h hd) d)))))
+                                             sum))))))))
+                  out))]
+    (testing "left=T right=1 degenerates BIT-IDENTICALLY to the causal kernel"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores!)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! T 1))))
+    (testing "left=T right=T degenerates BIT-IDENTICALLY to the bidir kernel"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores-bidir!)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! T T))))
+    (testing "small [left right] windows match a naive double reference through softmax+out"
+      (doseq [[l r] [[3 2] [16 4] [2 1] [1 1] [4 3]]]
+        (let [got (composed l r)
+              ref* (naive l r)]
+          (dotimes [i (* T dim)]
+            (is (< (Math/abs (- (aget ref* i) (double (aget got i)))) 1e-5)
+                (str "window [" l " " r "] element " i))))))
+    (testing "right=0 attends the diagonal (same as right=1, moonshine's j1 = i + max(0, right-1))"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores-windowed! 3 0)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! 3 1))))))
+
+;; ================================================================
+;; Partial interleaved RoPE (GPT-J convention, moonshine decoder)
+;; ================================================================
+
+(defn- moonshine-rope-partial!
+  "Copied reference: moonshine's rope-partial! — GPT-J interleaved partial RoPE
+  in place, rotate first 32 of each 64-dim head, theta 10000."
+  [^floats x heads pos]
+  (let [pos (double pos)]
+    (dotimes [h (long heads)]
+      (let [base (* h 64)]
+        (dotimes [j 16]
+          (let [freq (Math/pow 10000.0 (- (/ (* 2.0 j) 32.0)))
+                ang (* pos freq)
+                c (Math/cos ang) s (Math/sin ang)
+                i0 (+ base (* 2 j)) i1 (inc i0)
+                x0 (aget x i0) x1 (aget x i1)]
+            (aset x i0 (float (- (* x0 c) (* x1 s))))
+            (aset x i1 (float (+ (* x1 c) (* x0 s)))))))))
+  x)
+
+(deftest rope-pos-partial-test
+  (let [heads 3 hd 64 rd 32
+        rng (java.util.Random. 7)
+        frand (fn [n] (let [a (float-array n)]
+                        (dotimes [i n] (aset a i (float (.nextGaussian rng)))) a))]
+    (testing "bit-exact vs the copied moonshine reference loop"
+      (doseq [pos [0 1 7 100 255]]
+        (let [x (frand (* heads hd))
+              ref* (moonshine-rope-partial! (aclone ^floats x) heads pos)
+              got (attn/rope-pos-partial! (aclone ^floats x) heads hd rd 10000.0 pos)]
+          (is (java.util.Arrays/equals ^floats ref* ^floats got)
+              (str "pos " pos)))))
+    (testing "dims beyond rotary-dim pass through untouched"
+      (let [x (frand (* heads hd))
+            got (attn/rope-pos-partial! (aclone ^floats x) heads hd rd 10000.0 42)]
+        (dotimes [h heads]
+          (doseq [d (range rd hd)]
+            (is (= (aget x (+ (* h hd) d)) (aget ^floats got (+ (* h hd) d))))))))
+    (testing "pos 0 is the identity"
+      (let [x (frand (* heads hd))
+            got (attn/rope-pos-partial! (aclone ^floats x) heads hd hd 10000.0 0)]
+        (is (java.util.Arrays/equals ^floats x ^floats got))))
+    (testing "rotary-dim = head-dim rotates every adjacent pair, norm-preserving"
+      (let [x (frand (* heads hd))
+            got ^floats (attn/rope-pos-partial! (aclone ^floats x) heads hd hd 10000.0 5)]
+        (is (not (java.util.Arrays/equals ^floats x got)))
+        (dotimes [p (quot (* heads hd) 2)]
+          (let [i0 (* 2 p) i1 (inc i0)
+                n-in (+ (* (double (aget x i0)) (aget x i0))
+                        (* (double (aget x i1)) (aget x i1)))
+                n-out (+ (* (double (aget got i0)) (aget got i0))
+                         (* (double (aget got i1)) (aget got i1)))]
+            (is (< (Math/abs (- n-in n-out)) 1e-4) (str "pair " p))))))))
+
+;; ================================================================
+;; Decode attention with weight capture (timestamp alignment signal)
+;; ================================================================
+
+(deftest gqa-decode-attention-weights-test
+  (let [n 5 hd 8
+        rng (java.util.Random. 11)
+        frand (fn [k] (let [a (float-array k)]
+                        (dotimes [i k] (aset a i (float (.nextGaussian rng)))) a))
+        scale (/ 1.0 (Math/sqrt (double hd)))]
+    (doseq [[n-q n-kv] [[4 4] [4 2]]]
+      (let [q (frand (* n-q hd))
+            kc (frand (* n n-kv hd))
+            vc (frand (* n n-kv hd))
+            wsink (float-array n)
+            base ^floats (attn/gqa-decode-attention q kc vc n n-q n-kv hd scale)
+            got ^floats (attn/gqa-decode-attention-weights! q kc vc n n-q n-kv hd scale wsink)]
+        (testing (str "output bit-identical to gqa-decode-attention (n-q " n-q " n-kv " n-kv ")")
+          (is (java.util.Arrays/equals base got)))
+        (testing "head-averaged weights sum to ~1 for the query"
+          (let [s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (aget wsink j))) s))]
+            (is (approx= s 1.0 1e-5))))
+        (testing "wsink ACCUMULATES across calls (per-layer averaging contract)"
+          (attn/gqa-decode-attention-weights! q kc vc n n-q n-kv hd scale wsink)
+          (let [s (loop [j 0 s 0.0] (if (< j n) (recur (inc j) (+ s (aget wsink j))) s))]
+            (is (approx= s 2.0 1e-5))))))))

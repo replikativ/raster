@@ -449,6 +449,28 @@
                                                          (+ 1.0 (m/tanh (* 0.7978845608028654
                                                                            (+ v (* 0.044715 v v v)))))))))))
 
+;; !-variant erf-EXACT GELU: out = 0.5*x*(1 + erf(x/sqrt(2))), erf via the
+;; Abramowitz–Stegun 7.1.26 polynomial (|abs err| <= 1.5e-7 — below f32 output
+;; resolution). NOT interchangeable with `gelu`/`gelu!` (tanh approximation):
+;; HF checkpoints trained with exact GELU (moonshine encoder, Qwen3-ASR AuT
+;; stem/encoder/projector) disagree with tanh-GELU well above f32 noise — a
+;; documented port trap. In-place safe (x = out, same-index read/write).
+(deftm gelu-erf! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
+                      (raster.par/map-void! i n
+                                            (let [v (aget x i)
+                                                  z (* v 0.7071067811865476)
+                                                  az (n/abs z)
+                                                  tt (/ 1.0 (+ 1.0 (* 0.3275911 az)))
+                                                  e (- 1.0 (* tt
+                                                              (+ 0.254829592
+                                                                 (* tt (+ -0.284496736
+                                                                          (* tt (+ 1.421413741
+                                                                                   (* tt (+ -1.453152027
+                                                                                            (* tt 1.061405429))))))))
+                                                              (m/exp (- (* az az)))))
+                                                  erf (if (< z 0.0) (- e) e)]
+                                              (aset out i (* 0.5 v (+ 1.0 erf)))))))
+
 ;; Broadcast row-bias add in place semantics via separate out (resident-graph
 ;; friendly): out[r,j] = x[r,j] + b[j]. Follows every biased linear in
 ;; encoder-family layers (AuT, BERT) — the quantized GEMM kernels are bias-free.
@@ -499,6 +521,37 @@
                      (let [out (alloc-like x (* rows features))]
                        (rms-norm! x weight out rows features eps gain-offset)
                        out)))
+
+;; Single-ROW Stage-A rms-norm: the functional par/reduce + par/map form.
+;; rms-norm! parallelizes over ROWS (one work-item per row, serial feature
+;; reduce — the right shape for multi-row/prefill); this variant is for the
+;; rows=1 decode case, where rms-norm! degenerates to ONE work-item. Here the
+;; feature reduce itself is parallel: on the GPU-resident graph the reduce
+;; result is realized as a resident 1-elem buffer and its scalar chain (inv)
+;; is fused into the consuming map — ~4x better occupancy than the 1-work-item
+;; serial reduce (validated on the gemma-3 resident decode graph).
+;;
+;; Concrete-float ON PURPOSE (not (All [T])): this is a float GPU kernel, so
+;; the reduce accumulator and every FP scalar must be float. Threading double
+;; eps/gain-offset/literals through it would leave raster.numeric ops
+;; undevirtualized (float x double has no monomorphic overload) → on GPU that
+;; cannot lower to OpenCL C → garbage output. The Double params are cast to
+;; float at entry, keeping the whole dataflow float-typed.
+(deftm rms-norm-1row!
+  [x :- (Array float) weight :- (Array float) out :- (Array float)
+   features :- Long eps :- Double gain-offset :- Double] :- Void
+  (let [ss  (raster.par/reduce acc (float 0.0) i features
+                               (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
+                                                                       (raster.arrays/aget x i))))
+        inv (raster.numeric// (float 1.0)
+                              (raster.numeric/sqrt
+                               (raster.numeric/+ (raster.numeric// ss (float features))
+                                                 (float eps))))]
+    (raster.par/map-void! j features
+                          (raster.arrays/aset out j
+                                              (raster.numeric/* (raster.numeric/* (raster.arrays/aget x j) inv)
+                                                                (raster.numeric/+ (float gain-offset)
+                                                                                  (raster.arrays/aget weight j)))))))
 
 ;; --- Bias-free linear + gated MLP (modern decoder LMs) ---
 ;; Modern LLMs (Llama, Qwen, Gemma, Mistral) use bias-free projections.
@@ -559,6 +612,42 @@
 ;; fan-out buffer semantics of the previous acopy!.
 (deftm residual-add-backward (All [T] [dy :- (Array T) n :- Long] :- (Array T)
                                   (broadcast [dy] dy)))
+
+;; ================================================================
+;; Sentence-embedding pooling (mean pool + L2 normalize)
+;; ================================================================
+
+;; The sentence-transformers pooling tail shared by the BERT-family encoders
+;; (MiniLM/MPNet/BGE: mean pool + L2) and the decoder embedders
+;; (Qwen3-Embedding last-token pool + L2, EmbeddingGemma mean pool + Dense + L2).
+
+(deftm mean-pool
+  "Mean pooling over rows: x [rows, dim] row-major -> out [dim],
+  out_d = mean_r x[r,d]. Returns a fresh array."
+  (All [T] [x :- (Array T) rows :- Long dim :- Long] :- (Array T)
+       (let [out (alloc-like x dim)
+             inv-n (/ 1.0 (double rows))]
+         (dotimes [r rows]
+           (dotimes [d dim]
+             (aset out d (+ (aget out d)
+                            (aget x (+ (* r (int dim)) d))))))
+         (dotimes [d dim]
+           (aset out d (* (aget out d) inv-n)))
+         out)))
+
+(deftm l2-normalize!
+  "In-place L2 normalization: v <- v / max(||v||_2, 1e-12). Returns v.
+  The 1e-12 floor only guards the all-zero vector (any real embedding norm
+  is far above it, where the result is exactly v/||v||)."
+  (All [T] [v :- (Array T) n :- Long] :- (Array T)
+       (let [norm (n/sqrt (loop [i 0 acc 0.0]
+                            (if (< i n)
+                              (recur (inc i) (+ acc (* (aget v i) (aget v i))))
+                              acc)))
+             inv-norm (/ 1.0 (n/max norm 1e-12))]
+         (dotimes [i n]
+           (aset v i (* (aget v i) inv-norm)))
+         v)))
 
 ;; --- Group Norm ---
 ;; x:[batch, channels, spatial], gamma:[channels], beta:[channels]
@@ -671,10 +760,13 @@
 
 ;; im2col-1d: rearrange input patches into columns for GEMM
 ;; x:[batch, c_in, length] -> cols:[c_in*kernel, batch*l_out]
+;; Padding is split left/right so causal convs (pad-left = kernel-1,
+;; pad-right = 0 — the moonshine frontend) share this kernel with the
+;; symmetric case (pad-left = pad-right).
 (deftm im2col-1d (All [T] [x :- (Array T) batch :- Long c-in :- Long
                            length :- Long kernel :- Long stride :- Long
-                           pad :- Long] :- (Array T)
-                      (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                           pad-left :- Long pad-right :- Long] :- (Array T)
+                      (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
                             col-rows (* c-in kernel)
                             col-cols (* batch l-out)
                             cols (alloc-like x (* col-rows col-cols))]
@@ -682,7 +774,7 @@
                           (dotimes [c c-in]
                             (dotimes [kk kernel]
                               (dotimes [out-pos l-out]
-                                (let [in-pos (+ (- (* out-pos (int stride)) pad) kk)
+                                (let [in-pos (+ (- (* out-pos (int stride)) (int pad-left)) kk)
                                       row (+ (* c (int kernel)) kk)
                                       col (+ (* b (int l-out)) out-pos)]
                                   (when (and (>= in-pos 0) (< in-pos length))
@@ -693,19 +785,39 @@
                                                    in-pos)))))))))
                         cols)))
 
+;; im2col-1d-cl: channels-LAST variant for row-major sequence layouts.
+;; x:[length, c_in] -> patches:[l_out, c_in*kernel] (one row per output
+;; position, (c*kernel + k) within the row — matches a contiguous torch
+;; [c_out, c_in, kernel] weight reshaped to [c_out, c_in*kernel], so the
+;; conv is `linear patches W b`). Out-of-range taps stay zero.
+(deftm im2col-1d-cl (All [T] [x :- (Array T) length :- Long c-in :- Long
+                              kernel :- Long stride :- Long
+                              pad-left :- Long pad-right :- Long] :- (Array T)
+                         (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
+                               row-w (* c-in kernel)
+                               patches (alloc-like x (* l-out row-w))]
+                           (dotimes [out-pos l-out]
+                             (dotimes [c c-in]
+                               (dotimes [kk kernel]
+                                 (let [in-pos (+ (- (* out-pos (int stride)) (int pad-left)) kk)]
+                                   (when (and (>= in-pos 0) (< in-pos length))
+                                     (aset patches (+ (* out-pos (int row-w)) (* c (int kernel)) kk)
+                                           (aget x (+ (* in-pos (int c-in)) c))))))))
+                           patches)))
+
 ;; col2im-1d: reverse of im2col (accumulate)
 ;; cols:[c_in*kernel, batch*l_out] -> dx:[batch, c_in, length]
 (deftm col2im-1d (All [T] [cols :- (Array T) batch :- Long c-in :- Long
                            length :- Long kernel :- Long stride :- Long
-                           pad :- Long] :- (Array T)
-                      (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                           pad-left :- Long pad-right :- Long] :- (Array T)
+                      (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
                             col-cols (* batch l-out)
                             dx (alloc-like cols (* batch c-in length))]
                         (dotimes [b batch]
                           (dotimes [c c-in]
                             (dotimes [kk kernel]
                               (dotimes [out-pos l-out]
-                                (let [in-pos (+ (- (* out-pos (int stride)) pad) kk)]
+                                (let [in-pos (+ (- (* out-pos (int stride)) (int pad-left)) kk)]
                                   (when (and (>= in-pos 0) (< in-pos length))
                                     (let [row (+ (* c (int kernel)) kk)
                                           col (+ (* b (int l-out)) out-pos)
@@ -723,10 +835,10 @@
 (deftm conv1d (All [T] [x :- (Array T) W :- (Array T) b :- (Array T)
                         batch :- Long c-in :- Long length :- Long
                         c-out :- Long kernel :- Long stride :- Long
-                        pad :- Long] :- (Array T)
-                   (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                        pad-left :- Long pad-right :- Long] :- (Array T)
+                   (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
         ;; im2col: x -> cols:[c_in*kernel, batch*l_out]
-                         cols (im2col-1d x batch c-in length kernel stride pad)
+                         cols (im2col-1d x batch c-in length kernel stride pad-left pad-right)
         ;; GEMM: W_reshaped:[c_out, c_in*kernel] @ cols -> y_cols:[c_out, batch*l_out]
                          ck (* c-in kernel)
                          bl (* batch l-out)
@@ -744,6 +856,19 @@
                                    (+ (aget y-cols src-idx)
                                       (aget b co)))))))
                      y)))
+
+;; Channels-last conv1d for row-major sequence layouts (single sequence,
+;; no batch dim): x:[length, c_in], W:[c_out, c_in*kernel] (contiguous
+;; torch [c_out, c_in, kernel]), b:[c_out] -> y:[l_out, c_out].
+;; im2col-1d-cl + `linear` — a causal stride-2 conv (moonshine frontend)
+;; is (conv1d-cl x W b length c-in c-out kernel 2 (dec kernel) 0).
+(deftm conv1d-cl (All [T] [x :- (Array T) W :- (Array T) b :- (Array T)
+                           length :- Long c-in :- Long c-out :- Long
+                           kernel :- Long stride :- Long
+                           pad-left :- Long pad-right :- Long] :- (Array T)
+                      (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
+                            patches (im2col-1d-cl x length c-in kernel stride pad-left pad-right)]
+                        (linear patches W b l-out (* c-in kernel) c-out))))
 
 ;; conv1d rrule — pullback registered after backward deftm (below)
 
@@ -1846,9 +1971,9 @@
                                     W :- (Array T)
                                     batch :- Long c-in :- Long length :- Long
                                     c-out :- Long kernel :- Long stride :- Long
-                                    pad :- Long]
+                                    pad-left :- Long pad-right :- Long]
                                :- (Array T)
-                               (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                               (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
                                      ck (* c-in kernel)
                                      bl (* batch l-out)
                                      dy-cols (alloc-like dy (* c-out bl))]
@@ -1861,14 +1986,14 @@
                                          (aset dy-cols dst-idx (aget dy src-idx))))))
                                  (let [d-cols (alloc-like dy (* ck bl))
                                        _ (blas/dgemm-tn! W dy-cols d-cols ck c-out bl (n/oftype dy 1.0) (n/oftype dy 0.0))]
-                                   (col2im-1d d-cols batch c-in length kernel stride pad)))))
+                                   (col2im-1d d-cols batch c-in length kernel stride pad-left pad-right)))))
 
 (deftm conv1d-backward-dW (All [T] [dy :- (Array T) x :- (Array T)
                                     batch :- Long c-in :- Long length :- Long
                                     c-out :- Long kernel :- Long stride :- Long
-                                    pad :- Long]
+                                    pad-left :- Long pad-right :- Long]
                                :- (Array T)
-                               (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                               (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
                                      ck (* c-in kernel)
                                      bl (* batch l-out)
                                      dy-cols (alloc-like dy (* c-out bl))]
@@ -1879,7 +2004,7 @@
                                                         (* co (int l-out)) li)
                                              dst-idx (+ (* co (int bl)) (* bi (int l-out)) li)]
                                          (aset dy-cols dst-idx (aget dy src-idx))))))
-                                 (let [cols (im2col-1d x batch c-in length kernel stride pad)
+                                 (let [cols (im2col-1d x batch c-in length kernel stride pad-left pad-right)
                                        dW (alloc-like dy (* c-out ck))
                                        _ (blas/dgemm-nt! dy-cols cols dW c-out bl ck (n/oftype dy 1.0) (n/oftype dy 0.0))]
                                    dW))))
@@ -1887,9 +2012,9 @@
 (deftm conv1d-backward-db (All [T] [dy :- (Array T)
                                     batch :- Long c-out :- Long
                                     length :- Long kernel :- Long
-                                    stride :- Long pad :- Long]
+                                    stride :- Long pad-left :- Long pad-right :- Long]
                                :- (Array T)
-                               (let [l-out (+ 1 (quot (+ length (* 2 pad) (- kernel)) stride))
+                               (let [l-out (+ 1 (quot (+ length pad-left pad-right (- kernel)) stride))
                                      db (alloc-like dy c-out)]
                                  (dotimes [bi batch]
                                    (dotimes [co c-out]
@@ -2019,22 +2144,22 @@
 
 ;; conv1d template — direct calls to per-gradient deftms
 (tmpl/merge-into-template! 'raster.dl.nn/conv1d
-                           {:params '[x W b batch c-in length c-out kernel stride pad]
+                           {:params '[x W b batch c-in length c-out kernel stride pad-left pad-right]
                             :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x W _b batch c-in length c-out kernel stride pad]
+                            :grads-fn (fn [ctx [x W _b batch c-in length c-out kernel stride pad-left pad-right]
                                            _result-sym adjoint-sym gensym-fn]
                                         (let [dx (gensym-fn "dx")
                                               dW (gensym-fn "dW")
                                               db (gensym-fn "db")]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/conv1d-backward-dx
-                                                             adjoint-sym x W batch c-in length c-out kernel stride pad)
+                                                             adjoint-sym x W batch c-in length c-out kernel stride pad-left pad-right)
                                                     dW (list 'raster.dl.nn/conv1d-backward-dW
-                                                             adjoint-sym x batch c-in length c-out kernel stride pad)
+                                                             adjoint-sym x batch c-in length c-out kernel stride pad-left pad-right)
                                                     db (list 'raster.dl.nn/conv1d-backward-db
-                                                             adjoint-sym batch c-out length kernel stride pad)])
-                                           ;; 10 params: dx dW db + 7 nil (batch c-in length c-out kernel stride pad)
-                                           [dx dW db nil nil nil nil nil nil nil]]))})
+                                                             adjoint-sym batch c-out length kernel stride pad-left pad-right)])
+                                           ;; 11 params: dx dW db + 8 nil (batch c-in length c-out kernel stride pad-left pad-right)
+                                           [dx dW db nil nil nil nil nil nil nil nil]]))})
 
 ;; ================================================================
 ;; Forward (JVP) rules — §13 A3 hand frules for the norm residue.
