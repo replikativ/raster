@@ -449,6 +449,28 @@
                                                          (+ 1.0 (m/tanh (* 0.7978845608028654
                                                                            (+ v (* 0.044715 v v v)))))))))))
 
+;; !-variant erf-EXACT GELU: out = 0.5*x*(1 + erf(x/sqrt(2))), erf via the
+;; Abramowitz–Stegun 7.1.26 polynomial (|abs err| <= 1.5e-7 — below f32 output
+;; resolution). NOT interchangeable with `gelu`/`gelu!` (tanh approximation):
+;; HF checkpoints trained with exact GELU (moonshine encoder, Qwen3-ASR AuT
+;; stem/encoder/projector) disagree with tanh-GELU well above f32 noise — a
+;; documented port trap. In-place safe (x = out, same-index read/write).
+(deftm gelu-erf! (All [T] [x :- (Array T) out :- (Array T) n :- Long] :- Void
+                      (raster.par/map-void! i n
+                                            (let [v (aget x i)
+                                                  z (* v 0.7071067811865476)
+                                                  az (n/abs z)
+                                                  tt (/ 1.0 (+ 1.0 (* 0.3275911 az)))
+                                                  e (- 1.0 (* tt
+                                                              (+ 0.254829592
+                                                                 (* tt (+ -0.284496736
+                                                                          (* tt (+ 1.421413741
+                                                                                   (* tt (+ -1.453152027
+                                                                                            (* tt 1.061405429))))))))
+                                                              (m/exp (- (* az az)))))
+                                                  erf (if (< z 0.0) (- e) e)]
+                                              (aset out i (* 0.5 v (+ 1.0 erf)))))))
+
 ;; Broadcast row-bias add in place semantics via separate out (resident-graph
 ;; friendly): out[r,j] = x[r,j] + b[j]. Follows every biased linear in
 ;; encoder-family layers (AuT, BERT) — the quantized GEMM kernels are bias-free.

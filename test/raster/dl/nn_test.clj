@@ -188,6 +188,43 @@
                   x 1e-5)]
       (is (arr-approx= dx num-dx 1e-4)))))
 
+(deftest gelu-erf-test
+  ;; erf-exact GELU (A&S 7.1.26) — the HF-checkpoint activation (moonshine,
+  ;; Qwen3-ASR AuT). Reference: the same polynomial evaluated in double.
+  (let [erf-as (fn ^double [^double z]
+                 (let [x (Math/abs z)
+                       t (/ 1.0 (+ 1.0 (* 0.3275911 x)))
+                       y (- 1.0 (* t
+                                   (+ 0.254829592
+                                      (* t (+ -0.284496736
+                                              (* t (+ 1.421413741
+                                                      (* t (+ -1.453152027
+                                                              (* t 1.061405429))))))))
+                                   (Math/exp (- (* x x)))))]
+                   (if (neg? z) (- y) y)))
+        gold (fn ^double [^double v]
+               (* 0.5 v (+ 1.0 (erf-as (/ v (Math/sqrt 2.0))))))
+        vals [-4.0 -2.0 -1.0 -0.5 -0.1 0.0 0.1 0.5 1.0 2.0 4.0]]
+    (testing "double: matches the double A&S reference"
+      (let [x (double-array vals)
+            out (double-array (count vals))]
+        (nn/gelu-erf! x out (count vals))
+        (dotimes [i (count vals)]
+          (is (approx= (gold (nth vals i)) (aget out i) 1e-12)))))
+    (testing "float: matches the double reference within f32 resolution, in place"
+      (let [x (float-array (map float vals))]
+        (nn/gelu-erf! x x (count vals))
+        (dotimes [i (count vals)]
+          (is (approx= (gold (nth vals i)) (aget x i) 1e-6)))))
+    (testing "erf-exact vs tanh approximation differ measurably (the port trap)"
+      (let [x (double-array [-1.0 0.5 3.0])
+            erf-out (double-array 3)
+            _ (nn/gelu-erf! x erf-out 3)
+            tanh-out (nn/gelu x 3)
+            md (apply max (map #(Math/abs (- (aget erf-out %) (aget ^doubles tanh-out %))) (range 3)))]
+        (is (> md 1e-5) "tanh-GELU is NOT a substitute for erf-GELU")
+        (is (< md 1e-2) "but they are the same activation family")))))
+
 (deftest sigmoid-test
   (testing "sigmoid forward"
     (let [x (double-array [0 -100 100])

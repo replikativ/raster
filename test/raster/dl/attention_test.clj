@@ -137,3 +137,69 @@
           emb (attn/sinusoidal-embedding timesteps 2 8)]
       ;; First and second rows should differ
       (is (not (= (aget emb 0) (aget emb 8)))))))
+
+;; ================================================================
+;; Windowed prefill scores (moonshine-style sliding-window encoder)
+;; ================================================================
+
+(deftest attn-prefill-scores-windowed-test
+  (let [T 7 heads 2 hd 4
+        dim (* heads hd)
+        rng (java.util.Random. 42)
+        frand (fn [n] (let [a (float-array n)]
+                        (dotimes [i n] (aset a i (float (.nextGaussian rng)))) a))
+        q (frand (* T dim)) k (frand (* T dim)) v (frand (* T dim))
+        scale (/ 1.0 (Math/sqrt (double hd)))
+        scores (fn [f & extra]
+                 (let [sc (float-array (* T heads T))]
+                   (apply f q k sc T heads 1 heads hd scale extra) sc))
+        composed (fn [left right]
+                   (let [sc (scores attn/attn-prefill-scores-windowed! left right)
+                         out (float-array (* T dim))]
+                     (attn/attn-prefill-softmax! sc T heads)
+                     (attn/attn-prefill-out! sc v out T heads 1 heads hd)
+                     out))
+        ;; naive double-precision windowed reference: query i attends
+        ;; j in [i-(left-1), i+max(0, right-1)] inclusive
+        naive (fn [left right]
+                (let [out (double-array (* T dim))]
+                  (dotimes [i T]
+                    (let [j0 (max 0 (- i (dec (long left))))
+                          j1 (min (dec T) (+ i (max 0 (dec (long right)))))]
+                      (dotimes [h heads]
+                        (let [qb (+ (* i dim) (* h hd))
+                              es (double-array T)
+                              mx (reduce max -1.0e30
+                                         (for [j (range j0 (inc j1))]
+                                           (* scale (reduce + (for [d (range hd)]
+                                                                (* (aget q (+ qb d))
+                                                                   (aget k (+ (* (long j) dim) (* h hd) d))))))))
+                              sum (reduce + (for [j (range j0 (inc j1))]
+                                              (let [s (* scale (reduce + (for [d (range hd)]
+                                                                           (* (aget q (+ qb d))
+                                                                              (aget k (+ (* (long j) dim) (* h hd) d))))))
+                                                    e (Math/exp (- s mx))]
+                                                (aset es (long j) e) e)))]
+                          (dotimes [d hd]
+                            (aset out (+ (* i dim) (* h hd) d)
+                                  (double (/ (reduce + (for [j (range j0 (inc j1))]
+                                                         (* (aget es (long j))
+                                                            (aget v (+ (* (long j) dim) (* h hd) d)))))
+                                             sum))))))))
+                  out))]
+    (testing "left=T right=1 degenerates BIT-IDENTICALLY to the causal kernel"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores!)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! T 1))))
+    (testing "left=T right=T degenerates BIT-IDENTICALLY to the bidir kernel"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores-bidir!)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! T T))))
+    (testing "small [left right] windows match a naive double reference through softmax+out"
+      (doseq [[l r] [[3 2] [16 4] [2 1] [1 1] [4 3]]]
+        (let [got (composed l r)
+              ref* (naive l r)]
+          (dotimes [i (* T dim)]
+            (is (< (Math/abs (- (aget ref* i) (double (aget got i)))) 1e-5)
+                (str "window [" l " " r "] element " i))))))
+    (testing "right=0 attends the diagonal (same as right=1, moonshine's j1 = i + max(0, right-1))"
+      (is (java.util.Arrays/equals ^floats (scores attn/attn-prefill-scores-windowed! 3 0)
+                                   ^floats (scores attn/attn-prefill-scores-windowed! 3 1))))))

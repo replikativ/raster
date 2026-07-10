@@ -1606,3 +1606,40 @@
                                                                                             (aget k (clojure.core/+ kb d)))))
                                                                            acc))]
                                                                (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))
+
+;; Sliding-window scores (moonshine-style 'ergodic' encoder): query i attends j
+;; iff 0 <= i-j <= left-1 (past incl. self) or 0 < j-i <= right-1 (future).
+;; left >= 1 required; right = 0 and right = 1 both mean "no future" (the
+;; diagonal always attends — same as moonshine's j1 = i + max(0, right-1)).
+;; Degenerate windows recover the siblings exactly: [nrows, 1] == the causal
+;; kernel, [nrows, nrows] == the bidir kernel; per-block calls with
+;; left = right = block-size give block-diagonal attention. Out-of-window
+;; scores get the same -1.0e30 sentinel as the causal kernel, so
+;; attn-prefill-softmax!/attn-prefill-out! compose unchanged: exp(-1e30 - mx)
+;; underflows to exactly 0.0 and masked lanes contribute exact zeros.
+(deftm attn-prefill-scores-windowed! (All [T] [q :- (Array T) k :- (Array T) sc :- (Array T)
+                                               nrows :- Long n-q :- Long group :- Long
+                                               n-kv :- Long head-dim :- Long
+                                               scale :- Double left :- Long right :- Long] :- Void
+                                          (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* n-q nrows))
+                                                                (let [per-i (clojure.core/* n-q nrows)
+                                                                      i (quot idx per-i)
+                                                                      rest0 (rem idx per-i)
+                                                                      hq (quot rest0 nrows)
+                                                                      j (rem rest0 nrows)
+                                                                      row (clojure.core/+ (clojure.core/* i n-q) hq)]
+                                                                  (if (or (> (clojure.core/- i j) (dec left))
+                                                                          (and (< i j) (> (clojure.core/- j i) (dec right))))
+                                                                    (aset sc (clojure.core/+ (clojure.core/* row nrows) j) -1.0e30)
+                                                                    (let [hkv (quot hq group)
+                                                                          qb (clojure.core/+ (clojure.core/* i (clojure.core/* n-q head-dim))
+                                                                                             (clojure.core/* hq head-dim))
+                                                                          kb (clojure.core/+ (clojure.core/* j (clojure.core/* n-kv head-dim))
+                                                                                             (clojure.core/* hkv head-dim))
+                                                                          dot (loop [d 0 acc 0.0]
+                                                                                (if (< d head-dim)
+                                                                                  (recur (inc d)
+                                                                                         (+ acc (* (aget q (clojure.core/+ qb d))
+                                                                                                   (aget k (clojure.core/+ kb d)))))
+                                                                                  acc))]
+                                                                      (aset sc (clojure.core/+ (clojure.core/* row nrows) j) (* dot scale))))))))
