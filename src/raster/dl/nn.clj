@@ -522,6 +522,37 @@
                        (rms-norm! x weight out rows features eps gain-offset)
                        out)))
 
+;; Single-ROW Stage-A rms-norm: the functional par/reduce + par/map form.
+;; rms-norm! parallelizes over ROWS (one work-item per row, serial feature
+;; reduce — the right shape for multi-row/prefill); this variant is for the
+;; rows=1 decode case, where rms-norm! degenerates to ONE work-item. Here the
+;; feature reduce itself is parallel: on the GPU-resident graph the reduce
+;; result is realized as a resident 1-elem buffer and its scalar chain (inv)
+;; is fused into the consuming map — ~4x better occupancy than the 1-work-item
+;; serial reduce (validated on the gemma-3 resident decode graph).
+;;
+;; Concrete-float ON PURPOSE (not (All [T])): this is a float GPU kernel, so
+;; the reduce accumulator and every FP scalar must be float. Threading double
+;; eps/gain-offset/literals through it would leave raster.numeric ops
+;; undevirtualized (float x double has no monomorphic overload) → on GPU that
+;; cannot lower to OpenCL C → garbage output. The Double params are cast to
+;; float at entry, keeping the whole dataflow float-typed.
+(deftm rms-norm-1row!
+  [x :- (Array float) weight :- (Array float) out :- (Array float)
+   features :- Long eps :- Double gain-offset :- Double] :- Void
+  (let [ss  (raster.par/reduce acc (float 0.0) i features
+                               (raster.numeric/+ acc (raster.numeric/* (raster.arrays/aget x i)
+                                                                       (raster.arrays/aget x i))))
+        inv (raster.numeric// (float 1.0)
+                              (raster.numeric/sqrt
+                               (raster.numeric/+ (raster.numeric// ss (float features))
+                                                 (float eps))))]
+    (raster.par/map-void! j features
+                          (raster.arrays/aset out j
+                                              (raster.numeric/* (raster.numeric/* (raster.arrays/aget x j) inv)
+                                                                (raster.numeric/+ (float gain-offset)
+                                                                                  (raster.arrays/aget weight j)))))))
+
 ;; --- Bias-free linear + gated MLP (modern decoder LMs) ---
 ;; Modern LLMs (Llama, Qwen, Gemma, Mistral) use bias-free projections.
 ;; linear-nb: y = x @ W^T, W:[out_f,in_f] (HF layout), no bias.

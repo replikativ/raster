@@ -581,3 +581,27 @@
   (testing "xavier-init creates correct size"
     (let [w (nn/xavier-init 3 5)]
       (is (= 15 (alength w))))))
+
+;; ================================================================
+;; rms-norm-1row! (single-row Stage-A par/reduce form) tests
+;; ================================================================
+
+(deftest rms-norm-1row-test
+  (testing "matches rms-norm! at rows=1 (float, gemma-style gain-offset 1.0)"
+    (let [n 640
+          r (java.util.Random. 42)
+          x (float-array n) w (float-array n)
+          _ (dotimes [i n]
+              (aset x i (float (- (.nextDouble r) 0.5)))
+              (aset w i (float (* 0.1 (- (.nextDouble r) 0.5)))))
+          out-ref (float-array n)
+          out-1row (float-array n)]
+      (nn/rms-norm! x w out-ref 1 n 1e-6 1.0)
+      (nn/rms-norm-1row! x w out-1row n 1e-6 1.0)
+      (dotimes [i n]
+        ;; the 1row form accumulates in float (consistent-float GPU kernel);
+        ;; rms-norm! accumulates in double — compare within float tolerance.
+        (is (< (Math/abs (- (aget out-ref i) (aget out-1row i))) 1e-5)
+            (str "elem " i)))
+      (is (some #(> (Math/abs (aget out-1row (int %))) 0.1) (range n))
+          "non-degenerate output"))))
