@@ -12,6 +12,7 @@
             [raster.core :refer [deftm]]
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
+            [raster.dl.loss :as loss]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
             [raster.dl.gpu-grad-parity :as gp]))
@@ -119,6 +120,50 @@
           (str "rope bwd sl=" sl " heads=" heads " hd=" hd " theta=" theta
                " maxdiff=" (max-abs-diff got ref))))))
 
+;; ── GATE 1b: batched-causal-sdpa backward vs finite differences ───────────────────
+;; The three flat resident kernels (dq/dk/dv) are the flash-attention backward of
+;; batched-causal-sdpa. Check them directly against central FD of the forward: for a
+;; random upstream adjoint dO, L = Σ_k dO[k]·out[k]; then dL/dQ = dq-kernel, dL/dK =
+;; dk-kernel, dL/dV = dv-kernel. Run at BOTH f64 and f32 (the rewrite must not change
+;; the gradient at either dtype).
+(defn- sdpa-fd-d [f ^doubles a idx eps]
+  (let [a0 (aget a idx)
+        fp (do (aset a idx (+ a0 eps)) (f)) fm (do (aset a idx (- a0 eps)) (f))]
+    (aset a idx a0) (/ (- fp fm) (* 2.0 eps))))
+(defn- sdpa-fd-f [f ^floats a idx eps]
+  (let [a0 (aget a idx)
+        fp (do (aset a idx (float (+ a0 eps))) (f)) fm (do (aset a idx (float (- a0 eps))) (f))]
+    (aset a idx (float a0)) (/ (- fp fm) (* 2.0 eps))))
+
+(deftest batched-causal-sdpa-backward-matches-fd-f64
+  (testing "dQ/dK/dV kernels match central finite differences (double)"
+    (let [batch 2 sl 3 hd 4 n (* batch sl hd)
+          Q (da n 101) K (da n 202) V (da n 303) dO (da n 404)
+          dot (fn [^doubles a ^doubles b] (reduce + 0.0 (map * (seq a) (seq b))))
+          L   (fn [] (dot dO (attn/batched-causal-sdpa Q K V batch sl hd)))
+          dQ (attn/batched-causal-sdpa-dq dO Q K V batch sl hd)
+          dK (attn/batched-causal-sdpa-dk dO Q K V batch sl hd)
+          dV (attn/batched-causal-sdpa-dv dO Q K V batch sl hd)]
+      (doseq [i [0 5 11 16 23]]
+        (is (< (Math/abs (- (aget ^doubles dQ i) (sdpa-fd-d L Q i 1e-5))) 1e-6) (str "dQ[" i "]"))
+        (is (< (Math/abs (- (aget ^doubles dK i) (sdpa-fd-d L K i 1e-5))) 1e-6) (str "dK[" i "]"))
+        (is (< (Math/abs (- (aget ^doubles dV i) (sdpa-fd-d L V i 1e-5))) 1e-6) (str "dV[" i "]"))))))
+
+(deftest batched-causal-sdpa-backward-matches-fd-f32
+  (testing "dQ/dK/dV kernels match central finite differences (float)"
+    (let [batch 2 sl 3 hd 4 n (* batch sl hd)
+          Q (fa n 101) K (fa n 202) V (fa n 303) dO (fa n 404)
+          dot (fn [^floats a ^floats b] (reduce + 0.0 (map #(* (double %1) (double %2)) (seq a) (seq b))))
+          L   (fn [] (dot dO (attn/batched-causal-sdpa Q K V batch sl hd)))
+          dQ (attn/batched-causal-sdpa-dq dO Q K V batch sl hd)
+          dK (attn/batched-causal-sdpa-dk dO Q K V batch sl hd)
+          dV (attn/batched-causal-sdpa-dv dO Q K V batch sl hd)
+          ok? (fn [a n] (< (Math/abs (- a n)) (+ 3e-2 (* 3e-2 (Math/abs n)))))]
+      (doseq [i [0 5 11 16 23]]
+        (is (ok? (double (aget ^floats dQ i)) (sdpa-fd-f L Q i 3e-2)) (str "dQ[" i "]"))
+        (is (ok? (double (aget ^floats dK i)) (sdpa-fd-f L K i 3e-2)) (str "dK[" i "]"))
+        (is (ok? (double (aget ^floats dV i)) (sdpa-fd-f L V i 3e-2)) (str "dV[" i "]"))))))
+
 ;; ── GATE 2: GPU resident parity ──────────────────────────────────────────────────
 ;; Losses use the resident-proven mse-loss reduction so the value+grad extracts to a
 ;; straight-line resident program (forward + backward + loss-grad, all :map-void/:reduce).
@@ -152,6 +197,48 @@
       (println "  [rms-norm] grad(w) steps:" (:step-kinds (get grads 'w))
                "rel-err" (:rel-err (get grads 'w)))
       (is (every? some? (map :resident? (vals grads)))))))
+
+;; gqa-causal-mha value+grad: the milestone — the SDPA backward (dq/dk/dv kernels)
+;; composed with pack/broadcast/unpack. grad wrt Q must extract FULLY RESIDENT.
+(deftm gqa-parity-loss [Q :- (Array float) K :- (Array float) V :- (Array float) tgt :- (Array float)
+                        seq-len :- Long nq :- Long nkv :- Long hd :- Long] :- Double
+  (let [y (raster.dl.attention/gqa-causal-mha Q K V seq-len nq nkv hd)]
+    (raster.dl.loss/mse-loss y tgt (clojure.core/* seq-len (clojure.core/* nq hd)))))
+
+(deftest gqa-causal-mha-value+grad-resident-parity
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] gqa-causal-mha resident parity: no Level Zero GPU")
+    (let [sl 4 nq 4 nkv 2 hd 8
+          Q (fa (* sl nq hd) 21) K (fa (* sl nkv hd) 22) V (fa (* sl nkv hd) 23)
+          tgt (fa (* sl nq hd) 24)
+          {:keys [grads]}
+          (gp/grad-parity #'gqa-parity-loss
+                          [{:name 'Q :type '(Array float) :val Q}
+                           {:name 'K :type '(Array float) :val K}
+                           {:name 'V :type '(Array float) :val V}
+                           {:name 'tgt :type '(Array float) :val tgt}
+                           {:name 'seq-len :type 'Long :val sl}
+                           {:name 'nq :type 'Long :val nq}
+                           {:name 'nkv :type 'Long :val nkv}
+                           {:name 'hd :type 'Long :val hd}]
+                          :grad-args '[Q])]
+      (println "  [gqa] grad(Q) steps:" (:step-kinds (get grads 'Q))
+               "rel-err" (:rel-err (get grads 'Q)))
+      (is (:resident? (get grads 'Q))))))
+
+;; NOTE — the FULL attention-block value+grad (rms-norm → q/k/v linear-nb → rope →
+;; gqa-causal-mha → out linear-nb → mse, grad wrt x) does NOT yet extract fully
+;; resident, but the blocker is NOT the SDPA backward (this PR's deliverable). A
+;; bisected compile-gpu-program probe shows the ONLY surviving undevirtualized
+;; dispatches are the linear-GEMM family — {linear-nb 1, mse-grad 1, linear-dx 4,
+;; linear-dW 3} — i.e. exactly the pre-existing F5 blocker (linear GEMM recognition
+;; in composed AD IR + mse-grad residency). pack/broadcast/rope/rms-norm AND the new
+;; sdpa dq/dk/dv kernels are ALL absent from the surviving list — they compose
+;; resident (the gqa-causal-mha test below is the resident+parity milestone). The
+;; interpreted CPU value+grad of the same block also throws a [F/[D ClassCast in the
+;; linear-composition layer; both are tracked as the next Phase-1b prereq, separate
+;; from this PR. Re-add a resident-parity deftest here once linear GEMM composition
+;; lowers.
 
 (deftest rope-value+grad-resident-parity
   (if-not @gp/gpu-available?
