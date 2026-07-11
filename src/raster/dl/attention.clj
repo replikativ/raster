@@ -608,100 +608,287 @@
                                                  out (nn/matmul scores V seq-len seq-len dv)]
                                              out)))
 
-;; Backward for causal-scaled-dot-product-attn. Returns Object[3] = [dQ dK dV].
-;; Same algorithm as the pullback closure below (forward recomputation + softmax
-;; backprop + d_V/dQ/dK gemms), but as a regular deftm so :grads-fn can splice
-;; a single call into the AD body's flat let* (compile-aot needs flat IR).
-(deftm causal-scaled-dot-product-attn-backward
+;; Backward for causal-scaled-dot-product-attn — THREE flat resident par/map-void!
+;; kernels, one per gradient (dQ / dK / dV), each returning a SEPARATE (Array T)
+;; (NOT an object-array bundle → NO lost float tag). Same recompute-the-row-softmax
+;; philosophy as batched-causal-sdpa-dq/dk/dv (see there): every work-item owns a
+;; DISJOINT output row (no atomics/host-dotimes/blit). Conventions:
+;;   score_ij = (Q_i·K_j) / sqrt(dk)   (causal j≤i)   w_ij = softmax_j(score)
+;;   dw_ij    = ⟨dO_i, V_j⟩            D_i = Σ_{j≤i} w_ij·dw_ij
+;;   dQ_i = (1/√dk)·Σ_{j≤i} w_ij·(dw_ij−D_i)·K_j
+;;   dK_j = (1/√dk)·Σ_{i≥j} w_ij·(dw_ij−D_i)·Q_i     dV_j = Σ_{i≥j} w_ij·dO_i
+;; UNLIKE batched-causal-sdpa these split the Q/K feature dim (dk) from the V/out
+;; feature dim (dv). Every T-touching scalar stays T-typed via the SAME two
+;; mechanisms as the forward: reduction seeds are bare floating literals that narrow
+;; to the element dtype, and the 1/√dk scale is a DIVISION by a data-scalar-typed
+;; (n/oftype <val> (n/sqrt (double dk))) — NEVER a Double literal × T.
+
+(deftm causal-scaled-dot-product-attn-dq
+  "dQ of causal-scaled-dot-product-attn. Parallel over query row i (disjoint):
+  recomputes the causal row softmax + D_i, then
+  dQ[i,d] = (1/√dk)·Σ_{j≤i} w_ij·(⟨dO_i,V_j⟩ − D_i)·K[j,d]."
   (All [T]
        [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
         seq-len :- Long dk :- Long dv :- Long]
-       :- (Array Object)
-    ;; scale is :- T (element-typed) so dot*scale and scale*(weights·…) devirtualize
-    ;; for every T — a Double scale would be T×Double (no monomorphic overload → GPU
-    ;; garbage). one/z0 likewise element-typed for the BLAS alpha/beta and masked grad.
-       (let [scale (n/oftype Q (/ 1.0 (n/sqrt (double dk))))
-             one   (n/oftype Q 1.0)
-             z0    (n/oftype Q 0.0)
-             neg-inf (n/oftype Q -1.0e38)   ; T-typed sentinel, no device-buffer read (see forward)
-             scores  (alloc-like Q (* seq-len seq-len))
-             weights (alloc-like Q (* seq-len seq-len))]
-      ;; Forward recomputation with causal mask (masked entries = neg-inf so
-      ;; exp(neg-inf - max) = 0; no explicit branch — mirrors the forward softmax).
-         (dotimes [i seq-len]
-           (dotimes [j seq-len]
-             (let [dot (loop [d 0 acc 0.0]
-                         (if (< d dk)
-                           (recur (inc d)
-                                  (+ acc (* (aget Q (+ (* i (int dk)) d))
-                                            (aget K (+ (* j (int dk)) d)))))
-                           acc))]
-               (aset scores (+ (* i (int seq-len)) j)
-                     (if (> j i) neg-inf (* dot scale))))))
-         (dotimes [i seq-len]
-           (let [offset (* i (int seq-len))
-                 max-s (loop [j 0 mm neg-inf]
-                         (if (< j seq-len)
-                           (recur (inc j) (n/max mm (aget scores (+ offset j))))
-                           mm))
-                 sum-exp (loop [j 0 s 0.0]
-                           (if (< j seq-len)
-                             (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
-                               (aset weights (+ offset j) e)
-                               (recur (inc j) (+ s e)))
-                             s))
-                 inv-sum (/ one sum-exp)]
-             (dotimes [j seq-len]
-               (aset weights (+ offset j)
-                     (* (aget weights (+ offset j)) inv-sum)))))
-         (let [d-weights (alloc-like Q (* seq-len seq-len))
-               _ (blas/dgemm-nt! d-out V d-weights seq-len dv seq-len one z0)
-               dV (alloc-like Q (* seq-len dv))
-               _ (blas/dgemm-tn! weights d-out dV seq-len seq-len dv one z0)
-               d-scores (alloc-like Q (* seq-len seq-len))]
-           (dotimes [i seq-len]
-             (let [offset (* i (int seq-len))
-                   dot-wdw (loop [j 0 acc 0.0]
-                             (if (< j seq-len)
-                               (recur (inc j)
-                                      (+ acc (* (aget weights (+ offset j))
-                                                (aget d-weights (+ offset j)))))
-                               acc))]
-               (dotimes [j seq-len]
-                 (aset d-scores (+ offset j)
-                       (if (> j i)
-                         z0
-                         (* scale
-                            (aget weights (+ offset j))
-                            (- (aget d-weights (+ offset j)) dot-wdw)))))))
-           (let [dQ (nn/matmul d-scores K seq-len seq-len dk)
-                 dK (alloc-like Q (* seq-len dk))
-                 _ (blas/dgemm-tn! d-scores Q dK seq-len seq-len dk one z0)
-                 out (object-array 3)]
-             (clojure.core/aset out 0 dQ)
-             (clojure.core/aset out 1 dK)
-             (clojure.core/aset out 2 dV)
-             out)))))
+       :- (Array T)
+       (let [dQ (alloc-like Q (* seq-len dk))]
+         (raster.par/map-void! i seq-len
+                               (let [qrow (clojure.core/* i dk)
+                                     orow (clojure.core/* i dv)
+                                     mx (loop [j 0 mm -1.0e38]
+                                          (if (<= j i)
+                                            (let [krow (clojure.core/* j dk)
+                                                  dot (loop [d 0 acc 0.0]
+                                                        (if (< d dk)
+                                                          (recur (inc d)
+                                                                 (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                           (aget K (clojure.core/+ krow d)))))
+                                                          acc))]
+                                              (recur (inc j) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                            mm))
+                                     sum (loop [j 0 s 0.0]
+                                           (if (<= j i)
+                                             (let [krow (clojure.core/* j dk)
+                                                   dot (loop [d 0 acc 0.0]
+                                                         (if (< d dk)
+                                                           (recur (inc d)
+                                                                  (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                            (aget K (clojure.core/+ krow d)))))
+                                                           acc))]
+                                               (recur (inc j) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                             s))
+                                     inv (/ 1.0 sum)
+                                     Di (loop [j 0 acc 0.0]
+                                          (if (<= j i)
+                                            (let [krow (clojure.core/* j dk)
+                                                  vrow (clojure.core/* j dv)
+                                                  dot (loop [d 0 a 0.0]
+                                                        (if (< d dk)
+                                                          (recur (inc d)
+                                                                 (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                         (aget K (clojure.core/+ krow d)))))
+                                                          a))
+                                                  w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                                  dw (loop [d 0 a 0.0]
+                                                       (if (< d dv)
+                                                         (recur (inc d)
+                                                                (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                        (aget V (clojure.core/+ vrow d)))))
+                                                         a))]
+                                              (recur (inc j) (+ acc (* w dw))))
+                                            acc))]
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (do (aset dQ (clojure.core/+ qrow d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [j 0]
+                                   (if (<= j i)
+                                     (let [krow (clojure.core/* j dk)
+                                           vrow (clojure.core/* j dv)
+                                           dot (loop [d 0 a 0.0]
+                                                 (if (< d dk)
+                                                   (recur (inc d)
+                                                          (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                  (aget K (clojure.core/+ krow d)))))
+                                                   a))
+                                           w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                           dw (loop [d 0 a 0.0]
+                                                (if (< d dv)
+                                                  (recur (inc d)
+                                                         (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                 (aget V (clojure.core/+ vrow d)))))
+                                                  a))
+                                           c  (* w (- dw Di))]
+                                       (loop [d 0]
+                                         (if (< d dk)
+                                           (do (aset dQ (clojure.core/+ qrow d)
+                                                     (+ (aget dQ (clojure.core/+ qrow d))
+                                                        (* c (aget K (clojure.core/+ krow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc j)))
+                                     nil))
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (let [v (aget dQ (clojure.core/+ qrow d))]
+                                       (aset dQ (clojure.core/+ qrow d) (/ v (n/oftype v (n/sqrt (double dk)))))
+                                       (recur (inc d)))
+                                     nil))))
+         dQ)))
 
-;; grads-fn (compile-aot flat codegen): calls the backward deftm above and
-;; extracts the three gradients via aget — a single flat let-binding shape
-;; for PE/CSE/DCE.
+(deftm causal-scaled-dot-product-attn-dv
+  "dV of causal-scaled-dot-product-attn. Parallel over key row j (disjoint). Loops
+  queries i≥j (causal), recomputing query i's row softmax to get w_ij, and
+  accumulates dV[j,d] = Σ_{i≥j} w_ij·dO[i,d]."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long dk :- Long dv :- Long]
+       :- (Array T)
+       (let [dV (alloc-like Q (* seq-len dv))]
+         (raster.par/map-void! j seq-len
+                               (let [jrowk (clojure.core/* j dk)
+                                     jrowv (clojure.core/* j dv)]
+                                 (loop [d 0]
+                                   (if (< d dv)
+                                     (do (aset dV (clojure.core/+ jrowv d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [i j]
+                                   (if (< i seq-len)
+                                     (let [qrow (clojure.core/* i dk)
+                                           orow (clojure.core/* i dv)
+                                           mx (loop [k 0 mm -1.0e38]
+                                                (if (<= k i)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        dot (loop [d 0 acc 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                 (aget K (clojure.core/+ krow d)))))
+                                                                acc))]
+                                                    (recur (inc k) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                                  mm))
+                                           sum (loop [k 0 s 0.0]
+                                                 (if (<= k i)
+                                                   (let [krow (clojure.core/* k dk)
+                                                         dot (loop [d 0 acc 0.0]
+                                                               (if (< d dk)
+                                                                 (recur (inc d)
+                                                                        (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                  (aget K (clojure.core/+ krow d)))))
+                                                                 acc))]
+                                                     (recur (inc k) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                                   s))
+                                           inv (/ 1.0 sum)
+                                           dotij (loop [d 0 acc 0.0]
+                                                   (if (< d dk)
+                                                     (recur (inc d)
+                                                            (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                      (aget K (clojure.core/+ jrowk d)))))
+                                                     acc))
+                                           w (* (m/exp (- (/ dotij (n/oftype dotij (n/sqrt (double dk)))) mx)) inv)]
+                                       (loop [d 0]
+                                         (if (< d dv)
+                                           (do (aset dV (clojure.core/+ jrowv d)
+                                                     (+ (aget dV (clojure.core/+ jrowv d))
+                                                        (* w (aget d-out (clojure.core/+ orow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc i)))
+                                     nil))))
+         dV)))
+
+(deftm causal-scaled-dot-product-attn-dk
+  "dK of causal-scaled-dot-product-attn. Parallel over key row j (disjoint). Loops
+  queries i≥j (causal); for each, recomputes query i's row softmax + D_i and
+  accumulates dK[j,d] = (1/√dk)·Σ_{i≥j} w_ij·(⟨dO_i,V_j⟩ − D_i)·Q[i,d]."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-len :- Long dk :- Long dv :- Long]
+       :- (Array T)
+       (let [dK (alloc-like Q (* seq-len dk))]
+         (raster.par/map-void! j seq-len
+                               (let [jrowk (clojure.core/* j dk)
+                                     jrowv (clojure.core/* j dv)]
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (do (aset dK (clojure.core/+ jrowk d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [i j]
+                                   (if (< i seq-len)
+                                     (let [qrow (clojure.core/* i dk)
+                                           orow (clojure.core/* i dv)
+                                           mx (loop [k 0 mm -1.0e38]
+                                                (if (<= k i)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        dot (loop [d 0 acc 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                 (aget K (clojure.core/+ krow d)))))
+                                                                acc))]
+                                                    (recur (inc k) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                                  mm))
+                                           sum (loop [k 0 s 0.0]
+                                                 (if (<= k i)
+                                                   (let [krow (clojure.core/* k dk)
+                                                         dot (loop [d 0 acc 0.0]
+                                                               (if (< d dk)
+                                                                 (recur (inc d)
+                                                                        (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                  (aget K (clojure.core/+ krow d)))))
+                                                                 acc))]
+                                                     (recur (inc k) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                                   s))
+                                           inv (/ 1.0 sum)
+                                           Di (loop [k 0 acc 0.0]
+                                                (if (<= k i)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        vrow (clojure.core/* k dv)
+                                                        dot (loop [d 0 a 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                               (aget K (clojure.core/+ krow d)))))
+                                                                a))
+                                                        w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                                        dw (loop [d 0 a 0.0]
+                                                             (if (< d dv)
+                                                               (recur (inc d)
+                                                                      (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                              (aget V (clojure.core/+ vrow d)))))
+                                                               a))]
+                                                    (recur (inc k) (+ acc (* w dw))))
+                                                  acc))
+                                           dotij (loop [d 0 acc 0.0]
+                                                   (if (< d dk)
+                                                     (recur (inc d)
+                                                            (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                      (aget K (clojure.core/+ jrowk d)))))
+                                                     acc))
+                                           wij (* (m/exp (- (/ dotij (n/oftype dotij (n/sqrt (double dk)))) mx)) inv)
+                                           dwij (loop [d 0 a 0.0]
+                                                  (if (< d dv)
+                                                    (recur (inc d)
+                                                           (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                   (aget V (clojure.core/+ jrowv d)))))
+                                                    a))
+                                           c (* wij (- dwij Di))]
+                                       (loop [d 0]
+                                         (if (< d dk)
+                                           (do (aset dK (clojure.core/+ jrowk d)
+                                                     (+ (aget dK (clojure.core/+ jrowk d))
+                                                        (* c (aget Q (clojure.core/+ qrow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc i)))
+                                     nil))
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (let [v (aget dK (clojure.core/+ jrowk d))]
+                                       (aset dK (clojure.core/+ jrowk d) (/ v (n/oftype v (n/sqrt (double dk)))))
+                                       (recur (inc d)))
+                                     nil))))
+         dK)))
+
+;; grads-fn (compile-aot flat codegen): three direct (Array T) kernel calls — one
+;; per gradient (dQ/dK/dV). No object-array bundle, no clojure.core/aget-on-Object:
+;; each grad carries its own float/double tag so composed cotangents devirtualize.
 
 (tmpl/merge-into-template! 'raster.dl.attention/causal-scaled-dot-product-attn
                            {:params '[Q K V seq-len dk dv]
                             :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [Q K V seq-len dk dv] _result-sym adjoint-sym gensym-fn]
-                              (let [bundle (gensym-fn "cspa_grads")
-                                    dQ (gensym-fn "dQ")
+                              (let [dQ (gensym-fn "dQ")
                                     dK (gensym-fn "dK")
                                     dV (gensym-fn "dV")]
                                 [(update ctx :bindings into
-                                         [bundle (list 'raster.dl.attention/causal-scaled-dot-product-attn-backward
-                                                       adjoint-sym Q K V seq-len dk dv)
-                                          dQ (list 'clojure.core/aget bundle 0)
-                                          dK (list 'clojure.core/aget bundle 1)
-                                          dV (list 'clojure.core/aget bundle 2)])
+                                         [dQ (list 'raster.dl.attention/causal-scaled-dot-product-attn-dq
+                                                   adjoint-sym Q K V seq-len dk dv)
+                                          dK (list 'raster.dl.attention/causal-scaled-dot-product-attn-dk
+                                                   adjoint-sym Q K V seq-len dk dv)
+                                          dV (list 'raster.dl.attention/causal-scaled-dot-product-attn-dv
+                                                   adjoint-sym Q K V seq-len dk dv)])
                                  [dQ dK dV nil nil nil]]))})
 
 ;; Forward tangent (JVP, §13 A3) of causal SDPA — the standard form, single
@@ -1684,60 +1871,260 @@
 ;; Backward helper for scaled-dot-product attention
 ;; ================================================================
 
-(deftm scaled-dot-product-attn-backward
-  [d-out :- (Array double)
-   Q :- (Array double) K :- (Array double) V :- (Array double)
-   seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
-  :- (Array Object)
-  (let [scale (/ 1.0 (n/sqrt (double dk)))
-        ;; Recompute scores and weights
-        scores (double-array (* seq-q seq-k))
-        weights (double-array (* seq-q seq-k))]
-    (dotimes [i seq-q]
-      (dotimes [j seq-k]
-        (let [dot (loop [d 0 acc 0.0]
-                    (if (< d dk)
-                      (recur (inc d) (+ acc (* (aget Q (+ (* i (int dk)) d))
-                                               (aget K (+ (* j (int dk)) d)))))
-                      acc))]
-          (aset scores (+ (* i (int seq-k)) j) (* dot scale)))))
-    (dotimes [i seq-q]
-      (let [offset (* i (int seq-k))
-            max-s (loop [j 0 m n/neg-inf]
-                    (if (< j seq-k) (recur (inc j) (n/max m (aget scores (+ offset j)))) m))
-            sum-exp (loop [j 0 s 0.0]
-                      (if (< j seq-k)
-                        (let [e (m/exp (- (aget scores (+ offset j)) max-s))]
-                          (aset weights (+ offset j) e)
-                          (recur (inc j) (+ s e))) s))
-            inv-sum (/ 1.0 sum-exp)]
-        (dotimes [j seq-k]
-          (aset weights (+ offset j) (* (aget weights (+ offset j)) inv-sum)))))
-    ;; d_weights = d_out @ V^T -> [seq_q, seq_k]
-    (let [d-weights (double-array (* seq-q seq-k))
-          _ (blas/dgemm-nt! d-out V d-weights seq-q dv seq-k 1.0 0.0)
-          ;; d_V = weights^T @ d_out -> [seq_k, dv]
-          dV (double-array (* seq-k dv))
-          _ (blas/dgemm-tn! weights d-out dV seq-k seq-q dv 1.0 0.0)
-          ;; Backprop through softmax
-          d-scores (double-array (* seq-q seq-k))]
-      (dotimes [i seq-q]
-        (let [offset (* i (int seq-k))
-              dot-wdw (loop [j 0 acc 0.0]
-                        (if (< j seq-k)
-                          (recur (inc j) (+ acc (* (aget weights (+ offset j))
-                                                   (aget d-weights (+ offset j)))))
-                          acc))]
-          (dotimes [j seq-k]
-            (aset d-scores (+ offset j)
-                  (* scale (aget weights (+ offset j))
-                     (- (aget d-weights (+ offset j)) dot-wdw))))))
-      ;; dQ = d_scores @ K -> [seq_q, dk]
-      (let [dQ (nn/matmul d-scores K seq-q seq-k dk)
-            ;; dK = d_scores^T @ Q -> [seq_k, dk]
-            dK (double-array (* seq-k dk))
-            _ (blas/dgemm-tn! d-scores Q dK seq-k seq-q dk 1.0 0.0)]
-        (object-array [dQ dK dV])))))
+;; Backward for scaled-dot-product-attn (bidirectional, non-causal) — THREE flat
+;; resident par/map-void! kernels, one per gradient (dQ/dK/dV), each a SEPARATE
+;; (Array T) (NOT an object-array bundle → NO lost float tag). Same recompute-the-
+;; row-softmax structure as the causal kernels, but the j-sums run over ALL seq-k
+;; (no j≤i mask) and the query loops over all seq-q. Q/K feature dim = dk, V/out = dv.
+;;   score_ij = (Q_i·K_j)/√dk   w_ij = softmax_j(score)   dw_ij = ⟨dO_i,V_j⟩
+;;   D_i = Σ_j w_ij·dw_ij   dQ_i = (1/√dk)·Σ_j w_ij·(dw_ij−D_i)·K_j
+;;   dK_j = (1/√dk)·Σ_i w_ij·(dw_ij−D_i)·Q_i   dV_j = Σ_i w_ij·dO_i
+;; T-typing discipline identical to the causal kernels (reduction seeds are bare
+;; floating literals; the 1/√dk scale is a DIVISION by an (n/oftype …)-typed scalar).
+
+(deftm scaled-dot-product-attn-dq
+  "dQ of scaled-dot-product-attn. Parallel over query row i (disjoint)."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+       :- (Array T)
+       (let [dQ (alloc-like Q (* seq-q dk))]
+         (raster.par/map-void! i seq-q
+                               (let [qrow (clojure.core/* i dk)
+                                     orow (clojure.core/* i dv)
+                                     mx (loop [j 0 mm -1.0e38]
+                                          (if (< j seq-k)
+                                            (let [krow (clojure.core/* j dk)
+                                                  dot (loop [d 0 acc 0.0]
+                                                        (if (< d dk)
+                                                          (recur (inc d)
+                                                                 (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                           (aget K (clojure.core/+ krow d)))))
+                                                          acc))]
+                                              (recur (inc j) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                            mm))
+                                     sum (loop [j 0 s 0.0]
+                                           (if (< j seq-k)
+                                             (let [krow (clojure.core/* j dk)
+                                                   dot (loop [d 0 acc 0.0]
+                                                         (if (< d dk)
+                                                           (recur (inc d)
+                                                                  (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                            (aget K (clojure.core/+ krow d)))))
+                                                           acc))]
+                                               (recur (inc j) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                             s))
+                                     inv (/ 1.0 sum)
+                                     Di (loop [j 0 acc 0.0]
+                                          (if (< j seq-k)
+                                            (let [krow (clojure.core/* j dk)
+                                                  vrow (clojure.core/* j dv)
+                                                  dot (loop [d 0 a 0.0]
+                                                        (if (< d dk)
+                                                          (recur (inc d)
+                                                                 (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                         (aget K (clojure.core/+ krow d)))))
+                                                          a))
+                                                  w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                                  dw (loop [d 0 a 0.0]
+                                                       (if (< d dv)
+                                                         (recur (inc d)
+                                                                (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                        (aget V (clojure.core/+ vrow d)))))
+                                                         a))]
+                                              (recur (inc j) (+ acc (* w dw))))
+                                            acc))]
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (do (aset dQ (clojure.core/+ qrow d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [j 0]
+                                   (if (< j seq-k)
+                                     (let [krow (clojure.core/* j dk)
+                                           vrow (clojure.core/* j dv)
+                                           dot (loop [d 0 a 0.0]
+                                                 (if (< d dk)
+                                                   (recur (inc d)
+                                                          (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                  (aget K (clojure.core/+ krow d)))))
+                                                   a))
+                                           w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                           dw (loop [d 0 a 0.0]
+                                                (if (< d dv)
+                                                  (recur (inc d)
+                                                         (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                 (aget V (clojure.core/+ vrow d)))))
+                                                  a))
+                                           c  (* w (- dw Di))]
+                                       (loop [d 0]
+                                         (if (< d dk)
+                                           (do (aset dQ (clojure.core/+ qrow d)
+                                                     (+ (aget dQ (clojure.core/+ qrow d))
+                                                        (* c (aget K (clojure.core/+ krow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc j)))
+                                     nil))
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (let [v (aget dQ (clojure.core/+ qrow d))]
+                                       (aset dQ (clojure.core/+ qrow d) (/ v (n/oftype v (n/sqrt (double dk)))))
+                                       (recur (inc d)))
+                                     nil))))
+         dQ)))
+
+(deftm scaled-dot-product-attn-dv
+  "dV of scaled-dot-product-attn. Parallel over key row j (disjoint); loops all
+  queries i and accumulates dV[j,d] = Σ_i w_ij·dO[i,d]."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+       :- (Array T)
+       (let [dV (alloc-like Q (* seq-k dv))]
+         (raster.par/map-void! j seq-k
+                               (let [jrowk (clojure.core/* j dk)
+                                     jrowv (clojure.core/* j dv)]
+                                 (loop [d 0]
+                                   (if (< d dv)
+                                     (do (aset dV (clojure.core/+ jrowv d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [i 0]
+                                   (if (< i seq-q)
+                                     (let [qrow (clojure.core/* i dk)
+                                           orow (clojure.core/* i dv)
+                                           mx (loop [k 0 mm -1.0e38]
+                                                (if (< k seq-k)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        dot (loop [d 0 acc 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                 (aget K (clojure.core/+ krow d)))))
+                                                                acc))]
+                                                    (recur (inc k) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                                  mm))
+                                           sum (loop [k 0 s 0.0]
+                                                 (if (< k seq-k)
+                                                   (let [krow (clojure.core/* k dk)
+                                                         dot (loop [d 0 acc 0.0]
+                                                               (if (< d dk)
+                                                                 (recur (inc d)
+                                                                        (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                  (aget K (clojure.core/+ krow d)))))
+                                                                 acc))]
+                                                     (recur (inc k) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                                   s))
+                                           inv (/ 1.0 sum)
+                                           dotij (loop [d 0 acc 0.0]
+                                                   (if (< d dk)
+                                                     (recur (inc d)
+                                                            (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                      (aget K (clojure.core/+ jrowk d)))))
+                                                     acc))
+                                           w (* (m/exp (- (/ dotij (n/oftype dotij (n/sqrt (double dk)))) mx)) inv)]
+                                       (loop [d 0]
+                                         (if (< d dv)
+                                           (do (aset dV (clojure.core/+ jrowv d)
+                                                     (+ (aget dV (clojure.core/+ jrowv d))
+                                                        (* w (aget d-out (clojure.core/+ orow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc i)))
+                                     nil))))
+         dV)))
+
+(deftm scaled-dot-product-attn-dk
+  "dK of scaled-dot-product-attn. Parallel over key row j (disjoint); loops all
+  queries i, recomputing query i's softmax + D_i, and accumulates
+  dK[j,d] = (1/√dk)·Σ_i w_ij·(⟨dO_i,V_j⟩ − D_i)·Q[i,d]."
+  (All [T]
+       [d-out :- (Array T) Q :- (Array T) K :- (Array T) V :- (Array T)
+        seq-q :- Long seq-k :- Long dk :- Long dv :- Long]
+       :- (Array T)
+       (let [dK (alloc-like Q (* seq-k dk))]
+         (raster.par/map-void! j seq-k
+                               (let [jrowk (clojure.core/* j dk)
+                                     jrowv (clojure.core/* j dv)]
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (do (aset dK (clojure.core/+ jrowk d) 0.0) (recur (inc d)))
+                                     nil))
+                                 (loop [i 0]
+                                   (if (< i seq-q)
+                                     (let [qrow (clojure.core/* i dk)
+                                           orow (clojure.core/* i dv)
+                                           mx (loop [k 0 mm -1.0e38]
+                                                (if (< k seq-k)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        dot (loop [d 0 acc 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                 (aget K (clojure.core/+ krow d)))))
+                                                                acc))]
+                                                    (recur (inc k) (n/max mm (/ dot (n/oftype dot (n/sqrt (double dk)))))))
+                                                  mm))
+                                           sum (loop [k 0 s 0.0]
+                                                 (if (< k seq-k)
+                                                   (let [krow (clojure.core/* k dk)
+                                                         dot (loop [d 0 acc 0.0]
+                                                               (if (< d dk)
+                                                                 (recur (inc d)
+                                                                        (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                                  (aget K (clojure.core/+ krow d)))))
+                                                                 acc))]
+                                                     (recur (inc k) (+ s (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)))))
+                                                   s))
+                                           inv (/ 1.0 sum)
+                                           Di (loop [k 0 acc 0.0]
+                                                (if (< k seq-k)
+                                                  (let [krow (clojure.core/* k dk)
+                                                        vrow (clojure.core/* k dv)
+                                                        dot (loop [d 0 a 0.0]
+                                                              (if (< d dk)
+                                                                (recur (inc d)
+                                                                       (+ a (* (aget Q (clojure.core/+ qrow d))
+                                                                               (aget K (clojure.core/+ krow d)))))
+                                                                a))
+                                                        w  (* (m/exp (- (/ dot (n/oftype dot (n/sqrt (double dk)))) mx)) inv)
+                                                        dw (loop [d 0 a 0.0]
+                                                             (if (< d dv)
+                                                               (recur (inc d)
+                                                                      (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                              (aget V (clojure.core/+ vrow d)))))
+                                                               a))]
+                                                    (recur (inc k) (+ acc (* w dw))))
+                                                  acc))
+                                           dotij (loop [d 0 acc 0.0]
+                                                   (if (< d dk)
+                                                     (recur (inc d)
+                                                            (+ acc (* (aget Q (clojure.core/+ qrow d))
+                                                                      (aget K (clojure.core/+ jrowk d)))))
+                                                     acc))
+                                           wij (* (m/exp (- (/ dotij (n/oftype dotij (n/sqrt (double dk)))) mx)) inv)
+                                           dwij (loop [d 0 a 0.0]
+                                                  (if (< d dv)
+                                                    (recur (inc d)
+                                                           (+ a (* (aget d-out (clojure.core/+ orow d))
+                                                                   (aget V (clojure.core/+ jrowv d)))))
+                                                    a))
+                                           c (* wij (- dwij Di))]
+                                       (loop [d 0]
+                                         (if (< d dk)
+                                           (do (aset dK (clojure.core/+ jrowk d)
+                                                     (+ (aget dK (clojure.core/+ jrowk d))
+                                                        (* c (aget Q (clojure.core/+ qrow d)))))
+                                               (recur (inc d)))
+                                           nil))
+                                       (recur (inc i)))
+                                     nil))
+                                 (loop [d 0]
+                                   (if (< d dk)
+                                     (let [v (aget dK (clojure.core/+ jrowk d))]
+                                       (aset dK (clojure.core/+ jrowk d) (/ v (n/oftype v (n/sqrt (double dk)))))
+                                       (recur (inc d)))
+                                     nil))))
+         dK)))
 
 ;; ================================================================
 ;; Template registration for scaled-dot-product attention
@@ -1746,16 +2133,16 @@
 (tmpl/merge-into-template! 'raster.dl.attention/scaled-dot-product-attn
                            {:params '[Q K V seq-q seq-k dk dv] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [Q K V seq-q seq-k dk dv] _result-sym adjoint-sym gensym-fn]
-                                        (let [grads-arr (gensym-fn "attn_grads")
-                                              dQ (gensym-fn "dQ")
+                                        (let [dQ (gensym-fn "dQ")
                                               dK (gensym-fn "dK")
                                               dV (gensym-fn "dV")]
                                           [(update ctx :bindings into
-                                                   [grads-arr (list 'raster.dl.attention/scaled-dot-product-attn-backward
-                                                                    adjoint-sym Q K V seq-q seq-k dk dv)
-                                                    dQ (list 'clojure.core/aget grads-arr 0)
-                                                    dK (list 'clojure.core/aget grads-arr 1)
-                                                    dV (list 'clojure.core/aget grads-arr 2)])
+                                                   [dQ (list 'raster.dl.attention/scaled-dot-product-attn-dq
+                                                             adjoint-sym Q K V seq-q seq-k dk dv)
+                                                    dK (list 'raster.dl.attention/scaled-dot-product-attn-dk
+                                                             adjoint-sym Q K V seq-q seq-k dk dv)
+                                                    dV (list 'raster.dl.attention/scaled-dot-product-attn-dv
+                                                             adjoint-sym Q K V seq-q seq-k dk dv)])
                                            [dQ dK dV nil nil nil nil]]))})
 
 ;; Forward tangent (JVP, §13 A3) of (bidirectional) SDPA — the standard form,

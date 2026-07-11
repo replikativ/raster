@@ -66,6 +66,31 @@
        (vary-meta sym assoc :raster.type/tag type-tag)
        sym))))
 
+;; ----------------------------------------------------------------
+;; Lost-tag instrumentation (diagnostic-first; task #58 phase-1b).
+;; The raw-loop reverse-AD codegen defaults an untagged cotangent's shadow
+;; array/scalar to 'doubles/'double (silently narrowing f32 → f64: the [F/[D
+;; ClassCast + F5 GPU under-devirtualization root). Until the enumeration of
+;; lost-tag sites is clean these sites WARN (dedup'd to *err*, keyed by
+;; [site binding]) instead of throwing, so the full corpus can be collected
+;; without behavior change. Flip to fail-loud (tangent/zero-expr) only once the
+;; corpus is clean.
+(def ^:private default-tag-warn-seen (atom #{}))
+
+(defn- warn-default-tag!
+  "Emit a dedup'd LOST-TAG warning to *err* when a reverse-AD codegen site falls
+  back to `default-tag` because the primal binding carries no :raster.type/tag.
+  Keyed by [site binding]. Returns `default-tag` unchanged (no behavior change)."
+  [site binding-hint default-tag]
+  (let [k [site (str binding-hint)]]
+    (when-not (contains? @default-tag-warn-seen k)
+      (swap! default-tag-warn-seen conj k)
+      (binding [*out* *err*]
+        (println (str "[ad.reverse LOST-TAG default] site=" site
+                      " binding=" binding-hint " -> default " default-tag
+                      " (primal has no :raster.type/tag)"))))
+    default-tag))
+
 (defmacro ^:private with-ad-gensym
   "Ensure *gensym-counter* is bound. If already bound (non-nil), inherit it;
   otherwise bind a fresh counter starting at 0. This allows composed AD passes
@@ -1531,18 +1556,21 @@
         ;; element type (inherits :raster.type/tag if present; defaults to doubles).
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :dotimes-read-arr (name arr) 'doubles))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
-                                         (or (:raster.type/tag (meta p)) 'double)))
+                                         (or (:raster.type/tag (meta p))
+                                             (warn-default-tag! :dotimes-scalar (name p) 'double))))
                             active-free)
 
         ;; Backward loop: reads d_out, calls pullbacks, accumulates
         ;; d-out-sym is the gradient of the output array — bound by gen-reverse-let
         ;; from adj-env contributions. Tag inherits from the output array type
         ;; (defaults to doubles, the dominant case for raster training).
-        out-array-tag (or (some-> written-arrs first meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> written-arrs first meta :raster.type/tag)
+                          (warn-default-tag! :dotimes-out-arr (some-> written-arrs first name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
                        'double)
@@ -1757,13 +1785,16 @@
         ;; Type-tag the gradient symbols so downstream type inference is complete.
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :parmap-read-arr (name arr) 'doubles))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
-                                         (or (:raster.type/tag (meta p)) 'double)))
+                                         (or (:raster.type/tag (meta p))
+                                             (warn-default-tag! :parmap-scalar (name p) 'double))))
                             active-free)
-        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> out-sym meta :raster.type/tag)
+                          (warn-default-tag! :parmap-out-arr (some-> out-sym name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
                        'double)
@@ -2190,11 +2221,13 @@
           (gen-reverse-let binds [val-result-sym] iter-active))
 
         ;; === Backward code ===
-        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> out-sym meta :raster.type/tag)
+                          (warn-default-tag! :carry-out-arr (some-> out-sym name) 'doubles))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :carry-read-arr (name arr) 'doubles))))
                               read-arrs)
         arr->d-sym (zipmap read-arrs d-read-arr-syms)
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
@@ -2554,7 +2587,7 @@
     (let [scalar-tag (case dtype :float 'float :double 'double nil)
           array-tag  (case dtype :float 'floats :double 'doubles nil)
           alloc-fn   (case dtype :float 'clojure.core/float-array
-                                 :double 'clojure.core/double-array nil)
+                           :double 'clojure.core/double-array nil)
           init-sym   (ad-gensym "carry_init" scalar-tag)
           n-sym      (ad-gensym "carry_n" 'long)
           pos-sym    (ad-gensym "carry_pos")
@@ -3416,12 +3449,12 @@
   ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
   ;; monotonic counter keeps every generated name globally unique.
   (with-ad-gensym
-   (let [resolved (resolve-deftm-var f-var)
-        m (meta resolved)
-        params (or (:raster.core/deftm-params m)
-                   (throw (ex-info "grad requires a deftm var" {:var f-var})))
-        walked-body (or (rcore/ensure-walked-body! resolved)
-                        (throw (ex-info "No walked body on var" {:var f-var})))
+    (let [resolved (resolve-deftm-var f-var)
+          m (meta resolved)
+          params (or (:raster.core/deftm-params m)
+                     (throw (ex-info "grad requires a deftm var" {:var f-var})))
+          walked-body (or (rcore/ensure-walked-body! resolved)
+                          (throw (ex-info "No walked body on var" {:var f-var})))
         ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
         ;; only defined for SCALAR-valued functions — a vector tail (e.g. the
         ;; [primal grads...] of a value+grad result, or a tuple-returning
@@ -3429,41 +3462,41 @@
         ;; the reverse fold would silently return zero gradients. Fail loud.
         ;; The transparent-composition idiom is to USE the components in a
         ;; scalar program: (let [vg ((value+grad #'f) x)] ...scalar of (nth vg i)...).
-        _ (let [wb-form (first walked-body)
-                tail (if (and (seq? wb-form)
-                              (contains? #{'let 'let*} (first wb-form)))
-                       (last wb-form)
-                       wb-form)]
-            (when (vector? tail)
-              (throw (ex-info
-                      (str "Cannot differentiate the tuple-valued function `" f-var
-                           "` — its output is a vector, which has no canonical "
-                           "cotangent seed (this is what value+grad returns; "
-                           "value+grad of value+grad is ill-typed). Compose "
-                           "transparently instead: call the inner gradient in a "
-                           "scalar deftm and differentiate that, e.g. "
-                           "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
-                           "For 1-param scalar fns, (grad (grad f)) composes directly.")
-                      {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
-        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
-        all-params (vec (map-indexed
-                         (fn [i p]
-                           (let [tag (nth tags i nil)
-                                 base (if (symbol? p) p (symbol (name p)))]
-                             (if tag
-                               (with-meta base {:raster.type/tag tag})
-                               (with-meta base nil))))
-                         params))
+          _ (let [wb-form (first walked-body)
+                  tail (if (and (seq? wb-form)
+                                (contains? #{'let 'let*} (first wb-form)))
+                         (last wb-form)
+                         wb-form)]
+              (when (vector? tail)
+                (throw (ex-info
+                        (str "Cannot differentiate the tuple-valued function `" f-var
+                             "` — its output is a vector, which has no canonical "
+                             "cotangent seed (this is what value+grad returns; "
+                             "value+grad of value+grad is ill-typed). Compose "
+                             "transparently instead: call the inner gradient in a "
+                             "scalar deftm and differentiate that, e.g. "
+                             "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
+                             "For 1-param scalar fns, (grad (grad f)) composes directly.")
+                        {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
+          tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+          all-params (vec (map-indexed
+                           (fn [i p]
+                             (let [tag (nth tags i nil)
+                                   base (if (symbol? p) p (symbol (name p)))]
+                               (if tag
+                                 (with-meta base {:raster.type/tag tag})
+                                 (with-meta base nil))))
+                           params))
         ;; Only differentiable-tag params seed activity analysis. Non-diff
         ;; params (Long/longs scalars, indices, etc.) are constants for AD —
         ;; expressions involving only them stay inactive and don't need AD
         ;; rules. Their grad slots are still emitted in the output vector
         ;; (via all-params) so positional consumers don't shift.
-        diff-active-params (vec (keep-indexed
-                                 (fn [i p]
-                                   (when (differentiable-tag? (nth tags i nil)) p))
-                                 all-params))
-        source-ns (or (:ns m) *ns*)
+          diff-active-params (vec (keep-indexed
+                                   (fn [i p]
+                                     (when (differentiable-tag? (nth tags i nil)) p))
+                                   all-params))
+          source-ns (or (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
         ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
         ;; actual primal flowing) — not from a global binary any-param-is-float
@@ -3472,45 +3505,45 @@
         ;; cross-entropy) needs a FLOAT seed for its pullback; the Double is
         ;; only the .invk interface boundary. The legacy binary inference
         ;; remains as fallback for untagged tails.
-        dtype (case (body-tail-tag (first walked-body))
-                float  :float
-                double :double
-                (if (some #{'floats 'float} tags) :float :double))
+          dtype (case (body-tail-tag (first walked-body))
+                  float  :float
+                  double :double
+                  (if (some #{'floats 'float} tags) :float :double))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-        hoisted (ad-prepare (first walked-body))
+          hoisted (ad-prepare (first walked-body))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-        ad-form (transform-body hoisted diff-active-params)
-        flat (binding [ad-flatten/*flatten-dtype* dtype]
-               (ad-flatten/flatten-for-gradient ad-form))
+          ad-form (transform-body hoisted diff-active-params)
+          flat (binding [ad-flatten/*flatten-dtype* dtype]
+                 (ad-flatten/flatten-for-gradient ad-form))
         ;; Pad the gradient output vector so positional consumers see one slot
         ;; per ORIGINAL param (loss + N grads), with nil where the param was
         ;; non-differentiable. flat's inner form is (let* bindings [primal d1
         ;; d2 ... dN_diff]); we rewrite it to [primal slot1 ... slotN_all].
-        padded-form
-        (when flat
-          (let [diff->idx (zipmap diff-active-params (range))
-                grad-slots (mapv (fn [p]
-                                   (if-let [j (diff->idx p)]
-                                     (nth (:param-adj-syms flat) j)
-                                     nil))
-                                 all-params)
-                output-vec (vec (cons (:result-sym flat) grad-slots))
-                [op bindings _] (:form flat)]
+          padded-form
+          (when flat
+            (let [diff->idx (zipmap diff-active-params (range))
+                  grad-slots (mapv (fn [p]
+                                     (if-let [j (diff->idx p)]
+                                       (nth (:param-adj-syms flat) j)
+                                       nil))
+                                   all-params)
+                  output-vec (vec (cons (:result-sym flat) grad-slots))
+                  [op bindings _] (:form flat)]
             ;; FAIL-LOUD backstop: the flat let* must have globally-unique
             ;; gensym-minted bound names. A duplicate means a *gensym-counter*
             ;; collision slipped through (the enclosing with-ad-gensym above is
             ;; what prevents it) — would silently miscompile the gradient.
-            (assert-unique-ad-minted-binds! bindings f-var)
-            (list op bindings output-vec)))]
-    (when flat
-      {:walked-body [padded-form]
-       :params all-params
-       :tags tags
-       :source-ns source-ns
-       :result-sym (:result-sym flat)
-       :param-adj-syms (:param-adj-syms flat)}))))
+              (assert-unique-ad-minted-binds! bindings f-var)
+              (list op bindings output-vec)))]
+      (when flat
+        {:walked-body [padded-form]
+         :params all-params
+         :tags tags
+         :source-ns source-ns
+         :result-sym (:result-sym flat)
+         :param-adj-syms (:param-adj-syms flat)}))))
 
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.

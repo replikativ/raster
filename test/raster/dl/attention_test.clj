@@ -72,12 +72,40 @@
           pb (rrfn out Q K V seq-len seq-len dk dv)
           dy (double-array (repeat (* seq-len dv) 1.0))
           [dQ dK dV _ _ _ _] (pb dy)
-          num-dQ (numerical-grad-array
-                  #(let [o (attn/scaled-dot-product-attn Q K V seq-len seq-len dk dv)]
-                     (loop [i 0 s 0.0]
-                       (if (< i (alength o)) (recur (inc i) (+ s (aget o i))) s)))
-                  Q 1e-5)]
-      (is (arr-approx= dQ num-dQ 1e-3)))))
+          loss (fn [] (let [o (attn/scaled-dot-product-attn Q K V seq-len seq-len dk dv)]
+                        (loop [i 0 s 0.0]
+                          (if (< i (alength o)) (recur (inc i) (+ s (aget o i))) s))))
+          num-dQ (numerical-grad-array loss Q 1e-5)
+          num-dK (numerical-grad-array loss K 1e-5)
+          num-dV (numerical-grad-array loss V 1e-5)]
+      (is (arr-approx= dQ num-dQ 1e-3) "dQ")
+      (is (arr-approx= dK num-dK 1e-3) "dK")
+      (is (arr-approx= dV num-dV 1e-3) "dV"))))
+
+(deftest causal-scaled-dot-product-attn-gradient-test
+  (testing "causal attention gradients (dQ/dK/dV) vs finite diff"
+    (let [seq-len 3 dk 3 dv 3
+          rng (java.util.Random. 7)
+          Q (double-array (* seq-len dk))
+          K (double-array (* seq-len dk))
+          V (double-array (* seq-len dv))
+          _ (dotimes [i (* seq-len dk)] (aset Q i (.nextGaussian rng)))
+          _ (dotimes [i (* seq-len dk)] (aset K i (.nextGaussian rng)))
+          _ (dotimes [i (* seq-len dv)] (aset V i (.nextGaussian rng)))
+          rrfn (tmpl/template-pullback 'raster.dl.attention/causal-scaled-dot-product-attn)
+          out (attn/causal-scaled-dot-product-attn Q K V seq-len dk dv)
+          pb (rrfn out Q K V seq-len dk dv)
+          dy (double-array (repeat (* seq-len dv) 1.0))
+          [dQ dK dV _ _ _] (pb dy)
+          loss (fn [] (let [o (attn/causal-scaled-dot-product-attn Q K V seq-len dk dv)]
+                        (loop [i 0 s 0.0]
+                          (if (< i (alength o)) (recur (inc i) (+ s (aget o i))) s))))
+          num-dQ (numerical-grad-array loss Q 1e-5)
+          num-dK (numerical-grad-array loss K 1e-5)
+          num-dV (numerical-grad-array loss V 1e-5)]
+      (is (arr-approx= dQ num-dQ 1e-3) "causal dQ")
+      (is (arr-approx= dK num-dK 1e-3) "causal dK")
+      (is (arr-approx= dV num-dV 1e-3) "causal dV"))))
 
 ;; ================================================================
 ;; Multi-head attention
