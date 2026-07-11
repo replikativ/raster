@@ -916,7 +916,7 @@
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
                                         {:sym sym :ctx ctx :have (keys buffers)}))))
            step->bounds
-           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator] :as step}]
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator output] :as step}]
              (case convention
                ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
                ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
@@ -925,36 +925,44 @@
                :gemm
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
-                     cbuf (buf-of (:C step) :gemm-C)
-                     a16 (mkbuf-fn (* m k) :half)
+                     cbuf (buf-of (:C step) :gemm-C)]
+                 (if (< n 8)
+                   ;; Small-N fallback: the XMX kernel's B-operand 2D-block VNNI read needs a
+                   ;; >=16-byte pitch (N*2 bytes at fp16) — N<8 violates it and yields garbage
+                   ;; (relerr ~1). Bind the plain scalar f32 GEMM instead: it reads the f32
+                   ;; residents directly, so NO convert/transpose expansion kernels at all.
+                   ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
+                   (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]
+                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))}])
+                   (let [a16 (mkbuf-fn (* m k) :half)
                      ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
                      ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
-                     raw
-                     (case (:variant step)
+                         raw
+                         (case (:variant step)
                        ;; C = A[m,k] · B[k,n]
-                       :nn
-                       (let [b16 (mkbuf-fn (* k n) :half)]
-                         (swap! gemm-scratch conj a16 b16)
-                         [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
-                          (gemm-fn a16 b16 cbuf m n k :float)])
+                           :nn
+                           (let [b16 (mkbuf-fn (* k n) :half)]
+                             (swap! gemm-scratch conj a16 b16)
+                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
+                              (gemm-fn a16 b16 cbuf m n k :float)])
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
-                       :nt
-                       (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
-                         (swap! gemm-scratch conj a16 b16 bt16)
-                         [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
-                          (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                           :nt
+                           (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
+                             (swap! gemm-scratch conj a16 b16 bt16)
+                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
+                              (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
                        ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
                        ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
-                       :tn
-                       (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
-                         (swap! gemm-scratch conj a16 at16 b16)
-                         [(conv-fn abuf a16 (* k m)) (trans-fn a16 at16 k m :half)
-                          (conv-fn bbuf b16 (* k n)) (gemm-fn at16 b16 cbuf m n k :float)])
-                       (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
-                                            " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
-                 (mapv (fn [b] {:bound b}) raw))
+                           :tn
+                           (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
+                             (swap! gemm-scratch conj a16 at16 b16)
+                             [(conv-fn abuf a16 (* k m)) (trans-fn a16 at16 k m :half)
+                              (conv-fn bbuf b16 (* k n)) (gemm-fn at16 b16 cbuf m n k :float)])
+                           (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
+                                                " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
+                     (mapv (fn [b] {:bound b}) raw))))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).
@@ -995,8 +1003,21 @@
                          zk (zerofill-fn (if (= dtype :double) :double :float))]
                      [(bind-fn zk [out-buf] [] (long out-size))
                       (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)]))
+               ;; reduce: SegRed sig (inputs…, output, scl…, _n_bound) — bind the registry's
+               ;; :array-params ++ [output] and launch a SINGLE workgroup (:group-count 1) so
+               ;; the kernel's grid-stride loop covers all n and writes output[0] into its
+               ;; resident 1-elem buffer (mirrors bind-step!'s :reduce; the #42 leftover).
+               :reduce
+               (let [ki (or (info-fn kernel-name)
+                            (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                            {:kernel kernel-name})))
+                     array-bufs (conj (mapv #(buf-of % kernel-name) (:array-params ki))
+                                      (buf-of output kernel-name))
+                     scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                                   scalar-specs)]
+                 [(bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})])
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
-                                    ":map / :map-void / :gemm / :scatter are wired on the resident path")
+                                    ":map / :map-void / :reduce / :gemm / :scatter are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
            graph (record-fn bounds)]

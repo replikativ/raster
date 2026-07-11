@@ -1820,6 +1820,52 @@
      (.set gc I32 8 (int 1))
      bnd)))
 
+(def ^:private gemm-scalar-cache
+  "Cache for compiled scalar (non-XMX) GEMM kernels, keyed by variant (:nn|:nt|:tn).
+   Each entry is {:module :kernel :kernel-name}. f32 in/out — the small-N fallback."
+  (atom {}))
+
+(defn- ensure-gemm-scalar-kernel!
+  "Lazily compile + cache the plain scalar f32 GEMM kernel for a layout variant
+   (:nn | :nt | :tn). Returns {:module :kernel :kernel-name}. Used when the output
+   column dim N is too small for the XMX 2D-block path (2D-block IO needs a
+   >=16-byte pitch → N>=8 at fp16; N<8 reads garbage)."
+  [variant]
+  (ensure-init!)
+  (or (get @gemm-scalar-cache variant)
+      (let [kname (str "gemm_scalar_" (name variant))
+            cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-scalar-kernel)
+                        kname :variant variant))
+            device-hex (:device-id-hex @state)
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     cl-src :device device-hex))
+            module (load-module! spv)
+            kernel (create-kernel module kname)
+            entry {:module module :kernel kernel :kernel-name kname}]
+        (swap! gemm-scalar-cache assoc variant entry)
+        entry)))
+
+(defn bind-registered-gemm-scalar!
+  "Bind the plain scalar (non-XMX) f32 GEMM kernel over RESIDENT f32 DeviceBuffers for
+  recording into a command graph — the small-N fallback for bind-program!'s :gemm steps
+  (XMX's 2D-block B read violates the 16-byte minimum pitch when N<8 and produces
+  garbage). Reads/writes the f32 buffers directly: no f16 convert or transpose expansion.
+  variant :nn (C=A·B), :nt (C=A·Bᵀ, B stored [n,k]), :tn (C=Aᵀ·B, A stored [k,m]).
+  Returns a bound {:kernel :gc-seg …} map (1D grid over m·n). A fresh kernel handle per
+  binding (LZ kernel args are mutable handle state → shared handles clobber)."
+  [a b c m n k variant]
+  (let [{:keys [module kernel-name]} (ensure-gemm-scalar-kernel! variant)
+        kh (create-kernel-fresh module kernel-name)
+        m (long m) n (long n) k (long k)
+        total (* m n)
+        args [(:segment a) (:segment b) (:segment c)
+              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+        bnd (bind-kernel! kh 256 args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
+    bnd))
+
 (def ^:private convert-cache (atom nil))
 
 (defn- ensure-convert-kernel!
