@@ -175,14 +175,79 @@
         (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V seq-len nq nkv hd])]
           (is (< (rel-err out cpu) 1e-5) (str "gqa-causal-mha GPU relerr " (rel-err out cpu))))))))
 
-(deftest gpu-ad-full-train-step-residency-boundary
-  ;; This test does NOT need a GPU — it pins the CURRENT residency boundary at the IR level.
-  ;; The full mse∘linear-nb float train step (value+grad + SGD) is AD-transformed and its 3
-  ;; matmuls DO lower to resident GEMM steps, but its loss reduction (mse-loss) and the
-  ;; daxpy-diff-into! elementwise gradient have no resident kernel in this composed path, so
-  ;; compile-gpu-program returns nil (→ compile-aot :target-device uses the staging fn). When
-  ;; the saved-activation / elementwise-loss lowering lands (see .internal/ad_gpu_residency.md),
-  ;; this returns a descriptor and the assertion below must flip to a full end-to-end run.
+(deftest gpu-gemm-small-n-scalar-fallback
+  ;; XMX GEMM's B-operand 2D-block VNNI read requires Intel 2D-block IO's 16-byte minimum
+  ;; pitch (N*2 bytes at fp16) — output-column dims N<8 violated it and produced garbage
+  ;; (relerr ~1). bind-program! now routes N<8 :gemm steps to a plain scalar f32 kernel
+  ;; (no f16 convert/transpose). n=8 stays on the XMX path (16-byte pitch = the minimum)
+  ;; as the boundary control.
+  (if-not @gpu-available?
+    (println "  [SKIP] gpu-gemm-small-n: no Level Zero GPU")
+    (let [tol 5e-3]
+      (doseq [n [2 4 6 8]]
+        (testing (str "forward linear-nb (:nt) at out-features n=" n)
+          (let [b 16 i 32 o n
+                x (rnd (* b i) (+ 100 n)) W (rnd (* o i) (+ 200 n))
+                cpu (nn/linear-nb x W b i o)
+                {:keys [descriptor out]} (run-resident #'nn/linear-nb [x W b i o])]
+            (is (= [:nt] (mapv :variant (:steps descriptor))))
+            (is (< (rel-err out cpu) tol)
+                (str ":nt n=" n " relerr " (rel-err out cpu)))))
+        (testing (str "backward linear-dx (:nn) at in-features n=" n)
+          (let [b 16 o 32 i n
+                dy (rnd (* b o) (+ 300 n)) W (rnd (* o i) (+ 400 n))
+                cpu (nn/linear-dx dy W b i o)
+                {:keys [descriptor out]} (run-resident #'nn/linear-dx [dy W b i o])]
+            (is (= [:nn] (mapv :variant (:steps descriptor))))
+            (is (< (rel-err out cpu) tol)
+                (str ":nn n=" n " relerr " (rel-err out cpu)))))))))
+
+(deftest gpu-reduce-step-program-binds-and-replays
+  ;; bind-program! (the resident whole-offload binder) wired only :map/:map-void/:gemm/
+  ;; :scatter step kinds; a program containing a par/reduce whose result stays resident
+  ;; (the #42 resident-reduce work: fuse-reduce-results gives it a device 1-elem out-buf)
+  ;; threw at bind time even though bind-step! already handled :reduce. This pins the
+  ;; wiring: sum(a) feeding an elementwise scale compiles to [:reduce :map] steps, binds,
+  ;; and replays with the correct output. (An ESCAPING tail reduce — a loss returned as
+  ;; the scalar result — still doesn't bind: that is the remaining #42 leftover, same as
+  ;; bind-step!.)
+  (if-not @gpu-available?
+    (println "  [SKIP] gpu-reduce-step: no Level Zero GPU")
+    (let [probe (eval '(raster.core/deftm gpu-reduce-consumer-probe
+                         [a :- (Array float) out :- (Array float) n :- Long] :- Void
+                         (let [s (raster.par/reduce
+                                  acc 0.0 i n
+                                  (raster.numeric/+ acc (raster.arrays/aget a i)))]
+                           (raster.par/map-void!
+                            j n
+                            (raster.arrays/aset out j
+                                                (raster.numeric/* (raster.arrays/aget a j) s))))))
+          n 64
+          a (rnd n 51)
+          out (float-array n)
+          s (double (reduce + 0.0 (map double (seq a))))
+          cpu (float-array (map #(float (* (double %) s)) (seq a)))
+          {:keys [descriptor] :as r} (run-resident probe [a out n])
+          gpu (:out r)]
+      (is (some #(= :reduce (:convention %)) (:steps descriptor))
+          "resident-consumed par/reduce compiles to a :reduce step")
+      (is (< (rel-err gpu cpu) 1e-4)
+          (str "reduce→map-void replay relerr " (rel-err gpu cpu))))))
+
+(deftest gpu-ad-full-train-step-fully-resident
+  ;; This test does NOT need a GPU — it pins residency at the IR level. The full
+  ;; mse∘linear-nb float train step (value+grad + SGD, returning the updated weights like
+  ;; finetune's lora-train-step) is AD-transformed and EVERY piece — the matmuls (resident
+  ;; GEMM steps), the fused loss-reduction chain, and the elementwise gradient/SGD kernels —
+  ;; lowers to a resident program descriptor. This used to assert the OPPOSITE
+  ;; (compile-gpu-program → nil) while the loss reduction had no resident kernel; the #42
+  ;; par/reduce residency work flipped it. A regression back to nil means some step fell
+  ;; off the resident path (staging-fn fallback = the old gap).
+  ;;
+  ;; NOTE the remaining #42 leftover: a train step whose RESULT is the loss scalar still
+  ;; does NOT extract (the primal mse reduce ESCAPES to the host, so it can't fuse —
+  ;; :scalar-let-reads-device-buffer). The resident train-step convention is therefore
+  ;; "return the updated weights, monitor loss on host" (same as lora-train-step).
   (require 'raster.core 'raster.dl.loss 'raster.dl.optim 'raster.ad.reverse 'raster.arrays)
   (let [loss (eval '(raster.core/deftm gpu-ad-probe-loss
                       [W :- (Array float) x :- (Array float) tgt :- (Array float)
@@ -191,14 +256,16 @@
                         (raster.dl.loss/mse-loss pred tgt (clojure.core/* batch out-f)))))
         train (eval '(raster.core/deftm gpu-ad-probe-train
                        [W :- (Array float) x :- (Array float) tgt :- (Array float)
-                        batch :- Long in-f :- Long out-f :- Long lr :- Double] :- Double
+                        batch :- Long in-f :- Long out-f :- Long lr :- Double] :- (Array float)
                        (let [vg ((raster.ad.reverse/value+grad #'gpu-ad-probe-loss)
                                  W x tgt batch in-f out-f)
-                             loss (clojure.core/nth vg 0)
                              dW (clojure.core/nth vg 1)]
                          (raster.dl.optim/sgd-step! W dW (raster.arrays/alength W) lr)
-                         loss)))]
-    (testing "full AD train step is not yet a fully-resident program (documents the gap)"
+                         W)))]
+    (testing "full AD train step compiles to a fully-resident program (pins residency)"
       ;; :on-non-resident :nil = probe the boundary without throwing (default is :throw now)
-      (is (nil? (pl/compile-gpu-program train :ze:0 :dtype :float :on-non-resident :nil))
-          "mse reduction + daxpy elementwise gradient have no resident kernel yet"))))
+      (let [p (pl/compile-gpu-program train :ze:0 :dtype :float :on-non-resident :nil)]
+        (is (some? p)
+            "mse∘linear train step must extract fully resident (matmuls + fused loss + SGD)")
+        (when p
+          (is (seq (:steps p)) "resident descriptor carries kernel steps"))))))

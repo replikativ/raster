@@ -412,6 +412,41 @@
          "}\n")))
 
 ;; ================================================================
+;; Scalar (non-XMX) GEMM kernel — small-N fallback
+;; ================================================================
+
+(defn emit-gemm-scalar-kernel
+  "Generate a plain scalar (non-XMX) f32 GEMM kernel for output-column dims too
+  small for the XMX 2D-block path: Intel 2D-block IO requires a >=16-byte pitch,
+  which at fp16 means N>=8 — N in {2,4,6} reads a garbage B tile. This kernel
+  reads the f32 resident buffers DIRECTLY (no f16 convert/transpose expansion),
+  one work-item per C element, grid-stride over m*n, scalar k-loop.
+
+    :nn  C[m,n] = A[m,k] * B[k,n]
+    :nt  C[m,n] = A[m,k] * B[n,k]^T   (B stored row-major [n,k])
+    :tn  C[m,n] = A[k,m]^T * B[k,n]   (A stored row-major [k,m])
+
+  kernel-name: string name. variant: :nn | :nt | :tn (default :nn).
+  Returns OpenCL C source string."
+  [kernel-name & {:keys [variant] :or {variant :nn}}]
+  (let [a-idx (case variant :tn "A[p * m + i]" "A[i * k + p]")
+        b-idx (case variant :nt "B[j * k + p]" "B[p * n + j]")]
+    (str "__kernel void " kernel-name
+         "(__global const float* restrict A,"
+         " __global const float* restrict B,"
+         " __global float* restrict C,"
+         " int m, int n, int k) {\n"
+         "    int total = m * n;\n"
+         "    for (int idx = get_global_id(0); idx < total; idx += get_global_size(0)) {\n"
+         "        int i = idx / n;\n"
+         "        int j = idx % n;\n"
+         "        float acc = 0.0f;\n"
+         "        for (int p = 0; p < k; ++p) acc += " a-idx " * " b-idx ";\n"
+         "        C[idx] = acc;\n"
+         "    }\n"
+         "}\n")))
+
+;; ================================================================
 ;; Axpy kernel (in-place weight update)
 ;; ================================================================
 
