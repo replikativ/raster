@@ -993,6 +993,24 @@
                 (let [ret (or (:raster.core/return-tag (meta v))
                               (:tag (meta v)))]
                   (when (and ret (not= ret 'Object)) ret))))))
+        ;; Scalar arithmetic (clojure.core/Math * + - / min max, …) over
+        ;; primitive operands. Mirrors infer-arg-tag's scalar-op rule (the late
+        ;; pipeline has it; this walk-time typer was missing it). Without this a
+        ;; head-dim product `(* (long nq) (long hd))` — a Long dim arg to an
+        ;; (All [T]) kernel like linear-nb — types as nil, so the call's overload
+        ;; can't be confirmed, its (Array T) result stays UNtyped, and the walker
+        ;; then devirtualizes the downstream parametric kernel (rope/gqa) to its
+        ;; T=double DEFAULT — a double attention output that a float linear-nb
+        ;; can't consume (the F5 composed-attention-block non-residency root).
+        (descriptor/scalar-op? head)
+        (let [arg-tags (keep #(infer-expr-tag % type-env source-ns) (rest expr))]
+          (cond
+            (descriptor/alength-op? head) 'long
+            (some #{'double} arg-tags) 'double
+            (some #{'float} arg-tags) 'float
+            (some #{'long} arg-tags) 'long
+            (empty? arg-tags) nil
+            :else 'long))
         ;; Unknown
         :else nil))))
 
