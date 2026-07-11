@@ -1538,6 +1538,20 @@
                         (let [r (cons ms args)]
                           (if-let [m (meta expr)] (with-meta r m) r))))))))))))))
 
+(defn resolve-call-with-tags
+  "Resolve ONE generic deftm call whose argument tags are all statically
+  known — from `env` (sym → tag), symbol :raster.type/tag metadata, or
+  literals (via inf/infer-arg-tag). Returns the devirtualized form (.invk
+  or mangled call, result tag stamped) or nil when any arg tag is unknown
+  or no signature matches — the caller keeps the symbolic form unchanged.
+
+  Emission-time seam for raster.ad.templates (which requiring-resolves
+  this — genuine cycle: inline requires templates), so AD backward calls
+  devirtualize AT EMISSION when the primal tags suffice, deterministically
+  on the first compile (see pipeline.clj's fixpoint-finalize hazard note)."
+  [expr env]
+  (try-resolve-dispatch expr env))
+
 (defn- resolve-dispatch-walk
   "Recursively resolve generic deftm calls in an expression.
    Tracks types through let/loop bindings for inner resolution.

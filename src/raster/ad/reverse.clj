@@ -445,6 +445,15 @@
                   (let [without-last (vec (drop-last 2 bs))]
                     (vec (concat without-last [tape-sym (:forward-code dt-info) sym out-buf]))))}))
 
+(def ^:private mangled-arg-stamp-tags
+  "Dispatch tags from a devirtualized forward call's mangled name that are
+  precise enough to CARRY onto its arg symbols as :raster.type/tag for the
+  backward emission (ad-record :call): concrete primitive scalars/arrays
+  only. 'Object and value-type tags are deliberately excluded — the runtime
+  value may be more specific than the boxed dispatch slot, and stamping
+  them would lock the emitted backward helpers onto generic overloads."
+  '#{double float long int doubles floats longs ints})
+
 (defmethod ad-record :call [_ sym init-expr activity]
   (let [head (first init-expr)
         [op args invk?] (if (= '.invk head)
@@ -469,8 +478,24 @@
                                 tag-str (if (.endsWith ^String tag-str "-impl")
                                           (subs tag-str 0 (clojure.core/- (count tag-str) 5))
                                           tag-str)]
-                            (mapv symbol (.split ^String tag-str "_")))))]
-         {:type :call :sym sym :base-op base-op :args args :arg-tags arg-tags
+                            (mapv symbol (.split ^String tag-str "_")))))
+             ;; Π-emission input (plan 1c): CARRY the devirtualized forward
+             ;; call's dispatch tags onto its arg SYMBOLS, so the template
+             ;; grads-fn and the emission-time resolver read them as primal
+             ;; tags. Only stamps a symbol that has no tag yet, and only
+             ;; concrete primitive scalar/array tags — 'Object (and value
+             ;; types) are excluded so backward helpers aren't locked onto
+             ;; the generic overload. Carried, never guessed.
+             args (if (and arg-tags (= (count arg-tags) (count args)))
+                    (mapv (fn [a t]
+                            (if (and (symbol? a)
+                                     (nil? (:raster.type/tag (meta a)))
+                                     (contains? mangled-arg-stamp-tags t))
+                              (vary-meta a assoc :raster.type/tag t)
+                              a))
+                          args arg-tags)
+                    args)]
+         {:type :call :sym sym :base-op base-op :args args
           :active-args (set (filter #(and (symbol? %) (get activity % false)) args))}))}))
 
 ;; ================================================================

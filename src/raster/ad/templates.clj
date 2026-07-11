@@ -22,6 +22,7 @@
                            ;;   -> [updated-ctx [grad-sym ...]]) for flat bindings}"
   (:require [raster.compiler.support.mangled :as mangled]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ad.bind-ctx :as bind-ctx]
             [raster.ad.tangent :as tangent]))
 
 ;; ================================================================
@@ -126,9 +127,120 @@
 ;; values are plain symbols (param→actual, result→sym, adjoint→sym), so this is
 ;; a strict superset of the old hand-rolled let*/loop*/dotimes substitutor.
 
+;; ================================================================
+;; Π at emission (plan 1a-1c): tags are CARRIED from the primal call
+;; site into the emitted backward code — read from the actual arg
+;; symbols' :raster.type/tag, projected through tangent/tangent-tag,
+;; stamped on the minted gradient syms + emitted call forms, and used
+;; to devirtualize fully-tagged backward calls AT EMISSION. Where a
+;; primal tag is absent the emission is byte-identical to the untagged
+;; path — never guess, never default.
+;; ================================================================
+
+(defn arg-tag
+  "The carried :raster.type/tag of an actual call-site argument: symbol
+  metadata, or the literal's own type. nil when unknown (no guessing)."
+  [x]
+  (cond
+    (symbol? x) (:raster.type/tag (meta x))
+    (instance? Double x) 'double
+    (instance? Float x) 'float
+    (instance? Long x) 'long
+    (instance? Integer x) 'int
+    :else nil))
+
+(defn grad-tag
+  "Π of an actual argument: the tag the gradient binding FOR that argument
+  carries — (tangent-tag (arg-tag x)) — or nil when the primal tag is
+  absent/⊥ (the emission then stays untagged). Grads-fn emission sites pass
+  this to the tagged gensym arity: (gensym-fn \"dx\" (grad-tag x))."
+  [x]
+  (tangent/tangent-tag (arg-tag x)))
+
+(def ^:private emission-resolver
+  "inline.clj's single-call devirtualizer (resolve-call-with-tags), loaded
+  lazily via requiring-resolve — genuine cycle (inline requires templates),
+  and the interpreted runtime-AD path may instantiate templates before the
+  compiler pass namespaces are loaded."
+  (delay (try (requiring-resolve
+               'raster.compiler.passes.scalar.inline/resolve-call-with-tags)
+              (catch Throwable _ nil))))
+
+(defn- resolve-emitted-expr
+  "Emission-time devirtualization of an emitted gradient expression (the
+  LIVE successor of the abandoned resolve-emitted-calls path). Inside-out:
+  resolves each generic deftm call using ONLY carried tags — symbol
+  :raster.type/tag metadata (primal args / Π-tagged grad syms), `env`
+  (tags of earlier bindings in the same emission), literals, and the
+  result tags of already-resolved nested calls. inline's
+  resolve-call-with-tags resolves a call ONLY when every arg tag is known;
+  otherwise the form is returned unchanged (the no-guessing property —
+  an untagged emission is byte-identical to the pre-tagging path).
+  Resolving here is deterministic on the FIRST compile: parametric
+  specializations are created at emission rather than as a later-pass
+  side effect (the pipeline.clj fixpoint-finalize cold-compile hazard)."
+  [expr env]
+  (if-let [resolve-call @emission-resolver]
+    (letfn [(walk [e]
+              (if (and (seq? e) (seq e) (not= 'quote (first e)))
+                (let [args (map walk (rest e))
+                      e' (if (= (seq args) (seq (rest e)))
+                           e
+                           (with-meta (apply list (first e) args) (meta e)))]
+                  (if (and (symbol? (first e')) (namespace (first e')))
+                    (or (resolve-call e' env) e')
+                    e'))
+                e))]
+      (walk expr))
+    expr))
+
+(defn- stamp-emitted-bindings
+  "Post-process the bindings a grads-fn just emitted (plan 1c):
+   1. LHS: the gradient binding for parameter i gets Π(tag of actual arg i)
+      when the grads-fn didn't already mint it tagged (positional net for
+      sites not yet using the tagged gensym arity). Only stamps when the
+      primal tag is PRESENT — absent tags leave the emission untouched.
+   2. RHS: resolve fully-tagged backward calls at emission
+      (resolve-emitted-expr), threading earlier tagged LHS syms as env.
+   3. RHS call forms get the binding's tag as :raster.type/tag when known,
+      so downstream consumers (walker signature-result-tag,
+      resolve-generic-deftm-calls) read it instead of re-deriving.
+  Returns [bindings' grad-syms']."
+  [new-bindings actual-params grad-syms]
+  (let [;; Positional Π map for RETURNED grad syms still untagged; a sym
+        ;; returned for two conflicting slots is dropped (never guess).
+        pos-tags (reduce
+                  (fn [m [i g]]
+                    (if (and (symbol? g) (nil? (:raster.type/tag (meta g))))
+                      (if-let [t (grad-tag (nth actual-params i nil))]
+                        (if (and (contains? m g) (not= (get m g) t))
+                          (dissoc m g)
+                          (assoc m g t))
+                        m)
+                      m))
+                  {} (map-indexed vector grad-syms))
+        stamp-sym (fn [s]
+                    (if-let [t (and (symbol? s) (get pos-tags s))]
+                      (vary-meta s assoc :raster.type/tag t)
+                      s))
+        [pairs _] (reduce
+                   (fn [[acc env] [s e]]
+                     (let [s (stamp-sym s)
+                           t (when (symbol? s) (:raster.type/tag (meta s)))
+                           e (resolve-emitted-expr e env)
+                           e (if (and t (seq? e)
+                                      (nil? (:raster.type/tag (meta e))))
+                               (vary-meta e assoc :raster.type/tag t)
+                               e)]
+                       [(conj acc s e) (if t (assoc env s t) env)]))
+                   [[] {}] (partition 2 new-bindings))]
+    [pairs (mapv stamp-sym grad-syms)]))
+
 (defn- compile-grads-to-fn
   "Compile static :grads data into a :grads-fn closure.
-  This unifies the two template paths so instantiation always uses :grads-fn."
+  This unifies the two template paths so instantiation always uses :grads-fn.
+  Each grad binding is minted through the tagged gensym arity with
+  Π(tag of the actual arg it differentiates) — untagged when unknown."
   [{:keys [params result adjoint grads]}]
   (fn [ctx actual-params result-sym adjoint-sym gensym-fn]
     (let [param-subst (zipmap params actual-params)
@@ -136,7 +248,8 @@
           adj-subst {adjoint adjoint-sym}
           smap (merge param-subst result-subst adj-subst)
           grad-bindings (mapv (fn [i grad-expr]
-                                (let [grad-sym (gensym-fn (str "dg_" (name (nth params i))))
+                                (let [grad-sym (gensym-fn (str "dg_" (name (nth params i)))
+                                                          (grad-tag (nth actual-params i nil)))
                                       substituted (util/subst-syms smap grad-expr)]
                                   [grad-sym substituted]))
                               (range) grads)]
@@ -149,6 +262,13 @@
 
   All templates have a :grads-fn (static :grads are auto-compiled at registration).
   The :grads-fn receives actual call-site params and produces gradient bindings.
+  The gensym-fn handed to the grads-fn is canonicalized tag-capable
+  (bind-ctx/tag-capable), so every emission site can mint Π-tagged syms.
+
+  Emitted bindings are post-processed (stamp-emitted-bindings): gradient
+  LHS syms carry Π(primal arg tag), fully-tagged backward calls are
+  devirtualized at emission, and tagged call forms carry :raster.type/tag —
+  all no-ops when the primal args carry no tags.
 
   Returns [updated-ctx, [grad-sym ...]] where grad-syms are the symbols
   bound to gradient values for each parameter."
@@ -156,7 +276,9 @@
   (let [grads-fn (or (:grads-fn template)
                      (throw (ex-info "AD template has no :grads-fn (and no :grads to compile)"
                                      {:template (select-keys template [:params :result :adjoint])})))
-        [ctx' grad-syms :as result] (grads-fn ctx actual-params result-sym adjoint-sym (:gensym-fn ctx))]
+        gensym-fn (bind-ctx/tag-capable (:gensym-fn ctx))
+        n-before (count (:bindings ctx))
+        [ctx' grad-syms] (grads-fn ctx actual-params result-sym adjoint-sym gensym-fn)]
     ;; Validate gradient count matches actual parameter count
     (when (and grad-syms (not= (count grad-syms) (count actual-params)))
       (throw (ex-info (str "AD template gradient count mismatch: " (count grad-syms)
@@ -166,63 +288,12 @@
                        :param-count (count actual-params)
                        :actual-params (vec actual-params)
                        :declared-params (:params template)})))
-    result))
-
-;; ================================================================
-;; Resolve generic deftm calls emitted by grads-fn
-;; ================================================================
-
-(defn- try-resolve-call-with-tags
-  "Resolve a generic deftm call to its mangled implementation using arg-tags
-   from the forward call as type context. Returns resolved form or nil."
-  [expr forward-tags]
-  (when (and (seq? expr) (symbol? (first expr)) (namespace (first expr))
-             (not (.contains ^String (name (first expr)) "_m_")))
-    (try
-      (when-let [v (resolve (first expr))]
-        (when-let [dt-atom (:raster.core/dispatch-table (meta v))]
-          (let [dt @dt-atom
-                arity (dec (count expr))
-                entries (get dt arity)]
-            (when (seq entries)
-              ;; Build expected tags: backward helpers typically use the same
-              ;; element types as the forward call (doubles→doubles, etc.)
-              ;; Use the forward tags as a pool of known types
-              (let [dominant-tag (first forward-tags) ;; e.g., doubles
-                    ;; Match: find entry whose tags are all the dominant type
-                    match (or (first (filter (fn [entry]
-                                               (every? #(= % dominant-tag) (:tags entry)))
-                                             entries))
-                             ;; Or single-method fallback
-                              (when (= 1 (count entries)) (first entries)))]
-                (when match
-                  (let [mangled-name (str (name (first expr)) "_m_"
-                                          (clojure.string/join "_" (map name (:tags match))))
-                        mangled (symbol (str (:mangled-ns match)) mangled-name)]
-                    (when (resolve mangled)
-                      (cons mangled (rest expr))))))))))
-      (catch Exception _ nil))))
-
-(defn- resolve-in-expr
-  "Recursively resolve generic deftm calls in an expression."
-  [expr forward-tags]
-  (cond
-    (not (seq? expr)) expr
-    (and (symbol? (first expr)) (namespace (first expr)))
-    (or (try-resolve-call-with-tags expr forward-tags)
-        (let [resolved (map #(resolve-in-expr % forward-tags) expr)]
-          (if (= (seq resolved) (seq expr)) expr (apply list resolved))))
-    :else (let [resolved (map #(resolve-in-expr % forward-tags) expr)]
-            (if (= (seq resolved) (seq expr)) expr (apply list resolved)))))
-
-(defn resolve-emitted-calls
-  "Resolve generic deftm calls in template-emitted bindings using the
-   forward call's arg-tags as type context. This devirtualizes backward
-   helper calls at AD transform time, avoiding runtime dispatch."
-  [bindings forward-tags]
-  (vec (mapcat (fn [[sym expr]]
-                 [sym (resolve-in-expr expr forward-tags)])
-               (partition 2 bindings))))
+    (let [bindings' (:bindings ctx')
+          [new-part grad-syms'] (stamp-emitted-bindings
+                                 (subvec (vec bindings') n-before)
+                                 (vec actual-params) (vec grad-syms))]
+      [(assoc ctx' :bindings (into (vec (take n-before bindings')) new-part))
+       (when grad-syms grad-syms')])))
 
 ;; ================================================================
 ;; Qualified numeric op → base op reverse mapping
@@ -372,12 +443,12 @@
                      :grads-fn (fn [ctx actual-params _result-sym adjoint-sym gensym-fn]
                                  (if (= 1 (count actual-params))
                  ;; Unary negation: grad = -dy
-                                   (let [g (gensym-fn "dg_x")]
+                                   (let [g (gensym-fn "dg_x" (grad-tag (first actual-params)))]
                                      [(update ctx :bindings into [g (list 'raster.numeric/- adjoint-sym)])
                                       [g]])
                  ;; Binary subtraction: grad_x = dy, grad_y = -dy
-                                   (let [gx (gensym-fn "dg_x")
-                                         gy (gensym-fn "dg_y")]
+                                   (let [gx (gensym-fn "dg_x" (grad-tag (first actual-params)))
+                                         gy (gensym-fn "dg_y" (grad-tag (second actual-params)))]
                                      [(update ctx :bindings into [gx adjoint-sym
                                                                   gy (list 'raster.numeric/- adjoint-sym)])
                                       [gx gy]])))})
@@ -475,8 +546,8 @@
 (register-template! 'Math/min
                     {:params '[x y] :result nil :adjoint 'dy
                      :grads-fn (fn [ctx [x y] _result-sym adjoint-sym gensym-fn]
-                                 (let [gx (gensym-fn "dg_x")
-                                       gy (gensym-fn "dg_y")]
+                                 (let [gx (gensym-fn "dg_x" (grad-tag x))
+                                       gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
                                             [gx (list 'if (list 'clojure.core/<= (list 'double x) (list 'double y))
                                                       adjoint-sym 0.0)
@@ -488,8 +559,8 @@
 (register-template! 'Math/max
                     {:params '[x y] :result nil :adjoint 'dy
                      :grads-fn (fn [ctx [x y] _result-sym adjoint-sym gensym-fn]
-                                 (let [gx (gensym-fn "dg_x")
-                                       gy (gensym-fn "dg_y")]
+                                 (let [gx (gensym-fn "dg_x" (grad-tag x))
+                                       gy (gensym-fn "dg_y" (grad-tag y))]
                                    [(update ctx :bindings into
                                             [gx (list 'if (list 'clojure.core/>= (list 'double x) (list 'double y))
                                                       adjoint-sym 0.0)
@@ -647,7 +718,7 @@
 (register-template! 'raster.sci.special/betainc
                     {:params '[a b x] :result nil :adjoint 'dy
                      :grads-fn (fn [ctx [a b x] _result-sym adjoint-sym gensym-fn]
-                                 (let [dx (gensym-fn "dg_x")]
+                                 (let [dx (gensym-fn "dg_x" (grad-tag x))]
                                    [(update ctx :bindings into
                                             [dx (list 'raster.numeric/*
                                                       adjoint-sym
@@ -719,7 +790,7 @@
                     {:params '[arr i] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [arr i] _result-sym adjoint-sym gensym-fn]
-                       (let [d-arr (gensym-fn "d_arr")]
+                       (let [d-arr (gensym-fn "d_arr" (grad-tag arr))]
                          [(update ctx :bindings into
                                   [d-arr (list 'raster.ad.reverse/aget-grad arr i adjoint-sym)])
                           [d-arr nil]]))})
@@ -752,7 +823,7 @@
                     {:params '[pred target n] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [pred target n] _result-sym adjoint-sym gensym-fn]
-                       (let [d-pred (gensym-fn "d_pred")
+                       (let [d-pred (gensym-fn "d_pred" (grad-tag pred))
            ;; d_pred[i] = (2*dy/n)*(pred[i]-target[i]). Emitted as the inlinable
            ;; (All [T]) mse-grad SOAC (a broadcast), NOT the CPU-era ^:no-inline
            ;; BLAS helper daxpy-diff! — so the fused backward lowers to a resident
@@ -775,7 +846,7 @@
                     {:params '[a rows cols] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [a rows cols] _result-sym adjoint-sym gensym-fn]
-                       (let [d-a (gensym-fn "d_a")]
+                       (let [d-a (gensym-fn "d_a" (grad-tag a))]
                          [(update ctx :bindings into
                                   [d-a (list 'raster.dl.nn/transpose-2d adjoint-sym cols rows)])
                           [d-a nil nil]]))})
@@ -787,8 +858,8 @@
                     {:params '[A B m k n] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [A B m k n] _result-sym adjoint-sym gensym-fn]
-                       (let [dA (gensym-fn "dA")
-                             dB (gensym-fn "dB")]
+                       (let [dA (gensym-fn "dA" (grad-tag A))
+                             dB (gensym-fn "dB" (grad-tag B))]
                          [(update ctx :bindings into
                                   [dA (list 'raster.dl.nn/matmul-dA adjoint-sym B m k n)
                                    dB (list 'raster.dl.nn/matmul-dB A adjoint-sym m k n)])
@@ -802,9 +873,9 @@
                     {:params '[x W b batch in-f out-f] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [x W b batch in-f out-f] _result-sym adjoint-sym gensym-fn]
-                       (let [dx (gensym-fn "dx")
-                             dW (gensym-fn "dW")
-                             db (gensym-fn "db")]
+                       (let [dx (gensym-fn "dx" (grad-tag x))
+                             dW (gensym-fn "dW" (grad-tag W))
+                             db (gensym-fn "db" (grad-tag b))]
                          [(update ctx :bindings into
                                   [dx (list 'raster.dl.nn/linear-dx adjoint-sym W batch in-f out-f)
                                    dW (list 'raster.dl.nn/linear-dW adjoint-sym x batch in-f out-f)
@@ -817,7 +888,7 @@
                     {:params '[x n] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [x n] _result-sym adjoint-sym gensym-fn]
-                       (let [dx (gensym-fn "dx")]
+                       (let [dx (gensym-fn "dx" (grad-tag x))]
                          [(update ctx :bindings into
                                   [dx (list 'raster.dl.nn/silu-backward adjoint-sym x n)])
                           [dx nil]]))})
@@ -830,7 +901,7 @@
                     {:params '[ref t dim] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [ref t dim] _result-sym adjoint-sym gensym-fn]
-                       (let [dt (gensym-fn "dt")]
+                       (let [dt (gensym-fn "dt" (grad-tag t))]
                          [(update ctx :bindings into
                                   [dt (list 'raster.dl.gsdm/sinusoidal-embed-backward
                                             adjoint-sym t dim)])
@@ -853,12 +924,12 @@
                        (let [;; dimension bindings — reference forward params directly for hoistability
                              dW-rows (gensym-fn "dW_rows")
                              dW-cols (gensym-fn "dW_cols")
-                             dW-buf  (gensym-fn "dW_buf")
-                             dW      (gensym-fn "dW")
-                             dx-buf  (gensym-fn "dx_buf")
-                             dx      (gensym-fn "dx")
-                             db-buf  (gensym-fn "db_buf")
-                             db      (gensym-fn "db")]
+                             dW-buf  (gensym-fn "dW_buf" (grad-tag W))
+                             dW      (gensym-fn "dW" (grad-tag W))
+                             dx-buf  (gensym-fn "dx_buf" (grad-tag x))
+                             dx      (gensym-fn "dx" (grad-tag x))
+                             db-buf  (gensym-fn "db_buf" (grad-tag b))
+                             db      (gensym-fn "db" (grad-tag b))]
                          [(update ctx :bindings into
                                   [;; compute dimensions from forward params (b, x) for hoistability
                                    dW-rows (list 'clojure.core/alength b)
@@ -883,7 +954,7 @@
                     {:params '[x] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [x] _result-sym adjoint-sym gensym-fn]
-                       (let [dx (gensym-fn "dx")]
+                       (let [dx (gensym-fn "dx" (grad-tag x))]
                          [(update ctx :bindings into
                                   [dx (list 'raster.nn/relu-backward adjoint-sym x)])
                           [dx]]))})
@@ -894,7 +965,7 @@
                     {:params '[x] :result 's :adjoint 'dy
                      :grads-fn
                      (fn [ctx [x] result-sym adjoint-sym gensym-fn]
-                       (let [dx (gensym-fn "dx")]
+                       (let [dx (gensym-fn "dx" (grad-tag x))]
                          [(update ctx :bindings into
                                   [dx (list 'raster.nn/softmax-backward adjoint-sym result-sym)])
                           [dx]]))})
@@ -905,7 +976,7 @@
                     {:params '[p t] :result nil :adjoint 'dy
                      :grads-fn
                      (fn [ctx [p t] _result-sym adjoint-sym gensym-fn]
-                       (let [dp (gensym-fn "dp")]
+                       (let [dp (gensym-fn "dp" (grad-tag p))]
                          [(update ctx :bindings into
                                   [dp (list 'raster.nn/cross-entropy-backward-dp adjoint-sym p t)])
                           [dp nil]]))})
@@ -928,19 +999,20 @@
                              w-out  (gensym-fn "w_out")
                              ckk    (gensym-fn "ckk")
                              bhw    (gensym-fn "bhw")
-           ;; buffers
-                             dy-cols-buf (gensym-fn "dy_cols_buf")
-                             dy-cols     (gensym-fn "dy_cols")
-                             cols-buf    (gensym-fn "cols_buf")
-                             cols        (gensym-fn "cols")
-                             dW-buf      (gensym-fn "dW_buf")
-                             dW          (gensym-fn "dW")
-                             d-cols-buf  (gensym-fn "d_cols_buf")
-                             d-cols      (gensym-fn "d_cols")
-                             dx-buf      (with-meta (gensym-fn "dx_buf") {:hoistable true})
-                             dx          (gensym-fn "dx")
-                             db-buf      (with-meta (gensym-fn "db_buf") {:hoistable true})
-                             db          (gensym-fn "db")]
+           ;; buffers — Π-tagged from the primal args they derive from
+           ;; (vary-meta, not with-meta: :hoistable must not wipe the tag)
+                             dy-cols-buf (gensym-fn "dy_cols_buf" (grad-tag W))
+                             dy-cols     (gensym-fn "dy_cols" (grad-tag W))
+                             cols-buf    (gensym-fn "cols_buf" (grad-tag x))
+                             cols        (gensym-fn "cols" (grad-tag x))
+                             dW-buf      (gensym-fn "dW_buf" (grad-tag W))
+                             dW          (gensym-fn "dW" (grad-tag W))
+                             d-cols-buf  (gensym-fn "d_cols_buf" (grad-tag x))
+                             d-cols      (gensym-fn "d_cols" (grad-tag x))
+                             dx-buf      (vary-meta (gensym-fn "dx_buf" (grad-tag x)) assoc :hoistable true)
+                             dx          (gensym-fn "dx" (grad-tag x))
+                             db-buf      (vary-meta (gensym-fn "db_buf" (grad-tag b)) assoc :hoistable true)
+                             db          (gensym-fn "db" (grad-tag b))]
                          [(update ctx :bindings into
                                   [;; compute output dims
                                    h-out (list 'clojure.core/+ 1
@@ -956,22 +1028,22 @@
                                    ckk   (list 'long (list 'clojure.core/* c-in (list 'clojure.core/* kh kw)))
                                    bhw   (list 'long (list 'clojure.core/* batch (list 'clojure.core/* h-out w-out)))
            ;; rearrange dy -> dy_cols[c_out, bhw]
-                                   (with-meta dy-cols-buf {:hoistable true})
+                                   (vary-meta dy-cols-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like W (list 'clojure.core/* c-out bhw))
                                    dy-cols     (list 'raster.dl.nn/conv2d-rearrange-dy!
                                                      adjoint-sym dy-cols-buf batch c-out h-out w-out)
            ;; im2col for forward recomputation
-                                   (with-meta cols-buf {:hoistable true})
+                                   (vary-meta cols-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like x (list 'clojure.core/* ckk bhw))
                                    cols        (list 'raster.dl.nn/im2col-2d!
                                                      x cols-buf batch c-in h w kh kw stride-h stride-w pad-h pad-w)
            ;; dW = dy_cols @ cols^T
-                                   (with-meta dW-buf {:hoistable true})
+                                   (vary-meta dW-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like W (list 'clojure.core/* c-out ckk))
                                    dW          (list 'raster.dl.nn/conv2d-backward-dW-into!
                                                      dy-cols cols dW-buf c-out bhw ckk)
            ;; d_cols = W^T @ dy_cols
-                                   (with-meta d-cols-buf {:hoistable true})
+                                   (vary-meta d-cols-buf assoc :hoistable true)
                                    (list 'raster.arrays/zeros-like x (list 'clojure.core/* ckk bhw))
                                    d-cols      (list 'raster.dl.nn/conv2d-backward-dcols-into!
                                                      W dy-cols d-cols-buf ckk c-out bhw)
@@ -1005,11 +1077,11 @@
            ;; bound syms
                              n-out    (gensym-fn "n_out")
                              n-in     (gensym-fn "n_in")
-                             out-buf  (with-meta (gensym-fn "mp_out_buf") {:hoistable true})
-                             argmax   (with-meta (gensym-fn "argmax") {:hoistable true})
+                             out-buf  (vary-meta (gensym-fn "mp_out_buf" (grad-tag x)) assoc :hoistable true)
+                             argmax   (vary-meta (gensym-fn "argmax") assoc :hoistable true)
                              fwd      (gensym-fn "mp_fwd")
-                             dx-buf   (with-meta (gensym-fn "dx_buf") {:hoistable true})
-                             dx       (gensym-fn "dx")]
+                             dx-buf   (vary-meta (gensym-fn "dx_buf" (grad-tag x)) assoc :hoistable true)
+                             dx       (gensym-fn "dx" (grad-tag x))]
                          [(update ctx :bindings into
                                   [n-out  n-out-expr
                                    n-in   n-in-expr
@@ -1034,8 +1106,8 @@
                       {:params '[A b n] :result 'x :adjoint 'dy
                        :grads-fn (fn [ctx [A b n] result-sym adjoint-sym gensym-fn]
                                    (let [grads-arr (gensym-fn "solve_grads")
-                                         dA (gensym-fn "dA")
-                                         db (gensym-fn "db")]
+                                         dA (gensym-fn "dA" (grad-tag A))
+                                         db (gensym-fn "db" (grad-tag b))]
                                      [(update ctx :bindings into
                                               [grads-arr (list 'raster.linalg.core/solve-backward
                                                                adjoint-sym A result-sym n)
@@ -1047,7 +1119,7 @@
 (merge-into-template! 'raster.linalg.core/array-det
                       {:params '[A n] :result 'det-val :adjoint 'dy
                        :grads-fn (fn [ctx [A n] result-sym adjoint-sym gensym-fn]
-                                   (let [dA (gensym-fn "dA")]
+                                   (let [dA (gensym-fn "dA" (grad-tag A))]
                                      [(update ctx :bindings into
                                               [dA (list 'raster.linalg.core/array-det-backward
                                                         adjoint-sym result-sym A n)])
@@ -1540,7 +1612,7 @@
           (reduce
            (fn [[ctx grads] i]
              (if-let [adj-f (get adjoint-map i)]
-               (let [g (gensym-fn (str "dadj_" i))]
+               (let [g (gensym-fn (str "dadj_" i) (grad-tag (nth args i nil)))]
                  [(update ctx :bindings into [g (adj-f args adjoint-sym)])
                   (conj grads g)])
                [ctx (conj grads nil)]))
