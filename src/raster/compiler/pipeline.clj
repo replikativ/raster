@@ -395,12 +395,37 @@
   [form opts]
   (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
-        opts (assoc opts :simplify? true)]
+        opts (assoc opts :simplify? true)
+        ;; GPU determinism epilogue (cold-compile inline gate). An AD-emitted generic
+        ;; parametric call (e.g. linear-dx from linear-nb's grads-fn) can survive the
+        ;; whole fixpoint UNdevirtualized when the incremental type env can't type an
+        ;; intermediate arg yet. On a FRESH JVM the later resolve-generic-deftm-calls
+        ;; (buffer-fuse/late-cleanup) then devirtualizes it to `.invk foo_m_floats…-impl`
+        ;; — creating the float specialization as a SIDE EFFECT — but that is AFTER the
+        ;; last inline pass, so the .invk survives to resident extraction and the first
+        ;; compile-gpu-program fails while the second succeeds. Run the same resolver
+        ;; HERE at convergence and, if it devirtualized anything, expand once more so
+        ;; the first compile inlines exactly like every later one. GPU-gated: CPU
+        ;; backends call .invk directly, so late devirtualization is sufficient there
+        ;; (and the shared-suite behavior stays untouched).
+        finalize (fn [current]
+                   (if-not (and (device/gpu-target? (:target-device opts))
+                                (form/binding-form? current))
+                     current
+                     ;; The resolver needs binding :tag metadata — the AD-emitted
+                     ;; bindings from THIS fixpoint don't carry it yet (late-cleanup
+                     ;; re-tags for the same reason before ITS resolve call).
+                     (let [tagged (tag-binding-types current (:param-env opts))
+                           resolved (inline/resolve-generic-deftm-calls
+                                     tagged (:param-env opts))]
+                       (if (= resolved tagged)
+                         current
+                         (inline/expand-for-backends resolved 3 (:param-env opts))))))]
     (loop [current form
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        {:form (ensure-let*-result current) :stats total-stats}
+        {:form (ensure-let*-result (finalize current)) :stats total-stats}
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
                          (inline/expand-for-backends current 3 (:param-env opts)))
@@ -420,7 +445,8 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            {:form (ensure-let*-result current) :stats (assoc total-stats :fixpoint-iterations iter)}
+            {:form (ensure-let*-result (finalize current))
+             :stats (assoc total-stats :fixpoint-iterations iter)}
             (recur rewalked (inc iter)
                    (assoc total-stats :fixpoint-iterations (inc iter)))))))))
 

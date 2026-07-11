@@ -1681,9 +1681,14 @@
                   (when cls
                     (.importClass ^clojure.lang.Namespace source-ns cls)
                     (swap! types/tag-class-registry assoc specialized-name cls)))))
-            ;; Create the mangled defn var (minimal — just a placeholder for metadata)
+            ;; Create the mangled defn var (minimal — just a placeholder for metadata).
+            ;; Variadic [& args]: the real params are carried in ::deftm-params metadata
+            ;; below, and the placeholder is replaced by a delegating variadic fn after
+            ;; do-bytecode-upgrade! anyway. A positional param vector here would hit
+            ;; Clojure's 20-positional-param limit for wide deftms (e.g. a 37-param
+            ;; transformer block): "Can't specify more than 20 params".
             (binding [*ns* source-ns]
-              (eval (list 'defn mangled-sym (vec params)
+              (eval (list 'defn mangled-sym '[& args]
                           (list 'throw (list 'UnsupportedOperationException.
                                              "bytecode-compiled — should not reach here")))))
             ;; Set metadata on the mangled var

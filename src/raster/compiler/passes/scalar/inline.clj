@@ -205,14 +205,42 @@
             ;; → the index never advances → infinite hang. util/alpha-convert renames
             ;; only bound vars (params stay free for subst); fresh-like preserves the
             ;; name prefix + tags, so name-based heuristics and dtype tags survive.
-            hygienic-wb (mapv util/alpha-convert effective-wb)]
-        (if source-ns
+                hygienic-wb (mapv util/alpha-convert effective-wb)]
+            (if source-ns
               {:params params
                :tags (or qualified-tags tags)
                :return-tag return-tag
                :walked-body (mapv #(inf/qualify-body-symbols % source-ns param-set)
                                   hygienic-wb)}
               {:params params :tags tags :return-tag return-tag :walked-body hygienic-wb})))))))
+
+(defn- force-mangled-specialization!
+  "Fresh-JVM determinism: a walked body may reference a mangled specialization
+   (foo_m_floats_… / its -impl) that does not exist yet in THIS JVM — e.g. the
+   dtype monomorphizer rewrote call names to the float mangle before the float
+   specialization was ever forced. Parse the dispatch tags back out of the
+   mangled name, verify the parse by re-mangling (never act on a mis-parse),
+   and force the concrete specialization through the standard parametric entry
+   point (inf/try-parametric-specialize!). Returns the now-resolved mangled var,
+   or nil. Only simple tags parse unambiguously — compound (`_dot_`) and
+   parametric-class (`__`) tag names are skipped (try-parametric-specialize!
+   cannot fabricate trigger args for those anyway)."
+  [base-sym]
+  (let [nm (name base-sym)
+        idx (str/index-of nm "_m_")]
+    (when (and idx (namespace base-sym))
+      (let [tag-str (subs nm (+ (long idx) 3))]
+        (when-not (or (.contains ^String tag-str "__")
+                      (.contains ^String tag-str "_dot_")
+                      (str/blank? tag-str))
+          (let [parent-name (subs nm 0 (long idx))
+                tags (mapv symbol (str/split tag-str #"_"))
+                parent-sym (symbol (namespace base-sym) parent-name)]
+            ;; Round-trip check: mangling the parsed pieces must reproduce the name.
+            (when (and (= nm (name (types/mangle parent-name tags)))
+                       (try (resolve parent-sym) (catch Exception _ nil)))
+              (inf/try-parametric-specialize! parent-sym tags)
+              (try (resolve base-sym) (catch Exception _ nil)))))))))
 
 (defn- try-resolve-deftm
   "Try to resolve a symbol to a deftm var with an inlinable walked body.
@@ -228,7 +256,11 @@
            ;; Single source of truth for inline opacity (direct + `_m_` parent).
            dispatch-no-inline? (dispatch/no-inline? base-sym)]
        (when-not dispatch-no-inline?
-         (when-let [v (try (resolve base-sym) (catch Exception _ nil))]
+         (when-let [v (or (try (resolve base-sym) (catch Exception _ nil))
+                          ;; Cold-compile gate: the mangled specialization does not
+                          ;; exist yet in this JVM — force it deterministically so the
+                          ;; FIRST compile behaves like every later one.
+                          (force-mangled-specialization! base-sym))]
            (when-not (:no-inline (meta v))
              (let [parametric-sym (symbol (namespace base-sym) (name base-sym))
                    has-parametric? (contains? @dispatch/parametric-registry parametric-sym)]
