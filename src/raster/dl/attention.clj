@@ -68,23 +68,33 @@
 ;; x is [seq, heads, head_dim] flattened. theta is the RoPE base — Gemma uses
 ;; 10000 for local/sliding layers and 1e6 for global layers (pass per layer);
 ;; Llama/Qwen use a single base. Generic across all RoPE decoder LMs.
+;; Resident training RoPE forward: same NeoX/HF rotate-half as rope-prefill!,
+;; but ALLOCATES + RETURNS out (the AD-templated (Array T) primitive). The grid
+;; is flattened over seq-len·heads·(head-dim/2) work-items (one rotation each),
+;; so it lowers to a single resident :map-void kernel — the old raw nested
+;; dotimes the resident extractor rejected. Pairing/theta semantics are bit-
+;; identical to rope-prefill! (t = position p): out[base+i] = x0·c − x1·s,
+;; out[base+i+hdim2] = x1·c + x0·s, with freq = θ^(−2i/d), ang = p·freq.
 (deftm rope (All [T] [x :- (Array T) seq-len :- Long heads :- Long
                       head-dim :- Long theta :- Double] :- (Array T)
-                 (let [out (alloc-like x (* seq-len (* heads head-dim)))
-                       half (quot head-dim 2)
-        ;; inv_freq_i = theta^(-2i/d) = exp(-2i/d * ln theta); no pow intrinsic.
-                       ln-theta (m/log theta)]
-                   (dotimes [p seq-len]
-                     (dotimes [h heads]
-                       (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))]
-                         (dotimes [i half]
-                           (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                 ang (* (double p) freq)
-                                 c (m/cos ang) s (m/sin ang)
-                                 x0 (aget x (+ base i))
-                                 x1 (aget x (+ (+ base i) half))]
-                             (aset out (+ base i) (- (* x0 c) (* x1 s)))
-                             (aset out (+ (+ base i) half) (+ (* x1 c) (* x0 s))))))))
+                 (let [out (alloc-like x (* seq-len (* heads head-dim)))]
+                   (raster.par/map-void! idx (clojure.core/* seq-len (clojure.core/* heads (quot head-dim 2)))
+                                         (let [hdim2 (quot head-dim 2)
+                                               per-row (clojure.core/* heads hdim2)
+                                               t (quot idx per-row)
+                                               rest0 (rem idx per-row)
+                                               h (quot rest0 hdim2)
+                                               i (rem rest0 hdim2)
+                                               base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                                                                    (clojure.core/* h head-dim))
+                                               ln-theta (m/log theta)
+                                               freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                               ang (* (double t) freq)
+                                               c (m/cos ang) s (m/sin ang)
+                                               x0 (aget x (clojure.core/+ base i))
+                                               x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                           (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                                           (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))
                    out)))
 
 ;; RoPE backward: RoPE applies the orthogonal rotation R(ang) to each (x0,x1)
@@ -92,22 +102,31 @@
 ;;   dx0 =  c·dy0 + s·dy1
 ;;   dx1 = −s·dy0 + c·dy1
 ;; No trainable params (theta/positions are fixed) — only x gets a gradient.
+;; Resident RoPE backward: the transpose rotation R(−ang) on (dy0,dy1), flattened
+;; over the same seq-len·heads·(head-dim/2) grid as the forward → one resident
+;; :map-void kernel. c/s recomputed identically to the forward (theta-exact):
+;;   dx[base+i]       =  c·dy0 + s·dy1
+;;   dx[base+i+hdim2] =  c·dy1 − s·dy0
 (deftm rope-backward-dx (All [T] [dy :- (Array T) seq-len :- Long heads :- Long
                                   head-dim :- Long theta :- Double] :- (Array T)
-                             (let [dx (alloc-like dy (* seq-len (* heads head-dim)))
-                                   half (quot head-dim 2)
-                                   ln-theta (m/log theta)]
-                               (dotimes [p seq-len]
-                                 (dotimes [h heads]
-                                   (let [base (+ (* p (* heads head-dim)) (* h (int head-dim)))]
-                                     (dotimes [i half]
-                                       (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                             ang (* (double p) freq)
-                                             c (m/cos ang) s (m/sin ang)
-                                             d0 (aget dy (+ base i))
-                                             d1 (aget dy (+ (+ base i) half))]
-                                         (aset dx (+ base i) (+ (* d0 c) (* d1 s)))
-                                         (aset dx (+ (+ base i) half) (- (* d1 c) (* d0 s))))))))
+                             (let [dx (alloc-like dy (* seq-len (* heads head-dim)))]
+                               (raster.par/map-void! idx (clojure.core/* seq-len (clojure.core/* heads (quot head-dim 2)))
+                                                     (let [hdim2 (quot head-dim 2)
+                                                           per-row (clojure.core/* heads hdim2)
+                                                           t (quot idx per-row)
+                                                           rest0 (rem idx per-row)
+                                                           h (quot rest0 hdim2)
+                                                           i (rem rest0 hdim2)
+                                                           base (clojure.core/+ (clojure.core/* t (clojure.core/* heads head-dim))
+                                                                                (clojure.core/* h head-dim))
+                                                           ln-theta (m/log theta)
+                                                           freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                                           ang (* (double t) freq)
+                                                           c (m/cos ang) s (m/sin ang)
+                                                           d0 (aget dy (clojure.core/+ base i))
+                                                           d1 (aget dy (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                                                       (aset dx (clojure.core/+ base i) (+ (* d0 c) (* d1 s)))
+                                                       (aset dx (clojure.core/+ (clojure.core/+ base i) hdim2) (- (* d1 c) (* d0 s)))))
                                dx)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
