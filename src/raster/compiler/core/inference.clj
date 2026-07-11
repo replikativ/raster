@@ -23,6 +23,18 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.tc-extensions]))
 
+;; Signature-derived result typing lives in dispatch (with the parametric
+;; registry). dispatch → specialize → inference, so we resolve it lazily
+;; (cached) — the same requiring-resolve pattern used for parametric-registry.
+(def ^:private signature-result-tag-fn
+  (delay (requiring-resolve 'raster.compiler.core.dispatch/signature-result-tag)))
+
+(defn- signature-result-tag
+  "Signature-derived result tag (dispatch/signature-result-tag), or nil when the
+   op has no unifiable (All [T]) signature. Callers fall back to the facet."
+  [op arg-tags]
+  (when-let [f @signature-result-tag-fn] (f op arg-tags)))
+
 ;; ================================================================
 ;; Type-env accessors
 ;; ================================================================
@@ -1838,9 +1850,10 @@
             ;; below can't supply it. Register new ops in op-descriptor, not here.
             (some? (descriptor/result-type-rule
                     (or (:raster.op/original (meta expr)) (form/effective-op expr))))
-            (let [op (or (:raster.op/original (meta expr)) (form/effective-op expr))]
-              (descriptor/result-tag
-               op (map #(infer-arg-tag % env) (form/effective-args expr))))
+            (let [op (or (:raster.op/original (meta expr)) (form/effective-op expr))
+                  arg-tags (map #(infer-arg-tag % env) (form/effective-args expr))]
+              (or (signature-result-tag op arg-tags)  ; signature first
+                  (descriptor/result-tag op arg-tags)))
 
             (= '.invk head)
             (when-let [impl-sym (second expr)]
