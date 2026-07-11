@@ -66,6 +66,31 @@
        (vary-meta sym assoc :raster.type/tag type-tag)
        sym))))
 
+;; ----------------------------------------------------------------
+;; Lost-tag instrumentation (diagnostic-first; task #58 phase-1b).
+;; The raw-loop reverse-AD codegen defaults an untagged cotangent's shadow
+;; array/scalar to 'doubles/'double (silently narrowing f32 → f64: the [F/[D
+;; ClassCast + F5 GPU under-devirtualization root). Until the enumeration of
+;; lost-tag sites is clean these sites WARN (dedup'd to *err*, keyed by
+;; [site binding]) instead of throwing, so the full corpus can be collected
+;; without behavior change. Flip to fail-loud (tangent/zero-expr) only once the
+;; corpus is clean.
+(def ^:private default-tag-warn-seen (atom #{}))
+
+(defn- warn-default-tag!
+  "Emit a dedup'd LOST-TAG warning to *err* when a reverse-AD codegen site falls
+  back to `default-tag` because the primal binding carries no :raster.type/tag.
+  Keyed by [site binding]. Returns `default-tag` unchanged (no behavior change)."
+  [site binding-hint default-tag]
+  (let [k [site (str binding-hint)]]
+    (when-not (contains? @default-tag-warn-seen k)
+      (swap! default-tag-warn-seen conj k)
+      (binding [*out* *err*]
+        (println (str "[ad.reverse LOST-TAG default] site=" site
+                      " binding=" binding-hint " -> default " default-tag
+                      " (primal has no :raster.type/tag)"))))
+    default-tag))
+
 (defmacro ^:private with-ad-gensym
   "Ensure *gensym-counter* is bound. If already bound (non-nil), inherit it;
   otherwise bind a fresh counter starting at 0. This allows composed AD passes
@@ -515,6 +540,94 @@
   [rev-ctx kvs]
   (update rev-ctx :bindings into kvs))
 
+(def ^:private nil-possible-heads
+  "Adjoint-IR operator heads whose result MAY be the dynamic 0̄ (nil): the
+  nil-safe `grad-acc` fold (nil iff both inputs nil), a pullback-vector slot
+  `nth` (nil for an inactive/zero component), and `if` (an untaken branch may be
+  a nil zero). Anything else in adjoint position is an allocated array/number
+  kernel output, hence non-nil."
+  '#{raster.ad.reverse/grad-acc grad-acc
+     clojure.core/nth nth
+     if if*})
+
+(defn- provably-non-nil-contrib?
+  "Conservative static test: can `contrib` NEVER evaluate to nil (the dynamic 0̄)?
+  True only for a symbol bound (in `binding-map`, the rev-ctx bindings gathered so
+  far) to a plain op-call whose head is not a nil-producing form — i.e. a real
+  backward-kernel/allocation output (`linear-dx`, `aget-grad`, `residual-add`,
+  `float-array`, …). A literal nil, a `(nth grads i)` pullback slot, a nil-safe
+  `grad-acc`, an `(if …)`, or a symbol we can't vouch for → false. When in doubt,
+  false: the caller then keeps the nil-safe `grad-acc` fold. This is what makes the
+  resident `residual-add` reroute SOUND — `residual-add` has no nil check, so it may
+  only see cotangents that are provably present."
+  [binding-map contrib]
+  (letfn [(non-nil-expr? [e]
+            (and (some? e) (seq? e) (symbol? (first e))
+                 (not (contains? nil-possible-heads (first e)))))]
+    (cond
+      (nil? contrib)    false
+      (symbol? contrib) (if-let [b (find binding-map contrib)]
+                          (non-nil-expr? (val b))
+                          false)
+      (seq? contrib)    (non-nil-expr? contrib)
+      :else             false)))
+
+(defn- sum-contribs-into
+  "Bind `target-sym` to the sum of `contribs` (default when empty) inside
+  `rev-ctx`, choosing a GPU-RESIDENT lowering for the multi-contribution ARRAY
+  fan-out case.
+
+  For a SCALAR (or empty / single-contribution) target this is exactly the old
+  `(bindings-into rev-ctx [target-sym (sum-contribs contribs default)])`: the
+  scalar fold stays `grad-acc` (its nil-safety is load-bearing on the interpreted
+  CPU path, and a scalar grad-acc lowers as a host scalar-let anyway).
+
+  For an ARRAY target with ≥2 contributions that are ALL PROVABLY NON-NIL — a
+  value/param that FANS OUT to several ACTIVE downstream consumers (e.g. `xn`
+  feeding q/k/v, whose cotangents are `linear-dx` kernel outputs) — `grad-acc`'s
+  nil-safe `defn` has no GPU kernel, so the array accumulation hits
+  `:unlowered-array-op` and defeats residency. Here we instead SEED the
+  accumulator with the first contribution directly (numerically identical to
+  `(reduce grad-acc contribs)`, which also starts from the first element) and fold
+  the rest with the already RESIDENT element-wise `raster.dl.nn/residual-add` (a
+  `broadcast +` → `:map` kernel). Each intermediate accumulator is stamped with
+  the target's array `tag` so it devirtualizes to the cotangent element dtype
+  (float here, not a silently-widened double). The per-add element count is
+  `(alength <seed>)`, which `resolve-alength` traces to the seed buffer's
+  allocation size host-side.
+
+  CRITICAL soundness gate: `residual-add` has NO nil check, but a cotangent
+  contribution can be nil at RUNTIME (a statically-nil template gradient, a
+  pullback slot for an inactive arg, an untaken `if` branch). grad-acc's
+  `(nil? b) → a` silently drops those; residual-add would NPE. So the reroute
+  fires ONLY when every contribution is `provably-non-nil-contrib?`; otherwise we
+  keep the nil-safe grad-acc fold (correct on CPU, and grad-acc still lowers as a
+  host scalar-let for scalars / is DCE'd when dead). This is exactly the
+  attention-block fan-out (all q/k/v cotangents are active kernel outputs) while a
+  dot-product / train-step d_W accumulation — which includes a nil template
+  gradient — falls back to grad-acc unchanged."
+  [rev-ctx target-sym contribs default tag]
+  (let [binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
+    (if (and (>= (count contribs) 2)
+             (= :array (:kind (tangent/tangent-kind tag)))
+             (every? #(provably-non-nil-contrib? binding-map %) contribs))
+      (let [[seed & more] contribs
+            n-sym   (ad-gensym "gacc_n")
+            rev-ctx (bindings-into rev-ctx [n-sym (list 'raster.arrays/alength seed)])
+            ;; Fold the remaining contributions with the resident add; the LAST add
+            ;; binds `target-sym` directly (no trailing alias for the extractor to
+            ;; copy-propagate). Intermediates carry `tag` → float-typed buffers.
+            n     (count more)
+            kvs   (loop [acc seed, cs more, i 0, out []]
+                    (if (empty? cs)
+                      out
+                      (let [dst (if (= i (dec n)) target-sym (ad-gensym "gacc" tag))]
+                        (recur dst (rest cs) (inc i)
+                               (into out [dst (list 'raster.dl.nn/residual-add
+                                                    acc (first cs) n-sym)])))))]
+        (bindings-into rev-ctx kvs))
+      (bindings-into rev-ctx [target-sym (sum-contribs contribs default)]))))
+
 (defmulti ^:private emit-backward
   "Reverse-pass per-record emission (PURE): returns the updated
   {:adj-env :rev-ctx}. `adj-sym` is this record's gensym'd adjoint (nil for the
@@ -680,10 +793,14 @@
    (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
      (let [array-type? (contains? #{:dotimes :par-map :par-reduce :par-scan} type)
            adj-contribs (when-not array-type? (get adj-env sym))
+           sym-tag (:raster.type/tag (meta sym))
            adj-sym (when-not array-type?
-                     (ad-gensym (str "d_" (name sym)) (:raster.type/tag (meta sym))))
+                     (ad-gensym (str "d_" (name sym)) sym-tag))
            rev-ctx (if adj-sym
-                     (bindings-into rev-ctx [adj-sym (sum-contribs adj-contribs nil)])
+                     ;; Fan-out array cotangent (e.g. d_xn from q/k/v) folds via
+                     ;; the resident residual-add; scalars keep the nil-safe
+                     ;; grad-acc fold. See sum-contribs-into.
+                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
        (if (or array-type? adj-contribs)
          (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
@@ -719,14 +836,21 @@
      (fn [{:keys [rev-ctx param-adj-syms]} p]
        (let [tag (:raster.type/tag (meta p))
              {:keys [kind dtype]} (tangent/tangent-kind tag)
-             raw (sum-contribs (get adj-env p) (param-zero-expr p))
-             expr (if (and (= kind :scalar)
-                           (or (= dtype :float)
-                               (and (= dtype :double) mixed-float?)))
-                    (tangent/project-expr tag raw)
-                    raw)
-             adj-sym (ad-gensym (str "d_" (name p)) tag)]
-         {:rev-ctx (bindings-into rev-ctx [adj-sym expr])
+             contribs (get adj-env p)
+             adj-sym (ad-gensym (str "d_" (name p)) tag)
+             ;; ARRAY param fan-out (a weight consumed by ≥2 ops) accumulates via
+             ;; the resident residual-add (no scalar projection applies to arrays).
+             rev-ctx
+             (if (and (= kind :array) (>= (count contribs) 2))
+               (sum-contribs-into rev-ctx adj-sym contribs (param-zero-expr p) tag)
+               (let [raw (sum-contribs contribs (param-zero-expr p))
+                     expr (if (and (= kind :scalar)
+                                   (or (= dtype :float)
+                                       (and (= dtype :double) mixed-float?)))
+                            (tangent/project-expr tag raw)
+                            raw)]
+                 (bindings-into rev-ctx [adj-sym expr])))]
+         {:rev-ctx rev-ctx
           :param-adj-syms (conj param-adj-syms adj-sym)}))
      {:rev-ctx rev-ctx :param-adj-syms []}
      active-params)))
@@ -1531,18 +1655,21 @@
         ;; element type (inherits :raster.type/tag if present; defaults to doubles).
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :dotimes-read-arr (name arr) 'doubles))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
-                                         (or (:raster.type/tag (meta p)) 'double)))
+                                         (or (:raster.type/tag (meta p))
+                                             (warn-default-tag! :dotimes-scalar (name p) 'double))))
                             active-free)
 
         ;; Backward loop: reads d_out, calls pullbacks, accumulates
         ;; d-out-sym is the gradient of the output array — bound by gen-reverse-let
         ;; from adj-env contributions. Tag inherits from the output array type
         ;; (defaults to doubles, the dominant case for raster training).
-        out-array-tag (or (some-> written-arrs first meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> written-arrs first meta :raster.type/tag)
+                          (warn-default-tag! :dotimes-out-arr (some-> written-arrs first name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
                        'double)
@@ -1757,13 +1884,16 @@
         ;; Type-tag the gradient symbols so downstream type inference is complete.
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :parmap-read-arr (name arr) 'doubles))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
-                                         (or (:raster.type/tag (meta p)) 'double)))
+                                         (or (:raster.type/tag (meta p))
+                                             (warn-default-tag! :parmap-scalar (name p) 'double))))
                             active-free)
-        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> out-sym meta :raster.type/tag)
+                          (warn-default-tag! :parmap-out-arr (some-> out-sym name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
                        'double)
@@ -2190,11 +2320,13 @@
           (gen-reverse-let binds [val-result-sym] iter-active))
 
         ;; === Backward code ===
-        out-array-tag (or (some-> out-sym meta :raster.type/tag) 'doubles)
+        out-array-tag (or (some-> out-sym meta :raster.type/tag)
+                          (warn-default-tag! :carry-out-arr (some-> out-sym name) 'doubles))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
-                                           (or (:raster.type/tag (meta arr)) 'doubles)))
+                                           (or (:raster.type/tag (meta arr))
+                                               (warn-default-tag! :carry-read-arr (name arr) 'doubles))))
                               read-arrs)
         arr->d-sym (zipmap read-arrs d-read-arr-syms)
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
@@ -2554,7 +2686,7 @@
     (let [scalar-tag (case dtype :float 'float :double 'double nil)
           array-tag  (case dtype :float 'floats :double 'doubles nil)
           alloc-fn   (case dtype :float 'clojure.core/float-array
-                                 :double 'clojure.core/double-array nil)
+                           :double 'clojure.core/double-array nil)
           init-sym   (ad-gensym "carry_init" scalar-tag)
           n-sym      (ad-gensym "carry_n" 'long)
           pos-sym    (ad-gensym "carry_pos")
@@ -3416,12 +3548,12 @@
   ;; the wrong dimension (gqa dW came out [hd,in] not [nq*hd,in]). Sharing one
   ;; monotonic counter keeps every generated name globally unique.
   (with-ad-gensym
-   (let [resolved (resolve-deftm-var f-var)
-        m (meta resolved)
-        params (or (:raster.core/deftm-params m)
-                   (throw (ex-info "grad requires a deftm var" {:var f-var})))
-        walked-body (or (rcore/ensure-walked-body! resolved)
-                        (throw (ex-info "No walked body on var" {:var f-var})))
+    (let [resolved (resolve-deftm-var f-var)
+          m (meta resolved)
+          params (or (:raster.core/deftm-params m)
+                     (throw (ex-info "grad requires a deftm var" {:var f-var})))
+          walked-body (or (rcore/ensure-walked-body! resolved)
+                          (throw (ex-info "No walked body on var" {:var f-var})))
         ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
         ;; only defined for SCALAR-valued functions — a vector tail (e.g. the
         ;; [primal grads...] of a value+grad result, or a tuple-returning
@@ -3429,41 +3561,41 @@
         ;; the reverse fold would silently return zero gradients. Fail loud.
         ;; The transparent-composition idiom is to USE the components in a
         ;; scalar program: (let [vg ((value+grad #'f) x)] ...scalar of (nth vg i)...).
-        _ (let [wb-form (first walked-body)
-                tail (if (and (seq? wb-form)
-                              (contains? #{'let 'let*} (first wb-form)))
-                       (last wb-form)
-                       wb-form)]
-            (when (vector? tail)
-              (throw (ex-info
-                      (str "Cannot differentiate the tuple-valued function `" f-var
-                           "` — its output is a vector, which has no canonical "
-                           "cotangent seed (this is what value+grad returns; "
-                           "value+grad of value+grad is ill-typed). Compose "
-                           "transparently instead: call the inner gradient in a "
-                           "scalar deftm and differentiate that, e.g. "
-                           "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
-                           "For 1-param scalar fns, (grad (grad f)) composes directly.")
-                      {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
-        tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
-        all-params (vec (map-indexed
-                         (fn [i p]
-                           (let [tag (nth tags i nil)
-                                 base (if (symbol? p) p (symbol (name p)))]
-                             (if tag
-                               (with-meta base {:raster.type/tag tag})
-                               (with-meta base nil))))
-                         params))
+          _ (let [wb-form (first walked-body)
+                  tail (if (and (seq? wb-form)
+                                (contains? #{'let 'let*} (first wb-form)))
+                         (last wb-form)
+                         wb-form)]
+              (when (vector? tail)
+                (throw (ex-info
+                        (str "Cannot differentiate the tuple-valued function `" f-var
+                             "` — its output is a vector, which has no canonical "
+                             "cotangent seed (this is what value+grad returns; "
+                             "value+grad of value+grad is ill-typed). Compose "
+                             "transparently instead: call the inner gradient in a "
+                             "scalar deftm and differentiate that, e.g. "
+                             "(let [vg ((value+grad #'f) x)] ...scalar use of (nth vg i)...). "
+                             "For 1-param scalar fns, (grad (grad f)) composes directly.")
+                        {:var f-var :tail-shape :vector :reason :tuple-valued-output}))))
+          tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
+          all-params (vec (map-indexed
+                           (fn [i p]
+                             (let [tag (nth tags i nil)
+                                   base (if (symbol? p) p (symbol (name p)))]
+                               (if tag
+                                 (with-meta base {:raster.type/tag tag})
+                                 (with-meta base nil))))
+                           params))
         ;; Only differentiable-tag params seed activity analysis. Non-diff
         ;; params (Long/longs scalars, indices, etc.) are constants for AD —
         ;; expressions involving only them stay inactive and don't need AD
         ;; rules. Their grad slots are still emitted in the output vector
         ;; (via all-params) so positional consumers don't shift.
-        diff-active-params (vec (keep-indexed
-                                 (fn [i p]
-                                   (when (differentiable-tag? (nth tags i nil)) p))
-                                 all-params))
-        source-ns (or (:ns m) *ns*)
+          diff-active-params (vec (keep-indexed
+                                   (fn [i p]
+                                     (when (differentiable-tag? (nth tags i nil)) p))
+                                   all-params))
+          source-ns (or (:ns m) *ns*)
         ;; Π: the SEED is the cotangent of the RESULT of the differentiated
         ;; GRAPH, so its dtype derives from the walked body's TAIL tag (the
         ;; actual primal flowing) — not from a global binary any-param-is-float
@@ -3472,45 +3604,45 @@
         ;; cross-entropy) needs a FLOAT seed for its pullback; the Double is
         ;; only the .invk interface boundary. The legacy binary inference
         ;; remains as fallback for untagged tails.
-        dtype (case (body-tail-tag (first walked-body))
-                float  :float
-                double :double
-                (if (some #{'floats 'float} tags) :float :double))
+          dtype (case (body-tail-tag (first walked-body))
+                  float  :float
+                  double :double
+                  (if (some #{'floats 'float} tags) :float :double))
         ;; Shared pre-AD preparation (lower composites → materialize → hoist
         ;; into flat ANF) — see ad-prepare, shared with the JVP path.
-        hoisted (ad-prepare (first walked-body))
+          hoisted (ad-prepare (first walked-body))
         ;; transform-body itself will lift any binding-position loop into
         ;; tail position via lift-loop-to-tail.
-        ad-form (transform-body hoisted diff-active-params)
-        flat (binding [ad-flatten/*flatten-dtype* dtype]
-               (ad-flatten/flatten-for-gradient ad-form))
+          ad-form (transform-body hoisted diff-active-params)
+          flat (binding [ad-flatten/*flatten-dtype* dtype]
+                 (ad-flatten/flatten-for-gradient ad-form))
         ;; Pad the gradient output vector so positional consumers see one slot
         ;; per ORIGINAL param (loss + N grads), with nil where the param was
         ;; non-differentiable. flat's inner form is (let* bindings [primal d1
         ;; d2 ... dN_diff]); we rewrite it to [primal slot1 ... slotN_all].
-        padded-form
-        (when flat
-          (let [diff->idx (zipmap diff-active-params (range))
-                grad-slots (mapv (fn [p]
-                                   (if-let [j (diff->idx p)]
-                                     (nth (:param-adj-syms flat) j)
-                                     nil))
-                                 all-params)
-                output-vec (vec (cons (:result-sym flat) grad-slots))
-                [op bindings _] (:form flat)]
+          padded-form
+          (when flat
+            (let [diff->idx (zipmap diff-active-params (range))
+                  grad-slots (mapv (fn [p]
+                                     (if-let [j (diff->idx p)]
+                                       (nth (:param-adj-syms flat) j)
+                                       nil))
+                                   all-params)
+                  output-vec (vec (cons (:result-sym flat) grad-slots))
+                  [op bindings _] (:form flat)]
             ;; FAIL-LOUD backstop: the flat let* must have globally-unique
             ;; gensym-minted bound names. A duplicate means a *gensym-counter*
             ;; collision slipped through (the enclosing with-ad-gensym above is
             ;; what prevents it) — would silently miscompile the gradient.
-            (assert-unique-ad-minted-binds! bindings f-var)
-            (list op bindings output-vec)))]
-    (when flat
-      {:walked-body [padded-form]
-       :params all-params
-       :tags tags
-       :source-ns source-ns
-       :result-sym (:result-sym flat)
-       :param-adj-syms (:param-adj-syms flat)}))))
+              (assert-unique-ad-minted-binds! bindings f-var)
+              (list op bindings output-vec)))]
+      (when flat
+        {:walked-body [padded-form]
+         :params all-params
+         :tags tags
+         :source-ns source-ns
+         :result-sym (:result-sym flat)
+         :param-adj-syms (:param-adj-syms flat)}))))
 
 (defn- make-runtime-value+grad-fn
   "Build a runtime IFn from the AD-transformed walked body.

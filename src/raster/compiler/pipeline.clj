@@ -1325,6 +1325,32 @@
         clean-lets (vec (map-indexed (fn [i x] (if (even? i) (strip-meta x) x)) scalar-lets))]
     (eval (list 'fn [clean-params] (list* 'let* clean-lets [expr])))))
 
+(defn- find-untransformed-vg
+  "Deep-scan form for a value+grad/grad APPLICATION that survived AD inlining:
+     ((value+grad <var>) args…)  or  ((grad <var>) args…)
+   and the corrupted vector-literal shape the resident path degrades it into:
+     [(value+grad <var>) args…].
+   Returns the first offending sub-form, or nil. Used as a fail-loud backstop so an
+   un-AD-transformed value+grad never silently miscompiles to an input arg (F1)."
+  [form]
+  (let [vg-partial? (fn [x] (and (seq? x) (= 2 (count x))
+                                 (or (= (first x) 'raster.ad.reverse/value+grad)
+                                     (= (first x) 'raster.ad.reverse/grad))))
+        found (volatile! nil)]
+    (clojure.walk/prewalk
+     (fn [x]
+       (when (nil? @found)
+         (cond
+           ;; call: ((value+grad <var>) args…)
+           (and (seq? x) (seq (rest x)) (vg-partial? (first x)))
+           (vreset! found x)
+           ;; corrupted vector: [(value+grad <var>) args…]
+           (and (vector? x) (seq x) (vg-partial? (first x)))
+           (vreset! found x)))
+       x)
+     form)
+    @found))
+
 (defn compile-gpu-program
   "Compile f-var through the SAME fused GPU pipeline as compile-aot :target-device, but return a
    RESIDENT program descriptor for the session bound-dispatch path instead of make-gpu-fn's
@@ -1419,6 +1445,20 @@
         _ (when (System/getProperty "raster.debug.preextract")
             (binding [*out* *err*]
               (println "=== PRE-EXTRACT ===") (println (pr-str form)) (println "=== END-PRE-EXTRACT ===")))
+        ;; F1 fail-loud backstop. A value+grad/grad APPLICATION that survives to here
+        ;; was never AD-transformed (the inline hoist could not reach its position —
+        ;; e.g. buried inside a par/loop/fn scope). On the resident path it is misread
+        ;; as data (`(nth [(value+grad (var f)) …] k)` → returns an INPUT arg, not the
+        ;; gradient): a SILENT wrong answer. Throw with the offending form instead.
+        _ (when-let [vg (find-untransformed-vg form)]
+            (throw (ex-info
+                    (str "compile-gpu-program: " f-var " has an untransformed value+grad/grad "
+                         "application that survived AD inlining: " (pr-str vg)
+                         ". The AD transform only fires for a call in a liftable position; this "
+                         "one is buried in a scope the inline hoist cannot cross (par/loop/fn body). "
+                         "Bind `((value+grad #'f) args…)` directly to a let symbol at the deftm's "
+                         "top level and read `(nth vg k)` from there.")
+                    {:fn f-var :vg-form vg})))
         extracted (extract-gpu-program form)
         prog (if-let [nr (::non-resident extracted)]
                (if (= on-non-resident :throw)

@@ -370,6 +370,86 @@
                :mode (if (= op 'raster.ad.reverse/value+grad)
                        :value+grad :grad)})))))))
 
+(defn- hoist-nested-vg
+  "F1 fix — make the value+grad/grad AD transform fire wherever the call appears.
+
+   The binding-level AD machinery (value+grad-call? → inline-value+grad-call +
+   vg-elements + resolve-vg-nth) only recognizes a value+grad APPLICATION when it
+   is the WHOLE init of a let* binding. A call nested inside another form — e.g.
+   `(nth ((value+grad #'f) x tgt) 1)` — is never AD-transformed: it survives the
+   whole pipeline as a raw application. On the GPU-resident path it then gets
+   misread as data (`[(value+grad (var f)) x tgt]`), and `(nth … 1)` returns the
+   FIRST INPUT instead of the gradient — a silent wrong answer.
+
+   This pre-pass lifts every value+grad/grad application that is a proper SUB-form
+   (not the entire init) into its own fresh binding placed immediately before the
+   binding (or, for the body, appended after all bindings) that referenced it. The
+   ordinary binding loop then AD-transforms the lifted binding and resolve-vg-nth
+   folds the outer `(nth vg N)` to the gradient element.
+
+   Takes the raw bindings vector and body exprs; returns
+   {:bindings <flat vec> :body <seq of body exprs> :changed? bool}."
+  [bindings-vec body-exprs]
+  (let [changed? (atom false)
+        lift-in (fn lift-in [expr]
+                  ;; walk expr; lift nested vg apps. `expr` is NEVER the top-level
+                  ;; init here (caller passes children), so any vg-app found is nested.
+                  (let [lifted (atom [])
+                        walk (fn walk [f]
+                               (cond
+                                 (value+grad-call? f)
+                                 (let [g (gensym "vg_")]
+                                   (swap! lifted conj [g f])
+                                   (reset! changed? true)
+                                   g)
+                                 ;; Do NOT cross a scope boundary (inner let*/loop*/
+                                 ;; fn*/par body): lifting a vg app that closes over an
+                                 ;; inner-bound var to the outer level would break scope.
+                                 ;; Leave it — the fail-loud backstop catches anything the
+                                 ;; hoist can't safely reach.
+                                 (and (seq? f)
+                                      (or (form/introduces-scope? f)
+                                          (form/binding-form? f))) f
+                                 (seq? f)
+                                 (let [r (apply list (map walk f))]
+                                   (if-let [m (meta f)] (with-meta r m) r))
+                                 (vector? f)
+                                 (let [r (mapv walk f)]
+                                   (if-let [m (meta f)] (with-meta r m) r))
+                                 :else f))
+                        new-expr (walk expr)]
+                    [@lifted new-expr]))
+        ;; process one init: if the init itself IS a vg app, leave it (binding loop
+        ;; handles it); otherwise recurse into its children lifting nested apps.
+        process-init (fn [init]
+                       (if (or (value+grad-call? init)
+                               (and (seq? init)
+                                    (or (form/introduces-scope? init)
+                                        (form/binding-form? init))))
+                         [[] init]
+                         (if (seq? init)
+                           (let [[lifted children] (reduce (fn [[ls acc] child]
+                                                             (let [[l c] (lift-in child)]
+                                                               [(into ls l) (conj acc c)]))
+                                                           [[] []] init)
+                                 r (apply list children)]
+                             [lifted (if-let [m (meta init)] (with-meta r m) r)])
+                           (lift-in init))))
+        new-bindings (reduce (fn [acc [sym init]]
+                               (let [[lifted new-init] (process-init init)]
+                                 (-> acc (into lifted) (conj [sym new-init]))))
+                             [] (partition 2 bindings-vec))
+        ;; body exprs: lift nested vg apps into trailing bindings.
+        body-lifted (atom [])
+        new-body (mapv (fn [expr]
+                         (let [[lifted new-expr] (process-init expr)]
+                           (swap! body-lifted into lifted)
+                           new-expr))
+                       body-exprs)]
+    {:bindings (vec (mapcat identity (into (vec new-bindings) @body-lifted)))
+     :body new-body
+     :changed? @changed?}))
+
 (defn- parse-ftm-form
   "Parse an ftm form: (ftm [a :- Type, b :- Type] :- RetType body).
    Handles both typed [a :- T, b :- T] and untyped [a b] and mixed [a :- T, b] params.
@@ -861,7 +941,14 @@
   ([form] (inline-one-pass form subst-syms false))
   ([form subst-fn] (inline-one-pass form subst-fn false))
   ([form subst-fn skip-ad-rule-check?]
-   (let [[_ bindings-vec & body-exprs-raw] form
+   (let [[_ bindings-vec0 & body-exprs-raw0] form
+         ;; F1: hoist nested value+grad/grad applications out of any init/body
+         ;; sub-position into their own preceding binding, so the binding-level AD
+         ;; machinery (value+grad-call? + vg-elements + resolve-vg-nth) fires. A
+         ;; `(nth ((value+grad #'f) …) k)` otherwise never AD-transforms — silent
+         ;; wrong answer (nth on the raw call → an input arg, not the gradient).
+         {bindings-vec :bindings body-exprs-raw :body}
+         (hoist-nested-vg bindings-vec0 body-exprs-raw0)
          ;; Lift body-position calls into bindings so they get inlined too.
          ;; Without this, a tail call like (dense W2 a b2) stays opaque because
          ;; inline-one-pass only processes let* binding pairs.

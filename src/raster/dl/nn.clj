@@ -1572,48 +1572,81 @@
 ;;   dw_i = Σ_rows dy_i·x_i·inv   (independent of the gain offset g0)
 ;; ----------------------------------------------------------------
 
+;; Resident per-row backward kernel: one work-item per row (same shape as the
+;; forward rms-norm!). Recomputes inv-rms per row EXACTLY as the forward does
+;; ((/ s (double features)) → 1/sqrt(mean+eps)), then the two serial per-row
+;; reductions (ms for inv, c = Σ (g0+w)·x·dy) and the per-element write all live
+;; inside the one work-item — a single resident :map-void kernel. The old raw
+;; nested dotimes+loop had a two-accumulator shape loop-lift could not recover,
+;; so the resident extractor rejected it (:scalar-let-reads-device-buffer).
 (deftm rms-norm-backward-dx (All [T] [dy :- (Array T) x :- (Array T) weight :- (Array T)
                                       rows :- Long features :- Long
                                       eps :- Double gain-offset :- Double] :- (Array T)
                                  (let [dx (alloc-like dy (* rows features))]
-                                   (dotimes [r rows]
-                                     (let [offset (* r (int features))
-                                           ms (loop [i 0 s 0.0]
-                                                (if (< i features)
-                                                  (let [v (aget x (+ offset i))]
-                                                    (recur (inc i) (+ s (* v v))))
-                                                  (/ s features)))
-                                           inv (/ 1.0 (n/sqrt (+ ms eps)))
-                                           c (loop [i 0 s 0.0]
-                                               (if (< i features)
-                                                 (let [gi (+ gain-offset (aget weight i))]
-                                                   (recur (inc i)
-                                                          (+ s (* gi (* (aget x (+ offset i))
-                                                                        (aget dy (+ offset i)))))))
-                                                 s))
-                                           inv3f (/ (* inv (* inv inv)) features)]
-                                       (dotimes [i features]
-                                         (let [gi (+ gain-offset (aget weight i))]
-                                           (aset dx (+ offset i)
-                                                 (- (* inv (* gi (aget dy (+ offset i))))
-                                                    (* inv3f (* (aget x (+ offset i)) c))))))))
+                                   (raster.par/map-void! r rows
+                                                         (let [offset (clojure.core/* r features)
+                                                               ms (loop [i 0 s 0.0]
+                                                                    (if (< i features)
+                                                                      (let [v (aget x (clojure.core/+ offset i))]
+                                                                        (recur (inc i) (+ s (* v v))))
+                                                                      (/ s (double features))))
+                                                               inv (/ 1.0 (n/sqrt (+ ms eps)))
+                                                               c (loop [i 0 s 0.0]
+                                                                   (if (< i features)
+                                                                     (let [gi (+ gain-offset (aget weight i))]
+                                                                       (recur (inc i)
+                                                                              (+ s (* gi (* (aget x (clojure.core/+ offset i))
+                                                                                            (aget dy (clojure.core/+ offset i)))))))
+                                                                     s))
+                                                               inv3f (/ (* inv (* inv inv)) (double features))]
+                                                           (loop [i 0]
+                                                             (if (< i features)
+                                                               (let [gi (+ gain-offset (aget weight i))]
+                                                                 (aset dx (clojure.core/+ offset i)
+                                                                       (- (* inv (* gi (aget dy (clojure.core/+ offset i))))
+                                                                          (* inv3f (* (aget x (clojure.core/+ offset i)) c))))
+                                                                 (recur (inc i)))
+                                                               nil))))
                                    dx)))
 
+;; Resident weight-gradient: dw is a CROSS-ROW reduction (Σ over rows into a
+;; per-feature output), which is NOT a per-row independent write, so it needs
+;; TWO resident kernels (the two par passes the task permits):
+;;   (1) per-row normalize  xhat[r,i] = x[r,i]·inv_r   (par over rows, recomputes
+;;       inv-rms exactly as the forward → one :map-void kernel), then
+;;   (2) per-feature column sum  dw[i] = Σ_r dy[r,i]·xhat[r,i]  (par over features,
+;;       an output-parallel segment reduce with disjoint writes — no atomics — the
+;;       same fan-in shape as sum-kv-heads → one :map-void kernel). The accumulator
+;;       is seeded with the r=0 product (a T-typed value, not a Double literal) so
+;;       the sum stays polymorphic and devirtualizes on both CPU and GPU.
 (deftm rms-norm-backward-dweight (All [T] [dy :- (Array T) x :- (Array T)
                                            rows :- Long features :- Long eps :- Double] :- (Array T)
-                                      (let [dw (alloc-like dy features)]
-                                        (dotimes [r rows]
-                                          (let [offset (* r (int features))
-                                                ms (loop [i 0 s 0.0]
-                                                     (if (< i features)
-                                                       (let [v (aget x (+ offset i))]
-                                                         (recur (inc i) (+ s (* v v))))
-                                                       (/ s features)))
-                                                inv (/ 1.0 (n/sqrt (+ ms eps)))]
-                                            (dotimes [i features]
-                                              (aset dw i (+ (aget dw i)
-                                                            (* (aget dy (+ offset i))
-                                                               (* (aget x (+ offset i)) inv)))))))
+                                      (let [xhat (alloc-like x (* rows features))
+                                            dw (alloc-like dy features)]
+                                        (raster.par/map-void! r rows
+                                                              (let [offset (clojure.core/* r features)
+                                                                    ms (loop [i 0 s 0.0]
+                                                                         (if (< i features)
+                                                                           (let [v (aget x (clojure.core/+ offset i))]
+                                                                             (recur (inc i) (+ s (* v v))))
+                                                                           (/ s (double features))))
+                                                                    inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                                                                (loop [i 0]
+                                                                  (if (< i features)
+                                                                    (do (aset xhat (clojure.core/+ offset i)
+                                                                              (* (aget x (clojure.core/+ offset i)) inv))
+                                                                        (recur (inc i)))
+                                                                    nil))))
+                                        (raster.par/map-void! i features
+                                                              (aset dw i
+                                                                    (loop [r 1
+                                                                           acc (* (aget dy i) (aget xhat i))]
+                                                                      (if (< r rows)
+                                                                        (let [off (clojure.core/* r features)]
+                                                                          (recur (inc r)
+                                                                                 (+ acc (* (aget dy (clojure.core/+ off i))
+                                                                                           (aget xhat (clojure.core/+ off i))))))
+                                                                        acc))))
                                         dw)))
 
 ;; ----------------------------------------------------------------
