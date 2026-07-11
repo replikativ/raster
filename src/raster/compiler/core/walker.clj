@@ -471,6 +471,19 @@
             (if-let [ret-tag (:raster.type/ret-tag (meta (second result)))]
               (vary-meta result assoc :raster.type/tag ret-tag)
               result)
+            ;; Kept-symbolic op with a :result-type facet — an op that does NOT
+            ;; devirtualize to .invk (residual-add, grad-acc: they lower via SOAC
+            ;; fusion / stay a nil-safe host defn) but whose result tag still derives
+            ;; from its ARG tags via the registry (:same-as-first-arg for
+            ;; residual-add, :first-typed-arg for grad-acc). The .invk arms above
+            ;; can't reach these (no impl-sym / ret-tag), so without this arm the
+            ;; result stays untagged and the reverse-AD fan-out reroute (which gates
+            ;; on an :array sym-tag) can't fire. Register new ops in op-descriptor
+            ;; (:result-type), not here.
+            (and (symbol? head) (namespace head)
+                 (some? (descriptor/result-type-rule head)))
+            (let [rt (descriptor/result-tag head (map walked-tag (rest result)))]
+              (if rt (vary-meta result assoc :raster.type/tag rt) result))
             ;; Primitive cast — (double x), (float x), etc.
             (contains? types/primitive-info head)
             (vary-meta result assoc :raster.type/tag head)
@@ -701,6 +714,13 @@
                  tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
                          (inf/walked-init-monomorphized-tag rewritten-init tc-tag
                                                             (:element-dtype ctx))
+                         ;; A tag the walker's post-stamp derived on the init FORM
+                         ;; itself (e.g. a kept-symbolic residual-add stamped via the
+                         ;; :result-type facet, which infer-binding-tag can't reach —
+                         ;; no impl-sym/.invk ret-tag). Monomorphization-correct (it
+                         ;; came from the already-walked args), so it beats TC's
+                         ;; dtype-blind guess.
+                         (:raster.type/tag (meta rewritten-init))
                          tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)

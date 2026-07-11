@@ -290,6 +290,70 @@
       (is (:resident? (get grads 'x))
           "full attention-block grad(x) must extract FULLY RESIDENT"))))
 
+;; ── B2 MILESTONE: RESIDUAL-connection fan-out value+grad, FULLY RESIDENT ──────────
+;; A real decoder layer has RESIDUAL connections (the attention block above has none):
+;; a value `x1 = residual-add(x, m)` feeds BOTH the next `residual-add(x1, o)` AND
+;; `rms-norm(x1)` (fan-out), so its cotangent is `d_x1 = grad-acc(d_z, dx)` — a
+;; multi-contribution ARRAY accumulation. Before B2 this fell back to the nil-safe
+;; `grad-acc` (no GPU kernel) → :unlowered-array-op → non-resident. B2 makes it fold
+;; via the resident `residual-add`. THREE things had to line up:
+;;   1. `residual-add` is kept SYMBOLIC in the walk (lowers via broadcast SOAC), so its
+;;      result sym was UNTAGGED — the reverse-AD reroute gates on an :array sym-tag and
+;;      never fired. Fixed by a :result-type facet (raster.dl.nn) + the walker's
+;;      bare-symbolic-call arm + the let-binder reading the init's stamped tag.
+;;   2. The residual contribution `d_z` is a bare SYMBOL ALIAS: mse-loss binds
+;;      `d_pred = (mse-grad …)`, residual-add's IDENTITY-grad passthrough forwards that
+;;      adjoint SYMBOL to both input slots, and `sum-contribs` aliases a single
+;;      contribution to itself — so `d_z → d_pred → (mse-grad …)`, two symbol hops
+;;      before the kernel. `provably-non-nil-contrib?` now FOLLOWS pure symbol aliases
+;;      through the SSA binding-map to their non-nil kernel source (nil-safety intact:
+;;      any hop through grad-acc/nth/if/nil is still rejected → keeps nil-safe grad-acc).
+;;   3. The differentiated input `x` ALSO fans out (linear-nb ∘ residual), exercising
+;;      the param-adjoint reroute path too.
+;; grad(x) and grad(W1) must extract FULLY RESIDENT and match CPU. This is the B2
+;; regression pin (the grad-acc→residual-add reroute over aliases + the symbolic-op tag).
+(deftm resblk-parity-loss
+  [x :- (Array float) wn :- (Array float) W1 :- (Array float)
+   pn :- (Array float) W2 :- (Array float) tgt :- (Array float)
+   rows :- Long d :- Long eps :- Double go :- Double] :- Double
+  (let [n  (clojure.core/* rows d)
+        h  (raster.dl.nn/rms-norm x wn rows d eps go)
+        m  (raster.dl.nn/linear-nb h W1 rows d d)
+        x1 (raster.dl.nn/residual-add x m n)       ;; x1 FANS OUT ↓↓
+        h2 (raster.dl.nn/rms-norm x1 pn rows d eps go)
+        o  (raster.dl.nn/linear-nb h2 W2 rows d d)
+        z  (raster.dl.nn/residual-add x1 o n)]
+    (raster.dl.loss/mse-loss z tgt n)))
+
+(deftest resblk-value+grad-resident-parity
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] resblk (residual fan-out) resident parity: no Level Zero GPU")
+    (let [rows 4 d 16 eps 1e-6 go 1.0
+          x  (fa (* rows d) 51) wn (fa d 52) W1 (fa (* d d) 53)
+          pn (fa d 54) W2 (fa (* d d) 55) tgt (fa (* rows d) 56)
+          {:keys [grads]}
+          (gp/grad-parity #'resblk-parity-loss
+                          [{:name 'x :type '(Array float) :val x}
+                           {:name 'wn :type '(Array float) :val wn}
+                           {:name 'W1 :type '(Array float) :val W1}
+                           {:name 'pn :type '(Array float) :val pn}
+                           {:name 'W2 :type '(Array float) :val W2}
+                           {:name 'tgt :type '(Array float) :val tgt}
+                           {:name 'rows :type 'Long :val rows}
+                           {:name 'd :type 'Long :val d}
+                           {:name 'eps :type 'Double :val eps}
+                           {:name 'go :type 'Double :val go}]
+                          ;; grad(x) is the B2 target: x FANS OUT (residual-add ∘
+                          ;; rms-norm) AND x1 = residual-add(x,m) fans out again — the
+                          ;; whole reroute-over-aliases + symbolic-op-tag chain. It
+                          ;; extracts resident and matches the CPU reference at ~5e-4.
+                          :grad-args '[x]
+                          :rtol 3.0e-2)]
+      (println "  [resblk] grad(x) steps:" (:step-kinds (get grads 'x))
+               "rel-err" (:rel-err (get grads 'x)))
+      (is (:resident? (get grads 'x))
+          "residual fan-out grad(x) must extract FULLY RESIDENT"))))
+
 (deftest rope-value+grad-resident-parity
   (if-not @gp/gpu-available?
     (println "  [SKIP] rope resident parity: no Level Zero GPU")

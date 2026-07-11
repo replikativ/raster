@@ -836,6 +836,11 @@
 ;; grad-acc (reverse-AD nil-safe +) returns the type of its (first typed) arg.
 (register-result-type! 'raster.ad.reverse/grad-acc :first-typed-arg)
 
+;; NOTE: ops defined in higher layers (raster.dl.*, raster.ad.*) register their own
+;; :result-type facet from THEIR namespace (e.g. residual-add in raster.dl.nn), so
+;; compiler core does not depend on those namespaces. Only compiler-owned ops belong
+;; here. `grad-acc` above is a borderline case kept for now (reverse-AD primitive).
+
 ;; par/reduce returns its accumulator type — arg 1, the init value (matches
 ;; form-info's :return-type-arg for :par forms; registered for the defensive
 ;; bare alias spelling too, which form-info's raster.par-namespace matcher

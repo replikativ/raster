@@ -2093,6 +2093,18 @@
                             :grads-fn (fn [ctx [_a _b _n] _result-sym adjoint-sym _gensym-fn]
                                         [ctx [adjoint-sym adjoint-sym nil]])})
 
+;; residual-add / residual-add-backward are kept SYMBOLIC in the walk (they lower via
+;; broadcast SOAC fusion to a :map kernel, not .invk), so the walker's .invk ret-tag
+;; arm never fires and their result sym would stay untagged. They return (Array T) —
+;; the SAME array tag as their first arg. The :result-type facet lets the walker stamp
+;; the result (via its bare-symbolic-call arm), which the reverse-AD fan-out reroute
+;; needs: a value x1 = (residual-add …) that FANS OUT folds its cotangent via the
+;; resident residual-add ONLY when x1's sym-tag is :array. Without the tag the residual
+;; fan-out d_x1 falls back to the GPU-kernel-less nil-safe grad-acc → non-resident (B2).
+;; Registered HERE (not in compiler core) so core keeps no dependency on raster.dl.nn.
+(descriptor/register-result-type! 'raster.dl.nn/residual-add :same-as-first-arg)
+(descriptor/register-result-type! 'raster.dl.nn/residual-add-backward :same-as-first-arg)
+
 ;; hadamard rrule — elementwise product (gated MLPs). d_a = dy⊙b, d_b = dy⊙a.
 (tmpl/merge-into-template! 'raster.dl.nn/hadamard
                            {:params '[a b n] :result nil :adjoint 'dy

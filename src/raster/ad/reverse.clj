@@ -552,25 +552,44 @@
 
 (defn- provably-non-nil-contrib?
   "Conservative static test: can `contrib` NEVER evaluate to nil (the dynamic 0̄)?
-  True only for a symbol bound (in `binding-map`, the rev-ctx bindings gathered so
-  far) to a plain op-call whose head is not a nil-producing form — i.e. a real
-  backward-kernel/allocation output (`linear-dx`, `aget-grad`, `residual-add`,
-  `float-array`, …). A literal nil, a `(nth grads i)` pullback slot, a nil-safe
-  `grad-acc`, an `(if …)`, or a symbol we can't vouch for → false. When in doubt,
-  false: the caller then keeps the nil-safe `grad-acc` fold. This is what makes the
-  resident `residual-add` reroute SOUND — `residual-add` has no nil check, so it may
-  only see cotangents that are provably present."
+  True only when `contrib` resolves — possibly through a chain of pure symbol
+  ALIASES in `binding-map` (the rev-ctx bindings gathered so far) — to a plain
+  op-call whose head is not a nil-producing form, i.e. a real backward-kernel /
+  allocation output (`linear-dx`, `mse-grad`, `rms-norm-backward-dx`,
+  `residual-add`, `float-array`, …).
+
+  Alias-following is essential: a residual cotangent is a bare symbol alias.
+  `sum-contribs` returns a single contribution AS ITSELF (an alias), and
+  `residual-add`'s identity-grad passthrough forwards its output adjoint SYMBOL to
+  both input slots — so a fan-out contribution like `d_z` binds to `d_pred` which
+  binds to `(mse-grad …)`. TWO symbol hops precede the kernel. We chase them,
+  validating EVERY hop.
+
+  Returns false for: a literal nil, a `(nth grads i)` pullback slot, a nil-safe
+  `grad-acc`, an `(if …)`, a symbol bound to any of those (directly or through
+  aliases), or a free symbol not in `binding-map` (a param / the `dy__rad` seed —
+  we can't vouch for it). When in doubt, false: the caller then keeps the nil-safe
+  `grad-acc` fold.
+
+  SOUND because every binding is a pure SSA alias (`s1 = s2` ⇒ equal runtime
+  values) and the binding-map is acyclic (reverse-pass gensyms, each bound once,
+  referencing only earlier bindings). A chain is non-nil iff its terminal op-call
+  is non-nil, and EVERY hop is checked — a chain passing through a nil-possible
+  head (grad-acc / nth / if) or a nil binding is still rejected. This is what keeps
+  the resident `residual-add` reroute nil-safe: `residual-add` has no nil check, so
+  it may only see cotangents that are provably present."
   [binding-map contrib]
-  (letfn [(non-nil-expr? [e]
-            (and (some? e) (seq? e) (symbol? (first e))
-                 (not (contains? nil-possible-heads (first e)))))]
-    (cond
-      (nil? contrib)    false
-      (symbol? contrib) (if-let [b (find binding-map contrib)]
-                          (non-nil-expr? (val b))
-                          false)
-      (seq? contrib)    (non-nil-expr? contrib)
-      :else             false)))
+  (letfn [(go [c seen]
+              (cond
+                (nil? c)     false
+                (symbol? c)  (cond
+                               (contains? seen c)        false   ;; cycle guard (SSA ⇒ unreachable)
+                               (contains? binding-map c) (recur (get binding-map c) (conj seen c))
+                               :else                     false)  ;; free var / dy__rad seed
+                (seq? c)     (and (symbol? (first c))
+                                  (not (contains? nil-possible-heads (first c))))
+                :else        false))]
+    (go contrib #{})))
 
 (defn- sum-contribs-into
   "Bind `target-sym` to the sum of `contribs` (default when empty) inside
