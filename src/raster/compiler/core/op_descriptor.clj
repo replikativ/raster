@@ -841,11 +841,14 @@
 ;; compiler core does not depend on those namespaces. Only compiler-owned ops belong
 ;; here. `grad-acc` above is a borderline case kept for now (reverse-AD primitive).
 
-;; par/reduce returns its accumulator type — arg 1, the init value (matches
-;; form-info's :return-type-arg for :par forms; registered for the defensive
-;; bare alias spelling too, which form-info's raster.par-namespace matcher
-;; doesn't classify).
-(register-result-type! 'raster.par/reduce [:arg 1])
+;; par/reduce returns its accumulator type — arg 1, the init value. The CANONICAL
+;; spelling `raster.par/reduce` is typed independently by form-info's
+;; :return-type-arg (:par forms → arg 1; ir/form.clj) — the walker types it via its
+;; dedicated `:par-reduce` handler and late inference falls through to the form-info
+;; arm — so no op-descriptor entry is needed for it. Only the DEFENSIVE bare alias
+;; `par/reduce` needs one: form-info's raster.par-namespace matcher (namespace
+;; "raster.par…") does not classify the bare "par" namespace, so it has no
+;; :return-type-arg of its own.
 (register-result-type! 'par/reduce [:arg 1])
 
 ;; --- Devirtualization detection ---
