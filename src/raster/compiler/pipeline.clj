@@ -379,6 +379,17 @@
       norm
       (let [g (gensym "_ret_")] (list 'let* [g norm] g)))))
 
+(def fixpoint-census
+  "Tag-completeness census at the fixpoint edge (Phase 0 of
+  .internal/ad_typed_emission_plan.md). Reset at every pass-fixpoint entry;
+  one entry per iteration plus a :final entry on the finalized form, each
+  {:label :untagged-bindings :untagged-by-head :undevirtualized
+   :undevirtualized-ops}. Tests read this to assert emission-time tagging
+  progress. One compile at a time assumed (plain atom, no per-compile key)."
+  (atom []))
+
+(declare record-fixpoint-census!)
+
 (defn- pass-fixpoint
   "Fixpoint pass: expand → normalize → rewalk → PE+CSE until stable.
 
@@ -421,11 +432,14 @@
                        (if (= resolved tagged)
                          current
                          (inline/expand-for-backends resolved 3 (:param-env opts))))))]
+    (reset! fixpoint-census [])
     (loop [current form
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        {:form (ensure-let*-result (finalize current)) :stats total-stats}
+        (let [final (ensure-let*-result (finalize current))]
+          (record-fixpoint-census! :final final)
+          {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
                          (inline/expand-for-backends current 3 (:param-env opts)))
@@ -445,10 +459,14 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            {:form (ensure-let*-result (finalize current))
-             :stats (assoc total-stats :fixpoint-iterations iter)}
-            (recur rewalked (inc iter)
-                   (assoc total-stats :fixpoint-iterations (inc iter)))))))))
+            (let [final (ensure-let*-result (finalize current))]
+              (record-fixpoint-census! :final final)
+              {:form final
+               :stats (assoc total-stats :fixpoint-iterations iter)})
+            (do
+              (record-fixpoint-census! iter rewalked)
+              (recur rewalked (inc iter)
+                     (assoc total-stats :fixpoint-iterations (inc iter))))))))))
 
 (defn- pass-mode-select
   "Analyze Jacobian structure and annotate form with recommended AD mode.
@@ -510,6 +528,68 @@
             (mapcat collect-undevirtualized form))
     (vector? form) (mapcat collect-undevirtualized form)
     :else nil))
+
+(def ^:dynamic *log-tag-census*
+  "When true (or env RASTER_TAG_CENSUS is set), pass-fixpoint prints the
+  :final tag-census line to *err* when it is nonzero. The fixpoint-census
+  atom is populated regardless."
+  false)
+
+(defn- untagged-binding-pairs
+  "Collect [sym init] for every let* binding whose sym lacks
+  :raster.type/tag. fn* pullback bindings are excluded (closures are never
+  tagged); loop*/dotimes binders are excluded (integer counters/carries are
+  outside the let*-binding typedness contract)."
+  [form]
+  (cond
+    (seq? form)
+    (if (and (= 'let* (first form)) (vector? (second form)))
+      (let [pairs (partition 2 (second form))]
+        (concat (keep (fn [[s e]]
+                        (when (and (symbol? s)
+                                   (nil? (:raster.type/tag (meta s)))
+                                   (not (and (seq? e) (= 'fn* (first e)))))
+                          [s e]))
+                      pairs)
+                (mapcat (fn [[_ e]] (untagged-binding-pairs e)) pairs)
+                (mapcat untagged-binding-pairs (drop 2 form))))
+      (mapcat untagged-binding-pairs form))
+    (vector? form) (mapcat untagged-binding-pairs form)
+    :else nil))
+
+(defn- census-rhs-head
+  "Classification key that makes an untagged binding actionable: the impl
+  symbol for .invk calls (its mangled name shows the chosen dtype), the head
+  symbol for other calls, :vector/:atom otherwise."
+  [e]
+  (cond
+    (and (seq? e) (= '.invk (first e))) (second e)
+    (seq? e) (first e)
+    (vector? e) :vector
+    :else :atom))
+
+(defn- record-fixpoint-census!
+  "Append one tag-completeness entry to fixpoint-census (Phase 0 of
+  .internal/ad_typed_emission_plan.md)."
+  [label form]
+  (let [untagged (untagged-binding-pairs form)
+        undevirt (collect-undevirtualized form)
+        entry {:label label
+               :untagged-bindings (count untagged)
+               :untagged-by-head (frequencies (map (comp census-rhs-head second) untagged))
+               :undevirtualized (count undevirt)
+               :undevirtualized-ops (frequencies (map first undevirt))}]
+    (swap! fixpoint-census conj entry)
+    (when (and (= label :final)
+               (or *log-tag-census* (System/getenv "RASTER_TAG_CENSUS"))
+               (or (pos? (:untagged-bindings entry))
+                   (pos? (:undevirtualized entry))))
+      (binding [*out* *err*]
+        (println (str "TAG-CENSUS fixpoint-final: " (:untagged-bindings entry)
+                      " untagged binding(s) " (pr-str (:untagged-by-head entry))
+                      "; " (:undevirtualized entry) " undevirtualized call(s) "
+                      (pr-str (:undevirtualized-ops entry))))))
+    entry))
 
 (defn- pass-late-cleanup
   "Late CSE + DCE + dispatch resolution after buffer fusion and backward inlining.

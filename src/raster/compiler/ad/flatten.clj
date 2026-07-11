@@ -25,6 +25,7 @@
   3. Names the gradient outputs (one per active param)
   4. Appends SGD weight update calls: (nc/axpy! (- lr) d_Wi Wi)"
   (:require [raster.ad.tangent :as tangent]
+            [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.form :as form]))
 
 (def ^:dynamic *flatten-dtype*
@@ -64,24 +65,34 @@
     - [primal pullback]
 
   Returns a canonical let* form or nil when the input is not recognized
-  as AD output."
+  as AD output. Every caller passes what it believes is transform-body
+  output and treats nil as \"leave the call unexpanded\" — a silent
+  degradation — so a nil result warns with the ADTransformed dialect
+  validator's diagnosis."
   [form]
-  (cond
-    (let-form? form)
-    (when-let [{:keys [bindings body]} (decompose-flat-let* form)]
-      (when (and (vector? body)
-                 (= 2 (count body))
-                 (seq? (second body))
-                 (= 'fn* (first (second body))))
-        (with-meta (make-flat-let* bindings body) (meta form))))
+  (let [canonical
+        (cond
+          (let-form? form)
+          (when-let [{:keys [bindings body]} (decompose-flat-let* form)]
+            (when (and (vector? body)
+                       (= 2 (count body))
+                       (seq? (second body))
+                       (= 'fn* (first (second body))))
+              (with-meta (make-flat-let* bindings body) (meta form))))
 
-    (and (vector? form)
-         (= 2 (count form))
-         (seq? (second form))
-         (= 'fn* (first (second form))))
-    (with-meta (make-flat-let* [] form) (meta form))
+          (and (vector? form)
+               (= 2 (count form))
+               (seq? (second form))
+               (= 'fn* (first (second form))))
+          (with-meta (make-flat-let* [] form) (meta form))
 
-    :else nil))
+          :else nil)]
+    (when (and (nil? canonical) (some? form))
+      (binding [*out* *err*]
+        (println (str "WARNING: AD output failed canonicalization — the value+grad "
+                      "call stays unexpanded (silent fallback). Dialect check: "
+                      (pr-str (dialects/validate-ad-transformed form))))))
+    canonical))
 
 (defn- decompose-flat-let*
   "Decompose a let/let* form and normalize it to the canonical flat-let view.
