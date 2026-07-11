@@ -540,6 +540,94 @@
   [rev-ctx kvs]
   (update rev-ctx :bindings into kvs))
 
+(def ^:private nil-possible-heads
+  "Adjoint-IR operator heads whose result MAY be the dynamic 0̄ (nil): the
+  nil-safe `grad-acc` fold (nil iff both inputs nil), a pullback-vector slot
+  `nth` (nil for an inactive/zero component), and `if` (an untaken branch may be
+  a nil zero). Anything else in adjoint position is an allocated array/number
+  kernel output, hence non-nil."
+  '#{raster.ad.reverse/grad-acc grad-acc
+     clojure.core/nth nth
+     if if*})
+
+(defn- provably-non-nil-contrib?
+  "Conservative static test: can `contrib` NEVER evaluate to nil (the dynamic 0̄)?
+  True only for a symbol bound (in `binding-map`, the rev-ctx bindings gathered so
+  far) to a plain op-call whose head is not a nil-producing form — i.e. a real
+  backward-kernel/allocation output (`linear-dx`, `aget-grad`, `residual-add`,
+  `float-array`, …). A literal nil, a `(nth grads i)` pullback slot, a nil-safe
+  `grad-acc`, an `(if …)`, or a symbol we can't vouch for → false. When in doubt,
+  false: the caller then keeps the nil-safe `grad-acc` fold. This is what makes the
+  resident `residual-add` reroute SOUND — `residual-add` has no nil check, so it may
+  only see cotangents that are provably present."
+  [binding-map contrib]
+  (letfn [(non-nil-expr? [e]
+            (and (some? e) (seq? e) (symbol? (first e))
+                 (not (contains? nil-possible-heads (first e)))))]
+    (cond
+      (nil? contrib)    false
+      (symbol? contrib) (if-let [b (find binding-map contrib)]
+                          (non-nil-expr? (val b))
+                          false)
+      (seq? contrib)    (non-nil-expr? contrib)
+      :else             false)))
+
+(defn- sum-contribs-into
+  "Bind `target-sym` to the sum of `contribs` (default when empty) inside
+  `rev-ctx`, choosing a GPU-RESIDENT lowering for the multi-contribution ARRAY
+  fan-out case.
+
+  For a SCALAR (or empty / single-contribution) target this is exactly the old
+  `(bindings-into rev-ctx [target-sym (sum-contribs contribs default)])`: the
+  scalar fold stays `grad-acc` (its nil-safety is load-bearing on the interpreted
+  CPU path, and a scalar grad-acc lowers as a host scalar-let anyway).
+
+  For an ARRAY target with ≥2 contributions that are ALL PROVABLY NON-NIL — a
+  value/param that FANS OUT to several ACTIVE downstream consumers (e.g. `xn`
+  feeding q/k/v, whose cotangents are `linear-dx` kernel outputs) — `grad-acc`'s
+  nil-safe `defn` has no GPU kernel, so the array accumulation hits
+  `:unlowered-array-op` and defeats residency. Here we instead SEED the
+  accumulator with the first contribution directly (numerically identical to
+  `(reduce grad-acc contribs)`, which also starts from the first element) and fold
+  the rest with the already RESIDENT element-wise `raster.dl.nn/residual-add` (a
+  `broadcast +` → `:map` kernel). Each intermediate accumulator is stamped with
+  the target's array `tag` so it devirtualizes to the cotangent element dtype
+  (float here, not a silently-widened double). The per-add element count is
+  `(alength <seed>)`, which `resolve-alength` traces to the seed buffer's
+  allocation size host-side.
+
+  CRITICAL soundness gate: `residual-add` has NO nil check, but a cotangent
+  contribution can be nil at RUNTIME (a statically-nil template gradient, a
+  pullback slot for an inactive arg, an untaken `if` branch). grad-acc's
+  `(nil? b) → a` silently drops those; residual-add would NPE. So the reroute
+  fires ONLY when every contribution is `provably-non-nil-contrib?`; otherwise we
+  keep the nil-safe grad-acc fold (correct on CPU, and grad-acc still lowers as a
+  host scalar-let for scalars / is DCE'd when dead). This is exactly the
+  attention-block fan-out (all q/k/v cotangents are active kernel outputs) while a
+  dot-product / train-step d_W accumulation — which includes a nil template
+  gradient — falls back to grad-acc unchanged."
+  [rev-ctx target-sym contribs default tag]
+  (let [binding-map (into {} (map vec (partition 2 (:bindings rev-ctx))))]
+    (if (and (>= (count contribs) 2)
+             (= :array (:kind (tangent/tangent-kind tag)))
+             (every? #(provably-non-nil-contrib? binding-map %) contribs))
+      (let [[seed & more] contribs
+            n-sym   (ad-gensym "gacc_n")
+            rev-ctx (bindings-into rev-ctx [n-sym (list 'raster.arrays/alength seed)])
+            ;; Fold the remaining contributions with the resident add; the LAST add
+            ;; binds `target-sym` directly (no trailing alias for the extractor to
+            ;; copy-propagate). Intermediates carry `tag` → float-typed buffers.
+            n     (count more)
+            kvs   (loop [acc seed, cs more, i 0, out []]
+                    (if (empty? cs)
+                      out
+                      (let [dst (if (= i (dec n)) target-sym (ad-gensym "gacc" tag))]
+                        (recur dst (rest cs) (inc i)
+                               (into out [dst (list 'raster.dl.nn/residual-add
+                                                    acc (first cs) n-sym)])))))]
+        (bindings-into rev-ctx kvs))
+      (bindings-into rev-ctx [target-sym (sum-contribs contribs default)]))))
+
 (defmulti ^:private emit-backward
   "Reverse-pass per-record emission (PURE): returns the updated
   {:adj-env :rev-ctx}. `adj-sym` is this record's gensym'd adjoint (nil for the
@@ -705,10 +793,14 @@
    (fn [{:keys [adj-env rev-ctx]} {:keys [type sym] :as record}]
      (let [array-type? (contains? #{:dotimes :par-map :par-reduce :par-scan} type)
            adj-contribs (when-not array-type? (get adj-env sym))
+           sym-tag (:raster.type/tag (meta sym))
            adj-sym (when-not array-type?
-                     (ad-gensym (str "d_" (name sym)) (:raster.type/tag (meta sym))))
+                     (ad-gensym (str "d_" (name sym)) sym-tag))
            rev-ctx (if adj-sym
-                     (bindings-into rev-ctx [adj-sym (sum-contribs adj-contribs nil)])
+                     ;; Fan-out array cotangent (e.g. d_xn from q/k/v) folds via
+                     ;; the resident residual-add; scalars keep the nil-safe
+                     ;; grad-acc fold. See sum-contribs-into.
+                     (sum-contribs-into rev-ctx adj-sym adj-contribs nil sym-tag)
                      rev-ctx)]
        (if (or array-type? adj-contribs)
          (emit-backward record adj-sym activity {:adj-env adj-env :rev-ctx rev-ctx})
@@ -744,14 +836,21 @@
      (fn [{:keys [rev-ctx param-adj-syms]} p]
        (let [tag (:raster.type/tag (meta p))
              {:keys [kind dtype]} (tangent/tangent-kind tag)
-             raw (sum-contribs (get adj-env p) (param-zero-expr p))
-             expr (if (and (= kind :scalar)
-                           (or (= dtype :float)
-                               (and (= dtype :double) mixed-float?)))
-                    (tangent/project-expr tag raw)
-                    raw)
-             adj-sym (ad-gensym (str "d_" (name p)) tag)]
-         {:rev-ctx (bindings-into rev-ctx [adj-sym expr])
+             contribs (get adj-env p)
+             adj-sym (ad-gensym (str "d_" (name p)) tag)
+             ;; ARRAY param fan-out (a weight consumed by ≥2 ops) accumulates via
+             ;; the resident residual-add (no scalar projection applies to arrays).
+             rev-ctx
+             (if (and (= kind :array) (>= (count contribs) 2))
+               (sum-contribs-into rev-ctx adj-sym contribs (param-zero-expr p) tag)
+               (let [raw (sum-contribs contribs (param-zero-expr p))
+                     expr (if (and (= kind :scalar)
+                                   (or (= dtype :float)
+                                       (and (= dtype :double) mixed-float?)))
+                            (tangent/project-expr tag raw)
+                            raw)]
+                 (bindings-into rev-ctx [adj-sym expr])))]
+         {:rev-ctx rev-ctx
           :param-adj-syms (conj param-adj-syms adj-sym)}))
      {:rev-ctx rev-ctx :param-adj-syms []}
      active-params)))
