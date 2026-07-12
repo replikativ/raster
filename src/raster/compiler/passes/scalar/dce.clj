@@ -194,13 +194,33 @@
    DCE — exactly the reason function parameters are seeded live. (When `src` is
    bound locally, the alias doesn't escape and normal in-let liveness applies.)
    Used to keep a `leaf = (aget params-container k)` + its in-place optimizer
-   update from being silently eliminated."
+   update from being silently eliminated.
+
+   `.invk` — raster's DEVIRTUALIZED DISPATCH head — is NOT interop and must be
+   looked THROUGH, not matched on its leading dot. It is the head of essentially
+   every typed call in the IR, and `(second init)` is then the impl SYMBOL (never
+   a let-bound sym), so the old `(.startsWith (name head) \".\")` arm classified
+   EVERY `.invk` binding as an escaping alias and seeded it live. That silently
+   defeated DCE for any in-place-written buffer allocated through a devirtualized
+   call — notably the frozen-weight `dW = (.invk zeros-like-impl …)` of a LoRA /
+   partially-consumed value+grad, whose dead `dgemm-tn!` then survived because its
+   output looked live. Unwrap the `.invk` and classify the REAL op instead: an
+   `aget` through it (the devirtualized `leaf = (aget params-container k)`) is
+   still an escaping alias; an allocation is not."
   [init bound-syms]
-  (and (seq? init) (symbol? (first init)) (>= (count init) 2)
-       (symbol? (second init))
-       (not (contains? bound-syms (second init)))
-       (or (.startsWith (name (first init)) ".")                  ; .field / .-field / (. obj field) — value-class field access (any interop form)
-           (descriptor/aget-op? (first init)))))
+  (when (and (seq? init) (symbol? (first init)) (>= (count init) 2))
+    (let [head  (first init)
+          invk? (= '.invk head)
+          op    (if invk? (second init) head)
+          src   (if invk? (nth init 2 nil) (second init))]
+      (boolean
+       (and (symbol? op) (symbol? src)
+            (not (contains? bound-syms src))
+            (or ;; .field / .-field / (. obj field) — value-class field access
+             (and (not invk?) (.startsWith (name head) "."))
+             (descriptor/aget-op? op)
+             (when-let [base (descriptor/extract-base-op op)]
+               (descriptor/aget-op? base))))))))
 
 (defn eliminate-dead-bindings
   "Remove dead bindings from a flat let* form.
