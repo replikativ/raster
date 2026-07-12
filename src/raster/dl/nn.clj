@@ -2103,6 +2103,12 @@
 ;; resident residual-add ONLY when x1's sym-tag is :array. Without the tag the residual
 ;; fan-out d_x1 falls back to the GPU-kernel-less nil-safe grad-acc → non-resident (B2).
 ;; Registered HERE (not in compiler core) so core keeps no dependency on raster.dl.nn.
+;; LOAD-BEARING (plan D2 assert-then-delete audit, 2026-07-11): with this pair removed,
+;; backward-kernel-resident-test/resblk-value+grad-resident-parity FAILS on a cold JVM —
+;; x1 = (residual-add x m n) stays untagged, the grad-acc→residual-add reroute can't
+;; fire, and the surviving untagged `d_x1 = (grad-acc d_pred d_x)` trips the
+;; fixpoint-edge typedness throw. (The oftype and grad-acc facets from the same audit
+;; were provably dead and deleted — see op_descriptor.clj.) KEEP.
 (descriptor/register-result-type! 'raster.dl.nn/residual-add :same-as-first-arg)
 (descriptor/register-result-type! 'raster.dl.nn/residual-add-backward :same-as-first-arg)
 
