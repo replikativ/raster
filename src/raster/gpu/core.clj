@@ -795,6 +795,27 @@
 ;; (returns a {:kernel :gc-seg …} bound map over GPU-RESIDENT buffers) collected into
 ;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
 
+;; ── split-k schedule knobs (see the `splitk` fn in bind-program!) ──────────────
+;; The XMX GEMM launches ceil(n/128) x ceil(m/128) workgroups of 256 items (= 16
+;; hw threads). This iGPU (64 EU x 8 threads) holds 32 such workgroups, so any GEMM
+;; below that count is OCCUPANCY-bound, not memory- or compute-bound. Splitting k
+;; buys workgroups at constant DRAM traffic; the knobs bound how far.
+
+(def ^:dynamic *gemm-splitk-fill-wgs*
+  "Workgroups that saturate the device (64 EU x 8 hw threads / 16 threads per 256-item
+   workgroup). A GEMM at or above this is NOT split." 32)
+
+(def ^:dynamic *gemm-splitk-target-wgs*
+  "Workgroup count a split GEMM aims for — a few waves over the fill count, so memory
+   latency has something to hide behind." 128)
+
+(def ^:dynamic *gemm-splitk-min-chunk*
+  "Smallest k-chunk worth giving a workgroup: below this the per-chunk fixed cost (A
+   prefetch, storing a full partial C tile) outweighs the reduction." 1024)
+
+(def ^:dynamic *gemm-splitk-max-splits*
+  "Hard cap on k-chunks — the partials buffer is splits·m·n f32." 64)
+
 (defn bind-program!
   "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session:
    allocate resident buffers for the array params + intermediate scratch, bind each kernel
@@ -936,6 +957,29 @@
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
+         ;; SPLIT-K: the XMX GEMM's workgroup grid is ceil(n/128) x ceil(m/128) —
+         ;; a GEMM whose OUTPUT is small but whose K is huge (the tied-embedding
+         ;; backward: m=13, n=640, k=262144 → 5 workgroups) leaves the machine
+         ;; empty and no inner-loop tuning can help. Split the k-reduction over a
+         ;; third grid dimension, then combine the partials. See
+         ;; ze-runtime/bind-registered-gemm-splitk!.
+         splitk (fn [m n k]
+                  (let [base (* (Math/ceil (/ (double n) 128.0))
+                                (Math/ceil (/ (double m) 128.0)))]
+                    (if (>= base *gemm-splitk-fill-wgs*)
+                      [1 k]                       ;; already fills the machine
+                      (let [want (long (Math/ceil (/ (double *gemm-splitk-target-wgs*) base)))
+                            ;; each chunk must be a multiple of 32 (the K-unroll) and at
+                            ;; least *gemm-splitk-min-chunk* long, or the per-chunk fixed
+                            ;; cost (A prefetch + the store of a full partial C tile)
+                            ;; swamps the reduction it does.
+                            cap (quot (long k) (long *gemm-splitk-min-chunk*))
+                            s (min want cap (long *gemm-splitk-max-splits*))]
+                        (if (< s 2)
+                          [1 k]
+                          (let [kc (* 32 (quot (+ (quot (long k) s) 31) 32))
+                                s (quot (+ (long k) kc -1) kc)]
+                            [s kc]))))))
          alloc-size-of (fn [sym-kw]
                          (some (fn [{:keys [sym size-fn]}]
                                  (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
@@ -985,6 +1029,23 @@
                        :kernel-name (str "gemm_scalar_" (name (:variant step)))
                        :phase (:phase step)}])
                    (let [a16 (mkbuf-fn (* m k) :half)
+                     ;; The GEMM proper: one bound kernel, or — when the (m,n) tiling can't
+                     ;; fill the machine — a split-k PAIR (partial GEMM over a 3D grid +
+                     ;; a partials combine), which is a pure SCHEDULE change: same operands,
+                     ;; same DRAM traffic, same result up to f32 summation order.
+                         mk-gemm
+                         (fn [abuf* bbuf*]
+                           (let [[splits kc] (splitk m n k)]
+                             (if (= 1 (long splits))
+                               [["gemm_nonsquare_float" (gemm-fn abuf* bbuf* cbuf m n k :float) false]]
+                               (let [sk-fn (rt-resolve device-id "bind-registered-gemm-splitk!")
+                                     red-fn (rt-resolve device-id "bind-registered-splitk-reduce!")
+                                     parts (mkbuf-fn (* (long splits) m n) :float)]
+                                 (swap! gemm-scratch conj parts)
+                                 [["gemm_nonsquare_splitk"
+                                   (sk-fn abuf* bbuf* parts m n k kc splits) false]
+                                  ["gemm_splitk_reduce"
+                                   (red-fn parts cbuf (* m n) splits) false]]))))
                      ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
                      ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
                      ;; Each entry is [kernel-name bnd const?]: kernel-name so profiling can
@@ -996,28 +1057,28 @@
                            :nn
                            (let [b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]
-                              ["gemm_nonsquare_float" (gemm-fn a16 b16 cbuf m n k :float) false]])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]]
+                                   (mk-gemm a16 b16)))
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
                            :nt
                            (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16 bt16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* n k)) b-const?]
-                              ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]
-                              ["gemm_nonsquare_float" (gemm-fn a16 bt16 cbuf m n k :float) false]])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* n k)) b-const?]
+                                    ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]]
+                                   (mk-gemm a16 bt16)))
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
                        ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
                        ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
                            :tn
                            (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 at16 b16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* k m)) a-const?]
-                              ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]
-                              ["gemm_nonsquare_float" (gemm-fn at16 b16 cbuf m n k :float) false]])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* k m)) a-const?]
+                                    ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]]
+                                   (mk-gemm at16 b16)))
                            (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
                                                 " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
                      (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)

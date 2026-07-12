@@ -1886,6 +1886,88 @@
      (.set gc I32 8 (int 1))
      bnd)))
 
+;; ── SPLIT-K GEMM (the low-occupancy-shape schedule) ────────────────────────────
+;; A GEMM whose (M,N) tiling yields fewer workgroups than fill the machine —
+;; ceil(N/128)·ceil(M/128) — cannot be rescued by a better inner loop: the machine
+;; is idle. Splitting the K reduction across a third grid dimension multiplies the
+;; workgroup count at CONSTANT DRAM traffic (each (n-tile, k-chunk) block of B is
+;; still read exactly once), then a second kernel sums the per-chunk partials.
+;; Measured lever: the tied-embedding backward dx[13,640] = dlogits[13,262144] ·
+;; E[262144,640] launches 5 workgroups of the ~32 that fill this iGPU.
+
+(def ^:private gemm-splitk-cache (atom nil))
+(def ^:private splitk-reduce-cache (atom nil))
+
+(defn- ensure-gemm-splitk-kernel!
+  "Lazily compile + cache the split-k XMX gemm (f16 A/B in, f32 PARTIALS out).
+   Returns {:module :kernel :kernel-name}."
+  []
+  (ensure-init!)
+  (when (nil? @gemm-splitk-cache)
+    (let [kname "gemm_nonsquare_splitk"
+          cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                      kname :c-dtype :float :split-k? true))
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   cl-src :device (:device-id-hex @state)))
+          module (load-module! spv)
+          kernel (create-kernel module kname)]
+      (clojure.core/reset! gemm-splitk-cache
+                           {:module module :kernel kernel :kernel-name kname})))
+  @gemm-splitk-cache)
+
+(defn- ensure-splitk-reduce-kernel!
+  "Lazily compile + cache the split-k partials-combine kernel."
+  []
+  (ensure-init!)
+  (when (nil? @splitk-reduce-cache)
+    (let [kname "gemm_splitk_reduce"
+          src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                  ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-splitk-reduce-kernel)
+                   kname))
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   src :device (:device-id-hex @state)))
+          module (load-module! spv)
+          kernel (create-kernel module kname)]
+      (clojure.core/reset! splitk-reduce-cache
+                           {:module module :kernel kernel :kernel-name kname})))
+  @splitk-reduce-cache)
+
+(defn bind-registered-gemm-splitk!
+  "Bind the SPLIT-K XMX GEMM: A[m×k]·B[k×n] → `partials` [splits, m, n] f32.
+  Grid is 3D — X = ceil(n/128), Y = ceil(m/128), Z = splits — so the launched
+  workgroup count is `splits` times the plain GEMM's. `kc` is the k-chunk each
+  z-slice reduces (must be a multiple of 32 so no interior chunk hits the k-remainder
+  path; the LAST chunk clamps to k). Pair with bind-registered-splitk-reduce!."
+  [a b partials m n k kc splits]
+  (let [{:keys [module kernel-name]} (ensure-gemm-splitk-kernel!)
+        kh (create-kernel-fresh module kernel-name)
+        m (long m) n (long n) k (long k) kc (long kc) splits (long splits)
+        args [(:segment a) (:segment b) (:segment partials)
+              {:type :int :value (int m)} {:type :int :value (int n)}
+              {:type :int :value (int k)} {:type :int :value (int kc)}]
+        bnd (bind-kernel-2d! kh [256 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 8 (int splits))                             ;; Z = k-chunks
+    bnd))
+
+(defn bind-registered-splitk-reduce!
+  "Bind the split-k combine: C[i] = Σ_s partials[s·mn + i], one work-item per output
+  element of C (mn = m·n)."
+  [partials c mn splits]
+  (let [{:keys [module kernel-name]} (ensure-splitk-reduce-kernel!)
+        kh (create-kernel-fresh module kernel-name)
+        mn (long mn) splits (long splits)
+        args [(:segment partials) (:segment c)
+              {:type :int :value (int mn)} {:type :int :value (int splits)}]
+        bnd (bind-kernel! kh 256 args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double mn) 256.0))))
+    bnd))
+
 (def ^:private gemm-scalar-cache
   "Cache for compiled scalar (non-XMX) GEMM kernels, keyed by variant (:nn|:nt|:tn).
    Each entry is {:module :kernel :kernel-name}. f32 in/out — the small-N fallback."
