@@ -357,10 +357,13 @@
 
 (tmpl/merge-into-template! 'raster.nn/softmax-cross-entropy
                            {:params '[logits t] :result 'r :adjoint 'dy
-                            :grads-fn (fn [ctx [_logits t] result-sym adjoint-sym gensym-fn]
-               ;; result is [loss s], need to extract s
-                                        (let [s-sym (gensym-fn "sce_s")
-                                              d-logits (gensym-fn "d_logits")]
+                            :grads-fn (fn [ctx [logits t] result-sym adjoint-sym gensym-fn]
+               ;; result is [loss s], need to extract s — a PRIMAL intermediate
+               ;; (the softmax output), so it carries the primal logits tag
+               ;; directly (arg-tag, not Π of it; identical for differentiable
+               ;; tags but semantically the primal space).
+                                        (let [s-sym (gensym-fn "sce_s" (tmpl/arg-tag logits))
+                                              d-logits (gensym-fn "d_logits" (tmpl/grad-tag logits))]
                                           [(update ctx :bindings into
                                                    [s-sym (list 'clojure.core/nth result-sym 1)
                                                     d-logits (list 'raster.nn/softmax-cross-entropy-backward

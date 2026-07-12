@@ -74,7 +74,7 @@
 (tmpl/merge-into-template! 'raster.ad.fixed-point/fixed-point-solve
                            {:params '[g z0 theta tol maxiter] :result 'z-star :adjoint 'v
                             :grads-fn (fn [ctx [g z0 theta tol maxiter] result-sym adjoint-sym gensym-fn]
-                                        (let [d-theta (gensym-fn "d_theta")]
+                                        (let [d-theta (gensym-fn "d_theta" (tmpl/grad-tag theta))]
                                           [(update ctx :bindings into
                                                    [d-theta (list 'raster.ad.fixed-point/fixed-point-backward
                                                                   g result-sym theta adjoint-sym)])
