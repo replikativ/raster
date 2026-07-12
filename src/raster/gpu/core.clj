@@ -278,6 +278,8 @@
           ;; be destroyed here or every session leaks them (the SIGABRT class of driver leak).
           (doseq [[_ prog] programs]
             (when destroy-graph! (try (destroy-graph! (:graph prog)) (catch Exception _)))
+            (when (and destroy-graph! (:prologue-graph prog))
+              (try (destroy-graph! (:prologue-graph prog)) (catch Exception _)))
             (when destroy-prepared!
               (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
             ;; f16 GEMM-conversion scratch is allocated outside :buffers — free it here.
@@ -852,7 +854,11 @@
                    grads (~1e-6-level parity) — the exactness escape hatch.
    The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy. Loss
    scaling (for cotangents small enough to hit the f16 min-normal 6.1e-5) is a CALLER
-   concern — the VJP is linear in the seed, so scale the seed by S and use lr/S."
+   concern — the VJP is linear in the seed, so scale the seed by S and use lr/S.
+   Under :f16-xmx the f32→f16 conversion (and, for :nt/:tn, the transpose of that f16 copy)
+   of any operand whose role is :constant is recorded into a PROLOGUE graph replayed once
+   here at bind — frozen weights are converted once, not once per replay. This assumes the
+   :constant contract literally: a buffer bound :constant must not be mutated afterwards."
   ([sess descriptor args] (bind-program! sess descriptor args {} {}))
   ([sess descriptor args roles] (bind-program! sess descriptor args roles {}))
   ([sess descriptor args roles {:keys [key reuse-buffers rename profile?]
@@ -942,17 +948,27 @@
                     (or (get buffers (key-of sym))
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
                                         {:sym sym :key (key-of sym) :ctx ctx :have (keys buffers)}))))
+           ;; A GEMM operand that is a :constant param (frozen weights) never changes on device,
+           ;; so its f32→f16 conversion — and, for the transposed variants, the transpose of that
+           ;; f16 copy — is the SAME work every replay. Those kernels are recorded into a separate
+           ;; PROLOGUE graph replayed exactly once at bind (see const-prologue? below), not into
+           ;; the per-step graph. The f16 scratch buffers are allocated either way, so this costs
+           ;; no VRAM; it just stops re-converting the weights every step. Measured on the gemma
+           ;; layer VJP (5.6M frozen weight elements vs ~0.2M activation elements): f32_to_f16
+           ;; 7.2 → 0.6 ms, transpose_half 3.2 → 0.2 ms per replay.
+           const-operand? (fn [sym] (= :constant (get effective-roles sym)))
            step->bounds
            (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator output] :as step}]
              (case convention
                ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
-               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
-               ;; convert redundantly per replay for now (correctness-first) — hoist to a once-at-
-               ;; bind :constant f16 upload later.
+               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); the
+               ;; conversions of :constant operands are hoisted to the bind-time prologue graph.
                :gemm
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
-                     cbuf (buf-of (:C step) :gemm-C)]
+                     cbuf (buf-of (:C step) :gemm-C)
+                     a-const? (const-operand? (:A step))
+                     b-const? (const-operand? (:B step))]
                  (if (or (= :f32-scalar gemm-precision) (< n 8) (< k 8))
                    ;; Scalar f32 path, taken when (a) the :gemm-precision policy is
                    ;; :f32-scalar (exact-grad training — see the docstring), or (b) the
@@ -971,38 +987,42 @@
                    (let [a16 (mkbuf-fn (* m k) :half)
                      ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
                      ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
-                     ;; Each entry is [kernel-name bnd] so profiling can attribute device time.
+                     ;; Each entry is [kernel-name bnd const?]: kernel-name so profiling can
+                     ;; attribute device time, const? = "depends only on :constant operands" ⇒
+                     ;; recorded into the bind-time prologue graph instead of the replay graph.
                          raw
                          (case (:variant step)
                        ;; C = A[m,k] · B[k,n]
                            :nn
                            (let [b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* m k))]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* k n))]
-                              ["gemm_nonsquare_float" (gemm-fn a16 b16 cbuf m n k :float)]])
+                             [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]
+                              ["gemm_nonsquare_float" (gemm-fn a16 b16 cbuf m n k :float) false]])
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
                            :nt
                            (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16 bt16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* m k))]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* n k))]
-                              ["transpose_half" (trans-fn b16 bt16 n k :half)]
-                              ["gemm_nonsquare_float" (gemm-fn a16 bt16 cbuf m n k :float)]])
+                             [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* n k)) b-const?]
+                              ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]
+                              ["gemm_nonsquare_float" (gemm-fn a16 bt16 cbuf m n k :float) false]])
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
                        ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
                        ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
                            :tn
                            (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 at16 b16)
-                             [["f32_to_f16" (conv-fn abuf a16 (* k m))]
-                              ["transpose_half" (trans-fn a16 at16 k m :half)]
-                              ["f32_to_f16" (conv-fn bbuf b16 (* k n))]
-                              ["gemm_nonsquare_float" (gemm-fn at16 b16 cbuf m n k :float)]])
+                             [["f32_to_f16" (conv-fn abuf a16 (* k m)) a-const?]
+                              ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]
+                              ["gemm_nonsquare_float" (gemm-fn at16 b16 cbuf m n k :float) false]])
                            (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
                                                 " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
-                     (mapv (fn [[nm b]] {:bound b :kernel-name nm :phase (:phase step)}) raw))))
+                     (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)
+                                           :const-prologue? (boolean c)})
+                           raw))))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).
@@ -1063,15 +1083,26 @@
                                     ":map / :map-void / :reduce / :gemm / :scatter are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
+           ;; CONSTANT PROLOGUE: the f16 conversions/transposes of :constant GEMM operands run
+           ;; ONCE, in their own recorded graph replayed here at bind — the per-step graph holds
+           ;; only the kernels whose inputs can actually change between replays. Order within the
+           ;; prologue is preserved (a :nt/:tn transpose still follows its own convert).
+           prologue-bounds (filterv :const-prologue? bounds)
+           replay-bounds   (filterv (complement :const-prologue?) bounds)
+           prologue-graph (when (seq prologue-bounds) (record-fn prologue-bounds))
+           _ (when prologue-graph ((rt-resolve device-id "replay-graph!") prologue-graph))
            ;; The non-profiling call is EXACTLY the 1-arity fast path (no opts map) so a
            ;; recorded non-profiling graph is byte-for-byte what it was before profiling existed.
            graph (if profile?
-                   (record-fn bounds {:barriers? true :profile? true})
-                   (record-fn bounds))]
+                   (record-fn replay-bounds {:barriers? true :profile? true})
+                   (record-fn replay-bounds))]
        (swap! sess update :programs assoc pkey
               {:descriptor descriptor
                :roles effective-roles
                :graph graph
+               ;; kept for close-session! (its queue/list must be destroyed) and as the seam for a
+               ;; future refresh-constants! — replaying it re-derives the f16 copies of the weights.
+               :prologue-graph prologue-graph
                :bounds bounds
                :profile? (boolean profile?)
                ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
