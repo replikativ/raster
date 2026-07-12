@@ -279,7 +279,11 @@
           (doseq [[_ prog] programs]
             (when destroy-graph! (try (destroy-graph! (:graph prog)) (catch Exception _)))
             (when destroy-prepared!
-              (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))))
+              (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
+            ;; f16 GEMM-conversion scratch is allocated outside :buffers — free it here.
+            (when (seq (:scratch-buffers prog))
+              (let [free! (rt-resolve device-id "free-buffer!")]
+                (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
         (free-buffers-internal! buffers device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
@@ -1044,6 +1048,9 @@
                :roles effective-roles
                :graph graph
                :bounds bounds
+               ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
+               ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
+               :scratch-buffers @gemm-scratch
                :param->key param->key
                ;; resolved buffer key of the functional :result-sym (may be a scratch alloc,
                ;; hence resolved through THIS program's key-fn, not a raw name->keyword).
