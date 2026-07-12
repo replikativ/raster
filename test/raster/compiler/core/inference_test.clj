@@ -112,6 +112,26 @@
     (is (not (inf/generic-fn? 'no.such/fn)))))
 
 ;; ================================================================
+;; infer-arg-tag: constructor arm vs degenerate dot heads
+;; ================================================================
+
+(deftest infer-arg-tag-ctor-arm-dot-heads-test
+  (testing "host dot special forms never yield the empty-symbol tag"
+    ;; The ctor arm strips a trailing "." from the head; on the bare dot
+    ;; special form `.` that produced (symbol "") — tag poison the bytecode
+    ;; emitter once trusted as :verified (no checkcast → VerifyError).
+    (is (nil? (inf/infer-arg-tag '(. obj method x) {})))
+    (is (nil? (inf/infer-arg-tag '(. obj (method x)) {}))))
+  (testing "degenerate all-dot heads (`..`, `...`) yield nil, not \".\"/\"..\""
+    (is (nil? (inf/infer-arg-tag '(.. obj (foo) (bar)) {})))
+    (is (nil? (inf/infer-arg-tag (list (symbol "...") 'obj) {}))))
+  (testing "method-sugar heads (.foo obj) do not hit the ctor arm"
+    (is (nil? (inf/infer-arg-tag '(.foo obj) {}))))
+  (testing "real constructor sugar still yields the class symbol"
+    (is (= 'java.util.Random (inf/infer-arg-tag '(java.util.Random.) {})))
+    (is (= 'Foo (inf/infer-arg-tag '(Foo. 1 2) {})))))
+
+;; ================================================================
 ;; trace-inference
 ;; ================================================================
 

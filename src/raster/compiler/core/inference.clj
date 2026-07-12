@@ -1934,7 +1934,19 @@
                 (empty? arg-tags) nil
                 :else 'long))
             (= 'new head) (when-let [cls-sym (second expr)] (symbol (str cls-sym)))
-            (and (symbol? head) (.endsWith (name head) "."))
+            ;; Constructor sugar (ClassName. args) → the class name. The guard
+            ;; must EXCLUDE the degenerate dot heads that also end in ".":
+            ;; the host dot special form `.` itself (stripping it yields the
+            ;; EMPTY symbol — tag poison the bytecode emitter once trusted as
+            ;; :verified → VerifyError) and `..`/`...`-style member-access
+            ;; heads (stripping yields "."/".." — equally meaningless as a
+            ;; class tag). A real constructor head has a non-"." class name
+            ;; before the trailing dot, so require length>1 and no leading dot.
+            (and (symbol? head)
+                 (let [nm (name head)]
+                   (and (> (count nm) 1)
+                        (.endsWith nm ".")
+                        (not (.startsWith nm ".")))))
             (symbol (subs (name head) 0 (dec (count (name head)))))
             (and (symbol? head) (namespace head))
             (try
