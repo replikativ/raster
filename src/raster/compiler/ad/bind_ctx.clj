@@ -11,11 +11,33 @@
       (emit-let* ctx sym))
     ;; => (let* [buf__1 (nc/raw x)] buf__1)")
 
+(defn tag-capable
+  "Canonicalize a caller-supplied gensym-fn into the two-arity BindCtx
+  contract:
+    (f prefix)      — mint a fresh symbol (unchanged behavior)
+    (f prefix tag)  — mint a fresh symbol stamped {:raster.type/tag tag}
+                      when `tag` is non-nil; nil tag = plain mint, so
+                      callers can pass Π's nil (no tangent space / unknown
+                      primal tag) without branching.
+  Always mints through the wrapped fn's single arity and stamps in the
+  wrapper, so any provider (plain gensym closures, reverse.clj's
+  ad-gensym, jvp-gensym) yields identical tagging semantics. Idempotent
+  under re-wrapping."
+  [gensym-fn]
+  (fn mint
+    ([prefix] (gensym-fn prefix))
+    ([prefix tag]
+     (let [sym (gensym-fn prefix)]
+       (if (some? tag)
+         (vary-meta sym assoc :raster.type/tag tag)
+         sym)))))
+
 (defn make-ctx
   "Create a fresh binding context.
-  gensym-fn: (fn [prefix] -> unique-symbol)"
+  gensym-fn: (fn [prefix] -> unique-symbol); wrapped via `tag-capable`
+  so (gensym-fn prefix tag) is always available to template grads-fns."
   [gensym-fn]
-  {:bindings [] :gensym-fn gensym-fn})
+  {:bindings [] :gensym-fn (tag-capable gensym-fn)})
 
 (defn genlet
   "Add a binding to the context. Returns [updated-ctx, sym].

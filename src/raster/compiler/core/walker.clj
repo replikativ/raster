@@ -19,6 +19,19 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.macroexpand :as mex]))
 
+;; Signature-derived result typing lives in dispatch (with the parametric
+;; registry + substitute-type-var). dispatch → specialize → walker, so the
+;; walker cannot statically require dispatch; resolve lazily (cached) like
+;; inference.clj does for parametric-registry.
+(def ^:private signature-result-tag-fn
+  (delay (requiring-resolve 'raster.compiler.core.dispatch/signature-result-tag)))
+
+(defn- signature-result-tag
+  "Signature-derived result tag (dispatch/signature-result-tag), or nil when the
+   op has no unifiable (All [T]) signature. Callers fall back to the facet."
+  [op arg-tags]
+  (when-let [f @signature-result-tag-fn] (f op arg-tags)))
+
 (defn- warn-boxed-dispatch?
   "Check if *warn-on-boxed-dispatch* is bound and true."
   []
@@ -462,7 +475,10 @@
             (let [op   (:raster.op/original (meta result))
                   rule (descriptor/result-type-rule op)
                   ref  (nth result 2)
-                  et   (or (when (= :element-of-first-arg rule)
+                  ;; .invk = (.invk impl arg0 arg1 …) — the op args start at idx 2.
+                  arg-tags (map walked-tag (drop 2 result))
+                  et   (or (signature-result-tag op arg-tags)  ; signature first
+                           (when (= :element-of-first-arg rule)
                              (get-in type-env [ref :element]))     ; parametric array ref → element
                            (descriptor/result-tag op [(get-in type-env [ref :tag])]))]
               (if et (vary-meta result assoc :raster.type/tag et) result))
@@ -471,6 +487,21 @@
             (if-let [ret-tag (:raster.type/ret-tag (meta (second result)))]
               (vary-meta result assoc :raster.type/tag ret-tag)
               result)
+            ;; Kept-symbolic op with a :result-type facet — an op that does NOT
+            ;; devirtualize to .invk (residual-add, grad-acc: they lower via SOAC
+            ;; fusion / stay a nil-safe host defn) but whose result tag still derives
+            ;; from its ARG tags via the registry (:same-as-first-arg for
+            ;; residual-add, :first-typed-arg for grad-acc). The .invk arms above
+            ;; can't reach these (no impl-sym / ret-tag), so without this arm the
+            ;; result stays untagged and the reverse-AD fan-out reroute (which gates
+            ;; on an :array sym-tag) can't fire. Register new ops in op-descriptor
+            ;; (:result-type), not here.
+            (and (symbol? head) (namespace head)
+                 (some? (descriptor/result-type-rule head)))
+            (let [arg-tags (map walked-tag (rest result))
+                  rt (or (signature-result-tag head arg-tags)  ; signature first
+                         (descriptor/result-tag head arg-tags))]
+              (if rt (vary-meta result assoc :raster.type/tag rt) result))
             ;; Primitive cast — (double x), (float x), etc.
             (contains? types/primitive-info head)
             (vary-meta result assoc :raster.type/tag head)
@@ -701,6 +732,13 @@
                  tag (or (inf/floating-literal-narrowed-tag init (:element-dtype ctx))
                          (inf/walked-init-monomorphized-tag rewritten-init tc-tag
                                                             (:element-dtype ctx))
+                         ;; A tag the walker's post-stamp derived on the init FORM
+                         ;; itself (e.g. a kept-symbolic residual-add stamped via the
+                         ;; :result-type facet, which infer-binding-tag can't reach —
+                         ;; no impl-sym/.invk ret-tag). Monomorphization-correct (it
+                         ;; came from the already-walked args), so it beats TC's
+                         ;; dtype-blind guess.
+                         (:raster.type/tag (meta rewritten-init))
                          tc-tag
                          (inf/infer-binding-tag sym init rewritten-init type-env
                                                 {:source-ns (:source-ns ctx)

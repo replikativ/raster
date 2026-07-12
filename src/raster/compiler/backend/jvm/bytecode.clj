@@ -1847,6 +1847,7 @@
   [code args locals ctx]
   (let [[arr idx] args
         arr-tag (or (:tag (meta arr))
+                    (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
         ;; Skip checkcast when the local's type is verified by the
         ;; JVM method descriptor (typed param, not Object)
@@ -1878,7 +1879,7 @@
       objects (do (.aaload code) :ref)
       (do (when arr-tag
             (binding [*out* *err*]
-              (println "WARNING: emit-aget-intrinsic: unrecognized arr-tag" arr-tag
+              (println "WARNING: emit-aget-intrinsic: unrecognized arr-tag" (pr-str arr-tag)
                        "for" arr "— falling back to aaload (Object[])")))
           (.aaload code) :ref))))
 
@@ -1889,6 +1890,7 @@
   [code args locals ctx]
   (let [[arr idx val] args
         arr-tag (or (:tag (meta arr))
+                    (:raster.type/tag (meta arr))
                     (when (symbol? arr) (:hint (get locals arr))))
         arr-verified? (when (symbol? arr) (:verified (get locals arr)))
         arr-type (emit-form code arr locals ctx)]
@@ -2837,9 +2839,12 @@
                              ;; ^objects → checkcast [Ljava/lang/Object;
                              ;; ^doubles → checkcast [D
                              ;; ^ClassName → checkcast to that class
-                            ;; Infer tag: explicit hint, alias source, deftm return-tag,
-                            ;; .invk return-tag, or Java static field/method return type
+                            ;; Infer tag: explicit hint, CARRIED :raster.type/tag stamp
+                            ;; (AD emission / walker — emitters read stamps, never
+                            ;; re-infer), alias source, deftm return-tag, .invk
+                            ;; return-tag, or Java static field/method return type
                             tag (or (:tag (meta sym))
+                                    (:raster.type/tag (meta sym))
                                     ;; Alias: inherit from source
                                     (when (symbol? init)
                                       (:hint (get locs init)))
@@ -2947,6 +2952,13 @@
                                                                      locs))]
                                         (inf/infer-arg-tag init local-env))
                                       (catch Throwable _ nil)))
+                            ;; A degenerate empty-symbol tag (infer-arg-tag's ctor arm
+                            ;; misfires on host `(. obj meth …)` dot forms: (name '.)
+                            ;; ends with ".") is POISON: it would mark the local
+                            ;; :verified (≠ 'Object) while emitting no checkcast, so a
+                            ;; downstream aget skips its checkcast too → VerifyError
+                            ;; (aaload on Object). Treat it as absent.
+                            tag (if (and (symbol? tag) (zero? (count (name tag)))) nil tag)
                             ;; Checkcast for typed let bindings (arrays, records, etc.)
                             ;; These CHECKCASTs are redundant when getfield already returns
                             ;; the typed value, but C2 uses them as type proofs for downstream

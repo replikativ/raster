@@ -935,6 +935,107 @@
 
     :else annotation))
 
+;; ================================================================
+;; Signature-derived result typing (tag-level)
+;;
+;; The `unify-type-var` / `unify-parametric` machinery above unifies a
+;; parametric (All [T]) signature against runtime CLASSES (for dispatch).
+;; `signature-result-tag` is the compile-time TAG-level twin: it unifies the
+;; declared signature against the argument dispatch TAGS a pass already knows
+;; (floats/doubles/long/…) and substitutes the bound type vars into the RETURN
+;; annotation to derive the op's result tag — deriving what a :result-type
+;; op-descriptor facet would otherwise hand-restate. It is the single mechanism
+;; the walker and late inference route through (facet is the fallback).
+;; ================================================================
+
+(defn- tag-unify-type-var
+  "Tag-level twin of `unify-type-var`: unify a single param ANNOTATION against an
+   argument dispatch TAG (a symbol like 'floats/'double/'long, or nil).
+   Returns:
+     - a binding map {T elem}      when the annotation binds a type variable
+                                   ((Array T) vs 'floats → {T float}; bare T vs
+                                    'float → {T float})
+     - {}                          when the annotation is concrete and CONSISTENT
+                                   with arg-tag (no variable to bind)
+     - nil                         on any mismatch / underdetermined (nil) tag —
+                                   the caller then yields nil and the facet speaks."
+  [annotation arg-tag type-vars]
+  (cond
+    (nil? arg-tag) nil
+
+    ;; (Array T) — bind T to the array tag's element type ('floats → 'float)
+    (and (sequential? annotation) (= 'Array (first annotation))
+         (symbol? (second annotation))
+         (contains? type-vars (second annotation)))
+    (when-let [elem (get types/primitive-array-element-types arg-tag)]
+      {(second annotation) elem})
+
+    ;; bare T — bind T directly to the (scalar element) arg tag ('float/'double)
+    (and (symbol? annotation) (contains? type-vars annotation))
+    {annotation arg-tag}
+
+    ;; concrete annotation (no variable) — consistency check by tag equality.
+    ;; Strict: a mismatch yields nil so the facet fallback speaks rather than a
+    ;; possibly-wrong signature tag.
+    :else
+    (when (= (types/annotation->tag annotation nil) arg-tag) {})))
+
+(defn- op->parametric-qname
+  "Resolve an op (var or symbol) to the qualified symbol key used in
+   `parametric-registry`. Returns nil when it cannot be resolved."
+  [op]
+  (cond
+    (var? op)    (let [m (meta op)] (symbol (str (:ns m)) (str (:name m))))
+    (symbol? op) (or (try (when-let [v (resolve op)]
+                            (let [m (meta v)]
+                              (when (and (:ns m) (:name m))
+                                (symbol (str (:ns m)) (str (:name m))))))
+                          (catch Exception _ nil))
+                     op)
+    :else nil))
+
+(defn signature-result-tag
+  "Derive the result dispatch tag of `op` applied to arguments whose inferred
+   dispatch tags are `arg-tags`, by unifying op's declared (All [T]) signature
+   against those tags and substituting the bound type variables into the RETURN
+   annotation. `op` is a var or (qualified/bare) symbol; `arg-tags` a seq of
+   dispatch-tag symbols (or nils).
+
+   Returns nil — so callers fall back to the :result-type facet — when:
+     - op has no registered parametric (All [T]) template (e.g. a monomorphic
+       overloaded deftm like oftype, or a plain host fn),
+     - no template's arity matches, a concrete param is inconsistent, or the
+       type variables are underdetermined,
+     - the type vars don't all bind (return annotation would stay symbolic)."
+  [op arg-tags]
+  (let [qn        (op->parametric-qname op)
+        templates (or (and qn (get @parametric-registry qn))
+                      (when (symbol? op) (get @parametric-registry op)))
+        arg-tags  (vec arg-tags)]
+    (when (seq templates)
+      (some
+       (fn [{:keys [type-var-list annotations ret-annotation]}]
+         (when (and ret-annotation
+                    (= (count annotations) (count arg-tags)))
+           (let [tvs (set type-var-list)
+                 bindings
+                 (reduce
+                  (fn [acc [ann tag]]
+                    (let [b (tag-unify-type-var ann tag tvs)]
+                      (if (or (nil? b)
+                              (not (every? (fn [[k v]]
+                                             (or (not (contains? acc k))
+                                                 (= (get acc k) v)))
+                                           b)))
+                        (reduced nil)
+                        (merge acc b))))
+                  {} (map vector annotations arg-tags))]
+             (when (and bindings (every? #(contains? bindings %) tvs))
+               (let [subst (substitute-type-var ret-annotation bindings)
+                     tag   (types/annotation->tag subst nil)]
+                 tag)))))
+       templates))))
+
 (defn register-parametric!
   "Register a parametric method template.
    type-vars: [T] — the type variables

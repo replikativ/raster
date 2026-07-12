@@ -214,3 +214,67 @@
     (is (true? (dispatch/assignable-from? Object String)))
     (is (not (dispatch/assignable-from? Double String))
         "Double is not assignable from String")))
+
+;; ================================================================
+;; Signature-derived result typing (tag-level)
+;; ================================================================
+
+(deftest signature-result-tag-test
+  ;; Register synthetic (All [T]) templates so the test is self-contained
+  ;; (no dl.nn dependency). Shapes mirror the real facet-registered ops.
+  (testing "array-in/array-out (residual-add shape) — element tag preserved"
+    (dispatch/register-parametric!
+     'raster.numeric/sigtest-resid '[T]
+     '[(Array T) (Array T) Long] '(Array T)
+     '[a b n] nil *ns*)
+    ;; float and double both derive purely from the arg tags — no hard-coding
+    (is (= 'floats  (dispatch/signature-result-tag
+                     'raster.numeric/sigtest-resid '[floats floats long])))
+    (is (= 'doubles (dispatch/signature-result-tag
+                     'raster.numeric/sigtest-resid '[doubles doubles long]))))
+
+  (testing "bare-T return (residual-add-backward-style scalar out)"
+    (dispatch/register-parametric!
+     'raster.numeric/sigtest-scalar '[T]
+     '[(Array T) Long] 'T
+     '[dy n] nil *ns*)
+    (is (= 'float  (dispatch/signature-result-tag
+                    'raster.numeric/sigtest-scalar '[floats long])))
+    (is (= 'double (dispatch/signature-result-tag
+                    'raster.numeric/sigtest-scalar '[doubles long]))))
+
+  (testing "multiple type variables — return follows the SECOND var"
+    (dispatch/register-parametric!
+     'raster.numeric/sigtest-multi '[T U]
+     '[(Array T) (Array U)] '(Array U)
+     '[a b] nil *ns*)
+    (is (= 'doubles (dispatch/signature-result-tag
+                     'raster.numeric/sigtest-multi '[floats doubles])))
+    (is (= 'floats  (dispatch/signature-result-tag
+                     'raster.numeric/sigtest-multi '[doubles floats]))))
+
+  (testing "concrete-param consistency — Long param must match arg tag"
+    (dispatch/register-parametric!
+     'raster.numeric/sigtest-consistent '[T]
+     '[(Array T) Long] '(Array T)
+     '[a n] nil *ns*)
+    ;; consistent: Long param vs 'long arg → resolves
+    (is (= 'floats (dispatch/signature-result-tag
+                    'raster.numeric/sigtest-consistent '[floats long])))
+    ;; inconsistent: Long param vs 'double arg → nil (facet fallback speaks)
+    (is (nil? (dispatch/signature-result-tag
+               'raster.numeric/sigtest-consistent '[floats double]))))
+
+  (testing "nil / underdetermined → nil"
+    ;; no template registered for this op
+    (is (nil? (dispatch/signature-result-tag
+               'raster.numeric/sigtest-unregistered '[floats long])))
+    ;; nil arg tag underdetermines T
+    (is (nil? (dispatch/signature-result-tag
+               'raster.numeric/sigtest-resid '[nil floats long])))
+    ;; arity mismatch → no matching template
+    (is (nil? (dispatch/signature-result-tag
+               'raster.numeric/sigtest-resid '[floats])))
+    ;; non-array arg against (Array T) → cannot bind T → nil
+    (is (nil? (dispatch/signature-result-tag
+               'raster.numeric/sigtest-resid '[float floats long])))))

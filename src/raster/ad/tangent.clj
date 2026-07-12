@@ -45,6 +45,20 @@
   [tag]
   (not= :none (:kind (tangent-kind tag))))
 
+(defn tangent-tag
+  "Π — the tangent-type projection on TAGS (.internal/ad_formal_framework.md
+  §5, item #1): maps a PRIMAL's :raster.type/tag to the tag of its
+  tangent/cotangent space. Identity on the differentiable tags
+  (double/float scalars, doubles/floats arrays — exactly the tags
+  `differentiable?` accepts), nil for everything else — ⊥/no-tangent
+  (integers, booleans, Object) AND unknown (nil in, nil out).
+
+  The single seam every AD emission site asks instead of copying the
+  primal tag ad hoc or defaulting a dtype: a nil result means the
+  emission stays UNTAGGED (never guess, never narrow)."
+  [primal-tag]
+  (when (differentiable? primal-tag) primal-tag))
+
 (defn zero-expr
   "IR expression for a typed zero cotangent of the tangent space of `tag`.
   Scalars: a typed zero literal. Arrays: a typed array constructor sized
