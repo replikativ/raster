@@ -100,6 +100,40 @@
       (is (= 'out (second reconstructed))))))
 
 ;; ================================================================
+;; Written arrays are OUTPUTS, never scalars (the horizontal-fusion
+;; multi-output invariant): soac->par-form flattens a fused multi-output
+;; map to a single-out par/map! whose SECONDARY outputs survive only as
+;; side-effect asets in the lambda — re-parsing that form must classify
+;; them as array outputs or the GPU backend declares them as scalar
+;; kernel params (`float hfuse_out__N`) and extraction emits an
+;; unresolvable host reference.
+;; ================================================================
+
+(deftest aset-written-array-classified-as-output-test
+  (testing "bare aset target in a par/map! lambda → :outputs, not :scalars"
+    (let [expr '(raster.par/map! hout1 i n float
+                                 (do (raster.arrays/aset hout2 i (float (* (aget d i) (aget a i))))
+                                     (* (aget d i) (aget b i))))
+          node (soac/par-form->soac 'da expr 0)]
+      (is (contains? (:outputs node) 'hout2)
+          "aset-written array must be a SOAC output")
+      (is (not (contains? (:scalars node) 'hout2))
+          "aset-written array must never be a scalar param")
+      (is (contains? (:outputs node) 'hout1))
+      (is (= #{'d 'a 'b} (:inputs node)))))
+
+  (testing "devirtualized (.invk aset-impl …) target → :outputs, not :scalars"
+    (let [aset-invk (with-meta
+                      (list '.invk 'raster.arrays/aset_m_floats_long_float-impl
+                            'hout2 'i (list 'float '(* (aget d i) (aget a i))))
+                      {:raster.op/original 'raster.arrays/aset})
+          expr (list 'raster.par/map! 'hout1 'i 'n 'float
+                     (list 'do aset-invk '(* (aget d i) (aget b i))))
+          node (soac/par-form->soac 'da expr 0)]
+      (is (contains? (:outputs node) 'hout2))
+      (is (not (contains? (:scalars node) 'hout2))))))
+
+;; ================================================================
 ;; let-bindings->nodes / nodes->let-bindings
 ;; ================================================================
 

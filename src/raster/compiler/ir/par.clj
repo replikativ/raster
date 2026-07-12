@@ -670,6 +670,30 @@
 
     :else #{}))
 
+(defn collect-aset-arrays
+  "Collect array symbols WRITTEN via aset in a body expression.
+  Returns a set of array symbols (stripped of metadata).
+
+  The write-side counterpart of collect-aget-arrays: recognizes bare
+  (clojure.core/aset arr idx v) / (raster.arrays/aset arr idx v) AND
+  devirtualized (.invk aset-impl arr idx v) via the carried :raster.op/original.
+  Used by SOAC io classification so an array a lambda writes (e.g. the
+  side-effect writes of a horizontally-fused multi-output map) is classified as
+  an array OUTPUT — never a scalar param."
+  [body-expr]
+  (cond
+    (descriptor/aset-call? body-expr)
+    (apply set/union #{(descriptor/aset-array-sym body-expr)}
+           (map collect-aset-arrays (descriptor/call-args body-expr)))
+
+    (seq? body-expr)
+    (apply set/union #{} (map collect-aset-arrays (rest body-expr)))
+
+    (vector? body-expr)
+    (apply set/union #{} (map collect-aset-arrays body-expr))
+
+    :else #{}))
+
 (defn extract-par-stencil-info
   "Extract structured info from a par/stencil! form.
   Returns {:out, :inputs, :radius, :boundary, :cast, :idx, :bound, :body} or nil."
