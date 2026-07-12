@@ -11,6 +11,7 @@
   Uses :raster.core/ qualified keywords for metadata to maintain
   compatibility with bytecode.clj and tooling/inspect.clj."
   (:require [clojure.string :as str]
+            [clojure.walk]
             [clojure.core.typed :as t]
             [raster.compiler.core.types :as types]
             [raster.compiler.core.method-entry]
@@ -586,17 +587,77 @@
       (when-let [^Class cls (get @types/tag-class-registry tag)]
         (symbol (.getName cls)))))
 
-(defn- build-tc-ann [table-atom ret-tags]
+;; Forward decls — the parametric registry + its substitution helper are defined
+;; further down (the parametric-dispatch section), but the TC annotation builder
+;; below must consult them.
+(declare parametric-registry substitute-type-var)
+
+(def tc-parametric-element-types
+  "The element types a parametric (All [T]) template is instantiated at when its
+  TC signature is built. These are exactly the dtypes the compiler monomorphizes
+  to (compile-aot / compile-gpu-program :dtype), i.e. the ones a call site can
+  legitimately present."
+  '[double float])
+
+(defn- parametric-tc-sigs
+  "TC signatures for the (All [T]) templates registered under `qsym`, instantiated
+  at every element type in `tc-parametric-element-types`.
+
+  TYPES ONLY — nothing is compiled here. This is what makes devirtualization
+  LOAD-ORDER INDEPENDENT. A parametric deftm eagerly registers only its `double`
+  specialization at definition time (core.clj), so a table-derived TC signature
+  says `rms-norm : [(Array double) … :-> (Array double)]` and TC REJECTS every
+  float call site. A rejected body reports type-errors, and inference.clj discards
+  ALL binding types when a body has type-errors — so every arg tag at the call is
+  nil, `try-parametric-specialize!` bails (it needs complete arg tags), the call
+  survives undevirtualized, and the GPU fixpoint census throws. The same compile
+  SUCCEEDS as soon as anything earlier in the JVM happens to have instantiated the
+  float overload (which re-emits the annotation with a float signature) — a cold
+  vs. warm divergence, i.e. a compile whose result depends on JVM history.
+
+  Declaring the template's instantiations up front breaks that chicken-and-egg:
+  TC type-checks a float body cleanly on a fresh JVM, the tags flow, and the
+  concrete impl is then instantiated ON DEMAND at the devirtualization site by
+  `inference/try-parametric-specialize!` — which is where instantiation belongs."
+  [qsym]
+  (when-let [templates (get @parametric-registry qsym)]
+    (for [template templates
+          elem tc-parametric-element-types
+          :let [tvs (or (:type-var-list template) (vec (:type-vars template)))
+                bindings (zipmap tvs (repeat elem))
+                subst (fn [ann]
+                        (clojure.walk/postwalk
+                         #(if (contains? bindings %) (get bindings %) %)
+                         (substitute-type-var ann bindings)))
+                param-tags (mapv #(types/annotation->tag (subst %1) %2)
+                                 (:annotations template) (:params template))
+                param-types (mapv tag->tc-ann param-tags)
+                ret-tag (when-let [ra (:ret-annotation template)]
+                          (types/annotation->tag (subst ra) 'ret))]
+          :when (and (seq tvs) (every? some? param-types))]
+      {:tags param-tags
+       :sig (vec (concat param-types
+                         [:-> (or (tag->tc-ann ret-tag) 'clojure.core.typed/Any)]))})))
+
+(defn- build-tc-ann [table-atom ret-tags qsym]
   (let [table @table-atom
-        sigs (for [[_arity methods] table
-                   {:keys [tags]} methods
-                   :let [known-params? (every? tag->tc-ann tags)]
-                   :when known-params?]
-               (let [param-types (mapv tag->tc-ann tags)
-                     ret-type (get ret-tags tags 'clojure.core.typed/Any)]
-                 (vec (concat param-types [:-> ret-type]))))]
-    (when (seq sigs)
-      (list* 'typed.clojure/IFn sigs))))
+        sigs (vec (for [[_arity methods] table
+                        {:keys [tags]} methods
+                        :let [known-params? (every? tag->tc-ann tags)]
+                        :when known-params?]
+                    (let [param-types (mapv tag->tc-ann tags)
+                          ret-type (get ret-tags tags 'clojure.core.typed/Any)]
+                      (vec (concat param-types [:-> ret-type])))))
+        ;; A REGISTERED specialization always wins over the synthesized template
+        ;; signature (same tags ⇒ same types, but the registered one carries the
+        ;; impl var's actual return tag).
+        registered (into #{} (for [[_arity methods] table, {:keys [tags]} methods] tags))
+        extra (->> (parametric-tc-sigs qsym)
+                   (remove #(contains? registered (:tags %)))
+                   (mapv :sig))
+        all (into sigs extra)]
+    (when (seq all)
+      (list* 'typed.clojure/IFn all))))
 
 (defn- emit-tc-ann! [target-ns-obj simple-name table-atom]
   (try
@@ -617,7 +678,7 @@
                              (if ret (assoc m tags (or (tag->tc-ann ret) ret)) m)))
                          m methods))
                       {} @table-atom)
-            type-form (build-tc-ann table-atom ret-tags)]
+            type-form (build-tc-ann table-atom ret-tags qsym)]
         (when type-form
           (ann-fn [ns-sym qsym type-form {} nil nil]))))
     (catch Exception e
