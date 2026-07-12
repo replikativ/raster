@@ -388,6 +388,16 @@
   progress. One compile at a time assumed (plain atom, no per-compile key)."
   (atom []))
 
+(def fixpoint-finalize-divergence
+  "Phase-2 (plan D2) instrumentation: count of pass-fixpoint finalize-epilogue
+  activations where resolve-generic-deftm-calls actually CHANGED the re-tagged
+  form (i.e. the re-tag + re-expand epilogue was load-bearing, not a no-op).
+  Emission-time devirtualization (Phase 1c) may have obsoleted it — if this
+  stays 0 across a full suite + a fresh-JVM GPU resident compile, the epilogue
+  is provably dead and gets deleted. Each activation also prints a dedup-free
+  [pass-fixpoint finalize] line to *err* so the suite log is greppable."
+  (atom 0))
+
 (declare record-fixpoint-census!)
 
 (defn- pass-fixpoint
@@ -431,14 +441,17 @@
                                      tagged (:param-env opts))]
                        (if (= resolved tagged)
                          current
-                         (inline/expand-for-backends resolved 3 (:param-env opts))))))]
+                         (do (swap! fixpoint-finalize-divergence inc)
+                             (binding [*out* *err*]
+                               (println "[pass-fixpoint finalize] resolve-generic-deftm-calls devirtualized at the fixpoint edge (epilogue LIVE)"))
+                             (inline/expand-for-backends resolved 3 (:param-env opts)))))))]
     (reset! fixpoint-census [])
     (loop [current form
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
         (let [final (ensure-let*-result (finalize current))]
-          (record-fixpoint-census! :final final)
+          (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
@@ -460,11 +473,11 @@
                          expanded)]
           (if (= rewalked current)
             (let [final (ensure-let*-result (finalize current))]
-              (record-fixpoint-census! :final final)
+              (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})
             (do
-              (record-fixpoint-census! iter rewalked)
+              (record-fixpoint-census! iter rewalked opts)
               (recur rewalked (inc iter)
                      (assoc total-stats :fixpoint-iterations (inc iter))))))))))
 
@@ -568,18 +581,88 @@
     (vector? e) :vector
     :else :atom))
 
+(def ^:private census-exempt-int-arith-heads
+  "clojure.core integer index/dim arithmetic heads — EXEMPT from the fixpoint-edge
+  typedness contract. By convention (CLAUDE.md) integer index/counter/dimension
+  arithmetic stays clojure.core (zero-cost ladd/lsub intrinsics on the JVM, +1/-1
+  in the GPU C emitter) and is never polymorphic float arithmetic, so an untagged
+  Long-arith binding needs no :raster.type/tag to lower correctly."
+  '#{clojure.core/* clojure.core/+ clojure.core/- clojure.core//
+     clojure.core/quot clojure.core/rem clojure.core/mod
+     clojure.core/inc clojure.core/dec})
+
+(defn- census-exempt-head?
+  "The fixpoint-edge typedness contract's EXEMPT classes (measured floor, plan
+  Phase 0/2 of .internal/ad_typed_emission_plan.md), keyed by census-rhs-head:
+
+    1. void-returning SOAC/effect STATEMENT bindings (raster.par/map-void!,
+       dotimes) — the binding exists only to sequence an effect; there is no
+       result VALUE to tag (the census's untagged-binding-pairs already excludes
+       fn* pullback closures and loop*/dotimes BINDERS for the same reason).
+    2. clojure.core integer scalar arithmetic on Long dims/indices — see
+       census-exempt-int-arith-heads.
+    3. :vector — an aggregate host result (the AD [primal grads] result vector);
+       a persistent vector carries no element dtype, so tag-typedness does not
+       apply to the binding.
+
+  Everything else (raster.dl/raster.nn kernels, .invk impls, raster.numeric
+  scalar math, aliases, constants) MUST carry :raster.type/tag at the fixpoint
+  edge."
+  [head]
+  (or (contains? '#{raster.par/map-void! par/map-void! dotimes} head)
+      (contains? census-exempt-int-arith-heads head)
+      (= :vector head)))
+
 (defn- record-fixpoint-census!
   "Append one tag-completeness entry to fixpoint-census (Phase 0 of
-  .internal/ad_typed_emission_plan.md)."
-  [label form]
+  .internal/ad_typed_emission_plan.md).
+
+  Phase 2 (D1) ENFORCEMENT: at the :final entry on a GPU target (the same
+  device/gpu-target? gate pass-late-cleanup's throw uses), typedness is an
+  invariant — any NON-EXEMPT untagged binding (see census-exempt-head?) or any
+  surviving undevirtualized raster.* dispatch call THROWS with op frequencies +
+  example forms. GPU cannot fall back to IFn.invoke, and a tag lost here is
+  guessed downstream (the f32→f64 narrowing hazard) — fail loud at the AD/
+  fixpoint edge instead. CPU targets keep the warn-only census line (printed
+  under *log-tag-census* / RASTER_TAG_CENSUS)."
+  [label form opts]
   (let [untagged (untagged-binding-pairs form)
         undevirt (collect-undevirtualized form)
+        non-exempt (remove (fn [[_ e]] (census-exempt-head? (census-rhs-head e))) untagged)
         entry {:label label
                :untagged-bindings (count untagged)
                :untagged-by-head (frequencies (map (comp census-rhs-head second) untagged))
+               :non-exempt-untagged (count non-exempt)
                :undevirtualized (count undevirt)
                :undevirtualized-ops (frequencies (map first undevirt))}]
     (swap! fixpoint-census conj entry)
+    (when (and (= label :final)
+               (device/gpu-target? (:target-device opts))
+               (or (seq non-exempt) (seq undevirt)))
+      (let [trunc (fn [f] (let [s (pr-str f)] (subs s 0 (min 200 (count s)))))
+            untagged-heads (frequencies (map (comp census-rhs-head second) non-exempt))
+            untagged-examples (mapv (fn [[s e]] (trunc (list s '= e))) (take 3 non-exempt))
+            undevirt-ops (frequencies (map first undevirt))
+            undevirt-examples (mapv trunc (take 3 (distinct undevirt)))]
+        (throw (ex-info (str "fixpoint edge typedness violation on GPU target: "
+                             (count non-exempt) " non-exempt untagged binding(s) "
+                             (pr-str untagged-heads)
+                             (when (seq untagged-examples)
+                               (str " e.g. " (pr-str untagged-examples)))
+                             "; " (count undevirt) " undevirtualized dispatch call(s) "
+                             (pr-str undevirt-ops)
+                             (when (seq undevirt-examples)
+                               (str " e.g. " (pr-str undevirt-examples)))
+                             ". Tags must be CARRIED from emission (Π), never guessed "
+                             "downstream — an untagged binding here narrows f32→f64 or "
+                             "miscompiles to GPU garbage. Fix the emission site (grads-fn "
+                             "tagged gensym / template Π) or the upstream forward-path tag "
+                             "loss; exempt classes are documented at census-exempt-head?.")
+                        {:non-exempt-untagged untagged-heads
+                         :untagged-examples untagged-examples
+                         :undevirtualized undevirt-ops
+                         :undevirtualized-examples undevirt-examples
+                         :target-device (:target-device opts)}))))
     (when (and (= label :final)
                (or *log-tag-census* (System/getenv "RASTER_TAG_CENSUS"))
                (or (pos? (:untagged-bindings entry))

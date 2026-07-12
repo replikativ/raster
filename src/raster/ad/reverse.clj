@@ -77,11 +77,21 @@
 ;; corpus is clean.
 (def ^:private default-tag-warn-seen (atom #{}))
 
+(def default-tag-fire-counts
+  "Phase-2 (plan D2) instrumentation: TOTAL warn-default-tag! activations by site
+  keyword — every fire counts, unlike the printed warning (dedup'd by
+  [site binding]). The assert-then-delete audit reads this after a full-suite run:
+  a site with count 0 is provably dead and becomes a fail-loud throw; a site that
+  still fires marks an upstream forward-path tag loss to fix at its source."
+  (atom {}))
+
 (defn- warn-default-tag!
   "Emit a dedup'd LOST-TAG warning to *err* when a reverse-AD codegen site falls
   back to `default-tag` because the primal binding carries no :raster.type/tag.
-  Keyed by [site binding]. Returns `default-tag` unchanged (no behavior change)."
+  Keyed by [site binding]. Returns `default-tag` unchanged (no behavior change).
+  Every activation is counted in `default-tag-fire-counts` (undedup'd)."
   [site binding-hint default-tag]
+  (swap! default-tag-fire-counts update site (fnil inc 0))
   (let [k [site (str binding-hint)]]
     (when-not (contains? @default-tag-warn-seen k)
       (swap! default-tag-warn-seen conj k)
@@ -1716,7 +1726,7 @@
                           (warn-default-tag! :dotimes-out-arr (some-> written-arrs first name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
-                       'double)
+                       (warn-default-tag! :dotimes-out-elem out-array-tag 'double))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         iter-pb-sym (ad-gensym "iter_pb")
         d-val-sym (ad-gensym "d_val" out-elem-tag)
@@ -1940,7 +1950,7 @@
                           (warn-default-tag! :parmap-out-arr (some-> out-sym name) 'doubles))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
-                       'double)
+                       (warn-default-tag! :parmap-out-elem out-array-tag 'double))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         bwd-idx-sym (ad-gensym "bi")
         iter-pb-sym (ad-gensym "iter_pb")
