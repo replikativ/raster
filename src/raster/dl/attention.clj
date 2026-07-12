@@ -131,8 +131,8 @@
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
                            {:params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [_x seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                            :grads-fn (fn [ctx [x seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.attention/rope-backward-dx
                                                              adjoint-sym seq-len heads head-dim theta)])
@@ -879,9 +879,9 @@
                             :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [Q K V seq-len dk dv] _result-sym adjoint-sym gensym-fn]
-                              (let [dQ (gensym-fn "dQ")
-                                    dK (gensym-fn "dK")
-                                    dV (gensym-fn "dV")]
+                              (let [dQ (gensym-fn "dQ" (tmpl/grad-tag Q))
+                                    dK (gensym-fn "dK" (tmpl/grad-tag K))
+                                    dV (gensym-fn "dV" (tmpl/grad-tag V))]
                                 [(update ctx :bindings into
                                          [dQ (list 'raster.dl.attention/causal-scaled-dot-product-attn-dq
                                                    adjoint-sym Q K V seq-len dk dv)
@@ -1443,9 +1443,9 @@
                             :grads-fn
                             (fn [ctx [Q K V batch seq-len head-dim]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [dQ (gensym-fn "dQ")
-                                    dK (gensym-fn "dK")
-                                    dV (gensym-fn "dV")]
+                              (let [dQ (gensym-fn "dQ" (tmpl/grad-tag Q))
+                                    dK (gensym-fn "dK" (tmpl/grad-tag K))
+                                    dV (gensym-fn "dV" (tmpl/grad-tag V))]
                                 [(update ctx :bindings into
                                          [dQ (list 'raster.dl.attention/batched-causal-sdpa-dq
                                                    adjoint-sym Q K V batch seq-len head-dim)
@@ -2133,9 +2133,9 @@
 (tmpl/merge-into-template! 'raster.dl.attention/scaled-dot-product-attn
                            {:params '[Q K V seq-q seq-k dk dv] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [Q K V seq-q seq-k dk dv] _result-sym adjoint-sym gensym-fn]
-                                        (let [dQ (gensym-fn "dQ")
-                                              dK (gensym-fn "dK")
-                                              dV (gensym-fn "dV")]
+                                        (let [dQ (gensym-fn "dQ" (tmpl/grad-tag Q))
+                                              dK (gensym-fn "dK" (tmpl/grad-tag K))
+                                              dV (gensym-fn "dV" (tmpl/grad-tag V))]
                                           [(update ctx :bindings into
                                                    [dQ (list 'raster.dl.attention/scaled-dot-product-attn-dq
                                                              adjoint-sym Q K V seq-q seq-k dk dv)

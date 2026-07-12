@@ -11,7 +11,12 @@
   (:require [clojure.test :refer [deftest testing is]]
             [raster.ad.tangent :as tangent]
             [raster.ad.templates :as tmpl]
-            [raster.compiler.ad.bind-ctx :as bind-ctx]))
+            [raster.compiler.ad.bind-ctx :as bind-ctx]
+            ;; external :grads-fn registration sites (Phase 1d — tagged mints)
+            [raster.dl.nn]
+            [raster.dl.array-ops]
+            [raster.dl.attention]
+            [raster.nn]))
 
 (defn- make-test-ctx
   "Deterministic single-arity gensym (the pre-change BindCtx contract) —
@@ -148,3 +153,76 @@
           "a call with ANY unknown arg tag stays symbolic")
       (is (every? #(nil? (tag-of %)) grad-syms)
           "Π of an absent primal tag is nil — LHS stays untagged"))))
+
+;; ================================================================
+;; Phase 1d — external :grads-fn registration sites mint tagged syms
+;; (dl/nn, dl/array-ops, dl/attention, raster.nn) at the mint site,
+;; independent of the positional net in stamp-emitted-bindings.
+;; ================================================================
+
+(defn- instantiate
+  "Instantiate `op`'s template with the given actuals; returns
+  [binding-pairs grad-syms]."
+  [op actuals result-sym adjoint]
+  (let [[template _] (tmpl/resolve-template op)
+        [ctx grad-syms] (tmpl/instantiate-template-ctx
+                         template actuals result-sym adjoint (make-test-ctx))]
+    [(partition 2 (:bindings ctx)) grad-syms]))
+
+(deftest external-grads-fn-tagged-mints-test
+  (testing "dl/nn rms-norm: float primals ⇒ float-tagged dx/dw at mint"
+    (let [[pairs grad-syms]
+          (instantiate 'raster.dl.nn/rms-norm
+                       [(tagged 'x0 'floats) (tagged 'w0 'floats)
+                        'rows0 'feat0 'eps0 'go0]
+                       nil (tagged 'dy0 'floats))]
+      (is (= '[floats floats nil nil nil nil] (mapv tag-of grad-syms)))
+      (is (every? (fn [[s rhs]] (and (= 'floats (tag-of s))
+                                     (= 'floats (tag-of rhs))))
+                  pairs)
+          "both grad bindings carry Π(primal) on LHS and RHS form")))
+
+  (testing "dl/array-ops broadcast-add: dh/dt tagged, integer intermediate ba_n stays ⊥"
+    (let [[pairs grad-syms]
+          (instantiate 'raster.dl.array-ops/broadcast-add
+                       [(tagged 'h0 'floats) (tagged 't0 'floats) 'batch0 'dim0]
+                       nil (tagged 'dy0 'floats))
+          by-prefix (fn [p] (first (filter #(.startsWith (name (first %)) p) pairs)))]
+      (is (= '[floats floats nil nil] (mapv tag-of grad-syms)))
+      (is (nil? (tag-of (first (by-prefix "ba_n"))))
+          "Π is ⊥ on the integer element-count intermediate — never guessed")
+      (is (= 'floats (tag-of (first (by-prefix "dh")))))
+      (is (= 'floats (tag-of (first (by-prefix "dt")))))))
+
+  (testing "dl/attention batched-causal-sdpa: dQ/dK/dV tagged from Q/K/V"
+    (let [[pairs grad-syms]
+          (instantiate 'raster.dl.attention/batched-causal-sdpa
+                       [(tagged 'Q0 'floats) (tagged 'K0 'floats) (tagged 'V0 'floats)
+                        'b0 'sl0 'hd0]
+                       nil (tagged 'dy0 'floats))]
+      (is (= '[floats floats floats nil nil nil] (mapv tag-of grad-syms)))
+      (is (every? (fn [[s _]] (= 'floats (tag-of s))) pairs))))
+
+  (testing "raster.nn softmax-cross-entropy: the PRIMAL intermediate sce_s is tagged"
+    (let [[pairs grad-syms]
+          (instantiate 'raster.nn/softmax-cross-entropy
+                       [(tagged 'logits0 'floats) (tagged 't0 'floats)]
+                       'r0 (tagged 'dy0 'float))
+          [[s-sym _] [dl-sym _]] pairs]
+      (is (.startsWith (name s-sym) "sce_s"))
+      (is (= 'floats (tag-of s-sym))
+          "intermediate softmax extraction carries the primal logits tag")
+      (is (= 'floats (tag-of dl-sym)))
+      (is (= '[floats nil] (mapv tag-of grad-syms))))))
+
+(deftest external-grads-fn-untagged-unchanged-test
+  (testing "untagged primals ⇒ emission byte-identical, no tags anywhere"
+    (let [[pairs grad-syms]
+          (instantiate 'raster.dl.nn/rms-norm
+                       '[x0 w0 rows0 feat0 eps0 go0] nil 'dy0)]
+      (is (= '[[dx__1 (raster.dl.nn/rms-norm-backward-dx dy0 x0 w0 rows0 feat0 eps0 go0)]
+               [dw__2 (raster.dl.nn/rms-norm-backward-dweight dy0 x0 rows0 feat0 eps0)]]
+             (mapv vec pairs)))
+      (is (every? (fn [[s rhs]] (and (nil? (tag-of s)) (nil? (tag-of rhs)))) pairs)
+          "no :raster.type/tag invented on LHS or RHS")
+      (is (every? #(nil? (tag-of %)) (remove nil? grad-syms))))))

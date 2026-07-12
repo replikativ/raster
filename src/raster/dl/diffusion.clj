@@ -112,9 +112,12 @@
 (tmpl/merge-into-template! 'raster.dl.diffusion/forward-noise
                            {:params '[x0 noise alpha-t n] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [x0 noise alpha-t n] _result-sym adjoint-sym gensym-fn]
+                                        ;; grads-arr is the Object[] bundle from the
+                                        ;; multi-output backward — no differentiable
+                                        ;; tag (Π ⊥), stays untagged by design.
                                         (let [grads-arr (gensym-fn "fn_grads")
-                                              dx0 (gensym-fn "dx0")
-                                              d-noise (gensym-fn "d_noise")]
+                                              dx0 (gensym-fn "dx0" (tmpl/grad-tag x0))
+                                              d-noise (gensym-fn "d_noise" (tmpl/grad-tag noise))]
                                           [(update ctx :bindings into
                                                    [grads-arr (list 'raster.dl.diffusion/forward-noise-backward
                                                                     adjoint-sym alpha-t n)

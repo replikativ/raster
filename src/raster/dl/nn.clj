@@ -307,7 +307,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/gelu
                            {:params '[x n] :adjoint 'dy
                             :grads-fn (fn [ctx [x n] _result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/gelu-backward adjoint x n)])
                                            [dx nil]]))})
@@ -328,7 +328,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/sigmoid
                            {:params '[x n] :adjoint 'dy
                             :grads-fn (fn [ctx [x n] result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/sigmoid-backward adjoint result n)])
                                            [dx nil]]))})
@@ -349,7 +349,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/tanh-act
                            {:params '[x n] :adjoint 'dy
                             :grads-fn (fn [ctx [x n] result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/tanh-act-backward adjoint result n)])
                                            [dx nil]]))})
@@ -377,7 +377,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/leaky-relu
                            {:params '[x n alpha] :adjoint 'dy
                             :grads-fn (fn [ctx [x n alpha] _result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/leaky-relu-backward adjoint x n alpha)])
                                            [dx nil nil]]))})
@@ -1246,7 +1246,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/embedding
                            {:params '[table indices n vocab dim] :adjoint 'dy
                             :grads-fn (fn [ctx [table indices n vocab dim] _result adjoint gensym-fn]
-                                        (let [dt (gensym-fn "d_table")]
+                                        (let [dt (gensym-fn "d_table" (tmpl/grad-tag table))]
                                           [(update ctx :bindings into
                                                    [dt (list 'raster.dl.nn/embedding-backward adjoint indices n vocab dim)])
                                            [dt nil nil nil nil]]))})
@@ -1275,7 +1275,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/dropout
                            {:params '[x mask n] :adjoint 'dy
                             :grads-fn (fn [ctx [x mask n] _result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/dropout-backward adjoint mask n)])
                                            [dx nil nil]]))})
@@ -1329,7 +1329,7 @@
 (tmpl/merge-into-template! 'raster.dl.nn/softmax-1d
                            {:params '[x n] :adjoint 'dy
                             :grads-fn (fn [ctx [x n] result adjoint gensym-fn]
-                                        (let [dx (gensym-fn "dx")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/softmax-1d-backward adjoint result n)])
                                            [dx nil]]))})
@@ -2071,7 +2071,8 @@
                            {:params '[x weight rows features eps gain-offset] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [x weight rows features eps gain-offset]
                                            _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx") dw (gensym-fn "dw")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dw (gensym-fn "dw" (tmpl/grad-tag weight))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/rms-norm-backward-dx
                                                              adjoint-sym x weight rows features eps gain-offset)
@@ -2109,7 +2110,8 @@
 (tmpl/merge-into-template! 'raster.dl.nn/hadamard
                            {:params '[a b n] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [a b n] _result-sym adjoint-sym gensym-fn]
-                                        (let [da (gensym-fn "da") db (gensym-fn "db")]
+                                        (let [da (gensym-fn "da" (tmpl/grad-tag a))
+                                              db (gensym-fn "db" (tmpl/grad-tag b))]
                                           [(update ctx :bindings into
                                                    [da (list 'raster.dl.nn/hadamard-backward adjoint-sym b n)
                                                     db (list 'raster.dl.nn/hadamard-backward adjoint-sym a n)])
@@ -2120,7 +2122,8 @@
 (tmpl/merge-into-template! 'raster.dl.nn/linear-nb
                            {:params '[x W batch in-f out-f] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [x W batch in-f out-f] _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx") dW (gensym-fn "dW")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dW (gensym-fn "dW" (tmpl/grad-tag W))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/linear-dx adjoint-sym W batch in-f out-f)
                                                     dW (list 'raster.dl.nn/linear-dW adjoint-sym x batch in-f out-f)])
@@ -2139,10 +2142,10 @@
 ;; layer-norm template — direct calls to per-gradient deftms
 (tmpl/merge-into-template! 'raster.dl.nn/layer-norm
                            {:params '[x gamma beta batch features eps] :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x gamma _beta batch features eps] _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx")
-                                              dgamma (gensym-fn "dgamma")
-                                              dbeta (gensym-fn "dbeta")]
+                            :grads-fn (fn [ctx [x gamma beta batch features eps] _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dgamma (gensym-fn "dgamma" (tmpl/grad-tag gamma))
+                                              dbeta (gensym-fn "dbeta" (tmpl/grad-tag beta))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/layer-norm-backward-dx
                                                              adjoint-sym x gamma batch features eps)
@@ -2155,11 +2158,11 @@
 ;; group-norm template — direct calls to per-gradient deftms
 (tmpl/merge-into-template! 'raster.dl.nn/group-norm
                            {:params '[x gamma beta batch channels spatial groups eps] :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x gamma _beta batch channels spatial groups eps]
+                            :grads-fn (fn [ctx [x gamma beta batch channels spatial groups eps]
                                            _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx")
-                                              dgamma (gensym-fn "dgamma")
-                                              dbeta (gensym-fn "dbeta")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dgamma (gensym-fn "dgamma" (tmpl/grad-tag gamma))
+                                              dbeta (gensym-fn "dbeta" (tmpl/grad-tag beta))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/group-norm-backward-dx
                                                              adjoint-sym x gamma batch channels spatial groups eps)
@@ -2173,11 +2176,11 @@
 (tmpl/merge-into-template! 'raster.dl.nn/batch-norm
                            {:params '[x gamma beta running-mean running-var batch features eps momentum training]
                             :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x gamma _beta _rm _rv batch features eps _momentum _training]
+                            :grads-fn (fn [ctx [x gamma beta _rm _rv batch features eps _momentum _training]
                                            _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx")
-                                              dgamma (gensym-fn "dgamma")
-                                              dbeta (gensym-fn "dbeta")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dgamma (gensym-fn "dgamma" (tmpl/grad-tag gamma))
+                                              dbeta (gensym-fn "dbeta" (tmpl/grad-tag beta))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/batch-norm-backward-dx
                                                              adjoint-sym x gamma batch features eps)
@@ -2191,11 +2194,11 @@
 (tmpl/merge-into-template! 'raster.dl.nn/conv1d
                            {:params '[x W b batch c-in length c-out kernel stride pad-left pad-right]
                             :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x W _b batch c-in length c-out kernel stride pad-left pad-right]
+                            :grads-fn (fn [ctx [x W b batch c-in length c-out kernel stride pad-left pad-right]
                                            _result-sym adjoint-sym gensym-fn]
-                                        (let [dx (gensym-fn "dx")
-                                              dW (gensym-fn "dW")
-                                              db (gensym-fn "db")]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dW (gensym-fn "dW" (tmpl/grad-tag W))
+                                              db (gensym-fn "db" (tmpl/grad-tag b))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.nn/conv1d-backward-dx
                                                              adjoint-sym x W batch c-in length c-out kernel stride pad-left pad-right)
