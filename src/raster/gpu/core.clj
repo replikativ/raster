@@ -869,11 +869,23 @@
    program can't derive: :constant = weights (uploaded once here, never re-uploaded by
    run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
    CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
-   (down)."
+   (down).
+
+   :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
+   compile-gpu-program, default :f16-xmx; a bind-time caller may override with
+   (assoc descriptor :gemm-precision …) since the descriptor is plain data):
+     :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output). Fast
+                   (systolic), but the f16 input conversion costs gradient precision
+                   (~1e-3-level composed-grad noise) — the decode/inference default.
+     :f32-scalar — bind the plain scalar f32 GEMM for ALL :gemm steps: reads the f32
+                   residents directly, no convert/transpose expansion kernels. Exact f32
+                   grads (~1e-6-level parity) — what training wants.
+   The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy."
   ([sess descriptor args] (bind-program! sess descriptor args {}))
   ([sess descriptor args roles]
    (let [device-id (:device-id @sess)
          {:keys [dtype all-params array-params allocs steps]} descriptor
+         gemm-precision (or (:gemm-precision descriptor) :f16-xmx)
          effective-roles (merge (:array-roles descriptor) roles)
          argmap (zipmap all-params args)
          dt (if (= dtype :double) :double :float)
@@ -926,12 +938,15 @@
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
                      cbuf (buf-of (:C step) :gemm-C)]
-                 (if (or (< n 8) (< k 8))
-                   ;; Small-dim fallback: the XMX kernel's 2D-block reads need a >=16-byte
-                   ;; pitch — the B-operand VNNI read's pitch is N*2 bytes (fp16) and the
-                   ;; A-operand row read's pitch is K*2 bytes, so N<8 OR K<8 violates it and
-                   ;; yields garbage (relerr ~1; K<8 shows as scrambled + zeroed C rows).
-                   ;; Bind the plain scalar f32 GEMM instead: it reads the f32 residents
+                 (if (or (= :f32-scalar gemm-precision) (< n 8) (< k 8))
+                   ;; Scalar f32 path, taken when (a) the :gemm-precision policy is
+                   ;; :f32-scalar (exact-grad training — see the docstring), or (b) the
+                   ;; XMX hardware pitch gate fires regardless of policy: the XMX
+                   ;; kernel's 2D-block reads need a >=16-byte pitch — the B-operand
+                   ;; VNNI read's pitch is N*2 bytes (fp16) and the A-operand row read's
+                   ;; pitch is K*2 bytes, so N<8 OR K<8 violates it and yields garbage
+                   ;; (relerr ~1; K<8 shows as scrambled + zeroed C rows).
+                   ;; Binds the plain scalar f32 GEMM: it reads the f32 residents
                    ;; directly, so NO convert/transpose expansion kernels at all.
                    ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
                    (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]

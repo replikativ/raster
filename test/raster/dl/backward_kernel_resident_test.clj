@@ -290,6 +290,50 @@
       (is (:resident? (get grads 'x))
           "full attention-block grad(x) must extract FULLY RESIDENT"))))
 
+;; ── :gemm-precision :f32-scalar — exact-grad GEMM policy (training) ──────────────
+;; Same composed attention block as above, but the resident :gemm steps bind the plain
+;; scalar f32 GEMM (no f32→f16 convert/transpose expansion). The ~1.7e-2 composed
+;; divergence of the default :f16-xmx path is pure f16 INPUT-CONVERSION noise, not an
+;; AD/compile defect — under :f32-scalar the same compiled program matches the CPU f32
+;; reference at ~1e-6-level. This pins the policy end-to-end: compile-gpu-program
+;; carries :gemm-precision on the descriptor, bind-program! binds scalar GEMMs for it.
+(deftest attn-block-f32-scalar-gemm-precision-parity
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] attn-block :f32-scalar gemm-precision parity: no Level Zero GPU")
+    (let [seq 6 dmodel 32 nq 4 nkv 1 hd 8 eps 1e-6 go 1.0 theta 10000.0
+          x  (fa (* seq dmodel) 31) wn (fa dmodel 32)
+          Wq (fa (* dmodel (* nq hd)) 33) Wk (fa (* dmodel (* nkv hd)) 34)
+          Wv (fa (* dmodel (* nkv hd)) 35) Wo (fa (* (* nq hd) dmodel) 36)
+          tgt (fa (* seq dmodel) 37)
+          {:keys [grads]}
+          (gp/grad-parity #'attn-block-parity-loss
+                          [{:name 'x :type '(Array float) :val x}
+                           {:name 'wn :type '(Array float) :val wn}
+                           {:name 'Wq :type '(Array float) :val Wq}
+                           {:name 'Wk :type '(Array float) :val Wk}
+                           {:name 'Wv :type '(Array float) :val Wv}
+                           {:name 'Wo :type '(Array float) :val Wo}
+                           {:name 'tgt :type '(Array float) :val tgt}
+                           {:name 'seq :type 'Long :val seq}
+                           {:name 'dmodel :type 'Long :val dmodel}
+                           {:name 'nq :type 'Long :val nq}
+                           {:name 'nkv :type 'Long :val nkv}
+                           {:name 'hd :type 'Long :val hd}
+                           {:name 'eps :type 'Double :val eps}
+                           {:name 'go :type 'Double :val go}
+                           {:name 'theta :type 'Double :val theta}]
+                          :grad-args '[x]
+                          :gemm-precision :f32-scalar
+                          ;; exact-f32 GEMM: only summation-order noise remains
+                          ;; (CPU BLAS sgemm vs scalar device GEMM, both f32).
+                          :rtol 1.0e-5)]
+      (println "  [attn-block :f32-scalar] grad(x) steps:" (:step-kinds (get grads 'x))
+               "rel-err" (:rel-err (get grads 'x)))
+      (is (:resident? (get grads 'x))
+          "attn-block grad(x) under :gemm-precision :f32-scalar must extract FULLY RESIDENT")
+      (is (some #{:gemm} (:step-kinds (get grads 'x)))
+          "the policy case must actually exercise resident :gemm steps"))))
+
 ;; ── B2 MILESTONE: RESIDUAL-connection fan-out value+grad, FULLY RESIDENT ──────────
 ;; A real decoder layer has RESIDUAL connections (the attention block above has none):
 ;; a value `x1 = residual-add(x, m)` feeds BOTH the next `residual-add(x1, o)` AND

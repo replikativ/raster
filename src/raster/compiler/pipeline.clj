@@ -1463,8 +1463,25 @@
                         correct default: a caller that binds the result to a session graph would
                         otherwise silently record an EMPTY graph (all-zero output). See #42.
      :nil             — return nil, for probing callers that legitimately fall back to the
-                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test)."
-  [f-var device-id & {:keys [dtype on-non-resident] :or {on-non-resident :throw}}]
+                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
+
+   :gemm-precision sets the resident :gemm binding policy CARRIED on the descriptor
+   (bind-program! reads it; a bind-time caller may still override with
+   (assoc descriptor :gemm-precision …)):
+     :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C. Fast, but the f16 input
+                          conversion costs gradient precision (~1e-3-level composed-grad
+                          noise) — right for decode/inference.
+     :f32-scalar        — plain scalar f32 GEMM for ALL :gemm steps (reads f32 residents
+                          directly, no convert/transpose expansion). Exact f32 grads
+                          (~1e-6-level parity) — right for training.
+   No size heuristics; the XMX hardware pitch gate (n<8 or k<8 → scalar) applies in
+   bind-program! regardless of policy."
+  [f-var device-id & {:keys [dtype on-non-resident gemm-precision]
+                      :or {on-non-resident :throw gemm-precision :f16-xmx}}]
+  (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
+    (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
+                         " (expected :f16-xmx or :f32-scalar)")
+                    {:gemm-precision gemm-precision})))
   (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
@@ -1586,6 +1603,7 @@
                                     array-params)))]
     (when prog
       {:dtype effective-dtype
+       :gemm-precision gemm-precision
        :all-params all-params
        :array-params array-params
        :array-roles array-roles
