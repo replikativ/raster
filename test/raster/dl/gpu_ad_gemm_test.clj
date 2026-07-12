@@ -114,11 +114,17 @@
           (is (< (rel-err out cpu) tol) (str "sum-kv relerr " (rel-err out cpu))))))))
 
 ;; ── Fused causal SDPA forward (dense-attention-on-GPU Phase 2+3) ─────────────────
-;; batched-causal-sdpa's FORWARD is a SINGLE resident par/map-void! causal-attention
-;; kernel (one work-item per (batch, query row)); its result equals the per-batch
+;; batched-causal-sdpa's FORWARD is THREE resident par/map-void! kernels — scores
+;; (one work item per (b,i,j)), the per-row softmax sweep, and the W·V accumulation
+;; (one work item per OUTPUT ELEMENT (b,i,d)) — with NO GEMM and no host scalar-let.
+;; (It was one work-item-per-(batch,query-row) kernel until S2a: that shape is only
+;; b·seq = 256 work items wide at gemma dims and recomputed each QKᵀ dot three times;
+;; the materialized-W shape is 65536 items wide and computes each dot once. The
+;; materialized W is also what dQ/dK/dV read, so a fused value+grad program CSEs the
+;; forward re-run's W with the backward's.) Its result equals the per-batch
 ;; GEMM+softmax reference, and gqa-causal-mha (pack→broadcast→fused-sdpa→unpack)
-;; compiles to a FULLY resident program. The backward is unchanged (recomputes its own
-;; forward), covered by decoder-ad-test's FD checks.
+;; compiles to a FULLY resident program. Backward FD gates: decoder-ad-test +
+;; backward-kernel-resident-test.
 
 (defn- ref-batched-sdpa
   "Per-batch causal SDPA via the tested single-head causal-scaled-dot-product-attn —
@@ -146,15 +152,16 @@
         (str "fused batched-causal-sdpa vs GEMM reference relerr " (rel-err fused ref)))))
 
 (deftest fused-causal-sdpa-resident
-  ;; batched-causal-sdpa forward lowers to ONE resident :map-void kernel and matches CPU.
+  ;; batched-causal-sdpa forward lowers to resident :map-void kernels ONLY (scores /
+  ;; row-softmax / W·V accumulation — no GEMM, no host scalar-let) and matches CPU.
   (if-not @gpu-available?
     (println "  [SKIP] fused-causal-sdpa-resident: no Level Zero GPU")
     (let [batch 4 seq-len 6 hd 8 n (* batch seq-len hd)
           Q (rnd n 71) K (rnd n 72) V (rnd n 73)
           cpu (attn/batched-causal-sdpa Q K V batch seq-len hd)
           {:keys [descriptor out]} (run-resident #'attn/batched-causal-sdpa [Q K V batch seq-len hd])]
-      (is (= [:map-void] (mapv :convention (:steps descriptor)))
-          "fused causal SDPA is a single resident :map-void kernel (no GEMM, no host scalar-let)")
+      (is (= [:map-void :map-void :map-void] (mapv :convention (:steps descriptor)))
+          "causal SDPA lowers to the three resident :map-void kernels (no GEMM, no host scalar-let)")
       (is (< (rel-err out cpu) 1e-5) (str "fused-sdpa GPU relerr " (rel-err out cpu))))))
 
 (deftest gqa-causal-mha-forward-fully-resident
