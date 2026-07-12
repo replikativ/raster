@@ -29,7 +29,7 @@
 ;; ---- RoPE ----
 (deftm rope-loss [x :- (Array float) tgt :- (Array float)
                   seq :- Long heads :- Long hd :- Long theta :- Double] :- Double
-  (let [y (raster.dl.attention/rope x seq heads hd theta)
+  (let [y (raster.dl.attention/rope x 1 seq heads hd theta)
         n* (clojure.core/* seq (clojure.core/* heads hd))]
     (loop [i 0 s 0.0]
       (if (clojure.core/< i n*)
@@ -73,7 +73,7 @@
 ;; ---- GQA / MQA causal attention ----
 (deftm gqa-loss [Q :- (Array double) K :- (Array double) V :- (Array double) tgt :- (Array double)
                  seq :- Long nq :- Long nkv :- Long hd :- Long] :- Double
-  (raster.dl.loss/mse-loss (raster.dl.attention/gqa-causal-mha Q K V seq nq nkv hd)
+  (raster.dl.loss/mse-loss (raster.dl.attention/gqa-causal-mha Q K V 1 seq nq nkv hd)
                            tgt (clojure.core/* seq (clojure.core/* nq hd))))
 
 (deftest gqa-attention-grad

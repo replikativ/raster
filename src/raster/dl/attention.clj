@@ -75,13 +75,17 @@
 ;; dotimes the resident extractor rejected. Pairing/theta semantics are bit-
 ;; identical to rope-prefill! (t = position p): out[base+i] = x0·c − x1·s,
 ;; out[base+i+hdim2] = x1·c + x0·s, with freq = θ^(−2i/d), ang = p·freq.
-(deftm rope (All [T] [x :- (Array T) seq-len :- Long heads :- Long
+(deftm rope (All [T] [x :- (Array T) batch :- Long seq-len :- Long heads :- Long
                       head-dim :- Long theta :- Double] :- (Array T)
-                 (let [out (alloc-like x (* seq-len (* heads head-dim)))]
-                   (raster.par/map-void! idx (clojure.core/* seq-len (clojure.core/* heads (quot head-dim 2)))
+                 (let [rows (* batch seq-len)
+                       out (alloc-like x (* rows (* heads head-dim)))]
+                   (raster.par/map-void! idx (clojure.core/* (clojure.core/* batch seq-len)
+                                                             (clojure.core/* heads (quot head-dim 2)))
                                          (let [hdim2 (quot head-dim 2)
                                                per-row (clojure.core/* heads hdim2)
                                                t (quot idx per-row)
+                                               ;; position resets per example: row t = b*seq-len + p
+                                               p (rem t seq-len)
                                                rest0 (rem idx per-row)
                                                h (quot rest0 hdim2)
                                                i (rem rest0 hdim2)
@@ -89,7 +93,7 @@
                                                                     (clojure.core/* h head-dim))
                                                ln-theta (m/log theta)
                                                freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                               ang (* (double t) freq)
+                                               ang (* (double p) freq)
                                                c (m/cos ang) s (m/sin ang)
                                                x0 (aget x (clojure.core/+ base i))
                                                x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
@@ -107,13 +111,16 @@
 ;; :map-void kernel. c/s recomputed identically to the forward (theta-exact):
 ;;   dx[base+i]       =  c·dy0 + s·dy1
 ;;   dx[base+i+hdim2] =  c·dy1 − s·dy0
-(deftm rope-backward-dx (All [T] [dy :- (Array T) seq-len :- Long heads :- Long
+(deftm rope-backward-dx (All [T] [dy :- (Array T) batch :- Long seq-len :- Long heads :- Long
                                   head-dim :- Long theta :- Double] :- (Array T)
-                             (let [dx (alloc-like dy (* seq-len (* heads head-dim)))]
-                               (raster.par/map-void! idx (clojure.core/* seq-len (clojure.core/* heads (quot head-dim 2)))
+                             (let [rows (* batch seq-len)
+                                   dx (alloc-like dy (* rows (* heads head-dim)))]
+                               (raster.par/map-void! idx (clojure.core/* (clojure.core/* batch seq-len)
+                                                                         (clojure.core/* heads (quot head-dim 2)))
                                                      (let [hdim2 (quot head-dim 2)
                                                            per-row (clojure.core/* heads hdim2)
                                                            t (quot idx per-row)
+                                                           p (rem t seq-len)
                                                            rest0 (rem idx per-row)
                                                            h (quot rest0 hdim2)
                                                            i (rem rest0 hdim2)
@@ -121,7 +128,7 @@
                                                                                 (clojure.core/* h head-dim))
                                                            ln-theta (m/log theta)
                                                            freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                                           ang (* (double t) freq)
+                                                           ang (* (double p) freq)
                                                            c (m/cos ang) s (m/sin ang)
                                                            d0 (aget dy (clojure.core/+ base i))
                                                            d1 (aget dy (clojure.core/+ (clojure.core/+ base i) hdim2))]
@@ -130,13 +137,13 @@
                                dx)))
 
 (tmpl/merge-into-template! 'raster.dl.attention/rope
-                           {:params '[x seq-len heads head-dim theta] :result nil :adjoint 'dy
-                            :grads-fn (fn [ctx [x seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
+                           {:params '[x batch seq-len heads head-dim theta] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [x batch seq-len heads head-dim theta] _result-sym adjoint-sym gensym-fn]
                                         (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                           [(update ctx :bindings into
                                                    [dx (list 'raster.dl.attention/rope-backward-dx
-                                                             adjoint-sym seq-len heads head-dim theta)])
-                                           [dx nil nil nil nil]]))})
+                                                             adjoint-sym batch seq-len heads head-dim theta)])
+                                           [dx nil nil nil nil nil]]))})
 
 ;; --- Grouped / multi-query causal attention ---
 ;; q:[seq,n_q,hd]  k,v:[seq,n_kv,hd]  (n_kv divides n_q; n_kv<n_q = GQA, n_kv=1 = MQA).
@@ -1376,33 +1383,57 @@
 
 (deftm gqa-causal-mha
   "Differentiable grouped/multi-query causal self-attention over PRE-PROJECTED,
-  PRE-ROPED Q:[seq,n_q·hd] and K/V:[seq,n_kv·hd] (n_kv divides n_q; n_kv<n_q = GQA,
-  n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv). Returns [seq, n_q·hd].
+  PRE-ROPED Q:[batch·seq, n_q·hd] and K/V:[batch·seq, n_kv·hd] (n_kv divides n_q;
+  n_kv<n_q = GQA, n_kv=1 = MQA). Query head hq reads kv head hq/(n_q/n_kv).
+  Rows are EXAMPLE-MAJOR (row = b·seq + s); returns [batch·seq, n_q·hd]. Causality
+  is per example — example b attends only within its own seq rows, never across the
+  batch. `batch` = 1 is the single-sequence case.
 
   FLAT decomposition (no per-head carry loop): pack Q/K/V to per-head-contiguous
   layout, BROADCAST the n_kv kv heads up to the n_q query heads (broadcast-kv-heads),
-  run a batched causal SDPA over the n_q head slabs, then unpack the disjoint
-  per-head outputs back to [seq, n_q·hd]. Every step is an AD-registered primitive
-  with a FLAT grads-fn (pack↔unpack, broadcast-kv-heads↔sum-kv-heads,
+  run a batched causal SDPA over the head slabs, then unpack the disjoint per-head
+  outputs back to [batch·seq, n_q·hd]. Every step is an AD-registered primitive with
+  a FLAT grads-fn (pack↔unpack, broadcast-kv-heads↔sum-kv-heads,
   batched-causal-sdpa↔its backward), so value+grad differentiates it as a
   straight-line let* — NO fn* pullback / ArrayList tape (the old raw carry loop
   emitted one, which cannot lower to GPU). The MQA/GQA dK/dV fan-in (the `group`
   query heads sharing one kv head) falls out exactly as sum-kv-heads (the
   broadcast dual). Scale is 1/sqrt(hd) (Llama/Qwen; Gemma when
-  query_pre_attn_scalar = head_dim). The output projection is a separate linear-nb."
+  query_pre_attn_scalar = head_dim). The output projection is a separate linear-nb.
+
+  BATCHING IS A RELAYOUT, NOT A NEW KERNEL. The batch axis is carried entirely by
+  the SHAPE LITERALS handed to the four existing ops — none of them changes, and the
+  backward (their duals) batches for free. The enabling choice is a HEAD-MAJOR slab
+  order: pack-heads over `rows = batch·seq` emits n_h blocks of B·seq·hd, so the
+  [seq, hd] slabs land at slab index (h·batch + b) — head outer, example inner. Then
+
+    pack-heads    x[(b·seq+s)·(n_h·hd) + h·hd + d] → slab (h·batch + b), row s   ✓
+    broadcast-kv  block size B·seq·hd, so kv head g's WHOLE [batch,seq,hd] block is
+                  repeated `group` times → out block h_q = block (h_q/group), i.e.
+                  out slab (h_q·batch + b) = kv slab ((h_q/group)·batch + b)       ✓
+    batched-sdpa  batch := n_q·batch disjoint [seq,hd] slabs, each causal within its
+                  OWN seq rows — examples cannot mix (no cross-slab accumulation)   ✓
+    unpack-heads  the exact inverse permutation back to [batch·seq, n_q·hd]         ✓
+
+  (An example-major slab order (b·n_h + h) would instead force a strided variant of
+  broadcast-kv-heads, since consecutive-repeat fan-out only lines up when the batch
+  axis is INSIDE the head axis. Hence head-major.) The GEMMs feeding this op just see
+  a taller m = batch·seq — free occupancy; only the softmax/SDPA slab COUNT grows."
   (All [T]
        [Q :- (Array T) K :- (Array T) V :- (Array T)
-        seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+        batch :- Long seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
        :- (Array T)
        (let [group (quot n-q n-kv)
-             slab  (* seq-len head-dim)
-             Qp (ops/pack-heads Q seq-len n-q head-dim)
-             Kp (ops/pack-heads K seq-len n-kv head-dim)
-             Vp (ops/pack-heads V seq-len n-kv head-dim)
-             Ke (ops/broadcast-kv-heads Kp n-kv group slab)
-             Ve (ops/broadcast-kv-heads Vp n-kv group slab)
-             Op (batched-causal-sdpa Qp Ke Ve n-q seq-len head-dim)]
-         (ops/unpack-heads Op seq-len n-q head-dim))))
+             rows  (* batch seq-len)
+             ;; per-HEAD block spanning all `batch` examples (the broadcast unit)
+             bslab (* batch (* seq-len head-dim))
+             Qp (ops/pack-heads Q rows n-q head-dim)
+             Kp (ops/pack-heads K rows n-kv head-dim)
+             Vp (ops/pack-heads V rows n-kv head-dim)
+             Ke (ops/broadcast-kv-heads Kp n-kv group bslab)
+             Ve (ops/broadcast-kv-heads Vp n-kv group bslab)
+             Op (batched-causal-sdpa Qp Ke Ve (* n-q batch) seq-len head-dim)]
+         (ops/unpack-heads Op rows n-q head-dim))))
 
 ;; gqa-causal-mha has NO hand-written reverse rule of its own: it is composed
 ;; entirely from AD-registered primitives with flat grads-fn templates
@@ -1421,27 +1452,35 @@
   (All [T]
        [dQ :- (Array T) dK :- (Array T) dV :- (Array T)
         Q :- (Array T) K :- (Array T) V :- (Array T)
-        seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
+        batch :- Long seq-len :- Long n-q :- Long n-kv :- Long head-dim :- Long]
        :- (Array T)
        (let [group (quot n-q n-kv)
              qstride (* n-q head-dim)
              kvstride (* n-kv head-dim)
-             dOut (alloc-like Q (* seq-len qstride))]
-         (dotimes [hq n-q]
-           (let [hkv (quot hq (int group))
-                 Qh (ops/slice-strided-2d Q seq-len qstride (* hq (int head-dim)) head-dim)
-                 Kh (ops/slice-strided-2d K seq-len kvstride (* hkv (int head-dim)) head-dim)
-                 Vh (ops/slice-strided-2d V seq-len kvstride (* hkv (int head-dim)) head-dim)
-                 dQh (ops/slice-strided-2d dQ seq-len qstride (* hq (int head-dim)) head-dim)
-                 dKh (ops/slice-strided-2d dK seq-len kvstride (* hkv (int head-dim)) head-dim)
-                 dVh (ops/slice-strided-2d dV seq-len kvstride (* hkv (int head-dim)) head-dim)
-                 dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
-                                                         seq-len head-dim head-dim)]
-             (dotimes [r seq-len]
-               (let [qoff (+ (* r (int qstride)) (* hq (int head-dim)))
-                     hoff (* r (int head-dim))]
-                 (dotimes [c head-dim]
-                   (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))
+             dOut (alloc-like Q (* batch (* seq-len qstride)))]
+         ;; per (example, query head): each example's `seq` rows are an independent
+         ;; causal sequence. slice-strided-2d's col-offset is a FLAT additive offset,
+         ;; so the example base (b·seq·stride) folds into it with rows := seq-len.
+         (dotimes [b batch]
+           (let [qbase (* b (int (* seq-len qstride)))
+                 kvbase (* b (int (* seq-len kvstride)))]
+             (dotimes [hq n-q]
+               (let [hkv (quot hq (int group))
+                     qoff0 (+ qbase (* hq (int head-dim)))
+                     kvoff0 (+ kvbase (* hkv (int head-dim)))
+                     Qh (ops/slice-strided-2d Q seq-len qstride qoff0 head-dim)
+                     Kh (ops/slice-strided-2d K seq-len kvstride kvoff0 head-dim)
+                     Vh (ops/slice-strided-2d V seq-len kvstride kvoff0 head-dim)
+                     dQh (ops/slice-strided-2d dQ seq-len qstride qoff0 head-dim)
+                     dKh (ops/slice-strided-2d dK seq-len kvstride kvoff0 head-dim)
+                     dVh (ops/slice-strided-2d dV seq-len kvstride kvoff0 head-dim)
+                     dOh (causal-scaled-dot-product-attn-jvp dQh dKh dVh Qh Kh Vh
+                                                             seq-len head-dim head-dim)]
+                 (dotimes [r seq-len]
+                   (let [qoff (+ qoff0 (* r (int qstride)))
+                         hoff (* r (int head-dim))]
+                     (dotimes [c head-dim]
+                       (aset dOut (+ qoff c) (aget dOh (+ hoff c))))))))))
          dOut)))
 
 ;; gqa-causal-mha :jvp-fn — one kernel call; absent tangents get typed zeros
@@ -1449,7 +1488,7 @@
 (tmpl/merge-into-template!
  'raster.dl.attention/gqa-causal-mha
  {:jvp-fn
-  (fn [ctx [Q K V seq-len n-q n-kv head-dim] tangent-args _result-sym gensym-fn]
+  (fn [ctx [Q K V batch seq-len n-q n-kv head-dim] tangent-args _result-sym gensym-fn]
     (let [dQ (nth tangent-args 0 nil)
           dK (nth tangent-args 1 nil)
           dV (nth tangent-args 2 nil)]
@@ -1461,7 +1500,7 @@
                                 (or dQ (tmpl/jvp-zero-like Q))
                                 (or dK (tmpl/jvp-zero-like K))
                                 (or dV (tmpl/jvp-zero-like V))
-                                Q K V seq-len n-q n-kv head-dim))))})
+                                Q K V batch seq-len n-q n-kv head-dim))))})
 
 ;; ================================================================
 ;; Multi-head self-attention (bidirectional, for BERT-style models)

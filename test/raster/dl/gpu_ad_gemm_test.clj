@@ -173,13 +173,13 @@
     (println "  [SKIP] gqa-causal-mha-fully-resident: no Level Zero GPU")
     (let [seq-len 6 nq 4 nkv 1 hd 8
           Q (rnd (* seq-len nq hd) 81) K (rnd (* seq-len nkv hd) 82) V (rnd (* seq-len nkv hd) 83)
-          cpu (attn/gqa-causal-mha Q K V seq-len nq nkv hd)
+          cpu (attn/gqa-causal-mha Q K V 1 seq-len nq nkv hd)
           p (pl/compile-gpu-program #'attn/gqa-causal-mha :ze:0 :dtype :float :on-non-resident :nil)]
       (is (some? p) "gqa-causal-mha forward compiles to a resident descriptor (no non-resident binding)")
       (when p
         (is (every? #(= :map-void %) (mapv :convention (:steps p)))
             "every gqa-causal-mha forward step is a resident :map-void kernel")
-        (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V seq-len nq nkv hd])]
+        (let [{:keys [out]} (run-resident #'attn/gqa-causal-mha [Q K V 1 seq-len nq nkv hd])]
           (is (< (rel-err out cpu) 1e-5) (str "gqa-causal-mha GPU relerr " (rel-err out cpu))))))))
 
 (deftest gpu-gemm-small-n-scalar-fallback
