@@ -1350,7 +1350,17 @@
                 (vswap! device-buffers conj sym))
             (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
             (if-let [s (parse-gpu-step sym expr)]
-              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym)
+                  ;; A :map step's runtime VALUE is its out buffer (invoke-registered-kernel
+                  ;; returns output-array), so the binding sym is a pure alias of the out
+                  ;; array. Copy-propagate it like any other array alias — a later step
+                  ;; that reads the binding sym (e.g. the primary of a horizontally-fused
+                  ;; multi-output map, whose out is a fusion-materialized buffer) must
+                  ;; resolve to the REAL resident buffer at bind time.
+                  (when (= :map (:convention s))
+                    (let [out (last (:arrays s))]
+                      (when (and (symbol? out) (not= sym out))
+                        (vswap! aliases assoc sym out)))))
               (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
             (gemm-invk? expr)

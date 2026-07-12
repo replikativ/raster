@@ -354,6 +354,51 @@
       (is (:resident? (get grads 'x))
           "residual fan-out grad(x) must extract FULLY RESIDENT"))))
 
+;; ── horizontal-fusion multi-output regression (the gemma-block extraction bug) ────
+;; Two independent same-bound pure elementwise branches (g = a⊙a, u = b⊙b) consumed
+;; elementwise (y = g⊙u) then reduced (mse) — the residual/fan-out shape of the gemma
+;; FFN at tiny dims. The SOAC fuser horizontally fuses the branch pair into ONE
+;; multi-output map whose SECONDARY output buffer (`hfuse_out__N`) exists only as a
+;; side-effect aset in the fused lambda; the backward re-creates the same pair
+;; (da = d_y⊙…, db = d_y⊙…). This pins three formerly-broken layers:
+;;   1. SOAC io classification: an aset-written array is an array OUTPUT, never a
+;;      scalar (before: the kernel declared `float hfuse_out__N` and the extraction
+;;      eval'd the bare buffer sym on the host → `Unable to resolve symbol`).
+;;   2. Resident extraction: a :map step's binding sym ALIASES its out buffer
+;;      (invoke-registered-kernel returns it), so a later step reading the fused
+;;      PRIMARY's binding resolves to the real resident buffer at bind time.
+;;   3. resolve-alength: `(alength <invoke-binding>)` — a later fused branch's bound —
+;;      resolves through the invoke's registered buffer semantics (:in-place-arg) to
+;;      the out buffer's alloc size instead of surviving as a host read of a device
+;;      buffer.
+(deftm hfuse-two-branch-loss
+  [a :- (Array float) b :- (Array float) tgt :- (Array float) n :- Long] :- Double
+  (let [g (raster.dl.nn/hadamard a a n)
+        u (raster.dl.nn/hadamard b b n)
+        y (raster.dl.nn/hadamard g u n)]
+    (raster.dl.loss/mse-loss y tgt n)))
+
+(deftest horizontal-fusion-multi-output-resident-parity
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] horizontal-fusion multi-output resident parity: no Level Zero GPU")
+    (let [n 32
+          a (fa n 61) b (fa n 62) tgt (fa n 63)
+          {:keys [grads]}
+          (gp/grad-parity #'hfuse-two-branch-loss
+                          [{:name 'a :type '(Array float) :val a}
+                           {:name 'b :type '(Array float) :val b}
+                           {:name 'tgt :type '(Array float) :val tgt}
+                           {:name 'n :type 'Long :val n}]
+                          ;; grad(a) reads the fused PRIMARY output (the invoke-binding
+                          ;; alias), grad(b) the SECONDARY (the hfuse_out alias binding).
+                          :grad-args '[a b]
+                          :rtol 1.0e-5)]
+      (doseq [g '[a b]]
+        (println "  [hfuse] grad(" g ") steps:" (:step-kinds (get grads g))
+                 "rel-err" (:rel-err (get grads g)))
+        (is (:resident? (get grads g))
+            (str "fused multi-output grad(" g ") must extract FULLY RESIDENT"))))))
+
 (deftest rope-value+grad-resident-parity
   (if-not @gp/gpu-available?
     (println "  [SKIP] rope resident parity: no Level Zero GPU")
