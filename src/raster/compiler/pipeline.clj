@@ -413,6 +413,17 @@
   ;; resolver never found anything left to do. The fixpoint-edge census throw
   ;; (record-fixpoint-census!) guards the invariant: a regression shows up as
   ;; a loud GPU compile error here, not a first-compile-fails flake.
+  ;;
+  ;; POSTSCRIPT (2026-07-12): deleting the epilogue was right, and the census DID
+  ;; do its job — it caught a cold-JVM under-devirtualization (6 undevirtualized
+  ;; raster.dl.nn/rms-norm on a fresh JVM, clean on a warm one). But the bug was
+  ;; never IN the fixpoint: a parametric (All [T]) deftm registers only its
+  ;; `double` specialization at definition time, so the var's TC signature —
+  ;; built from the dispatch TABLE — rejected every float call site, and a body
+  ;; with TC type-errors has ALL its binding types discarded, leaving the call's
+  ;; arg tags nil so try-parametric-specialize! could not fire. Re-expanding here
+  ;; would never have fixed that; declaring the template's float signature up
+  ;; front does (dispatch/parametric-tc-sigs). The census is the messenger.
   (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
         opts (assoc opts :simplify? true)]
