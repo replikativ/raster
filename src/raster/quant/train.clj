@@ -147,8 +147,8 @@
 ;; Only x gets a gradient; the quantized weight is frozen (nil for the rest).
 (tmpl/merge-into-template! 'raster.quant.train/qlinear-q8
   {:params '[x codes scales m in out] :result nil :adjoint 'dy
-   :grads-fn (fn [ctx [_x codes scales m in out] _result-sym adjoint-sym gensym-fn]
-               (let [dx (gensym-fn "dx")]
+   :grads-fn (fn [ctx [x codes scales m in out] _result-sym adjoint-sym gensym-fn]
+               (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                  [(update ctx :bindings into
                           [dx (list 'raster.quant.train/qlinear-q8-dx
                                     adjoint-sym codes scales m in out)])

@@ -9,11 +9,23 @@
    par form vocabulary but produce different target code."
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.backend.gpu.par-opencl :as legacy]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
+
+;; Buffer semantics of the emitted kernel-invoke marker: invoke-registered-kernel
+;; WRITES its `out` arg in place (arg 2 of [kname inputs out scalars n]) and
+;; RETURNS it, so the binding sym is a pure alias of the out buffer. Declared in
+;; the registry (not pattern-matched in passes) so resolve-alength's call-through
+;; alias tracking resolves `(alength <invoke-binding>)` to the out buffer's alloc
+;; size — a shape horizontal fusion produces when a later map's bound reads the
+;; length of a fused map's result.
+(descriptor/register-op-descriptor!
+ 'raster.gpu.ze-runtime/invoke-registered-kernel
+ {:buffer {:allocates? false :in-place-arg 2}})
 
 ;; ================================================================
 ;; Single source of declared GPU param types (shared by BOTH compile entries:

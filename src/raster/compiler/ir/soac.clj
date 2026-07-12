@@ -89,13 +89,22 @@
 (defn- extract-io
   "Extract inputs, outputs, and scalars from a SOAC lambda.
   inputs: array syms read via aget
-  outputs: the output array sym(s)
-  scalars: free syms minus inputs, outputs, idx, acc, and operators"
+  outputs: the output array sym(s) PLUS any array the lambda writes via aset
+  scalars: free syms minus inputs, outputs, idx, acc, and operators
+
+  INVARIANT: an array symbol written inside the lambda is an array OUTPUT of
+  the SOAC — never a scalar. The structural out slot alone is not enough: a
+  horizontally-fused multi-output map carries its secondary outputs only as
+  side-effect asets in the lambda body (soac->par-form flattens the fused node
+  to a single-out par/map!), so the write-side collection is what keeps them
+  classified as array params when the par form is re-parsed."
   [lambda idx-sym out-syms & {:keys [acc-sym]}]
   (let [inputs (collect-aget-arrays lambda)
+        written (par/collect-aset-arrays lambda)
         all-free (util/free-syms lambda)
         exclude (set/union inputs
                            (set out-syms)
+                           written
                            #{idx-sym}
                            (if acc-sym #{acc-sym} #{})
                            ;; Exclude common operators/literals that appear as symbols
@@ -103,7 +112,7 @@
                                       #{'do 'let 'let* 'if 'double 'float 'int 'long}))
         scalars (set/difference all-free exclude)]
     {:inputs inputs
-     :outputs (set out-syms)
+     :outputs (into (set out-syms) written)
      :scalars scalars}))
 
 ;; ================================================================

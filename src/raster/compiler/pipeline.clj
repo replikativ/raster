@@ -404,41 +404,25 @@
   Max 5 iterations to prevent divergence.
   (=> :* :fixpointed)"
   [form opts]
+  ;; NOTE (plan D2): the former GPU-determinism finalize epilogue (re-tag +
+  ;; resolve-generic-deftm-calls + re-expand at convergence, for cold-JVM
+  ;; AD-emitted generic calls) was DELETED after instrumentation proved it a
+  ;; no-op: 0 activations across the full fresh-JVM suite incl. every resident
+  ;; GPU compile (2026-07-11). Phase-1c emission-time devirtualization
+  ;; obsoleted it — AD-emitted calls now devirtualize at emission, so the
+  ;; resolver never found anything left to do. The fixpoint-edge census throw
+  ;; (record-fixpoint-census!) guards the invariant: a regression shows up as
+  ;; a loud GPU compile error here, not a first-compile-fails flake.
   (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
-        opts (assoc opts :simplify? true)
-        ;; GPU determinism epilogue (cold-compile inline gate). An AD-emitted generic
-        ;; parametric call (e.g. linear-dx from linear-nb's grads-fn) can survive the
-        ;; whole fixpoint UNdevirtualized when the incremental type env can't type an
-        ;; intermediate arg yet. On a FRESH JVM the later resolve-generic-deftm-calls
-        ;; (buffer-fuse/late-cleanup) then devirtualizes it to `.invk foo_m_floats…-impl`
-        ;; — creating the float specialization as a SIDE EFFECT — but that is AFTER the
-        ;; last inline pass, so the .invk survives to resident extraction and the first
-        ;; compile-gpu-program fails while the second succeeds. Run the same resolver
-        ;; HERE at convergence and, if it devirtualized anything, expand once more so
-        ;; the first compile inlines exactly like every later one. GPU-gated: CPU
-        ;; backends call .invk directly, so late devirtualization is sufficient there
-        ;; (and the shared-suite behavior stays untouched).
-        finalize (fn [current]
-                   (if-not (and (device/gpu-target? (:target-device opts))
-                                (form/binding-form? current))
-                     current
-                     ;; The resolver needs binding :tag metadata — the AD-emitted
-                     ;; bindings from THIS fixpoint don't carry it yet (late-cleanup
-                     ;; re-tags for the same reason before ITS resolve call).
-                     (let [tagged (tag-binding-types current (:param-env opts))
-                           resolved (inline/resolve-generic-deftm-calls
-                                     tagged (:param-env opts))]
-                       (if (= resolved tagged)
-                         current
-                         (inline/expand-for-backends resolved 3 (:param-env opts))))))]
+        opts (assoc opts :simplify? true)]
     (reset! fixpoint-census [])
     (loop [current form
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        (let [final (ensure-let*-result (finalize current))]
-          (record-fixpoint-census! :final final)
+        (let [final (ensure-let*-result current)]
+          (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
               expanded (binding [inline/*ad-transform-body-fn* ad-reverse/transform-body]
@@ -459,12 +443,12 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            (let [final (ensure-let*-result (finalize current))]
-              (record-fixpoint-census! :final final)
+            (let [final (ensure-let*-result current)]
+              (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})
             (do
-              (record-fixpoint-census! iter rewalked)
+              (record-fixpoint-census! iter rewalked opts)
               (recur rewalked (inc iter)
                      (assoc total-stats :fixpoint-iterations (inc iter))))))))))
 
@@ -568,18 +552,88 @@
     (vector? e) :vector
     :else :atom))
 
+(def ^:private census-exempt-int-arith-heads
+  "clojure.core integer index/dim arithmetic heads — EXEMPT from the fixpoint-edge
+  typedness contract. By convention (CLAUDE.md) integer index/counter/dimension
+  arithmetic stays clojure.core (zero-cost ladd/lsub intrinsics on the JVM, +1/-1
+  in the GPU C emitter) and is never polymorphic float arithmetic, so an untagged
+  Long-arith binding needs no :raster.type/tag to lower correctly."
+  '#{clojure.core/* clojure.core/+ clojure.core/- clojure.core//
+     clojure.core/quot clojure.core/rem clojure.core/mod
+     clojure.core/inc clojure.core/dec})
+
+(defn- census-exempt-head?
+  "The fixpoint-edge typedness contract's EXEMPT classes (measured floor, plan
+  Phase 0/2 of .internal/ad_typed_emission_plan.md), keyed by census-rhs-head:
+
+    1. void-returning SOAC/effect STATEMENT bindings (raster.par/map-void!,
+       dotimes) — the binding exists only to sequence an effect; there is no
+       result VALUE to tag (the census's untagged-binding-pairs already excludes
+       fn* pullback closures and loop*/dotimes BINDERS for the same reason).
+    2. clojure.core integer scalar arithmetic on Long dims/indices — see
+       census-exempt-int-arith-heads.
+    3. :vector — an aggregate host result (the AD [primal grads] result vector);
+       a persistent vector carries no element dtype, so tag-typedness does not
+       apply to the binding.
+
+  Everything else (raster.dl/raster.nn kernels, .invk impls, raster.numeric
+  scalar math, aliases, constants) MUST carry :raster.type/tag at the fixpoint
+  edge."
+  [head]
+  (or (contains? '#{raster.par/map-void! par/map-void! dotimes} head)
+      (contains? census-exempt-int-arith-heads head)
+      (= :vector head)))
+
 (defn- record-fixpoint-census!
   "Append one tag-completeness entry to fixpoint-census (Phase 0 of
-  .internal/ad_typed_emission_plan.md)."
-  [label form]
+  .internal/ad_typed_emission_plan.md).
+
+  Phase 2 (D1) ENFORCEMENT: at the :final entry on a GPU target (the same
+  device/gpu-target? gate pass-late-cleanup's throw uses), typedness is an
+  invariant — any NON-EXEMPT untagged binding (see census-exempt-head?) or any
+  surviving undevirtualized raster.* dispatch call THROWS with op frequencies +
+  example forms. GPU cannot fall back to IFn.invoke, and a tag lost here is
+  guessed downstream (the f32→f64 narrowing hazard) — fail loud at the AD/
+  fixpoint edge instead. CPU targets keep the warn-only census line (printed
+  under *log-tag-census* / RASTER_TAG_CENSUS)."
+  [label form opts]
   (let [untagged (untagged-binding-pairs form)
         undevirt (collect-undevirtualized form)
+        non-exempt (remove (fn [[_ e]] (census-exempt-head? (census-rhs-head e))) untagged)
         entry {:label label
                :untagged-bindings (count untagged)
                :untagged-by-head (frequencies (map (comp census-rhs-head second) untagged))
+               :non-exempt-untagged (count non-exempt)
                :undevirtualized (count undevirt)
                :undevirtualized-ops (frequencies (map first undevirt))}]
     (swap! fixpoint-census conj entry)
+    (when (and (= label :final)
+               (device/gpu-target? (:target-device opts))
+               (or (seq non-exempt) (seq undevirt)))
+      (let [trunc (fn [f] (let [s (pr-str f)] (subs s 0 (min 200 (count s)))))
+            untagged-heads (frequencies (map (comp census-rhs-head second) non-exempt))
+            untagged-examples (mapv (fn [[s e]] (trunc (list s '= e))) (take 3 non-exempt))
+            undevirt-ops (frequencies (map first undevirt))
+            undevirt-examples (mapv trunc (take 3 (distinct undevirt)))]
+        (throw (ex-info (str "fixpoint edge typedness violation on GPU target: "
+                             (count non-exempt) " non-exempt untagged binding(s) "
+                             (pr-str untagged-heads)
+                             (when (seq untagged-examples)
+                               (str " e.g. " (pr-str untagged-examples)))
+                             "; " (count undevirt) " undevirtualized dispatch call(s) "
+                             (pr-str undevirt-ops)
+                             (when (seq undevirt-examples)
+                               (str " e.g. " (pr-str undevirt-examples)))
+                             ". Tags must be CARRIED from emission (Π), never guessed "
+                             "downstream — an untagged binding here narrows f32→f64 or "
+                             "miscompiles to GPU garbage. Fix the emission site (grads-fn "
+                             "tagged gensym / template Π) or the upstream forward-path tag "
+                             "loss; exempt classes are documented at census-exempt-head?.")
+                        {:non-exempt-untagged untagged-heads
+                         :untagged-examples untagged-examples
+                         :undevirtualized undevirt-ops
+                         :undevirtualized-examples undevirt-examples
+                         :target-device (:target-device opts)}))))
     (when (and (= label :final)
                (or *log-tag-census* (System/getenv "RASTER_TAG_CENSUS"))
                (or (pos? (:untagged-bindings entry))
@@ -1350,7 +1404,17 @@
                 (vswap! device-buffers conj sym))
             (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
             (if-let [s (parse-gpu-step sym expr)]
-              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (do (vswap! steps conj s) (vswap! device-buffers conj sym)
+                  ;; A :map step's runtime VALUE is its out buffer (invoke-registered-kernel
+                  ;; returns output-array), so the binding sym is a pure alias of the out
+                  ;; array. Copy-propagate it like any other array alias — a later step
+                  ;; that reads the binding sym (e.g. the primary of a horizontally-fused
+                  ;; multi-output map, whose out is a fusion-materialized buffer) must
+                  ;; resolve to the REAL resident buffer at bind time.
+                  (when (= :map (:convention s))
+                    (let [out (last (:arrays s))]
+                      (when (and (symbol? out) (not= sym out))
+                        (vswap! aliases assoc sym out)))))
               (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
             (gemm-invk? expr)
@@ -1453,8 +1517,25 @@
                         correct default: a caller that binds the result to a session graph would
                         otherwise silently record an EMPTY graph (all-zero output). See #42.
      :nil             — return nil, for probing callers that legitimately fall back to the
-                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test)."
-  [f-var device-id & {:keys [dtype on-non-resident] :or {on-non-resident :throw}}]
+                        compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
+
+   :gemm-precision sets the resident :gemm binding policy CARRIED on the descriptor
+   (bind-program! reads it; a bind-time caller may still override with
+   (assoc descriptor :gemm-precision …)):
+     :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C. Fast, but the f16 input
+                          conversion costs gradient precision (~1e-3-level composed-grad
+                          noise) — right for decode/inference.
+     :f32-scalar        — plain scalar f32 GEMM for ALL :gemm steps (reads f32 residents
+                          directly, no convert/transpose expansion). Exact f32 grads
+                          (~1e-6-level parity) — right for training.
+   No size heuristics; the XMX hardware pitch gate (n<8 or k<8 → scalar) applies in
+   bind-program! regardless of policy."
+  [f-var device-id & {:keys [dtype on-non-resident gemm-precision]
+                      :or {on-non-resident :throw gemm-precision :f16-xmx}}]
+  (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
+    (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
+                         " (expected :f16-xmx or :f32-scalar)")
+                    {:gemm-precision gemm-precision})))
   (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
@@ -1576,6 +1657,7 @@
                                     array-params)))]
     (when prog
       {:dtype effective-dtype
+       :gemm-precision gemm-precision
        :all-params all-params
        :array-params array-params
        :array-roles array-roles

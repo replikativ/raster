@@ -119,7 +119,7 @@
 (tmpl/merge-into-template! 'raster.dl.loss/cross-entropy-loss
                            {:params '[logits target batch classes] :adjoint 'dy
                             :grads-fn (fn [ctx [logits target batch classes] _result adjoint gensym-fn]
-                                        (let [dl (gensym-fn "d_logits")]
+                                        (let [dl (gensym-fn "d_logits" (tmpl/grad-tag logits))]
                                           [(update ctx :bindings into
                                                    [dl (list 'raster.dl.loss/cross-entropy-loss-backward
                                                              adjoint logits target batch classes)])
@@ -154,7 +154,7 @@
 (tmpl/merge-into-template! 'raster.dl.loss/huber-loss
                            {:params '[pred target n delta] :adjoint 'dy
                             :grads-fn (fn [ctx [pred target n delta] _result adjoint gensym-fn]
-                                        (let [dp (gensym-fn "d_pred")]
+                                        (let [dp (gensym-fn "d_pred" (tmpl/grad-tag pred))]
                                           [(update ctx :bindings into
                                                    [dp (list 'raster.dl.loss/huber-loss-backward adjoint pred target n delta)])
                                            [dp nil nil nil]]))})
@@ -183,7 +183,7 @@
 (tmpl/merge-into-template! 'raster.dl.loss/l1-loss
                            {:params '[pred target n] :adjoint 'dy
                             :grads-fn (fn [ctx [pred target n] _result adjoint gensym-fn]
-                                        (let [dp (gensym-fn "d_pred")]
+                                        (let [dp (gensym-fn "d_pred" (tmpl/grad-tag pred))]
                                           [(update ctx :bindings into
                                                    [dp (list 'raster.dl.loss/l1-loss-backward adjoint pred target n)])
                                            [dp nil nil]]))})

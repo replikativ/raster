@@ -228,9 +228,9 @@
                             :params '[x seq-len n-heads head-dim]
                             :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_x seq-len n-heads head-dim]
+                            (fn [ctx [x seq-len n-heads head-dim]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [dx (gensym-fn "d_x")]
+                              (let [dx (gensym-fn "d_x" (tmpl/grad-tag x))]
                                 [(update ctx :bindings into
                                          [dx (list 'raster.dl.array-ops/unpack-heads
                                                    adjoint-sym seq-len n-heads head-dim)])
@@ -243,9 +243,9 @@
                             :params '[x seq-len n-heads head-dim]
                             :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_x seq-len n-heads head-dim]
+                            (fn [ctx [x seq-len n-heads head-dim]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [dx (gensym-fn "d_x")]
+                              (let [dx (gensym-fn "d_x" (tmpl/grad-tag x))]
                                 [(update ctx :bindings into
                                          [dx (list 'raster.dl.array-ops/pack-heads
                                                    adjoint-sym seq-len n-heads head-dim)])
@@ -322,8 +322,8 @@
                                 [(sum-kv-heads d-out n-kv group slab) nil nil nil]))
                             :params '[src n-kv group slab] :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_src n-kv group slab] _result-sym adjoint-sym gensym-fn]
-                              (let [d-src (gensym-fn "d_src")]
+                            (fn [ctx [src n-kv group slab] _result-sym adjoint-sym gensym-fn]
+                              (let [d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-src (list 'raster.dl.array-ops/sum-kv-heads
                                                       adjoint-sym n-kv group slab)])
@@ -335,8 +335,8 @@
                                 [(broadcast-kv-heads d-out n-kv group slab) nil nil nil]))
                             :params '[src n-kv group slab] :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_src n-kv group slab] _result-sym adjoint-sym gensym-fn]
-                              (let [d-src (gensym-fn "d_src")]
+                            (fn [ctx [src n-kv group slab] _result-sym adjoint-sym gensym-fn]
+                              (let [d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-src (list 'raster.dl.array-ops/broadcast-kv-heads
                                                       adjoint-sym n-kv group slab)])
@@ -350,9 +350,9 @@
                            {:params '[src rows row-stride col-offset n-cols]
                             :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_src rows row-stride col-offset n-cols]
+                            (fn [ctx [src rows row-stride col-offset n-cols]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-src (gensym-fn "d_src")]
+                              (let [d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-src (list 'raster.dl.array-ops/scatter-strided-2d
                                                       adjoint-sym rows row-stride col-offset n-cols)])
@@ -362,9 +362,9 @@
                            {:params '[packed rows row-stride col-offset n-cols]
                             :result nil :adjoint 'dy
                             :grads-fn
-                            (fn [ctx [_packed rows row-stride col-offset n-cols]
+                            (fn [ctx [packed rows row-stride col-offset n-cols]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-packed (gensym-fn "d_packed")]
+                              (let [d-packed (gensym-fn "d_packed" (tmpl/grad-tag packed))]
                                 [(update ctx :bindings into
                                          [d-packed (list 'raster.dl.array-ops/slice-strided-2d
                                                          adjoint-sym rows row-stride col-offset n-cols)])
@@ -927,8 +927,8 @@
                            {:params '[a b n] :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [a b n] _result-sym adjoint-sym gensym-fn]
-                              (let [da (gensym-fn "da")
-                                    db (gensym-fn "db")]
+                              (let [da (gensym-fn "da" (tmpl/grad-tag a))
+                                    db (gensym-fn "db" (tmpl/grad-tag b))]
                                 [(update ctx :bindings into
                                          [da (list 'raster.dl.array-ops/array-add-backward adjoint-sym n)
                                           db (list 'raster.dl.array-ops/array-add-backward adjoint-sym n)])
@@ -938,8 +938,10 @@
                            {:params '[h t batch dim] :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [h t batch dim] _result-sym adjoint-sym gensym-fn]
-                              (let [dh (gensym-fn "dh")
-                                    dt (gensym-fn "dt")
+                              (let [dh (gensym-fn "dh" (tmpl/grad-tag h))
+                                    dt (gensym-fn "dt" (tmpl/grad-tag t))
+                                    ;; integer element-count intermediate: Π is ⊥
+                                    ;; on long — stays untagged by design
                                     n (gensym-fn "ba_n")]
                                 [(update ctx :bindings into
                                          [n (list 'raster.numeric/* batch dim)
@@ -953,7 +955,7 @@
                             :grads-fn
                             (fn [ctx [vals indices n-dst n-pairs stride]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-vals (gensym-fn "d_vals")]
+                              (let [d-vals (gensym-fn "d_vals" (tmpl/grad-tag vals))]
                                 [(update ctx :bindings into
                                          [d-vals (list 'raster.dl.array-ops/gather
                                                        adjoint-sym indices n-dst n-pairs stride)])
@@ -965,7 +967,7 @@
                             :grads-fn
                             (fn [ctx [src indices n-src n-pairs stride]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-src (gensym-fn "d_src")]
+                              (let [d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-src (list 'raster.dl.array-ops/scatter-add
                                                       adjoint-sym indices n-src n-pairs stride)])
@@ -977,8 +979,8 @@
                             :grads-fn
                             (fn [ctx [A B idx-a idx-b n-a n-b n-pairs slice-dim total-dim n-slices]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [dA (gensym-fn "dA")
-                                    dB (gensym-fn "dB")]
+                              (let [dA (gensym-fn "dA" (tmpl/grad-tag A))
+                                    dB (gensym-fn "dB" (tmpl/grad-tag B))]
                                 [(update ctx :bindings into
                                          [dA (list 'raster.dl.array-ops/indexed-dot-dA
                                                    adjoint-sym B idx-a idx-b n-a n-pairs
@@ -996,8 +998,8 @@
                             (fn [ctx [coeffs src dst-indices src-indices n-dst n-src n-pairs
                                       slice-dim total-dim n-slices]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-coeffs (gensym-fn "d_coeffs")
-                                    d-src (gensym-fn "d_src")]
+                              (let [d-coeffs (gensym-fn "d_coeffs" (tmpl/grad-tag coeffs))
+                                    d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-coeffs (list 'raster.dl.array-ops/scatter-mul-add-d-coeffs
                                                          adjoint-sym src dst-indices src-indices
@@ -1013,7 +1015,7 @@
                             :grads-fn
                             (fn [ctx [x scale clamp-bound n]
                                  result-sym adjoint-sym gensym-fn]
-                              (let [dx (gensym-fn "dx")]
+                              (let [dx (gensym-fn "dx" (tmpl/grad-tag x))]
                                 [(update ctx :bindings into
                                          [dx (list 'raster.dl.array-ops/scale-clamp-exp-backward
                                                    adjoint-sym x result-sym scale clamp-bound n)])
@@ -1025,7 +1027,7 @@
                             :grads-fn
                             (fn [ctx [src n-rows n-cols]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-src (gensym-fn "d_src")]
+                              (let [d-src (gensym-fn "d_src" (tmpl/grad-tag src))]
                                 [(update ctx :bindings into
                                          [d-src (list 'raster.dl.array-ops/reduce-axis-backward
                                                       adjoint-sym n-rows n-cols)])
@@ -1037,8 +1039,8 @@
                             :grads-fn
                             (fn [ctx [wV Z n-nodes emb-dim n-heads eps]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [dwV (gensym-fn "dwV")
-                                    dZ (gensym-fn "dZ")]
+                              (let [dwV (gensym-fn "dwV" (tmpl/grad-tag wV))
+                                    dZ (gensym-fn "dZ" (tmpl/grad-tag Z))]
                                 [(update ctx :bindings into
                                          [dwV (list 'raster.dl.array-ops/segment-div-dwV
                                                     adjoint-sym Z n-nodes emb-dim n-heads eps)
@@ -1083,11 +1085,11 @@
                             (fn [ctx [values space-emb spaces state-emb states pos-emb
                                       We be n-vars emb-dim n-spaces n-states]
                                  _result-sym adjoint-sym gensym-fn]
-                              (let [d-values (gensym-fn "d_values")
-                                    d-space-emb (gensym-fn "d_space_emb")
-                                    d-state-emb (gensym-fn "d_state_emb")
-                                    d-We (gensym-fn "d_We")
-                                    d-be (gensym-fn "d_be")]
+                              (let [d-values (gensym-fn "d_values" (tmpl/grad-tag values))
+                                    d-space-emb (gensym-fn "d_space_emb" (tmpl/grad-tag space-emb))
+                                    d-state-emb (gensym-fn "d_state_emb" (tmpl/grad-tag state-emb))
+                                    d-We (gensym-fn "d_We" (tmpl/grad-tag We))
+                                    d-be (gensym-fn "d_be" (tmpl/grad-tag be))]
                                 [(update ctx :bindings into
                                          [d-values (list 'raster.dl.array-ops/flat-embed-d-values
                                                          adjoint-sym We n-vars emb-dim)
@@ -1106,9 +1108,9 @@
                            {:params '[h W bias n-rows dim] :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [h W bias n-rows dim] _result-sym adjoint-sym gensym-fn]
-                              (let [dh (gensym-fn "dh")
-                                    dW (gensym-fn "dW")
-                                    dbias (gensym-fn "dbias")]
+                              (let [dh (gensym-fn "dh" (tmpl/grad-tag h))
+                                    dW (gensym-fn "dW" (tmpl/grad-tag W))
+                                    dbias (gensym-fn "dbias" (tmpl/grad-tag bias))]
                                 [(update ctx :bindings into
                                          [dh (list 'raster.dl.array-ops/dot-rows-dh adjoint-sym W n-rows dim)
                                           dW (list 'raster.dl.array-ops/dot-rows-dW adjoint-sym h n-rows dim)
@@ -1119,7 +1121,7 @@
                            {:params '[pred target states n] :result nil :adjoint 'dy
                             :grads-fn
                             (fn [ctx [pred target states n] _result-sym adjoint-sym gensym-fn]
-                              (let [d-pred (gensym-fn "d_pred")]
+                              (let [d-pred (gensym-fn "d_pred" (tmpl/grad-tag pred))]
                                 [(update ctx :bindings into
                                          [d-pred (list 'raster.dl.array-ops/masked-mse-loss-backward
                                                        adjoint-sym pred target states n)])

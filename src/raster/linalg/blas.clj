@@ -715,9 +715,12 @@
 (tmpl/merge-into-template! 'raster.linalg.blas/dgemm!
                            {:params '[A B C m k n alpha beta] :result nil :adjoint 'dy
                             :grads-fn (fn [ctx [A B C m k n alpha beta] _result-sym adjoint-sym gensym-fn]
+                                        ;; grads-arr is the Object[] bundle from
+                                        ;; dgemm-backward — no differentiable tag
+                                        ;; (Π ⊥), stays untagged by design.
                                         (let [grads-arr (gensym-fn "dgemm_grads")
-                                              dA (gensym-fn "dA")
-                                              dB (gensym-fn "dB")]
+                                              dA (gensym-fn "dA" (tmpl/grad-tag A))
+                                              dB (gensym-fn "dB" (tmpl/grad-tag B))]
                                           [(update ctx :bindings into
                                                    [grads-arr (list 'raster.linalg.blas/dgemm-backward
                                                                     adjoint-sym A B m k n alpha beta)

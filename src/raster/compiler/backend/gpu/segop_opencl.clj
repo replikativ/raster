@@ -56,13 +56,30 @@
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ;; Use pre-computed inputs/scalars from SegOp
-        arr-params (vec (sort-by name (:inputs segmap)))
+        ;; Use pre-computed inputs/outputs/scalars from SegOp.
+        ;; :outputs may carry SECONDARY outputs beyond `out-sym` — the side-effect
+        ;; aset targets of a horizontally-fused multi-output map. Those are array
+        ;; params too (declared NON-const, appended after the inputs so the invoke's
+        ;; positional arg order matches the C signature); an input that is also
+        ;; written (read+write buffer) likewise loses const.
+        written (set (map #(symbol (name %)) (:outputs segmap)))
+        input-params (vec (sort-by name (:inputs segmap)))
+        input-name-set (set (map #(symbol (name %)) input-params))
+        out-name (when out-sym (symbol (name out-sym)))
+        extra-outs (vec (sort-by name
+                                 (remove #(or (= % out-name)
+                                              (contains? input-name-set %))
+                                         written)))
+        arr-params (into input-params extra-outs)
         scl-params (vec (sort-by name (:scalars segmap)))
         arr-dtype (fn [s] (get array-types s (get array-types (symbol (name s)) dtype)))
         arr-type (fn [s] (get codegen/opencl-type-map (arr-dtype s) default-ctype))
+        written-params (filterv #(contains? written (symbol (name %))) arr-params)
         arr-param-str (str/join ", "
-                                (map (fn [s] (str "__global const " (arr-type s) "* restrict "
+                                (map (fn [s] (str "__global "
+                                                  (when-not (contains? written (symbol (name s)))
+                                                    "const ")
+                                                  (arr-type s) "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
         ;; Integer scalar params seed *int-vars* so index math stays integer
@@ -95,6 +112,10 @@
      :source source
      :array-params arr-params
      :scalar-params scl-params
+     ;; array params (by sig name) the kernel WRITES — secondary fused outputs and
+     ;; read+write inputs. The staging invoke copies these back to their JVM arrays
+     ;; after launch; the resident role-derivation marks written PARAMS :output.
+     :written-arrays written-params
      :out-param out-param
      :dtype out-dtype}))
 

@@ -827,19 +827,27 @@
       ;; a fixed result tag symbol
       (symbol? rule)                 rule)))
 
-;; oftype coerces its value to the ELEMENT type of its ref (first arg): a float
-;; at :float (ref a float[]), a double at :double. The registry rule lets the
-;; walker and late inference stamp oftype-seeded scalars (reduction seeds, an
-;; attention scale) without per-op arms in either.
-(register-result-type! 'raster.numeric/oftype :element-of-first-arg)
-
-;; grad-acc (reverse-AD nil-safe +) returns the type of its (first typed) arg.
-(register-result-type! 'raster.ad.reverse/grad-acc :first-typed-arg)
+;; DELETED (plan D2 assert-then-delete audit, 2026-07-11):
+;;   - 'raster.numeric/oftype :element-of-first-arg — oftype-seeded scalars
+;;     (softmax neg-inf seeds, attention scales) are now tagged without the
+;;     facet: every resident attention/gqa/rms-norm/rope value+grad compile
+;;     passes COLD (fresh JVM) with the entry removed, as does the full suite.
+;;     (Historically the walker's oftype :element arm needed it; emission-time
+;;     tagging + TC stamps cover those sites today.)
+;;   - 'raster.ad.reverse/grad-acc :first-typed-arg — grad-acc adjoint bindings
+;;     are tagged at their mint site (Π tagged gensym) and the GPU fan-out path
+;;     reroutes grad-acc to residual-add before the fixpoint edge; resblk/hfuse/
+;;     attn-block cold + ODE/laws canaries + full suite green without it.
+;; The fixpoint-edge census throw (pipeline/record-fixpoint-census!) guards the
+;; invariant: if either becomes load-bearing again it resurfaces as a loud GPU
+;; compile error naming the untagged binding, not silent narrowing.
+;; NB raster.dl.nn/residual-add(+backward) :same-as-first-arg SURVIVED the same
+;; audit as LOAD-BEARING — see the comment at its registration in raster.dl.nn.
 
 ;; NOTE: ops defined in higher layers (raster.dl.*, raster.ad.*) register their own
 ;; :result-type facet from THEIR namespace (e.g. residual-add in raster.dl.nn), so
 ;; compiler core does not depend on those namespaces. Only compiler-owned ops belong
-;; here. `grad-acc` above is a borderline case kept for now (reverse-AD primitive).
+;; here.
 
 ;; par/reduce returns its accumulator type — arg 1, the init value. The CANONICAL
 ;; spelling `raster.par/reduce` is typed independently by form-info's

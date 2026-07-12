@@ -50,14 +50,15 @@
               (catch Throwable _ false))))
 
 (defn- run-resident
-  "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array."
-  [f-var args dtype]
+  "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array.
+   gemm-precision is compile-gpu-program's :gemm-precision (:f16-xmx | :f32-scalar)."
+  [f-var args dtype gemm-precision]
   (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
         make-session (ns-resolve gpu 'make-session)
         bind-program! (ns-resolve gpu 'bind-program!)
         run-program! (ns-resolve gpu 'run-program!)
         close-session! (ns-resolve gpu 'close-session!)
-        p (pl/compile-gpu-program f-var :ze:0 :dtype dtype)
+        p (pl/compile-gpu-program f-var :ze:0 :dtype dtype :gemm-precision gemm-precision)
         s (make-session :ze:0)]
     (try
       (bind-program! s p args {})
@@ -102,12 +103,14 @@
      :dtype       :float (default) | :double   — resident compile dtype
      :rtol        max relative error (default 1e-3 for f32)
      :grad-args   coll of arg :name symbols to check (default: all Array-typed args)
+     :gemm-precision  :f16-xmx (default) | :f32-scalar — compile-gpu-program's resident
+                  :gemm binding policy (:f32-scalar = exact-grad scalar f32 GEMM)
 
    Runs on ze:0. Fails loudly (via clojure.test/is) if any checked gradient's wrapper
    does not extract fully resident, or if the GPU grad diverges beyond rtol.
    Returns {:grads {argname {:resident? :step-kinds :rel-err}}}."
-  [loss-var arg-specs & {:keys [dtype rtol grad-args]
-                         :or {dtype :float rtol 1.0e-3}}]
+  [loss-var arg-specs & {:keys [dtype rtol grad-args gemm-precision]
+                         :or {dtype :float rtol 1.0e-3 gemm-precision :f16-xmx}}]
   (let [names (mapv :name arg-specs)
         types (mapv :type arg-specs)
         vals  (mapv :val arg-specs)
@@ -130,14 +133,15 @@
                                            "-" (Math/abs (hash [loss-fqsym gname dtype]))))
                         wvar (build-wrapper wname names types loss-fqsym k (nth types j))
                         ;; residency probe (no throw): nil ⇒ a step fell to the host.
-                        desc (pl/compile-gpu-program wvar :ze:0 :dtype dtype :on-non-resident :nil)
+                        desc (pl/compile-gpu-program wvar :ze:0 :dtype dtype :on-non-resident :nil
+                                                     :gemm-precision gemm-precision)
                         step-kinds (mapv :convention (:steps desc))
                         _ (is (some? desc)
                               (str "grad(" gname ") of " loss-fqsym
                                    " must extract FULLY RESIDENT (compile-gpu-program returned nil ⇒ "
                                    "a kernel fell back to the host)"))
                         re (when desc
-                             (let [{:keys [out]} (run-resident wvar wargs dtype)
+                             (let [{:keys [out]} (run-resident wvar wargs dtype gemm-precision)
                                    e (rel-err out cpu-grad)]
                                (is (< e rtol)
                                    (str "grad(" gname ") GPU-vs-CPU rel-err " e " (rtol " rtol ")"))

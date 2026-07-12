@@ -1706,6 +1706,21 @@
     (when-not output-is-buffer?
       (let [dst-seg (MemorySegment/ofArray output-array)]
         (MemorySegment/copy dev-output 0 dst-seg 0 n-bytes)))
+    ;; Copy back WRITTEN input-position arrays (a horizontally-fused kernel's
+    ;; secondary outputs / read+write buffers, named by the registry's
+    ;; :written-arrays). Only JVM arrays need the copy — device buffers were
+    ;; written in place.
+    (when-let [wa (seq (:written-arrays info))]
+      (let [wnames (set (map name wa))
+            aps (mapv name (:array-params info))]
+        (doseq [[arr seg ^long idx] (map vector input-arrays dev-inputs (range))]
+          (when (and (not (device-buffer? arr))
+                     (< idx (count aps))
+                     (contains? wnames (nth aps idx)))
+            (let [arr-bytes (if (= dtype :float)
+                              (* (alength ^floats arr) 4)
+                              (* (alength ^doubles arr) 8))]
+              (MemorySegment/copy ^MemorySegment seg 0 (MemorySegment/ofArray arr) 0 arr-bytes))))))
     output-array))
 
 (defn invoke-reduction-kernel

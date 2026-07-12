@@ -127,15 +127,53 @@
                                (class x))
                           {:class (class x)}))))
 
+(defn- expr-manifest-tag
+  "The statically KNOWN scalar tag of an IR expression — carried or manifest,
+  never inferred: a symbol's/form's carried :raster.type/tag stamp, the head
+  of an explicit float/double cast form, or a numeric literal's own type.
+  nil when the expression's type is not statically known."
+  [expr]
+  (cond
+    (or (symbol? expr) (seq? expr))
+    (or (:raster.type/tag (meta expr))
+        (when (and (seq? expr)
+                   (contains? #{'float 'clojure.core/float} (first expr)))
+          'float)
+        (when (and (seq? expr)
+                   (contains? #{'double 'clojure.core/double} (first expr)))
+          'double))
+    (float? expr) 'double  ;; a bare Clojure literal like 0.0 is a double
+    :else nil))
+
 (defn project-expr
   "Wrap `cotangent-expr` with the projection onto the tangent space of the
-  primal `tag` (Π_x), when the dtypes could mismatch. Scalars get a
-  nil-safe cast call; arrays and unknown tags pass through unchanged
-  (array adjoints are anchored by their typed shadow buffers)."
+  primal `tag` (Π_x), when the dtypes could mismatch.
+
+  Emission is TYPED IR whenever the cotangent's type is statically known
+  (carried tag / manifest cast / literal): same dtype → identity (no wrap),
+  different scalar dtype → a bare primitive cast, which devirtualizes to a
+  zero-cost intrinsic on every backend. A statically-typed cotangent is a
+  materialized typed value — never the runtime nil 0̄ — so the nil-safe
+  runtime helpers (project-double/project-float) are emitted ONLY for
+  UNTAGGED cotangents (the dynamic/interpreted path, where nil can flow).
+  Arrays and unknown primal tags pass through unchanged (array adjoints are
+  anchored by their typed shadow buffers)."
   [tag cotangent-expr]
   (let [{:keys [kind dtype]} (tangent-kind tag)]
     (if (= kind :scalar)
-      (case dtype
-        :float  (list 'raster.ad.tangent/project-float cotangent-expr)
-        :double (list 'raster.ad.tangent/project-double cotangent-expr))
+      (let [ct (tangent-kind (expr-manifest-tag cotangent-expr))]
+        (cond
+          ;; Statically in the primal's tangent space already — Π is the identity.
+          (and (= :scalar (:kind ct)) (= dtype (:dtype ct)))
+          cotangent-expr
+          ;; Statically scalar of the other dtype — Π is a primitive cast.
+          (= :scalar (:kind ct))
+          (let [cast-tag (case dtype :float 'float :double 'double)]
+            (with-meta (list cast-tag cotangent-expr)
+              {:raster.type/tag cast-tag}))
+          ;; Untagged — the runtime nil-safe projection (dynamic 0̄ may flow).
+          :else
+          (case dtype
+            :float  (list 'raster.ad.tangent/project-float cotangent-expr)
+            :double (list 'raster.ad.tangent/project-double cotangent-expr))))
       cotangent-expr)))
