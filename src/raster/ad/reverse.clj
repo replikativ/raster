@@ -67,39 +67,27 @@
        sym))))
 
 ;; ----------------------------------------------------------------
-;; Lost-tag instrumentation (diagnostic-first; task #58 phase-1b).
-;; The raw-loop reverse-AD codegen defaults an untagged cotangent's shadow
-;; array/scalar to 'doubles/'double (silently narrowing f32 → f64: the [F/[D
-;; ClassCast + F5 GPU under-devirtualization root). Until the enumeration of
-;; lost-tag sites is clean these sites WARN (dedup'd to *err*, keyed by
-;; [site binding]) instead of throwing, so the full corpus can be collected
-;; without behavior change. Flip to fail-loud (tangent/zero-expr) only once the
-;; corpus is clean.
-(def ^:private default-tag-warn-seen (atom #{}))
-
-(def default-tag-fire-counts
-  "Phase-2 (plan D2) instrumentation: TOTAL warn-default-tag! activations by site
-  keyword — every fire counts, unlike the printed warning (dedup'd by
-  [site binding]). The assert-then-delete audit reads this after a full-suite run:
-  a site with count 0 is provably dead and becomes a fail-loud throw; a site that
-  still fires marks an upstream forward-path tag loss to fix at its source."
-  (atom {}))
-
-(defn- warn-default-tag!
-  "Emit a dedup'd LOST-TAG warning to *err* when a reverse-AD codegen site falls
-  back to `default-tag` because the primal binding carries no :raster.type/tag.
-  Keyed by [site binding]. Returns `default-tag` unchanged (no behavior change).
-  Every activation is counted in `default-tag-fire-counts` (undedup'd)."
-  [site binding-hint default-tag]
-  (swap! default-tag-fire-counts update site (fnil inc 0))
-  (let [k [site (str binding-hint)]]
-    (when-not (contains? @default-tag-warn-seen k)
-      (swap! default-tag-warn-seen conj k)
-      (binding [*out* *err*]
-        (println (str "[ad.reverse LOST-TAG default] site=" site
-                      " binding=" binding-hint " -> default " default-tag
-                      " (primal has no :raster.type/tag)"))))
-    default-tag))
+;; Lost-tag enforcement (plan Phase 2 / D2, .internal/ad_typed_emission_plan.md).
+;; These sites used to default an untagged cotangent's shadow array/scalar to
+;; 'doubles/'double (silently narrowing f32 → f64: the [F/[D ClassCast + F5 GPU
+;; under-devirtualization root), warn-first while the lost-tag corpus was
+;; collected. The instrumented full-suite run (2026-07-11, 1804 tests /
+;; 31230 assertions, fresh JVM incl. all resident GPU compiles) measured
+;; ZERO activations at every site — under the Phase-1 Π emission invariant
+;; the primal tag is always present, so the defaults are provably dead and
+;; now FAIL LOUD instead: a fire means an upstream forward-path tag loss that
+;; must be fixed at its source (walker/inference), never papered over in AD.
+(defn- lost-tag!
+  "Fail-loud replacement for the retired warn-default-tag! 'doubles/'double
+  default sites: a reverse-AD codegen site needed the primal binding's
+  :raster.type/tag and it is absent."
+  [site binding-hint]
+  (throw (ex-info (str "reverse-AD lost tag at " site " (binding " binding-hint
+                       "): primal carries no :raster.type/tag. This default site "
+                       "was retired (Π emission invariant, plan D2) — fix the "
+                       "upstream forward-path tag loss; do not re-add a silent "
+                       "'doubles/'double default (f32→f64 narrowing hazard).")
+                  {:site site :binding (str binding-hint)})))
 
 (defmacro ^:private with-ad-gensym
   "Ensure *gensym-counter* is bound. If already bound (non-nil), inherit it;
@@ -1706,27 +1694,27 @@
 
         ;; === Backward code ===
         ;; For each read array: shadow array d_arr — tag matches source array's
-        ;; element type (inherits :raster.type/tag if present; defaults to doubles).
+        ;; element type (inherits :raster.type/tag; absent tag fails loud — plan D2).
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
                                            (or (:raster.type/tag (meta arr))
-                                               (warn-default-tag! :dotimes-read-arr (name arr) 'doubles))))
+                                               (lost-tag! :dotimes-read-arr (name arr)))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
                                          (or (:raster.type/tag (meta p))
-                                             (warn-default-tag! :dotimes-scalar (name p) 'double))))
+                                             (lost-tag! :dotimes-scalar (name p)))))
                             active-free)
 
         ;; Backward loop: reads d_out, calls pullbacks, accumulates
         ;; d-out-sym is the gradient of the output array — bound by gen-reverse-let
         ;; from adj-env contributions. Tag inherits from the output array type
-        ;; (defaults to doubles, the dominant case for raster training).
+        ;; (absent tag fails loud — plan D2).
         out-array-tag (or (some-> written-arrs first meta :raster.type/tag)
-                          (warn-default-tag! :dotimes-out-arr (some-> written-arrs first name) 'doubles))
+                          (lost-tag! :dotimes-out-arr (some-> written-arrs first name)))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
-                       (warn-default-tag! :dotimes-out-elem out-array-tag 'double))
+                       (lost-tag! :dotimes-out-elem out-array-tag))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         iter-pb-sym (ad-gensym "iter_pb")
         d-val-sym (ad-gensym "d_val" out-elem-tag)
@@ -1939,18 +1927,18 @@
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
                                            (or (:raster.type/tag (meta arr))
-                                               (warn-default-tag! :parmap-read-arr (name arr) 'doubles))))
+                                               (lost-tag! :parmap-read-arr (name arr)))))
                               read-arrs)
         d-scalar-syms (mapv (fn [p]
                               (ad-gensym (str "d_" (name p) "_acc")
                                          (or (:raster.type/tag (meta p))
-                                             (warn-default-tag! :parmap-scalar (name p) 'double))))
+                                             (lost-tag! :parmap-scalar (name p)))))
                             active-free)
         out-array-tag (or (some-> out-sym meta :raster.type/tag)
-                          (warn-default-tag! :parmap-out-arr (some-> out-sym name) 'doubles))
+                          (lost-tag! :parmap-out-arr (some-> out-sym name)))
         out-elem-tag (case out-array-tag
                        doubles 'double, floats 'float, longs 'long, ints 'int,
-                       (warn-default-tag! :parmap-out-elem out-array-tag 'double))
+                       (lost-tag! :parmap-out-elem out-array-tag))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         bwd-idx-sym (ad-gensym "bi")
         iter-pb-sym (ad-gensym "iter_pb")
@@ -2375,12 +2363,12 @@
 
         ;; === Backward code ===
         out-array-tag (or (some-> out-sym meta :raster.type/tag)
-                          (warn-default-tag! :carry-out-arr (some-> out-sym name) 'doubles))
+                          (lost-tag! :carry-out-arr (some-> out-sym name)))
         d-out-sym (ad-gensym "d_out" out-array-tag)
         d-read-arr-syms (mapv (fn [arr]
                                 (ad-gensym (str "d_" (name arr))
                                            (or (:raster.type/tag (meta arr))
-                                               (warn-default-tag! :carry-read-arr (name arr) 'doubles))))
+                                               (lost-tag! :carry-read-arr (name arr)))))
                               read-arrs)
         arr->d-sym (zipmap read-arrs d-read-arr-syms)
         d-scalar-syms (mapv (fn [p] (ad-gensym (str "d_" (name p) "_acc"))) active-free)
