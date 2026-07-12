@@ -926,11 +926,13 @@
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
                      cbuf (buf-of (:C step) :gemm-C)]
-                 (if (< n 8)
-                   ;; Small-N fallback: the XMX kernel's B-operand 2D-block VNNI read needs a
-                   ;; >=16-byte pitch (N*2 bytes at fp16) — N<8 violates it and yields garbage
-                   ;; (relerr ~1). Bind the plain scalar f32 GEMM instead: it reads the f32
-                   ;; residents directly, so NO convert/transpose expansion kernels at all.
+                 (if (or (< n 8) (< k 8))
+                   ;; Small-dim fallback: the XMX kernel's 2D-block reads need a >=16-byte
+                   ;; pitch — the B-operand VNNI read's pitch is N*2 bytes (fp16) and the
+                   ;; A-operand row read's pitch is K*2 bytes, so N<8 OR K<8 violates it and
+                   ;; yields garbage (relerr ~1; K<8 shows as scrambled + zeroed C rows).
+                   ;; Bind the plain scalar f32 GEMM instead: it reads the f32 residents
+                   ;; directly, so NO convert/transpose expansion kernels at all.
                    ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
                    (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]
                      [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))}])
