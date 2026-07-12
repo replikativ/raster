@@ -388,16 +388,6 @@
   progress. One compile at a time assumed (plain atom, no per-compile key)."
   (atom []))
 
-(def fixpoint-finalize-divergence
-  "Phase-2 (plan D2) instrumentation: count of pass-fixpoint finalize-epilogue
-  activations where resolve-generic-deftm-calls actually CHANGED the re-tagged
-  form (i.e. the re-tag + re-expand epilogue was load-bearing, not a no-op).
-  Emission-time devirtualization (Phase 1c) may have obsoleted it — if this
-  stays 0 across a full suite + a fresh-JVM GPU resident compile, the epilogue
-  is provably dead and gets deleted. Each activation also prints a dedup-free
-  [pass-fixpoint finalize] line to *err* so the suite log is greppable."
-  (atom 0))
-
 (declare record-fixpoint-census!)
 
 (defn- pass-fixpoint
@@ -414,43 +404,24 @@
   Max 5 iterations to prevent divergence.
   (=> :* :fixpointed)"
   [form opts]
+  ;; NOTE (plan D2): the former GPU-determinism finalize epilogue (re-tag +
+  ;; resolve-generic-deftm-calls + re-expand at convergence, for cold-JVM
+  ;; AD-emitted generic calls) was DELETED after instrumentation proved it a
+  ;; no-op: 0 activations across the full fresh-JVM suite incl. every resident
+  ;; GPU compile (2026-07-11). Phase-1c emission-time devirtualization
+  ;; obsoleted it — AD-emitted calls now devirtualize at emission, so the
+  ;; resolver never found anything left to do. The fixpoint-edge census throw
+  ;; (record-fixpoint-census!) guards the invariant: a regression shows up as
+  ;; a loud GPU compile error here, not a first-compile-fails flake.
   (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
-        opts (assoc opts :simplify? true)
-        ;; GPU determinism epilogue (cold-compile inline gate). An AD-emitted generic
-        ;; parametric call (e.g. linear-dx from linear-nb's grads-fn) can survive the
-        ;; whole fixpoint UNdevirtualized when the incremental type env can't type an
-        ;; intermediate arg yet. On a FRESH JVM the later resolve-generic-deftm-calls
-        ;; (buffer-fuse/late-cleanup) then devirtualizes it to `.invk foo_m_floats…-impl`
-        ;; — creating the float specialization as a SIDE EFFECT — but that is AFTER the
-        ;; last inline pass, so the .invk survives to resident extraction and the first
-        ;; compile-gpu-program fails while the second succeeds. Run the same resolver
-        ;; HERE at convergence and, if it devirtualized anything, expand once more so
-        ;; the first compile inlines exactly like every later one. GPU-gated: CPU
-        ;; backends call .invk directly, so late devirtualization is sufficient there
-        ;; (and the shared-suite behavior stays untouched).
-        finalize (fn [current]
-                   (if-not (and (device/gpu-target? (:target-device opts))
-                                (form/binding-form? current))
-                     current
-                     ;; The resolver needs binding :tag metadata — the AD-emitted
-                     ;; bindings from THIS fixpoint don't carry it yet (late-cleanup
-                     ;; re-tags for the same reason before ITS resolve call).
-                     (let [tagged (tag-binding-types current (:param-env opts))
-                           resolved (inline/resolve-generic-deftm-calls
-                                     tagged (:param-env opts))]
-                       (if (= resolved tagged)
-                         current
-                         (do (swap! fixpoint-finalize-divergence inc)
-                             (binding [*out* *err*]
-                               (println "[pass-fixpoint finalize] resolve-generic-deftm-calls devirtualized at the fixpoint edge (epilogue LIVE)"))
-                             (inline/expand-for-backends resolved 3 (:param-env opts)))))))]
+        opts (assoc opts :simplify? true)]
     (reset! fixpoint-census [])
     (loop [current form
            iter 0
            total-stats {:fixpoint-iterations 0}]
       (if (>= iter max-iters)
-        (let [final (ensure-let*-result (finalize current))]
+        (let [final (ensure-let*-result current)]
           (record-fixpoint-census! :final final opts)
           {:form final :stats total-stats})
         (let [;; Step 1: Expand (inline deftm calls + value+grad AD inlining)
@@ -472,7 +443,7 @@
                            (if (map? rw-result) (:form rw-result) rw-result))
                          expanded)]
           (if (= rewalked current)
-            (let [final (ensure-let*-result (finalize current))]
+            (let [final (ensure-let*-result current)]
               (record-fixpoint-census! :final final opts)
               {:form final
                :stats (assoc total-stats :fixpoint-iterations iter)})
