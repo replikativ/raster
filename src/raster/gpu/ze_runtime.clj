@@ -2246,9 +2246,16 @@
                   (mapv (fn [i]
                           (let [ev-desc (.allocate ^Arena arena 32)
                                 _ (.set ev-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_DESC))
-                                _ (.set ev-desc I32 16 (int i))                       ;; index
-                                _ (.set ev-desc I32 20 (int ZE_EVENT_SCOPE_FLAG_HOST)) ;; signal
-                                _ (.set ev-desc I32 24 (int 0))                       ;; wait
+                                _ (.set ev-desc I32 16 (int i))  ;; index
+                                ;; signal scope 0 (in-command-list only), NOT HOST: a HOST-scope
+                                ;; signal forces a cache-hierarchy flush after EVERY kernel, which
+                                ;; measured 3-5x slower on the gemma layer graphs (fwd 32→170 ms)
+                                ;; — a profiler must not perturb what it measures. The pool is
+                                ;; HOST_VISIBLE, so event status + kernel timestamps are readable
+                                ;; from the host after the synchronous queue-execute returns
+                                ;; (validated vs host wall time on iGPU; re-validate on dGPU).
+                                _ (.set ev-desc I32 20 (int 0))  ;; signal scope
+                                _ (.set ev-desc I32 24 (int 0))  ;; wait scope
                                 e-out (ptr-seg arena)]
                             (ze-call! "zeEventCreate" @h-zeEventCreate
                                       [event-pool ev-desc e-out])
