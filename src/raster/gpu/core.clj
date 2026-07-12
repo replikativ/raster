@@ -833,6 +833,11 @@
                      differently-named params (rename both onto one key + :reuse-buffers), or
                      keep two same-named params separate (rename one away from the collision).
                      run-program!/upload!/download address the renamed buffer by the new key.
+     :profile?       record the graph in PROFILING mode: a kernel-timestamp device event per
+                     launch (Level-Zero only). profile-program! then returns per-kernel device
+                     times. Opt-in: without it the recorded graph is exactly the fast path
+                     (no events, no overhead); run-program! on a profiled program still works
+                     (it resets the events after each replay).
 
    :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
    compile-gpu-program, default :f16-xmx; a bind-time caller may override with
@@ -846,7 +851,8 @@
    The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy."
   ([sess descriptor args] (bind-program! sess descriptor args {} {}))
   ([sess descriptor args roles] (bind-program! sess descriptor args roles {}))
-  ([sess descriptor args roles {:keys [key reuse-buffers rename] :or {key :program rename {}}}]
+  ([sess descriptor args roles {:keys [key reuse-buffers rename profile?]
+                                :or {key :program rename {}}}]
    (let [device-id (:device-id @sess)
          pkey key
          _ (when (contains? (:programs @sess) pkey)
@@ -955,36 +961,44 @@
                    ;; directly, so NO convert/transpose expansion kernels at all.
                    ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
                    (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]
-                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))}])
+                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))
+                       :kernel-name (str "gemm_scalar_" (name (:variant step)))
+                       :phase (:phase step)}])
                    (let [a16 (mkbuf-fn (* m k) :half)
                      ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
                      ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
+                     ;; Each entry is [kernel-name bnd] so profiling can attribute device time.
                          raw
                          (case (:variant step)
                        ;; C = A[m,k] · B[k,n]
                            :nn
                            (let [b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16)
-                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
-                              (gemm-fn a16 b16 cbuf m n k :float)])
+                             [["f32_to_f16" (conv-fn abuf a16 (* m k))]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* k n))]
+                              ["gemm_nonsquare_float" (gemm-fn a16 b16 cbuf m n k :float)]])
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
                            :nt
                            (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16 bt16)
-                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
-                              (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                             [["f32_to_f16" (conv-fn abuf a16 (* m k))]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* n k))]
+                              ["transpose_half" (trans-fn b16 bt16 n k :half)]
+                              ["gemm_nonsquare_float" (gemm-fn a16 bt16 cbuf m n k :float)]])
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
                        ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
                        ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
                            :tn
                            (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 at16 b16)
-                             [(conv-fn abuf a16 (* k m)) (trans-fn a16 at16 k m :half)
-                              (conv-fn bbuf b16 (* k n)) (gemm-fn at16 b16 cbuf m n k :float)])
+                             [["f32_to_f16" (conv-fn abuf a16 (* k m))]
+                              ["transpose_half" (trans-fn a16 at16 k m :half)]
+                              ["f32_to_f16" (conv-fn bbuf b16 (* k n))]
+                              ["gemm_nonsquare_float" (gemm-fn at16 b16 cbuf m n k :float)]])
                            (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
                                                 " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
-                     (mapv (fn [b] {:bound b}) raw))))
+                     (mapv (fn [[nm b]] {:bound b :kernel-name nm :phase (:phase step)}) raw))))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).
@@ -994,7 +1008,8 @@
                    (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
                          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                                        scalar-specs)]
-                     [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+                     [(assoc (bind-fn kernel-name buf-vec scalars (long (n-fn args)))
+                             :phase (:phase step))]))
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
                ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
                ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
@@ -1023,8 +1038,9 @@
                          zerofill-fn (rt-resolve device-id "ensure-zero-fill-kernel!")
                          scatter-fn (rt-resolve device-id "bind-registered-scatter-kernel!")
                          zk (zerofill-fn (if (= dtype :double) :double :float))]
-                     [(bind-fn zk [out-buf] [] (long out-size))
-                      (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)]))
+                     [(assoc (bind-fn zk [out-buf] [] (long out-size)) :phase (:phase step))
+                      (assoc (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)
+                             :phase (:phase step))]))
                ;; reduce: SegRed sig (inputs…, output, scl…, _n_bound) — bind the registry's
                ;; :array-params ++ [output] and launch a SINGLE workgroup (:group-count 1) so
                ;; the kernel's grid-stride loop covers all n and writes output[0] into its
@@ -1037,17 +1053,23 @@
                                       (buf-of output kernel-name))
                      scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                                    scalar-specs)]
-                 [(bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})])
+                 [(assoc (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})
+                         :phase (:phase step))])
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
                                     ":map / :map-void / :reduce / :gemm / :scatter are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
-           graph (record-fn bounds)]
+           ;; The non-profiling call is EXACTLY the 1-arity fast path (no opts map) so a
+           ;; recorded non-profiling graph is byte-for-byte what it was before profiling existed.
+           graph (if profile?
+                   (record-fn bounds {:barriers? true :profile? true})
+                   (record-fn bounds))]
        (swap! sess update :programs assoc pkey
               {:descriptor descriptor
                :roles effective-roles
                :graph graph
                :bounds bounds
+               :profile? (boolean profile?)
                ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
                ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
                :scratch-buffers @gemm-scratch
@@ -1089,7 +1111,8 @@
    or, back-compat, the descriptor of a single-program session. args = values in :all-params
    order (same as bind-program!). Returns {output-param-sym → downloaded JVM array}."
   [sess prog-or-handle args]
-  (let [{:keys [descriptor roles graph param->key result-key]} (resolve-program sess prog-or-handle)
+  (let [{:keys [descriptor roles graph param->key result-key profile?]}
+        (resolve-program sess prog-or-handle)
         {:keys [all-params array-params result-sym]} descriptor
         device-id (:device-id @sess)
         argmap (zipmap all-params args)
@@ -1099,6 +1122,12 @@
     (doseq [p array-params :when (= :input (get roles p :input))]
       (upload! sess (get param->key p) (get argmap p)))
     (replay-fn graph)
+    ;; a PROFILED graph's events must be reset between replays (re-signaling a signaled event
+    ;; is invalid); this replay's timestamps are intentionally discarded — use profile-program!
+    ;; to read them.
+    (when profile?
+      (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
+        (reset-fn graph)))
     ;; download :output array-params (in-place-mutated results) PLUS the functional :result-sym
     ;; (a fresh alloc returned by the deftm — the common SOAC case; it is not an array-param so
     ;; it has no :output role, but it IS the program's return value).
@@ -1109,6 +1138,53 @@
       (and result-sym (not (some #(= result-sym %) array-params))
            (contains? (:buffers @sess) result-key))
       (assoc result-sym (download sess result-key)))))
+
+(defn profile-program!
+  "The profiling twin of run-program!: same upload → replay → download sequence over a program
+   bound with {:profile? true}, but reads the per-kernel DEVICE timestamps the replay produced.
+   A separate verb (rather than an opts flag on run-program!) because profiling is a BIND-time
+   property — the events are recorded into the command graph — and because run-program!'s
+   return shape stays stable for every existing caller.
+
+   Returns
+     {:result          {output-param → array}        ;; exactly run-program!'s return value
+      :profile         [{:kernel-name str :phase kw :ms double :context-ms double} …]
+                       ;; execution order; :ms = device (global-timestamp) kernel duration
+      :kernel-total-ms double     ;; Σ per-kernel device time
+      :device-wall-ms  double     ;; device span: first kernel start → last kernel end
+                                  ;; (includes inter-kernel gaps = dispatch/barrier overhead)
+      :host-wall-ms    double}    ;; System/nanoTime around the replay call, for comparison
+
+   Device kernel times come from Level-Zero kernel-timestamp events (immune to host scheduling
+   and far more stable under platform power-state swings than host wall time). Throws if the
+   program was not bound with {:profile? true}."
+  [sess prog-or-handle args]
+  (let [{:keys [descriptor roles graph param->key result-key profile?]}
+        (resolve-program sess prog-or-handle)
+        {:keys [all-params array-params result-sym]} descriptor
+        device-id (:device-id @sess)
+        argmap (zipmap all-params args)
+        replay-fn (rt-resolve device-id "replay-graph!")
+        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")]
+    (when-not profile?
+      (throw (ex-info "profile-program!: program was not bound with {:profile? true} — rebind it with (bind-program! sess descriptor args roles {:profile? true})"
+                      {:program (or (::program-key prog-or-handle) :program)})))
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (get param->key p) (get argmap p)))
+    (let [t0 (System/nanoTime)
+          _ (replay-fn graph)
+          t1 (System/nanoTime)
+          prof (read-ts-fn graph)   ;; reads AND resets the events
+          result (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
+                                    [p (download sess (get param->key p))]))
+                   (and result-sym (not (some #(= result-sym %) array-params))
+                        (contains? (:buffers @sess) result-key))
+                   (assoc result-sym (download sess result-key)))]
+      {:result result
+       :profile (mapv #(select-keys % [:kernel-name :phase :ms :context-ms]) (:kernels prof))
+       :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
+       :device-wall-ms (:wall-ms prof)
+       :host-wall-ms (/ (- t1 t0) 1.0e6)})))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.
