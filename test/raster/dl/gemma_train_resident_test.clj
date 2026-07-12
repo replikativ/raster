@@ -64,12 +64,16 @@
    seq :- Long d :- Long nq :- Long nkv :- Long hd :- Long dff :- Long r :- Long
    eps :- Double theta :- Double] :- (Array float)
   (let [nqh (clojure.core/* nq hd) nkh (clojure.core/* nkv hd) n (clojure.core/* seq d)
+        ;; qk-norm row counts pre-bound to locals: a source-level binding carries the
+        ;; TC Long stamp, so rms-norm's inlined alloc size devirtualizes in the
+        ;; FORWARD-only GPU program too (finetune.train/gblock's step-2 note).
+        snq (clojure.core/* seq nq) snkv (clojure.core/* seq nkv)
         h  (nn/rms-norm x input-ln seq d eps 1.0)
         q  (raster.dl.gemma-train-resident-test/lora-lin h Wq Aq Bq seq d r nqh)
         k  (raster.dl.gemma-train-resident-test/lora-lin h Wk Ak Bk seq d r nkh)
         v  (raster.dl.gemma-train-resident-test/lora-lin h Wv Av Bv seq d r nkh)
-        q  (nn/rms-norm q q-norm (clojure.core/* seq nq) hd eps 1.0)
-        k  (nn/rms-norm k k-norm (clojure.core/* seq nkv) hd eps 1.0)
+        q  (nn/rms-norm q q-norm snq hd eps 1.0)
+        k  (nn/rms-norm k k-norm snkv hd eps 1.0)
         q  (attn/rope q seq nq hd theta)
         k  (attn/rope k seq nkv hd theta)
         a  (attn/gqa-causal-mha q k v seq nq nkv hd)
@@ -289,3 +293,164 @@
                   (is (< (/ (Math/abs (- g c)) (max 1e-9 (Math/abs c))) 1.0e-3)
                       (format "step %d GPU %.6f vs CPU %.6f" k g c)))))
             (finally (close-session! sess))))))))
+
+;; ═════════════════════════════════════════════════════════════════════════════════
+;; DUAL-PROGRAM SHARED SESSION (task #9): the fwd program and the VJP train-step
+;; program bound into ONE session over shared weight+adapter buffers. The fwd
+;; program reads the adapters the train program updates on-device — NO per-step
+;; adapter download/re-upload (the finetune 18-layer loop's refresh-adapters!
+;; round-trip) and NO second copy of the frozen weights (the ~2x VRAM of the
+;; two-session path).
+;; ═════════════════════════════════════════════════════════════════════════════════
+
+;; Forward-only program twin (finetune.train/gblock-fwd! shape): yo := gblk(x,…),
+;; residual-add! with the constant zero buffer = the resident copy-to-output-param.
+(deftm gblk-fwd!
+  [x :- (Array float)
+   input-ln :- (Array float) q-norm :- (Array float) k-norm :- (Array float)
+   post-attn :- (Array float) pre-ffn :- (Array float) post-ffn :- (Array float)
+   Wq :- (Array float) Aq :- (Array float) Bq :- (Array float)
+   Wk :- (Array float) Ak :- (Array float) Bk :- (Array float)
+   Wv :- (Array float) Av :- (Array float) Bv :- (Array float)
+   Wo :- (Array float) Ao :- (Array float) Bo :- (Array float)
+   Wg :- (Array float) Ag :- (Array float) Bg :- (Array float)
+   Wu :- (Array float) Au :- (Array float) Bu :- (Array float)
+   Wd :- (Array float) Ad :- (Array float) Bd :- (Array float)
+   zero :- (Array float) yo :- (Array float)
+   seq :- Long d :- Long nq :- Long nkv :- Long hd :- Long dff :- Long r :- Long
+   eps :- Double theta :- Double] :- (Array float)
+  (let [y (raster.dl.gemma-train-resident-test/gblk x
+                                                    input-ln q-norm k-norm post-attn pre-ffn post-ffn
+                                                    Wq Aq Bq Wk Ak Bk Wv Av Bv Wo Ao Bo Wg Ag Bg Wu Au Bu Wd Ad Bd
+                                                    seq d nq nkv hd dff r eps theta)]
+    (raster.dl.nn/residual-add! y zero yo (clojure.core/* seq d))
+    yo))
+
+(defn- fwd-args*
+  "gblk-fwd! arg vector for a state map."
+  [{:keys [seq d nq nkv hd dff r eps theta]} st zero yo]
+  (-> (mapv st '[x input-ln q-norm k-norm post-attn pre-ffn post-ffn
+                 Wq Aq Bq Wk Ak Bk Wv Av Bv Wo Ao Bo Wg Ag Bg Wu Au Bu Wd Ad Bd])
+      (conj zero yo)
+      (into [seq d nq nkv hd dff r eps theta])))
+
+(def ^:private frozen-syms
+  '[x input-ln q-norm k-norm post-attn pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd])
+
+(defn- session-bytes [sess]
+  (reduce + 0 (map :byte-size (vals (:buffers @sess)))))
+
+(deftest gemma-lora-dual-program-shared-session
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] gemma dual-program shared session: no Level Zero GPU")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          make-session (ns-resolve gpu 'make-session)
+          bind-program! (ns-resolve gpu 'bind-program!)
+          run-program! (ns-resolve gpu 'run-program!)
+          close-session! (ns-resolve gpu 'close-session!)
+          download (ns-resolve gpu 'download)
+          cfg CFG
+          lr 0.02
+          n (* (:seq cfg) (:d cfg))
+          st0 (init-state cfg)
+          trn-prog (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
+                                           :on-non-resident :nil :gemm-precision :f32-scalar)
+          fwd-prog (pl/compile-gpu-program #'gblk-fwd! :ze:0 :dtype :float
+                                           :on-non-resident :nil :gemm-precision :f32-scalar)
+          trn-roles (merge (zipmap adapter-syms (repeat :state))
+                           (zipmap (conj frozen-syms 'tgt) (repeat :constant)))
+          ;; the interleaved schedule: k train steps, fwd-only eval, k more, eval again
+          k-steps 5
+          run-schedule! (fn [train! eval!]
+                          (vec (for [_ (range 2)]
+                                 (do (dotimes [_ k-steps] (train!))
+                                     (eval!)))))]
+      (is (some? trn-prog) "train-step twin must extract fully resident")
+      (is (some? fwd-prog) "fwd twin must extract fully resident")
+      (when (and trn-prog fwd-prog)
+        ;; ── baseline: the OLD two-session path with the explicit refresh round-trip ──
+        (let [stB (clone-adapters st0)
+              t-sess (make-session :ze:0)
+              f-sess (make-session :ze:0)
+              baseline
+              (try
+                (bind-program! t-sess trn-prog (train-args cfg stB lr) trn-roles)
+                (bind-program! f-sess fwd-prog (fwd-args* cfg stB (float-array n) (float-array n))
+                               (merge (zipmap frozen-syms (repeat :constant))
+                                      {'zero :constant}
+                                      (zipmap adapter-syms (repeat :input))))
+                (let [refresh! (fn [] (doseq [s adapter-syms]
+                                        (let [^floats host (stB s)
+                                              ^floats dev (download t-sess (keyword (name s)))]
+                                          (System/arraycopy dev 0 host 0 (alength host)))))
+                      evals (run-schedule!
+                             #(run-program! t-sess trn-prog (train-args cfg stB lr))
+                             #(do (refresh!)
+                                  (get (run-program! f-sess fwd-prog
+                                                     (fwd-args* cfg stB (float-array 0) (float-array 0)))
+                                       'yo)))]
+                  {:evals evals
+                   :adapters (do (refresh!) (reduce (fn [m s] (assoc m s (aclone ^floats (stB s)))) {} adapter-syms))
+                   :bytes (+ (session-bytes t-sess) (session-bytes f-sess))})
+                (finally (close-session! t-sess) (close-session! f-sess)))]
+          ;; ── shared: BOTH programs in ONE session, weights + adapters shared ──
+          (let [stS (clone-adapters st0)
+                sess (make-session :ze:0)]
+            (try
+              (let [trn-h (bind-program! sess trn-prog (train-args cfg stS lr) trn-roles
+                                         {:key :train})]
+                (testing "collision without :reuse-buffers fails loud"
+                  (is (thrown? clojure.lang.ExceptionInfo
+                               (bind-program! sess fwd-prog
+                                              (fwd-args* cfg stS (float-array n) (float-array n))
+                                              {} {:key :fwd}))))
+                (testing "re-binding an already-bound program key fails loud"
+                  (is (thrown? clojure.lang.ExceptionInfo
+                               (bind-program! sess trn-prog (train-args cfg stS lr) trn-roles
+                                              {:key :train}))))
+                (let [fwd-h (bind-program! sess fwd-prog
+                                           (fwd-args* cfg stS (float-array n) (float-array n))
+                                           (merge (zipmap frozen-syms (repeat :constant))
+                                                  {'zero :constant}
+                                                  ;; adapters :state — SHARED with the train
+                                                  ;; program, never re-uploaded by run-program!
+                                                  (zipmap adapter-syms (repeat :state)))
+                                           {:key :fwd :reuse-buffers true})
+                      evals (run-schedule!
+                             #(run-program! sess trn-h (train-args cfg stS lr))
+                             #(get (run-program! sess fwd-h
+                                                 (fwd-args* cfg stS (float-array 0) (float-array 0)))
+                                   'yo))
+                      shared-adapters (reduce (fn [m s] (assoc m s (download sess (keyword (name s)))))
+                                              {} adapter-syms)
+                      shared-bytes (session-bytes sess)
+                      max-abs-diff (fn [^floats a ^floats b]
+                                     (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2)))
+                                                          (seq a) (seq b))))]
+                  (testing "fwd sees the VJP-updated adapters with NO refresh round-trip"
+                    (doseq [[i [ys yb]] (map-indexed vector (map vector evals (:evals baseline)))]
+                      (is (< (max-abs-diff ys yb) 1.0e-5)
+                          (format "eval %d: shared-session fwd output diverges from two-session baseline" i))))
+                  (testing "on-device adapter state matches the two-session trajectory (f32 noise)"
+                    (doseq [s adapter-syms]
+                      (is (< (max-abs-diff (shared-adapters s) (get (:adapters baseline) s)) 1.0e-5)
+                          (str s " trajectory diverged"))))
+                  (testing "loss after interleaved training matches the baseline"
+                    (let [lS (host-loss cfg (merge stS shared-adapters))
+                          lB (host-loss cfg (merge stS (:adapters baseline)))]
+                      (println (format "  [dual-program] loss shared %.6f vs two-session %.6f" lS lB))
+                      (is (< (/ (Math/abs (- lS lB)) (max 1e-9 (Math/abs lB))) 1.0e-4))))
+                  (testing "shared session VRAM drops by the duplicated shared-param bytes"
+                    ;; the baseline holds the common params (x, frozen weights/norms, adapters)
+                    ;; TWICE — once per session. Sharing must eliminate that second copy. (At
+                    ;; these tiny dims scratch dominates; at real gemma dims the shared frozen
+                    ;; weights ARE the ~2x — 1.7 GB → ~0.9 GB for the 18-layer stack.)
+                    (let [shared-param-bytes (reduce + 0 (map #(* 4 (alength ^floats (stS %)))
+                                                              (concat frozen-syms adapter-syms)))]
+                      (println (format "  [dual-program] VRAM: shared %d KiB vs two-session %d KiB (%.2fx, %d KiB dedup'd)"
+                                       (long (/ shared-bytes 1024)) (long (/ (:bytes baseline) 1024))
+                                       (double (/ shared-bytes (:bytes baseline)))
+                                       (long (/ shared-param-bytes 1024))))
+                      (is (<= shared-bytes (- (:bytes baseline) shared-param-bytes))
+                          "the second copy of every shared param must be gone")))))
+              (finally (close-session! sess)))))))))
