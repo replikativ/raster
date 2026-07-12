@@ -842,13 +842,17 @@
    :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
    compile-gpu-program, default :f16-xmx; a bind-time caller may override with
    (assoc descriptor :gemm-precision …) since the descriptor is plain data):
-     :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output). Fast
-                   (systolic), but the f16 input conversion costs gradient precision
-                   (~1e-3-level composed-grad noise) — the decode/inference default.
+     :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output): the
+                   mixed-precision (AMP) policy — f16 inputs, f32 math. Valid for BACKWARD
+                   programs too (measured on the real gemma-3-270m layer VJP: adapter grads
+                   rel-err ~9e-4 / cosine 1.000 vs the :f32-scalar grads; kernel time
+                   65.5 → 38.8 ms, its GEMM part 36.8 → 12.0 ms).
      :f32-scalar — bind the plain scalar f32 GEMM for ALL :gemm steps: reads the f32
                    residents directly, no convert/transpose expansion kernels. Exact f32
-                   grads (~1e-6-level parity) — what training wants.
-   The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy."
+                   grads (~1e-6-level parity) — the exactness escape hatch.
+   The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy. Loss
+   scaling (for cotangents small enough to hit the f16 min-normal 6.1e-5) is a CALLER
+   concern — the VJP is linear in the seed, so scale the seed by S and use lr/S."
   ([sess descriptor args] (bind-program! sess descriptor args {} {}))
   ([sess descriptor args roles] (bind-program! sess descriptor args roles {}))
   ([sess descriptor args roles {:keys [key reuse-buffers rename profile?]
