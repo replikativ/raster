@@ -2014,39 +2014,73 @@
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
     bnd))
 
-(def ^:private convert-cache (atom nil))
+(def ^:private convert-cache (atom {}))
+
+(defn- convert-source
+  "f32→f16 element-wise convert, `w` elements per work-item (w ∈ #{1 2 4}).
+
+   The scalar form (`out[i] = (half)in[i]`, ONE element per work-item) is REQUEST-RATE
+   bound on this iGPU, not DRAM bound: it moves 6 bytes per work-item and tops out around
+   8 GB/s against a ~78 GB/s streaming ceiling. Widening to w elements cuts the memory
+   requests per lane w-fold at identical DRAM traffic.
+
+   `vstore_halfN` is CORE OpenCL (no cl_khr_fp16 dependency) and converts f32→f16 with the
+   default rounding mode = round-to-nearest-even — the SAME rounding as the `(half)` cast it
+   replaces, so the output is BIT-EXACT, not merely close. The `n & (w-1)` tail keeps the
+   kernel correct for element counts that are not a multiple of w.
+
+   `w` is NOT a constant: past a point, widening costs work-items faster than it saves
+   requests and the launch stops filling the machine. The caller picks it from the hardware
+   descriptor (core.hardware/stream-vector-width)."
+  [w]
+  (if (= 1 (long w))
+    (str "__kernel void f32_to_f16(__global const float* restrict in, "
+         "__global half* restrict out, int n) {\n"
+         "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
+         "out[i] = (half)in[i];\n}\n")
+    (let [w (long w)
+          sh (case w 2 1 4 2)]                            ;; log2(w), for the >> / << below
+      (str "__kernel void f32_to_f16(__global const float* restrict in, "
+           "__global half* restrict out, int n) {\n"
+           "  int nv = n >> " sh ";\n"
+           "  for (int i = get_global_id(0); i < nv; i += get_global_size(0))\n"
+           "    vstore_half" w "(vload" w "(i, in), i, out);\n"
+           "  for (int i = (nv << " sh ") + get_global_id(0); i < n; i += get_global_size(0))\n"
+           "    out[i] = (half)in[i];\n}\n"))))
 
 (defn- ensure-convert-kernel!
-  "Lazily compile + cache the f32→f16 element-wise convert kernel. Returns {:module :kernel}."
-  []
+  "Lazily compile + cache the f32→f16 convert kernel for vector width `w`. {:module :kernel}."
+  [w]
   (ensure-init!)
-  (when (nil? @convert-cache)
-    (let [src (str "__kernel void f32_to_f16(__global const float* restrict in, "
-                   "__global half* restrict out, int n) {\n"
-                   "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
-                   "out[i] = (half)in[i];\n}\n")
-          device-hex (:device-id-hex @state)
-          spv (do (require 'raster.compiler.support.spirv-cache)
-                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                   src :device device-hex))
-          module (load-module! spv)
-          kernel (create-kernel module "f32_to_f16")]
-      (clojure.core/reset! convert-cache {:module module :kernel kernel})))
-  @convert-cache)
+  (or (get @convert-cache w)
+      (let [spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     (convert-source w) :device (:device-id-hex @state)))
+            module (load-module! spv)
+            entry {:module module :kernel (create-kernel module "f32_to_f16")}]
+        (swap! convert-cache assoc w entry)
+        entry)))
 
 (defn bind-registered-convert!
   "Bind an f32→f16 element-wise convert kernel over RESIDENT buffers for recording into a
   command graph (the Option-B activation cast before an fp16 XMX GEMM). in: f32 DeviceBuffer,
   out: f16 (:half) DeviceBuffer, n elements. Returns a bound {:kernel :gc-seg} map. Fresh
-  kernel handle per binding."
-  [in out n]
-  (let [{:keys [module]} (ensure-convert-kernel!)
-        kh (create-kernel-fresh module "f32_to_f16")
-        n (long n)
-        args [(:segment in) (:segment out) {:type :int :value (int n)}]
-        bnd (bind-kernel! kh 256 args)]
-    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double n) 256.0))))
-    bnd))
+  kernel handle per binding.
+
+  `w` = elements per work-item (the vector width the CALLER scheduled from the hardware
+  descriptor); default 1 = the scalar kernel."
+  ([in out n] (bind-registered-convert! in out n 1))
+  ([in out n w]
+   (let [{:keys [module]} (ensure-convert-kernel! w)
+         kh (create-kernel-fresh module "f32_to_f16")
+         n (long n) w (long w)
+         args [(:segment in) (:segment out) {:type :int :value (int n)}]
+         bnd (bind-kernel! kh 256 args)
+         ;; one work-item per w elements. Floor at one group so an n < w program still
+         ;; launches the work-items its tail loop needs.
+         gc (max 1 (long (Math/ceil (/ (double (quot n w)) 256.0))))]
+     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int gc))
+     bnd)))
 
 (def ^:private transpose-cache (atom {}))
 
