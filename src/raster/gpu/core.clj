@@ -27,6 +27,7 @@
   (:refer-clojure :exclude [])
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
@@ -802,12 +803,15 @@
 ;; buys workgroups at constant DRAM traffic; the knobs bound how far.
 
 (def ^:dynamic *gemm-splitk-fill-wgs*
-  "Workgroups that saturate the device (64 EU x 8 hw threads / 16 threads per 256-item
-   workgroup). A GEMM at or above this is NOT split." 32)
+  "Workgroups that saturate the device. nil = DERIVE it from the target's HardwareDescriptor
+   (machine-lanes / 256 — Arc 140V: 8192/256 = 32); bind to a number to override. A GEMM at
+   or above this count is NOT split.
+
+   This used to be the literal 32, which is this laptop's iGPU and no other machine's." nil)
 
 (def ^:dynamic *gemm-splitk-target-wgs*
   "Workgroup count a split GEMM aims for — a few waves over the fill count, so memory
-   latency has something to hide behind." 128)
+   latency has something to hide behind. nil = 4x the fill count." nil)
 
 (def ^:dynamic *gemm-splitk-min-chunk*
   "Smallest k-chunk worth giving a workgroup: below this the per-chunk fixed cost (A
@@ -815,6 +819,42 @@
 
 (def ^:dynamic *gemm-splitk-max-splits*
   "Hard cap on k-chunks — the partials buffer is splits·m·n f32." 64)
+
+(defn gemm-fill-workgroups
+  "Workgroups that fill `device-id` at the XMX GEMM's 256-item workgroup — the bound that
+   decides whether a GEMM is occupancy-starved. From the target's HardwareDescriptor unless
+   *gemm-splitk-fill-wgs* overrides."
+  [device-id]
+  (long (or *gemm-splitk-fill-wgs* (hw/fill-workgroups (hw/descriptor-for device-id) 256))))
+
+(defn gemm-schedule
+  "THE GEMM schedule decision, as a pure function of the shape and the machine width —
+   never of the model. Returns [splits k-chunk]; splits = 1 means the plain XMX GEMM.
+
+   The XMX GEMM tiles C into 128x128 blocks, so its grid is ceil(n/128) x ceil(m/128)
+   workgroups. When that is fewer than `fill-wgs`, the device runs partly EMPTY and no
+   inner-loop tuning can help — the only way to buy workgroups is to split the k-reduction
+   across a third grid dimension and combine the partials afterwards (same operands, same
+   DRAM traffic, same result up to f32 summation order).
+
+   Callers: bind-program! (the binder) and gemm_splitk_test (the executable spec). ONE
+   copy — the policy is not re-implemented anywhere."
+  ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs)))))
+  ([m n k fill-wgs target-wgs]
+   (let [base (* (Math/ceil (/ (double n) 128.0))
+                 (Math/ceil (/ (double m) 128.0)))]
+     (if (>= base (double fill-wgs))
+       [1 k]                              ;; already fills the machine
+       (let [want (long (Math/ceil (/ (double target-wgs) base)))
+             ;; each chunk must be a multiple of 32 (the K-unroll) and at least
+             ;; *gemm-splitk-min-chunk* long, or the per-chunk fixed cost (A prefetch + the
+             ;; store of a full partial C tile) swamps the reduction it does.
+             cap (quot (long k) (long *gemm-splitk-min-chunk*))
+             s (min want cap (long *gemm-splitk-max-splits*))]
+         (if (< s 2)
+           [1 k]
+           (let [kc (* 32 (quot (+ (quot (long k) s) 31) 32))]
+             [(quot (+ (long k) kc -1) kc) kc])))))))
 
 (defn bind-program!
   "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session:
@@ -957,29 +997,19 @@
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
-         ;; SPLIT-K: the XMX GEMM's workgroup grid is ceil(n/128) x ceil(m/128) —
-         ;; a GEMM whose OUTPUT is small but whose K is huge (the tied-embedding
-         ;; backward: m=13, n=640, k=262144 → 5 workgroups) leaves the machine
-         ;; empty and no inner-loop tuning can help. Split the k-reduction over a
-         ;; third grid dimension, then combine the partials. See
-         ;; ze-runtime/bind-registered-gemm-splitk!.
-         splitk (fn [m n k]
-                  (let [base (* (Math/ceil (/ (double n) 128.0))
-                                (Math/ceil (/ (double m) 128.0)))]
-                    (if (>= base *gemm-splitk-fill-wgs*)
-                      [1 k]                       ;; already fills the machine
-                      (let [want (long (Math/ceil (/ (double *gemm-splitk-target-wgs*) base)))
-                            ;; each chunk must be a multiple of 32 (the K-unroll) and at
-                            ;; least *gemm-splitk-min-chunk* long, or the per-chunk fixed
-                            ;; cost (A prefetch + the store of a full partial C tile)
-                            ;; swamps the reduction it does.
-                            cap (quot (long k) (long *gemm-splitk-min-chunk*))
-                            s (min want cap (long *gemm-splitk-max-splits*))]
-                        (if (< s 2)
-                          [1 k]
-                          (let [kc (* 32 (quot (+ (quot (long k) s) 31) 32))
-                                s (quot (+ (long k) kc -1) kc)]
-                            [s kc]))))))
+         ;; ── the SCHEDULE seam ────────────────────────────────────────────────
+         ;; Every launch geometry below is a function of (shape, MACHINE WIDTH) and
+         ;; nothing else — never of the model. The machine width comes from the target's
+         ;; HardwareDescriptor, so the same program schedules itself differently on a
+         ;; different GPU instead of inheriting this laptop's iGPU as a literal.
+         desc      (hw/descriptor-for device-id)
+         fill-wgs  (gemm-fill-workgroups device-id)
+         ;; elementwise/convert vector width: widest that still fills the machine.
+         vec-width (fn [n] (hw/stream-vector-width desc n))
+         ;; SPLIT-K: see `gemm-schedule` — a GEMM whose grid is below the machine's fill
+         ;; count is occupancy-bound, and splitting k buys workgroups at constant DRAM
+         ;; traffic. See ze-runtime/bind-registered-gemm-splitk!.
+         splitk (fn [m n k] (gemm-schedule m n k fill-wgs))
          alloc-size-of (fn [sym-kw]
                          (some (fn [{:keys [sym size-fn]}]
                                  (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
@@ -1057,16 +1087,16 @@
                            :nn
                            (let [b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]]
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
                                    (mk-gemm a16 b16)))
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
                            :nt
                            (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16 bt16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k)) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* n k)) b-const?]
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* n k) (vec-width (* n k))) b-const?]
                                     ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]]
                                    (mk-gemm a16 bt16)))
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
@@ -1075,9 +1105,9 @@
                            :tn
                            (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 at16 b16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* k m)) a-const?]
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* k m) (vec-width (* k m))) a-const?]
                                     ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n)) b-const?]]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
                                    (mk-gemm at16 b16)))
                            (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
                                                 " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
