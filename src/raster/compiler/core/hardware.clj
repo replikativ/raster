@@ -164,24 +164,30 @@
 (defn stream-vector-width
   "Vector width (1 | 2 | 4) for an ELEMENTWISE/streaming kernel over `n` elements.
 
-   Two forces pull against each other, and the machine width is what balances them:
-     - WIDER is better per lane: this iGPU's elementwise kernels are REQUEST-RATE bound,
-       not DRAM bound (a scalar f32 copy tops out ~53 GB/s while an f64 copy over the same
-       work-item count reaches ~78 — same requests, twice the bytes). float4 quarters the
-       requests per lane at identical DRAM traffic.
-     - WIDER costs work-items: n/w of them. Drop below `machine-lanes` and EUs go idle,
-       which is exactly how a naive `always float4` LOSES on a mid-sized kernel (n=16384
-       scalar = 16384 work-items = full; float4 = 4096 = HALF the machine idle).
+   These kernels are REQUEST-RATE bound on an iGPU, not DRAM bound: a scalar f32 copy tops
+   out ~53 GB/s while an f64 copy over the SAME work-item count reaches ~78 — same requests,
+   twice the bytes, more bandwidth. Widening to w elements per work-item cuts the memory
+   requests per lane w-fold at identical DRAM traffic.
 
-   So: take the widest w whose work-item count still fills the machine, cap at 4, and
-   fall back to scalar for anything too small to fill it at all (those kernels are
-   launch-bound; vectorizing them only removes lanes)."
+   The obvious counter-force is that w elements per item means n/w ITEMS, so a wide vector
+   on a small kernel leaves EUs idle. That suggests 'take the widest w that still fills the
+   machine' — and MEASUREMENT SAYS THAT RULE IS WRONG. On the gemma layer's f32→f16 casts
+   (median n=16384 on a 8192-lane part) float4 leaves HALF the machine idle (4096 items =
+   16 workgroups of the 32 that fill it) and still beat float2 at full occupancy, at both
+   B=1 and B=16. A 16-byte request carries more memory-level parallelism per thread than the
+   idle EUs cost: half a machine issuing wide requests beats a full machine issuing narrow
+   ones.
+
+   So: go as WIDE as possible, and only fall back when the launch gets genuinely small — the
+   floor is a quarter of the machine's work-items, below which a kernel is launch-bound and
+   removing its lanes helps nothing."
   [desc n]
   (let [lanes (long (:machine-lanes desc 8192))
+        floor (max 1 (quot lanes 4))                ;; smallest work-item count worth widening
         n (long n)]
     (cond
-      (>= (quot n 4) lanes) 4
-      (>= (quot n 2) lanes) 2
+      (>= (quot n 4) floor) 4
+      (>= (quot n 2) floor) 2
       :else 1)))
 
 (defn reduction-accumulators

@@ -151,13 +151,15 @@
       (is (= 32 (fill-wgs arc 256)))
       (is (= 64 (fill-wgs arc 128)))
       (is (= 16 (fill-wgs {:machine-lanes 4096} 256))))
-    (testing "stream-vector-width takes the widest vector that STILL FILLS the machine"
-      ;; the whole trap: float4 on a mid-sized kernel removes work-items faster than it
-      ;; saves memory requests, and half the EUs go idle.
-      (is (= 4 (vec-width arc (* 8192 4))))       ;; 32768 → 8192 float4 items = full
-      (is (= 2 (vec-width arc (* 8192 2))))       ;; 16384 → 8192 float2 items = full
-      (is (= 1 (vec-width arc 8192)))             ;; 8192  → scalar is already exactly full
-      (is (= 1 (vec-width arc 1024))))            ;; too small to fill at any width
-    (testing "a wider machine needs a bigger n before it pays to vectorize"
-      (is (= 1 (vec-width {:machine-lanes 65536} 32768)))
-      (is (= 4 (vec-width {:machine-lanes 65536} (* 65536 4)))))))
+    (testing "stream-vector-width goes as WIDE as it can down to a quarter-machine floor"
+      ;; measured: float4 at n=16384 leaves half the EUs idle (16 workgroups of 32) and STILL
+      ;; beats float2 at full occupancy — a 16-byte request carries more memory-level
+      ;; parallelism per thread than the idle lanes cost. Wide beats full.
+      (is (= 4 (vec-width arc 32768)))            ;; 8192 float4 items
+      (is (= 4 (vec-width arc 16384)))            ;; 4096 items = HALF the machine, still w4
+      (is (= 4 (vec-width arc 8192)))             ;; 2048 items = the quarter-machine floor
+      (is (= 2 (vec-width arc 4096)))             ;; below it at w4 → step down
+      (is (= 1 (vec-width arc 1024))))            ;; launch-bound: widening only removes lanes
+    (testing "the floor scales with the machine — a wider part needs a bigger n"
+      (is (= 1 (vec-width {:machine-lanes 65536} 8192)))
+      (is (= 4 (vec-width {:machine-lanes 65536} 65536))))))
