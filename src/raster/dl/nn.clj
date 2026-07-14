@@ -522,6 +522,77 @@
                        (rms-norm! x weight out rows features eps gain-offset)
                        out)))
 
+;; ----------------------------------------------------------------
+;; rms-norm, GPU SCHEDULE: two-stage (chunked) reduction.
+;;
+;; SAME MATH, DIFFERENT DECOMPOSITION. rms-norm!/rms-norm above parallelize over
+;; ROWS: one work item per row, serial over `features`. That is the right schedule
+;; on the CPU (the inner feature loops are contiguous and lift to SIMD; it is the
+;; decode hot path of every pretrained decoder-LM) and the WRONG one on a wide GPU:
+;; a training block at rows = bs*seq = 64 launches 64 work items on a machine that
+;; is 8192 lanes wide (0.8% fill) and measures ~1.7 GB/s against a 78 GB/s ceiling.
+;;
+;; This variant is the chunk-parallel schedule (the same one finetune.head-gpu uses
+;; for its vocab softmax stats):
+;;   stage 1  par over (row × chunk)  — partial Σ x² over a contiguous feature run
+;;   stage 2  par over row            — combine the chunk partials → inv-rms (cheap:
+;;                                      `chunks` reads per row, no `features` factor)
+;;   stage 3  par over (row × feature) — scale × gain; full-occupancy elementwise
+;; `chunks` is a caller-chosen Long (an explicit param, exactly like head-gpu's
+;; chunk-max) — pick it so rows*chunks fills the device (≈8192 items on Arc 140V)
+;; while keeping the inner run contiguous (a chunk of ≥8 features).
+;;
+;; NOT bit-identical to rms-norm: the sum of squares is REASSOCIATED across chunks
+;; (f64 agrees to ~1e-15, f32 to ~1e-6 relative). Use rms-norm when you need the
+;; row-serial summation order.
+;;
+;; WHY TWO DEFTMS AND NOT ONE OP WITH A SCHEDULE: raster has no schedule-selection
+;; mechanism yet (task S6 — schedule-as-data). Until it does, the honest spelling is
+;; two ops with the same semantics and different decompositions, chosen at the call
+;; site by target: CPU/decode calls rms-norm, a GPU-compiled block calls
+;; rms-norm-chunked. Do NOT "fix" this by teaching a backend pass to rewrite one into
+;; the other — this pair is the concrete motivating case for the schedule work.
+;; ----------------------------------------------------------------
+
+(deftm rms-norm-chunked
+  (All [T] [x :- (Array T) weight :- (Array T)
+            rows :- Long features :- Long chunks :- Long
+            eps :- Double gain-offset :- Double] :- (Array T)
+       (let [csz (clojure.core/quot (clojure.core/+ features (clojure.core/- chunks 1)) chunks)
+             ps  (alloc-like x (* rows chunks))
+             inv (alloc-like x rows)
+             out (alloc-like x (* rows features))]
+         ;; stage 1 — chunk-parallel partial sums of squares
+         (raster.par/map-void! t (clojure.core/* rows chunks)
+                               (let [r (quot t chunks)
+                                     c (rem t chunks)
+                                     start (clojure.core/* c csz)
+                                     e0 (clojure.core/+ start csz)
+                                     end (if (< e0 features) e0 features)
+                                     len (clojure.core/- end start)
+                                     offset (clojure.core/+ (clojure.core/* r features) start)
+                                     s (loop [i 0 s 0.0]
+                                         (if (< i len)
+                                           (let [v (aget x (clojure.core/+ offset i))]
+                                             (recur (inc i) (+ s (* v v))))
+                                           s))]
+                                 (aset ps t s)))
+         ;; stage 2 — per-row combine (identical arithmetic to rms-norm!'s tail)
+         (raster.par/map-void! r rows
+                               (let [base (clojure.core/* r chunks)
+                                     ms (loop [c 0 s 0.0]
+                                          (if (< c chunks)
+                                            (recur (inc c) (+ s (aget ps (clojure.core/+ base c))))
+                                            (/ s (double features))))]
+                                 (aset inv r (/ 1.0 (n/sqrt (+ ms eps))))))
+         ;; stage 3 — full-occupancy apply
+         (raster.par/map-void! t (clojure.core/* rows features)
+                               (let [r (quot t features)
+                                     i (rem t features)]
+                                 (aset out t (* (aget x t) (aget inv r)
+                                                (+ gain-offset (aget weight i))))))
+         out)))
+
 ;; Single-ROW Stage-A rms-norm: the functional par/reduce + par/map form.
 ;; rms-norm! parallelizes over ROWS (one work-item per row, serial feature
 ;; reduce — the right shape for multi-row/prefill); this variant is for the
@@ -1609,6 +1680,67 @@
                                                                nil))))
                                    dx)))
 
+;; The GPU (chunked) schedule of the SAME backward — the twin of rms-norm-chunked
+;; above, and the pullback its rrule emits. Row-parallel backward-dx at rows=64 is
+;; the single most occupancy-starved kernel in the gemma training layer; here the two
+;; per-row reductions (Σ x² for inv-rms, and c = Σ (g0+w)·x·dy) are chunk-parallel and
+;; the per-element write is (row × feature)-parallel:
+;;   stage 1  par (row × chunk)   — BOTH partial reductions, one kernel, two stores
+;;   stage 2  par (row)           — combine → k1 = inv, k2 = inv³·c/F
+;;   stage 3  par (row × feature) — dx_j = k1·(g0+w_j)·dy_j − k2·x_j
+;; Same reassociation caveat as the forward (not bit-identical to rms-norm-backward-dx).
+(deftm rms-norm-chunked-backward-dx
+  (All [T] [dy :- (Array T) x :- (Array T) weight :- (Array T)
+            rows :- Long features :- Long chunks :- Long
+            eps :- Double gain-offset :- Double] :- (Array T)
+       (let [csz (clojure.core/quot (clojure.core/+ features (clojure.core/- chunks 1)) chunks)
+             pss (alloc-like x (* rows chunks))    ;; Σ x²        per (row, chunk)
+             pc  (alloc-like x (* rows chunks))    ;; Σ (g0+w)x·dy per (row, chunk)
+             k1  (alloc-like x rows)               ;; inv-rms      per row
+             k2  (alloc-like x rows)               ;; inv³·c/F     per row
+             dx  (alloc-like dy (* rows features))]
+         (raster.par/map-void! t (clojure.core/* rows chunks)
+                               (let [r (quot t chunks)
+                                     c (rem t chunks)
+                                     start (clojure.core/* c csz)
+                                     e0 (clojure.core/+ start csz)
+                                     end (if (< e0 features) e0 features)
+                                     len (clojure.core/- end start)
+                                     offset (clojure.core/+ (clojure.core/* r features) start)
+                                     sq (loop [i 0 s 0.0]
+                                          (if (< i len)
+                                            (let [v (aget x (clojure.core/+ offset i))]
+                                              (recur (inc i) (+ s (* v v))))
+                                            s))
+                                     sc (loop [i 0 s 0.0]
+                                          (if (< i len)
+                                            (let [j (clojure.core/+ offset i)
+                                                  gi (+ gain-offset (aget weight (clojure.core/+ start i)))]
+                                              (recur (inc i) (+ s (* gi (* (aget x j) (aget dy j))))))
+                                            s))]
+                                 (aset pss t sq)
+                                 (aset pc t sc)))
+         (raster.par/map-void! r rows
+                               (let [base (clojure.core/* r chunks)
+                                     ms (loop [c 0 s 0.0]
+                                          (if (< c chunks)
+                                            (recur (inc c) (+ s (aget pss (clojure.core/+ base c))))
+                                            (/ s (double features))))
+                                     cc (loop [c 0 s 0.0]
+                                          (if (< c chunks)
+                                            (recur (inc c) (+ s (aget pc (clojure.core/+ base c))))
+                                            s))
+                                     inv (/ 1.0 (n/sqrt (+ ms eps)))]
+                                 (aset k1 r inv)
+                                 (aset k2 r (* (/ (* inv (* inv inv)) (double features)) cc))))
+         (raster.par/map-void! t (clojure.core/* rows features)
+                               (let [r (quot t features)
+                                     i (rem t features)
+                                     gi (+ gain-offset (aget weight i))]
+                                 (aset dx t (- (* (aget k1 r) (* gi (aget dy t)))
+                                               (* (aget k2 r) (aget x t))))))
+         dx)))
+
 ;; Resident weight-gradient: dw is a CROSS-ROW reduction (Σ over rows into a
 ;; per-feature output), which is NOT a per-row independent write, so it needs
 ;; TWO resident kernels (the two par passes the task permits):
@@ -2079,6 +2211,24 @@
                                                     dw (list 'raster.dl.nn/rms-norm-backward-dweight
                                                              adjoint-sym x rows features eps)])
                                            [dx dw nil nil nil nil]]))})
+
+;; rms-norm-chunked rrule — the GPU schedule's pullback. dx takes the chunked
+;; backward (the occupancy fix); dw stays the ROW-parallel rms-norm-backward-dweight:
+;; in every training block we compile the norms are FROZEN (:constant), so this dW is
+;; dead and DCE'd before it ever reaches a kernel. If a caller ever trains the norm
+;; gains under the chunked schedule, that dW is the next thing to chunk.
+(tmpl/merge-into-template! 'raster.dl.nn/rms-norm-chunked
+                           {:params '[x weight rows features chunks eps gain-offset] :result nil :adjoint 'dy
+                            :grads-fn (fn [ctx [x weight rows features chunks eps gain-offset]
+                                           _result-sym adjoint-sym gensym-fn]
+                                        (let [dx (gensym-fn "dx" (tmpl/grad-tag x))
+                                              dw (gensym-fn "dw" (tmpl/grad-tag weight))]
+                                          [(update ctx :bindings into
+                                                   [dx (list 'raster.dl.nn/rms-norm-chunked-backward-dx
+                                                             adjoint-sym x weight rows features chunks eps gain-offset)
+                                                    dw (list 'raster.dl.nn/rms-norm-backward-dweight
+                                                             adjoint-sym x rows features eps)])
+                                           [dx dw nil nil nil nil nil]]))})
 
 ;; residual-add rrule — elementwise sum (transformer residuals, LoRA base+delta).
 ;; The additive fan-out backward is the IDENTITY: d_a = d_b = dy. Return the adjoint

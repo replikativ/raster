@@ -15,7 +15,8 @@
   first (optimized for the host CPU), falls back to OpenBLAS. Avoids conflicts
   with Neanderthal's bundled JNI OpenBLAS by checking loader lookup first."
   (:require [raster.core :refer [deftm]]
-            [raster.ad.templates :as tmpl])
+            [raster.ad.templates :as tmpl]
+            [raster.compiler.core.op-descriptor :as descriptor])
   (:import [java.lang.foreign
             Arena FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout]))
@@ -333,6 +334,28 @@
                            (MemorySegment/ofArray C) (int n)]))
   C)
 
+;; ── which argument a GEMM WRITES (the compiler's effect model) ─────────────────
+;; A `!` name makes these `mutating-op?` by convention, and a mutating op with no
+;; registered output index is treated as possibly writing EVERY array argument. That
+;; over-approximation is what kept DEAD gemms alive: DCE keeps a mutating binding
+;; whose mutation target is live, and `A`/`B` (the READ-ONLY operands) are of course
+;; live — so a `C` nobody ever reads still got computed. The concrete case is
+;; frozen-weight training: the backward of a `linear-nb` against a :constant weight
+;; produces a dW (a `:tn` gemm into a fresh buffer) whose value+grad slot the caller
+;; never `nth`s. It was computed, written, and discarded — 7 GEMMs + their f16
+;; converts/transposes per gemma LoRA layer.
+;;
+;; C (arg 2) is the ONLY buffer a cblas gemm writes. Declaring it makes the effect
+;; explicit, so DCE can see that a dead C means a dead GEMM. :allocates? false — these
+;; write into a caller-provided buffer, so buffer_fuse leaves them alone (the same
+;; shape as the conv2d-backward-*-into! registrations). Mode is :accumulate because
+;; beta is a RUNTIME arg (beta≠0 reads C first); every current call site passes 0.
+(doseq [op '[raster.linalg.blas/dgemm! raster.linalg.blas/dgemm-tn!
+             raster.linalg.blas/dgemm-nt!]]
+  (descriptor/register-buffer-semantics! op {:allocates? false :in-place-arg 2
+                                             :mutating? true})
+  (descriptor/register-buffer-write! op :accumulate 2))
+
 ;; ================================================================
 ;; Batched GEMM — one contiguous [batch,·,·] buffer per operand, looped over
 ;; head slabs via asSlice offsets (no per-head alloc). Used by batched multi-head
@@ -350,10 +373,10 @@
           as (* m k) bs (* n k) cs (* m n)]
       (dotimes [h batch]
         (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
-           (.asSlice sa (* (long h) as 4)) (int k)
-           (.asSlice sb (* (long h) bs 4)) (int k)
-           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+                               (.asSlice sa (* (long h) as 4)) (int k)
+                               (.asSlice sb (* (long h) bs 4)) (int k)
+                               (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
   C)
 
 (deftm ^:no-inline batched-gemm-nt!
@@ -364,10 +387,10 @@
           as (* m k) bs (* n k) cs (* m n)]
       (dotimes [h batch]
         (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
-           (.asSlice sa (* (long h) as 8)) (int k)
-           (.asSlice sb (* (long h) bs 8)) (int k)
-           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_TRANS (int m) (int n) (int k) alpha
+                               (.asSlice sa (* (long h) as 8)) (int k)
+                               (.asSlice sb (* (long h) bs 8)) (int k)
+                               0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
   C)
 
 (deftm ^:no-inline batched-gemm-nn!
@@ -380,10 +403,10 @@
           as (* m k) bs (* k n) cs (* m n)]
       (dotimes [h batch]
         (.invokeWithArguments ^java.lang.invoke.MethodHandle @sgemm-mh
-          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
-           (.asSlice sa (* (long h) as 4)) (int k)
-           (.asSlice sb (* (long h) bs 4)) (int n)
-           (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+                               (.asSlice sa (* (long h) as 4)) (int k)
+                               (.asSlice sb (* (long h) bs 4)) (int n)
+                               (float 0.0) (.asSlice sc (* (long h) cs 4)) (int n)]))))
   C)
 
 (deftm ^:no-inline batched-gemm-nn!
@@ -394,10 +417,10 @@
           as (* m k) bs (* k n) cs (* m n)]
       (dotimes [h batch]
         (.invokeWithArguments ^java.lang.invoke.MethodHandle @dgemm-mh
-          [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
-           (.asSlice sa (* (long h) as 8)) (int k)
-           (.asSlice sb (* (long h) bs 8)) (int n)
-           0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
+                              [CBLAS_ROW_MAJOR CBLAS_NO_TRANS CBLAS_NO_TRANS (int m) (int n) (int k) alpha
+                               (.asSlice sa (* (long h) as 8)) (int k)
+                               (.asSlice sb (* (long h) bs 8)) (int n)
+                               0.0 (.asSlice sc (* (long h) cs 8)) (int n)]))))
   C)
 
 ;; ================================================================

@@ -75,7 +75,22 @@
                               (when gpu? (:global-memory-bytes caps))
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
-      gpu? (assoc :integrated? (boolean (:integrated? caps))))))
+      gpu? (assoc :integrated? (boolean (:integrated? caps))
+                  :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
+      ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
+      ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
+      ;; shape, so it belongs on the descriptor rather than as a literal at each launch site
+      ;; (it was 8192, hardcoded, in three of them). Arc 140V: 64 x 8 x 16 = 8192.
+      ;;
+      ;; Set ONLY when the device actually reported all three. Defaulting a missing EU count
+      ;; to 1 would silently yield machine-lanes=16 — split-k would never fire and every
+      ;; elementwise kernel would mis-vectorize, with no error anywhere. A missing value
+      ;; leaves the key ABSENT, and the derivations below fall back to a documented default.
+      (and gpu? (:total-eus caps) (:threads-per-eu caps)
+           (or (:simd-width caps) (rt/subgroup-size device-id)))
+      (assoc :machine-lanes (* (long (:total-eus caps))
+                               (long (:threads-per-eu caps))
+                               (long (or (:simd-width caps) (rt/subgroup-size device-id))))))))
 
 (defn host-descriptor
   "The descriptor for the running host CPU (projected from runtime.hardware :cpu:0)."
@@ -133,6 +148,47 @@
   ([desc {:keys [regs-per-tile latency-target] :or {regs-per-tile 2 latency-target 4}}]
    (max 1 (min (long latency-target)
                (quot (long (:num-vector-registers desc)) (long regs-per-tile))))))
+
+;; ---------------------------------------------------------------------------
+;; GPU launch geometry — a schedule is a function of (shape, machine width),
+;; never of the model. These are the two decisions every GPU launch site needs.
+;; ---------------------------------------------------------------------------
+
+(defn fill-workgroups
+  "Workgroups of `wg` work-items needed to fill the device once = machine-lanes / wg.
+   A launch below this count leaves EUs idle and is OCCUPANCY-bound — no amount of
+   inner-loop tuning helps it. Arc 140V at wg=256: 8192/256 = 32."
+  [desc wg]
+  (max 1 (quot (long (:machine-lanes desc 8192)) (long wg))))
+
+(defn stream-vector-width
+  "Vector width (1 | 2 | 4) for an ELEMENTWISE/streaming kernel over `n` elements.
+
+   These kernels are REQUEST-RATE bound on an iGPU, not DRAM bound: a scalar f32 copy tops
+   out ~53 GB/s while an f64 copy over the SAME work-item count reaches ~78 — same requests,
+   twice the bytes, more bandwidth. Widening to w elements per work-item cuts the memory
+   requests per lane w-fold at identical DRAM traffic.
+
+   The obvious counter-force is that w elements per item means n/w ITEMS, so a wide vector
+   on a small kernel leaves EUs idle. That suggests 'take the widest w that still fills the
+   machine' — and MEASUREMENT SAYS THAT RULE IS WRONG. On the gemma layer's f32→f16 casts
+   (median n=16384 on a 8192-lane part) float4 leaves HALF the machine idle (4096 items =
+   16 workgroups of the 32 that fill it) and still beat float2 at full occupancy, at both
+   B=1 and B=16. A 16-byte request carries more memory-level parallelism per thread than the
+   idle EUs cost: half a machine issuing wide requests beats a full machine issuing narrow
+   ones.
+
+   So: go as WIDE as possible, and only fall back when the launch gets genuinely small — the
+   floor is a quarter of the machine's work-items, below which a kernel is launch-bound and
+   removing its lanes helps nothing."
+  [desc n]
+  (let [lanes (long (:machine-lanes desc 8192))
+        floor (max 1 (quot lanes 4))                ;; smallest work-item count worth widening
+        n (long n)]
+    (cond
+      (>= (quot n 4) floor) 4
+      (>= (quot n 2) floor) 2
+      :else 1)))
 
 (defn reduction-accumulators
   "Independent vector accumulators to keep live in a SIMD REDUCTION to hide FMA latency

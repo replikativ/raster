@@ -620,18 +620,41 @@
   Options:
     :alpha   - scalar multiplier (default 1.0)
     :beta    - accumulation factor (default 0.0, C = alpha*A*B + beta*C)
-    :c-dtype - output type, :half or :float (default :half)"
-  [kernel-name & {:keys [alpha beta c-dtype]
-                  :or {alpha 1.0 beta 0.0 c-dtype :half}}]
-  (let [c-type (if (= c-dtype :float) "float" "half")
+    :c-dtype - output type, :half or :float (default :half)
+    :split-k? - SPLIT-K variant (default false): a THIRD grid dimension over
+                k-chunks. Workgroup (x,y,z) reduces only k ∈ [z·KC, min(K,(z+1)·KC))
+                and writes its PARTIAL C tile to C + z·M·N (so C is a
+                [splits, M, N] f32 partials buffer, combined by
+                emit-gemm-splitk-reduce-kernel). This is the schedule fix for a
+                GEMM whose (M,N) tiling cannot fill the machine — e.g. the tied-
+                embedding backward dx[13,640] = dlogits[13,262144]·E[262144,640]
+                launches ceil(640/128)·ceil(13/128) = 5 workgroups (of the ~32 that
+                fill this iGPU) each doing a k=262144 serial reduction. Splitting k
+                multiplies the workgroup count without changing the total DRAM
+                traffic (each (n-tile, k-chunk) block of B is still read once).
+                Adds an `int KC` kernel arg. :split-k? forces :c-dtype :float
+                (partials must accumulate in f32). Only valid with beta = 0."
+  [kernel-name & {:keys [alpha beta c-dtype split-k?]
+                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false}}]
+  (when (and split-k? (not= beta 0.0))
+    (throw (ex-info "split-k GEMM requires beta = 0 (partials are summed by the reduce kernel)"
+                    {:beta beta})))
+  (let [c-dtype (if split-k? :float c-dtype)
+        c-type (if (= c-dtype :float) "float" "half")
         c-size (if (= c-dtype :float) 4 2)
-        store-cast (if (= c-dtype :float) "" "(half)")]
+        store-cast (if (= c-dtype :float) "" "(half)")
+        ;; upper bound of THIS workgroup's k-range: the full K normally, the k-chunk
+        ;; end under split-k. Only the LOOP bounds and the A-prefetch guard use it —
+        ;; the 2D-block reads keep the full M/K/N extents (they are the hardware OOB
+        ;; clamp of the whole matrix, not of this workgroup's slice).
+        kend (if split-k? "k_hi" "K")]
     (str
      "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
      "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
      "\n"
      "// Non-square GEMM: C[M×N] = A[M×K] × B[K×N]\n"
      "// Tile: 128×128 per workgroup, 16 subgroups (4×4), K-unroll ×2\n"
+     (when split-k? "// SPLIT-K: grid z = k-chunk; C is a [splits, M, N] f32 partials buffer\n")
      "\n"
      "__attribute__((intel_reqd_sub_group_size(16)))\n"
      "__kernel void " kernel-name "(\n"
@@ -639,6 +662,7 @@
      "    __global const half* restrict B,\n"
      "    __global " c-type "* restrict C,\n"
      "    int M, int N, int K"
+     (when split-k? ", int KC")
      (when (not= alpha 1.0) ", float alpha")
      (when (not= beta 0.0) ", float beta")
      ") {\n"
@@ -651,9 +675,23 @@
      "    int n_base0 = get_group_id(0) * 128 + sg_col * 32;\n"
      "    int n_base1 = n_base0 + 16;\n"
      "\n"
-     "    // Early exit if entire subgroup tile is OOB\n"
-     "    if (m_base >= M && n_base0 >= N) return;\n"
+     ;; A subgroup whose M-tile is entirely past M writes nothing (every store is
+     ;; guarded by `row < M`), and likewise for an N-tile past N (`col < N`) — so
+     ;; either condition alone makes the subgroup pure waste. The old `&&` kept
+     ;; those subgroups grinding the whole K-loop (and re-reading B): at M=13 that
+     ;; is 3 of every 4 subgroups. There are no barriers/SLM in this kernel, so a
+     ;; per-subgroup early return is safe.
+     "    // Early exit if this subgroup's tile contributes no in-range element\n"
+     "    if (m_base >= M || n_base0 >= N) return;\n"
      "\n"
+     (when split-k?
+       (str
+        "    // this workgroup's k-slice\n"
+        "    int k_lo = get_group_id(2) * KC;\n"
+        "    if (k_lo >= K) return;\n"
+        "    int k_hi = k_lo + KC; if (k_hi > K) k_hi = K;\n"
+        "    C += (long)get_group_id(2) * (long)M * (long)N;\n"
+        "\n"))
      "    // 8 accumulators: 4 M-tiles × 2 N-tiles\n"
      "    float8 acc00=0.0f, acc10=0.0f, acc20=0.0f, acc30=0.0f;\n"
      "    float8 acc01=0.0f, acc11=0.0f, acc21=0.0f, acc31=0.0f;\n"
@@ -661,20 +699,20 @@
      "    int a_wb = K * 2, a_pb = K * 2;\n"
      "    int b_wb = N * 2, b_pb = N * 2;\n"
      "\n"
-     "    // Prefetch first 3 K-steps of A\n"
-     "    for (int p = 0; p < 3 && p * 16 < K; p++) {\n"
-     "        int pk = p * 16;\n"
+     "    // Prefetch first 3 K-steps of A (from this workgroup's k origin)\n"
+     "    for (int p = 0; p < 3 && " (if split-k? "k_lo + " "") "p * 16 < " kend "; p++) {\n"
+     "        int pk = " (if split-k? "k_lo + " "") "p * 16;\n"
      "        for (int m = 0; m < 4; m++)\n"
      "            intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
      "    }\n"
      "\n"
      "    // Main K-loop: 32 K elements per iteration (2 K-steps)\n"
-     "    int k = 0;\n"
-     "    for (; k + 31 < K; k += 32) {\n"
+     "    int k = " (if split-k? "k_lo" "0") ";\n"
+     "    for (; k + 31 < " kend "; k += 32) {\n"
      "        // K-step 1: k\n"
      "        int pk = k + 48;\n"
-     "        if (pk < K) {\n"
+     "        if (pk < " kend ") {\n"
      "            for (int m = 0; m < 4; m++)\n"
      "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
@@ -701,7 +739,7 @@
      "        // K-step 2: k+16\n"
      "        int k2 = k + 16;\n"
      "        pk = k2 + 48;\n"
-     "        if (pk < K) {\n"
+     "        if (pk < " kend ") {\n"
      "            for (int m = 0; m < 4; m++)\n"
      "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
@@ -725,8 +763,8 @@
      "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
      "    }\n"
      "\n"
-     "    // Remainder K-steps (K not multiple of 32)\n"
-     "    for (; k < K; k += 16) {\n"
+     "    // Remainder K-steps (k-range not a multiple of 32)\n"
+     "    for (; k < " kend "; k += 16) {\n"
      "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
      "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
      "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
@@ -795,6 +833,23 @@
      "        }\n"
      "    }\n"
      "}\n")))
+
+(defn emit-gemm-splitk-reduce-kernel
+  "Second stage of a split-k GEMM: C[i] = Σ_s partials[s·MN + i], i < MN = M·N.
+  One work-item per OUTPUT element (grid-stride), each summing `splits` f32
+  partials — MN work items, so the combine itself has full occupancy whenever the
+  GEMM's output is non-tiny. f32 throughout (the partials are f32 accumulators)."
+  [kernel-name]
+  (str "__kernel void " kernel-name "(\n"
+       "    __global const float* restrict partials,\n"
+       "    __global float* restrict C,\n"
+       "    int mn, int splits) {\n"
+       "    for (int i = get_global_id(0); i < mn; i += get_global_size(0)) {\n"
+       "        float acc = 0.0f;\n"
+       "        for (int s = 0; s < splits; ++s) acc += partials[(long)s * (long)mn + i];\n"
+       "        C[i] = acc;\n"
+       "    }\n"
+       "}\n"))
 
 (defn gemm-launch-config
   "Compute 2D launch config for GEMM kernel.

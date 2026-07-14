@@ -105,7 +105,7 @@
 (deftest rope-forward-matches-reference
   (doseq [[sl heads hd theta] [[6 4 8 10000.0] [4 2 16 1.0e6] [3 3 4 10000.0]]]
     (let [x (da (* sl heads hd) (+ 60 sl))
-          got (attn/rope x sl heads hd theta)
+          got (attn/rope x 1 sl heads hd theta)
           ref (ref-rope x sl heads hd theta)]
       (is (< (max-abs-diff got ref) 1e-9)
           (str "rope fwd sl=" sl " heads=" heads " hd=" hd " theta=" theta
@@ -114,7 +114,7 @@
 (deftest rope-backward-matches-reference
   (doseq [[sl heads hd theta] [[6 4 8 10000.0] [4 2 16 1.0e6] [3 3 4 10000.0]]]
     (let [dy (da (* sl heads hd) (+ 70 sl))
-          got (attn/rope-backward-dx dy sl heads hd theta)
+          got (attn/rope-backward-dx dy 1 sl heads hd theta)
           ref (ref-rope-dx dy sl heads hd theta)]
       (is (< (max-abs-diff got ref) 1e-9)
           (str "rope bwd sl=" sl " heads=" heads " hd=" hd " theta=" theta
@@ -174,7 +174,7 @@
 
 (deftm rope-parity-loss [x :- (Array float) tgt :- (Array float)
                          seq-len :- Long heads :- Long head-dim :- Long theta :- Double] :- Double
-  (let [y (raster.dl.attention/rope x seq-len heads head-dim theta)]
+  (let [y (raster.dl.attention/rope x 1 seq-len heads head-dim theta)]
     (raster.dl.loss/mse-loss y tgt (clojure.core/* seq-len (clojure.core/* heads head-dim)))))
 
 (deftest rms-norm-value+grad-resident-parity
@@ -198,11 +198,43 @@
                "rel-err" (:rel-err (get grads 'w)))
       (is (every? some? (map :resident? (vals grads)))))))
 
+;; The GPU SCHEDULE of the same op (rms-norm-chunked): its value+grad must ALSO extract
+;; fully resident and match the CPU grads. This is the schedule the gemma training block
+;; actually runs — three kernels (chunk-partial reduce | row combine | apply) per norm
+;; instead of one 64-work-item kernel.
+(deftm rmsn-chunked-parity-loss [x :- (Array float) w :- (Array float) tgt :- (Array float)
+                                 rows :- Long feat :- Long chunks :- Long
+                                 eps :- Double go :- Double] :- Double
+  (let [y (raster.dl.nn/rms-norm-chunked x w rows feat chunks eps go)]
+    (raster.dl.loss/mse-loss y tgt (clojure.core/* rows feat))))
+
+(deftest rms-norm-chunked-value+grad-resident-parity
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] rms-norm-chunked resident parity: no Level Zero GPU")
+    (let [rows 8 feat 32 chunks 4 go 1.0 eps 1e-6
+          x (fa (* rows feat) 1) w (fa feat 2) tgt (fa (* rows feat) 3)
+          {:keys [grads]}
+          (gp/grad-parity #'rmsn-chunked-parity-loss
+                          [{:name 'x :type '(Array float) :val x}
+                           {:name 'w :type '(Array float) :val w}
+                           {:name 'tgt :type '(Array float) :val tgt}
+                           {:name 'rows :type 'Long :val rows}
+                           {:name 'feat :type 'Long :val feat}
+                           {:name 'chunks :type 'Long :val chunks}
+                           {:name 'eps :type 'Double :val eps}
+                           {:name 'go :type 'Double :val go}]
+                          :grad-args '[x w])]
+      (println "  [rms-norm-chunked] grad(x) steps:" (:step-kinds (get grads 'x))
+               "rel-err" (:rel-err (get grads 'x)))
+      (println "  [rms-norm-chunked] grad(w) steps:" (:step-kinds (get grads 'w))
+               "rel-err" (:rel-err (get grads 'w)))
+      (is (every? some? (map :resident? (vals grads)))))))
+
 ;; gqa-causal-mha value+grad: the milestone — the SDPA backward (dq/dk/dv kernels)
 ;; composed with pack/broadcast/unpack. grad wrt Q must extract FULLY RESIDENT.
 (deftm gqa-parity-loss [Q :- (Array float) K :- (Array float) V :- (Array float) tgt :- (Array float)
                         seq-len :- Long nq :- Long nkv :- Long hd :- Long] :- Double
-  (let [y (raster.dl.attention/gqa-causal-mha Q K V seq-len nq nkv hd)]
+  (let [y (raster.dl.attention/gqa-causal-mha Q K V 1 seq-len nq nkv hd)]
     (raster.dl.loss/mse-loss y tgt (clojure.core/* seq-len (clojure.core/* nq hd)))))
 
 (deftest gqa-causal-mha-value+grad-resident-parity
@@ -244,9 +276,9 @@
         q  (raster.dl.nn/linear-nb xn Wq seq dmodel (clojure.core/* nq hd))
         k  (raster.dl.nn/linear-nb xn Wk seq dmodel (clojure.core/* nkv hd))
         v  (raster.dl.nn/linear-nb xn Wv seq dmodel (clojure.core/* nkv hd))
-        qr (raster.dl.attention/rope q seq nq hd theta)
-        kr (raster.dl.attention/rope k seq nkv hd theta)
-        a  (raster.dl.attention/gqa-causal-mha qr kr v seq nq nkv hd)
+        qr (raster.dl.attention/rope q 1 seq nq hd theta)
+        kr (raster.dl.attention/rope k 1 seq nkv hd theta)
+        a  (raster.dl.attention/gqa-causal-mha qr kr v 1 seq nq nkv hd)
         o  (raster.dl.nn/linear-nb a Wo seq (clojure.core/* nq hd) dmodel)]
     (raster.dl.loss/mse-loss o tgt (clojure.core/* seq dmodel))))
 

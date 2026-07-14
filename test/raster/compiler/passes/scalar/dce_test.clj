@@ -117,3 +117,46 @@
       ;; x is dead, y is kept by root-pred, z is live from body
       (is (= 1 (:bindings-removed stats))
           "only x should be removed; y is a root"))))
+
+;; ================================================================
+;; Declared output buffer of a mutating op (the frozen-weight dW leak)
+;; ================================================================
+
+(deftest declared-output-arg-narrows-mutation-targets-test
+  ;; A mutating op that DECLARES its output buffer writes exactly that argument; the
+  ;; other operands are read-only. Treating them as mutation targets kept DEAD calls
+  ;; alive, because DCE keeps a mutating binding whose target is live — and a GEMM's
+  ;; A/B operands are of course live elsewhere. That is how a LoRA backward computed
+  ;; full weight gradients for FROZEN weights (7 :tn GEMMs per gemma layer) whose
+  ;; value+grad slots nobody ever reads.
+  (require 'raster.linalg.blas)                ;; registers dgemm!'s :in-place-arg 2
+  (let [emt @#'dce/extract-mutation-targets]
+    (testing "a cblas gemm mutates ONLY its C argument"
+      (is (= '#{dW} (emt '(raster.linalg.blas/dgemm-tn! dy x dW out-f batch in-f 1.0 0.0)))
+          "dy and x are read-only operands, not mutation targets")
+      (is (= '#{dx} (emt '(raster.linalg.blas/dgemm! dy W dx batch out-f in-f 1.0 0.0)))))
+
+    (testing "an undeclared mutating op keeps the conservative any-arg approximation"
+      (is (contains? (emt '(some.ns/unknown-mutator! a b c)) 'a))
+      (is (contains? (emt '(some.ns/unknown-mutator! a b c)) 'b)))))
+
+(deftest dead-gemm-into-unread-buffer-is-eliminated-test
+  ;; End-to-end on the flat IR the AD transform produces for a frozen-weight dW:
+  ;;   dW_buf = (alloc)              ; fresh
+  ;;   _      = (dgemm-tn! dy x dW_buf …)
+  ;; with dy/x live (they feed the gradients we DO read) but dW_buf read by nobody.
+  (require 'raster.linalg.blas)
+  (let [form '(let* [dx_buf (clojure.core/double-array 8)
+                     _1 (raster.linalg.blas/dgemm! dy W dx_buf 2 2 2 1.0 0.0)
+                     dW_buf (clojure.core/double-array 8)
+                     _2 (raster.linalg.blas/dgemm-tn! dy x dW_buf 2 2 2 1.0 0.0)]
+                    dx_buf)
+        {:keys [form stats]} (dce/eliminate-dead-bindings form)
+        kept (set (map first (partition 2 (second form))))]
+    (testing "the dW GEMM and its buffer are dead"
+      (is (not (contains? kept 'dW_buf)))
+      (is (not (contains? kept '_2)))
+      (is (= 2 (:bindings-removed stats))))
+    (testing "the dx GEMM (whose buffer IS read) survives"
+      (is (contains? kept 'dx_buf))
+      (is (contains? kept '_1)))))

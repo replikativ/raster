@@ -270,21 +270,21 @@
   "Repeat each of n-kv contiguous [slab] KV-head blocks `group` times:
   out[(g*group+r)*slab + i] = src[g*slab + i], for g<n-kv, r<group, i<slab.
   Output length = n-kv*group*slab. Used to align KV heads with query heads in GQA/MQA.
-  Resident broadcast: `par/map-void!` over the n-kv*group output blocks (work-item
-  e = g*group+r), each copying the slab of source kv-head g = e/group. In-kernel
-  integer index math (clojure.core) → resident :map-void kernel; a pure fan-out
-  copy (no atomics)."
+
+  OUTPUT-ELEMENT parallel (work-item o = e*slab + i over n-kv*group*slab items), the
+  same shape as its dual sum-kv-heads. It was BLOCK parallel (one work item per output
+  head-block, each serially copying a whole slab), which at gemma-3-270m's MQA shape
+  (n_kv=1, group=4) is FOUR work items — 0.05% of this GPU — each streaming a 16384-
+  element slab: 0.84 ms to move 0.33 MB (a 0.004 ms roofline), ×4 kernels/layer ×18
+  layers = 60 ms/step. The block count is n_q, which is never a machine-filling number;
+  the element count always is. Pure fan-out copy, no atomics → resident :map-void kernel."
   (All [T] [src :- (Array T) n-kv :- Long group :- Long slab :- Long] :- (Array T)
        (let [out (alloc-like src (* n-kv group slab))]
-         (par/map-void! e (clojure.core/* n-kv group)
-                        (let [g (quot e group)
-                              dst (clojure.core/* e slab)
-                              soff (clojure.core/* g slab)]
-                          (loop [i 0]
-                            (if (< i slab)
-                              (do (aset out (clojure.core/+ dst i) (aget src (clojure.core/+ soff i)))
-                                  (recur (inc i)))
-                              nil))))
+         (par/map-void! o (clojure.core/* (clojure.core/* n-kv group) slab)
+                        (let [e (quot o slab)
+                              i (rem o slab)
+                              g (quot e group)]
+                          (aset out o (aget src (clojure.core/+ (clojure.core/* g slab) i)))))
          out)))
 
 (deftm sum-kv-heads

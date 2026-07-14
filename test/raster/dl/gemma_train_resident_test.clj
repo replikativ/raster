@@ -74,9 +74,9 @@
         v  (raster.dl.gemma-train-resident-test/lora-lin h Wv Av Bv seq d r nkh)
         q  (nn/rms-norm q q-norm snq hd eps 1.0)
         k  (nn/rms-norm k k-norm snkv hd eps 1.0)
-        q  (attn/rope q seq nq hd theta)
-        k  (attn/rope k seq nkv hd theta)
-        a  (attn/gqa-causal-mha q k v seq nq nkv hd)
+        q  (attn/rope q 1 seq nq hd theta)
+        k  (attn/rope k 1 seq nkv hd theta)
+        a  (attn/gqa-causal-mha q k v 1 seq nq nkv hd)
         o  (raster.dl.gemma-train-resident-test/lora-lin a Wo Ao Bo seq nqh r d)
         o  (nn/rms-norm o post-attn seq d eps 1.0)
         x1 (nn/residual-add x o n)
@@ -293,6 +293,108 @@
                   (is (< (/ (Math/abs (- g c)) (max 1e-9 (Math/abs c))) 1.0e-3)
                       (format "step %d GPU %.6f vs CPU %.6f" k g c)))))
             (finally (close-session! sess))))))))
+
+;; ═════════════════════════════════════════════════════════════════════════════════
+;; MIXED-PRECISION BACKWARD (S2a): the SAME resident train step (value+grad + SGD) under
+;; :gemm-precision :f16-xmx — f16 GEMM inputs, f32 accumulate/output — must train the
+;; adapters along the SAME loss trajectory as the exact :f32-scalar policy.
+;;
+;; This is the gate for running the VJP/backward program in mixed precision (the forward
+;; was already validated). Measured on the real gemma-3-270m layer (seq 64, d 640, dff
+;; 2048, r 16, ze:0, device-event timing): VJP kernel time 65.5 → 38.8 ms (1.69x), its
+;; GEMM part 36.8 → 12.0 ms (3.07x); adapter-grad rel-err vs the f32 grads ~9e-4 with
+;; cosine similarity 1.000 — f16 MANTISSA noise, not underflow (0.1-0.3% of grad entries
+;; fall below the f16 min normal 6.1e-5; shrinking the seed cotangent 1000x — deep into
+;; subnormal territory — only degrades rel-err to ~2.5e-3, and loss scaling recovers it
+;; because the VJP is linear in the seed).
+;;
+;; Dims are bind-time scalars, so the SAME compiled descriptor serves both policies (and
+;; both dim sets). CFG-MP is sized so that every :gemm step clears the XMX pitch gate
+;; (n>=8 and k>=8) — at CFG's r=4/nkh=4 the gate would silently fall back to scalar and
+;; the test would not exercise f16 at all. That is asserted, not assumed.
+;; ═════════════════════════════════════════════════════════════════════════════════
+
+(def CFG-MP
+  "Same block, dims above the XMX pitch gate (r=8, nkh=8, nqh=16)."
+  {:seq 8 :d 16 :nq 2 :nkv 1 :hd 8 :dff 32 :r 8 :eps 1.0e-6 :theta 10000.0})
+
+(defn- gemm-dims
+  "[{:variant :m :n :k} …] for every :gemm step of a descriptor at `args`."
+  [prog args]
+  (mapv (fn [s] {:variant (:variant s)
+                 :m (long ((:m-fn s) args)) :n (long ((:n-fn s) args)) :k (long ((:k-fn s) args))})
+        (filter #(= :gemm (:convention %)) (:steps prog))))
+
+(defn- run-trajectory!
+  "n-steps of the resident train step under `prog`'s GEMM policy in a fresh session.
+   Returns the host loss trajectory [loss(state_0) … loss(state_n)]."
+  [gpu prog cfg st0 lr n-steps]
+  (let [make-session (ns-resolve gpu 'make-session)
+        bind-program! (ns-resolve gpu 'bind-program!)
+        run-program! (ns-resolve gpu 'run-program!)
+        close-session! (ns-resolve gpu 'close-session!)
+        download (ns-resolve gpu 'download)
+        st (clone-adapters st0)
+        args (train-args cfg st lr)
+        sess (make-session :ze:0)]
+    (try
+      (let [h (bind-program! sess prog args
+                             (merge (zipmap adapter-syms (repeat :state))
+                                    (zipmap '[x input-ln q-norm k-norm post-attn
+                                              pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
+                                            (repeat :constant)))
+                             {:key :train})]
+        (loop [k 0 losses [(host-loss cfg st)]]
+          (if (= k n-steps)
+            losses
+            (do (run-program! sess h args)
+                (recur (inc k)
+                       (conj losses
+                             (host-loss cfg (reduce (fn [m s]
+                                                      (assoc m s (download sess (keyword (name s)))))
+                                                    st adapter-syms))))))))
+      (finally (close-session! sess)))))
+
+(deftest gemma-lora-mixed-precision-backward-trajectory
+  (if-not @gp/gpu-available?
+    (println "  [SKIP] gemma LoRA mixed-precision backward: no Level Zero GPU")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          cfg CFG-MP
+          lr 0.02
+          n-steps 25
+          st0 (init-state cfg)
+          args (train-args cfg st0 lr)
+          p32 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
+                                      :on-non-resident :nil :gemm-precision :f32-scalar)
+          ;; the descriptor is plain data: the policy is a bind-time re-tag, same program
+          p16 (assoc p32 :gemm-precision :f16-xmx)]
+      (is (some? p32) "train-step must extract fully resident")
+      (when p32
+        (let [dims (gemm-dims p32 args)]
+          (testing "every backward GEMM clears the XMX pitch gate (so :f16-xmx really fires)"
+            (println "  [mixed-precision bwd]" (count dims) "gemm steps, variants:"
+                     (frequencies (map :variant dims)))
+            (is (every? (fn [{:keys [n k]}] (and (>= n 8) (>= k 8))) dims)
+                (str "gemm steps below the n>=8/k>=8 pitch gate would silently stay scalar: "
+                     (pr-str (filter (fn [{:keys [n k]}] (or (< n 8) (< k 8))) dims)))))
+          (let [l32 (run-trajectory! gpu p32 cfg st0 lr n-steps)
+                l16 (run-trajectory! gpu p16 cfg st0 lr n-steps)]
+            (println "  [mixed-precision bwd] f32-scalar loss:"
+                     (mapv #(format "%.6f" %) (take 3 l32)) "…"
+                     (mapv #(format "%.6f" %) (take-last 2 l32)))
+            (println "  [mixed-precision bwd] f16-xmx    loss:"
+                     (mapv #(format "%.6f" %) (take 3 l16)) "…"
+                     (mapv #(format "%.6f" %) (take-last 2 l16)))
+            (testing "the f16-xmx backward still trains (loss decreases on-device)"
+              (is (< (peek l16) (* 0.7 (first l16)))
+                  (str "final " (peek l16) " vs initial " (first l16))))
+            (testing "the f16-xmx trajectory tracks the exact f32 trajectory step for step"
+              ;; f16 GEMM inputs perturb each gradient by ~1e-3 relative; over 25 SGD steps
+              ;; that stays a ~1e-3-level trajectory divergence (it does NOT compound into a
+              ;; different optimization path at this lr).
+              (doseq [[k a b] (map vector (range) l32 l16)]
+                (is (< (/ (Math/abs (- a b)) (max 1.0e-9 (Math/abs a))) 5.0e-3)
+                    (format "step %d: f32 %.6f vs f16 %.6f" k a b))))))))))
 
 ;; ═════════════════════════════════════════════════════════════════════════════════
 ;; DUAL-PROGRAM SHARED SESSION (task #9): the fwd program and the VJP train-step

@@ -413,6 +413,17 @@
   ;; resolver never found anything left to do. The fixpoint-edge census throw
   ;; (record-fixpoint-census!) guards the invariant: a regression shows up as
   ;; a loud GPU compile error here, not a first-compile-fails flake.
+  ;;
+  ;; POSTSCRIPT (2026-07-12): deleting the epilogue was right, and the census DID
+  ;; do its job — it caught a cold-JVM under-devirtualization (6 undevirtualized
+  ;; raster.dl.nn/rms-norm on a fresh JVM, clean on a warm one). But the bug was
+  ;; never IN the fixpoint: a parametric (All [T]) deftm registers only its
+  ;; `double` specialization at definition time, so the var's TC signature —
+  ;; built from the dispatch TABLE — rejected every float call site, and a body
+  ;; with TC type-errors has ALL its binding types discarded, leaving the call's
+  ;; arg tags nil so try-parametric-specialize! could not fire. Re-expanding here
+  ;; would never have fixed that; declaring the template's float signature up
+  ;; front does (dispatch/parametric-tc-sigs). The census is the messenger.
   (let [max-iters 5
         ;; Force simplify mode for the fixpoint — we always want normalize+rewalk
         opts (assoc opts :simplify? true)]
@@ -1522,12 +1533,21 @@
    :gemm-precision sets the resident :gemm binding policy CARRIED on the descriptor
    (bind-program! reads it; a bind-time caller may still override with
    (assoc descriptor :gemm-precision …)):
-     :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C. Fast, but the f16 input
-                          conversion costs gradient precision (~1e-3-level composed-grad
-                          noise) — right for decode/inference.
+     :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C accumulate/output. The
+                          mixed-precision (AMP) policy: f16 INPUTS, f32 math. Costs ~1e-3
+                          relative gradient noise (f16 mantissa, cosine similarity to the
+                          f32 grads still 1.000) and buys ~3x on the GEMM kernels.
      :f32-scalar        — plain scalar f32 GEMM for ALL :gemm steps (reads f32 residents
                           directly, no convert/transpose expansion). Exact f32 grads
-                          (~1e-6-level parity) — right for training.
+                          (~1e-6-level parity) — the exactness escape hatch (grad tests,
+                          FD gates, anything that must bit-track the CPU reference).
+   Both policies are validated for BACKWARD/value+grad programs, not just forward:
+   see raster.dl.gemma-train-resident-test/gemma-lora-mixed-precision-backward-trajectory
+   (25 on-device SGD steps under each policy, trajectories agree) and the measured
+   real-dims gemma layer VJP (65.5 → 38.8 ms kernel, GEMM 36.8 → 12.0 ms).
+   f16 UNDERFLOW (min normal 6.1e-5) is the one hazard a small-magnitude cotangent can hit
+   — the remedy is standard AMP loss scaling, and it lives in the CALLER (scale the seed
+   cotangent by S, use lr/S), not in this policy: the VJP is linear in the seed.
    No size heuristics; the XMX hardware pitch gate (n<8 or k<8 → scalar) applies in
    bind-program! regardless of policy."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision]

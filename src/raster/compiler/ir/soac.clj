@@ -149,16 +149,25 @@
    those bindings into VAL so the returned :value is one flat expression — the
    same shape a pure map's lambda has, which is what lets the SAME vertical-fusion
    path inline it downstream. Recognizes bare `aset` and walker-devirtualized
-   `(.invk aset-impl …)` via the op-descriptor matchers."
+   `(.invk aset-impl …)` via the op-descriptor matchers.
+
+   The let* body must be a SINGLE form. A multi-statement let* body
+   `(let* [v …] (aset a i v) (aset b i …))` is NOT a single write: modelling it as
+   a SoacMap over `b` DROPPED the store to `a` outright (soac->par-form rebuilds the
+   body from the lambda alone), and the store vanished from the emitted kernel —
+   a silent miscompile, not a missed fusion. Anything with more than one statement
+   returns nil ⇒ ScalarBinding ⇒ the legacy void path, which emits the body as
+   written."
   [body idx-sym]
   (let [stmt (if (and (seq? body) (= 'do (first body)) (= 2 (count body)))
                (second body) body)]
     (cond
-      ;; let*-wrapped write: recurse into the let body, then inline the bindings
+      ;; let*-wrapped write: recurse into the SOLE let body form, then inline the bindings
       (and (seq? stmt) (contains? #{'let* 'let} (first stmt)))
       (let [[_ binds & lbody] stmt]
-        (when-let [inner (single-aset-void (last lbody) idx-sym)]
-          (update inner :value #(inline-let-bindings binds %))))
+        (when (= 1 (count lbody))
+          (when-let [inner (single-aset-void (first lbody) idx-sym)]
+            (update inner :value #(inline-let-bindings binds %)))))
 
       (descriptor/aset-call? stmt)
       (let [cargs (vec (descriptor/call-args stmt))]   ;; (arr idx-expr val)

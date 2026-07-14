@@ -104,6 +104,14 @@
 (def ^:private ZE_MODULE_FORMAT_NATIVE 0x01)
 (def ^:private ZE_RESULT_SUCCESS 0)
 
+;; Device-event kernel timing (profiling)
+(def ^:private ZE_STRUCTURE_TYPE_EVENT_POOL_DESC 0x10)
+(def ^:private ZE_STRUCTURE_TYPE_EVENT_DESC 0x11)
+(def ^:private ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2 0x00020006)
+(def ^:private ZE_EVENT_POOL_FLAG_HOST_VISIBLE 0x1)
+(def ^:private ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP 0x4)
+(def ^:private ZE_EVENT_SCOPE_FLAG_HOST 0x4)
+
 ;; ================================================================
 ;; Layout helpers
 ;; ================================================================
@@ -208,6 +216,20 @@
 
 (def ^:private h-zeCommandListAppendBarrier
   (delay (make-handle "zeCommandListAppendBarrier" (fd I32 PTR PTR I32 PTR))))
+
+;; --- Device events (kernel timestamp profiling) ---
+(def ^:private h-zeEventPoolCreate
+  (delay (make-handle "zeEventPoolCreate" (fd I32 PTR PTR I32 PTR PTR))))
+(def ^:private h-zeEventPoolDestroy
+  (delay (make-handle "zeEventPoolDestroy" (fd I32 PTR))))
+(def ^:private h-zeEventCreate
+  (delay (make-handle "zeEventCreate" (fd I32 PTR PTR PTR))))
+(def ^:private h-zeEventDestroy
+  (delay (make-handle "zeEventDestroy" (fd I32 PTR))))
+(def ^:private h-zeEventQueryKernelTimestamp
+  (delay (make-handle "zeEventQueryKernelTimestamp" (fd I32 PTR PTR))))
+(def ^:private h-zeEventHostReset
+  (delay (make-handle "zeEventHostReset" (fd I32 PTR))))
 
 ;; --- Regular (replayable) command list + queue: enqueue-all-sync-once (command graph) ---
 (def ^:private ZE_STRUCTURE_TYPE_COMMAND_LIST_DESC 0x0f)
@@ -393,6 +415,35 @@
   ^MemorySegment []
   (ensure-init!)
   (:driver @state))
+
+(defn device-timer-props
+  "Device timer properties for converting kernel-timestamp ticks → nanoseconds.
+  Returns {:ns-per-tick double, :kernel-timestamp-valid-bits long, :timer-resolution long}.
+
+  Queried with stype ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2, where timerResolution
+  is the timer FREQUENCY in cycles/sec (exact — the 1.0 stype reports integer
+  nanoseconds-per-tick, which truncates e.g. 52.083 ns → 52). Fallback heuristic for
+  old drivers that ignore the 1_2 stype: a value < 1e5 cannot be a frequency and is
+  interpreted as ns-per-tick directly. Cached after first query."
+  []
+  (ensure-init!)
+  (or (:timer-props @state)
+      (let [{:keys [^Arena arena device]} @state
+            props (.allocate arena 512)
+            _ (.set props I32 0 (int ZE_STRUCTURE_TYPE_DEVICE_PROPERTIES_1_2))
+            _ (ze-call! "zeDeviceGetProperties(timer)" @h-zeDeviceGetProperties [device props])
+            ;; ze_device_properties_t offsets: timerResolution u64 @80,
+            ;; timestampValidBits u32 @88, kernelTimestampValidBits u32 @92 (see query-devices).
+            timer-resolution (.get props I64 80)
+            kts-bits (long (.get props I32 92))
+            ns-per-tick (if (< timer-resolution 100000)
+                          (double timer-resolution)              ;; already ns/tick (1.0 semantics)
+                          (/ 1.0e9 (double timer-resolution)))   ;; cycles/sec → ns/tick
+            tp {:ns-per-tick ns-per-tick
+                :kernel-timestamp-valid-bits kts-bits
+                :timer-resolution timer-resolution}]
+        (swap! state assoc :timer-props tp)
+        tp)))
 
 ;; ================================================================
 ;; Device queries (for hardware detection)
@@ -1835,6 +1886,88 @@
      (.set gc I32 8 (int 1))
      bnd)))
 
+;; ── SPLIT-K GEMM (the low-occupancy-shape schedule) ────────────────────────────
+;; A GEMM whose (M,N) tiling yields fewer workgroups than fill the machine —
+;; ceil(N/128)·ceil(M/128) — cannot be rescued by a better inner loop: the machine
+;; is idle. Splitting the K reduction across a third grid dimension multiplies the
+;; workgroup count at CONSTANT DRAM traffic (each (n-tile, k-chunk) block of B is
+;; still read exactly once), then a second kernel sums the per-chunk partials.
+;; Measured lever: the tied-embedding backward dx[13,640] = dlogits[13,262144] ·
+;; E[262144,640] launches 5 workgroups of the ~32 that fill this iGPU.
+
+(def ^:private gemm-splitk-cache (atom nil))
+(def ^:private splitk-reduce-cache (atom nil))
+
+(defn- ensure-gemm-splitk-kernel!
+  "Lazily compile + cache the split-k XMX gemm (f16 A/B in, f32 PARTIALS out).
+   Returns {:module :kernel :kernel-name}."
+  []
+  (ensure-init!)
+  (when (nil? @gemm-splitk-cache)
+    (let [kname "gemm_nonsquare_splitk"
+          cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                      kname :c-dtype :float :split-k? true))
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   cl-src :device (:device-id-hex @state)))
+          module (load-module! spv)
+          kernel (create-kernel module kname)]
+      (clojure.core/reset! gemm-splitk-cache
+                           {:module module :kernel kernel :kernel-name kname})))
+  @gemm-splitk-cache)
+
+(defn- ensure-splitk-reduce-kernel!
+  "Lazily compile + cache the split-k partials-combine kernel."
+  []
+  (ensure-init!)
+  (when (nil? @splitk-reduce-cache)
+    (let [kname "gemm_splitk_reduce"
+          src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                  ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-splitk-reduce-kernel)
+                   kname))
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   src :device (:device-id-hex @state)))
+          module (load-module! spv)
+          kernel (create-kernel module kname)]
+      (clojure.core/reset! splitk-reduce-cache
+                           {:module module :kernel kernel :kernel-name kname})))
+  @splitk-reduce-cache)
+
+(defn bind-registered-gemm-splitk!
+  "Bind the SPLIT-K XMX GEMM: A[m×k]·B[k×n] → `partials` [splits, m, n] f32.
+  Grid is 3D — X = ceil(n/128), Y = ceil(m/128), Z = splits — so the launched
+  workgroup count is `splits` times the plain GEMM's. `kc` is the k-chunk each
+  z-slice reduces (must be a multiple of 32 so no interior chunk hits the k-remainder
+  path; the LAST chunk clamps to k). Pair with bind-registered-splitk-reduce!."
+  [a b partials m n k kc splits]
+  (let [{:keys [module kernel-name]} (ensure-gemm-splitk-kernel!)
+        kh (create-kernel-fresh module kernel-name)
+        m (long m) n (long n) k (long k) kc (long kc) splits (long splits)
+        args [(:segment a) (:segment b) (:segment partials)
+              {:type :int :value (int m)} {:type :int :value (int n)}
+              {:type :int :value (int k)} {:type :int :value (int kc)}]
+        bnd (bind-kernel-2d! kh [256 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 8 (int splits))                             ;; Z = k-chunks
+    bnd))
+
+(defn bind-registered-splitk-reduce!
+  "Bind the split-k combine: C[i] = Σ_s partials[s·mn + i], one work-item per output
+  element of C (mn = m·n)."
+  [partials c mn splits]
+  (let [{:keys [module kernel-name]} (ensure-splitk-reduce-kernel!)
+        kh (create-kernel-fresh module kernel-name)
+        mn (long mn) splits (long splits)
+        args [(:segment partials) (:segment c)
+              {:type :int :value (int mn)} {:type :int :value (int splits)}]
+        bnd (bind-kernel! kh 256 args)]
+    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double mn) 256.0))))
+    bnd))
+
 (def ^:private gemm-scalar-cache
   "Cache for compiled scalar (non-XMX) GEMM kernels, keyed by variant (:nn|:nt|:tn).
    Each entry is {:module :kernel :kernel-name}. f32 in/out — the small-N fallback."
@@ -1881,39 +2014,73 @@
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double total) 256.0))))
     bnd))
 
-(def ^:private convert-cache (atom nil))
+(def ^:private convert-cache (atom {}))
+
+(defn- convert-source
+  "f32→f16 element-wise convert, `w` elements per work-item (w ∈ #{1 2 4}).
+
+   The scalar form (`out[i] = (half)in[i]`, ONE element per work-item) is REQUEST-RATE
+   bound on this iGPU, not DRAM bound: it moves 6 bytes per work-item and tops out around
+   8 GB/s against a ~78 GB/s streaming ceiling. Widening to w elements cuts the memory
+   requests per lane w-fold at identical DRAM traffic.
+
+   `vstore_halfN` is CORE OpenCL (no cl_khr_fp16 dependency) and converts f32→f16 with the
+   default rounding mode = round-to-nearest-even — the SAME rounding as the `(half)` cast it
+   replaces, so the output is BIT-EXACT, not merely close. The `n & (w-1)` tail keeps the
+   kernel correct for element counts that are not a multiple of w.
+
+   `w` is NOT a constant: past a point, widening costs work-items faster than it saves
+   requests and the launch stops filling the machine. The caller picks it from the hardware
+   descriptor (core.hardware/stream-vector-width)."
+  [w]
+  (if (= 1 (long w))
+    (str "__kernel void f32_to_f16(__global const float* restrict in, "
+         "__global half* restrict out, int n) {\n"
+         "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
+         "out[i] = (half)in[i];\n}\n")
+    (let [w (long w)
+          sh (case w 2 1 4 2)]                            ;; log2(w), for the >> / << below
+      (str "__kernel void f32_to_f16(__global const float* restrict in, "
+           "__global half* restrict out, int n) {\n"
+           "  int nv = n >> " sh ";\n"
+           "  for (int i = get_global_id(0); i < nv; i += get_global_size(0))\n"
+           "    vstore_half" w "(vload" w "(i, in), i, out);\n"
+           "  for (int i = (nv << " sh ") + get_global_id(0); i < n; i += get_global_size(0))\n"
+           "    out[i] = (half)in[i];\n}\n"))))
 
 (defn- ensure-convert-kernel!
-  "Lazily compile + cache the f32→f16 element-wise convert kernel. Returns {:module :kernel}."
-  []
+  "Lazily compile + cache the f32→f16 convert kernel for vector width `w`. {:module :kernel}."
+  [w]
   (ensure-init!)
-  (when (nil? @convert-cache)
-    (let [src (str "__kernel void f32_to_f16(__global const float* restrict in, "
-                   "__global half* restrict out, int n) {\n"
-                   "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
-                   "out[i] = (half)in[i];\n}\n")
-          device-hex (:device-id-hex @state)
-          spv (do (require 'raster.compiler.support.spirv-cache)
-                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                   src :device device-hex))
-          module (load-module! spv)
-          kernel (create-kernel module "f32_to_f16")]
-      (clojure.core/reset! convert-cache {:module module :kernel kernel})))
-  @convert-cache)
+  (or (get @convert-cache w)
+      (let [spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     (convert-source w) :device (:device-id-hex @state)))
+            module (load-module! spv)
+            entry {:module module :kernel (create-kernel module "f32_to_f16")}]
+        (swap! convert-cache assoc w entry)
+        entry)))
 
 (defn bind-registered-convert!
   "Bind an f32→f16 element-wise convert kernel over RESIDENT buffers for recording into a
   command graph (the Option-B activation cast before an fp16 XMX GEMM). in: f32 DeviceBuffer,
   out: f16 (:half) DeviceBuffer, n elements. Returns a bound {:kernel :gc-seg} map. Fresh
-  kernel handle per binding."
-  [in out n]
-  (let [{:keys [module]} (ensure-convert-kernel!)
-        kh (create-kernel-fresh module "f32_to_f16")
-        n (long n)
-        args [(:segment in) (:segment out) {:type :int :value (int n)}]
-        bnd (bind-kernel! kh 256 args)]
-    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double n) 256.0))))
-    bnd))
+  kernel handle per binding.
+
+  `w` = elements per work-item (the vector width the CALLER scheduled from the hardware
+  descriptor); default 1 = the scalar kernel."
+  ([in out n] (bind-registered-convert! in out n 1))
+  ([in out n w]
+   (let [{:keys [module]} (ensure-convert-kernel! w)
+         kh (create-kernel-fresh module "f32_to_f16")
+         n (long n) w (long w)
+         args [(:segment in) (:segment out) {:type :int :value (int n)}]
+         bnd (bind-kernel! kh 256 args)
+         ;; one work-item per w elements. Floor at one group so an n < w program still
+         ;; launches the work-items its tail loop needs.
+         gc (max 1 (long (Math/ceil (/ (double (quot n w)) 256.0))))]
+     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int gc))
+     bnd)))
 
 (def ^:private transpose-cache (atom {}))
 
@@ -2150,9 +2317,17 @@
 
   prepareds: ordered seq of maps from bind-registered-map-void-kernel (each carries its own
   dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
-  Re-record only if the kernel sequence or any buffer is reallocated."
+  Re-record only if the kernel sequence or any buffer is reallocated.
+
+  Profiling (:profile? true): one kernel-timestamp device event per launch is created from a
+  dedicated event pool and passed as the launch's signal event; read-graph-timestamps! after a
+  replay returns per-kernel device times in execution order (names/phases read from each
+  prepared's :kernel-name/:phase). Opt-in ONLY: with :profile? false (default) the recorded
+  command list is exactly today's fast path (NULL signal events, no pool, no extra keys on the
+  returned graph map). A profiled graph must have its events reset between replays —
+  read-graph-timestamps! does so after reading; reset-graph-events! does it without reading."
   ([prepareds] (record-graph! prepareds {:barriers? true}))
-  ([prepareds {:keys [barriers?] :or {barriers? true}}]
+  ([prepareds {:keys [barriers? profile?] :or {barriers? true profile? false}}]
    (ensure-init!)
    (let [{:keys [arena context device]} @state
          cq-desc (.allocate ^Arena arena 40)
@@ -2169,7 +2344,39 @@
                      [context device cl-desc l-out])
          lst (read-ptr l-out)
          h-launch @h-zeCommandListAppendLaunchKernel
-         h-barrier @h-zeCommandListAppendBarrier]
+         h-barrier @h-zeCommandListAppendBarrier
+         n-kernels (count prepareds)
+         ;; Profiling event pool + one timestamp event per launch. HOST_VISIBLE so the host
+         ;; can query/reset; KERNEL_TIMESTAMP so zeEventQueryKernelTimestamp is valid.
+         event-pool (when (and profile? (pos? n-kernels))
+                      (let [pool-desc (.allocate ^Arena arena 24)
+                            _ (.set pool-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_POOL_DESC))
+                            _ (.set pool-desc I32 16 (int (bit-or ZE_EVENT_POOL_FLAG_HOST_VISIBLE
+                                                                  ZE_EVENT_POOL_FLAG_KERNEL_TIMESTAMP)))
+                            _ (.set pool-desc I32 20 (int n-kernels))
+                            p-out (ptr-seg arena)]
+                        (ze-call! "zeEventPoolCreate" @h-zeEventPoolCreate
+                                  [context pool-desc (int 0) MemorySegment/NULL p-out])
+                        (read-ptr p-out)))
+         events (when event-pool
+                  (mapv (fn [i]
+                          (let [ev-desc (.allocate ^Arena arena 32)
+                                _ (.set ev-desc I32 0 (int ZE_STRUCTURE_TYPE_EVENT_DESC))
+                                _ (.set ev-desc I32 16 (int i))  ;; index
+                                ;; signal scope 0 (in-command-list only), NOT HOST: a HOST-scope
+                                ;; signal forces a cache-hierarchy flush after EVERY kernel, which
+                                ;; measured 3-5x slower on the gemma layer graphs (fwd 32→170 ms)
+                                ;; — a profiler must not perturb what it measures. The pool is
+                                ;; HOST_VISIBLE, so event status + kernel timestamps are readable
+                                ;; from the host after the synchronous queue-execute returns
+                                ;; (validated vs host wall time on iGPU; re-validate on dGPU).
+                                _ (.set ev-desc I32 20 (int 0))  ;; signal scope
+                                _ (.set ev-desc I32 24 (int 0))  ;; wait scope
+                                e-out (ptr-seg arena)]
+                            (ze-call! "zeEventCreate" @h-zeEventCreate
+                                      [event-pool ev-desc e-out])
+                            (read-ptr e-out)))
+                        (range n-kernels)))]
     ;; append each bound kernel's launch (args already live on its dedicated handle; the
     ;; group-count value is captured into the recorded command at append time). A barrier
     ;; after each launch enforces ordering so a kernel sees the previous one's writes — the
@@ -2177,21 +2384,26 @@
     ;; each is memory-bound so overlap buys little; correctness first. (Measured: an IN_ORDER
     ;; command list with no barriers is the same replay time — the ~50µs/kernel floor on this
     ;; iGPU is per-dispatch overhead, not the barrier. Fewer/bigger kernels is the lever.)
-     (doseq [{:keys [bound group-count]} prepareds]
-       (let [^MemorySegment gc (:gc-seg bound)]
+     (doseq [[i {:keys [bound group-count]}] (map-indexed vector prepareds)]
+       (let [^MemorySegment gc (:gc-seg bound)
+             signal-ev (if events (nth events i) MemorySegment/NULL)]
         ;; A 1D map/map-void carries its X-grid as group-count (Y=Z=1 pre-filled). A GEMM /
         ;; convert / transpose expansion pre-bakes its FULL (2D) gc-seg at bind time and passes
         ;; group-count = nil — leave its X/Y/Z untouched (overwriting X would break the 2D grid).
          (when (some? group-count) (.set gc I32 0 (int group-count)))
          (ze-call! "zeCommandListAppendLaunchKernel" h-launch
-                   [lst (:kernel bound) gc MemorySegment/NULL (int 0) MemorySegment/NULL])
+                   [lst (:kernel bound) gc signal-ev (int 0) MemorySegment/NULL])
          (when barriers?
            (ze-call! "zeCommandListAppendBarrier" h-barrier
                      [lst MemorySegment/NULL (int 0) MemorySegment/NULL]))))
      (ze-call! "zeCommandListClose" @h-zeCommandListClose [lst])
      (let [lists-arr (ptr-seg arena)]
        (.set lists-arr PTR 0 ^MemorySegment lst)
-       {:queue queue :list lst :lists-arr lists-arr}))))
+       (cond-> {:queue queue :list lst :lists-arr lists-arr}
+         events (assoc :events events
+                       :event-pool event-pool
+                       :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
+                       :phases (mapv :phase prepareds)))))))
 
 (defn replay-graph!
   "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."
@@ -2215,10 +2427,75 @@
 
 (defn destroy-graph!
   "Destroy a recorded command graph's queue + list (record-graph! creates one of each per graph
-  and never frees them). Without this every record-graph! leaks a zeCommandQueue + zeCommandList."
+  and never frees them), plus any profiling events + event pool (:profile? graphs). Without this
+  every record-graph! leaks a zeCommandQueue + zeCommandList."
   [graph]
   (destroy-handle! @h-zeCommandListDestroy (:list graph))
-  (destroy-handle! @h-zeCommandQueueDestroy (:queue graph)))
+  (destroy-handle! @h-zeCommandQueueDestroy (:queue graph))
+  (doseq [ev (:events graph)]
+    (destroy-handle! @h-zeEventDestroy ev))
+  (when-let [pool (:event-pool graph)]
+    (destroy-handle! @h-zeEventPoolDestroy pool)))
+
+(defn reset-graph-events!
+  "Host-reset all profiling events of a graph recorded with :profile? true, WITHOUT reading
+  them — required between replays (re-signaling an already-signaled event is invalid). No-op
+  for non-profiled graphs. read-graph-timestamps! resets as part of reading; call this instead
+  when a replay's timestamps are not wanted (e.g. warmup)."
+  [graph]
+  (doseq [ev (:events graph)]
+    (ze-call! "zeEventHostReset" @h-zeEventHostReset [ev]))
+  nil)
+
+(defn read-graph-timestamps!
+  "Read per-kernel device timestamps from a graph recorded with :profile? true, AFTER a
+  replay-graph! has completed (the synchronous queue guarantees all events are signaled).
+  Resets the events afterwards so the graph can be replayed again.
+
+  Returns {:kernels [{:kernel-name str :phase kw|nil :ms double :context-ms double
+                      :start-ticks long :end-ticks long} …]   ;; execution order
+           :wall-ms double|nil    ;; device span first-kernel-start → last-kernel-end
+           :ns-per-tick double}
+
+  :ms is the GLOBAL (wall-clock domain) kernel duration; :context-ms counts only cycles while
+  the kernel was actively executing (excludes preemption) — normally equal on this runtime's
+  single in-order queue. Tick→ns uses device-timer-props; per-kernel wraparound is corrected
+  with kernelTimestampValidBits, but :wall-ms is nil if the span itself wrapped (rare: ~223 s
+  at 32 valid bits / 52 ns per tick — report honestly rather than alias)."
+  [graph]
+  (let [{:keys [events kernel-names phases]} graph]
+    (when-not events
+      (throw (ex-info "read-graph-timestamps!: graph was not recorded with :profile? true" {})))
+    (let [{:keys [ns-per-tick kernel-timestamp-valid-bits]} (device-timer-props)
+          ns-per-tick (double ns-per-tick)
+          bits (long kernel-timestamp-valid-bits)
+          wrap (if (< bits 64) (bit-shift-left 1 bits) 0)
+          dur-ticks (fn ^long [^long s ^long e]
+                      (if (>= e s) (- e s) (+ (- wrap s) e)))
+          rows (let [tmp-arena (Arena/ofConfined)]
+                 (try
+                   (let [res (.allocate tmp-arena 32)]
+                     (mapv (fn [i ev]
+                             (ze-call! "zeEventQueryKernelTimestamp" @h-zeEventQueryKernelTimestamp
+                                       [ev res])
+                             (let [g-start (.get res I64 0)  g-end (.get res I64 8)
+                                   c-start (.get res I64 16) c-end (.get res I64 24)]
+                               {:kernel-name (nth kernel-names i)
+                                :phase (nth phases i)
+                                :ms (/ (* ns-per-tick (dur-ticks g-start g-end)) 1.0e6)
+                                :context-ms (/ (* ns-per-tick (dur-ticks c-start c-end)) 1.0e6)
+                                :start-ticks g-start
+                                :end-ticks g-end}))
+                           (range (count events)) events))
+                   (finally (.close tmp-arena))))
+          _ (doseq [ev events]
+              (ze-call! "zeEventHostReset" @h-zeEventHostReset [ev]))
+          span (when (seq rows)
+                 (- (long (reduce max (map :end-ticks rows)))
+                    (long (reduce min (map :start-ticks rows)))))]
+      {:kernels rows
+       :wall-ms (when (and span (>= span 0)) (/ (* ns-per-tick span) 1.0e6))
+       :ns-per-tick ns-per-tick})))
 
 ;; ================================================================
 ;; Exclusive scan kernel invocation (Blelloch algorithm)

@@ -1,7 +1,13 @@
 (ns raster.compiler.core.dispatch-test
   (:require [clojure.test :refer [deftest testing is]]
             [raster.compiler.core.dispatch :as dispatch]
-            [raster.compiler.core.types :as types]))
+            [raster.compiler.core.inference :as inf]
+            [raster.compiler.core.types :as types]
+            [raster.core]
+            [raster.dl.array-ops]
+            [raster.par]
+            [raster.arrays]
+            [raster.numeric]))
 
 ;; ================================================================
 ;; Method entry creation and specificity
@@ -278,3 +284,49 @@
     ;; non-array arg against (Array T) → cannot bind T → nil
     (is (nil? (dispatch/signature-result-tag
                'raster.numeric/sigtest-resid '[float floats long])))))
+
+;; ================================================================
+;; Parametric TC signatures — the LOAD-ORDER DETERMINISM invariant
+;; ================================================================
+
+(raster.core/deftm l2det-scale
+  (All [T] [x :- (Array T) w :- (Array T) n :- Long eps :- Double] :- (Array T)
+       (let [out (raster.dl.array-ops/alloc-like x n)]
+         (raster.par/map-void! i n
+                               (raster.arrays/aset out i
+                                                   (raster.numeric/* (raster.arrays/aget x i)
+                                                                     (raster.arrays/aget w i))))
+         out)))
+
+;; A CONCRETE float caller of the parametric op above. Its body is what TC must be
+;; able to check on a fresh JVM, BEFORE any float specialization of l2det-scale has
+;; been instantiated.
+(deftest parametric-tc-signature-is-dtype-complete-test
+  (testing "a parametric (All [T]) deftm has ONLY its eager `double` impl registered"
+    (let [tbl @(:raster.core/dispatch-table (meta #'l2det-scale))
+          tagsets (set (map :tags (mapcat val tbl)))]
+      (is (contains? tagsets '[doubles doubles long double])
+          "definition-time eager double specialization")
+      (is (not (contains? tagsets '[floats floats long double]))
+          "no float impl yet — this test is only meaningful COLD")))
+
+  (testing "TC still type-checks a FLOAT call site — the template's float signature is
+            declared up front, so binding types are NOT discarded"
+    ;; Before the fix, emit-tc-ann! derived the TC type purely from the registered
+    ;; dispatch table (double only) ⇒ TC reported an app-type-error on the float call
+    ;; ⇒ inference.clj discarded ALL binding tags ⇒ the call could not devirtualize
+    ;; ⇒ a GPU compile threw "undevirtualized dispatch call(s)" on a cold JVM but
+    ;; SUCCEEDED on a warm one. Devirtualization must not depend on JVM history.
+    (let [res (inf/tc-analyze-deftm-body
+               'l2det-caller
+               '[x w n] '[(Array float) (Array float) Long]
+               '[(let [y (raster.compiler.core.dispatch-test/l2det-scale x w n 1.0e-6)]
+                   y)]
+               *ns*)]
+      (is (some? res) "TC produced a result")
+      (is (= 'floats (get (:binding-tags res) 'y))
+          "the float call's result binding is tagged `floats` — TC accepted the
+           float signature of the parametric template")))
+
+  (testing "the synthesized signature covers every dtype the compiler monomorphizes to"
+    (is (= '[double float] dispatch/tc-parametric-element-types))))

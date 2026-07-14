@@ -27,6 +27,7 @@
   (:refer-clojure :exclude [])
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
@@ -278,6 +279,8 @@
           ;; be destroyed here or every session leaks them (the SIGABRT class of driver leak).
           (doseq [[_ prog] programs]
             (when destroy-graph! (try (destroy-graph! (:graph prog)) (catch Exception _)))
+            (when (and destroy-graph! (:prologue-graph prog))
+              (try (destroy-graph! (:prologue-graph prog)) (catch Exception _)))
             (when destroy-prepared!
               (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
             ;; f16 GEMM-conversion scratch is allocated outside :buffers — free it here.
@@ -793,6 +796,66 @@
 ;; (returns a {:kernel :gc-seg …} bound map over GPU-RESIDENT buffers) collected into
 ;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
 
+;; ── split-k schedule knobs (see the `splitk` fn in bind-program!) ──────────────
+;; The XMX GEMM launches ceil(n/128) x ceil(m/128) workgroups of 256 items (= 16
+;; hw threads). This iGPU (64 EU x 8 threads) holds 32 such workgroups, so any GEMM
+;; below that count is OCCUPANCY-bound, not memory- or compute-bound. Splitting k
+;; buys workgroups at constant DRAM traffic; the knobs bound how far.
+
+(def ^:dynamic *gemm-splitk-fill-wgs*
+  "Workgroups that saturate the device. nil = DERIVE it from the target's HardwareDescriptor
+   (machine-lanes / 256 — Arc 140V: 8192/256 = 32); bind to a number to override. A GEMM at
+   or above this count is NOT split.
+
+   This used to be the literal 32, which is this laptop's iGPU and no other machine's." nil)
+
+(def ^:dynamic *gemm-splitk-target-wgs*
+  "Workgroup count a split GEMM aims for — a few waves over the fill count, so memory
+   latency has something to hide behind. nil = 4x the fill count." nil)
+
+(def ^:dynamic *gemm-splitk-min-chunk*
+  "Smallest k-chunk worth giving a workgroup: below this the per-chunk fixed cost (A
+   prefetch, storing a full partial C tile) outweighs the reduction." 1024)
+
+(def ^:dynamic *gemm-splitk-max-splits*
+  "Hard cap on k-chunks — the partials buffer is splits·m·n f32." 64)
+
+(defn gemm-fill-workgroups
+  "Workgroups that fill `device-id` at the XMX GEMM's 256-item workgroup — the bound that
+   decides whether a GEMM is occupancy-starved. From the target's HardwareDescriptor unless
+   *gemm-splitk-fill-wgs* overrides."
+  [device-id]
+  (long (or *gemm-splitk-fill-wgs* (hw/fill-workgroups (hw/descriptor-for device-id) 256))))
+
+(defn gemm-schedule
+  "THE GEMM schedule decision, as a pure function of the shape and the machine width —
+   never of the model. Returns [splits k-chunk]; splits = 1 means the plain XMX GEMM.
+
+   The XMX GEMM tiles C into 128x128 blocks, so its grid is ceil(n/128) x ceil(m/128)
+   workgroups. When that is fewer than `fill-wgs`, the device runs partly EMPTY and no
+   inner-loop tuning can help — the only way to buy workgroups is to split the k-reduction
+   across a third grid dimension and combine the partials afterwards (same operands, same
+   DRAM traffic, same result up to f32 summation order).
+
+   Callers: bind-program! (the binder) and gemm_splitk_test (the executable spec). ONE
+   copy — the policy is not re-implemented anywhere."
+  ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs)))))
+  ([m n k fill-wgs target-wgs]
+   (let [base (* (Math/ceil (/ (double n) 128.0))
+                 (Math/ceil (/ (double m) 128.0)))]
+     (if (>= base (double fill-wgs))
+       [1 k]                              ;; already fills the machine
+       (let [want (long (Math/ceil (/ (double target-wgs) base)))
+             ;; each chunk must be a multiple of 32 (the K-unroll) and at least
+             ;; *gemm-splitk-min-chunk* long, or the per-chunk fixed cost (A prefetch + the
+             ;; store of a full partial C tile) swamps the reduction it does.
+             cap (quot (long k) (long *gemm-splitk-min-chunk*))
+             s (min want cap (long *gemm-splitk-max-splits*))]
+         (if (< s 2)
+           [1 k]
+           (let [kc (* 32 (quot (+ (quot (long k) s) 31) 32))]
+             [(quot (+ (long k) kc -1) kc) kc])))))))
+
 (defn bind-program!
   "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session:
    allocate resident buffers for the array params + intermediate scratch, bind each kernel
@@ -833,20 +896,34 @@
                      differently-named params (rename both onto one key + :reuse-buffers), or
                      keep two same-named params separate (rename one away from the collision).
                      run-program!/upload!/download address the renamed buffer by the new key.
+     :profile?       record the graph in PROFILING mode: a kernel-timestamp device event per
+                     launch (Level-Zero only). profile-program! then returns per-kernel device
+                     times. Opt-in: without it the recorded graph is exactly the fast path
+                     (no events, no overhead); run-program! on a profiled program still works
+                     (it resets the events after each replay).
 
    :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
    compile-gpu-program, default :f16-xmx; a bind-time caller may override with
    (assoc descriptor :gemm-precision …) since the descriptor is plain data):
-     :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output). Fast
-                   (systolic), but the f16 input conversion costs gradient precision
-                   (~1e-3-level composed-grad noise) — the decode/inference default.
+     :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output): the
+                   mixed-precision (AMP) policy — f16 inputs, f32 math. Valid for BACKWARD
+                   programs too (measured on the real gemma-3-270m layer VJP: adapter grads
+                   rel-err ~9e-4 / cosine 1.000 vs the :f32-scalar grads; kernel time
+                   65.5 → 38.8 ms, its GEMM part 36.8 → 12.0 ms).
      :f32-scalar — bind the plain scalar f32 GEMM for ALL :gemm steps: reads the f32
                    residents directly, no convert/transpose expansion kernels. Exact f32
-                   grads (~1e-6-level parity) — what training wants.
-   The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy."
+                   grads (~1e-6-level parity) — the exactness escape hatch.
+   The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy. Loss
+   scaling (for cotangents small enough to hit the f16 min-normal 6.1e-5) is a CALLER
+   concern — the VJP is linear in the seed, so scale the seed by S and use lr/S.
+   Under :f16-xmx the f32→f16 conversion (and, for :nt/:tn, the transpose of that f16 copy)
+   of any operand whose role is :constant is recorded into a PROLOGUE graph replayed once
+   here at bind — frozen weights are converted once, not once per replay. This assumes the
+   :constant contract literally: a buffer bound :constant must not be mutated afterwards."
   ([sess descriptor args] (bind-program! sess descriptor args {} {}))
   ([sess descriptor args roles] (bind-program! sess descriptor args roles {}))
-  ([sess descriptor args roles {:keys [key reuse-buffers rename] :or {key :program rename {}}}]
+  ([sess descriptor args roles {:keys [key reuse-buffers rename profile?]
+                                :or {key :program rename {}}}]
    (let [device-id (:device-id @sess)
          pkey key
          _ (when (contains? (:programs @sess) pkey)
@@ -920,6 +997,19 @@
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
+         ;; ── the SCHEDULE seam ────────────────────────────────────────────────
+         ;; Every launch geometry below is a function of (shape, MACHINE WIDTH) and
+         ;; nothing else — never of the model. The machine width comes from the target's
+         ;; HardwareDescriptor, so the same program schedules itself differently on a
+         ;; different GPU instead of inheriting this laptop's iGPU as a literal.
+         desc      (hw/descriptor-for device-id)
+         fill-wgs  (gemm-fill-workgroups device-id)
+         ;; elementwise/convert vector width: widest that still fills the machine.
+         vec-width (fn [n] (hw/stream-vector-width desc n))
+         ;; SPLIT-K: see `gemm-schedule` — a GEMM whose grid is below the machine's fill
+         ;; count is occupancy-bound, and splitting k buys workgroups at constant DRAM
+         ;; traffic. See ze-runtime/bind-registered-gemm-splitk!.
+         splitk (fn [m n k] (gemm-schedule m n k fill-wgs))
          alloc-size-of (fn [sym-kw]
                          (some (fn [{:keys [sym size-fn]}]
                                  (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
@@ -932,17 +1022,27 @@
                     (or (get buffers (key-of sym))
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
                                         {:sym sym :key (key-of sym) :ctx ctx :have (keys buffers)}))))
+           ;; A GEMM operand that is a :constant param (frozen weights) never changes on device,
+           ;; so its f32→f16 conversion — and, for the transposed variants, the transpose of that
+           ;; f16 copy — is the SAME work every replay. Those kernels are recorded into a separate
+           ;; PROLOGUE graph replayed exactly once at bind (see const-prologue? below), not into
+           ;; the per-step graph. The f16 scratch buffers are allocated either way, so this costs
+           ;; no VRAM; it just stops re-converting the weights every step. Measured on the gemma
+           ;; layer VJP (5.6M frozen weight elements vs ~0.2M activation elements): f32_to_f16
+           ;; 7.2 → 0.6 ms, transpose_half 3.2 → 0.2 ms per replay.
+           const-operand? (fn [sym] (= :constant (get effective-roles sym)))
            step->bounds
            (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator output] :as step}]
              (case convention
                ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
-               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); weights
-               ;; convert redundantly per replay for now (correctness-first) — hoist to a once-at-
-               ;; bind :constant f16 upload later.
+               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); the
+               ;; conversions of :constant operands are hoisted to the bind-time prologue graph.
                :gemm
                (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
                      abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
-                     cbuf (buf-of (:C step) :gemm-C)]
+                     cbuf (buf-of (:C step) :gemm-C)
+                     a-const? (const-operand? (:A step))
+                     b-const? (const-operand? (:B step))]
                  (if (or (= :f32-scalar gemm-precision) (< n 8) (< k 8))
                    ;; Scalar f32 path, taken when (a) the :gemm-precision policy is
                    ;; :f32-scalar (exact-grad training — see the docstring), or (b) the
@@ -955,36 +1055,65 @@
                    ;; directly, so NO convert/transpose expansion kernels at all.
                    ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
                    (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]
-                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))}])
+                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))
+                       :kernel-name (str "gemm_scalar_" (name (:variant step)))
+                       :phase (:phase step)}])
                    (let [a16 (mkbuf-fn (* m k) :half)
+                     ;; The GEMM proper: one bound kernel, or — when the (m,n) tiling can't
+                     ;; fill the machine — a split-k PAIR (partial GEMM over a 3D grid +
+                     ;; a partials combine), which is a pure SCHEDULE change: same operands,
+                     ;; same DRAM traffic, same result up to f32 summation order.
+                         mk-gemm
+                         (fn [abuf* bbuf*]
+                           (let [[splits kc] (splitk m n k)]
+                             (if (= 1 (long splits))
+                               [["gemm_nonsquare_float" (gemm-fn abuf* bbuf* cbuf m n k :float) false]]
+                               (let [sk-fn (rt-resolve device-id "bind-registered-gemm-splitk!")
+                                     red-fn (rt-resolve device-id "bind-registered-splitk-reduce!")
+                                     parts (mkbuf-fn (* (long splits) m n) :float)]
+                                 (swap! gemm-scratch conj parts)
+                                 [["gemm_nonsquare_splitk"
+                                   (sk-fn abuf* bbuf* parts m n k kc splits) false]
+                                  ["gemm_splitk_reduce"
+                                   (red-fn parts cbuf (* m n) splits) false]]))))
                      ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
                      ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
+                     ;; Each entry is [kernel-name bnd const?]: kernel-name so profiling can
+                     ;; attribute device time, const? = "depends only on :constant operands" ⇒
+                     ;; recorded into the bind-time prologue graph instead of the replay graph.
                          raw
                          (case (:variant step)
                        ;; C = A[m,k] · B[k,n]
                            :nn
                            (let [b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16)
-                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* k n))
-                              (gemm-fn a16 b16 cbuf m n k :float)])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
+                                   (mk-gemm a16 b16)))
                        ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
                        ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
                            :nt
                            (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 b16 bt16)
-                             [(conv-fn abuf a16 (* m k)) (conv-fn bbuf b16 (* n k))
-                              (trans-fn b16 bt16 n k :half) (gemm-fn a16 bt16 cbuf m n k :float)])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* n k) (vec-width (* n k))) b-const?]
+                                    ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]]
+                                   (mk-gemm a16 bt16)))
                        ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
                        ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
                        ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
                            :tn
                            (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
                              (swap! gemm-scratch conj a16 at16 b16)
-                             [(conv-fn abuf a16 (* k m)) (trans-fn a16 at16 k m :half)
-                              (conv-fn bbuf b16 (* k n)) (gemm-fn at16 b16 cbuf m n k :float)])
+                             (into [["f32_to_f16" (conv-fn abuf a16 (* k m) (vec-width (* k m))) a-const?]
+                                    ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
+                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
+                                   (mk-gemm at16 b16)))
                            (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
                                                 " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
-                     (mapv (fn [b] {:bound b}) raw))))
+                     (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)
+                                           :const-prologue? (boolean c)})
+                           raw))))
                ;; map / map-void bind through bind-registered-map-void-kernel (output is just
                ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
                ;; order incl. output).
@@ -994,7 +1123,8 @@
                    (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
                          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                                        scalar-specs)]
-                     [(bind-fn kernel-name buf-vec scalars (long (n-fn args)))]))
+                     [(assoc (bind-fn kernel-name buf-vec scalars (long (n-fn args)))
+                             :phase (:phase step))]))
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
                ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
                ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
@@ -1023,8 +1153,9 @@
                          zerofill-fn (rt-resolve device-id "ensure-zero-fill-kernel!")
                          scatter-fn (rt-resolve device-id "bind-registered-scatter-kernel!")
                          zk (zerofill-fn (if (= dtype :double) :double :float))]
-                     [(bind-fn zk [out-buf] [] (long out-size))
-                      (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)]))
+                     [(assoc (bind-fn zk [out-buf] [] (long out-size)) :phase (:phase step))
+                      (assoc (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)
+                             :phase (:phase step))]))
                ;; reduce: SegRed sig (inputs…, output, scl…, _n_bound) — bind the registry's
                ;; :array-params ++ [output] and launch a SINGLE workgroup (:group-count 1) so
                ;; the kernel's grid-stride loop covers all n and writes output[0] into its
@@ -1037,17 +1168,34 @@
                                       (buf-of output kernel-name))
                      scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                                    scalar-specs)]
-                 [(bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})])
+                 [(assoc (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})
+                         :phase (:phase step))])
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
                                     ":map / :map-void / :reduce / :gemm / :scatter are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
-           graph (record-fn bounds)]
+           ;; CONSTANT PROLOGUE: the f16 conversions/transposes of :constant GEMM operands run
+           ;; ONCE, in their own recorded graph replayed here at bind — the per-step graph holds
+           ;; only the kernels whose inputs can actually change between replays. Order within the
+           ;; prologue is preserved (a :nt/:tn transpose still follows its own convert).
+           prologue-bounds (filterv :const-prologue? bounds)
+           replay-bounds   (filterv (complement :const-prologue?) bounds)
+           prologue-graph (when (seq prologue-bounds) (record-fn prologue-bounds))
+           _ (when prologue-graph ((rt-resolve device-id "replay-graph!") prologue-graph))
+           ;; The non-profiling call is EXACTLY the 1-arity fast path (no opts map) so a
+           ;; recorded non-profiling graph is byte-for-byte what it was before profiling existed.
+           graph (if profile?
+                   (record-fn replay-bounds {:barriers? true :profile? true})
+                   (record-fn replay-bounds))]
        (swap! sess update :programs assoc pkey
               {:descriptor descriptor
                :roles effective-roles
                :graph graph
+               ;; kept for close-session! (its queue/list must be destroyed) and as the seam for a
+               ;; future refresh-constants! — replaying it re-derives the f16 copies of the weights.
+               :prologue-graph prologue-graph
                :bounds bounds
+               :profile? (boolean profile?)
                ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
                ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
                :scratch-buffers @gemm-scratch
@@ -1089,7 +1237,8 @@
    or, back-compat, the descriptor of a single-program session. args = values in :all-params
    order (same as bind-program!). Returns {output-param-sym → downloaded JVM array}."
   [sess prog-or-handle args]
-  (let [{:keys [descriptor roles graph param->key result-key]} (resolve-program sess prog-or-handle)
+  (let [{:keys [descriptor roles graph param->key result-key profile?]}
+        (resolve-program sess prog-or-handle)
         {:keys [all-params array-params result-sym]} descriptor
         device-id (:device-id @sess)
         argmap (zipmap all-params args)
@@ -1099,6 +1248,12 @@
     (doseq [p array-params :when (= :input (get roles p :input))]
       (upload! sess (get param->key p) (get argmap p)))
     (replay-fn graph)
+    ;; a PROFILED graph's events must be reset between replays (re-signaling a signaled event
+    ;; is invalid); this replay's timestamps are intentionally discarded — use profile-program!
+    ;; to read them.
+    (when profile?
+      (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
+        (reset-fn graph)))
     ;; download :output array-params (in-place-mutated results) PLUS the functional :result-sym
     ;; (a fresh alloc returned by the deftm — the common SOAC case; it is not an array-param so
     ;; it has no :output role, but it IS the program's return value).
@@ -1109,6 +1264,53 @@
       (and result-sym (not (some #(= result-sym %) array-params))
            (contains? (:buffers @sess) result-key))
       (assoc result-sym (download sess result-key)))))
+
+(defn profile-program!
+  "The profiling twin of run-program!: same upload → replay → download sequence over a program
+   bound with {:profile? true}, but reads the per-kernel DEVICE timestamps the replay produced.
+   A separate verb (rather than an opts flag on run-program!) because profiling is a BIND-time
+   property — the events are recorded into the command graph — and because run-program!'s
+   return shape stays stable for every existing caller.
+
+   Returns
+     {:result          {output-param → array}        ;; exactly run-program!'s return value
+      :profile         [{:kernel-name str :phase kw :ms double :context-ms double} …]
+                       ;; execution order; :ms = device (global-timestamp) kernel duration
+      :kernel-total-ms double     ;; Σ per-kernel device time
+      :device-wall-ms  double     ;; device span: first kernel start → last kernel end
+                                  ;; (includes inter-kernel gaps = dispatch/barrier overhead)
+      :host-wall-ms    double}    ;; System/nanoTime around the replay call, for comparison
+
+   Device kernel times come from Level-Zero kernel-timestamp events (immune to host scheduling
+   and far more stable under platform power-state swings than host wall time). Throws if the
+   program was not bound with {:profile? true}."
+  [sess prog-or-handle args]
+  (let [{:keys [descriptor roles graph param->key result-key profile?]}
+        (resolve-program sess prog-or-handle)
+        {:keys [all-params array-params result-sym]} descriptor
+        device-id (:device-id @sess)
+        argmap (zipmap all-params args)
+        replay-fn (rt-resolve device-id "replay-graph!")
+        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")]
+    (when-not profile?
+      (throw (ex-info "profile-program!: program was not bound with {:profile? true} — rebind it with (bind-program! sess descriptor args roles {:profile? true})"
+                      {:program (or (::program-key prog-or-handle) :program)})))
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (get param->key p) (get argmap p)))
+    (let [t0 (System/nanoTime)
+          _ (replay-fn graph)
+          t1 (System/nanoTime)
+          prof (read-ts-fn graph)   ;; reads AND resets the events
+          result (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
+                                    [p (download sess (get param->key p))]))
+                   (and result-sym (not (some #(= result-sym %) array-params))
+                        (contains? (:buffers @sess) result-key))
+                   (assoc result-sym (download sess result-key)))]
+      {:result result
+       :profile (mapv #(select-keys % [:kernel-name :phase :ms :context-ms]) (:kernels prof))
+       :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
+       :device-wall-ms (:wall-ms prof)
+       :host-wall-ms (/ (- t1 t0) 1.0e6)})))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.

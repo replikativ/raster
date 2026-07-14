@@ -26,6 +26,56 @@
        (not (par/par-reduce-by-key-form? expr))
        (not (par/par-map-pure-form? expr))))
 
+(declare extract-mutation-targets)
+
+(defn- declared-output-arg
+  "The 0-based index of the ONE argument a mutating op writes, when the op EXPLICITLY
+   declares it in the op-descriptor registry:
+     - :buffer-write :buf-arg-idx        (e.g. dense-into!, qlinear-i8!)
+     - :buffer {:allocates? false, :in-place-arg i}  (the *-into! shape: writes into,
+       and returns, a caller-provided buffer)
+   nil otherwise — the caller then falls back to the conservative 'any argument of a
+   mutating op may be written'.
+
+   Only EXPLICIT registrations count (get-op-descriptor, not resolve-buffer-semantics):
+   the latter auto-detects buffer semantics from a deftm body, and for an ALLOCATING op
+   :in-place-arg means 'this input may be REUSED as the output buffer' — a fusion hint,
+   not a write. Narrowing DCE's mutation set on a guess would be unsound."
+  [op-sym]
+  (letfn [(idx-of [s]
+            (when-let [d (descriptor/get-op-descriptor s)]
+              (or (get-in d [:buffer-write :buf-arg-idx])
+                  (let [b (:buffer d)]
+                    (when (and b (false? (:allocates? b))) (:in-place-arg b))))))]
+    (when (symbol? op-sym)
+      (or (idx-of op-sym)
+          (when-let [base (descriptor/extract-base-op op-sym)] (idx-of base))))))
+
+(defn- mutating-call-targets
+  "Mutation targets of a call to a mutating op with argument list `args`.
+
+   A mutating op that DECLARES its output buffer (op-descriptor :in-place-arg /
+   :buf-arg-idx) writes exactly that argument — every other operand is read-only.
+   Without a declaration we must assume any array argument could be written.
+
+   The difference is load-bearing, not cosmetic: DCE keeps a mutating binding when
+   any of its mutation targets is live, so treating the READ-ONLY operands of e.g.
+   `(dgemm-tn! dy x dW …)` as mutation targets kept the call alive purely because
+   `dy` and `x` are live elsewhere — a GEMM whose output nobody reads still ran.
+   (That is exactly the frozen-weight dW of LoRA/partially-consumed value+grad.)"
+  [op-sym args]
+  (let [args (vec args)
+        i (declared-output-arg op-sym)]
+    (if (and i (< (long i) (count args)))
+      (let [out (nth args i)]
+        (if (symbol? out) #{out} (extract-mutation-targets out)))
+      (apply clojure.set/union #{}
+             (map (fn [arg]
+                    (if (symbol? arg)
+                      #{arg}
+                      (extract-mutation-targets arg)))
+                  args)))))
+
 (defn- extract-mutation-targets
   "Find buffer symbols mutated by mutation ops anywhere in expr."
   [expr]
@@ -62,13 +112,7 @@
          (or (descriptor/mutating-op? (first expr))
              (descriptor/primitive-mutation-op? (first expr))
              (:mutating (meta expr))))
-    ;; All symbol args are potential mutation targets for mutating ops
-    (apply clojure.set/union #{}
-           (map (fn [arg]
-                  (if (symbol? arg)
-                    #{arg}
-                    (extract-mutation-targets arg)))
-                (rest expr)))
+    (mutating-call-targets (first expr) (rest expr))
 
     (and (seq? expr)
          (= '.invk (first expr))
@@ -78,13 +122,7 @@
            (or (descriptor/mutating-op? impl-sym)
                (when-let [base (descriptor/extract-base-op impl-sym)]
                  (descriptor/mutating-op? base)))))
-    (let [args (nnext expr)]
-      (apply clojure.set/union #{}
-             (map (fn [arg]
-                    (if (symbol? arg)
-                      #{arg}
-                      (extract-mutation-targets arg)))
-                  args)))
+    (mutating-call-targets (second expr) (nnext expr))
 
     (and (seq? expr)
          (= 'dotimes (first expr)))
@@ -156,13 +194,33 @@
    DCE — exactly the reason function parameters are seeded live. (When `src` is
    bound locally, the alias doesn't escape and normal in-let liveness applies.)
    Used to keep a `leaf = (aget params-container k)` + its in-place optimizer
-   update from being silently eliminated."
+   update from being silently eliminated.
+
+   `.invk` — raster's DEVIRTUALIZED DISPATCH head — is NOT interop and must be
+   looked THROUGH, not matched on its leading dot. It is the head of essentially
+   every typed call in the IR, and `(second init)` is then the impl SYMBOL (never
+   a let-bound sym), so the old `(.startsWith (name head) \".\")` arm classified
+   EVERY `.invk` binding as an escaping alias and seeded it live. That silently
+   defeated DCE for any in-place-written buffer allocated through a devirtualized
+   call — notably the frozen-weight `dW = (.invk zeros-like-impl …)` of a LoRA /
+   partially-consumed value+grad, whose dead `dgemm-tn!` then survived because its
+   output looked live. Unwrap the `.invk` and classify the REAL op instead: an
+   `aget` through it (the devirtualized `leaf = (aget params-container k)`) is
+   still an escaping alias; an allocation is not."
   [init bound-syms]
-  (and (seq? init) (symbol? (first init)) (>= (count init) 2)
-       (symbol? (second init))
-       (not (contains? bound-syms (second init)))
-       (or (.startsWith (name (first init)) ".")                  ; .field / .-field / (. obj field) — value-class field access (any interop form)
-           (descriptor/aget-op? (first init)))))
+  (when (and (seq? init) (symbol? (first init)) (>= (count init) 2))
+    (let [head  (first init)
+          invk? (= '.invk head)
+          op    (if invk? (second init) head)
+          src   (if invk? (nth init 2 nil) (second init))]
+      (boolean
+       (and (symbol? op) (symbol? src)
+            (not (contains? bound-syms src))
+            (or ;; .field / .-field / (. obj field) — value-class field access
+             (and (not invk?) (.startsWith (name head) "."))
+             (descriptor/aget-op? op)
+             (when-let [base (descriptor/extract-base-op op)]
+               (descriptor/aget-op? base))))))))
 
 (defn eliminate-dead-bindings
   "Remove dead bindings from a flat let* form.
