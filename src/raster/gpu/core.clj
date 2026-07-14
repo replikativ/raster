@@ -252,6 +252,7 @@
            :arena-id  arena-id
            :kernels   {}       ;; {phase-key → [kernel-info ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
+           :programs  {}       ;; {program-key → bound resident program (see bind-program!)}
            :closed?   false})))
 
 (defn close-session!
@@ -263,7 +264,7 @@
   this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (let [{:keys [device-id arena-id buffers prepared graphs closed?]} @sess]
+    (let [{:keys [device-id arena-id buffers prepared graphs programs closed?]} @sess]
       (when-not closed?
         ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
         ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
@@ -271,11 +272,22 @@
               destroy-prepared! (requiring-resolve (symbol (str ns-sym) "destroy-prepared!"))
               destroy-graph!    (requiring-resolve (symbol (str ns-sym) "destroy-graph!"))]
           (when destroy-graph!    (doseq [[_ g] graphs]   (try (destroy-graph! g)    (catch Exception _))))
-          (when destroy-prepared! (doseq [[_ p] prepared] (try (destroy-prepared! p) (catch Exception _)))))
+          (when destroy-prepared! (doseq [[_ p] prepared] (try (destroy-prepared! p) (catch Exception _))))
+          ;; bound resident programs: each holds a recorded graph (queue+list) AND the per-step
+          ;; bound kernel handles (create-kernel-fresh per bind, NOT in the registry) — both must
+          ;; be destroyed here or every session leaks them (the SIGABRT class of driver leak).
+          (doseq [[_ prog] programs]
+            (when destroy-graph! (try (destroy-graph! (:graph prog)) (catch Exception _)))
+            (when destroy-prepared!
+              (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
+            ;; f16 GEMM-conversion scratch is allocated outside :buffers — free it here.
+            (when (seq (:scratch-buffers prog))
+              (let [free! (rt-resolve device-id "free-buffer!")]
+                (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
         (free-buffers-internal! buffers device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {})))))
+        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {} :programs {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -643,77 +655,6 @@
           (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase}))))
     sess))
 
-(defn bind-program!
-  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
-   ONCE: allocate resident buffers for the array params + intermediate scratch, install +
-   prepare! each kernel step against them, and record the kernel sequence as a command graph.
-   After binding, run-program! replays the whole sequence with NO re-binding — the resident
-   bound-dispatch path, vs make-gpu-fn's per-call JVM-array staging. The bound machinery is
-   convention-agnostic, so map! and map-void! kernels bind identically (a map! kernel's output
-   is just another resident buffer in its :array-params).
-
-   args = values in the descriptor's :all-params order (JVM arrays for array params, numbers for
-   scalars). Buffer keys are the param/intermediate sym names as keywords.
-
-   roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
-   derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
-   program can't derive: :constant = weights (uploaded once here, never re-uploaded by
-   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
-   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
-   (down)."
-  ([sess descriptor args] (bind-program! sess descriptor args {}))
-  ([sess descriptor args roles]
-   (let [device-id (:device-id @sess)
-         {:keys [dtype all-params array-params allocs steps]} descriptor
-         effective-roles (merge (:array-roles descriptor) roles)
-         argmap (zipmap all-params args)
-         dt (if (= dtype :double) :double :float)
-         nel (fn [arr] (java.lang.reflect.Array/getLength arr))
-         ;; per-array element dtype from the ACTUAL JVM array — a program can mix dtypes (quant
-         ;; kernels carry byte weights + float scales + int bsums + float output), so a single
-         ;; program dtype mis-allocates (CCE [B→[F). The runtime array type is authoritative.
-         arr-dtype (fn [arr]
-                     (condp instance? arr
-                       (Class/forName "[B") :byte
-                       (Class/forName "[S") :short
-                       (Class/forName "[I") :int
-                       (Class/forName "[J") :long
-                       (Class/forName "[F") :float
-                       (Class/forName "[D") :double
-                       dt))
-         param-specs (into {} (map (fn [p]
-                                     (let [arr (get argmap p)]
-                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
-                                   array-params))
-         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
-                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
-                                   allocs))]
-     (alloc! sess (merge param-specs alloc-specs))
-     (doseq [step steps]
-       (bind-step! sess step args (fn [a] (keyword (name a)))))
-     (record-graph! sess (mapv :phase steps) :program)
-     (swap! sess assoc :program-descriptor descriptor :program-roles effective-roles)
-     sess)))
-
-(defn run-program!
-  "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
-   stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
-   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
-   resident from bind-program!. args = values in :all-params order (same as bind-program!).
-   Returns {output-param-sym → downloaded JVM array}."
-  [sess descriptor args]
-  (let [{:keys [all-params array-params]} descriptor
-        roles (:program-roles @sess)
-        argmap (zipmap all-params args)]
-    ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
-    ;; device; output produced by the kernels so its prior content is irrelevant).
-    (doseq [p array-params :when (= :input (get roles p :input))]
-      (upload! sess (keyword (name p)) (get argmap p)))
-    (replay! sess :program)
-    ;; download only outputs (inputs/constants/state are not host-visible results).
-    (into {} (for [p array-params :when (= :output (get roles p))]
-               [p (download sess (keyword (name p)))]))))
-
 ;; ----------------------------------------------------------------
 ;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single
 ;; fused compile-gpu-program later). Each op is compiled individually and chained into ONE command
@@ -853,8 +794,8 @@
 ;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
 
 (defn bind-program!
-  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session
-   ONCE: allocate resident buffers for the array params + intermediate scratch, bind each kernel
+  "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session:
+   allocate resident buffers for the array params + intermediate scratch, bind each kernel
    step against them (a fresh kernel handle per step, group count pre-set into its :gc-seg), and
    record the kernel sequence as ONE replayable command graph. After binding, run-program!
    replays the whole sequence with NO re-binding. The bound machinery is convention-agnostic, so
@@ -867,9 +808,31 @@
    roles = optional {param-sym → :constant|:state|:input|:output} override of the descriptor's
    derived defaults (read-only→:input, written→:output). Declare cross-call persistence the
    program can't derive: :constant = weights (uploaded once here, never re-uploaded by
-   run-program!); :state = persistent device state e.g. a KV cache (never downloaded). All buffer
-   CONTENTS are uploaded once here at bind; run-program! then moves only :input (up) and :output
-   (down).
+   run-program!); :state = persistent device state e.g. a KV cache or on-device-updated adapters
+   (never downloaded). All buffer CONTENTS are uploaded once here at bind; run-program! then
+   moves only :input (up) and :output (down).
+
+   Returns a program HANDLE {::program-key k :descriptor d} — pass it to run-program!. A session
+   can hold MULTIPLE programs (bound under distinct :key opts) over SHARED resident buffers.
+
+   opts (5-arity):
+     :key            program key (keyword, default :program). Binding an already-bound key
+                     throws. With a non-default key the program's scratch (intermediate alloc)
+                     buffers are namespaced `<key>.<sym>` so scratch never collides across
+                     programs; PARAM buffer keys stay the plain param names (the sharing seam).
+     :reuse-buffers  the explicit buffer-sharing rule. When true, an array param whose resolved
+                     buffer key ALREADY EXISTS in the session reuses that DeviceBuffer — the
+                     bound kernels of this program read/write the SAME device memory as the
+                     program that allocated it, and the param's host array is NOT uploaded
+                     (device contents are authoritative; that is the point: a VJP program's
+                     :state adapters are seen by a forward program with no host round-trip,
+                     frozen :constant weights upload once). Element-count or dtype mismatch
+                     FAILS LOUD (ex-info), never silently rebinds. When false/absent, ANY
+                     buffer-key collision throws — name collision alone never aliases memory.
+     :rename         {param-sym → buffer-key-keyword} per-param key override: share two
+                     differently-named params (rename both onto one key + :reuse-buffers), or
+                     keep two same-named params separate (rename one away from the collision).
+                     run-program!/upload!/download address the renamed buffer by the new key.
 
    :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
    compile-gpu-program, default :f16-xmx; a bind-time caller may override with
@@ -881,9 +844,15 @@
                    residents directly, no convert/transpose expansion kernels. Exact f32
                    grads (~1e-6-level parity) — what training wants.
    The XMX hardware pitch gate (n<8 or k<8 → scalar) applies regardless of policy."
-  ([sess descriptor args] (bind-program! sess descriptor args {}))
-  ([sess descriptor args roles]
+  ([sess descriptor args] (bind-program! sess descriptor args {} {}))
+  ([sess descriptor args roles] (bind-program! sess descriptor args roles {}))
+  ([sess descriptor args roles {:keys [key reuse-buffers rename] :or {key :program rename {}}}]
    (let [device-id (:device-id @sess)
+         pkey key
+         _ (when (contains? (:programs @sess) pkey)
+             (throw (ex-info (str "bind-program!: program key " pkey " already bound in this session"
+                                  " — bind each program under a distinct :key")
+                             {:key pkey :bound (keys (:programs @sess))})))
          {:keys [dtype all-params array-params allocs steps]} descriptor
          gemm-precision (or (:gemm-precision descriptor) :f16-xmx)
          effective-roles (merge (:array-roles descriptor) roles)
@@ -902,13 +871,48 @@
                        (Class/forName "[F") :float
                        (Class/forName "[D") :double
                        dt))
-         param-specs (into {} (map (fn [p]
-                                     (let [arr (get argmap p)]
-                                       [(keyword (name p)) [(arr-dtype arr) (nel arr) arr]]))
-                                   array-params))
-         alloc-specs (into {} (map (fn [{:keys [sym size-fn]}]
-                                     [(keyword (name sym)) [dt (long (size-fn args)) nil]])
-                                   allocs))
+         param->key (into {} (map (fn [p] [p (get rename p (keyword (name p)))])) array-params)
+         alloc->key (into {} (map (fn [{:keys [sym]}]
+                                    [sym (if (= pkey :program)
+                                           (keyword (name sym))
+                                           (keyword (str (name pkey) "." (name sym))))]))
+                          allocs)
+         existing-bufs (:buffers @sess)
+         ;; The sharing rule, enforced per resolved buffer key:
+         ;;   free key            → allocate (+ upload the param's host array)
+         ;;   collision, no reuse → THROW (a silent rebind would orphan the earlier program's
+         ;;                         graph pointers and leak the buffer)
+         ;;   collision + reuse   → same n-elements AND dtype → reuse the DeviceBuffer, skip
+         ;;                         the upload (device contents authoritative); else THROW.
+         reuse-or-spec (fn [k want-dtype want-n spec ctx]
+                         (if-let [buf (get existing-bufs k)]
+                           (if-not reuse-buffers
+                             (throw (ex-info (str "bind-program!: buffer key " k " already exists in "
+                                                  "this session (" ctx "). Sharing must be explicit: "
+                                                  "pass {:reuse-buffers true} to share it, or :rename "
+                                                  "to give this program's buffer a distinct key.")
+                                             {:key k :ctx ctx :program pkey}))
+                             (if (and (= (long want-n) (long (:n-elements buf)))
+                                      (= want-dtype (:dtype buf)))
+                               nil ;; reuse: no alloc, no upload
+                               (throw (ex-info (str "bind-program!: buffer key " k " exists with a "
+                                                    "DIFFERENT shape — refusing to alias (" ctx ")")
+                                               {:key k :ctx ctx :program pkey
+                                                :existing {:n (:n-elements buf) :dtype (:dtype buf)}
+                                                :wanted {:n want-n :dtype want-dtype}}))))
+                           [k spec]))
+         param-specs (into {} (keep (fn [p]
+                                      (let [arr (get argmap p)
+                                            adt (arr-dtype arr)]
+                                        (reuse-or-spec (param->key p) adt (nel arr)
+                                                       [adt (nel arr) arr]
+                                                       (str "param " p)))))
+                           array-params)
+         alloc-specs (into {} (keep (fn [{:keys [sym size-fn]}]
+                                      (let [n (long (size-fn args))]
+                                        (reuse-or-spec (alloc->key sym) dt n [dt n nil]
+                                                       (str "scratch " sym)))))
+                           allocs)
          info-fn   (rt-resolve device-id "kernel-registry-entry")
          bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
@@ -923,10 +927,11 @@
          gemm-scratch (atom [])]
      (alloc! sess (merge param-specs alloc-specs))
      (let [buffers (:buffers @sess)
+           key-of (fn [sym] (or (get param->key sym) (get alloc->key sym) (keyword (name sym))))
            buf-of (fn [sym ctx]
-                    (or (get buffers (keyword (name sym)))
+                    (or (get buffers (key-of sym))
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
-                                        {:sym sym :ctx ctx :have (keys buffers)}))))
+                                        {:sym sym :key (key-of sym) :ctx ctx :have (keys buffers)}))))
            step->bounds
            (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator output] :as step}]
              (case convention
@@ -1038,39 +1043,72 @@
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
            graph (record-fn bounds)]
-       (swap! sess assoc
-              :program-graph graph
-              :program-descriptor descriptor
-              :program-roles effective-roles))
-     sess)))
+       (swap! sess update :programs assoc pkey
+              {:descriptor descriptor
+               :roles effective-roles
+               :graph graph
+               :bounds bounds
+               ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
+               ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
+               :scratch-buffers @gemm-scratch
+               :param->key param->key
+               ;; resolved buffer key of the functional :result-sym (may be a scratch alloc,
+               ;; hence resolved through THIS program's key-fn, not a raw name->keyword).
+               :result-key (when-let [rs (:result-sym descriptor)]
+                             (or (get param->key rs) (get alloc->key rs) (keyword (name rs))))}))
+     {::program-key pkey :descriptor descriptor})))
+
+(defn- resolve-program
+  "Find the bound-program entry for run-program!'s second argument: a HANDLE from bind-program!
+   (looked up by its ::program-key), or — the single-program back-compat shape — the descriptor
+   itself (unambiguous when the session holds one program; with several, matched by descriptor
+   identity). Throws when nothing (or more than one thing) matches."
+  [sess prog-or-handle]
+  (let [programs (:programs @sess)]
+    (if-let [pkey (::program-key prog-or-handle)]
+      (or (get programs pkey)
+          (throw (ex-info (str "run-program!: no program bound under key " pkey)
+                          {:key pkey :bound (keys programs)})))
+      (case (count programs)
+        0 (throw (ex-info "run-program!: no program bound in this session — call bind-program! first" {}))
+        1 (val (first programs))
+        (let [matches (filter #(identical? prog-or-handle (:descriptor (val %))) programs)]
+          (if (= 1 (count matches))
+            (val (first matches))
+            (throw (ex-info (str "run-program!: session holds " (count programs) " programs — "
+                                 "pass the handle bind-program! returned (or a distinct descriptor)")
+                            {:bound (keys programs)}))))))))
 
 (defn run-program!
   "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are
    stable — only CONTENTS change), replay the recorded command graph, and download ONLY the
-   :output params. :constant (weights) and :state (KV cache) buffers are NEVER moved — they stay
-   resident from bind-program!. args = values in :all-params order (same as bind-program!).
-   Returns {output-param-sym → downloaded JVM array}."
-  [sess descriptor args]
-  (let [{:keys [all-params array-params result-sym]} descriptor
+   :output params. :constant (weights) and :state (KV cache / on-device adapters) buffers are
+   NEVER moved — they stay resident from bind-program!, and when several programs of this session
+   share them (bind-program! :reuse-buffers) each program reads the LIVE device state the others
+   left. prog-or-handle = the handle bind-program! returned (required for multi-program sessions)
+   or, back-compat, the descriptor of a single-program session. args = values in :all-params
+   order (same as bind-program!). Returns {output-param-sym → downloaded JVM array}."
+  [sess prog-or-handle args]
+  (let [{:keys [descriptor roles graph param->key result-key]} (resolve-program sess prog-or-handle)
+        {:keys [all-params array-params result-sym]} descriptor
         device-id (:device-id @sess)
-        roles (:program-roles @sess)
         argmap (zipmap all-params args)
         replay-fn (rt-resolve device-id "replay-graph!")]
     ;; upload only per-call inputs (constant uploaded once at bind; state mutated in place on
     ;; device; output produced by the kernels so its prior content is irrelevant).
     (doseq [p array-params :when (= :input (get roles p :input))]
-      (upload! sess (keyword (name p)) (get argmap p)))
-    (replay-fn (:program-graph @sess))
+      (upload! sess (get param->key p) (get argmap p)))
+    (replay-fn graph)
     ;; download :output array-params (in-place-mutated results) PLUS the functional :result-sym
     ;; (a fresh alloc returned by the deftm — the common SOAC case; it is not an array-param so
     ;; it has no :output role, but it IS the program's return value).
     (cond-> (into {} (for [p array-params :when (= :output (get roles p))]
-                       [p (download sess (keyword (name p)))]))
+                       [p (download sess (get param->key p))]))
       ;; download the functional :result-sym only when it is a distinct resident buffer (not
       ;; already an :output param, and actually allocated — a Void map-void has no result buffer).
       (and result-sym (not (some #(= result-sym %) array-params))
-           (contains? (:buffers @sess) (keyword (name result-sym))))
-      (assoc result-sym (download sess (keyword (name result-sym)))))))
+           (contains? (:buffers @sess) result-key))
+      (assoc result-sym (download sess result-key)))))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.
