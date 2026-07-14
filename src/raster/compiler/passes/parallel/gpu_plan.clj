@@ -17,6 +17,7 @@
      :stats {:gemm-rewrites :map-rewrites :reduce-rewrites ...}}"
   (:require
    [clojure.set :as set]
+   [raster.compiler.core.op-descriptor :as op]
    [raster.compiler.passes.parallel.device :as device]
    [raster.compiler.passes.parallel.patterns :as patterns]
    [raster.compiler.backend.gpu.opencl-codegen :as codegen]))
@@ -33,10 +34,9 @@
     (:raster.op/original (meta form))))
 
 (def ^:private blas-gemm-ops
-  "Set of original op symbols that are BLAS GEMM variants."
-  #{'raster.linalg.blas/dgemm!
-    'raster.linalg.blas/dgemm-tn!
-    'raster.linalg.blas/dgemm-nt!})
+  "Set of original op symbols that are BLAS GEMM variants. Keys of the shared
+   op-descriptor registry (also used by the RESIDENT extractor in pipeline)."
+  (set (keys op/blas-gemm-ops)))
 
 (defn- blas-gemm-call?
   "Match .invk calls to raster.linalg.blas/dgemm variants.
@@ -71,18 +71,23 @@
   "Classify a BLAS .invk call into GEMM variant.
   Handles both direct and do-wrapped (.invk blas/dgemm! ...) patterns.
   Returns {:variant :nn|:tn|:nt, :A sym :B sym :C sym :m expr :k expr :n expr
-           :alpha expr :beta expr :result-sym sym-or-nil} or nil."
+           :alpha expr :beta expr :result-sym sym-or-nil} or nil.
+
+  Returns nil — 'not a GPU-representable GEMM', so gpu-plan-pass KEEPS the original CPU
+  BLAS call — when alpha≠1.0 or beta≠0.0. invoke-registered-gemm! takes only
+  (A B C m n k) and OVERWRITES C, so rewriting an accumulating GEMM (beta=1, e.g.
+  nn/linear's bias fold) to it silently turned C += A·B into C = A·B. Declining the
+  offload costs performance; dropping the scalars cost CORRECTNESS. See
+  op/gemm-default-alpha-beta?."
   [form]
   (when (blas-gemm-call? form)
     (let [invk (extract-gemm-invk form)
           result-sym (patterns/unwrap-do-result form)
           original-op (invk-original-op invk)
           args (drop 2 invk)
-          variant (case original-op
-                    raster.linalg.blas/dgemm-tn! :tn
-                    raster.linalg.blas/dgemm-nt! :nt
-                    :nn)]
-      (when (>= (count args) 8)
+          variant (get op/blas-gemm-ops original-op :nn)]
+      (when (and (>= (count args) 8)
+                 (op/gemm-default-alpha-beta? (nth args 6) (nth args 7)))
         {:variant variant
          :A (nth args 0) :B (nth args 1) :C (nth args 2)
          :m (nth args 3) :k (nth args 4) :n (nth args 5)
