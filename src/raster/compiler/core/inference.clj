@@ -1028,6 +1028,43 @@
 
 (declare infer-rewritten-tag)
 
+(defn- rewritten-scalar-op-tag
+  "Tag of a REWRITTEN scalar-op form — clojure.core arithmetic (+ - * / min max …),
+   aget, alength — by unifying its OPERAND tags.
+
+   infer-rewritten-tag's var-resolution clause cannot type these: clojure.core's
+   arithmetic vars carry no :tag, so `(clojure.core/+ (aget a i) 1.0)` resolved to
+   the #'clojure.core/+ var, found no :tag, and typed as NIL. Every raster.numeric
+   call CONSUMING that result (e.g. `(n/sqrt (+ …))`) then lost its operand tag, so
+   its overload could not be confirmed and the call stayed UNDEVIRTUALIZED — which on
+   a GPU target trips the fixpoint typedness census (CPU silently falls back to the
+   ~100x-slower IFn.invoke). This is the same scalar-op typing gap d915365 closed in
+   infer-expr-tag; the REWRITTEN-form reader needed it too.
+
+   aget/alength are tested OUTSIDE the scalar-op? guard, on their own predicates: an
+   ELEMENT READ is not the unification of its operands (unifying `(aget a i)` over the
+   array tag and the long index would yield `long`), and `clojure.core/aget` — the
+   spelling the walker leaves behind after lowering `raster.arrays/aget` — is in
+   aget-op? but NOT in known-scalar-ops, so a scalar-op?-first guard would miss it and
+   leave `(+ (aget a i) (aget a j))` untyped whenever neither operand is a literal."
+  [head form type-env]
+  (cond
+    (descriptor/alength-op? head) 'long
+    (descriptor/aget-op? head) (infer-aget-type form type-env)
+    (descriptor/scalar-op? head)
+    (let [arg-tags (keep (fn [a]
+                           (or (when (seq? a) (infer-rewritten-tag a nil type-env))
+                               (literal-tag a)
+                               (when (symbol? a) (type-env-tag type-env a))))
+                         (rest form))]
+      (cond
+        (some #{'double} arg-tags) 'double
+        (some #{'float} arg-tags) 'float
+        (some #{'long} arg-tags) 'long
+        (empty? arg-tags) nil
+        :else 'long))
+    :else nil))
+
 (defn- prim-class->tag
   "Map a (boxed or primitive) numeric Class to a raster type tag, else nil."
   [c]
@@ -1113,7 +1150,11 @@
           (or (when-let [v (try (resolve head) (catch Throwable _ nil))]
                 (or (:raster.core/return-tag (meta v))
                     (:tag (meta v))))
-              (static-method-return-tag head (rest rewritten-form) type-env))
+              (static-method-return-tag head (rest rewritten-form) type-env)
+              ;; LAST — a scalar op whose var carries no :tag (clojure.core arithmetic).
+              ;; Placed as a fallback so it can never shadow a var's declared return tag
+              ;; or a resolved static-method overload: it only fills a slot that was nil.
+              (rewritten-scalar-op-tag head rewritten-form type-env))
 
            ;; .invk call
           (and (= '.invk head) (symbol? (second rewritten-form)))

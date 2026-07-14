@@ -51,3 +51,42 @@
 ;; raster.numeric/raster.math ops, NOT un-devirtualized user-deftm calls (e.g.
 ;; byte-dist inside local-join-bytes!, which still runs via runtime dispatch).
 ;; Extending it to flag user-deftm dispatch is tracked follow-up work.
+
+(deftest numeric-op-over-core-arithmetic-devirtualizes
+  ;; A raster.numeric op whose OPERAND is a clojure.core arithmetic result (the legal
+  ;; and idiomatic spelling for integer/index math, and what a fused reduction leaves
+  ;; behind) lost its operand tag: infer-rewritten-tag resolved the `clojure.core/+`
+  ;; var, found no :tag on it, and typed the operand NIL — so the consuming
+  ;; raster.numeric/sqrt could not confirm an overload and stayed RUNTIME-DISPATCHED.
+  ;; On CPU that is silently ~100x slower; on a GPU target it trips the fixpoint
+  ;; typedness census (`undevirtualized dispatch call raster.numeric/sqrt`) and was
+  ;; blocking the 2-kernel rms-norm schedule.
+  ;;
+  ;; Same scalar-op typing gap d915365 closed in infer-expr-tag — the REWRITTEN-form
+  ;; tag reader (infer-rewritten-tag) needed it too. Both operand shapes must devirt:
+  ;; with a literal (one operand already typed) AND with two agets (neither operand
+  ;; typed unless `clojure.core/aget` itself is read as an element load).
+  (testing "n/sqrt over clojure.core/+ and clojure.core/* results devirtualizes"
+    (let [probe-lit (eval '(raster.core/deftm devirt-core-arith-lit-probe
+                             [a :- (Array float) out :- (Array float) n :- Long] :- Void
+                             (raster.par/map-void!
+                              i n
+                              (raster.arrays/aset
+                               out i
+                               (raster.numeric/sqrt
+                                (clojure.core/+ (raster.arrays/aget a i) 1.0))))))
+          probe-agets (eval '(raster.core/deftm devirt-core-arith-agets-probe
+                               [a :- (Array float) out :- (Array float) n :- Long] :- Void
+                               (raster.par/map-void!
+                                i n
+                                (raster.arrays/aset
+                                 out i
+                                 (raster.numeric/sqrt
+                                  (clojure.core/* (raster.arrays/aget a i)
+                                                  (raster.arrays/aget a i)))))))]
+      (doseq [v [probe-lit probe-agets]]
+        (let [{:keys [dispatched]} (dispatch-counts v :float)]
+          (is (zero? dispatched)
+              (str v " has " dispatched " undevirtualized dispatch op(s) — a "
+                   "raster.numeric op over a clojure.core arithmetic result lost its "
+                   "operand tag (infer-rewritten-tag scalar-op gap)")))))))
