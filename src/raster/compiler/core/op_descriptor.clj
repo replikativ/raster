@@ -876,7 +876,6 @@
               (not (.startsWith ^String ns-str "java."))
               (not= ns-str "Math")))))
 
-
 ;; --- BLAS GEMM alpha/beta (the resident + staged GPU GEMM representability gate) ---
 
 (def blas-gemm-ops

@@ -1189,7 +1189,6 @@
   (and (seq? form) (= '.invk (first form))
        (contains? blas-gemm-ops (:raster.op/original (meta form)))))
 
-
 (def ^:private gpu-alloc-ops
   "Array-allocating ops that appear as devirtualized .invk (not a bare `float-array` head): a
    deftm's `(alloc-like x n)` / `(zeros-like x n)` output buffer. On the resident path these are
