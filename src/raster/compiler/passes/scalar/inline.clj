@@ -1088,6 +1088,31 @@
                          (if (and deftm-info (safe-to-inline? deftm-info))
                            (let [{:keys [params walked-body tags]} deftm-info
                                  args (call-args init)
+                 ;; ARITY GATE. The substitution below pairs callee params with call
+                 ;; args POSITIONALLY — `(nth args i)` over the param index. A call
+                 ;; whose arg count doesn't match the resolved deftm's param count
+                 ;; therefore died as a bare `IndexOutOfBoundsException: null` out of
+                 ;; PersistentVector, naming neither the callee nor the arities — and
+                 ;; only from inside the AD-prep inliner, which made it read like a
+                 ;; compiler bug rather than the wrong-arity CALL it is. (The same
+                 ;; stale call against a PARAMETRIC callee fails even more obscurely:
+                 ;; no overload resolves, the call is left symbolic, and reverse-AD
+                 ;; reports "No AD template for <callee>".) A deftm call with the wrong
+                 ;; number of args is always a bug — say so, at the call.
+                                 _ (when (not= (count params) (count args))
+                                     (throw (ex-info
+                                             (str "Arity mismatch inlining `" head "`: it takes "
+                                                  (count params) " arg(s) " (pr-str (vec params))
+                                                  " but the call passes " (count args) " "
+                                                  (pr-str (vec args))
+                                                  ". Fix the call site — a deftm has no variadic or "
+                                                  "multi-arity form, so this call can never dispatch.")
+                                             {:callee head
+                                              :expected-arity (count params)
+                                              :actual-arity (count args)
+                                              :params (vec params)
+                                              :args (vec args)
+                                              :form init})))
                  ;; Handle multi-form bodies: wrap in (do ...) if more than one form
                                  body-form (if (> (count walked-body) 1)
                                              (list* 'do walked-body)
