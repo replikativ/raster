@@ -87,6 +87,25 @@
   (float (Math/pow 10.0 (double x))))
 
 ;; ================================================================
+;; Powers and roots
+;; ================================================================
+;; sqrt/pow were documented (ns docstring, README) but never defined here —
+;; they existed only in raster.numeric (issue #55). raster.math is the Julia
+;; Base math surface, so it carries them too, with the same dispatch style as
+;; cbrt. AD coverage mirrors the other math fns: reverse templates alias the
+;; Math/sqrt / Math/pow rules (ad/templates.clj), forward-mode Dual lifts live
+;; in ad/forward.clj.
+
+(deftm sqrt "Compute the square root of x."
+  [x :- Double] :- Double (Math/sqrt x))
+(deftm sqrt [x :- Float] :- Float (float (Math/sqrt (double x))))
+
+(deftm pow "Raise x to the power y."
+  [x :- Double, y :- Double] :- Double (Math/pow x y))
+(deftm pow [x :- Double, y :- Long] :- Double (Math/pow x (double y)))
+(deftm pow [x :- Float, y :- Float] :- Float (float (Math/pow (double x) (double y))))
+
+;; ================================================================
 ;; Rounding functions
 ;; ================================================================
 

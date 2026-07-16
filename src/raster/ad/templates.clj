@@ -635,6 +635,8 @@
 (register-template! 'raster.math/cbrt (get-template 'Math/cbrt))
 (register-template! 'raster.math/log10 (get-template 'Math/log10))
 (register-template! 'raster.math/hypot (get-template 'Math/hypot))
+(register-template! 'raster.math/sqrt (get-template 'Math/sqrt))
+(register-template! 'raster.math/pow  (get-template 'Math/pow))
 
 ;; ================================================================
 ;; Numeric cast templates (identity passthrough)

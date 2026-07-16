@@ -460,6 +460,51 @@
                                  (aset result i (n/* (aget px i) scale)))
                                (->Dual cv result))))
 
+;; sqrt/pow on raster.math (issue #55) — same lifts as the raster.numeric ones.
+(deftm raster.math/sqrt (All [T] [x :- Dual] :- Dual
+                             (let [sv (n/sqrt (.v x))
+                                   inv2sv (n// 1.0 (n/* 2.0 sv))
+                                   px (.partials x)
+                                   len (alength px)
+                                   result (aclone px)]
+                               (dotimes [i len]
+                                 (aset result i (n/* (aget px i) inv2sv)))
+                               (->Dual sv result))))
+
+(deftm raster.math/pow (All [T] [x :- Dual, n :- Double] :- Dual
+                            (let [xv (.v x)
+                                  scale (n/* n (n/pow xv (n/- n 1.0)))
+                                  px (.partials x)
+                                  len (alength px)
+                                  result (aclone px)]
+                              (dotimes [i len]
+                                (aset result i (n/* (aget px i) scale)))
+                              (->Dual (n/pow xv n) result))))
+
+(deftm raster.math/pow (All [T] [x :- Dual, y :- Dual] :- Dual
+                            (let [xv (.v x) yv (.v y)
+                                  pv (n/pow xv yv)
+                                  dfdx (n/* yv (n/pow xv (n/- yv 1.0)))
+                                  dfdy (n/* pv (m/log xv))
+                                  px (.partials x) py (.partials y)
+                                  len (alength px)
+                                  result (aclone px)]
+                              (dotimes [i len]
+                                (aset result i (n/+ (n/* (aget px i) dfdx)
+                                                    (n/* (aget py i) dfdy))))
+                              (->Dual pv result))))
+
+(deftm raster.math/pow (All [T] [x :- Double, y :- Dual] :- Dual
+                            (let [yv (.v y)
+                                  pv (n/pow x yv)
+                                  dfdy (n/* pv (m/log x))
+                                  py (.partials y)
+                                  len (alength py)
+                                  result (aclone py)]
+                              (dotimes [i len]
+                                (aset result i (n/* (aget py i) dfdy)))
+                              (->Dual pv result))))
+
 (deftm raster.math/log10 (All [T] [x :- Dual] :- Dual
                               (let [xv (.v x)
                                     scale (n// 1.0 (n/* xv 2.302585092994046))
