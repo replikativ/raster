@@ -607,3 +607,30 @@
           analysis (#'rad/analyze-dotimes-body body 'i)]
       (is (= 1 (count (:asets analysis))))
       (is (= 'out (:arr (first (:asets analysis))))))))
+
+;; ================================================================
+;; issue #56: value+grad on the deref'd fn must say HOW to fix it
+;; ================================================================
+;; The README example was `(value+grad rosenbrock 1.0 1.0)` — the deref'd
+;; dispatch fn, not the var. The old error was a bare "grad requires a deftm
+;; var" naming neither the mistake nor the remedy.
+
+(deftm issue56-rosenbrock [x :- Double, y :- Double] :- Double
+  (let [a (raster.numeric/- y (raster.numeric/* x x))
+        b (raster.numeric/- 1.0 x)]
+    (raster.numeric/+ (raster.numeric/* 100.0 (raster.numeric/* a a))
+                      (raster.numeric/* b b))))
+
+(deftest value+grad-on-fn-object-names-the-remedy
+  (testing "passing the fn object throws with the #'var remedy in the message"
+    (let [t (try (doall ((rad/value+grad issue56-rosenbrock) 1.0 1.0))
+                 nil
+                 (catch clojure.lang.ExceptionInfo e e))]
+      (is (some? t) "fn-object argument must throw")
+      (when t
+        (is (re-find #"#'my-fn" (ex-message t))
+            (str "message must show the (value+grad #'my-fn) remedy, got: "
+                 (ex-message t))))))
+  (testing "the corrected README call works"
+    (is (= [0.0 0.0 0.0]
+           (mapv double ((rad/value+grad #'issue56-rosenbrock) 1.0 1.0))))))

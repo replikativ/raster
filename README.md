@@ -247,8 +247,9 @@ Forward-mode (Dual numbers) and reverse-mode (IR source transformation):
         b (- 1.0 x)]
     (+ (* 100.0 a a) (* b b))))
 
-;; value+grad returns [f(x), ∇f(x)]
-(value+grad rosenbrock 1.0 1.0) ;; => [0.0 [0.0 0.0]]
+;; value+grad takes the deftm VAR and returns a function
+;; computing [f(x), df/dx, df/dy]
+((value+grad #'rosenbrock) 1.0 1.0) ;; => [0.0 0.0 0.0]
 ```
 
 ### Compilation
