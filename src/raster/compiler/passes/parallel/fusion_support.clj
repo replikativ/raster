@@ -5,7 +5,18 @@
 
 (defn substitute-aget
   "Replace reads of `(aget target-sym idx)` inside `body` with `replacement`.
-	Rewrites the replacement so uses of `source-idx` become `target-idx`."
+	Rewrites the replacement so uses of `source-idx` become `target-idx`.
+
+	INDEX-INSENSITIVE (silently-ignored-information family, deferred): this matches an
+	aget by ARRAY NAME only and substitutes regardless of the aget's actual index expr —
+	it assumes the consumer reads target-sym at the SAME logical position the producer
+	wrote (differing only in index-var name, which the source-idx→target-idx rewrite
+	handles). A consumer that reads a DIFFERENT element — `(aget tmp (+ j 1))`, a
+	transpose, a gather — would be wrongly replaced with the producer's element at the
+	consumer's index. Vertical fusion only fires on same-index elementwise producer→
+	consumer pairs, so no reachable caller violates this today; a real guard must abort
+	the whole fusion (declining to substitute would leave a dangling ref to an eliminated
+	buffer), which belongs with the descriptor VALIDATOR (S4). Documented, not yet asserted."
   [body target-sym source-idx target-idx replacement]
   (walk/postwalk
    (fn [form]

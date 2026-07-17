@@ -72,6 +72,28 @@
       (is (= 'out (second par-form))))))
 
 ;; ================================================================
+;; Silently-ignored-information family: a Map+Reduce screma whose map
+;; was NOT inlined into the reduce lambda must fail loud — emitting only
+;; the reduce (as the arm used to) would drop the map computation.
+;; ================================================================
+
+(deftest screma-map-reduce-unfused-throws
+  (testing "a reduce screma still carrying a :map-lambda is rejected, not silently reduce-only"
+    (let [screma (soac/->Screma 1 'r 'i 'n #{'a 'tmp} #{'r} #{}
+                                nil [] [{:acc 'acc :init 0.0
+                                         :lambda '(+ acc (aget tmp i))}]
+                                '(* (aget a i) 2.0))]
+      (is (thrown-with-msg?
+           Exception #"was not inlined into the reduce lambda"
+           (soac/screma->par-form screma)))))
+  (testing "a properly-fused reduce (no map-lambda) still converts"
+    (let [screma (soac/->Screma 1 'r 'i 'n #{'a} #{'r} #{}
+                                nil [] [{:acc 'acc :init 0.0
+                                         :lambda '(+ acc (aget a i))}]
+                                nil)]
+      (is (= 'raster.par/reduce (first (soac/screma->par-form screma)))))))
+
+;; ================================================================
 ;; Screma composition
 ;; ================================================================
 

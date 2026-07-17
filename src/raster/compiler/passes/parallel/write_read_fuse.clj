@@ -100,6 +100,10 @@
 
     (seq? expr) (apply clojure.set/union #{} (map collect-aget-syms (rest expr)))
     (vector? expr) (apply clojure.set/union #{} (map collect-aget-syms expr))
+    ;; Map literals (e.g. a `case*` clause map) can hide an aget read; missing them makes the
+    ;; sole-consumer/liveness check map-blind — a buffer still read inside a case* would look
+    ;; dead and be wrongly fused away. Recurse into keys+vals like util/free-syms-flat does.
+    (map? expr) (apply clojure.set/union #{} (map collect-aget-syms (apply concat expr)))
     :else #{}))
 
 (defn- reads-sym?

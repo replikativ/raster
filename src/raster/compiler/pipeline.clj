@@ -1294,16 +1294,25 @@
    list in the kernel's signature order (for map! the separate output is appended, so on the
    resident path it is just another buffer). nil for an unrecognized head."
   [sym expr]
-  (let [head (first expr)]
+  ;; Every arm below destructures a FIXED-length invoke prefix. The invoke forms are
+  ;; compiler-generated (opencl_pass) with a known arity per convention. A wrong count means
+  ;; the emitter changed shape — extra operands would be SILENTLY DROPPED (the store-drop /
+  ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
+  ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
+  ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, scatter=6|7, reduce=4|5.
+  (let [head (first expr)
+        argc (count expr)]
     (cond
       (= head 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
-      (let [[_ kname arrays scalars n] expr]
-        {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
-         :convention :map-void :returns sym})
+      (when (= 5 argc)
+        (let [[_ kname arrays scalars n] expr]
+          {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
+           :convention :map-void :returns sym}))
       (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
-      (let [[_ kname inputs out scalars n] expr]
-        {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
-         :convention :map :returns sym})
+      (when (= 6 argc)
+        (let [[_ kname inputs out scalars n] expr]
+          {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
+           :convention :map :returns sym}))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
       ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
@@ -1311,26 +1320,33 @@
       ;; scatter). :arrays is the kernel C-sig order (out src index); the extra scalar
       ;; (stride) is a :scalar (n stays :n-expr, and n precedes stride in the C-sig — the
       ;; scatter bind places n before the scalars, unlike the map-void arrays,scalars,n order).
-      (let [[_ kname out src index n stride] expr
-            ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
-            ;; (scalar-native-type keys on the name, and the value-fn still evaluates
-            ;; the raw symbol — it is an int stride/index param either way).
-            strip-cast (fn [x] (if (and (seq? x)
-                                        (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
-                                 (second x) x))]
-        {:kernel-name kname :arrays [out src index]
-         :scalars (if stride [(strip-cast stride)] [])
-         :n-expr n :convention :scatter :accumulator out :returns sym})
+      ;; stride is optional: emitted 7-wide with a trailing nil, or 6-wide when absent.
+      (when (#{6 7} argc)
+        (let [[_ kname out src index n stride] expr
+              ;; Strip a `(long x)`/`(int x)` cast so the scalar is a bare symbol
+              ;; (scalar-native-type keys on the name, and the value-fn still evaluates
+              ;; the raw symbol — it is an int stride/index param either way).
+              strip-cast (fn [x] (if (and (seq? x)
+                                          (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
+                                   (second x) x))]
+          {:kernel-name kname :arrays [out src index]
+           :scalars (if stride [(strip-cast stride)] [])
+           :n-expr n :convention :scatter :accumulator out :returns sym}))
 
       (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
-      ;; 3-arg legacy (host-scalar return) vs 4-arg resident (writes out-buf, stays on device).
-      (if (= 5 (count expr))
+      ;; 3-arg legacy (host-scalar return, argc 4) vs resident (writes out-buf, stays on
+      ;; device, argc 5). Any OTHER count is an unmodeled shape — reject by name instead of
+      ;; silently treating it as the legacy 3-arg form (which would drop a real out-buf).
+      (cond
+        (= 5 argc)
         (let [[_ kname inputs out-buf n] expr]
           {:kernel-name kname :arrays (vec inputs) :output out-buf :scalars [] :n-expr n
            :convention :reduce :returns sym})
+        (= 4 argc)
         (let [[_ kname inputs n] expr]
           {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
-           :convention :reduce :returns sym}))
+           :convention :reduce :returns sym})
+        :else nil)
       ;; devirtualized BLAS GEMM: (.invk dgemm*-impl A B C m k n alpha beta). BLAS arg order is
       ;; (A B C m k n) — note m,k,n (NOT m,n,k). C (out) is written in place. This is how a
       ;; forward matmul (linear-nb → dgemm-nt!) AND its backward (linear-dx → dgemm!, linear-dW →

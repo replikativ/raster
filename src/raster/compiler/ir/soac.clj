@@ -479,7 +479,18 @@
    like rms-norm/attention/quant-act that doesn't reduce to a single-aset SoacMap)
    still declares the buffers it produces — otherwise consumers of those buffers
    get no dependency edge and the scheduler / horizontal-fuser can incorrectly
-   reorder or parallelize across the write (silent miscompile in composed layers)."
+   reorder or parallelize across the write (silent miscompile in composed layers).
+
+   KNOWN GAP (silently-ignored-information family, deferred): this sees ONLY aset
+   writes. An op whose output buffer is declared via the op-descriptor :buffer-write
+   registry but that writes with NO literal aset in this expr (a BLAS/GEMM .invk that
+   writes C in place, a runtime scatter) contributes NO producer edge here, so the
+   SOAC topological sort could reorder a consumer ahead of it. The registry DCE now
+   consults IS the right source of truth, but wiring it in here is a non-trivial change
+   (this runs pre-lowering where those ops are still symbolic deftm calls, not the
+   devirtualized .invk the registry keys on). Fixing it belongs with the descriptor
+   VALIDATOR (S4). Until then a genuinely reorderable buffer-write-only op reaching the
+   SOAC scheduler is the outstanding risk — documented, not yet guarded."
   [expr]
   (let [w (volatile! #{})]
     (walk/postwalk
@@ -575,12 +586,15 @@
             (list 'raster.par/scan (:out s) (:acc s) (:init s)
                   (:idx screma) (:bound screma) (:cast-fn screma) (:lambda s)))
 
-          ;; Map+Reduce: map feeds reduce
+          ;; Map+Reduce: a reduce WITH a still-present map-lambda. screma-compose's Map→Reduce
+          ;; inlines the producer map body INTO the reduce lambda and leaves :map-lambda nil, so
+          ;; a screma reaching here with both set is an UN-fused map — emitting only the reduce
+          ;; lambda (as this arm used to) would SILENTLY DROP the map computation. Reject loudly.
           (and (empty? (:scans screma)) (= 1 (count (:reduces screma))) (:map-lambda screma))
-          ;; Emit as reduce with map body inlined
-          (let [r (first (:reduces screma))]
-            (list 'raster.par/reduce (:acc r) (:init r)
-                  (:idx screma) (:bound screma) (:lambda r)))
+          (throw (ex-info (str "screma->par-form: Map+Reduce screma still carries a :map-lambda"
+                               " — the map body was not inlined into the reduce lambda; emitting"
+                               " the reduce alone would drop the map computation")
+                          {:screma screma}))
 
           :else
           (throw (ex-info "Cannot convert complex Screma to single par form"
@@ -589,7 +603,12 @@
 
 (defn- substitute-aget-sym
   "Replace (aget target-sym idx) with replacement-expr in body,
-  adjusting index variable from src-idx to dst-idx."
+  adjusting index variable from src-idx to dst-idx.
+
+  INDEX-INSENSITIVE (see fusion-support/substitute-aget): matches by array name only and
+  substitutes at ANY index, assuming same-position elementwise producer→consumer fusion.
+  A non-same-index consumer (gather/transpose/offset read) would be mis-fused. Reachable
+  only for the same-index case today; a real guard belongs with the descriptor VALIDATOR."
   [body target-sym src-idx dst-idx replacement-expr]
   (walk/postwalk
    (fn [f]
