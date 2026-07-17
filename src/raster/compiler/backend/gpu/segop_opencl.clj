@@ -94,20 +94,36 @@
                                      [arr-param-str out-param scl-param-str "int _n_bound"]))
         ;; Emit body as C expression
         adapted-body (ce/adapt-casts-for-dtype body out-dtype)
+        arr-sym-set (set (map #(symbol (name %)) arr-params))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* out-ctype
                            ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
-                   (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
+                   (ce/emit-expr adapted-body idx arr-sym-set))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
+        scalar-body-str (str "out[idx] = " cast-str ";")
+        ;; Affine-index vectorization (shared c_emit): a SegMap store is `out[idx] = f(..)`,
+        ;; expressed here as the synthetic aset the vectorizer analyzes. The store target
+        ;; is the literal `out` param (not c-symbol-mangled), so pass :store-name. nil ⇒
+        ;; scalar loop.
+        loop-region (binding [ce/*emit-config* ce/opencl-config
+                              ce/*scalar-type* out-ctype
+                              ce/*idx-sym* idx
+                              ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
+                      (ce/emit-vectorized-elementwise-loop
+                       (list 'aset 'out idx (if cast-fn (list cast-fn adapted-body) adapted-body))
+                       idx (conj arr-sym-set 'out) "idx" scalar-body-str
+                       {:n-bound "_n_bound" :store-name "out"}))
         ;; pragmas cover the output dtype AND every input array's dtype
         source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
-                    "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
-                    "        out[idx] = " cast-str ";\n"
-                    "    }\n"
-                    "}\n")]
+                    "    "
+                    (or loop-region
+                        (str "for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
+                             "        " scalar-body-str "\n"
+                             "    }"))
+                    "\n}\n")]
     {:kernel-name kernel-name
      :source source
      :array-params arr-params
