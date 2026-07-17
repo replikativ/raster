@@ -109,6 +109,15 @@
   vectorization section). Drives the ::vload / vector-cast emission in emit-expr."
   nil)
 
+(defn- contains-vload?
+  "True if the vectorizer's ::vload marker occurs anywhere in expr (i.e. the expr is
+  vector-valued). Used to drop element-type casts the walker inserted around what is
+  now a vector — `(double)(double4)` is illegal C but semantically identity here."
+  [expr]
+  (let [found (volatile! false)]
+    (walk/postwalk (fn [f] (when (and (seq? f) (= ::vload (first f))) (vreset! found true)) f) expr)
+    @found))
+
 ;; ================================================================
 ;; Op mapping (valid across all C-family backends)
 ;; ================================================================
@@ -940,8 +949,17 @@
      (and (seq? expr)
           (contains? #{'double 'float 'long 'int} (first expr))
           (= 2 (count expr)))
-     (emit-cast (remap-type (name (first expr)))
-                (emit-expr (second expr) idx-sym array-syms opencl-idx))
+     ;; Vectorizing: a cast the walker inserted around a now-vector expr. An element-type
+     ;; cast MATCHING the element type (e.g. `(double x)` where x is a double vload) is a
+     ;; no-op → drop it (`(double)(double4)` is illegal C). A cast to a DIFFERENT element
+     ;; type over a vector is a genuine per-lane precision change (a `^double` helper in a
+     ;; float kernel) with no clean vector lowering → bail this kernel to the scalar loop.
+     (if (and *vec-width* (contains-vload? (second expr)))
+       (if (= (name (first expr)) *scalar-type*)
+         (emit-expr (second expr) idx-sym array-syms opencl-idx)
+         (throw (ex-info "vector precision cast" {:raster.compiler.backend.gpu.c-emit/bail true})))
+       (emit-cast (remap-type (name (first expr)))
+                  (emit-expr (second expr) idx-sym array-syms opencl-idx)))
 
      ;; let/let* -> local variables with CSE
      (and (seq? expr) (contains? #{'let 'let*} (first expr)))
@@ -1413,6 +1431,13 @@
   "Infer the type tag of an expression in the current body context."
   [expr]
   (cond
+    ;; Vectorizer marker: a ::vload carries V element-type lanes — tag it as the element
+    ;; type so the deftm inliner accepts it and inlines the helper body with the vector
+    ;; flowing through (OpenCL vector arithmetic uses the scalar operators/builtins).
+    (and (seq? expr) (= ::vload (first expr)))
+    (when *scalar-type*
+      (get {"float" 'float "double" 'double "int" 'int "long" 'long} *scalar-type*))
+
     (symbol? expr)
     (or (:tag (meta expr))
         ;; Fall back to scalar type for untagged symbols (push constants, locals)
@@ -1915,10 +1940,12 @@
   become ::vload markers (emit-expr renders vloadV); broadcast/invariant loads and bare
   scalars stay scalar (OpenCL broadcasts them into the vector arithmetic). Element-type
   casts (float/double) wrapping a vector are no-ops and are dropped — a `(float)(float4)`
-  is illegal C but semantically identity here. Collects the divisor of every broadcast/
-  rowrel subscript into `divisors!` (an atom). Throws vec-bail! on anything that cannot
-  be proven vector-safe (non-affine subscript, gather, integer-narrowing over a vector,
-  non-integer divisor)."
+  is illegal C but semantically identity here. A deftm helper call keeps its shape; a
+  ::vload arg makes emit-expr's inliner (via infer-arg-tag) inline the helper body with
+  the vector flowing through — so no scalar-per-lane helper call survives. Collects the
+  divisor of every broadcast/rowrel subscript into `divisors!` (an atom). Throws vec-bail!
+  on anything that cannot be proven vector-safe (non-affine subscript, gather,
+  integer-narrowing over a vector, non-integer divisor)."
   [expr idx-sym array-syms divisors!]
   (letfn [(record-div! [d]
             (when-not (contains? #{"int" "uint" "long"} (infer-c-type d)) (vec-bail!))
@@ -2025,32 +2052,36 @@
    {:keys [n-bound store-name] :or {n-bound "_n_bound"}}]
   (when (:vectorize? *emit-config*)
     (when-let [{:keys [stores divisors]} (analyze-elementwise-vectorizable body idx-sym array-syms)]
-      (let [scalar-loop (str "for (int " opencl-idx " = get_global_id(0); "
-                             opencl-idx " < " n-bound "; "
-                             opencl-idx " += get_global_size(0)) {\n"
-                             "        " scalar-body-str "\n"
-                             "    }")
-            emit-vec-loop
-            (fn [V]
-              (let [store-strs (str/join " "
-                                         (map #(emit-vec-store % idx-sym array-syms opencl-idx V store-name) stores))]
-                (str "for (int _vb = get_global_id(0); _vb < (" n-bound " / " V "); "
-                     "_vb += get_global_size(0)) {\n"
-                     "        int " opencl-idx " = _vb * " V ";\n"
-                     "        " store-strs "\n"
-                     "    }")))
-            guard (fn [V] (str/join " && "
-                                    (cons (str "((" n-bound " % " V ") == 0)")
-                                          (map (fn [d]
-                                                 (str "((" (emit-expr d idx-sym array-syms opencl-idx)
-                                                      " % " V ") == 0)"))
-                                               divisors))))
-            v4 (binding [*vec-width* 4] (emit-vec-loop 4))
-            v2 (binding [*vec-width* 2] (emit-vec-loop 2))]
-        ;; A real GPU-helper call (gpufn_*) in the vectorized body would pass a vector
-        ;; to a scalar helper — its vector overload is a separate concern. Until then,
-        ;; bail to scalar if the emitted vector body calls one. (Numeric ops resolve to
-        ;; C operators, not gpufn_ calls, so they pass.)
-        (when-not (or (str/includes? v4 "gpufn_") (str/includes? v2 "gpufn_"))
-          (str "if (" (guard 4) ") {\n    " v4 "\n    } else if (" (guard 2) ") {\n    "
-               v2 "\n    } else {\n    " scalar-loop "\n    }"))))))
+      (try
+        (let [scalar-loop (str "for (int " opencl-idx " = get_global_id(0); "
+                               opencl-idx " < " n-bound "; "
+                               opencl-idx " += get_global_size(0)) {\n"
+                               "        " scalar-body-str "\n"
+                               "    }")
+              emit-vec-loop
+              (fn [V]
+                (let [store-strs (str/join " "
+                                           (map #(emit-vec-store % idx-sym array-syms opencl-idx V store-name) stores))]
+                  (str "for (int _vb = get_global_id(0); _vb < (" n-bound " / " V "); "
+                       "_vb += get_global_size(0)) {\n"
+                       "        int " opencl-idx " = _vb * " V ";\n"
+                       "        " store-strs "\n"
+                       "    }")))
+              guard (fn [V] (str/join " && "
+                                      (cons (str "((" n-bound " % " V ") == 0)")
+                                            (map (fn [d]
+                                                   (str "((" (emit-expr d idx-sym array-syms opencl-idx)
+                                                        " % " V ") == 0)"))
+                                                 divisors))))
+              v4 (binding [*vec-width* 4] (emit-vec-loop 4))
+              v2 (binding [*vec-width* 2] (emit-vec-loop 2))]
+          ;; A gpufn_ helper call surviving in the vectorized body would pass a vector to a
+          ;; scalar helper — bail to scalar. (Deftm helpers inline via emit-expr; numeric
+          ;; ops resolve to C operators — both pass. A non-inlinable helper leaves gpufn_.)
+          (when-not (or (str/includes? v4 "gpufn_") (str/includes? v2 "gpufn_"))
+            (str "if (" (guard 4) ") {\n    " v4 "\n    } else if (" (guard 2) ") {\n    "
+                 v2 "\n    } else {\n    " scalar-loop "\n    }")))
+        ;; A precision-changing vector cast (or other vector-unsafe form) surfaced during
+        ;; emission → fall back to the scalar loop (caller emits it).
+        (catch clojure.lang.ExceptionInfo e
+          (if (::bail (ex-data e)) nil (throw e)))))))
