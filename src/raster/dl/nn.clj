@@ -558,23 +558,29 @@
   (All [T] [x :- (Array T) weight :- (Array T)
             rows :- Long features :- Long chunks :- Long
             eps :- Double gain-offset :- Double] :- (Array T)
-       (let [csz (clojure.core/quot (clojure.core/+ features (clojure.core/- chunks 1)) chunks)
-             ps  (alloc-like x (* rows chunks))
+       (let [ps  (alloc-like x (* rows chunks))
              inv (alloc-like x rows)
              out (alloc-like x (* rows features))]
-         ;; stage 1 — chunk-parallel partial sums of squares
+         ;; stage 1 — chunk-parallel partial sums of squares.
+         ;; COALESCED SCHEDULE: chunk c owns the STRIDED feature set {c, c+chunks,
+         ;; c+2·chunks, …} rather than a contiguous [c·csz, (c+1)·csz) span. The
+         ;; contiguous span makes adjacent work items (c, c+1) start `csz` apart, so
+         ;; a subgroup's loads at any iteration are strided by csz — uncoalesced
+         ;; (measured ~22 GB/s of a ~70 GB/s ceiling). Striding the feature axis by
+         ;; `chunks` makes lane c and lane c+1 read x[rbase+c] and x[rbase+c+1] at the
+         ;; same step — contiguous across the subgroup ⇒ coalesced. Same Σx², merely
+         ;; reassociated across chunks (already non-bit-identical to rms-norm; f32
+         ;; agrees to ~1e-6 relative). The strided loop also handles a non-divisible
+         ;; `features` with no start/end/len bookkeeping. Every C backend inherits
+         ;; this — it is the deftm's own schedule, lowered by the shared c_emit.
          (raster.par/map-void! t (clojure.core/* rows chunks)
                                (let [r (quot t chunks)
                                      c (rem t chunks)
-                                     start (clojure.core/* c csz)
-                                     e0 (clojure.core/+ start csz)
-                                     end (if (< e0 features) e0 features)
-                                     len (clojure.core/- end start)
-                                     offset (clojure.core/+ (clojure.core/* r features) start)
-                                     s (loop [i 0 s 0.0]
-                                         (if (< i len)
-                                           (let [v (aget x (clojure.core/+ offset i))]
-                                             (recur (inc i) (+ s (* v v))))
+                                     rbase (clojure.core/* r features)
+                                     s (loop [i c s 0.0]
+                                         (if (< i features)
+                                           (let [v (aget x (clojure.core/+ rbase i))]
+                                             (recur (clojure.core/+ i chunks) (+ s (* v v))))
                                            s))]
                                  (aset ps t s)))
          ;; stage 2 — per-row combine (identical arithmetic to rms-norm!'s tail)
@@ -1693,30 +1699,30 @@
   (All [T] [dy :- (Array T) x :- (Array T) weight :- (Array T)
             rows :- Long features :- Long chunks :- Long
             eps :- Double gain-offset :- Double] :- (Array T)
-       (let [csz (clojure.core/quot (clojure.core/+ features (clojure.core/- chunks 1)) chunks)
-             pss (alloc-like x (* rows chunks))    ;; Σ x²        per (row, chunk)
+       (let [pss (alloc-like x (* rows chunks))    ;; Σ x²        per (row, chunk)
              pc  (alloc-like x (* rows chunks))    ;; Σ (g0+w)x·dy per (row, chunk)
              k1  (alloc-like x rows)               ;; inv-rms      per row
              k2  (alloc-like x rows)               ;; inv³·c/F     per row
              dx  (alloc-like dy (* rows features))]
+         ;; COALESCED SCHEDULE (see rms-norm-chunked stage 1): chunk c owns the
+         ;; STRIDED feature set {c, c+chunks, …} so adjacent work items read adjacent
+         ;; memory — a subgroup's loads are contiguous, not `csz` apart. Both partial
+         ;; reductions (Σ x² and Σ (g0+w)·x·dy) share the same stride. Same totals,
+         ;; reassociated across chunks (same caveat as the forward).
          (raster.par/map-void! t (clojure.core/* rows chunks)
                                (let [r (quot t chunks)
                                      c (rem t chunks)
-                                     start (clojure.core/* c csz)
-                                     e0 (clojure.core/+ start csz)
-                                     end (if (< e0 features) e0 features)
-                                     len (clojure.core/- end start)
-                                     offset (clojure.core/+ (clojure.core/* r features) start)
-                                     sq (loop [i 0 s 0.0]
-                                          (if (< i len)
-                                            (let [v (aget x (clojure.core/+ offset i))]
-                                              (recur (inc i) (+ s (* v v))))
+                                     rbase (clojure.core/* r features)
+                                     sq (loop [i c s 0.0]
+                                          (if (< i features)
+                                            (let [v (aget x (clojure.core/+ rbase i))]
+                                              (recur (clojure.core/+ i chunks) (+ s (* v v))))
                                             s))
-                                     sc (loop [i 0 s 0.0]
-                                          (if (< i len)
-                                            (let [j (clojure.core/+ offset i)
-                                                  gi (+ gain-offset (aget weight (clojure.core/+ start i)))]
-                                              (recur (inc i) (+ s (* gi (* (aget x j) (aget dy j))))))
+                                     sc (loop [i c s 0.0]
+                                          (if (< i features)
+                                            (let [j (clojure.core/+ rbase i)
+                                                  gi (+ gain-offset (aget weight i))]
+                                              (recur (clojure.core/+ i chunks) (+ s (* gi (* (aget x j) (aget dy j))))))
                                             s))]
                                  (aset pss t sq)
                                  (aset pc t sc)))
