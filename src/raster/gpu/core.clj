@@ -687,6 +687,27 @@
               {:type t :value (case t :int (int raw) :long (long raw) :double (double raw) (float raw))}))
           (:scalar-params ki))))
 
+(def ^:private valid-chain-roles
+  "Residency roles a chain buffer may carry. run-chain!/run-chain-ctx! move :input up and
+   download :output; :constant/:state/:scratch stay put. A role OUTSIDE this set (e.g. a
+   typo `:ouput`) is never matched by the `(= r :output)` filters and would SILENTLY never
+   be downloaded — so an unknown role is rejected at bind time, not lost at replay."
+  #{:constant :state :input :output :scratch})
+
+(defn- chain-roles-of
+  "Extract {buf-key → role} from the buffers spec, defaulting :scratch, and REJECT any
+   unknown role by name rather than storing it (where it would silently never download)."
+  [buffers]
+  (into {}
+        (map (fn [[k v]]
+               (let [r (or (nth v 3 nil) :scratch)]
+                 (when-not (contains? valid-chain-roles r)
+                   (throw (ex-info (str "chain buffer " k " has unknown role " (pr-str r)
+                                        " — must be one of " valid-chain-roles)
+                                   {:buffer k :role r :valid valid-chain-roles})))
+                 [k r])))
+        buffers))
+
 (defn chain-program!
   "Bind a hand-authored op-chain as one resident command graph.
      buffers: {buf-key → [dtype size init-array-or-nil role]} — role ∈
@@ -701,7 +722,7 @@
   ([sess buffers steps] (chain-program! sess buffers steps :float))
   ([sess buffers steps dtype]
    (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
-         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+         roles (chain-roles-of buffers)]
      (alloc! sess specs)
      ;; A multi-par-form op compiles to SEVERAL kernels — bind them ALL, in order (the old
      ;; `first` silently dropped every kernel after the first). All kernels of a step share
@@ -744,7 +765,7 @@
   ([sess buffers steps] (bind-chain! sess buffers steps :float))
   ([sess buffers steps dtype]
    (let [specs (into {} (map (fn [[k [dt sz init _]]] [k [dt sz init]]) buffers))
-         roles (into {} (map (fn [[k v]] [k (or (nth v 3 nil) :scratch)]) buffers))]
+         roles (chain-roles-of buffers)]
      (alloc! sess specs)
      (doseq [{:keys [op phase]} steps] (compile! sess phase op))
      (swap! sess assoc :chain-steps steps :chain-roles roles :chain-dtype dtype)
@@ -1143,6 +1164,14 @@
                          src-buf (buf-of src-sym :scatter-src)
                          idx-buf (buf-of idx-sym :scatter-idx)
                          n       (long (n-fn args))
+                         ;; A scatter step has AT MOST one scalar (the optional stride). Taking
+                         ;; `(first scalar-specs)` would silently drop any further scalars — so
+                         ;; assert the shape instead of miscompiling a multi-scalar scatter.
+                         _       (when (> (count scalar-specs) 1)
+                                   (throw (ex-info (str "resident scatter step " kernel-name
+                                                        " has " (count scalar-specs)
+                                                        " scalars — only a single stride is modeled")
+                                                   {:kernel kernel-name :scalar-specs scalar-specs})))
                          stride  (when (seq scalar-specs) (long ((:value-fn (first scalar-specs)) args)))
                          out-size (or (alloc-size-of accumulator)
                                       ;; fallback: accumulator is a param, use its length
