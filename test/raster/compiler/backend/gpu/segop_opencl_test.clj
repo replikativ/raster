@@ -18,6 +18,29 @@
         segops (lower/lower-reduce s nil)]
     (:source (sg/generate-segred-kernel (first segops) 'out :dtype :float))))
 
+;; ================================================================
+;; Silently-ignored-information family: a SegRed combine that the
+;; extractor only partially models must FAIL LOUD, not miscompile.
+;; ================================================================
+
+(deftest segred-nary-combine-rejected
+  (testing "a variadic (+ acc x y) combine is rejected, not silently summing only x"
+    ;; Before the fix, op-args extraction took a0=acc a1=x and DROPPED y — emitting a
+    ;; kernel that reduced with just x. A segmented reduce combine is binary (op acc elem).
+    (is (thrown-with-msg?
+         Exception #"only a binary \(op acc elem\) combine"
+         (segred-source '(+ acc (clojure.core/aget a j) (clojure.core/aget b j))))))
+  (testing "the ordinary binary combine still lowers unchanged"
+    (is (re-find #"val = " (segred-source '(+ acc (clojure.core/aget a j)))))))
+
+(deftest segred-multistatement-lambda-rejected
+  (testing "a reduce lambda with a multi-statement let body is rejected, not (last bdy)-dropped"
+    ;; The single-aset-void store-drop shape on the reduce side: (last bdy) silently dropped
+    ;; the earlier body forms.
+    (is (thrown-with-msg?
+         Exception #"multi-statement body"
+         (segred-source '(let* [t (clojure.core/aget a j)] (+ acc t) (+ acc t)))))))
+
 (deftest segred-devirtualized-aget-lowers-to-subscript
   (testing "the parametric (.invk aget-impl …) shape — the qlinear-k side of #55"
     (let [aget-invk (with-meta (list '.invk 'raster.arrays/aget_m_floats_long-impl 'a 'j)
