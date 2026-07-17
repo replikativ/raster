@@ -1041,29 +1041,51 @@
    ~100x-slower IFn.invoke). This is the same scalar-op typing gap d915365 closed in
    infer-expr-tag; the REWRITTEN-form reader needed it too.
 
-   aget/alength are tested OUTSIDE the scalar-op? guard, on their own predicates: an
-   ELEMENT READ is not the unification of its operands (unifying `(aget a i)` over the
-   array tag and the long index would yield `long`), and `clojure.core/aget` — the
-   spelling the walker leaves behind after lowering `raster.arrays/aget` — is in
-   aget-op? but NOT in known-scalar-ops, so a scalar-op?-first guard would miss it and
-   leave `(+ (aget a i) (aget a j))` untyped whenever neither operand is a literal."
+   SCOPE — this fallback types ARITHMETIC forms only, but its OPERAND reader also
+   understands aget/alength (element reads under arithmetic): `clojure.core/aget` —
+   the spelling the walker leaves behind after lowering `raster.arrays/aget` — is in
+   aget-op? but NOT in known-scalar-ops, and infer-rewritten-tag's var clause can't
+   type it, so `(+ (aget a i) (aget a j))` stayed untyped whenever neither operand
+   was a literal. A BARE top-level aget deliberately still returns nil here: typing
+   it flips the value from the boxed emission the bytecode emitter currently pairs
+   with untyped case*/loop merges to a primitive one — matrix-norm's `(aget S 0)`
+   2-norm branch then expects a primitive double at the case merge while the sibling
+   loop branches still box theirs → 'Stack size mismatch' VerifyError. That is a
+   pre-existing case*-merge boxing inconsistency in the emitter (see
+   bc-compiler known issues), not a reason to lose the arithmetic coverage; when the
+   emitter unifies case-branch boxing this can graduate to a plain infer-aget-type
+   branch.
+
+   SOUNDNESS: the unification only fires when EVERY operand's tag is known AND
+   primitive-numeric. Both relaxations are miscompiles, found the hard way (7 suite
+   errors on the keep-over-partial-info draft of this rule):
+     * partial coverage — `(* x 2.0)` with x UNTYPED unified over just the literal
+       to 'double; but x is a Sym/Dual in the Dual{Sym} initiality flows and the ODE
+       Dual sensitivity path, so the consuming op devirtualized to a Number-casting
+       specialization → ClassCastException (Sym/Dual cannot be cast to Number).
+     * non-primitive tags — operands tagged Dual/Sym/etc. fell through a
+       primitives-only cond to a bogus default. A boxed-carrier scalar op is exactly
+       what runtime dispatch is FOR; this rule must stay out of its way (nil)."
   [head form type-env]
-  (cond
-    (descriptor/alength-op? head) 'long
-    (descriptor/aget-op? head) (infer-aget-type form type-env)
-    (descriptor/scalar-op? head)
-    (let [arg-tags (keep (fn [a]
-                           (or (when (seq? a) (infer-rewritten-tag a nil type-env))
-                               (literal-tag a)
-                               (when (symbol? a) (type-env-tag type-env a))))
-                         (rest form))]
-      (cond
-        (some #{'double} arg-tags) 'double
-        (some #{'float} arg-tags) 'float
-        (some #{'long} arg-tags) 'long
-        (empty? arg-tags) nil
-        :else 'long))
-    :else nil))
+  (when (and (descriptor/scalar-op? head)
+             (not (descriptor/aget-op? head))
+             (not (descriptor/alength-op? head)))
+    (let [operand-tag (fn operand-tag [a]
+                        (or (when (seq? a)
+                              (let [h (first a)]
+                                (cond
+                                  (descriptor/alength-op? h) 'long
+                                  (descriptor/aget-op? h) (infer-aget-type a type-env)
+                                  :else (infer-rewritten-tag a nil type-env))))
+                            (literal-tag a)
+                            (when (symbol? a) (type-env-tag type-env a))))
+          arg-tags (mapv operand-tag (rest form))]
+      (when (and (seq arg-tags)
+                 (every? #{'double 'float 'long 'int} arg-tags))
+        (cond
+          (some #{'double} arg-tags) 'double
+          (some #{'float} arg-tags) 'float
+          :else 'long)))))
 
 (defn- prim-class->tag
   "Map a (boxed or primitive) numeric Class to a raster type tag, else nil."
