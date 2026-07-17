@@ -51,7 +51,11 @@
    :float-abs       "fabs"
    :float-max       "fmax"
    :float-min       "fmin"
-   :float-suffix?   true})
+   :float-suffix?   true
+   ;; Affine-index vectorization emits OpenCL vloadV/vstoreV. HIP/CUDA/GLSL configs
+   ;; omit this until their vector load/store spelling is added (they fall back to
+   ;; the scalar loop — always correct).
+   :vectorize?      true})
 
 (def glsl-config
   {:cast-style      :glsl
@@ -97,6 +101,13 @@
   so index arithmetic bound to a name (e.g. `base = b*32`) is typed int rather than
   defaulting to *scalar-type*. Loop and let* emitters seed it for their bodies."
   #{})
+
+(def ^:dynamic *vec-width*
+  "When non-nil (2 or 4), the affine-index vectorizer is active and *scalar-type*
+  refers to the ELEMENT type of the V-wide vectors being emitted. Only set inside
+  the vectorized fast-path of an elementwise kernel loop (see the affine
+  vectorization section). Drives the ::vload / vector-cast emission in emit-expr."
+  nil)
 
 ;; ================================================================
 ;; Op mapping (valid across all C-family backends)
@@ -914,6 +925,16 @@
            idx-expr (if invk? (nth expr 3) (nth expr 2))]
        (str (c-symbol arr) "["
             (emit-expr idx-expr idx-sym array-syms opencl-idx) "]"))
+
+     ;; Vectorizer marker: (::vload arr off-expr) → a V-wide contiguous vector load
+     ;; vloadV(0, arr + off). Emitted only inside the vectorized fast-path of an
+     ;; elementwise kernel (see the affine vectorization section), where *vec-width*
+     ;; is bound and the runtime divisibility guard guarantees off is V-aligned and
+     ;; the block stays within one row (so a rowrel `off = idx % C` load is contiguous).
+     (and (seq? expr) (= ::vload (first expr)))
+     (let [[_ arr off] expr]
+       (str "vload" *vec-width* "(0, " (c-symbol arr) " + "
+            (emit-expr off idx-sym array-syms opencl-idx) ")"))
 
      ;; Primitive cast
      (and (seq? expr)
@@ -1761,3 +1782,267 @@
      :source (str "static " ret-type " " c-name "(" param-strs ") {\n"
                   "    return " body-str ";\n"
                   "}\n")}))
+
+;; ================================================================
+;; Affine-index vectorization (shared, opt-in-by-provability)
+;; ================================================================
+;; Rewrites a straight-line elementwise kernel body so each work item processes
+;; V consecutive elements via vector loads/stores (vloadV / vstoreV). This is the
+;; #1 GPU bandwidth lever for the indexed elementwise family (chunked-rms-norm
+;; apply and friends): the currency for these streaming kernels is outstanding
+;; bytes per lane, and float4 loads/stores recover ~40% of the bandwidth the
+;; scalar path leaves on the table.
+;;
+;; Subscript classification (relative to the work-item index `idx`):
+;;   identity  a[idx]        -> contiguous  vloadV(0, a + idx)
+;;   a[idx/C]  (broadcast)   -> CONSTANT across the V lanes of one block -> scalar
+;;                             load a[idx/C], broadcast into the vector arithmetic
+;;   a[idx%C]  (row-relative)-> contiguous within a row -> vloadV(0, a + (idx%C))
+;;   free of idx (invariant) -> scalar broadcast
+;;   anything else           -> NOT vectorizable; fall back to the scalar loop.
+;;
+;; Legality (non-straddling) is enforced at RUNTIME, not guessed: the vectorized
+;; fast-path runs only when the element count and EVERY divisor C are multiples of
+;; V. Given the loop hands each work item a V-aligned block base (vb*V), C % V == 0
+;; guarantees a V-block never straddles a `/C` or `%C` row boundary — so idx/C is
+;; constant across the block and idx%C is contiguous. Otherwise the scalar loop
+;; runs. The transform is therefore always correct; it only ever CAPTURES the win
+;; when the dims cooperate (gemma d=640, hd=256 are multiples of 4).
+;;
+;; The classification is pure S-expression analysis (the JVM/CPU affine matchers in
+;; segop_simd are backend-coupled, so the small pure equivalents live here). Living
+;; in c_emit, every C-family backend that sets :vectorize? in its emit-config
+;; inherits it; the vloadV/vstoreV spelling is OpenCL-specific and gated on that
+;; flag, so HIP/CUDA enable it later by adding their spelling, not by rewriting.
+
+(def ^:private quot-ops #{'quot 'clojure.core/quot})
+(def ^:private rem-ops  #{'rem 'clojure.core/rem 'mod 'clojure.core/mod})
+(def ^:private prim-cast-ops #{'double 'float 'long 'int
+                               'clojure.core/double 'clojure.core/float
+                               'clojure.core/long 'clojure.core/int})
+(def ^:private idx-cast-ops #{'long 'int 'clojure.core/long 'clojure.core/int})
+
+(defn- sym-occurs?
+  "True if symbol s (matched by name) occurs anywhere in expr."
+  [expr s]
+  (let [found (atom false)]
+    (walk/postwalk (fn [f] (when (and (symbol? f) s (= (name f) (name s)))
+                             (reset! found true))
+                     f)
+                   expr)
+    @found))
+
+(defn- strip-idx-cast
+  "Unwrap a single (long idx)/(int idx) cast."
+  [e]
+  (if (and (seq? e) (= 2 (count e)) (contains? idx-cast-ops (first e)))
+    (second e) e))
+
+(defn- classify-subscript
+  "Classify an aget/aset index expression E relative to idx-sym. Returns one of
+  {:kind :contiguous} / {:kind :broadcast :divisor C} / {:kind :rowrel :divisor C}
+  / {:kind :invariant} / nil (non-affine → not vectorizable)."
+  [e idx-sym]
+  (let [e (strip-idx-cast e)
+        idx? (fn [x] (let [x (strip-idx-cast x)]
+                       (and (symbol? x) (= (name x) (name idx-sym)))))]
+    (cond
+      (idx? e) {:kind :contiguous}
+      (and (seq? e) (= 3 (count e)) (contains? quot-ops (first e))
+           (idx? (nth e 1)) (not (sym-occurs? (nth e 2) idx-sym)))
+      {:kind :broadcast :divisor (nth e 2)}
+      (and (seq? e) (= 3 (count e)) (contains? rem-ops (first e))
+           (idx? (nth e 1)) (not (sym-occurs? (nth e 2) idx-sym)))
+      {:kind :rowrel :divisor (nth e 2)}
+      (not (sym-occurs? e idx-sym)) {:kind :invariant}
+      :else nil)))
+
+(defn- inline-pure-lets
+  "Fully inline let/let* bindings that are pure (no side effects, not loops) so
+  subscript index expressions are exposed. Returns the inlined body, or nil if any
+  binding is side-effecting/loop-valued (can't safely inline → bail vectorization)."
+  [expr]
+  (loop [expr expr]
+    (if (and (seq? expr) (contains? #{'let 'let*} (first expr)))
+      (let [[_ bindings & body] expr
+            pairs (partition 2 bindings)]
+        (if (some (fn [[_ v]] (or (has-side-effects? v)
+                                  (and (seq? v) (contains? #{'loop 'loop*} (first v)))))
+                  pairs)
+          nil
+          (let [env (reduce (fn [env [s v]]
+                              (assoc env s (walk/postwalk-replace env v)))
+                            {} pairs)
+                body' (mapv #(walk/postwalk-replace env %) body)]
+            (if (= 1 (count body'))
+              (recur (first body'))
+              (cons 'do body')))))
+      expr)))
+
+(defn- aget-form?* [f] (and (seq? f) (>= (count f) 3) (descriptor/aget-op? (first f))))
+(defn- aset-form?* [f] (and (seq? f) (>= (count f) 4) (descriptor/aset-op? (first f))))
+
+(defn- collect-stores
+  "Return a vector of (aset ...) forms from a straight-line core (an aset or a do
+  of asets). nil if the shape is not straight-line stores."
+  [core]
+  (cond
+    (aset-form?* core) [core]
+    (and (seq? core) (= 'do (first core)))
+    (let [ss (rest core)]
+      (when (every? aset-form?* ss) (vec ss)))
+    :else nil))
+
+(defn- vec-bail!
+  "Abort vectorization of the current kernel (caught at the top level → scalar loop)."
+  [] (throw (ex-info "not-vectorizable" {::bail true})))
+
+(def ^:private cast-target
+  {'float "float" 'double "double" 'int "int" 'long "long"
+   'clojure.core/float "float" 'clojure.core/double "double"
+   'clojure.core/int "int" 'clojure.core/long "long"})
+
+(def ^:private value-has-vload?
+  (fn [expr]
+    (let [found (atom false)]
+      (walk/postwalk (fn [f] (when (and (seq? f) (= ::vload (first f))) (reset! found true)) f) expr)
+      @found)))
+
+(defn- preprocess-value
+  "Rewrite a value expression into its vectorized form: contiguous/row-relative loads
+  become ::vload markers (emit-expr renders vloadV); broadcast/invariant loads and bare
+  scalars stay scalar (OpenCL broadcasts them into the vector arithmetic). Element-type
+  casts (float/double) wrapping a vector are no-ops and are dropped — a `(float)(float4)`
+  is illegal C but semantically identity here. Collects the divisor of every broadcast/
+  rowrel subscript into `divisors!` (an atom). Throws vec-bail! on anything that cannot
+  be proven vector-safe (non-affine subscript, gather, integer-narrowing over a vector,
+  non-integer divisor)."
+  [expr idx-sym array-syms divisors!]
+  (letfn [(record-div! [d]
+            (when-not (contains? #{"int" "uint" "long"} (infer-c-type d)) (vec-bail!))
+            (swap! divisors! conj d))
+          (go [f]
+              (cond
+              ;; explicit aget → classify its index
+                (aget-form?* f)
+                (let [arr (nth f 1) idx-e (nth f 2)
+                      c (classify-subscript idx-e idx-sym)]
+                  (case (:kind c)
+                    :contiguous (list ::vload arr idx-sym)
+                    :rowrel     (do (record-div! (:divisor c)) (list ::vload arr idx-e))
+                    :broadcast  (do (record-div! (:divisor c)) f) ;; scalar broadcast load
+                    :invariant  f                                 ;; scalar, free of idx
+                    (vec-bail!)))                                 ;; nil → non-affine/gather
+              ;; primitive cast: element-type cast over a vector is a no-op → drop it
+                (and (seq? f) (= 2 (count f)) (contains? prim-cast-ops (first f)))
+                (let [inner (go (second f))
+                      target (get cast-target (first f))]
+                  (if (value-has-vload? inner)
+                    (if (= target *scalar-type*) inner (vec-bail!))
+                    (list (first f) inner)))
+              ;; bare array symbol used as a value → contiguous load
+                (and (symbol? f) (contains? array-syms (symbol (name f))))
+                (list ::vload f idx-sym)
+                (seq? f)    (doall (map go f))
+                (vector? f) (mapv go f)
+                :else f))]
+    (go expr)))
+
+(defn- idx-leaks?
+  "True if idx-sym occurs anywhere OUTSIDE an aget/aset index position — i.e. it
+  would feed per-lane arithmetic, which the block-scalar `idx` can't represent."
+  [core idx-sym]
+  (let [blanked (walk/postwalk
+                 (fn [f]
+                   (cond
+                     (aset-form?* f) (list (first f) (nth f 1) 0 (nth f 3))
+                     (aget-form?* f) (list (first f) (nth f 1) 0)
+                     :else f))
+                 core)]
+    (sym-occurs? blanked idx-sym)))
+
+(defn analyze-elementwise-vectorizable
+  "Analyze an elementwise kernel body for affine-index vectorization. Returns nil
+  (fall back to scalar) or a map {:stores [{:arr :val'} ...] :divisors [C-expr ...]}
+  where val' has contiguous/rowrel loads rewritten to ::vload markers. Width-independent
+  — the runtime guard is emitted per width by emit-vectorized-elementwise-loop.
+
+  Bails (nil) unless the body is straight-line elementwise stores over contiguous
+  positions, every array subscript classifies, idx never leaks into per-lane
+  arithmetic, and there is no control flow. Real GPU-helper calls (gpufn_*) are caught
+  downstream in the emitter (their vector overloads are a separate concern)."
+  [body idx-sym array-syms]
+  (when (contains? #{"float" "double"} *scalar-type*)
+    (try
+      (let [core (or (inline-pure-lets body) (vec-bail!))
+            stores (or (collect-stores core) (vec-bail!))]
+        (when (idx-leaks? core idx-sym) (vec-bail!))
+        ;; no control flow in a vectorizable straight-line body
+        (walk/postwalk
+         (fn [f] (when (and (seq? f)
+                            (contains? #{'if 'when 'case 'cond 'loop 'loop* 'and 'or} (first f)))
+                   (vec-bail!)) f)
+         core)
+        (let [divisors! (atom [])
+              store-recs
+              (mapv (fn [st]
+                      (let [[_ arr idx-e val] st]
+                        ;; a vstore writes contiguous lanes — the store index must be idx
+                        (when-not (= :contiguous (:kind (classify-subscript idx-e idx-sym)))
+                          (vec-bail!))
+                        {:arr arr :val (preprocess-value val idx-sym array-syms divisors!)}))
+                    stores)]
+          {:stores store-recs :divisors (vec (distinct @divisors!))}))
+      (catch clojure.lang.ExceptionInfo e
+        (if (::bail (ex-data e)) nil (throw e))))))
+
+(defn- emit-vec-store
+  "Emit one vstoreV statement for a store {:arr :val} at width V (element type =
+  *scalar-type*, bound by the caller)."
+  [{:keys [arr val]} idx-sym array-syms opencl-idx V]
+  (let [val-str (emit-expr val idx-sym array-syms opencl-idx)
+        vtype   (str *scalar-type* V)
+        ;; a pure-broadcast value (no vector load) must be widened to the vector type
+        data    (if (value-has-vload? val) val-str (str "(" vtype ")(" val-str ")"))]
+    (str "vstore" V "(" data ", 0, " (c-symbol arr) " + " opencl-idx ");")))
+
+(defn emit-vectorized-elementwise-loop
+  "Given an elementwise kernel body and the scalar loop body already emitted by the
+  backend (scalar-body-str), return the FULL loop region: a runtime divisibility
+  guard choosing a float4 / float2 vectorized grid-stride loop, falling back to the
+  scalar grid-stride loop. Returns nil if the body is not provably vectorizable, in
+  which case the caller emits its usual scalar loop.
+
+  opts: {:n-bound \"_n_bound\"}  (the C variable holding the element count)"
+  [body idx-sym array-syms opencl-idx scalar-body-str {:keys [n-bound] :or {n-bound "_n_bound"}}]
+  (when (:vectorize? *emit-config*)
+    (when-let [{:keys [stores divisors]} (analyze-elementwise-vectorizable body idx-sym array-syms)]
+      (let [scalar-loop (str "for (int " opencl-idx " = get_global_id(0); "
+                             opencl-idx " < " n-bound "; "
+                             opencl-idx " += get_global_size(0)) {\n"
+                             "        " scalar-body-str "\n"
+                             "    }")
+            emit-vec-loop
+            (fn [V]
+              (let [store-strs (str/join " "
+                                         (map #(emit-vec-store % idx-sym array-syms opencl-idx V) stores))]
+                (str "for (int _vb = get_global_id(0); _vb < (" n-bound " / " V "); "
+                     "_vb += get_global_size(0)) {\n"
+                     "        int " opencl-idx " = _vb * " V ";\n"
+                     "        " store-strs "\n"
+                     "    }")))
+            guard (fn [V] (str/join " && "
+                                    (cons (str "((" n-bound " % " V ") == 0)")
+                                          (map (fn [d]
+                                                 (str "((" (emit-expr d idx-sym array-syms opencl-idx)
+                                                      " % " V ") == 0)"))
+                                               divisors))))
+            v4 (binding [*vec-width* 4] (emit-vec-loop 4))
+            v2 (binding [*vec-width* 2] (emit-vec-loop 2))]
+        ;; A real GPU-helper call (gpufn_*) in the vectorized body would pass a vector
+        ;; to a scalar helper — its vector overload is a separate concern. Until then,
+        ;; bail to scalar if the emitted vector body calls one. (Numeric ops resolve to
+        ;; C operators, not gpufn_ calls, so they pass.)
+        (when-not (or (str/includes? v4 "gpufn_") (str/includes? v2 "gpufn_"))
+          (str "if (" (guard 4) ") {\n    " v4 "\n    } else if (" (guard 2) ") {\n    "
+               v2 "\n    } else {\n    " scalar-loop "\n    }"))))))

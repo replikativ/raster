@@ -198,6 +198,14 @@
                            ce/*scalar-type* default-ctype
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-stmt adapted-body idx all-arr-syms "idx"))
+        ;; Affine-index vectorization (shared c_emit): float4/float2 grid-stride loop
+        ;; guarded by a runtime divisibility check, else the scalar loop. nil ⇒ not
+        ;; provably vectorizable ⇒ scalar loop below.
+        loop-region (binding [ce/*emit-config* ce/opencl-config
+                              ce/*scalar-type* default-ctype
+                              ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
+                      (ce/emit-vectorized-elementwise-loop
+                       adapted-body idx all-arr-syms "idx" body-str {:n-bound "_n_bound"}))
         ;; Detect if body uses float atomic-add (needs CAS helper function)
         needs-float-atomic? (let [found (atom false)]
                               (walk/postwalk
@@ -227,10 +235,12 @@
                     (when (body-uses-dp4a? body) rstr-dp4a-helper)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
-                    "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
-                    "        " body-str "\n"
-                    "    }\n"
-                    "}\n")]
+                    "    "
+                    (or loop-region
+                        (str "for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
+                             "        " body-str "\n"
+                             "    }"))
+                    "\n}\n")]
     {:kernel-name    kernel-name
      :source         source
      :array-params   all-arr-params
