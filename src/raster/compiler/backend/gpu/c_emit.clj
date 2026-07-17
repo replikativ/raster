@@ -1815,6 +1815,10 @@
 ;; inherits it; the vloadV/vstoreV spelling is OpenCL-specific and gated on that
 ;; flag, so HIP/CUDA enable it later by adding their spelling, not by rewriting.
 
+(defn- vec-bail!
+  "Abort vectorization of the current kernel (caught at the top level → scalar loop)."
+  [] (throw (ex-info "not-vectorizable" {::bail true})))
+
 (def ^:private quot-ops #{'quot 'clojure.core/quot})
 (def ^:private rem-ops  #{'rem 'clojure.core/rem 'mod 'clojure.core/mod})
 (def ^:private prim-cast-ops #{'double 'float 'long 'int
@@ -1858,26 +1862,28 @@
       :else nil)))
 
 (defn- inline-pure-lets
-  "Fully inline let/let* bindings that are pure (no side effects, not loops) so
-  subscript index expressions are exposed. Returns the inlined body, or nil if any
-  binding is side-effecting/loop-valued (can't safely inline → bail vectorization)."
+  "Deep-inline EVERY pure let/let* (no side effects, not loops) anywhere in the form,
+  so subscript index expressions are exposed and no scalar local is declared for a
+  value that becomes a vector (a nested let inside a store value would otherwise emit
+  `float x = <float4>` — a type error). A vectorizable straight-line body has only
+  pure bindings; an impure/loop-valued binding throws vec-bail! (→ scalar loop)."
   [expr]
-  (loop [expr expr]
-    (if (and (seq? expr) (contains? #{'let 'let*} (first expr)))
-      (let [[_ bindings & body] expr
-            pairs (partition 2 bindings)]
-        (if (some (fn [[_ v]] (or (has-side-effects? v)
-                                  (and (seq? v) (contains? #{'loop 'loop*} (first v)))))
-                  pairs)
-          nil
-          (let [env (reduce (fn [env [s v]]
-                              (assoc env s (walk/postwalk-replace env v)))
-                            {} pairs)
-                body' (mapv #(walk/postwalk-replace env %) body)]
-            (if (= 1 (count body'))
-              (recur (first body'))
-              (cons 'do body')))))
-      expr)))
+  (walk/prewalk
+   (fn [f]
+     (if (and (seq? f) (contains? #{'let 'let*} (first f)))
+       (let [[_ bindings & body] f
+             pairs (partition 2 bindings)]
+         (when (some (fn [[_ v]] (or (has-side-effects? v)
+                                     (and (seq? v) (contains? #{'loop 'loop*} (first v)))))
+                     pairs)
+           (vec-bail!))
+         (let [env (reduce (fn [env [s v]]
+                             (assoc env s (walk/postwalk-replace env v)))
+                           {} pairs)
+               body' (mapv #(walk/postwalk-replace env %) body)]
+           (if (= 1 (count body')) (first body') (cons 'do body'))))
+       f))
+   expr))
 
 (defn- aget-form?* [f] (and (seq? f) (>= (count f) 3) (descriptor/aget-op? (first f))))
 (defn- aset-form?* [f] (and (seq? f) (>= (count f) 4) (descriptor/aset-op? (first f))))
@@ -1892,10 +1898,6 @@
     (let [ss (rest core)]
       (when (every? aset-form?* ss) (vec ss)))
     :else nil))
-
-(defn- vec-bail!
-  "Abort vectorization of the current kernel (caught at the top level → scalar loop)."
-  [] (throw (ex-info "not-vectorizable" {::bail true})))
 
 (def ^:private cast-target
   {'float "float" 'double "double" 'int "int" 'long "long"
@@ -1974,7 +1976,7 @@
   [body idx-sym array-syms]
   (when (contains? #{"float" "double"} *scalar-type*)
     (try
-      (let [core (or (inline-pure-lets body) (vec-bail!))
+      (let [core (inline-pure-lets body)
             stores (or (collect-stores core) (vec-bail!))]
         (when (idx-leaks? core idx-sym) (vec-bail!))
         ;; no control flow in a vectorizable straight-line body
@@ -1990,6 +1992,9 @@
                         ;; a vstore writes contiguous lanes — the store index must be idx
                         (when-not (= :contiguous (:kind (classify-subscript idx-e idx-sym)))
                           (vec-bail!))
+                        ;; a nested store inside the value (horizontally-fused multi-output
+                        ;; map) can't be a lane vector store — bail to scalar
+                        (walk/postwalk (fn [f] (when (aset-form?* f) (vec-bail!)) f) val)
                         {:arr arr :val (preprocess-value val idx-sym array-syms divisors!)}))
                     stores)]
           {:stores store-recs :divisors (vec (distinct @divisors!))}))
@@ -1998,13 +2003,14 @@
 
 (defn- emit-vec-store
   "Emit one vstoreV statement for a store {:arr :val} at width V (element type =
-  *scalar-type*, bound by the caller)."
-  [{:keys [arr val]} idx-sym array-syms opencl-idx V]
+  *scalar-type*, bound by the caller). store-name overrides the target C name (used by
+  the SegMap path whose output param is the literal `out`, not c-symbol-mangled)."
+  [{:keys [arr val]} idx-sym array-syms opencl-idx V store-name]
   (let [val-str (emit-expr val idx-sym array-syms opencl-idx)
         vtype   (str *scalar-type* V)
         ;; a pure-broadcast value (no vector load) must be widened to the vector type
         data    (if (value-has-vload? val) val-str (str "(" vtype ")(" val-str ")"))]
-    (str "vstore" V "(" data ", 0, " (c-symbol arr) " + " opencl-idx ");")))
+    (str "vstore" V "(" data ", 0, " (or store-name (c-symbol arr)) " + " opencl-idx ");")))
 
 (defn emit-vectorized-elementwise-loop
   "Given an elementwise kernel body and the scalar loop body already emitted by the
@@ -2013,8 +2019,10 @@
   scalar grid-stride loop. Returns nil if the body is not provably vectorizable, in
   which case the caller emits its usual scalar loop.
 
-  opts: {:n-bound \"_n_bound\"}  (the C variable holding the element count)"
-  [body idx-sym array-syms opencl-idx scalar-body-str {:keys [n-bound] :or {n-bound "_n_bound"}}]
+  opts: {:n-bound \"_n_bound\"   (the C variable holding the element count)
+         :store-name \"out\"}     (optional literal target name for a single store)"
+  [body idx-sym array-syms opencl-idx scalar-body-str
+   {:keys [n-bound store-name] :or {n-bound "_n_bound"}}]
   (when (:vectorize? *emit-config*)
     (when-let [{:keys [stores divisors]} (analyze-elementwise-vectorizable body idx-sym array-syms)]
       (let [scalar-loop (str "for (int " opencl-idx " = get_global_id(0); "
@@ -2025,7 +2033,7 @@
             emit-vec-loop
             (fn [V]
               (let [store-strs (str/join " "
-                                         (map #(emit-vec-store % idx-sym array-syms opencl-idx V) stores))]
+                                         (map #(emit-vec-store % idx-sym array-syms opencl-idx V store-name) stores))]
                 (str "for (int _vb = get_global_id(0); _vb < (" n-bound " / " V "); "
                      "_vb += get_global_size(0)) {\n"
                      "        int " opencl-idx " = _vb * " V ";\n"
