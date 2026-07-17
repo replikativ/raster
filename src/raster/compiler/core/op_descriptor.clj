@@ -876,3 +876,68 @@
               (not (.startsWith ^String ns-str "java."))
               (not= ns-str "Math")))))
 
+;; --- BLAS GEMM alpha/beta (the resident + staged GPU GEMM representability gate) ---
+
+(def blas-gemm-ops
+  "BLAS GEMM ops the GPU lowering paths recognize, → layout variant. dgemm! = C=A·B (:nn);
+   -nt! = A·Bᵀ; -tn! = AᵀB. Single source of truth for both the RESIDENT extractor
+   (pipeline/extract-gpu-program) and the STAGED plan pass (passes.parallel.gpu-plan)."
+  {'raster.linalg.blas/dgemm!    :nn
+   'raster.linalg.blas/dgemm-nt! :nt
+   'raster.linalg.blas/dgemm-tn! :tn})
+
+(defn gemm-scalar-literal
+  "The compile-time numeric VALUE of a GEMM alpha/beta operand, or nil if it is not a
+   literal. Sees through the two wrappers the walker leaves on a `(n/oftype x 1.0)`
+   argument — the devirtualized oftype .invk, and the primitive cast around the literal:
+
+     (.invk raster.numeric/oftype_m_floats_float-impl x (float 1.0))  →  1.0
+
+   nil (= 'not a literal', e.g. a runtime `scale` symbol like attention's 1/√dk) is
+   treated as NON-default by callers: rejecting a runtime expression that happens to
+   equal 1.0/0.0 costs only a CPU/staging fallback, whereas accepting one we cannot read
+   would be a wrong answer."
+  [expr]
+  (cond
+    (number? expr) (double expr)
+    (and (seq? expr) (contains? '#{float double long int
+                                   clojure.core/float clojure.core/double
+                                   clojure.core/long clojure.core/int}
+                                (first expr)))
+    (gemm-scalar-literal (second expr))
+    (and (seq? expr) (= '.invk (first expr))
+         (= 'raster.numeric/oftype (:raster.op/original (meta expr))))
+    (gemm-scalar-literal (last expr))
+    :else nil))
+
+(defn gemm-default-alpha-beta?
+  "True iff a GEMM call's (alpha, beta) operands are literally (1.0, 0.0) — the plain
+   C = A·B that the GPU GEMM kernels actually implement.
+
+   EVERY GPU GEMM kernel — resident XMX, resident scalar, split-k, and the staged
+   invoke-registered-gemm! — takes only (A B C m n k). None has an alpha/beta operand,
+   and all OVERWRITE C. So a call with alpha≠1 or beta≠0 is NOT representable, and the
+   lowering paths must REJECT it rather than drop the scalars on the floor:
+   `(dgemm! A B C m k n 1.0 1.0)` is an ACCUMULATE (C += A·B) — exactly how nn/linear
+   folds in its bias and how the SDPA backward sums its two dScores contributions — and
+   dropping beta silently computes C = A·B on GPU while CPU computes C += A·B. Wrong
+   results, no error, GPU only.
+
+   Honoring alpha/beta instead of rejecting is NOT the cheap kernel-arg change it looks
+   like. emit-gemm-nonsquare-kernel already accepts :alpha/:beta (baking the shape and
+   passing the values as runtime args), but:
+     - the XMX kernel CACHE keys on c-dtype alone, and the scalar + split-k combine
+       kernels have no alpha/beta at all (the split-k emitter explicitly THROWS on
+       beta≠0 — its partials are summed by a separate reduce kernel); and
+     - beta≠0 READS C, which collides with the residency model: buffer contents are
+       uploaded once at BIND, and run-program! re-uploads only :input buffers. A beta=1
+       GEMM writing an :output param would be correct on the FIRST replay and then
+       silently ACCUMULATE ACROSS REPLAYS — trading one silent miscompile for another.
+       A sound implementation must additionally prove that C's pre-step contents are
+       produced WITHIN the program (a prior beta=0 GEMM or fill kernel), which is a
+       residency analysis, not a kernel signature.
+   That work belongs with the first real consumer (sdpa-bwd on GPU), under a
+   MULTI-REPLAY test. Until then: fail loud."
+  [alpha-expr beta-expr]
+  (and (= 1.0 (gemm-scalar-literal alpha-expr))
+       (= 0.0 (gemm-scalar-literal beta-expr))))

@@ -241,6 +241,67 @@
       (is (< (rel-err gpu cpu) 1e-4)
           (str "reduce→map-void replay relerr " (rel-err gpu cpu))))))
 
+;; ── GEMM alpha/beta must never be silently dropped ───────────────────────────────
+;; The resident extractor took only args 0-5 of a dgemm .invk (A B C m k n) and dropped
+;; alpha/beta on the floor. Every GPU GEMM kernel computes C = A·B and OVERWRITES C, so
+;; an ACCUMULATING gemm — `(dgemm! A B C m k n 1.0 1.0)`, i.e. C += A·B, which is how
+;; nn/linear folds in its bias and how the SDPA backward sums its two dScores
+;; contributions — silently computed C = A·B on GPU while the CPU accumulated. Wrong
+;; results, no error, GPU only.
+
+(defn- accum-gemm-probe []
+  (eval '(raster.core/deftm gemm-beta-accum-probe
+           [A :- (Array float) B :- (Array float) C :- (Array float)
+            m :- Long k :- Long n :- Long] :- (Array float)
+           (let [_ (raster.linalg.blas/dgemm! A B C m k n
+                                              (raster.numeric/oftype A 1.0)
+                                              (raster.numeric/oftype A 1.0))]
+             C))))
+
+(deftest gemm-accumulate-never-silently-dropped
+  ;; THE anti-silent-miscompile gate. An accumulating GEMM must EITHER lower to a
+  ;; resident program that computes the correct C += A·B on device, OR be REJECTED at
+  ;; compile time. What it must never do is compile and return C = A·B.
+  ;;
+  ;; Written to pass under either fix, so it keeps holding if the resident GEMM later
+  ;; learns real alpha/beta (which additionally requires proving C's pre-step contents
+  ;; are produced inside the program — buffers upload once at BIND, so a beta=1 GEMM on
+  ;; an :output param would accumulate ACROSS REPLAYS; see op/gemm-default-alpha-beta?).
+  (require 'raster.linalg.blas 'raster.numeric)
+  (let [probe (accum-gemm-probe)
+        compiled (try {:ok (pl/compile-gpu-program probe :ze:0 :dtype :float)}
+                      (catch Throwable t {:err t}))]
+    (if-let [t (:err compiled)]
+      ;; Fix (b): rejected at compile. Assert it is the PRINCIPLED, named rejection —
+      ;; not an incidental failure that might mask a real regression.
+      (is (= :unsupported-gemm-alpha-beta (:why (:non-resident (ex-data t))))
+          (str "an accumulating GEMM must be rejected by NAME "
+               "(:unsupported-gemm-alpha-beta), got: " (.getMessage t)))
+      ;; Fix (a): it compiled — then it MUST be numerically correct on device.
+      (if-not @gpu-available?
+        (println "  [SKIP] gemm-accumulate: compiled resident but no GPU to verify")
+        (let [m 16 k 32 n 16
+              A (rnd (* m k) 11) B (rnd (* k n) 12) C0 (rnd (* m n) 13)
+              cpu (let [c (float-array (seq C0))] (probe A B c m k n) c)
+              ab-only (float-array (map - (seq cpu) (seq C0)))  ; A·B with beta dropped
+              {:keys [out]} (run-resident probe [A B (float-array (seq C0)) m k n])]
+          (is (< (rel-err out cpu) 5e-3)
+              (str "resident accumulating GEMM must compute C += A·B (CPU parity), "
+                   "relerr " (rel-err out cpu)))
+          (is (> (rel-err out ab-only) 1e-2)
+              "resident GEMM returned exactly A·B — beta was DROPPED (silent miscompile)"))))))
+
+(deftest gemm-default-alpha-beta-still-lowers
+  ;; The other side of the gate: the alpha=1/beta=0 GEMMs that DO lower must keep
+  ;; lowering. The alpha/beta literal reader has to see through the walker's wrappers
+  ;; — `(.invk raster.numeric/oftype…-impl x (float 1.0))` — or it would reject every
+  ;; working GEMM and silently un-offload the whole training path to the staging fn.
+  (doseq [[v variant] [[#'nn/linear-nb :nt] [#'nn/linear-dx :nn] [#'nn/linear-dW :tn]]]
+    (let [p (pl/compile-gpu-program v :ze:0 :dtype :float :on-non-resident :nil)]
+      (is (some? p) (str v " (alpha=1, beta=0) must still extract as a resident GEMM"))
+      (is (= [variant] (mapv :variant (:steps p)))
+          (str v " must still lower to a single " variant " GEMM step")))))
+
 (deftest gpu-ad-full-train-step-fully-resident
   ;; This test does NOT need a GPU — it pins residency at the IR level. The full
   ;; mse∘linear-nb float train step (value+grad + SGD, returning the updated weights like

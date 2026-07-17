@@ -3,7 +3,7 @@
             [raster.math :refer [sin cos tan asin acos atan atan2
                                  exp log log2 log10 expm1 log1p exp2 exp10
                                  ceil floor round trunc
-                                 hypot cbrt
+                                 hypot cbrt sqrt pow
                                  sinh cosh tanh asinh acosh atanh
                                  deg2rad rad2deg
                                  nextfloat prevfloat eps
@@ -475,3 +475,47 @@
     (is (= (float -1.0) (signum (float -42.0))))
     (is (= (float 0.0) (signum (float 0.0))))
     (is (instance? Float (signum (float 1.0))))))
+
+;; ================================================================
+;; sqrt / pow (issue #55)
+;; ================================================================
+;; raster.math's ns docstring and the README's FIRST example both refer
+;; `sqrt` (and the autodiff notebook uses `pow`), but the fns only existed in
+;; raster.numeric — `(require '[raster.math :refer [sqrt]])` threw at the very
+;; first step of the getting-started path.
+
+(deftest sqrt-test
+  (testing "sqrt at known values"
+    (is (approx= 0.0 (sqrt 0.0)))
+    (is (approx= 2.0 (sqrt 4.0)))
+    (is (approx= 5.0 (sqrt 25.0))))
+  (testing "sqrt Float variant"
+    (is (approx= 2.0 (sqrt (float 4.0)) float-tol))
+    (is (instance? Float (sqrt (float 4.0))))))
+
+(deftest pow-test
+  (testing "pow at known values"
+    (is (approx= 8.0 (pow 2.0 3.0)))
+    (is (approx= 8.0 (pow 2.0 3)))       ; Long exponent
+    (is (approx= 0.25 (pow 2.0 -2.0))))
+  (testing "pow Float variant"
+    (is (approx= 8.0 (pow (float 2.0) (float 3.0)) float-tol))
+    (is (instance? Float (pow (float 2.0) (float 3.0))))))
+
+(deftest readme-norm-example-test
+  ;; The exact README opening example — the issue-#55 repro.
+  (let [norm (eval '(raster.core/deftm issue55-norm [x :- Double, y :- Double] :- Double
+                      (raster.math/sqrt (raster.numeric/+ (raster.numeric/* x x)
+                                                          (raster.numeric/* y y)))))]
+    (is (approx= 5.0 (norm 3.0 4.0)))))
+
+(deftest sqrt-pow-differentiate-test
+  ;; The math-ns spellings must be AD-covered like the numeric ones
+  ;; (reverse templates alias Math/sqrt & Math/pow; Dual lifts in ad/forward).
+  (let [f (eval '(raster.core/deftm issue55-ad-probe [x :- Double] :- Double
+                   (raster.math/pow (raster.math/sqrt x) 3.0)))
+        vg ((requiring-resolve 'raster.ad.reverse/value+grad) (resolve 'issue55-ad-probe))
+        [v dx] (vg 4.0)]
+    ;; f(x) = x^(3/2): f(4) = 8, f'(4) = (3/2)*sqrt(4) = 3
+    (is (approx= 8.0 v))
+    (is (approx= 3.0 dx))))

@@ -1176,10 +1176,11 @@
   "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
    .invk form). dgemm! = C=A·B (:nn); -nt! = A·Bᵀ; -tn! = AᵀB. A backward matmul (linear-dx =
    dgemm! :nn, linear-dW = dgemm-tn! :tn) is just another GEMM — recognizing it here is what
-   lets an AD-expanded train step lower to a resident graph."
-  {'raster.linalg.blas/dgemm! :nn
-   'raster.linalg.blas/dgemm-nt! :nt
-   'raster.linalg.blas/dgemm-tn! :tn})
+   lets an AD-expanded train step lower to a resident graph.
+
+   The op→variant map itself lives in the op-descriptor registry (shared with the STAGED
+   gpu-plan pass), so a new GEMM spelling is one registry entry, not two."
+  op/blas-gemm-ops)
 
 (defn- gemm-invk?
   "True if form is a devirtualized BLAS GEMM .invk (carries :raster.op/original in
@@ -1335,11 +1336,15 @@
       ;; forward matmul (linear-nb → dgemm-nt!) AND its backward (linear-dx → dgemm!, linear-dW →
       ;; dgemm-tn!) lower to resident GEMM steps.
       (gemm-invk? expr)
+      ;; BLAS arg order is (A B C m k n alpha beta). alpha/beta are CARRIED, not dropped:
+      ;; the resident kernels implement only C = A·B, so extract-gpu-program rejects any
+      ;; call whose alpha/beta are not the default (1.0, 0.0) — see gemm-alpha-beta-default?.
       (let [args (vec (drop 2 expr))]
         {:convention :gemm
          :variant (get blas-gemm-ops (:raster.op/original (meta expr)))
          :A (nth args 0) :B (nth args 1) :C (nth args 2)
          :m-expr (nth args 3) :k-expr (nth args 4) :n-expr (nth args 5)
+         :alpha-expr (nth args 6 nil) :beta-expr (nth args 7 nil)
          :out-buf (nth args 2) :returns sym})
       :else nil)))
 
@@ -1427,10 +1432,16 @@
                       (when (and (symbol? out) (not= sym out))
                         (vswap! aliases assoc sym out)))))
               (reject! :unparseable-kernel-invoke sym expr))
-          ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step.
+          ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step. A non-default
+          ;; alpha/beta is NOT representable by the resident GEMM kernels (they compute
+          ;; C = A·B and overwrite C) — reject it by NAME instead of silently dropping the
+          ;; scalars, which turned an ACCUMULATE (C += A·B, beta=1) into an OVERWRITE on
+          ;; GPU while CPU accumulated. See gemm-alpha-beta-default?.
             (gemm-invk? expr)
             (if-let [s (parse-gpu-step sym expr)]
-              (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+              (if (op/gemm-default-alpha-beta? (:alpha-expr s) (:beta-expr s))
+                (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+                (reject! :unsupported-gemm-alpha-beta sym expr))
               (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path

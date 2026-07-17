@@ -1028,6 +1028,65 @@
 
 (declare infer-rewritten-tag)
 
+(defn- rewritten-scalar-op-tag
+  "Tag of a REWRITTEN scalar-op form — clojure.core arithmetic (+ - * / min max …),
+   aget, alength — by unifying its OPERAND tags.
+
+   infer-rewritten-tag's var-resolution clause cannot type these: clojure.core's
+   arithmetic vars carry no :tag, so `(clojure.core/+ (aget a i) 1.0)` resolved to
+   the #'clojure.core/+ var, found no :tag, and typed as NIL. Every raster.numeric
+   call CONSUMING that result (e.g. `(n/sqrt (+ …))`) then lost its operand tag, so
+   its overload could not be confirmed and the call stayed UNDEVIRTUALIZED — which on
+   a GPU target trips the fixpoint typedness census (CPU silently falls back to the
+   ~100x-slower IFn.invoke). This is the same scalar-op typing gap d915365 closed in
+   infer-expr-tag; the REWRITTEN-form reader needed it too.
+
+   SCOPE — this fallback types ARITHMETIC forms only, but its OPERAND reader also
+   understands aget/alength (element reads under arithmetic): `clojure.core/aget` —
+   the spelling the walker leaves behind after lowering `raster.arrays/aget` — is in
+   aget-op? but NOT in known-scalar-ops, and infer-rewritten-tag's var clause can't
+   type it, so `(+ (aget a i) (aget a j))` stayed untyped whenever neither operand
+   was a literal. A BARE top-level aget deliberately still returns nil here: typing
+   it flips the value from the boxed emission the bytecode emitter currently pairs
+   with untyped case*/loop merges to a primitive one — matrix-norm's `(aget S 0)`
+   2-norm branch then expects a primitive double at the case merge while the sibling
+   loop branches still box theirs → 'Stack size mismatch' VerifyError. That is a
+   pre-existing case*-merge boxing inconsistency in the emitter (see
+   bc-compiler known issues), not a reason to lose the arithmetic coverage; when the
+   emitter unifies case-branch boxing this can graduate to a plain infer-aget-type
+   branch.
+
+   SOUNDNESS: the unification only fires when EVERY operand's tag is known AND
+   primitive-numeric. Both relaxations are miscompiles, found the hard way (7 suite
+   errors on the keep-over-partial-info draft of this rule):
+     * partial coverage — `(* x 2.0)` with x UNTYPED unified over just the literal
+       to 'double; but x is a Sym/Dual in the Dual{Sym} initiality flows and the ODE
+       Dual sensitivity path, so the consuming op devirtualized to a Number-casting
+       specialization → ClassCastException (Sym/Dual cannot be cast to Number).
+     * non-primitive tags — operands tagged Dual/Sym/etc. fell through a
+       primitives-only cond to a bogus default. A boxed-carrier scalar op is exactly
+       what runtime dispatch is FOR; this rule must stay out of its way (nil)."
+  [head form type-env]
+  (when (and (descriptor/scalar-op? head)
+             (not (descriptor/aget-op? head))
+             (not (descriptor/alength-op? head)))
+    (let [operand-tag (fn operand-tag [a]
+                        (or (when (seq? a)
+                              (let [h (first a)]
+                                (cond
+                                  (descriptor/alength-op? h) 'long
+                                  (descriptor/aget-op? h) (infer-aget-type a type-env)
+                                  :else (infer-rewritten-tag a nil type-env))))
+                            (literal-tag a)
+                            (when (symbol? a) (type-env-tag type-env a))))
+          arg-tags (mapv operand-tag (rest form))]
+      (when (and (seq arg-tags)
+                 (every? #{'double 'float 'long 'int} arg-tags))
+        (cond
+          (some #{'double} arg-tags) 'double
+          (some #{'float} arg-tags) 'float
+          :else 'long)))))
+
 (defn- prim-class->tag
   "Map a (boxed or primitive) numeric Class to a raster type tag, else nil."
   [c]
@@ -1113,7 +1172,11 @@
           (or (when-let [v (try (resolve head) (catch Throwable _ nil))]
                 (or (:raster.core/return-tag (meta v))
                     (:tag (meta v))))
-              (static-method-return-tag head (rest rewritten-form) type-env))
+              (static-method-return-tag head (rest rewritten-form) type-env)
+              ;; LAST — a scalar op whose var carries no :tag (clojure.core arithmetic).
+              ;; Placed as a fallback so it can never shadow a var's declared return tag
+              ;; or a resolved static-method overload: it only fills a slot that was nil.
+              (rewritten-scalar-op-tag head rewritten-form type-env))
 
            ;; .invk call
           (and (= '.invk head) (symbol? (second rewritten-form)))

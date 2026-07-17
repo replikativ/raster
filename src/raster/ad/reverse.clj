@@ -2556,6 +2556,27 @@
           :on-miss :self
           :ambiguity-hint "Use the mangled var directly, e.g. #'ns/name_m_<tags>."}))
 
+(defn- deftm-params-or-throw
+  "The resolved deftm's param vector, or a throw that tells the user HOW to fix
+   the call. The most common miss (issue #56, hit on the README example) is
+   passing the DEREF'D dispatch fn — `(value+grad rosenbrock …)` — instead of
+   the var `#'rosenbrock`: the fn object carries none of the deftm metadata the
+   AD transform reads, and the old bare \"grad requires a deftm var\" named
+   neither the mistake nor the remedy."
+  [f-var resolved]
+  (or (:raster.core/deftm-params (meta resolved))
+      (throw (ex-info
+              (str "grad/value+grad requires a deftm VAR, got "
+                   (cond
+                     (var? f-var)
+                     (str f-var " — a var, but not one defined by deftm/ftm.")
+                     (ifn? f-var)
+                     (str "a function object. Pass the var instead: "
+                          "((value+grad #'my-fn) args…), not (value+grad my-fn) — "
+                          "the deftm metadata the AD transform reads lives on the var.")
+                     :else (pr-str f-var)))
+              {:var f-var}))))
+
 (def ^:private vjp-cache (atom {}))
 
 (defn- get-vjp-fn
@@ -3592,8 +3613,7 @@
   (with-ad-gensym
     (let [resolved (resolve-deftm-var f-var)
           m (meta resolved)
-          params (or (:raster.core/deftm-params m)
-                     (throw (ex-info "grad requires a deftm var" {:var f-var})))
+          params (deftm-params-or-throw f-var resolved)
           walked-body (or (rcore/ensure-walked-body! resolved)
                           (throw (ex-info "No walked body on var" {:var f-var})))
         ;; TUPLE-VALUED OUTPUT GUARD (#74, framework §14): grad/value+grad is
@@ -3931,8 +3951,7 @@
                         :array-params (:array-params cov)})))
            resolved (resolve-deftm-var f-var)
            m (meta resolved)
-           params (or (:raster.core/deftm-params m)
-                      (throw (ex-info "grad requires a deftm var" {:var f-var})))
+           params (deftm-params-or-throw f-var resolved)
            walked-body (or (rcore/ensure-walked-body! resolved)
                            (throw (ex-info "No walked body on var" {:var f-var})))
            tags (or (:raster.core/deftm-tags m) (vec (repeat (count params) 'double)))
