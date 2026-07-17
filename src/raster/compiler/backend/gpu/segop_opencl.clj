@@ -152,6 +152,15 @@
         [let-bindings inner-body]
         (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
           (let [[_ binds & bdy] lambda]
+            ;; A reduce combine's let body must be ONE expression `(op acc elem)`. Taking
+            ;; `(last bdy)` of a multi-statement body would SILENTLY DROP the earlier forms
+            ;; — the same shape as the single-aset-void store-drop. If earlier statements
+            ;; exist they carry computation/effects the combine depends on; reject loudly.
+            (when (> (count bdy) 1)
+              (throw (ex-info (str "SegRed: reduce combine lambda has a multi-statement body ("
+                                   (count bdy) " forms) — only a single combine expression is"
+                                   " modeled; earlier forms would be dropped")
+                              {:lambda lambda :body (vec bdy)})))
             [(vec (partition 2 binds)) (last bdy)])
           [nil lambda])
         ;; .invk-aware: the walker devirtualizes (raster.numeric/+ acc x) into
@@ -179,6 +188,15 @@
                               (str "(" a " " c-op " " b ")")))
         ;; Extract the element expression (the non-acc operand) from the SEMANTIC args.
         op-args (vec (when (seq? inner-body) (descriptor/call-args inner-body)))
+        ;; A segmented reduce combine is BINARY: (op acc elem). A variadic combine like
+        ;; (+ acc x y) has 3 operands — extracting only ONE non-acc operand would SILENTLY
+        ;; emit a kernel that sums just `x`, dropping `y` (the store-drop family). A legit
+        ;; fused map→reduce nests the map body as a single elem operand, so >2 is unmodeled.
+        _ (when (> (count op-args) 2)
+            (throw (ex-info (str "SegRed: reduce combine op has " (count op-args)
+                                 " operands — only a binary (op acc elem) combine is modeled;"
+                                 " extra operands would be dropped")
+                            {:op op-sym :op-args op-args :lambda lambda})))
         acc-at? (fn [a] (or (= a acc)
                             (and (seq? a) (= 'double (first a)) (= acc (second a)))))
         [_acc-pos elem-expr-raw]
