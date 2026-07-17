@@ -32,6 +32,10 @@
   (cond (symbol? e) #{e}
         (seq? e)    (apply set/union #{} (map all-symbol-uses e))
         (vector? e) (apply set/union #{} (map all-symbol-uses e))
+        ;; Map literals carry symbol references too — notably a `case*` clause map. Missing
+        ;; them makes this liveness map-blind (a sym used only inside a case* would look dead
+        ;; and be wrongly fused away), the same hole util/free-syms-flat was fixed for.
+        (map? e)    (apply set/union #{} (map all-symbol-uses (apply concat e)))
         :else       #{}))
 
 ;; ================================================================
