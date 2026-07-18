@@ -83,14 +83,18 @@
 
 (defn calibrate-cpu!
   "Measure the CPU (:cpu:0) and store a :measured map in the hardware registry, so descriptor-for
-   projects it (measured OVERRIDES catalogue/analytic). Returns the :measured map."
-  [& {:keys [device-id] :or {device-id :cpu:0}}]
+   projects it (measured OVERRIDES catalogue/analytic). MEASURE-ONCE: reuses a matching on-disk
+   calibration unless :force? is set; a fresh measurement is persisted (keyed by device signature ×
+   version). Returns the :measured map."
+  [& {:keys [device-id force?] :or {device-id :cpu:0}}]
   (rt/init!)
-  (let [caps (:capabilities (rt/device device-id))
-        llc  (or (:cache-l3 caps) (* 32 1024 1024))
-        bw   (measure-cpu-bandwidth :llc-bytes llc)
-        measured {:bandwidth-bytes-s (:bandwidth-bytes-s bw)
-                  :provenance {:bandwidth-bytes-s (if (:stationary? bw) :measured :measured-noisy)}
-                  :bench {:bandwidth bw}}]
-    (rt/set-measured! device-id measured)
-    measured))
+  (or (when-not force? (rt/load-calibration! device-id))
+      (let [caps (:capabilities (rt/device device-id))
+            llc  (or (:cache-l3 caps) (* 32 1024 1024))
+            bw   (measure-cpu-bandwidth :llc-bytes llc)
+            measured {:bandwidth-bytes-s (:bandwidth-bytes-s bw)
+                      :provenance {:bandwidth-bytes-s (if (:stationary? bw) :measured :measured-noisy)}
+                      :bench {:bandwidth (dissoc bw :n)}}]
+        (rt/set-measured! device-id measured)
+        (rt/save-calibration! device-id measured)
+        measured)))

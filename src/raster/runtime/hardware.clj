@@ -46,6 +46,51 @@
   [device-id]
   (get @measured-registry device-id))
 
+;; --- calibration disk cache (measure-once, keyed by device identity × version) ---------------
+
+(def calibration-version
+  "Bump when the microbench methodology changes, invalidating on-disk calibrations."
+  1)
+
+(defn device-signature
+  "A stable identity string for a device: name + the caps that affect measured performance. Two
+   machines with the same signature share a calibration; a different CPU/GPU/version gets a fresh
+   one (the disk-cache key discipline from XLA/Inductor)."
+  [device-id]
+  (let [d (device device-id)
+        caps (:capabilities d)]
+    (pr-str [(:name d)
+             (select-keys caps [:cores :arch :simd-width :total-eus :threads-per-eu
+                                :sm-count :compute-capability :global-memory-bytes])
+             calibration-version])))
+
+(defn- calibration-file ^File [device-id]
+  (io/file (System/getProperty "user.home") ".raster" "calibration"
+           (str (format "%08x" (hash (device-signature device-id))) ".edn")))
+
+(defn save-calibration!
+  "Persist a device's measured map to disk (atomic: temp file → rename), keyed by its signature."
+  [device-id measured]
+  (let [f (calibration-file device-id)]
+    (io/make-parents f)
+    (let [tmp (File/createTempFile "cal" ".edn" (.getParentFile f))]
+      (spit tmp (pr-str {:signature (device-signature device-id) :measured measured}))
+      (.renameTo tmp f))
+    measured))
+
+(defn load-calibration!
+  "Load a device's on-disk calibration into the measured-registry IF the signature matches (same
+   machine + calibration version). Returns the measured map or nil. Safe to call on startup."
+  [device-id]
+  (let [f (calibration-file device-id)]
+    (when (.exists f)
+      (try
+        (let [{:keys [signature measured]} (read-string (slurp f))]
+          (when (= signature (device-signature device-id))
+            (set-measured! device-id measured)
+            measured))
+        (catch Exception _ nil)))))
+
 ;; ================================================================
 ;; CPU detection (pure JVM)
 ;; ================================================================
