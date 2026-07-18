@@ -43,11 +43,96 @@
                                              (raster.arrays/aset out i (raster.arrays/aget src i)))
                        out))
 
-;; ── GPU session plumbing (mirrors gpu-ad-gemm-test/run-resident) ────────────────
+;; ── GPU availability probe (HONEST: distinguishes "no device" from "broken load") ──
+;; The old form was `(try … (catch Throwable _ false))`, which swallowed a BROKEN
+;; ze-runtime load (a compile error in the ns, a missing native symbol, an FFM bind
+;; failure) as if it meant "no GPU here". Every GPU-gated deftest then took its skip
+;; branch and the ENTIRE GPU suite went green with zero assertions — a suite that
+;; reported success while testing nothing. `gpu-status` separates the cases so a
+;; runtime breakage surfaces LOUDLY instead of masquerading as an absent device.
+(def gpu-status
+  "Delay yielding one of:
+     {:status :available   :n-devices k}  Level-Zero device(s) present.
+     {:status :no-device}                 runtime loaded cleanly, zero devices — a
+                                          LEGITIMATE, visible skip.
+     {:status :probe-error :error e}      query-devices threw (e.g. no L0 loader on a
+                                          GPU-less box) — a loud WARNING + skip, not a
+                                          hard failure (won't redden CI with no GPU).
+     {:status :load-failed :error e}      `require 'raster.gpu.ze-runtime` THREW — the
+                                          runtime failed to LOAD. This is a breakage,
+                                          NOT 'no device', and must fail loud."
+  (delay
+    (let [loaded (try (require 'raster.gpu.ze-runtime) {:ok true}
+                      (catch Throwable e {:ok false :error e}))]
+      (if-not (:ok loaded)
+        {:status :load-failed :error (:error loaded)}
+        (try
+          (let [devs ((resolve 'raster.gpu.ze-runtime/query-devices))]
+            (if (seq devs)
+              {:status :available :n-devices (count devs)}
+              {:status :no-device}))
+          (catch Throwable e {:status :probe-error :error e}))))))
+
+;; Boolean convenience for `(if-not @gp/gpu-available? …)` call sites: TRUE only when a
+;; device is actually usable. :load-failed is FALSE here so the skip branch runs — but
+;; that branch MUST route through `gpu-skip!`, which converts :load-failed into a
+;; failing assertion (below), so the breakage is never silently skipped.
 (def gpu-available?
-  (delay (try (require 'raster.gpu.ze-runtime)
-              (boolean (seq ((resolve 'raster.gpu.ze-runtime/query-devices))))
-              (catch Throwable _ false))))
+  (delay (= :available (:status @gpu-status))))
+
+;; Accumulates skip reasons across the whole JVM run so ONE authoritative summary line
+;; can be printed at shutdown, instead of the count silently wandering ±N run-to-run.
+(defonce ^:private gpu-skip-log (atom {}))
+
+(defonce ^:private gpu-summary-hook
+  (delay
+    (.addShutdownHook
+     (Runtime/getRuntime)
+     (Thread.
+      (fn []
+        (let [{:keys [status n-devices]} @gpu-status
+              skips @gpu-skip-log
+              total (reduce + 0 (vals skips))]
+          (println (format "  [GPU SUITE] probe=%s%s | %d test(s) took the skip path%s"
+                           (name status)
+                           (if n-devices (str " (" n-devices " device)") "")
+                           total
+                           (if (pos? total) (str " " (pr-str skips)) "")))))))
+    true))
+
+(defn gpu-skip!
+  "Call in the SKIP branch of a GPU-gated deftest instead of a bare `println`. It:
+     • registers exactly ONE marker assertion so the suite's assertion count is
+       DETERMINISTIC whether or not a GPU is present (skips no longer drop the body's
+       assertions silently → no more ±N count wander between runs);
+     • emits a visible, attributed skip line and records the reason for the shutdown
+       summary;
+     • on :load-failed registers a FAILING assertion — a broken runtime load must
+       never masquerade as a clean skip."
+  [test-label]
+  @gpu-summary-hook
+  (let [{:keys [status error]} @gpu-status]
+    (swap! gpu-skip-log update status (fnil inc 0))
+    (case status
+      :load-failed
+      (is false (str "[GPU LOAD FAILED] " test-label
+                     " — raster.gpu.ze-runtime failed to load: "
+                     (some-> error .getMessage)
+                     ". This is a RUNTIME BREAKAGE, not 'no GPU device' — the whole "
+                     "GPU suite would otherwise go green having tested nothing."))
+      :probe-error
+      (do (println (str "  [GPU SKIP/WARN] " test-label
+                        " — query-devices threw (" (some-> error .getMessage)
+                        "); treating as no usable device."))
+          (is true "gpu-skip-marker"))
+      :no-device
+      (do (println (str "  [GPU SKIP] " test-label " — no Level-Zero device"))
+          (is true "gpu-skip-marker"))
+      :available
+      (throw (IllegalStateException.
+              (str "gpu-skip! called for " test-label " while a GPU IS available"))))))
+
+;; ── GPU session plumbing (mirrors gpu-ad-gemm-test/run-resident) ────────────────
 
 (defn- run-resident
   "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array.

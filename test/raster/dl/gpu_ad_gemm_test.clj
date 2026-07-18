@@ -18,12 +18,12 @@
             [raster.dl.array-ops :as ops]
             [raster.dl.attention :as attn]
             [raster.arrays :as ra]
+            [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.nn :as nn]))
 
-(def ^:private gpu-available?
-  (delay (try (require 'raster.gpu.ze-runtime)
-              (boolean (seq ((resolve 'raster.gpu.ze-runtime/query-devices))))
-              (catch Throwable _ false))))
+;; Availability + skip routing use the shared HONEST probe (raster.dl.gpu-grad-parity):
+;; a broken ze-runtime load fails loud via gp/gpu-skip! instead of a silent "no device"
+;; skip, and skips register a marker so the assertion count stays deterministic.
 
 (defn- rnd [n seed]
   (let [a (float-array n) r (java.util.Random. seed)]
@@ -50,8 +50,8 @@
       (finally (close-session! s)))))
 
 (deftest gpu-ad-gemm-variants
-  (if-not @gpu-available?
-    (println "  [SKIP] gpu-ad-gemm: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gpu-ad-gemm")
     ;; XMX-friendly dims (multiples of 16); batch=16, in-f=32, out-f=16.
     (let [b 16 i 32 o 16
           ;; fp16 XMX GEMM: ~2.5e-4 relative error is the precision floor for these dims.
@@ -85,8 +85,8 @@
   ;; used inside the flat gqa-causal-mha are strided permutation/broadcast/segment-reduce
   ;; copies re-expressed over par/map-void!, so each lowers to a SINGLE resident :map-void
   ;; kernel on device (no raw loop / host-scalar fallback) and matches the CPU reference.
-  (if-not @gpu-available?
-    (println "  [SKIP] gpu-attention-layout: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gpu-attention-layout")
     (let [tol 1e-5]
       (testing "pack-heads lowers to a resident :map-void kernel and matches CPU"
         (let [sl 6 nh 4 hd 8 x (rnd (* sl nh hd) 21)
@@ -154,8 +154,8 @@
 (deftest fused-causal-sdpa-resident
   ;; batched-causal-sdpa forward lowers to resident :map-void kernels ONLY (scores /
   ;; row-softmax / W·V accumulation — no GEMM, no host scalar-let) and matches CPU.
-  (if-not @gpu-available?
-    (println "  [SKIP] fused-causal-sdpa-resident: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "fused-causal-sdpa-resident")
     (let [batch 4 seq-len 6 hd 8 n (* batch seq-len hd)
           Q (rnd n 71) K (rnd n 72) V (rnd n 73)
           cpu (attn/batched-causal-sdpa Q K V batch seq-len hd)
@@ -169,8 +169,8 @@
   ;; broadcast-kv-heads → fused batched-causal-sdpa → unpack-heads) compiles to a
   ;; FULLY resident program — every step a :map-void kernel, no non-resident binding —
   ;; and matches the CPU forward on the Arc.
-  (if-not @gpu-available?
-    (println "  [SKIP] gqa-causal-mha-fully-resident: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gqa-causal-mha-fully-resident")
     (let [seq-len 6 nq 4 nkv 1 hd 8
           Q (rnd (* seq-len nq hd) 81) K (rnd (* seq-len nkv hd) 82) V (rnd (* seq-len nkv hd) 83)
           cpu (attn/gqa-causal-mha Q K V 1 seq-len nq nkv hd)
@@ -188,8 +188,8 @@
   ;; (relerr ~1). bind-program! now routes N<8 :gemm steps to a plain scalar f32 kernel
   ;; (no f16 convert/transpose). n=8 stays on the XMX path (16-byte pitch = the minimum)
   ;; as the boundary control.
-  (if-not @gpu-available?
-    (println "  [SKIP] gpu-gemm-small-n: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gpu-gemm-small-n")
     (let [tol 5e-3]
       (doseq [n [2 4 6 8]]
         (testing (str "forward linear-nb (:nt) at out-features n=" n)
@@ -218,8 +218,8 @@
   ;; and replays with the correct output. (An ESCAPING tail reduce — a loss returned as
   ;; the scalar result — still doesn't bind: that is the remaining #42 leftover, same as
   ;; bind-step!.)
-  (if-not @gpu-available?
-    (println "  [SKIP] gpu-reduce-step: no Level Zero GPU")
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "gpu-reduce-step")
     (let [probe (eval '(raster.core/deftm gpu-reduce-consumer-probe
                          [a :- (Array float) out :- (Array float) n :- Long] :- Void
                          (let [s (raster.par/reduce
@@ -278,8 +278,8 @@
           (str "an accumulating GEMM must be rejected by NAME "
                "(:unsupported-gemm-alpha-beta), got: " (.getMessage t)))
       ;; Fix (a): it compiled — then it MUST be numerically correct on device.
-      (if-not @gpu-available?
-        (println "  [SKIP] gemm-accumulate: compiled resident but no GPU to verify")
+      (if-not @gp/gpu-available?
+        (gp/gpu-skip! "gemm-accumulate device verify (compiled resident)")
         (let [m 16 k 32 n 16
               A (rnd (* m k) 11) B (rnd (* k n) 12) C0 (rnd (* m n) 13)
               cpu (let [c (float-array (seq C0))] (probe A B c m k n) c)

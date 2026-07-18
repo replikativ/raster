@@ -7,11 +7,11 @@
    substrate for full gemma (the per-token loop + real weights are #32/#36)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.quant.kernels-k :as qk] [raster.compiler.backend.cpu.quant :as q]
-            [raster.dl.nn :as nn] [raster.dl.attention :as attn] [raster.gpu.core :as gpu]))
+            [raster.dl.nn :as nn] [raster.dl.attention :as attn] [raster.gpu.core :as gpu]
+            [raster.dl.gpu-grad-parity :as gp]))
 
-(defn- gpu-available? []
-  (try (require 'raster.gpu.ze-runtime)
-       (boolean (seq ((resolve 'raster.gpu.ze-runtime/query-devices)))) (catch Throwable _ false)))
+;; Availability via the shared HONEST probe: a broken ze-runtime load fails loud
+;; (gp/gpu-skip!), not a silent "no device" skip that would drop the whole body.
 (defn- gen [n seed] (let [a (float-array n) r (java.util.Random. seed)] (dotimes [i n] (aset a i (float (* 0.3 (- (.nextDouble r) 0.5))))) a))
 (defn- b->i [^bytes b] (let [w (quot (alength b) 4) o (int-array w) bb (.order (java.nio.ByteBuffer/wrap b) java.nio.ByteOrder/LITTLE_ENDIAN)] (dotimes [i w] (aset o i (.getInt bb (* i 4)))) o))
 (defn- relerr [a b] (/ (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) (seq a) (seq b))) (reduce max 1e-9 (map #(Math/abs (double %)) b))))
@@ -23,7 +23,8 @@
 (defn- add-cpu [a b n] (let [o (float-array n)] (dotimes [i n] (aset o i (float (+ (aget a i) (aget b i))))) o))
 
 (deftest full-decoder-layer-gpu
-  (when (gpu-available?)
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "full-decoder-layer-gpu")
     (testing "one full Q4_K decoder layer as a resident command graph matches CPU"
       (let [H 256 IM 512 nq 2 nkv 1 hd 128 grp 2 eps 1.0e-6 theta 1.0e4 scale (/ 1.0 (Math/sqrt (double hd))) kvrow (* nkv hd) p 2 clen (inc p)
             x (gen H 1) win (gen H 2) wqn (gen hd 3) wkn (gen hd 4) wpa (gen H 5) wpf (gen H 6) wpff (gen H 7)

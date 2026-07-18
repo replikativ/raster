@@ -231,7 +231,7 @@
 
 (deftest gemma-lora-block-resident-train-step
   (if-not @gp/gpu-available?
-    (println "  [SKIP] gemma LoRA block resident train-step: no Level Zero GPU")
+    (gp/gpu-skip! "gemma LoRA block resident train-step")
     (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
           make-session (ns-resolve gpu 'make-session)
           bind-program! (ns-resolve gpu 'bind-program!)
@@ -357,7 +357,7 @@
 
 (deftest gemma-lora-mixed-precision-backward-trajectory
   (if-not @gp/gpu-available?
-    (println "  [SKIP] gemma LoRA mixed-precision backward: no Level Zero GPU")
+    (gp/gpu-skip! "gemma LoRA mixed-precision backward")
     (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
           cfg CFG-MP
           lr 0.02
@@ -444,7 +444,7 @@
 
 (deftest gemma-lora-dual-program-shared-session
   (if-not @gp/gpu-available?
-    (println "  [SKIP] gemma dual-program shared session: no Level Zero GPU")
+    (gp/gpu-skip! "gemma dual-program shared session")
     (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
           make-session (ns-resolve gpu 'make-session)
           bind-program! (ns-resolve gpu 'bind-program!)
