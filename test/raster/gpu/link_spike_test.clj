@@ -1,9 +1,15 @@
 (ns raster.gpu.link-spike-test
-  "C.spike (.internal/artifact_layer_design.md §7.2) — the make-or-break de-risk for the
-   composition/linking PR. Link TWO instances of ONE compiled descriptor into ONE command graph
-   with the intermediate a device-resident INTERNAL node (never downloaded), using only bind-step!
-   internals + a hand-written 2-instance binding-plan (sym→key from DATA). If this is clean, the
-   linking primitive as designed is sound; if it's ugly on 2 instances, it's wrong before 18."
+  "C.spike (.internal/artifact_layer_design.md §7.2) — de-risk for the composition/linking PR.
+   Link TWO instances of ONE compiled descriptor into ONE command graph with the intermediate a
+   device-resident INTERNAL node (never downloaded), using only bind-step! internals + a
+   hand-written 2-instance binding-plan (sym→key from DATA).
+
+   SCOPE / HONESTY: this proves the linking primitive for the :map / :reduce / :map-void
+   conventions bind-step! handles — the sym→key-as-data plan, the shared internal resident node,
+   the single recorded graph. It does NOT de-risk the GEMM half: bind-step! THROWS on a :gemm step
+   (spike-gemm-is-the-known-gap below asserts this), so a composite with linear layers is NOT yet
+   unblocked. §3.2's remaining work — unifying bind-program!'s GEMM/scatter expansion into the
+   per-instance binder — is the composition PR's core task, still un-de-risked by this spike."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
@@ -44,6 +50,7 @@
           x0 (fa n 1) W0 (fa n 2) W1 (fa n 3)
           args [x0 W0 n]
           prog (pl/compile-gpu-program #'spike-had :ze:0 :dtype :float :on-non-resident :nil)
+          _ (is (some? prog) "spike-had must extract fully resident (else the spike can't run)")
           steps (:steps prog)
           result-sym (:result-sym prog)
           scratch-sym (first (remove #(= % result-sym) (map :sym (:allocs prog))))
@@ -88,3 +95,24 @@
                 (is (< (maxdiff x2 x2-cpu) 1.0e-3)
                     "device x2 must equal CPU double-composition to float precision"))))
           (finally (close-session! sess)))))))
+
+(deftest spike-gemm-is-the-known-gap
+  ;; the OTHER half of §7.2, made explicit and executable: the per-instance binder (bind-step!)
+  ;; REJECTS a :gemm step today, so linking a composite with linear layers is NOT yet de-risked.
+  ;; This asserts the gap rather than letting the elementwise spike overclaim it — the composition
+  ;; PR's core task is unifying bind-program!'s GEMM/scatter expansion into the per-instance binder.
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "C.spike GEMM-convention gap")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          make-session (ns-resolve gpu 'make-session)
+          bind-step!   (ns-resolve gpu 'bind-step!)
+          close-session! (ns-resolve gpu 'close-session!)
+          sess (make-session :ze:0)]
+      (try
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"cannot bind a :gemm"
+             (bind-step! sess {:convention :gemm :kernel-name "spike_gemm" :phase :g0
+                               :arrays [] :n-fn (fn [_] 1) :scalar-specs []}
+                         [] identity))
+            "bind-step! must reject :gemm — the composition PR must unify the GEMM expansion first")
+        (finally (close-session! sess))))))
