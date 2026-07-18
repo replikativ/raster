@@ -76,6 +76,15 @@
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
       gpu? (assoc :integrated? (boolean (:integrated? caps))
+                  :subgroup-size flanes
+                  ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. The Xe2
+                  ;; register file is 128 GRF registers/thread of 32 B (256-bit) at grf128; per
+                  ;; SIMD lane that is 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the
+                  ;; budget the schedule feasibility gate (raster.gpu.schedule/feasible?) charges
+                  ;; the accumulator + register staging against. AMD VGPR budget slots in here for
+                  ;; HIP. (:num-vector-registers above is a CPU-shaped placeholder; this is the
+                  ;; real GPU value.)
+                  :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem

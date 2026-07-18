@@ -1577,13 +1577,20 @@
    cotangent by S, use lr/S), not in this policy: the VJP is linear in the seed.
    No size heuristics; the XMX hardware pitch gate (n<8 or k<8 → scalar) applies in
    bind-program! regardless of policy."
-  [f-var device-id & {:keys [dtype on-non-resident gemm-precision]
+  [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule]
                       :or {on-non-resident :throw gemm-precision :f16-xmx}}]
   (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
     (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
                          " (expected :f16-xmx or :f32-scalar)")
                     {:gemm-precision gemm-precision})))
-  (let [resolved-var (or (resolve-deftm-var f-var dtype) f-var)
+  ;; S6 schedule: derive the descriptor-default schedule, deep-merge the user :schedule override
+  ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
+  ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
+  ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
+  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
+                           nil device-id schedule {:precision gemm-precision})
+        gemm-precision (:precision resolved-schedule)
+        resolved-var (or (resolve-deftm-var f-var dtype) f-var)
         params       (get-params f-var dtype)
         walked-body  (get-walked-body f-var dtype)
         active-params (clean-params params)
@@ -1705,6 +1712,7 @@
     (when prog
       {:dtype effective-dtype
        :gemm-precision gemm-precision
+       :schedule resolved-schedule
        :all-params all-params
        :array-params array-params
        :array-roles array-roles

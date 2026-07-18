@@ -952,7 +952,10 @@
                                   " — bind each program under a distinct :key")
                              {:key pkey :bound (keys (:programs @sess))})))
          {:keys [dtype all-params array-params allocs steps]} descriptor
-         gemm-precision (or (:gemm-precision descriptor) :f16-xmx)
+         ;; precision reads from the resolved S6 schedule (source of truth); :gemm-precision is
+         ;; back-compat sugar for a descriptor built before the schedule field, or one hand-assoc'd.
+         gemm-precision (or (get-in descriptor [:schedule :precision])
+                            (:gemm-precision descriptor) :f16-xmx)
          effective-roles (merge (:array-roles descriptor) roles)
          argmap (zipmap all-params args)
          dt (if (= dtype :double) :double :float)
