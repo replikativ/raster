@@ -923,9 +923,10 @@
                      (no events, no overhead); run-program! on a profiled program still works
                      (it resets the events after each replay).
 
-   :gemm steps bind per the descriptor's :gemm-precision policy (set at compile time by
-   compile-gpu-program, default :f16-xmx; a bind-time caller may override with
-   (assoc descriptor :gemm-precision …) since the descriptor is plain data):
+   :gemm steps bind per the resolved S6 schedule's precision — [:schedule :precision] (set at
+   compile time by compile-gpu-program, default :f16-xmx). :gemm-precision on the descriptor is a
+   back-compat fallback for a hand-built descriptor with no :schedule. A bind-time caller overrides
+   the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …):
      :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output): the
                    mixed-precision (AMP) policy — f16 inputs, f32 math. Valid for BACKWARD
                    programs too (measured on the real gemma-3-270m layer VJP: adapter grads

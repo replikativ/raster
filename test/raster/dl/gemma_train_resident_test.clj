@@ -366,8 +366,12 @@
           args (train-args cfg st0 lr)
           p32 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
                                       :on-non-resident :nil :gemm-precision :f32-scalar)
-          ;; the descriptor is plain data: the policy is a bind-time re-tag, same program
-          p16 (assoc p32 :gemm-precision :f16-xmx)]
+          ;; the descriptor is plain data: the precision is a bind-time re-tag on the SAME program.
+          ;; The S6 schedule is the source of truth bind-program! reads, so the override goes
+          ;; through [:schedule :precision] (NOT the deprecated top-level :gemm-precision, which the
+          ;; schedule now shadows — assoc'ing it would be a silent no-op and both trajectories would
+          ;; run f32).
+          p16 (assoc-in p32 [:schedule :precision] :f16-xmx)]
       (is (some? p32) "train-step must extract fully resident")
       (when p32
         (let [dims (gemm-dims p32 args)]

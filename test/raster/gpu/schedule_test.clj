@@ -57,12 +57,43 @@
     (is (true? (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)
                                                {:stage {:space :slm :copies {:a 2 :b 2}}})
                                 arc-desc))))
-  (testing "grf256 DOUBLES the budget (opt-in, for the deep-K follow-up)"
-    (let [s (sched/resolve (sched/derive-default nil arc-desc)
-                           {:grf {:mode :grf256} :stage {:space :register :copies {:a 1 :b 0}}})]
-      ;; f16-xmx acc scales with the file (512), + 1×128 staged = 640 > 512 → still rejected,
-      ;; but a f32-scalar acc (128) + 128 staged = 256 ≤ 512 fits.
-      (is (true? (sched/feasible? (assoc s :precision :f32-scalar) arc-desc))))))
+  (testing "grf256 DOUBLES the budget and GENUINELY unblocks register staging (acc is fixed, not budget-coupled)"
+    ;; the accumulator is a fixed 256 B/lane tile property; grf256 lifts the budget to 512, so
+    ;; register double-buffering both operands (256 acc + 256 staged = 512) now FITS — the knob is
+    ;; not pointless (the earlier budget-coupled model made grf256 useless for f16-xmx).
+    (let [g128 (sched/resolve (sched/derive-default nil arc-desc)
+                              {:stage {:space :register :copies {:a 2 :b 2}}})
+          g256 (sched/resolve (sched/derive-default nil arc-desc)
+                              {:grf {:mode :grf256} :stage {:space :register :copies {:a 2 :b 2}}})]
+      (is (thrown? clojure.lang.ExceptionInfo (sched/feasible? g128 arc-desc)) "rejected at grf128")
+      (is (true? (sched/feasible? g256 arc-desc)) "same schedule FITS at grf256 (512 ≤ 512)")))
+  (testing "deeper staging costs proportionally more (:depth is honored, not ignored)"
+    (let [d1 (sched/resolve (sched/derive-default nil arc-desc)
+                            {:grf {:mode :grf256} :stage {:space :register :copies {:a 2 :b 0} :depth 1}})
+          d3 (sched/resolve (sched/derive-default nil arc-desc)
+                            {:grf {:mode :grf256} :stage {:space :register :copies {:a 2 :b 0} :depth 3}})]
+      (is (true? (sched/feasible? d1 arc-desc)) "depth 1: 256 + 2×1×64 = 384 ≤ 512")
+      (is (thrown? clojure.lang.ExceptionInfo (sched/feasible? d3 arc-desc))
+          "depth 3: 256 + 2×3×64 = 640 > 512")))
+  (testing "FALSE-NEGATIVE guard: a smaller-budget (subgroup-32) device REJECTS the default f16-xmx"
+    ;; the dangerous case the budget-coupled model missed: on a 128 B/lane device the 256 B/lane
+    ;; accumulator genuinely spills — the fixed-acc model detects it; a budget-coupled acc would
+    ;; have charged acc=budget=128 and passed.
+    (let [sg32 (assoc arc-desc :grf-bytes-per-lane 128 :subgroup-size 32)]
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (sched/feasible? (sched/derive-default nil sg32) sg32))
+          "default f16-xmx tile (256 B/lane acc) does NOT fit a 128 B/lane budget")))
+  (testing "unmodeled precision / stage-space FAIL LOUD (not a silent XMX bind)"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown :precision"
+                          (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)
+                                                          {:precision :bf16}) arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown :stage :space"
+                          (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)
+                                                          {:stage {:space :regsiter}}) arc-desc))))
+  (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
+                          (sched/resolve (sched/derive-default nil arc-desc)
+                                         {:gemm-precision :f16-xmx :precision :f32-scalar})))))
 
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; T3 — derive-default: no dead knobs on by default (no device)

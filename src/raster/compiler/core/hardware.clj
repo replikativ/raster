@@ -77,13 +77,17 @@
              :balance     (if gpu? 60 40)}
       gpu? (assoc :integrated? (boolean (:integrated? caps))
                   :subgroup-size flanes
-                  ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. The Xe2
-                  ;; register file is 128 GRF registers/thread of 32 B (256-bit) at grf128; per
-                  ;; SIMD lane that is 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the
-                  ;; budget the schedule feasibility gate (raster.gpu.schedule/feasible?) charges
-                  ;; the accumulator + register staging against. AMD VGPR budget slots in here for
-                  ;; HIP. (:num-vector-registers above is a CPU-shaped placeholder; this is the
-                  ;; real GPU value.)
+                  ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. INTEL Xe/Xe2
+                  ;; grf128 model: 128 GRF registers/thread of 32 B (256-bit); per SIMD lane that is
+                  ;; 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the budget the schedule
+                  ;; feasibility gate (raster.gpu.schedule/feasible?) charges the accumulator +
+                  ;; register staging against.
+                  ;; NOTE (vendor-specificity, HIP/CUDA follow-up): 128×32 is the Intel-Xe-grf128
+                  ;; constant. NVIDIA (255 regs × 4 B / warp 32 ≈ 1020 B/lane) and AMD VGPR budgets
+                  ;; differ ~8× — this value is only correct for Intel targets until it is derived
+                  ;; from per-vendor caps (with descriptor :vendor/:arch). The gate must not be
+                  ;; trusted for a non-Intel descriptor yet. (:num-vector-registers above is a
+                  ;; CPU-shaped placeholder; this is the Intel GPU value.)
                   :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per

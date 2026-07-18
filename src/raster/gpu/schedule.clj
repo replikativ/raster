@@ -67,17 +67,28 @@
     (some? b) b
     :else a))
 
+(def ^:private valid-precisions #{:f16-xmx :f32-scalar})
+(def ^:private valid-stage-spaces #{:none :slm :l3 :register})
+(def ^:private valid-grf-modes #{:grf128 :grf256})
+
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
-   top-level keys in :meta :overrides. `:gemm-precision` is deprecated sugar: an override of
-   `{:gemm-precision p}` writes `{:precision p}`. Returns the resolved Schedule."
+   top-level keys in :meta :overrides. `:gemm-precision` is deprecated sugar for `:precision`.
+   A user `:meta` is NOT allowed to clobber the derived machine-params (stripped before merge).
+   Throws on a `{:gemm-precision X :precision Y}` conflict rather than silently letting the
+   deprecated key win."
   [derived override]
   (if (nil? override)
     derived
-    (let [override  (if-let [p (:gemm-precision override)]
-                      (-> override (dissoc :gemm-precision) (assoc :precision p))
-                      override)
-          pinned    (set (remove #{:meta} (keys override)))
+    (let [gp (:gemm-precision override)
+          _ (when (and gp (:precision override) (not= gp (:precision override)))
+              (throw (ex-info (str "schedule/resolve: conflicting :gemm-precision " gp
+                                   " and :precision " (:precision override)
+                                   " — pass one (prefer :precision; :gemm-precision is deprecated sugar)")
+                              {:gemm-precision gp :precision (:precision override)})))
+          override  (cond-> (dissoc override :meta)   ;; user :meta never clobbers machine-params
+                      gp (-> (dissoc :gemm-precision) (assoc :precision gp)))
+          pinned    (set (keys override))
           merged    (deep-merge derived override)]
       (update-in merged [:meta :overrides] (fnil into #{}) pinned))))
 
@@ -85,8 +96,27 @@
 ;; Stage 3 — the register-budget feasibility gate (axis 8b)
 ;; ================================================================
 
+;; The byte model charges KERNEL-TILE properties against the per-lane GRF budget — NOT fractions
+;; of the budget (an earlier draft did, which coupled the accumulator to the budget and made the
+;; gate unable to detect an accumulator that spills on a smaller budget). The accumulator and the
+;; staged-operand panel are fixed footprints of the emitted XMX tile; the budget is the device's.
+(def ^:private xmx-f16-acc-bytes-per-lane
+  "Per-lane accumulator footprint of the emitted f16 XMX tile: 8 float8 = 8×8×4 = 256 B/lane.
+   A CONSTANT of the kernel tile (independent of the device's GRF budget), so the gate detects a
+   tile whose accumulator alone exceeds a smaller-budget device. When descriptor `:matrix {:tile
+   …}` lands (HIP/CUDA follow-up) this is derived as tile_m/lane × tile_n × 4; 256 is the current
+   Arc XMX tile."
+  256)
+
+(def ^:private operand-panel-bytes-per-lane
+  "Per-lane footprint of ONE register-staged operand panel (a quarter of the f16 accumulator tile).
+   Register double-buffering both operands is 4 panels = 256 B/lane — on top of the 256 B/lane
+   accumulator that is the measured grf128 spill."
+  64)
+
 (defn- grf-budget-bytes-per-lane
-  "The per-lane GRF budget for the schedule's GRF mode. grf256 doubles the file."
+  "The per-lane GRF budget for the schedule's GRF mode. grf256 doubles the register file — so it
+   genuinely buys headroom the accumulator+staging can use (the accumulator does NOT scale with it)."
   [schedule desc]
   (let [base (long (:grf-bytes-per-lane desc 256))]
     (if (= :grf256 (get-in schedule [:grf :mode]))
@@ -94,25 +124,24 @@
       base)))
 
 (defn- acc-bytes-per-lane
-  "Accumulator footprint per lane by precision. The f16-xmx accumulator (8 float8 = 256 B/lane
-   at grf128) FILLS the register file — the design's core finding, and why ANY register staging
-   on top of it spills. :f32-scalar uses a quarter of the file."
-  [schedule budget]
+  "Accumulator footprint per lane by precision — a fixed kernel-tile property. f16-xmx uses the
+   full XMX accumulator tile; :f32-scalar a quarter of it (no wide MMA accumulator)."
+  [schedule]
   (case (:precision schedule)
-    :f16-xmx    budget
-    :f32-scalar (quot budget 4)
-    budget))
+    :f16-xmx    xmx-f16-acc-bytes-per-lane
+    :f32-scalar (quot xmx-f16-acc-bytes-per-lane 4)
+    xmx-f16-acc-bytes-per-lane))
 
 (defn- register-staged-bytes-per-lane
   "GRF charge of the staging schedule. ONLY :space :register consumes the register file; :slm /
-   :l3 / :none stage into SLM/L3 and cost nothing against the GRF budget (the design's measured
-   lesson: the winning staging space is L3/SLM, never register). Each register-staged operand
-   copy is a quarter-file operand panel."
-  [schedule budget]
-  (let [{:keys [space copies]} (:stage schedule)]
+   :l3 / :none stage into SLM/L3 and cost nothing against the GRF budget (the measured lesson: the
+   winning staging space is L3/SLM, never register). Charge = Σcopies × depth × operand-panel —
+   `:depth` (the staging ring depth) is honored, so deeper staging costs proportionally more."
+  [schedule]
+  (let [{:keys [space copies depth]} (:stage schedule)]
     (if (= space :register)
       (let [n-copies (+ (long (get copies :a 0)) (long (get copies :b 0)))]
-        (* n-copies (quot budget 4)))
+        (* n-copies (long (or depth 1)) operand-panel-bytes-per-lane))
       0)))
 
 (defn feasible?
@@ -125,16 +154,31 @@
    register double-buffering both operands is 256 + 4×64 = 512 > 256 → REJECTED at compile time
    (precisely the measurement-time spill, turned into a loud rejection)."
   [schedule desc]
+  ;; validate the resolved schedule BEFORE pricing it — an unmodeled precision / stage-space / grf
+  ;; mode (e.g. a :bf16 typo, or `:regsiter`) must FAIL LOUD here, not slip past into a silent XMX
+  ;; bind (the #{:f16-xmx :f32-scalar} kwarg check upstream only sees the sugar, not a :schedule).
+  (let [prec  (:precision schedule)
+        space (get-in schedule [:stage :space] :none)
+        grf   (get-in schedule [:grf :mode] :grf128)]
+    (when-not (valid-precisions prec)
+      (throw (ex-info (str "schedule: unknown :precision " (pr-str prec) " — expected " valid-precisions)
+                      {:precision prec})))
+    (when-not (valid-stage-spaces space)
+      (throw (ex-info (str "schedule: unknown :stage :space " (pr-str space) " — expected " valid-stage-spaces)
+                      {:space space})))
+    (when-not (valid-grf-modes grf)
+      (throw (ex-info (str "schedule: unknown :grf :mode " (pr-str grf) " — expected " valid-grf-modes)
+                      {:grf grf}))))
   (let [budget (grf-budget-bytes-per-lane schedule desc)
-        acc    (acc-bytes-per-lane schedule budget)
-        staged (register-staged-bytes-per-lane schedule budget)
+        acc    (acc-bytes-per-lane schedule)
+        staged (register-staged-bytes-per-lane schedule)
         req    (+ acc staged)]
     (when (> req budget)
       (throw (ex-info (str "schedule/feasible?: register budget exceeded — " req
                            " B/lane required > " budget " B/lane available"
                            " (grf mode " (get-in schedule [:grf :mode] :grf128) ", precision "
                            (:precision schedule) ", stage " (:stage schedule) ")."
-                           " Move staging to :slm/:l3, drop copies, or (if deep-K) opt into :grf256.")
+                           " Move staging to :slm/:l3, drop copies/depth, or opt into :grf256.")
                       {:required-bytes-per-lane req
                        :budget-bytes-per-lane budget
                        :acc-bytes-per-lane acc

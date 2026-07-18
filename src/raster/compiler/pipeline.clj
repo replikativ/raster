@@ -1557,9 +1557,10 @@
      :nil             — return nil, for probing callers that legitimately fall back to the
                         compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
 
-   :gemm-precision sets the resident :gemm binding policy CARRIED on the descriptor
-   (bind-program! reads it; a bind-time caller may still override with
-   (assoc descriptor :gemm-precision …)):
+   :gemm-precision sets the resident :gemm binding policy. It is now deprecated SUGAR for the S6
+   schedule's [:schedule :precision] (the source of truth bind-program! reads). A bind-time caller
+   overrides the policy on the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …)
+   — NOT (assoc descriptor :gemm-precision …), which the resolved schedule now shadows:
      :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C accumulate/output. The
                           mixed-precision (AMP) policy: f16 INPUTS, f32 math. Costs ~1e-3
                           relative gradient noise (f16 mantissa, cosine similarity to the
