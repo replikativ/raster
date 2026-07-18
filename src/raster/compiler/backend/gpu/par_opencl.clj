@@ -13,6 +13,7 @@
   (:require [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.ir.par :as par]
             [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as chw]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.passes.scalar.soa-lower :as sl]
@@ -310,7 +311,7 @@
         prop-kn (str kernel-name-prefix "_prop_" (gensym ""))
         ;; Workgroup/block sizes (power of 2)
         wg-size (if device-id
-                  (hw/optimal-workgroup-size device-id 256 :reduction? true)
+                  (chw/workgroup-size (chw/descriptor-for device-id) 256 :reduction? true)
                   256)
         block-size (* 2 wg-size) ;; Each thread handles 2 elements
         ;; OpenCL combine op
@@ -463,7 +464,7 @@
         identity-val (or init 0.0)
         ;; Workgroup size for local memory
         wg-size (if device-id
-                  (hw/optimal-workgroup-size device-id (or bound 65536) :reduction? true)
+                  (chw/workgroup-size (chw/descriptor-for device-id) (or bound 65536) :reduction? true)
                   256)
         reduce-op-str (condp = op
                         '+ "+"

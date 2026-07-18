@@ -12,7 +12,8 @@
 
   Each SegOp carries a KernelGrid with pre-computed launch config
   based on raster.runtime.hardware device properties."
-  (:require [raster.runtime.hardware :as hw]))
+  (:require [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as chw]))
 
 ;; ================================================================
 ;; Segmented space and grid config
@@ -116,8 +117,8 @@
   block-size * element-size bytes."
   [segop-type device-id n-expr & {:keys [dtype] :or {dtype :double}}]
   (hw/init!)
-  (let [config (hw/optimal-launch-config device-id 65536
-                                         :reduction? (not= segop-type :map))
+  (let [desc (chw/descriptor-for device-id)
+        config (chw/launch-config desc 65536 :reduction? (not= segop-type :map))
         block-size (or (:block-size config) 256)
         elem-size (case dtype :double 8 :float 4 :long 8 :int 4 8)
         shared-mem (case segop-type
@@ -125,9 +126,10 @@
                      :reduce (* block-size elem-size)
                      :scan (* block-size elem-size)
                      0)
-        ;; Grid size: ceil(n / block-size) capped at SM-count * 4
-        sm-count (or (hw/sm-count device-id) 80)
-        max-blocks (* sm-count 4)
+        ;; Grid cap for the grid-stride loop: enough workgroups to fill the machine a few waves
+        ;; over — derived from the descriptor's machine width (EU/SM count), not a CUDA sm-count
+        ;; literal that read 80 for an Intel Level-Zero device.
+        max-blocks (* (chw/fill-workgroups desc block-size) 4)
         grid-expr (list 'min max-blocks
                         (list 'int (list 'Math/ceil
                                          (list '/ (list 'double n-expr) (double block-size)))))]

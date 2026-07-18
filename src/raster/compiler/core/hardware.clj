@@ -76,7 +76,17 @@
                           :f16 (:peak-flops-hp caps) :half (:peak-flops-hp caps)})
         cache  (into {} (remove (comp nil? val))
                      {:l1 (:cache-l1 caps) :l2 (:cache-l2 caps) :l3 (:cache-l3 caps)
-                      :slm (when gpu? (:shared-local-memory caps))})]
+                      :slm (when gpu? (:shared-local-memory caps))})
+        ;; GPU occupancy inputs the launch-geometry derivations (workgroup-size / group-count /
+        ;; block-size / grid-size) read — present-only, projected from caps. Intel Level-Zero uses
+        ;; :total-eus/:threads-per-eu; NVIDIA CUDA uses :sm-count/:max-warps-per-sm/:max-blocks-per-sm.
+        gpu-geo (when gpu?
+                  (into {} (remove (comp nil? val))
+                        {:total-eus (:total-eus caps) :threads-per-eu (:threads-per-eu caps)
+                         :sm-count (:sm-count caps) :fpus-per-core (:fpus-per-core caps)
+                         :max-warps-per-sm (:max-warps-per-sm caps) :max-blocks-per-sm (:max-blocks-per-sm caps)
+                         :registers-per-block (:registers-per-block caps)
+                         :shared-memory-per-block (:shared-memory-per-block caps)}))]
     (cond-> {:device-type (if gpu? :gpu :cpu)
              :device-id   device-id
              :vector-bits vbits
@@ -113,6 +123,7 @@
                   ;; CPU-shaped placeholder; this is the Intel GPU value.)
                   :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
+      (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
       ;; shape, so it belongs on the descriptor rather than as a literal at each launch site
@@ -312,3 +323,91 @@
    exact opcode are resolved at emit time against the lane count.)"
   [desc]
   (if (:has-native-dot-reduce desc) :dpbusd :scalar))
+
+;; ---------------------------------------------------------------------------
+;; Occupancy-scored launch geometry — the SINGLE implementation. These read the
+;; descriptor (probe ⊕ catalogue ⊕ measured); runtime.hardware/optimal-* delegate
+;; here so there is one occupancy model, not two. The math is occupancy-maximizing
+;; over subgroup/warp-multiple candidates (Halide-style enumeration).
+;; ---------------------------------------------------------------------------
+
+(defn- enumerate-multiples
+  "Candidate sizes = multiples of `unit` up to `max-size` (powers of 2, plus ×3 — the
+   Halide tiling enumeration), filtered to exact multiples of `unit`."
+  [unit max-size]
+  (let [pow2s (take-while #(<= % max-size) (iterate #(* 2 %) unit))
+        pow2x3 (filter #(<= % max-size) (map #(* 3 %) pow2s))]
+    (filter #(zero? (rem % unit)) (sort (distinct (concat pow2s pow2x3))))))
+
+(defn workgroup-size
+  "Intel Level-Zero occupancy-optimal workgroup size for `n` elements. EU model:
+   EUs × threads-per-EU ÷ subgroup = max concurrent subgroups; score candidates by how
+   well they fill the EUs (reductions prefer larger groups). Reads :subgroup-size,
+   :max-workgroup-size, :total-eus, :threads-per-eu off the descriptor."
+  [desc n & {:keys [reduction?] :or {reduction? false}}]
+  (let [sg-size (long (:subgroup-size desc 16))
+        max-wg  (long (:max-workgroup-size desc 1024))
+        threads-per-eu (long (:threads-per-eu desc 8))
+        ;; powers-of-2 multiples of the subgroup (the Level-Zero workgroup enumeration; block-size's
+        ;; CUDA path additionally tries ×3 tiles — kept distinct to preserve the prior behavior).
+        candidates (take-while #(<= % max-wg) (iterate #(* 2 %) sg-size))
+        scored (map (fn [wg]
+                      (let [subgroups-per-wg (quot wg sg-size)
+                            wgs-per-eu (max 1 (quot threads-per-eu subgroups-per-wg))
+                            occupancy (min 1.0 (/ (* wgs-per-eu subgroups-per-wg sg-size)
+                                                  (* threads-per-eu 1.0)))
+                            score (if reduction? (* occupancy (Math/log (double wg))) occupancy)]
+                        {:workgroup-size wg :score score}))
+                    candidates)]
+    (:workgroup-size (apply max-key :score scored))))
+
+(defn group-count
+  "Level-Zero group count (grid) for `n` and `wg`: capped at EU-count × waves (grid-stride)."
+  [desc n wg & {:keys [reduction?] :or {reduction? false}}]
+  (let [eus (long (:total-eus desc 64))
+        waves (if reduction? 1 2)
+        needed (int (Math/ceil (/ (double n) (double wg))))]
+    (min needed (* eus waves))))
+
+(defn block-size
+  "NVIDIA CUDA occupancy-optimal block size for `n`. warp-multiple candidates scored by
+   occupancy against :max-warps-per-sm/:max-blocks-per-sm. Falls back to 256/512."
+  [desc n & {:keys [reduction?] :or {reduction? false}}]
+  (let [ws (long (:subgroup-size desc 32))          ;; warp size
+        max-tpb (long (:max-workgroup-size desc 1024))
+        max-warps (long (:max-warps-per-sm desc 64))
+        max-blocks (long (:max-blocks-per-sm desc 32))
+        candidates (enumerate-multiples ws max-tpb)]
+    (if (> (count candidates) 1)
+      (:block-size
+       (apply max-key :score
+              (map (fn [bs]
+                     (let [warps-per-block (quot bs ws)
+                           blocks-per-sm (min max-blocks (quot max-warps warps-per-block))
+                           occupancy (/ (double (* blocks-per-sm warps-per-block)) max-warps)
+                           score (if reduction? (* occupancy (Math/log (double bs))) occupancy)]
+                       {:block-size bs :score score}))
+                   candidates)))
+      (let [preferred (if reduction? 512 256)]
+        (* ws (quot (min max-tpb (max ws preferred)) ws))))))
+
+(defn grid-size
+  "NVIDIA CUDA grid size for `n` and `block`: blocks-per-SM × SM-count × waves, capped at needed."
+  [desc n block & {:keys [reduction?] :or {reduction? false}}]
+  (let [sm (long (:sm-count desc 108))
+        ws (long (:subgroup-size desc 32))
+        max-warps (long (:max-warps-per-sm desc 64))
+        max-blocks (long (:max-blocks-per-sm desc 32))
+        warps-per-block (quot block ws)
+        blocks-per-sm (min max-blocks (quot max-warps warps-per-block))
+        waves (if reduction? 1 2)]
+    (min (int (Math/ceil (/ (double n) block))) (* blocks-per-sm sm waves))))
+
+(defn launch-config
+  "CUDA launch config {:block-size :grid-size :shared-mem} for `n`, or nil when `n` is below
+   `min-elements` (too small to be worth a GPU launch). shared-mem = block × 8 for reductions."
+  [desc n & {:keys [reduction? min-elements] :or {reduction? false min-elements 1024}}]
+  (when (>= n min-elements)
+    (let [bs (block-size desc n :reduction? reduction?)
+          gs (grid-size desc n bs :reduction? reduction?)]
+      {:block-size bs :grid-size gs :shared-mem (if reduction? (* bs 8) 0)})))

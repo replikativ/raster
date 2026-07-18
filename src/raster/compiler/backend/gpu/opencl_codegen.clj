@@ -903,11 +903,13 @@
   (when (>= n min-elements)
     (if device-id
       (try
-        (require 'raster.runtime.hardware)
-        (let [hw-wg ((resolve 'raster.runtime.hardware/optimal-workgroup-size)
-                     device-id n :reduction? reduction?)
-              hw-gc ((resolve 'raster.runtime.hardware/optimal-group-count)
-                     device-id n hw-wg :reduction? reduction?)
+        (require 'raster.runtime.hardware 'raster.compiler.core.hardware)
+        ((resolve 'raster.runtime.hardware/init!))
+        (let [desc ((resolve 'raster.compiler.core.hardware/descriptor-for) device-id)
+              hw-wg ((resolve 'raster.compiler.core.hardware/workgroup-size)
+                     desc n :reduction? reduction?)
+              hw-gc ((resolve 'raster.compiler.core.hardware/group-count)
+                     desc n hw-wg :reduction? reduction?)
               local-mem (if reduction? (* hw-wg 8) 0)]
           {:workgroup-size hw-wg :group-count hw-gc :local-mem local-mem})
         (catch Exception _
