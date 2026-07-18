@@ -1,0 +1,300 @@
+(ns raster.gpu.compiled
+  "The `Compiled` artifact — a functional, inspectable GPU program value (S4 §2).
+
+   `(r/compile #'train-step args {:target :ze:0 :donate [adapters…] :constants [Wq …]})`
+   returns a `Compiled` that implements `IFn`: calling it replays the resident program and
+   returns device values (`raster.gpu.value/DeviceArray`), not host arrays. It wraps today's
+   `bind-program!`/`replay-program!` with ZERO change to the kernel/graph machinery — the
+   executable still lives in the session; `Compiled` lifts the *invocation contract* to
+   values-in / values-out with donation as a boundary write-back shim.
+
+   The three artifact primitives, honestly scoped to the whole-program MVP:
+     • device value      — outputs are DeviceArrays over resident buffers; no host round-trip.
+     • functional invoke  — `(step inputs)` → `{out-key → DeviceArray}`; mutation of resident
+                            :state is invisible (the old input value is consumed/invalidated).
+     • donation           — a donated in→out pair reuses the resident buffer; the input value
+                            is marked consumed (reads throw), the output value is fresh.
+
+   Roles are DERIVED (§4.2): `:donate` syms → :state (donated), `:constants` syms → :constant
+   (captured once at bind, never per-call), the remainder default to the descriptor's derived
+   read-only→:input / written→:output. Backend-neutral: `:target` selects the runtime; nothing
+   here hardcodes `:ze`."
+  (:refer-clojure :exclude [compile])
+  (:require [clojure.set :as set]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.value :as v]
+            [raster.compiler.pipeline :as pl]))
+
+(declare invoke-compiled)
+
+;; ================================================================
+;; The record
+;; ================================================================
+
+(defrecord Compiled
+           [session      ;; the GPU session atom the executable lives in (MVP: not yet lifted out)
+            handle       ;; the bind-program! handle {::gpu/program-key … :descriptor …}
+            in-tree      ;; ordered [{:key :sym :role :donate? :shape :dtype} …] — the arg spec
+            out-tree     ;; ordered [{:key :sym :shape :dtype :from} …] — the result spec (multi-output)
+            donated      ;; {in-key → out-key} — the alias plan (JAX input_output_aliases)
+            schedule     ;; the S6 Schedule map (reserved; nil until S6 fills it)
+            target       ;; device-id + (future) HardwareDescriptor
+            descriptor   ;; the raw compile-gpu-program descriptor — inspectable
+            args         ;; captured example args (:all-params order): resident bind contents + shape source
+            live-outputs] ;; atom holding the DeviceArrays projected by the LAST invocation. They
+                          ;; alias resident buffers the next replay overwrites, so they are
+                          ;; invalidated (marked dead) at the start of the next invoke and at close!
+                          ;; — otherwise a retained old output would silently observe a mutation.
+  clojure.lang.IFn
+  (invoke [this inputs] (invoke-compiled this inputs))
+  (invoke [this] (invoke-compiled this {}))
+  (applyTo [this argseq] (apply invoke-compiled this argseq)))
+
+(defn compiled? [x] (instance? Compiled x))
+
+;; ================================================================
+;; Role derivation (§4.2) and tree construction
+;; ================================================================
+
+(defn- derive-roles
+  "Effective {sym → role} for bind-program!: donated → :state, constants → :constant, the rest
+   fall through to the descriptor's derived defaults (read-only→:input, written→:output)."
+  [descriptor donate constants explicit-roles]
+  (let [donate-set   (set donate)
+        constant-set (set constants)
+        both         (set/intersection donate-set constant-set)]
+    (when (seq both)
+      (throw (ex-info (str "compile: syms are both :donate and :constants — a param is either "
+                           "donated (mutable :state) or frozen (:constant), not both: " both)
+                      {:conflict both})))
+    (merge (into {} (map (fn [s] [s :state]) donate-set))
+           (into {} (map (fn [s] [s :constant]) constant-set))
+           explicit-roles)))
+
+(defn- flat-n
+  "Element count of a JVM array (the flat logical shape for the MVP)."
+  [arr]
+  (when arr (java.lang.reflect.Array/getLength arr)))
+
+(defn- build-in-tree
+  [descriptor argmap donate constants effective-roles]
+  (let [donate-set (set donate)]
+    (vec (for [p (:array-params descriptor)
+               :let [arr (get argmap p)]]
+           {:key     (keyword (name p))
+            :sym     p
+            :role    (get effective-roles p (get (:array-roles descriptor) p :input))
+            :donate? (contains? donate-set p)
+            :shape   (when arr [(flat-n arr)])
+            :dtype   (:dtype descriptor)}))))
+
+(defn- build-out-tree
+  "Out-tree = donated in→out nodes + any explicit :outputs + the functional :result-sym + taps.
+   Each projects to a DeviceArray over a resident buffer (§3.4 multi-output)."
+  [descriptor argmap donate outputs result-sym taps dtype]
+  (let [donate-nodes  (for [s donate]
+                        {:key (keyword (str (name s) "'")) :sym s
+                         :shape (when-let [a (get argmap s)] [(flat-n a)]) :dtype dtype
+                         :from :donated})
+        output-nodes  (for [s outputs]
+                        {:key (keyword (name s)) :sym s
+                         :shape (when-let [a (get argmap s)] [(flat-n a)]) :dtype dtype
+                         :from :output})
+        result-node   (when result-sym
+                        [{:key (keyword (name result-sym)) :sym result-sym
+                          :shape nil :dtype dtype :from :result}])
+        tap-nodes     (for [s taps]
+                        {:key (keyword (name s)) :sym s :shape nil :dtype dtype :from :tap})]
+    (vec (concat donate-nodes output-nodes result-node tap-nodes))))
+
+;; ================================================================
+;; Compile (the public verb)
+;; ================================================================
+
+(defn compile
+  "Compile a deftm var into a `Compiled` artifact bound on `target`.
+
+   args  — example args in the descriptor's :all-params order. Supplies BOTH the shapes
+           compile-gpu-program derives AND the initial resident buffer contents at bind.
+   opts  — {:target :ze:0            device-id (default :ze:0)
+            :dtype  :float           element dtype (default :float)
+            :donate  [sym …]         resident :state threaded as values (donation)
+            :constants [sym …]       frozen, captured once at bind, never per-call
+            :inputs  [sym …]         per-call uploads (default: descriptor-derived)
+            :outputs [sym …]         additional written params to project as outputs
+            :taps    [sym …]         internal nodes to additionally expose (§5.1)
+            :roles   {sym → role}    explicit role override (last word)
+            :gemm-precision :f16-xmx|:f32-scalar
+            :on-non-resident :nil|:throw
+            :profile? bool           bind in profiling mode (for r/profile)
+            :schedule <map>}         reserved S6 schedule (threaded into the cache key)"
+  [fn-var args {:keys [target dtype donate constants outputs taps roles
+                       gemm-precision on-non-resident profile? schedule]
+                :or {target :ze:0 dtype :float on-non-resident :nil}}]
+  (let [prog (apply pl/compile-gpu-program fn-var target
+                    (cond-> [:dtype dtype :on-non-resident on-non-resident]
+                      gemm-precision (conj :gemm-precision gemm-precision)
+                      ;; forward the S6 schedule so it is resolved + gated by compile-gpu-program;
+                      ;; the RESOLVED schedule is read back off the descriptor below (never the raw
+                      ;; input). Harmless where compile-gpu-program predates :schedule (ignored kwarg).
+                      schedule (conj :schedule schedule)))
+        _ (when-not prog
+            (throw (ex-info "compile: compile-gpu-program returned nil — a step fell back to host (non-resident). Pass :on-non-resident :throw to see which."
+                            {:fn fn-var :target target})))
+        argmap    (zipmap (:all-params prog) args)
+        eff-roles (derive-roles prog donate constants roles)
+        result-sym (:result-sym prog)
+        sess    (gpu/make-session target)
+        handle  (try (gpu/bind-program! sess prog args eff-roles
+                                        (cond-> {} profile? (assoc :profile? true)))
+                     (catch Throwable e
+                       ;; don't leak the session's arena/buffers if bind throws (e.g. a
+                       ;; reuse-collision or a non-resident step).
+                       (try (gpu/close-session! sess) (catch Throwable _))
+                       (throw e)))
+        in-tree  (build-in-tree prog argmap donate constants eff-roles)
+        out-tree (build-out-tree prog argmap donate outputs result-sym taps dtype)
+        donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))]
+    (->Compiled sess handle in-tree out-tree donated (:schedule prog) target prog args (atom nil))))
+
+;; ================================================================
+;; Functional invocation (§2.3)
+;; ================================================================
+
+(defn- project-node
+  "Wrap a resident output node's live session buffer as an ::external DeviceArray (the session
+   owns the buffer's lifetime; the value never frees it). Fail-loud: a requested output node with
+   no resident buffer is an error (a dropped result / tap), NOT a silent omission — the ONE
+   documented exception is a :result node whose deftm returns Void/map-void (no result buffer),
+   which yields nil and is filtered by the caller."
+  [session handle {:keys [sym shape dtype from key] :as node} target]
+  (let [k   (gpu/resident-key session handle sym)
+        buf (gpu/buffer session k)]
+    (cond
+      buf (v/wrap-external buf target (or dtype (:dtype buf)) (or shape [(:n-elements buf)]))
+      (= from :result) nil   ;; documented Void/map-void result — no resident buffer to project
+      :else (throw (ex-info (str "invoke: requested output node " key " (" from ") resolved to no "
+                                 "resident buffer (key " k ") — the graph did not produce it")
+                            {:node node :resident-key k :available (keys (:buffers @session))})))))
+
+(defn invoke-compiled
+  "Replay the artifact and return device values. `inputs` : {in-key → DeviceArray|host-array}.
+     1. consume any donated-slot DeviceArrays passed in (donation-invalidation, §1.3);
+     2. assemble the args vector (captured resident contents; :input keys overridden by inputs);
+     3. replay the ONE recorded graph with NO host download (replay-program!);
+     4. project out-tree nodes as ::external DeviceArrays over the resident buffers.
+   Mutation of resident :state is invisible: the caller sees fresh output values and the old
+   donated inputs invalidated — never a mutation."
+  [^Compiled c inputs]
+  (let [{:keys [session handle in-tree out-tree donated descriptor target args live-outputs]} c
+        key->sym     (into {} (map (juxt :key :sym)) in-tree)
+        in-nodes     (into {} (map (juxt :key identity)) in-tree)
+        input-syms   (set (map :sym (filter #(= :input (:role %)) in-tree)))
+        input-keys   (set (map :key (filter #(= :input (:role %)) in-tree)))
+        donated-keys (set (keys donated))
+        ;; 0. VALIDATE inputs: every passed key must be an :input-role param or a donated slot —
+        ;;    never a :constant/:state key silently ignored (fail-loud, §7.7).
+        _ (doseq [[k _v] inputs]
+            (when-not (or (contains? input-keys k) (contains? donated-keys k))
+              (throw (ex-info (str "invoke: unsupported input key " k " — only :input-role params "
+                                   (vec input-keys) " or donated slots " (vec donated-keys)
+                                   " may be passed; a :constant/:state slot is captured at bind")
+                              {:key k :inputs (keys inputs)}))))
+        ;; 1. donation-invalidation. A DeviceArray passed to a donated slot MUST be this artifact's
+        ;;    own resident value threaded back (residency IS the donation; the buffer never moves).
+        ;;    A foreign device buffer would need a rebind that does not exist yet → FAIL LOUD rather
+        ;;    than consume-and-ignore-its-contents (the silent miscompile the review caught).
+        _ (doseq [[k _out] donated]
+            (when-let [val (get inputs k)]
+              (when (v/device-array? val)
+                (let [s    (get key->sym k)
+                      rbuf (gpu/buffer session (gpu/resident-key session handle s))
+                      node (get in-nodes k)]
+                  (when-not (identical? (:buffer val) rbuf)
+                    (throw (ex-info (str "invoke: donated input " k " is not this artifact's resident "
+                                         "value — the MVP only supports threading the artifact's own "
+                                         "output back into its donated slot; uploading a foreign "
+                                         "device value needs a rebind that is not yet wired")
+                                    {:key k})))
+                  (when (and node (:shape node) (:shape val) (not= (:shape node) (:shape val)))
+                    (throw (ex-info (str "invoke: donated input " k " shape " (:shape val)
+                                         " ≠ bound shape " (:shape node)) {:key k})))
+                  (v/consume! val)))))
+        ;; 2. assemble args: override :input-role syms (a DeviceArray :input is downloaded then
+        ;;    re-uploaded by replay — MVP limitation; device-resident :input rebind is future work).
+        argmap (reduce (fn [m [k val]]
+                         (let [s (get key->sym k)]
+                           (if (and s (contains? input-syms s))
+                             (assoc m s (if (v/device-array? val) (v/->host val) val))
+                             m)))
+                       (zipmap (:all-params descriptor) args)
+                       inputs)
+        call-args (mapv argmap (:all-params descriptor))]
+    ;; 3. invalidate the PREVIOUS batch of outputs — they alias resident buffers this replay
+    ;;    overwrites, so a retained old wrapper would observe a silent mutation (§2.3). ::external
+    ;;    free! only marks the wrapper dead; it never frees the session-owned buffer.
+    (when live-outputs
+      (doseq [da @live-outputs] (v/free! da))
+      (reset! live-outputs nil))
+    ;; 4. replay, no download.
+    (gpu/replay-program! session handle call-args)
+    ;; 5. project outputs as resident device values; record them for next-call invalidation.
+    (let [out (into {} (keep (fn [{:keys [key] :as node}]
+                               (when-let [da (project-node session handle node target)]
+                                 [key da]))
+                             out-tree))]
+      (when live-outputs (reset! live-outputs (vec (vals out))))
+      out)))
+
+;; ================================================================
+;; Inspection (§2.1) + lifecycle
+;; ================================================================
+
+(defn explain
+  "Print the artifact's shape: in-tree / out-tree / donation plan / target / schedule and the
+   resident step-kind histogram. Returns the Compiled unchanged."
+  [^Compiled c]
+  (let [{:keys [in-tree out-tree donated target schedule descriptor]} c
+        kinds (frequencies (map :convention (:steps descriptor)))]
+    (println "Compiled artifact")
+    (println "  target   :" target)
+    (println "  in-tree  :" (mapv (fn [n] [(:key n) (:role n) (when (:donate? n) :donate)]) in-tree))
+    (println "  out-tree :" (mapv (fn [n] [(:key n) (:from n)]) out-tree))
+    (println "  donated  :" donated)
+    (println "  schedule :" (or schedule :none))
+    (println "  steps    :" (count (:steps descriptor)) "resident, by kind:" kinds))
+  c)
+
+(defn ir
+  "Return the descriptor's resident steps (the artifact's lowered IR) for inspection."
+  [^Compiled c]
+  (mapv #(select-keys % [:convention :phase :variant :kernel-name]) (:steps (:descriptor c))))
+
+(defn profile
+  "Device-event profile of one replay (delegates to profile-program!). The artifact must have
+   been compiled with {:profile? true}. Returns profile-program!'s map."
+  [^Compiled c]
+  (gpu/profile-program! (:session c) (:handle c) (:args c)))
+
+(defn cache-key
+  "The serializable identity of the artifact minus closures (§2b C5): in/out trees, donation,
+   schedule, target, and the descriptor's step kinds + concrete shapes. Excludes the non-
+   serializable closures (:n-fn/:m-fn/…) and SPIR-V modules."
+  [^Compiled c]
+  {:in-tree  (mapv #(select-keys % [:key :role :donate? :shape :dtype]) (:in-tree c))
+   :out-tree (mapv #(select-keys % [:key :from :shape :dtype]) (:out-tree c))
+   :donated  (:donated c)
+   :schedule (:schedule c)
+   :target   (:target c)
+   :steps    (frequencies (map :convention (:steps (:descriptor c))))})
+
+(defn close!
+  "Release the artifact's session (frees resident buffers + destroys graphs/kernels). Invalidates
+   any still-live projected output values FIRST, so a `->host` on a value returned before close!
+   fails loud (use-after-free) instead of copying from a zeMemFree'd segment (SIGSEGV/garbage)."
+  [^Compiled c]
+  (when-let [lo (:live-outputs c)]
+    (doseq [da @lo] (v/free! da))
+    (reset! lo nil))
+  (gpu/close-session! (:session c))
+  nil)
