@@ -427,6 +427,31 @@
       :block-k (* 2 k)
       :matrix (:matrix desc {:family :dpas :m m :n n :k k :subgroup subgroup})})))
 
+(defn gemm-tile-candidates
+  "A CURATED set of valid GEMM tiles for `desc` — the autotuner's search space for the tile axis.
+   Not a free ×2/÷2 product (that explodes and yields non-divisible / register-spilling tiles):
+   the per-subgroup accumulator tile stays at the GRF-bound derived size, and only the WORKGROUP
+   block (occupancy) and K-unroll (pipeline depth) vary — the two axes with real, measurable
+   headroom. Every candidate keeps block divisible by the subgroup tile and workgroup ≤
+   max-workgroup-size, so all are feasible by construction."
+  [desc]
+  (let [base (derive-gemm-tile desc)
+        {:keys [sg-m sg-n block-k matrix]} base
+        max-wg (long (:max-workgroup-size desc 1024))
+        sg     (long (:subgroup matrix 16))
+        wg-ok? (fn [{:keys [block-m block-n]}]
+                 (<= (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)) sg) max-wg))]
+    (->> [base
+          (assoc base :block-m sg-m :block-n sg-n)                    ;; 1 subgroup — max workgroups (small problems)
+          (assoc base :block-m (* 2 sg-m) :block-n (* 2 sg-n))        ;; 4 subgroups
+          (assoc base :block-m (* 2 (:block-m base)))                 ;; taller M block
+          (assoc base :block-n (* 2 (:block-n base)))                 ;; wider N block
+          (assoc base :block-k (* 2 block-k))                         ;; deeper K unroll
+          (assoc base :block-k (max (long (:k matrix 16)) (quot block-k 2)))] ;; shallower K
+         (filter wg-ok?)
+         distinct
+         vec)))
+
 (defn block-size
   "NVIDIA CUDA occupancy-optimal block size for `n`. warp-multiple candidates scored by
    occupancy against :max-warps-per-sm/:max-blocks-per-sm. Falls back to 256/512."

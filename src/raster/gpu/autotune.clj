@@ -10,6 +10,7 @@
    infeasible candidate returns +Inf and self-prunes. This ns owns the SEARCH + CACHE; the kernel
    bench is the integration seam (lands with the resident/Compiled path)."
   (:require [raster.gpu.schedule :as sched]
+            [raster.compiler.core.hardware :as hw]
             [clojure.java.io :as io])
   (:import [java.io File]))
 
@@ -47,18 +48,19 @@
 ;; ================================================================
 
 (defn schedule-neighbors
-  "The moves coordinate-descent explores over an S6 Schedule. ONLY :precision is WIRED to codegen
-   today (it selects the XMX-f16 vs scalar GEMM binder); :grf / :stage are schema-only until the
-   emitter consumes them (the S6 review found nothing reads them at emission). Searching an un-wired
-   knob wastes measurements on a config that produces an identical kernel, so they are OFF here and
-   join when they reach emission — add {[:grf :mode] …} / {[:stage :space] …} then.
+  "The moves coordinate-descent explores over an S6 Schedule. Two WIRED axes:
+     :precision — selects the XMX-f16 vs scalar GEMM binder.
+     :tile      — the GEMM tile (T2/T3), a CURATED per-descriptor candidate list
+                  (hw/gemm-tile-candidates) that drives emit-gemm-tiled +
+                  bind-registered-gemm-tiled! (real, priced kernels).
+   :grf / :stage stay schema-only until the emitter consumes them (the S6 review found nothing
+   reads them at emission) — searching an un-wired knob wastes measurements on an identical kernel.
 
-   NB the largest measured tuning win — split-k factor (~10× on deep-k occupancy-bound shapes,
-   gemm_autotune_test) — is a GEMM-level occupancy axis, not yet an S6 schedule field; wiring it into
-   the schedule + bind path (it currently lives in the *gemm-splitk-* vars) is the next step to put
-   real tunable headroom under this search."
-  [_desc]
-  {:precision (fn [_] [:f16-xmx :f32-scalar])})
+   NB split-k factor (~10× on deep-k occupancy-bound shapes, gemm_autotune_test) is a separate
+   GEMM-level occupancy axis measured directly there; promoting it to an S6 field is the next step."
+  [desc]
+  {:precision (fn [_] [:f16-xmx :f32-scalar])
+   :tile      (fn [_] (hw/gemm-tile-candidates desc))})
 
 ;; ================================================================
 ;; Disk cache — keyed by (op × shape-class × descriptor-signature × version)

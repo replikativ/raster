@@ -1895,6 +1895,63 @@
      (.set gc I32 8 (int 1))
      bnd)))
 
+;; ── TILE-PARAMETRIC GEMM (autotune-facing) ─────────────────────────────────────
+;; The default bind-registered-gemm! above emits the derived-default tile (hardcoded 128/256
+;; launch). This path takes an EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune
+;; candidate) and DERIVES the launch geometry from it — the regular form: workgroup = subgroups ×
+;; subgroup-size, grid = ceil(n/block-n) × ceil(m/block-m). At the derived-default tile it produces
+;; the identical launch, so this is a strict generalization of the hardcoded path.
+
+(def ^:private gemm-tiled-cache
+  "Compiled tile-parametric GEMM kernels, keyed by [c-dtype tile-map]. Distinct tiles are distinct
+   kernels (distinct __kernel names)."
+  (atom {}))
+
+(defn- tile-signature [tile]
+  (let [{:keys [block-m block-n sg-m sg-n block-k]} tile]
+    (str block-m "x" block-n "_" sg-m "x" sg-n "_k" block-k)))
+
+(defn- ensure-gemm-kernel-tiled!
+  "Compile + cache the GEMM kernel for [c-dtype × tile]. Returns {:module :kernel-name :tile}."
+  [c-dtype tile]
+  (ensure-init!)
+  (or (get @gemm-tiled-cache [c-dtype tile])
+      (let [kname (str "gemm_tiled_" (name c-dtype) "_" (tile-signature tile))
+            emit  (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                      (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled))
+            cl-src (apply emit kname :c-dtype c-dtype (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     cl-src :device (:device-id-hex @state)))
+            module (load-module! spv)
+            entry {:module module :kernel-name kname :tile tile}]
+        (swap! gemm-tiled-cache assoc [c-dtype tile] entry)
+        entry)))
+
+(defn bind-registered-gemm-tiled!
+  "Bind the GEMM kernel for an EXPLICIT tile over resident fp16 buffers, DERIVING the launch
+   geometry from the tile. `tile` is a derive-gemm-tile map {:block-m :block-n :sg-m :sg-n :block-k
+   :matrix}. Fail-loud on an output-dtype mismatch, like bind-registered-gemm!."
+  [a b c m n k c-dtype tile]
+  (when-let [bd (:dtype c)]
+    (when (not= bd c-dtype)
+      (throw (ex-info (str "bind-registered-gemm-tiled!: output buffer dtype " bd " ≠ kernel dtype " c-dtype)
+                      {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
+  (let [{:keys [module kernel-name]} (ensure-gemm-kernel-tiled! c-dtype tile)
+        {:keys [block-m block-n sg-m sg-n matrix]} tile
+        sg   (long (:subgroup matrix 16))
+        n-subgroups (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)))
+        wg   (* n-subgroups sg)
+        kh   (create-kernel-fresh module kernel-name)
+        args [(:segment a) (:segment b) (:segment c)
+              {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+        bnd  (bind-kernel-2d! kh [wg 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))   ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))   ;; Y = gc-m
+    (.set gc I32 8 (int 1))
+    bnd))
+
 ;; ── SPLIT-K GEMM (the low-occupancy-shape schedule) ────────────────────────────
 ;; A GEMM whose (M,N) tiling yields fewer workgroups than fill the machine —
 ;; ceil(N/128)·ceil(M/128) — cannot be rescued by a better inner loop: the machine

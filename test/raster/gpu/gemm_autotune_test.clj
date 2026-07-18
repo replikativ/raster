@@ -11,6 +11,7 @@
    not a 'maximize splits' heuristic — finds the true optimum (which is interior, not the extreme)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.core.hardware :as hw]
             [raster.gpu.autotune :as at]))
 
 ;; ── the real cost-fn: device-event time of the resident split-k XMX GEMM ─────────
@@ -66,3 +67,58 @@
         (is (> speedup 4.0) (str "tuned split-k must beat the non-split baseline by >4× (got "
                                  (format "%.1fx" speedup) ")"))
         (is (<= @measured 12) "the ×2/÷2 ladder from the seed keeps the search cheap")))))
+
+;; ── T3: the TILE axis — every candidate tile is correct; coordinate-descent prices real kernels ──
+(defn- run-tiled-gemm
+  "Run bind-registered-gemm-tiled! for `tile` at (m,n,k) over fixed A/B, returning [C median-ms]."
+  [ze a16 b16 m n k tile]
+  (let [g!   (ns-resolve ze 'make-buffer)   free (ns-resolve ze 'free-buffer!)
+        rec  (ns-resolve ze 'record-graph!) rep (ns-resolve ze 'replay-graph!)
+        rst  (ns-resolve ze 'reset-graph-events!) rts (ns-resolve ze 'read-graph-timestamps!)
+        dst  (ns-resolve ze 'destroy-graph!) ba (ns-resolve ze 'buffer->array)
+        btg  (ns-resolve ze 'bind-registered-gemm-tiled!)
+        c    (g! (* m n) :float)]
+    (try
+      (let [g (rec [{:bound (btg a16 b16 c m n k :float tile) :kernel-name "t"}] {:profile? true})]
+        (try
+          (dotimes [_ 2] (rep g) (rst g))
+          (let [ms (vec (for [_ (range 7)] (do (rep g) (reduce + (map :ms (:kernels (rts g)))))))]
+            [(vec (ba c)) (nth (sort ms) 3)])
+          (finally (dst g))))
+      (finally (free c)))))
+
+(deftest autotune-tile-axis-all-candidates-correct
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "GEMM autotune: tile axis (all candidates correct + measured search)")
+    (let [ze   (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
+          f16  (ns-resolve ze 'buffer-of-floats-as-half)  free (ns-resolve ze 'free-buffer!)
+          desc (hw/descriptor-for :ze:0)
+          cands (hw/gemm-tile-candidates desc)
+          default-tile (hw/derive-gemm-tile desc)
+          m 256 n 256 k 512
+          rng (java.util.Random. 4)
+          mk  (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (* 0.05 (.nextGaussian rng))))) a))
+          a16 (f16 (mk (* m k)))  b16 (f16 (mk (* k n)))]
+      (try
+        (testing "the curated candidate list is non-trivial and includes the derived default"
+          (is (> (count cands) 1) "more than one tile to search")
+          (is (some #(= % default-tile) cands) "the derived default is in the search space"))
+        (let [ref (first (run-tiled-gemm ze a16 b16 m n k default-tile))
+              results (mapv (fn [t] (let [[c ms] (run-tiled-gemm ze a16 b16 m n k t)]
+                                      {:tile t :bit-identical? (= ref c) :ms ms})) cands)]
+          (testing "SAFETY: every candidate tile produces output bit-identical to the default"
+            (doseq [{:keys [tile bit-identical?]} results]
+              (is bit-identical? (str "tile " (select-keys tile [:block-m :block-n :block-k]) " must match default"))))
+          ;; coordinate-descent over the tile axis, priced by real device time
+          (let [cost (fn [cfg] (:ms (first (filter #(= (:tile %) (:tile cfg)) results))))
+                r (at/coordinate-descent {:tile default-tile}
+                                         {:tile (fn [_] cands)} cost)
+                winner (:tile (:config r))]
+            (println (format "\n=== GEMM tile autotune (m=%d n=%d k=%d) ===" m n k))
+            (doseq [{:keys [tile ms]} (sort-by :ms results)]
+              (println (format "  %-22s %.3f ms%s" (str (:block-m tile) "x" (:block-n tile) " k" (:block-k tile))
+                               ms (if (= tile winner) "  <- winner" ""))))
+            (testing "measured search returns a feasible candidate (Arc: hand-tuned default is ~optimal)"
+              (is (some #(= % winner) cands) "winner is one of the candidates")
+              (is (= ref (first (run-tiled-gemm ze a16 b16 m n k winner))) "winner output is correct"))))
+        (finally (free a16) (free b16))))))
