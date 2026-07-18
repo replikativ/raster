@@ -135,9 +135,20 @@
   Returns {:kernel-name :source :launch-config-fn :dtype}."
   [gemm-info dtype kernel-counter]
   (let [kname (str "gemm_" (name (:variant gemm-info)) "_" (swap! kernel-counter inc))
+        ;; Schedule knob: B-operand 2D-block prefetch (mirrors the always-on A prefetch).
+        ;; Measured (device events, Arc iGPU): +2.2x at N=2048 (49.6%->110% of the raster
+        ;; XMX ceiling, beating oneDNN's 95%), mild win at N=1024, but a ~5% REGRESSION at
+        ;; small N (N=640) — the win scales with B-tile latency, which grows with N. So gate
+        ;; on a STATIC N >= 1024: large-N projections (up/gate, N=2048) opt in; small-N
+        ;; (down-proj) and any dynamic/expression N stay byte-identical to today. Prefetch is
+        ;; a pure cache hint — the emitted math is bit-identical (measured rel-err 0.0 vs the
+        ;; no-prefetch kernel), so gradients are unchanged regardless of this flag.
+        n (:n gemm-info)
+        prefetch-b? (boolean (and (integer? n) (>= (long n) 1024)))
         ;; Use non-square GEMM kernel (handles arbitrary M,N,K)
         ;; XMX GEMM takes FP16 in, FP32 accum. Output dtype matches storage.
-        source (codegen/emit-gemm-nonsquare-kernel kname :c-dtype :float)]
+        source (codegen/emit-gemm-nonsquare-kernel kname :c-dtype :float
+                                                    :prefetch-b? prefetch-b?)]
     {:kernel-name kname
      :source source
      :dtype dtype
