@@ -645,8 +645,9 @@
                 iGPU), but 64 slabs = 128 workgroups fill it, feeding the DPAS array
                 across ALL slabs. No extra kernel arg — batch = grid-z extent, set at
                 launch. Mutually exclusive with :split-k? (both claim grid z)."
-  [kernel-name & {:keys [alpha beta c-dtype split-k? batched?]
-                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false}}]
+  [kernel-name & {:keys [alpha beta c-dtype split-k? batched? prefetch-b?]
+                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false
+                       prefetch-b? false}}]
   (when (and split-k? (not= beta 0.0))
     (throw (ex-info "split-k GEMM requires beta = 0 (partials are summed by the reduce kernel)"
                     {:beta beta})))
@@ -660,7 +661,21 @@
         ;; end under split-k. Only the LOOP bounds and the A-prefetch guard use it —
         ;; the 2D-block reads keep the full M/K/N extents (they are the hardware OOB
         ;; clamp of the whole matrix, not of this workgroup's slice).
-        kend (if split-k? "k_hi" "K")]
+        kend (if split-k? "k_hi" "K")
+        ;; B-prefetch (schedule knob :prefetch-b?): mirror the existing A-prefetch for the
+        ;; B operand, which is otherwise read (block_read_transform) with its L3/DRAM latency
+        ;; fully exposed each K-step. `kpos-expr` is a K-position C expression; warms this
+        ;; subgroup's B tile there = 16 K-rows × 32 N-cols (n_base0 + n_base1), issued as
+        ;; 2(K bands)×2(N tiles) of the proven 8r16x1c 2D-block prefetch. Guarded by kpos<kend.
+        bpref (fn [kpos-expr]
+                (str
+                 "        { int pkb = " kpos-expr ";\n"
+                 "          if (pkb < " kend ") {\n"
+                 "            for (int nb = 0; nb < 2; nb++)\n"
+                 "                for (int kk = 0; kk < 2; kk++)\n"
+                 "                    intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
+                 "                        (__global void*)B, b_wb, K, b_pb, (int2)(n_base0 + nb*16, pkb + kk*8));\n"
+                 "          } }\n"))]
     (str
      "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
      "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
@@ -726,6 +741,7 @@
      "        for (int m = 0; m < 4; m++)\n"
      "            intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
+     (when prefetch-b? (bpref "pk"))
      "    }\n"
      "\n"
      "    // Main K-loop: 32 K elements per iteration (2 K-steps)\n"
@@ -738,6 +754,7 @@
      "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
      "        }\n"
+     (when prefetch-b? (bpref "pk"))
      "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
      "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
      "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
@@ -765,6 +782,7 @@
      "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
      "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
      "        }\n"
+     (when prefetch-b? (bpref "pk"))
      "        bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
      "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k2)));\n"
      "        bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
