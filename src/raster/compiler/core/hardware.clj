@@ -62,19 +62,42 @@
         gpu?   (not= (rt/device-type device-id) :cpu)
         flanes (long (if gpu? (rt/subgroup-size device-id)
                          (rt/simd-lanes device-id :float)))   ;; f32 lanes / subgroup
-        vbits  (* flanes 32)]
+        vbits  (* flanes 32)
+        ;; PERFORMANCE quantities — bandwidth / per-dtype peak-flops / cache hierarchy — projected
+        ;; from whatever the probe or the shipped catalogue supplied (runtime.hardware merges the
+        ;; catalogue into caps). These are the roofline inputs (balance-for / roofline-time-ns).
+        ;; A CPU probe carries no bandwidth/flops (not statically knowable) → they are simply
+        ;; ABSENT here and the analytic fns fall back to :balance; the :measured layer (Phase 1)
+        ;; fills them from a microbenchmark and OVERWRITES the analytic guess.
+        bw-gb  (:memory-bandwidth-gb-s caps)
+        peak-flops (into {} (remove (comp nil? val))
+                         {:f32 (:peak-flops-sp caps) :float (:peak-flops-sp caps)
+                          :f64 (:peak-flops-dp caps) :double (:peak-flops-dp caps)
+                          :f16 (:peak-flops-hp caps) :half (:peak-flops-hp caps)})
+        cache  (into {} (remove (comp nil? val))
+                     {:l1 (:cache-l1 caps) :l2 (:cache-l2 caps) :l3 (:cache-l3 caps)
+                      :slm (when gpu? (:shared-local-memory caps))})]
     (cond-> {:device-type (if gpu? :gpu :cpu)
              :device-id   device-id
              :vector-bits vbits
              :has-native-dot-reduce
              (if gpu? true
-                 (let [a (str (:arch caps))]
-                   (boolean (or (.contains a "amd64") (.contains a "x86")))))
+                 ;; x86 has a widening int-dot-reduce ONLY with AVX-VNNI (vpdpbusd). Prefer the
+                 ;; probed feature set (correct: a pre-VNNI Haswell is x86 yet lacks vpdpbusd);
+                 ;; fall back to the coarse arch heuristic only when features weren't probed.
+                 (let [feats (:simd-features caps)
+                       a (str (:arch caps))]
+                   (if feats
+                     (boolean (some feats [:avx-vnni :avx512-vnni :vnni]))
+                     (boolean (or (.contains a "amd64") (.contains a "x86"))))))
              :num-vector-registers (if gpu? 128 (if (>= vbits 512) 32 16))
              :llc-bytes   (or (:cache-l3 caps)
                               (when gpu? (:global-memory-bytes caps))
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
+      bw-gb           (assoc :bandwidth-bytes-s (* (double bw-gb) 1e9))
+      (seq peak-flops) (assoc :peak-flops peak-flops)
+      (seq cache)     (assoc :cache cache)
       gpu? (assoc :integrated? (boolean (:integrated? caps))
                   :subgroup-size flanes
                   ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. INTEL Xe/Xe2
@@ -212,16 +235,76 @@
   [desc elem-type]
   (if (>= (natural-lanes desc elem-type) 8) 8 4))
 
+;; ---------------------------------------------------------------------------
+;; Roofline — the analytic performance model (XLA gpu_performance_model shape).
+;; Every input is a descriptor field, so it improves transparently as the
+;; :measured layer (Phase 1) overwrites the probed/catalogue/default constants.
+;; ---------------------------------------------------------------------------
+
+(defn peak-flops-for
+  "Peak FLOP/s for `dtype` on this target (from probe/catalogue/measured), or nil if unknown.
+   f16/half falls back to f32 when the target reports no separate half-rate."
+  [desc dtype]
+  (let [pf (:peak-flops desc)]
+    (or (get pf dtype)
+        (case dtype
+          (:float :f32) (:f32 pf)
+          (:double :f64) (:f64 pf)
+          (:half :f16) (or (:f16 pf) (:f32 pf))   ;; no half-rate reported → f32 ceiling (conservative)
+          nil))))
+
+(defn balance-for
+  "The roofline RIDGE (flops/byte) for `dtype`: peak-flops(dtype) / bandwidth — the arithmetic
+   intensity above which a kernel is compute-bound. PRECISION-DEPENDENT (the f16 ridge is far above
+   the f64 ridge on a mixed-rate GPU), derived from the descriptor's bandwidth+peak-flops when both
+   are present; falls back to the scalar :balance default only when they are absent. Fixes the bug
+   where a single :balance constant misclassifies every non-default-precision kernel."
+  [desc dtype]
+  (let [pf (peak-flops-for desc dtype)
+        bw (:bandwidth-bytes-s desc)]
+    (if (and pf bw (pos? (double bw)))
+      (/ (double pf) (double bw))
+      (double (:balance desc 40)))))
+
 (defn roofline-regime
-  "Memory-bound vs compute-bound by arithmetic intensity vs machine balance.
-   AI = flops/bytes; AI < balance -> :memory-bound (stream schedule); else
-   :compute-bound (tile schedule). Generalizes classify-regime: a decode GEMV
-   (flops ~= bytes, AI ~= 1 << balance) is memory-bound; a prefill GEMM reusing
-   each weight M times raises AI above balance."
-  [desc {:keys [flops bytes]}]
-  (if (< (/ (double flops) (double (max 1 bytes))) (double (:balance desc)))
-    :memory-bound
-    :compute-bound))
+  "Memory-bound vs compute-bound by arithmetic intensity vs the ridge. AI = flops/bytes;
+   AI < ridge -> :memory-bound (stream schedule), else :compute-bound (tile schedule).
+   The 3-arg form uses the PRECISION-AWARE ridge (`balance-for`); the 2-arg form keeps the legacy
+   scalar :balance (back-compat for callers with no dtype)."
+  ([desc {:keys [flops bytes]}]
+   (if (< (/ (double flops) (double (max 1 bytes))) (double (:balance desc)))
+     :memory-bound :compute-bound))
+  ([desc {:keys [flops bytes]} dtype]
+   (if (< (/ (double flops) (double (max 1 bytes))) (balance-for desc dtype))
+     :memory-bound :compute-bound)))
+
+(def ^:private memory-compute-parallelism
+  "Overlap fraction of the compute and memory ceilings (XLA kMemoryComputeParallelism): exec is a
+   SOFT roofline elbow ≈ max(compute,mem), not their sum."
+  0.95)
+
+(def ^:private default-launch-overhead-ns
+  "Per-kernel dispatch tax (XLA kKernelLaunchOverhead = 1µs) — the term that makes fusion pay for
+   itself analytically (fewer kernels ⇒ less tax). Overwritten by a measured empty-kernel ping."
+  1000.0)
+
+(defn roofline-time-ns
+  "Analytic runtime estimate in ns (XLA overlap roofline). compute = flops/peak-flops(dtype);
+   mem = bytes/bandwidth; exec = compute + mem − 0.95·min(compute,mem) + n-kernels·launch-tax.
+   Returns nil when the descriptor has no bandwidth/peak-flops yet (nothing probed or measured) —
+   the caller then has no estimate rather than a fabricated one. This is the ranker the schedule
+   search (Phase 2) prices candidates with; measurement (Phase 1) sharpens every term."
+  [desc {:keys [flops bytes dtype n-kernels launch-overhead-ns]
+         :or {dtype :f32 n-kernels 1}}]
+  (let [pf (peak-flops-for desc dtype)
+        bw (:bandwidth-bytes-s desc)]
+    (when (and pf bw (pos? (double pf)) (pos? (double bw)))
+      (let [compute-ns (* (/ (double flops) (double pf)) 1e9)
+            mem-ns     (* (/ (double bytes) (double bw)) 1e9)
+            overlap    (* memory-compute-parallelism (min compute-ns mem-ns))
+            tax        (* (long n-kernels)
+                          (double (or launch-overhead-ns (:launch-overhead-ns desc) default-launch-overhead-ns)))]
+        (+ compute-ns mem-ns (- overlap) tax)))))
 
 (defn reduce-intrinsic
   "The native widening-int-dot reduce instruction available on this target, or

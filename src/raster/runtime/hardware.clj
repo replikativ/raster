@@ -35,17 +35,42 @@
 ;; CPU detection (pure JVM)
 ;; ================================================================
 
-(defn- parse-cpuinfo-linux
-  "Parse /proc/cpuinfo for model name and cache sizes (Linux only)."
-  []
+(defn- read-proc-lines
+  "Read a /proc file as a vector of lines. MUST NOT use `slurp` — /proc files report no size and
+   `FileInputStream.available()` errors on them (kernel-dependent); a BufferedReader/line-seq reads
+   fine. Returns nil on any failure (non-Linux, permission)."
+  [path]
   (try
-    (let [content (slurp "/proc/cpuinfo")
-          lines (str/split-lines content)
-          model-line (first (filter #(str/starts-with? % "model name") lines))
-          model-name (when model-line
-                       (str/trim (second (str/split model-line #":\s*" 2))))]
-      {:model-name model-name})
-    (catch Exception _ {})))
+    (with-open [r (java.io.BufferedReader. (java.io.FileReader. ^String path))]
+      (vec (line-seq r)))
+    (catch Exception _ nil)))
+
+(defn- parse-cpuinfo-linux
+  "Parse /proc/cpuinfo for model name (Linux only)."
+  []
+  (let [lines (read-proc-lines "/proc/cpuinfo")
+        model-line (first (filter #(str/starts-with? % "model name") lines))
+        model-name (when model-line
+                     (str/trim (second (str/split model-line #":\s*" 2))))]
+    (cond-> {} model-name (assoc :model-name model-name))))
+
+(def ^:private cpuinfo-feature-map
+  "Kernel /proc/cpuinfo flag → raster SIMD-feature keyword. Only the flags the compiler's
+   hardware model cares about (dtype dot-reduce + vector width tier)."
+  {"avx"          :avx     "avx2"        :avx2      "fma"        :fma
+   "avx512f"      :avx512f "sse4_2"      :sse4-2
+   "avx_vnni"     :avx-vnni "avx512_vnni" :avx512-vnni "amx_int8" :amx-int8 "amx_tile" :amx-tile
+   "f16c"         :f16c    "avx512bf16"  :avx512-bf16})
+
+(defn- parse-cpu-features-linux
+  "Parse the `flags` line of /proc/cpuinfo into a set of raster SIMD-feature keywords (Linux only).
+   Drives :has-native-dot-reduce (VNNI) and dtype legality — the coarse arch-string heuristic
+   claims int-dot-reduce for ALL x86, which is wrong for pre-VNNI parts. Empty set on non-Linux."
+  []
+  (let [lines (read-proc-lines "/proc/cpuinfo")
+        flag-line (first (filter #(str/starts-with? % "flags") lines))
+        flags (when flag-line (set (str/split (str/trim (second (str/split flag-line #":\s*" 2))) #"\s+")))]
+    (into #{} (keep cpuinfo-feature-map) (or flags #{}))))
 
 (defn- parse-cache-sizes-linux
   "Read cache sizes from /sys/devices/system/cpu (Linux only)."
@@ -101,6 +126,7 @@
         linux? (and os-name (str/starts-with? (str/lower-case os-name) "linux"))
         cpuinfo (if linux? (parse-cpuinfo-linux) {})
         caches (if linux? (parse-cache-sizes-linux) {})
+        features (if linux? (parse-cpu-features-linux) #{})
         simd (detect-simd-width)
         model-name (or (:model-name cpuinfo) (str arch " CPU"))]
     {:id :cpu:0
@@ -112,11 +138,13 @@
                      :simd-width (:simd-width simd)
                      :simd-width-float (:simd-width-float simd)
                      :arch arch}
+                    (when (seq features) {:simd-features features})
                     (when (:cache-l1 caches) {:cache-l1 (:cache-l1 caches)})
                     (when (:cache-l2 caches) {:cache-l2 (:cache-l2 caches)})
                     (when (:cache-l3 caches) {:cache-l3 (:cache-l3 caches)}))
      :source {:simd-width (:source simd)
               :cores :detected
+              :features (if (seq features) :detected :unavailable)
               :cache (if (seq caches) :detected :unavailable)}}))
 
 ;; ================================================================
