@@ -31,6 +31,21 @@
 (defonce ^:private device-registry (atom {}))
 (defonce ^:private initialized? (atom false))
 
+;; The :measured layer — per-device microbench results (raster.runtime.microbench/calibrate-*!)
+;; that OVERRIDE probed/catalogue values in descriptor-for. Kept here (the probe/measure domain)
+;; so core.hardware reads it without a cycle. (Disk persistence is a later refinement.)
+(defonce ^:private measured-registry (atom {}))
+
+(defn set-measured!
+  "Store a device's measured hardware map (from a microbench calibration)."
+  [device-id measured]
+  (swap! measured-registry assoc device-id measured))
+
+(defn measured-for
+  "The stored :measured map for a device, or nil if it hasn't been calibrated."
+  [device-id]
+  (get @measured-registry device-id))
+
 ;; ================================================================
 ;; CPU detection (pure JVM)
 ;; ================================================================

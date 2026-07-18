@@ -50,13 +50,28 @@
 ;; Host detection
 ;; ---------------------------------------------------------------------------
 
-(defn descriptor-for
+(defn- merge-measured
+  "Overlay a device's :measured microbench layer (raster.runtime.microbench) onto the probed/
+   analytic descriptor: measured bandwidth / peak-flops / launch-overhead OVERRIDE the guess, the
+   whole map is kept under :measured for inspection, and its provenance is carried. This is the
+   feedback edge — measurement improving the readable model, not a cache beside it."
+  [desc device-id]
+  (if-let [m (rt/measured-for device-id)]
+    (cond-> (assoc desc :measured m)
+      (:bandwidth-bytes-s m)  (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
+      (:peak-flops m)         (update :peak-flops merge (:peak-flops m))
+      (:launch-overhead-ns m) (assoc :launch-overhead-ns (:launch-overhead-ns m))
+      (:provenance m)         (update :provenance merge (:provenance m)))
+    desc))
+
+(defn- build-descriptor
   "Project a runtime.hardware device into the planner's HardwareDescriptor — the SINGLE
    detection source (runtime.hardware owns the probing; this adds the compiler's analytic
    fields). CPU and GPU via one path (subsumes the old from-gpu-device-info). The
    register count follows the width (AVX-512 -> 32 zmm, else 16 ymm; GPU is GRF-backed);
    native int-dot-reduce is x86 vpdpbusd / GPU dp4a; LLC comes from the detected L3 (or
-   GPU global mem); balance uses Halide-style defaults."
+   GPU global mem); balance uses Halide-style defaults. The :measured layer is overlaid by
+   descriptor-for (below)."
   [device-id]
   (let [caps   (:capabilities (rt/device device-id))
         gpu?   (not= (rt/device-type device-id) :cpu)
@@ -138,6 +153,13 @@
       (assoc :machine-lanes (* (long (:total-eus caps))
                                (long (:threads-per-eu caps))
                                (long (or (:simd-width caps) (rt/subgroup-size device-id))))))))
+
+(defn descriptor-for
+  "The HardwareDescriptor for `device-id`: the probed/analytic model (build-descriptor) with the
+   :measured microbench layer overlaid (measurement OVERRIDES the guess, tagged in :provenance).
+   This is the single entry the planner reads — probe ⊕ catalogue ⊕ measured ⊕ derived."
+  [device-id]
+  (merge-measured (build-descriptor device-id) device-id))
 
 (defn host-descriptor
   "The descriptor for the running host CPU (projected from runtime.hardware :cpu:0)."
