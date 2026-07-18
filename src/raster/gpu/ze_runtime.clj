@@ -1968,6 +1968,58 @@
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int (Math/ceil (/ (double mn) 256.0))))
     bnd))
 
+;; ── BATCHED XMX GEMM (bmm) ───────────────────────────────────────────────────
+;; A per-slab GEMM whose (M,N) tiling launches too few workgroups to fill the
+;; machine is occupancy-bound (see split-k). When the deficit is instead resolved
+;; by MANY independent slabs (attention over heads: dV[b]=W[b]ᵀ·dO[b], 64 slabs of
+;; m=k=64,n=256), a single batched kernel over a 3D grid (z = slab) launches
+;; slabs × per-slab-tiles workgroups — feeding the DPAS array across all slabs where
+;; one slab starves it. A/B/C are contiguous [batch,M,K]/[batch,K,N]/[batch,M,N]
+;; f16/f16/f32 buffers; each workgroup offsets its base by its slab. This is the
+;; batched-nn primitive; the -tn/-nt layouts are handled by staging A/B (convert +
+;; batched transpose) exactly as the single GEMM's resident path does.
+
+(def ^:private gemm-batched-cache (atom nil))
+
+(defn- ensure-gemm-batched-kernel!
+  "Lazily compile + cache the BATCHED XMX gemm (f16 A/B in, f32 C out, grid-z=slab).
+   Returns {:module :kernel :kernel-name}."
+  []
+  (ensure-init!)
+  (when (nil? @gemm-batched-cache)
+    (let [kname "gemm_nonsquare_batched"
+          cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                      kname :c-dtype :float :batched? true))
+          spv (do (require 'raster.compiler.support.spirv-cache)
+                  ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                   cl-src :device (:device-id-hex @state)))
+          module (load-module! spv)
+          kernel (create-kernel module kname)]
+      (clojure.core/reset! gemm-batched-cache
+                           {:module module :kernel kernel :kernel-name kname})))
+  @gemm-batched-cache)
+
+(defn bind-registered-gemm-batched!
+  "Bind the BATCHED XMX GEMM: C[b] = A[b]·B[b] (nn) for b in 0..batch-1, over a 3D
+  grid — X = ceil(n/128), Y = ceil(m/128), Z = batch — so the launched workgroup
+  count is `batch`× the plain GEMM's. A[batch,m,k] & B[batch,k,n] f16, C[batch,m,n]
+  f32, all contiguous. Fresh kernel handle per bind (LZ kernel args are mutable
+  handle state)."
+  [a b c m n k batch]
+  (let [{:keys [module kernel-name]} (ensure-gemm-batched-kernel!)
+        kh (create-kernel-fresh module kernel-name)
+        m (long m) n (long n) k (long k) batch (long batch)
+        args [(:segment a) (:segment b) (:segment c)
+              {:type :int :value (int m)} {:type :int :value (int n)}
+              {:type :int :value (int k)}]
+        bnd (bind-kernel-2d! kh [256 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 8 (int batch))                              ;; Z = slabs
+    bnd))
+
 (def ^:private gemm-scalar-cache
   "Cache for compiled scalar (non-XMX) GEMM kernels, keyed by variant (:nn|:nt|:tn).
    Each entry is {:module :kernel :kernel-name}. f32 in/out — the small-N fallback."

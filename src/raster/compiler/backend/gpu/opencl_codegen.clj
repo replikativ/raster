@@ -633,12 +633,25 @@
                 multiplies the workgroup count without changing the total DRAM
                 traffic (each (n-tile, k-chunk) block of B is still read once).
                 Adds an `int KC` kernel arg. :split-k? forces :c-dtype :float
-                (partials must accumulate in f32). Only valid with beta = 0."
-  [kernel-name & {:keys [alpha beta c-dtype split-k?]
-                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false}}]
+                (partials must accumulate in f32). Only valid with beta = 0.
+    :batched? - BATCHED variant (default false): the SAME (M,N) tiling but with a
+                THIRD grid dimension over `batch` independent slabs — grid z = slab
+                index. A/B/C are contiguous [batch, M, K] / [batch, K, N] / [batch,
+                M, N] buffers; each workgroup offsets its A/B/C base by its slab
+                (z·M·K, z·K·N, z·M·N). This is the schedule fix for a GEMM whose
+                per-slab (M,N) tiling cannot fill the machine but where there are
+                MANY slabs — e.g. attention dV[b]=W[b]ᵀ·dO[b] over 64 heads at
+                m=k=64,n=256: one slab is 1×2=2 workgroups (of the ~32 that fill the
+                iGPU), but 64 slabs = 128 workgroups fill it, feeding the DPAS array
+                across ALL slabs. No extra kernel arg — batch = grid-z extent, set at
+                launch. Mutually exclusive with :split-k? (both claim grid z)."
+  [kernel-name & {:keys [alpha beta c-dtype split-k? batched?]
+                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false}}]
   (when (and split-k? (not= beta 0.0))
     (throw (ex-info "split-k GEMM requires beta = 0 (partials are summed by the reduce kernel)"
                     {:beta beta})))
+  (when (and split-k? batched?)
+    (throw (ex-info "batched and split-k GEMM both claim grid-z — mutually exclusive" {})))
   (let [c-dtype (if split-k? :float c-dtype)
         c-type (if (= c-dtype :float) "float" "half")
         c-size (if (= c-dtype :float) 4 2)
@@ -684,6 +697,14 @@
      "    // Early exit if this subgroup's tile contributes no in-range element\n"
      "    if (m_base >= M || n_base0 >= N) return;\n"
      "\n"
+     (when batched?
+       (str
+        "    // BATCHED: grid-z selects the slab; offset each operand to its base.\n"
+        "    long slab = get_group_id(2);\n"
+        "    A += slab * (long)M * (long)K;\n"
+        "    B += slab * (long)K * (long)N;\n"
+        "    C += slab * (long)M * (long)N;\n"
+        "\n"))
      (when split-k?
        (str
         "    // this workgroup's k-slice\n"
