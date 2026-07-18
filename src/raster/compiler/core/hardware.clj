@@ -138,6 +138,11 @@
                   ;; CPU-shaped placeholder; this is the Intel GPU value.)
                   :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
+      ;; MATRIX UNIT (systolic array) — the hardware matrix-multiply shape {:family :m :n :k
+      ;; :subgroup}, e.g. Intel XMX DPAS 8×16×16. A catalogue fact (not always probeable); the
+      ;; GEMM tile generator (derive-gemm-tile) reads it to size the accumulator tile + K-unroll,
+      ;; and the emitter keys its instruction family off :family (:dpas vs a WGMMA/MFMA fork).
+      (and gpu? (:matrix caps)) (assoc :matrix (:matrix caps))
       (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
@@ -390,6 +395,37 @@
         waves (if reduction? 1 2)
         needed (int (Math/ceil (/ (double n) (double wg))))]
     (min needed (* eus waves))))
+
+(defn derive-gemm-tile
+  "The default XMX-GEMM tile for a descriptor — {:block-m :block-n :sg-m :sg-n :block-k :matrix},
+   the argument map for raster...opencl-codegen/emit-gemm-tiled. DERIVED, not hardcoded:
+
+     - per-subgroup accumulator tile (sg-m×sg-n) is GRF-BOUND: it holds sg-m·sg-n/subgroup f32
+       accumulators per lane, so sg-m·sg-n ≤ grf-bytes-per-lane·subgroup/4. Take the largest square
+       tile under that cap, rounded DOWN to the matrix M_i/N_i granularity.
+     - workgroup tile is `wg-subgroups` (default 16 = a 4×4 subgroup grid) copies of the sg-tile.
+     - K-unroll is 2× the matrix K (double-buffered DPAS depth).
+
+   On the Arc 140V descriptor (matrix 8×16×16, GRF 256 B/lane, subgroup 16) this yields exactly the
+   hand-tuned 128×128 / 32×32 / K32 config — the T1 default — with zero magic numbers. Other Intel
+   parts (different GRF/subgroup) get a correctly-rescaled tile from the same rule. `opts` may pass
+   :wg-subgroups to override the workgroup subgroup count (the occupancy knob T3 autotunes)."
+  ([desc] (derive-gemm-tile desc {}))
+  ([desc opts]
+   (let [{:keys [m n k subgroup] :or {m 8 n 16 k 16 subgroup 16}} (:matrix desc)
+         grf     (long (:grf-bytes-per-lane desc 256))
+         sg      (long subgroup)
+         acc-cap (quot (* grf sg) 4)                 ;; max sg-m·sg-n (f32 accumulators)
+         side    (long (Math/sqrt (double acc-cap))) ;; largest square side
+         sg-m    (* m (max 1 (quot side m)))         ;; round down to M_i multiple
+         sg-n    (* n (max 1 (quot side n)))         ;; round down to N_i multiple
+         wg-sub  (long (:wg-subgroups opts 16))
+         side-sg (max 1 (long (Math/sqrt (double wg-sub))))]
+     {:block-m (* sg-m side-sg)
+      :block-n (* sg-n side-sg)
+      :sg-m sg-m :sg-n sg-n
+      :block-k (* 2 k)
+      :matrix (:matrix desc {:family :dpas :m m :n n :k k :subgroup subgroup})})))
 
 (defn block-size
   "NVIDIA CUDA occupancy-optimal block size for `n`. warp-multiple candidates scored by

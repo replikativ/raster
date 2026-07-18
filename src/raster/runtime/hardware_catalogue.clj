@@ -138,6 +138,7 @@
 
    "Intel(R) Arc(TM) Graphics"  ;; Lunar Lake integrated (Arc 140V)
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 64
     :threads-per-eu 8
     :simd-width 16
@@ -151,6 +152,7 @@
 
    "Arc A770"
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 512
     :threads-per-eu 8
     :simd-width 16
@@ -164,6 +166,7 @@
 
    "Arc B580"
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 320
     :threads-per-eu 8
     :simd-width 16
@@ -177,6 +180,7 @@
 
    "Data Center GPU Max"  ;; Intel PVC (Ponte Vecchio)
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 512
     :threads-per-eu 8
     :simd-width 16
