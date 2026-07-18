@@ -38,22 +38,32 @@
   (sh/sh "nvcc" "-ptx" "-arch=sm_89" "-o" (str src-path ".ptx") src-path))
 
 (defn- hipcc-gate
-  "hipcc syntax+codegen check for RDNA3 (gfx1100). -fsyntax-only is the lightest legality gate."
+  "hipcc SEMA/syntax check for RDNA3 (gfx1100). -fsyntax-only stops before codegen — it is the
+   lightest legality gate (strictly weaker than the nvcc -ptx leg, which does emit device code)."
   [src-path]
   (sh/sh "hipcc" "--offload-arch=gfx1100" "-fsyntax-only" "-x" "hip" src-path))
 
 ;; ── the kernels under gate: portable elementwise ─────────────────────────────────
+;; Coverage deliberately spans the hip-config DELTA from OpenCL — the abs/max/min overrides and the
+;; map-void let-bound-index (*int-vars*) path — not just the trivial wrapper, so the gate exercises
+;; where a divergence would actually live.
 (def ^:private kernels
-  "[label form opts] — elementwise forms spanning arith, scalar broadcast, device math, float,
-   and a side-effecting void map (the clearly-portable cases, zero vendor builtins)."
+  "[label form opts] — arith, scalar broadcast, device math, float, fma, the abs/max/min double
+   overrides (hip-config), and an integer body."
   [["add-double"   '(raster.par/map! out i n double (+ (aget a i) (aget b i)))          {}]
    ["scalar-mul"   '(raster.par/map! out i n double (* alpha (aget a i)))               {}]
    ["device-math"  '(raster.par/map! out i n double (Math/sin (aget a i)))              {}]
+   ["abs-double"   '(raster.par/map! out i n double (Math/abs (aget a i)))              {}]
+   ["clamp-double" '(raster.par/map! out i n double (Math/max (aget a i) (Math/min (aget b i) c))) {}]
    ["add-float"    '(raster.par/map! out i n float  (+ (aget a i) (aget b i)))          {:dtype :float}]
    ["fma-float"    '(raster.par/map! out i n float  (+ (* (aget a i) (aget b i)) (aget c i))) {:dtype :float}]])
 
 (def ^:private void-kernels
-  [["axpy-void" '(raster.par/map-void! i n (raster.arrays/aset y i (+ (aget y i) (* alpha (aget x i))))) {:dtype :float}]])
+  [["axpy-void"   '(raster.par/map-void! i n (raster.arrays/aset y i (+ (aget y i) (* alpha (aget x i))))) {:dtype :float}]
+   ;; a let-BOUND integer index: without *int-vars* seeding `base` infers the float scalar-type and
+   ;; becomes a non-integer array subscript → compile error. Guards the emit-stmt/*int-vars* path.
+   ["let-index-void" '(raster.par/map-void! i n (let [base (* i 2)]
+                                                  (raster.arrays/aset out base (aget a base)))) {:dtype :float}]])
 
 (defn- emit-all
   "Emit every gated kernel; return [{:label :source :name} …]. Runs with no device."
@@ -76,7 +86,20 @@
       (is (str/includes? source "extern \"C\" __global__ void") (str label ": __global__ wrapper"))
       (is (str/includes? source "blockIdx.x * blockDim.x + threadIdx.x") (str label ": grid-stride index"))
       (is (not (str/includes? source "__kernel")) (str label ": no OpenCL __kernel"))
-      (is (not (str/includes? source "get_global_id")) (str label ": no OpenCL builtins")))))
+      (is (not (str/includes? source "get_global_id")) (str label ": no OpenCL builtins"))))
+  (testing "a DOUBLE abs/max/min kernel emits the unsuffixed C++ overload, never the float-narrowing -f form"
+    ;; guards the fabsf-on-double miscompile the compile-gate itself cannot catch (it compiles
+    ;; either way; the -f form silently truncates).
+    (let [src (:source (hip/generate-par-map-kernel
+                        '(raster.par/map! out i n double (Math/max (Math/abs (aget a i)) (aget b i))) :dtype :double))]
+      (is (str/includes? src "fabs(") "double abs → fabs (double overload)")
+      (is (str/includes? src "fmax(") "double max → fmax")
+      (is (not (str/includes? src "fabsf")) "no float-narrowing fabsf on a double kernel")
+      (is (not (str/includes? src "fmaxf")) "no float-narrowing fmaxf on a double kernel"))))
+;; NOTE: par-hip's SoA and gpu-helper-call map-void guards (fail-loud throws) are defensive — they
+;; fire only on a real SoA-typed container / a real inlinable deftm call, which need full type
+;; metadata to construct and so aren't unit-triggered here; they are exercised by the resident
+;; suites that actually feed those forms.
 
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; The compile-gate: nvcc (CUDA) + hipcc (HIP). Skips cleanly if a compiler is absent.

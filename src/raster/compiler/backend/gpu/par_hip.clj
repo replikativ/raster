@@ -25,6 +25,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.par :as par]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.passes.scalar.soa-lower :as sl]
             [clojure.string :as str]))
 
 (def cuda-type-map
@@ -33,7 +34,10 @@
    — elementwise float/double/int need no header."
   (assoc (dtype/backend-types :c) :half "__half"))
 
-(defn- ctype [dtype] (get cuda-type-map dtype (get cuda-type-map :double)))
+(defn- ctype [dtype]
+  (or (get cuda-type-map dtype)
+      (throw (ex-info (str "par-hip: no CUDA-C type for dtype " (pr-str dtype))
+                      {:dtype dtype :known (keys cuda-type-map)}))))
 
 (def preamble
   "Portable HIP/CUDA compilation-unit preamble — prepend ONCE per module. HIP (clang) needs the
@@ -94,6 +98,19 @@
         body        (ce/normalize-array-prims (:body info))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         default-ct  (ctype dtype)
+        ;; FAIL LOUD on the two forms the HIP/CUDA map-void path does NOT yet model (rather than
+        ;; emit garbage/warn — the permissive-extractor family the project has been hardening):
+        ;;   • SoA container params (par_opencl expands them; par-hip does not yet),
+        ;;   • gpu-inlinable deftm helper calls (par_opencl prepends generate-c-helper sources;
+        ;;     par-hip would emit a bare call that either fails to compile OR — worse — silently
+        ;;     binds a same-named CUDA device builtin like rsqrt/ldexp).
+        _ (when (seq (sl/collect-soa-env body))
+            (throw (ex-info "par-hip: SoA container params in map-void are not supported on the HIP/CUDA backend yet"
+                            {:kernel kernel-name})))
+        _ (when-let [helpers (seq (ce/collect-gpu-fn-calls body))]
+            (throw (ex-info (str "par-hip: gpu-inlinable helper calls in map-void are not emitted on the "
+                                 "HIP/CUDA backend yet (would risk a silent CUDA-builtin name capture): " (vec helpers))
+                            {:kernel kernel-name :helpers (vec helpers)})))
         meta-types  (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
         array-syms  (ce/collect-arrays-in-body body)
@@ -113,11 +130,21 @@
         scl-type    (fn [s] (ce/scalar-native-type s scalar-types default-ct))
         scl-param-str (str/join ", " (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
         all-params  (str/join ", " (remove empty? [arr-param-str scl-param-str "int _n_bound"]))
-        body-str    (emit-body body idx arr-params dtype)
+        ;; map-void body is STATEMENTS (side effects), emitted via emit-stmt with *int-vars* seeded
+        ;; from idx + declared-int scalar params — WITHOUT this a let-bound index infers the float
+        ;; scalar-type and becomes a non-integer array subscript (compile error). Mirrors par_opencl.
+        arr-syms    (set (map #(symbol (name %)) arr-params))
+        int-scalar-syms (into #{idx} (filter #(= "int" (scl-type %)) scl-params))
+        body-str    (binding [ce/*emit-config* ce/hip-config
+                              ce/*scalar-type* default-ct
+                              ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
+                      (ce/emit-stmt (ce/adapt-casts-for-dtype body dtype) idx arr-syms "idx"))
         source      (str "extern \"C\" __global__ void " kernel-name
                          "(" all-params ") {\n"
                          "    for (int idx = " grid-stride-init "; idx < _n_bound; idx += " grid-stride-step ") {\n"
-                         "        " body-str ";\n"
+                         ;; emit-stmt is self-terminating (statements carry their own ;) — no
+                         ;; trailing ; here, unlike the map! expression path.
+                         "        " body-str "\n"
                          "    }\n"
                          "}\n")]
     {:kernel-name kernel-name :source source
