@@ -32,7 +32,7 @@
 
 (deftest device-timing-profile-program
   (if-not @gp/gpu-available?
-    (println "  [SKIP] device-timing: no Level Zero GPU")
+    (gp/gpu-skip! "device-timing")
     (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
           make-session   (ns-resolve gpu 'make-session)
           bind-program!  (ns-resolve gpu 'bind-program!)
@@ -88,6 +88,11 @@
             (let [h (bind-program! sess prog args {})
                   out ^floats (get (run-program! sess h args) (:result-sym prog))
                   graph (get-in @sess [:programs :program :graph])]
+              ;; Guard against a VACUOUS pass: if the internal :program key path ever
+              ;; returns nil, (not (contains? nil :events)) is trivially true and the
+              ;; "fast path unchanged" assertions below pass having checked nothing.
+              (is (some? graph)
+                  "unprofiled program graph must be present under [:programs :program :graph]")
               (testing "profiling OFF: same numerical result"
                 (dotimes [i 5]
                   (is (< (Math/abs (- (aget out i) (aget expected i))) 1.0e-5))))

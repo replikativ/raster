@@ -179,7 +179,7 @@
 
 (deftest rms-norm-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] rms-norm resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "rms-norm resident parity")
     (let [rows 4 feat 16 go 1.0 eps 1e-6
           x (fa (* rows feat) 1) w (fa feat 2) tgt (fa (* rows feat) 3)
           {:keys [grads]}
@@ -210,7 +210,7 @@
 
 (deftest rms-norm-chunked-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] rms-norm-chunked resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "rms-norm-chunked resident parity")
     (let [rows 8 feat 32 chunks 4 go 1.0 eps 1e-6
           x (fa (* rows feat) 1) w (fa feat 2) tgt (fa (* rows feat) 3)
           {:keys [grads]}
@@ -239,7 +239,7 @@
 
 (deftest gqa-causal-mha-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] gqa-causal-mha resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "gqa-causal-mha resident parity")
     (let [sl 4 nq 4 nkv 2 hd 8
           Q (fa (* sl nq hd) 21) K (fa (* sl nkv hd) 22) V (fa (* sl nkv hd) 23)
           tgt (fa (* sl nq hd) 24)
@@ -284,7 +284,7 @@
 
 (deftest attn-block-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] attn-block resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "attn-block resident parity")
     (let [seq 6 dmodel 32 nq 4 nkv 1 hd 8 eps 1e-6 go 1.0 theta 10000.0
           x  (fa (* seq dmodel) 31) wn (fa dmodel 32)
           Wq (fa (* dmodel (* nq hd)) 33) Wk (fa (* dmodel (* nkv hd)) 34)
@@ -331,7 +331,7 @@
 ;; carries :gemm-precision on the descriptor, bind-program! binds scalar GEMMs for it.
 (deftest attn-block-f32-scalar-gemm-precision-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] attn-block :f32-scalar gemm-precision parity: no Level Zero GPU")
+    (gp/gpu-skip! "attn-block :f32-scalar gemm-precision parity")
     (let [seq 6 dmodel 32 nq 4 nkv 1 hd 8 eps 1e-6 go 1.0 theta 10000.0
           x  (fa (* seq dmodel) 31) wn (fa dmodel 32)
           Wq (fa (* dmodel (* nq hd)) 33) Wk (fa (* dmodel (* nkv hd)) 34)
@@ -403,7 +403,7 @@
 
 (deftest resblk-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] resblk (residual fan-out) resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "resblk (residual fan-out) resident parity")
     (let [rows 4 d 16 eps 1e-6 go 1.0
           x  (fa (* rows d) 51) wn (fa d 52) W1 (fa (* d d) 53)
           pn (fa d 54) W2 (fa (* d d) 55) tgt (fa (* rows d) 56)
@@ -422,9 +422,11 @@
                           ;; grad(x) is the B2 target: x FANS OUT (residual-add ∘
                           ;; rms-norm) AND x1 = residual-add(x,m) fans out again — the
                           ;; whole reroute-over-aliases + symbolic-op-tag chain. It
-                          ;; extracts resident and matches the CPU reference at ~5e-4.
+                          ;; extracts resident and matches the CPU reference at ~5e-4,
+                          ;; so hold the gate at 1e-3 (≈2× headroom) — the former 3.0e-2
+                          ;; was 60× slack that could hide a real regression.
                           :grad-args '[x]
-                          :rtol 3.0e-2)]
+                          :rtol 1.0e-3)]
       (println "  [resblk] grad(x) steps:" (:step-kinds (get grads 'x))
                "rel-err" (:rel-err (get grads 'x)))
       (is (:resident? (get grads 'x))
@@ -456,7 +458,7 @@
 
 (deftest horizontal-fusion-multi-output-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] horizontal-fusion multi-output resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "horizontal-fusion multi-output resident parity")
     (let [n 32
           a (fa n 61) b (fa n 62) tgt (fa n 63)
           {:keys [grads]}
@@ -477,7 +479,7 @@
 
 (deftest rope-value+grad-resident-parity
   (if-not @gp/gpu-available?
-    (println "  [SKIP] rope resident parity: no Level Zero GPU")
+    (gp/gpu-skip! "rope resident parity")
     (let [sl 6 heads 4 hd 8 theta 10000.0
           x (fa (* sl heads hd) 11) tgt (fa (* sl heads hd) 12)
           {:keys [grads]}

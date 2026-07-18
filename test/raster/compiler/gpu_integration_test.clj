@@ -10,26 +10,20 @@
     3. Both :local (n=64) and :global/per-phase (n=4096) strategies
   Note: GPU kernels currently compute in float32 even for double inputs.
   Tolerance must account for float32 accumulated error (~1e-5 for typical workloads)."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]))
+  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+            [raster.dl.gpu-grad-parity :as gp]))
 
 ;; ================================================================
 ;; GPU availability check
 ;; ================================================================
 
-(def ^:private gpu-available?
-  "True when a Level Zero GPU device is present and initialized."
-  (delay
-    (try
-      (require 'raster.gpu.ze-runtime)
-      (let [init! (resolve 'raster.gpu.ze-runtime/init!)]
-        (init!)
-        true)
-      (catch Throwable _ false))))
-
-(defmacro ^:private when-gpu [& body]
-  `(if @gpu-available?
+;; Availability + skip routing delegate to the shared HONEST probe
+;; (raster.dl.gpu-grad-parity): a broken ze-runtime load fails loud instead of being
+;; swallowed as "no GPU", and skips register a marker so the assertion count is stable.
+(defmacro ^:private when-gpu [label & body]
+  `(if @gp/gpu-available?
      (do ~@body)
-     (println "  [SKIP] No GPU available")))
+     (gp/gpu-skip! ~label)))
 
 ;; ================================================================
 ;; Analytical reference for heat equation
@@ -101,7 +95,7 @@
 
 (deftest gpu-local-strategy-test
   (testing "GPU compound kernel (:local, n=64) matches CPU and analytical"
-    (when-gpu
+    (when-gpu "gpu-local-strategy"
      (require '[raster.compiler.pipeline :as pipeline])
      (require 'raster.ode.pde)
      (let [compile-aot (resolve 'raster.compiler.pipeline/compile-aot)
@@ -131,7 +125,7 @@
 
 (deftest gpu-global-strategy-test
   (testing "GPU per-phase kernels (n=4096) match CPU and analytical"
-    (when-gpu
+    (when-gpu "gpu-global-strategy"
      (require '[raster.compiler.pipeline :as pipeline])
      (require 'raster.ode.pde)
      (let [compile-aot (resolve 'raster.compiler.pipeline/compile-aot)

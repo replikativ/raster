@@ -33,7 +33,7 @@
 
 (deftest split-k-matches-plain-xmx-gemm
   (if-not @gp/gpu-available?
-    (println "  [SKIP] gemm split-k: no Level Zero GPU")
+    (gp/gpu-skip! "gemm split-k")
     (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
           make-buffer   (ns-resolve ze 'make-buffer)
           upload!       (ns-resolve ze 'array->buffer!)
@@ -82,7 +82,7 @@
   ;; an n that is not a multiple of w (the tail loop) and an n below w (no vector iteration
   ;; at all, and a group count that must not round down to zero).
   (if-not @gp/gpu-available?
-    (println "  [SKIP] vectorized convert: no Level Zero GPU")
+    (gp/gpu-skip! "vectorized convert")
     (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
           make-buffer (ns-resolve ze 'make-buffer)
           upload!     (ns-resolve ze 'array->buffer!)
