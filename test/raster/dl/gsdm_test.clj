@@ -398,16 +398,24 @@
       (is (.contains src "beta"))
       (is (.contains src "num_groups")))))
 
-(deftest gemm-nonsquare-kernel-test
-  (testing "non-square GEMM kernel generates valid OpenCL"
+(deftest gemm-tiled-kernel-test
+  (testing "tile-parametric GEMM kernel generates valid OpenCL"
     (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
           src (emit "gemm_test")]
       (is (string? src))
       (is (.contains src "gemm_test"))
       (is (.contains src "intel_sub_group_f16_f16_matrix_mad_k16"))
-      (is (.contains src "col0 < N"))
-      (is (.contains src "col1 < N")))))
+      (is (.contains src "intel_reqd_sub_group_size(16)"))
+      (is (.contains src "col < N"))
+      (testing "the tile is parametric, not baked — divisibility is enforced"
+        (is (thrown? clojure.lang.ExceptionInfo (emit "bad" :sg-m 30)))
+        (testing "a non-default tile changes the accumulator count (proof of parametricity)"
+          (let [big (emit "big" :block-m 128 :block-n 128 :sg-m 32 :sg-n 32)
+                small (emit "small" :block-m 64 :block-n 64 :sg-m 32 :sg-n 32)]
+            ;; 32×32 SG over an 8×16 DPAS → 4 M-subtiles × 2 N-subtiles = acc00..acc31
+            (is (.contains big "acc31"))
+            (is (.contains small "acc31"))))))))
 
 ;; ================================================================
 ;; FP16 buffer tests

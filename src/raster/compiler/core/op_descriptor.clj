@@ -924,7 +924,7 @@
    results, no error, GPU only.
 
    Honoring alpha/beta instead of rejecting is NOT the cheap kernel-arg change it looks
-   like. emit-gemm-nonsquare-kernel already accepts :alpha/:beta (baking the shape and
+   like. emit-gemm-tiled already accepts :alpha/:beta (baking the shape and
    passing the values as runtime args), but:
      - the XMX kernel CACHE keys on c-dtype alone, and the scalar + split-k combine
        kernels have no alpha/beta at all (the split-k emitter explicitly THROWS on

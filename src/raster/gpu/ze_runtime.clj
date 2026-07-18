@@ -1141,7 +1141,7 @@
   (or (get @gemm-cache c-dtype)
       (let [kname (str "gemm_nonsquare_" (name c-dtype))
             cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
                         kname :c-dtype c-dtype))
             device-hex (:device-id-hex @state)
             spv (do (require 'raster.compiler.support.spirv-cache)
@@ -1874,6 +1874,15 @@
   handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
   ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
   ([a b c m n k c-dtype]
+   ;; Fail loud on an output-buffer dtype mismatch: a :half kernel writing 2-byte halfs into a
+   ;; :float (4-byte) buffer reads back as silent zeros/garbage — the exact silent-miscompile the
+   ;; compiler is built to prevent. The kernel's output dtype IS c-dtype; the buffer must agree.
+   (when-let [bd (:dtype c)]
+     (when (not= bd c-dtype)
+       (throw (ex-info (str "bind-registered-gemm!: output buffer dtype " bd " ≠ kernel output dtype " c-dtype
+                            " — a mismatched write reads back as garbage. Allocate C as " c-dtype
+                            " or pass the matching c-dtype.")
+                       {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
    (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
          kh (create-kernel-fresh module kernel-name)
          m (long m) n (long n) k (long k)
@@ -1906,7 +1915,7 @@
   (when (nil? @gemm-splitk-cache)
     (let [kname "gemm_nonsquare_splitk"
           cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
                       kname :c-dtype :float :split-k? true))
           spv (do (require 'raster.compiler.support.spirv-cache)
                   ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
@@ -1989,7 +1998,7 @@
   (when (nil? @gemm-batched-cache)
     (let [kname "gemm_nonsquare_batched"
           cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
                       kname :c-dtype :float :batched? true))
           spv (do (require 'raster.compiler.support.spirv-cache)
                   ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)

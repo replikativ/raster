@@ -31,6 +31,10 @@
 (defonce ^:private device-registry (atom {}))
 (defonce ^:private initialized? (atom false))
 
+;; `device` is defined below (with the query API) but the calibration disk-cache above it
+;; references it — forward-declare so this file compiles top-down from a cold classloader.
+(declare device)
+
 ;; The :measured layer — per-device microbench results (raster.runtime.microbench/calibrate-*!)
 ;; that OVERRIDE probed/catalogue values in descriptor-for. Kept here (the probe/measure domain)
 ;; so core.hardware reads it without a cycle. (Disk persistence is a later refinement.)

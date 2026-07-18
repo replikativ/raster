@@ -135,9 +135,9 @@
   Returns {:kernel-name :source :launch-config-fn :dtype}."
   [gemm-info dtype kernel-counter]
   (let [kname (str "gemm_" (name (:variant gemm-info)) "_" (swap! kernel-counter inc))
-        ;; Use non-square GEMM kernel (handles arbitrary M,N,K)
+        ;; Tile-parametric XMX GEMM (handles arbitrary M,N,K)
         ;; XMX GEMM takes FP16 in, FP32 accum. Output dtype matches storage.
-        source (codegen/emit-gemm-nonsquare-kernel kname :c-dtype :float)]
+        source (codegen/emit-gemm-tiled kname :c-dtype :float)]
     {:kernel-name kname
      :source source
      :dtype dtype
