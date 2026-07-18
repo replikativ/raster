@@ -144,7 +144,18 @@
         ;; a pure cache hint — the emitted math is bit-identical (measured rel-err 0.0 vs the
         ;; no-prefetch kernel), so gradients are unchanged regardless of this flag.
         n (:n gemm-info)
-        prefetch-b? (boolean (and (integer? n) (>= (long n) 1024)))
+        k (:k gemm-info)
+        ;; Require BOTH a large N (B-tile latency worth hiding) AND enough K-steps to
+        ;; amortize the prefetch (distance +48 = 3 K-steps): the win is measured at
+        ;; K=640 (M1024,N2048: +2.2x). A tiny-K GEMM — e.g. the B1 backward dW
+        ;; dW[640,2048]=xᵀ·dy with K=tokens=64 (4 K-steps) — has nothing to hide and
+        ;; the extra prefetch issues are pure overhead, so gate it out. K>=512 keeps
+        ;; every forward projection (K=in_features>=640) and the B16 backward dW
+        ;; (K=tokens=1024) ON, while excluding the tiny-K B1 backward. Gating only ever
+        ;; DISABLES prefetch (falls back to the byte-identical no-prefetch kernel), so it
+        ;; is strictly regression-safe.
+        prefetch-b? (boolean (and (integer? n) (>= (long n) 1024)
+                                  (integer? k) (>= (long k) 512)))
         ;; Use non-square GEMM kernel (handles arbitrary M,N,K)
         ;; XMX GEMM takes FP16 in, FP32 accum. Output dtype matches storage.
         source (codegen/emit-gemm-nonsquare-kernel kname :c-dtype :float
