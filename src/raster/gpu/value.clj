@@ -83,18 +83,24 @@
             dtype       ;; :float :half :int … (redundant with buffer.dtype; cheap inspection)
             shape       ;; [d0 d1 …] logical shape (the buffer knows only flat n-elements)
             owner       ;; ::owned | ::donated | ::aliased | ::external
-            freed])     ;; AtomicBoolean — use-after-free / double-free / donation guard
+            freed       ;; AtomicBoolean — use-after-free / double-free / donation guard
+            base])      ;; for ::aliased: the base DeviceArray it views (else nil). Held as a
+                        ;; STRONG ref so reachability of an alias keeps the base — and thus the
+                        ;; base's Cleaner-guarded buffer — alive; also the seam ensure-live! reads
+                        ;; to reject reads through a base that was freed/consumed.
 
 (defn device-array? [x] (instance? DeviceArray x))
 
 (defn- make-device-array
   "Build a DeviceArray over an existing backend buffer, arming the Cleaner for
-   ::owned values. Low-level constructor used by `->device` and output projection."
-  [buffer device-id dtype shape owner]
-  (let [freed (AtomicBoolean. false)
-        da    (->DeviceArray buffer device-id dtype (vec shape) owner freed)]
-    (arm-cleaner! da freed buffer device-id (= owner ::owned))
-    da))
+   ::owned values. Low-level constructor used by `->device` and output projection.
+   `base` is non-nil only for ::aliased views (§ alias-of)."
+  ([buffer device-id dtype shape owner] (make-device-array buffer device-id dtype shape owner nil))
+  ([buffer device-id dtype shape owner base]
+   (let [freed (AtomicBoolean. false)
+         da    (->DeviceArray buffer device-id dtype (vec shape) owner freed base)]
+     (arm-cleaner! da freed buffer device-id (= owner ::owned))
+     da)))
 
 ;; ================================================================
 ;; Lifetime guards
@@ -112,6 +118,13 @@
                          " on a value that was already freed, consumed by donation,"
                          " or reclaimed")
                     {:op op :owner (:owner da) :shape (:shape da) :device (:device da)})))
+  ;; an ::aliased view is only as live as its base owner — reading through a freed base is a
+  ;; use-after-free even if the alias's own flag is clear.
+  (when-let [^DeviceArray b (:base da)]
+    (when (.get ^AtomicBoolean (:freed b))
+      (throw (ex-info (str "DeviceArray use-after-free: " op
+                           " through an ::aliased view whose base was freed/consumed")
+                      {:op op :owner (:owner da) :shape (:shape da) :device (:device da)}))))
   da)
 
 ;; ================================================================
@@ -139,7 +152,12 @@
    For :half/:float16 returns the encoded short array (matches buffer->array)."
   [^DeviceArray da]
   (ensure-live! da :->host)
-  ((rt-fn (:device da) "buffer->array") (:buffer da)))
+  ;; reachabilityFence: without it the JIT may treat `da` as dead after the (:buffer da) field
+  ;; load, letting GC run its Cleaner and zeMemFree the segment WHILE buffer->array copies from
+  ;; it — a native use-after-free. Keep `da` (and, via its :base field, any aliased base) reachable
+  ;; across the whole native copy.
+  (try ((rt-fn (:device da) "buffer->array") (:buffer da))
+       (finally (java.lang.ref.Reference/reachabilityFence da))))
 
 ;; ================================================================
 ;; Explicit free + donation
@@ -154,8 +172,9 @@
   (let [^AtomicBoolean freed (:freed da)]
     (when (.compareAndSet freed false true)
       (when (= (:owner da) ::owned)
-        (try ((rt-fn (:device da) "free-buffer!") (:buffer da))
-             (catch Throwable _)))))
+        ;; explicit free surfaces runtime errors (fail-loud) — unlike the Cleaner thread, whose
+        ;; reclamation MUST swallow (arm-cleaner!). The CAS guarantees this fires at most once.
+        ((rt-fn (:device da) "free-buffer!") (:buffer da)))))
   nil)
 
 (defn consume!
@@ -199,4 +218,5 @@
    base owner's lifetime governs the buffer."
   ([^DeviceArray base] (alias-of base (:shape base) (:dtype base)))
   ([^DeviceArray base shape dtype]
-   (make-device-array (:buffer base) (:device base) dtype shape ::aliased)))
+   (ensure-live! base :alias-of)
+   (make-device-array (:buffer base) (:device base) dtype shape ::aliased base)))

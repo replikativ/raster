@@ -165,5 +165,23 @@
                   l0 (host-loss cfg st0)
                   lN (host-loss cfg final-st)]
               (println "  [S4 artifact] loss" (format "%.6f → %.6f" l0 lN))
-              (is (< lN (* 0.7 l0)) (str "final " lN " vs initial " l0)))))
+              (is (< lN (* 0.7 l0)) (str "final " lN " vs initial " l0))))
+          (testing "S4 boundary contract (M4): a retained prior output is invalidated by the next call"
+            (let [prev    (step {})
+                  prev-da (get prev (keyword (str (name (first adapters)) "'")))]
+              (is (v/live? prev-da) "a freshly projected output is live")
+              (step {})
+              (is (not (v/live? prev-da)) "the next invocation invalidates the prior output (no silent mutation)")
+              (is (thrown? clojure.lang.ExceptionInfo (v/->host prev-da))
+                  "->host on a stale output fails loud")))
+          (testing "S4 boundary contract (B1): unsupported / foreign inputs fail loud, never silently ignored"
+            (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported input key"
+                                  (step {:not-a-param (float-array 1)}))
+                "a non-param key throws instead of being dropped")
+            (let [foreign (v/->device (float-array (java.lang.reflect.Array/getLength ^floats (st0 (first adapters))))
+                                      :ze:0)]
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not this artifact's resident value"
+                                    (step {(keyword (name (first adapters))) foreign}))
+                  "a foreign device value donated to a slot throws instead of being consumed-and-ignored")
+              (v/free! foreign))))
         (finally (r/close! step))))))
