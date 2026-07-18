@@ -1908,8 +1908,8 @@
   (atom {}))
 
 (defn- tile-signature [tile]
-  (let [{:keys [block-m block-n sg-m sg-n block-k]} tile]
-    (str block-m "x" block-n "_" sg-m "x" sg-n "_k" block-k)))
+  (let [{:keys [block-m block-n sg-m sg-n block-k num-stages]} tile]
+    (str block-m "x" block-n "_" sg-m "x" sg-n "_k" block-k "_s" (or num-stages 3))))
 
 (defn- ensure-gemm-kernel-tiled!
   "Compile + cache the GEMM kernel for [c-dtype × tile]. Returns {:module :kernel-name :tile}."
@@ -1919,7 +1919,8 @@
       (let [kname (str "gemm_tiled_" (name c-dtype) "_" (tile-signature tile))
             emit  (do (require 'raster.compiler.backend.gpu.opencl-codegen)
                       (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled))
-            cl-src (apply emit kname :c-dtype c-dtype (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
+            cl-src (apply emit kname :c-dtype c-dtype :prefetch (:num-stages tile 3)
+                          (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                      cl-src :device (:device-id-hex @state)))

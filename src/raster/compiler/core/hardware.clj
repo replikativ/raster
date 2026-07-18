@@ -425,7 +425,26 @@
       :block-n (* sg-n side-sg)
       :sg-m sg-m :sg-n sg-n
       :block-k (* 2 k)
+      :num-stages 3                             ;; pipelining depth (prefetch distance); T4 axis
       :matrix (:matrix desc {:family :dpas :m m :n n :k k :subgroup subgroup})})))
+
+(defn max-stages-for
+  "The pipelining-depth ceiling for a GEMM `tile` on `desc` — the SLM-bounded num_stages. A
+   software-pipelined GEMM keeps `stages` in-flight copies of the K-panel operands; a SLM-STAGED
+   kernel (the CUDA/HIP fork, or a future Intel SLM variant) needs `stages` × (A-panel + B-panel)
+   bytes of shared memory, so stages ≤ SLM-capacity / panel-bytes. Returns that cap (≥ 2).
+
+   NOTE the current Intel kernel stages via the hardware 2D-block PREFETCH queue, not SLM — there
+   the depth is a prefetch distance and this SLM cap is an upper advisory bound, not a hard limit;
+   for the SLM-staged fork it is load-bearing (a deeper pipeline than SLM holds fails to compile)."
+  [desc tile]
+  (let [{:keys [block-m block-n block-k]} tile
+        slm (long (:shared-local-memory desc (:slm-bytes desc 65536)))
+        ;; one pipeline stage stages an A K-panel (block-m×block-k) + a B K-panel (block-k×block-n),
+        ;; f16 = 2 bytes each.
+        panel-bytes (* 2 (+ (* (long block-m) (long block-k))
+                            (* (long block-k) (long block-n))))]
+    (max 2 (quot slm (max 1 panel-bytes)))))
 
 (defn gemm-tile-candidates
   "A CURATED set of valid GEMM tiles for `desc` — the autotuner's search space for the tile axis.
@@ -447,8 +466,11 @@
           (assoc base :block-m (* 2 (:block-m base)))                 ;; taller M block
           (assoc base :block-n (* 2 (:block-n base)))                 ;; wider N block
           (assoc base :block-k (* 2 block-k))                         ;; deeper K unroll
-          (assoc base :block-k (max (long (:k matrix 16)) (quot block-k 2)))] ;; shallower K
+          (assoc base :block-k (max (long (:k matrix 16)) (quot block-k 2))) ;; shallower K
+          (assoc base :num-stages (min 4 (max-stages-for desc base))) ;; deeper pipeline (T4), SLM-capped
+          (assoc base :num-stages 2)]                                ;; shallower pipeline
          (filter wg-ok?)
+         (filter (fn [t] (<= (long (:num-stages t 3)) (max-stages-for desc t)))) ;; SLM bound
          distinct
          vec)))
 

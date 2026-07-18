@@ -12,9 +12,24 @@
 
 (deftest arc-derives-the-hand-tuned-tile
   (testing "the Arc descriptor derives EXACTLY the T1 hand-tuned default (no magic numbers)"
-    (is (= {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32
+    (is (= {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32 :num-stages 3
             :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}
            (hw/derive-gemm-tile arc-desc)))))
+
+(deftest num-stages-is-slm-bounded
+  (testing "the pipeline depth cap is SLM-capacity / K-panel bytes (T4)"
+    (let [arc (assoc arc-desc :shared-local-memory 131072)   ;; Arc 140V: 128 KB SLM
+          tile (hw/derive-gemm-tile arc)]
+      ;; one stage = (128×32 + 32×128)×2 B = 16384 B; 131072/16384 = 8
+      (is (= 8 (hw/max-stages-for arc tile)))
+      (is (>= (hw/max-stages-for arc tile) 2) "always ≥ 2 (single/double buffer floor)"))
+    (testing "a tiny-SLM device caps the pipeline shallower"
+      (let [tiny (assoc arc-desc :shared-local-memory 16384)
+            tile (hw/derive-gemm-tile tiny)]
+        (is (< (hw/max-stages-for tiny tile) 8))))
+    (testing "candidates never exceed the SLM bound"
+      (doseq [t (hw/gemm-tile-candidates (assoc arc-desc :shared-local-memory 131072))]
+        (is (<= (long (:num-stages t 3)) (hw/max-stages-for (assoc arc-desc :shared-local-memory 131072) t)))))))
 
 (deftest tile-is-grf-bounded
   (testing "the per-subgroup accumulator tile fits the GRF budget (sg-m·sg-n/subgroup·4 ≤ grf/lane)"
@@ -38,7 +53,8 @@
 (deftest derived-tile-feeds-the-generator
   (testing "the derived tile is a valid emit-gemm-tiled argument map (round-trips to a kernel)"
     (let [tile (hw/derive-gemm-tile arc-desc)
-          src (apply cg/emit-gemm-tiled "gemm_derived" (mapcat identity tile))]
+          src (apply cg/emit-gemm-tiled "gemm_derived" :prefetch (:num-stages tile)
+                     (mapcat identity (dissoc tile :num-stages)))]
       (is (string? src))
       (is (.contains src "intel_sub_group_f16_f16_matrix_mad_k16"))
       (is (.contains src "acc31") "the 32×32/8×16 tile has 4×2 accumulators (acc00..acc31)"))))
