@@ -143,6 +143,12 @@
       ;; GEMM tile generator (derive-gemm-tile) reads it to size the accumulator tile + K-unroll,
       ;; and the emitter keys its instruction family off :family (:dpas vs a WGMMA/MFMA fork).
       (and gpu? (:matrix caps)) (assoc :matrix (:matrix caps))
+      ;; NVIDIA: derive the WMMA matrix shape from compute capability — every cc≥7.0 part has Tensor
+      ;; Cores with the universal 16×16×16 f16 WMMA fragment (warp 32), so it need not be catalogued
+      ;; per-part. (An explicit :matrix in caps wins — this only fills the gap.)
+      (and gpu? (nil? (:matrix caps)) (:compute-capability caps)
+           (>= (long (first (:compute-capability caps))) 7))
+      (assoc :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
       (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
