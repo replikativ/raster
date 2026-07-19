@@ -74,6 +74,175 @@
 ;; hand-written repack-stream; now the single source the kernel's gather mirrors).
 ;; ---------------------------------------------------------------------------
 
+;; ===========================================================================
+;; General layout facet (Triton-style, REDUCED model: stride + permutation +
+;; broadcast-mask + a named tile — NO GF(2) linear-layout algebra). A layout is
+;; plain DATA (a map with a :kind), consistent with schedule-as-data. The GF(2)
+;; core is deferred to the single boundary that needs it: a swizzled shared-memory
+;; layout (see .internal/layout_inference_design.md §"the one tension").
+;; ===========================================================================
+
+(defn dtype-bits [dtype]
+  (case dtype
+    (:half :f16 :bf16 :float16) 16
+    (:float :f32) 32
+    (:double :f64) 64
+    (:byte :int8 :i8 :uint8) 8
+    (:int :i32 :int32) 32
+    32))
+
+;; --- dense strided layouts (row/col-major, transpose views) ---
+
+(defn row-major
+  "Contiguous row-major layout of `shape` (identity perm — the default everywhere today)."
+  ([shape] (row-major shape :float))
+  ([shape dtype] {:kind :row-major :rank (count shape) :shape (vec shape)
+                  :perm (vec (range (count shape))) :dtype dtype}))
+
+(defn col-major [shape dtype]
+  (assoc (row-major shape dtype) :kind :col-major :perm (vec (reverse (range (count shape))))))
+
+(defn transpose-layout
+  "A layout viewing `l` transposed — flip the physical major order (:perm). The ONLY thing a
+   transpose changes; the data does not move (that's what makes a transpose potentially free)."
+  [l] (update l :perm (comp vec reverse)))
+
+(defn row-major-unit?
+  "Is this the trivial default — identity perm, no explicit strides, dense? The emitter
+   short-circuits on this to the exact pre-layout index expression (byte-identity)."
+  [l]
+  (and (map? l)
+       (contains? #{:row-major nil} (:kind l))
+       (nil? (:strides l))
+       (let [p (:perm l)] (or (nil? p) (= p (vec (range (count p))))))))
+
+(defn resolve-strides
+  "Per-LOGICAL-axis element strides from (shape, perm), row-major within the permuted order:
+   the innermost physical axis (perm[n-1]) has stride 1, perm[k] has the product of physical
+   extents after k. Numeric when shape is numeric, else an S-expression (clojure.core * — index
+   arithmetic stays clojure.core per project convention). An explicit :strides overrides."
+  [{:keys [shape perm strides]}]
+  (or strides
+      (let [n     (count shape)
+            perm  (or perm (vec (range n)))
+            pshp  (mapv shape perm)
+            mul   (fn [a b] (cond (= a 1) b (= b 1) a
+                                  (and (number? a) (number? b)) (* a b) :else (list '* a b)))
+            pstr  (loop [k (dec n) acc 1 out (vec (repeat n 1))]
+                    (if (< k 0) out
+                        (recur (dec k) (mul acc (nth pshp k)) (assoc out k acc))))]
+        (reduce (fn [m k] (assoc m (nth perm k) (nth pstr k)))
+                (vec (repeat n 1)) (range n)))))
+
+(defn layout->offset
+  "Physical element offset of logical `coords` under `layout` — Σ coord_i · stride_i, as a numeric
+   value or an S-expression. Zero-stride (broadcast) axes drop out; unit strides are bare."
+  [layout coords]
+  (let [st (resolve-strides layout)
+        terms (keep (fn [[c s]]
+                      (cond (= s 0) nil (= s 1) c
+                            (and (number? c) (number? s)) (* c s)
+                            :else (list '* c s)))
+                    (map vector coords st))]
+    (case (count terms)
+      0 0
+      1 (first terms)
+      (reduce (fn [a b] (if (and (number? a) (number? b)) (+ a b) (list '+ a b))) terms))))
+
+(defn offset->coords
+  "Inverse of layout->offset for a DENSE strided layout (numeric strides) — recover logical coords
+   by divmod in descending-stride order. A bijection only for dense row/col-major/transpose layouts
+   (the cases where delinearizing a flat index is meaningful)."
+  [layout offset]
+  (let [st (resolve-strides layout)
+        order (sort-by #(- (long (nth st %))) (range (count st)))]
+    (:coords (reduce (fn [{:keys [rem coords]} ax]
+                       (let [s (long (nth st ax))]
+                         {:rem (mod rem s) :coords (assoc coords ax (quot rem s))}))
+                     {:rem offset :coords (vec (repeat (count st) 0))} order))))
+
+;; --- tensor-core / coalesced layouts (carry tile + thread-map, not dense strides) ---
+
+(defn blocked-coalesced
+  "A coalesced memory layout: consecutive lanes read consecutive elements along the fastest axis,
+   size-per-thread clamped to a 128-bit vector load."
+  [shape dtype desc]
+  {:kind :blocked :rank (count shape) :shape (vec shape)
+   :perm (vec (range (count shape))) :dtype dtype
+   :thread-map {:order (vec (range (count shape)))
+                :size-per-thread (max 1 (quot 128 (dtype-bits dtype)))
+                :threads-per-warp (long (:subgroup-size desc 16))
+                :broadcast #{}}})
+
+(defn mma-frag
+  "The MMA/matrix result-fragment layout for a hardware `matrix` unit ({:family :m :n :k :subgroup})."
+  [matrix dtype]
+  {:kind :mma-frag :dtype dtype :matrix matrix
+   :tile {:m (:m matrix) :n (:n matrix) :k (:k matrix) :subgroup (:subgroup matrix)}})
+
+(defn dot-operand
+  "The MMA INPUT (A/B) layout — derived from the MMA fragment it feeds (Triton opIdx + parent +
+   kWidth). op-idx 0 = A, 1 = B."
+  [op-idx parent k-width dtype]
+  {:kind :dot-operand :op-idx op-idx :parent parent :k-width k-width :dtype dtype})
+
+(defn derive-layout
+  "The layout an operand of `instr` (a semantic op keyword) requires — enumerated dispatch from
+   (instruction, dtype, hardware descriptor), NOT a search. opts: {:op-idx :shape}."
+  [instr dtype desc & {:keys [op-idx shape] :or {op-idx 0}}]
+  (case instr
+    :elementwise    (row-major shape dtype)
+    :coalesced-load (blocked-coalesced shape dtype desc)
+    :mma-acc        (mma-frag (:matrix desc) dtype)
+    :dot-operand    (dot-operand op-idx (mma-frag (:matrix desc) dtype)
+                                 (max 1 (quot 32 (dtype-bits dtype))) dtype)
+    :transpose      (transpose-layout (row-major shape dtype))
+    (row-major shape dtype)))
+
+(defn quant-layout->facet
+  "Lift the CPU quant layout (quant-stream-layout) into the general facet shape, so the Q4 path and
+   the general path are ONE datatype (proves the generalization; the index-fn stays `repack`)."
+  [q]
+  (assoc q :general :quant :index-fn :repack))
+
+;; --- convert cost model (Triton's trichotomy in the reduced model) ---
+
+(defn- perm-crosses-coalescing-axis?
+  "Does converting src→dst change which logical axis is innermost (the coalescing axis)? If so the
+   data must cross lanes/warps; if only the within-lane order changes it's a register shuffle."
+  [src dst]
+  (let [ps (or (:perm src) (vec (range (:rank src 1))))
+        pd (or (:perm dst) (vec (range (:rank dst 1))))]
+    (not= (last ps) (last pd))))
+
+(defn register-local?
+  "A conversion that only reorders elements WITHIN a lane's registers — free (no shuffle)."
+  [src dst]
+  (and (= (:kind src) (:kind dst))
+       (= (:perm src) (:perm dst))
+       (= (:thread-map src) (:thread-map dst))))
+
+(defn lane-local?
+  "A conversion resolvable by a warp/subgroup shuffle (crosses lanes but not warps) — cheap. Reduced
+   proxy: the coalescing axis is unchanged but the intra-tile thread-map differs."
+  [src dst]
+  (and (not (register-local? src dst))
+       (not (perm-crosses-coalescing-axis? src dst))))
+
+(defn convert-cost
+  "Cost class of a layout conversion (the highest-leverage idea from Triton, reduced): register-local
+   → FREE register shuffle; lane-local → warp shuffle; else → shared-memory round-trip (priced in
+   bytes, and re-entering schedule/feasible? when the register-fragment footprint changes)."
+  [src dst _desc]
+  (cond
+    (register-local? src dst) {:class :register-shuffle :bytes 0}
+    (lane-local? src dst)     {:class :warp-shuffle :bytes 0}
+    :else                     (let [n (reduce (fn [a b] (if (and (number? a) (number? b)) (* a b) (list '* a b)))
+                                              1 (:shape dst (:shape src [1])))
+                                    b (dtype-bits (:dtype dst (:dtype src :float)))]
+                                {:class :shared-roundtrip
+                                 :bytes (if (number? n) (* n (quot b 8)) (list '* n (quot b 8)))})))
+
 (defn repack
   "Row-major quantized weight {wq, ws[out*nb]} -> the descriptor's interleaved layout.
   Output column i lands in accumulator lane i (no shuffles). Generated from the

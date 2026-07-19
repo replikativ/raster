@@ -78,6 +78,33 @@
             expr])      ;; the RHS expression
 
 ;; ================================================================
+;; Dot — a first-class GEMM/contraction node (feature 4 keystone)
+;; ================================================================
+;; A contraction C[m,n] = Σ_k A[m,k]·B[k,n], modelled as an IR NODE (not an opaque
+;; BLAS .invk) so it participates in the dependency graph + fusion. It is NOT a generic
+;; SOAC (its K-reduction is a real contraction, not a fold over the SOAC iteration — the
+;; eval agent's finding), so `soac?` EXCLUDES it and the map/reduce lowering skips it; a
+;; dedicated GEMM emit path handles it. But the DEPENDENCY accessors DO handle it, so its
+;; output C carries a producer edge BY CONSTRUCTION — closing the documented leak at
+;; soac-outputs (a GEMM writing C with no edge → reorderable consumer). `epilogue` is the
+;; fused same-position elementwise consumer lambda (bias/act/residual), or nil; when set,
+;; the emitter splices it into the validated store slot (emit-gemm-tiled :epilogue).
+(defrecord Dot
+           [id           ;; int
+            sym          ;; symbol (binding)
+            inputs       ;; #{A B + epilogue operands} — read arrays (dep graph)
+            outputs      ;; #{C} — written array (dep graph producer edge)
+            bound        ;; expr — output element count m*n (for scheduling)
+            A B C        ;; operand symbols
+            m n k        ;; dim exprs
+            variant      ;; :nn | :tn | :nt
+            alpha beta   ;; scalars
+            epilogue     ;; {:lambda expr :element sym :operands #{sym}} or nil (fused consumer)
+            layout-a layout-b])  ;; :layout facets on the operands (transpose-elim), or nil
+
+(defn dot? [node] (instance? Dot node))
+
+;; ================================================================
 ;; Input/output extraction helpers
 ;; ================================================================
 
@@ -430,23 +457,27 @@
 ;; ================================================================
 
 (defn soac?
-  "Check if a node is a SOAC (not a ScalarBinding)."
+  "Check if a node is a generic SOAC (map/reduce/scan/stencil) — NOT a ScalarBinding and NOT a Dot.
+   A Dot is a contraction with its own emit path, so the map/reduce lowering must skip it."
   [node]
-  (not (instance? ScalarBinding node)))
+  (and (not (instance? ScalarBinding node))
+       (not (instance? Dot node))))
 
 (defn soac-inputs
-  "Get the set of input array symbols for a SOAC node."
+  "Get the set of input array symbols for a SOAC node (or a Dot)."
   [node]
-  (when (soac? node) (:inputs node)))
+  (when (or (soac? node) (dot? node)) (:inputs node)))
 
 (defn soac-outputs
-  "Get the set of output symbols for a SOAC node."
+  "Get the set of output symbols for a SOAC node (or a Dot — its written C, so the dependency graph
+   gets a producer edge for the contraction by construction, closing the documented leak)."
   [node]
   (cond
     (instance? SoacMap node)     (:outputs node)
     (instance? SoacReduce node)  #{(:output node)}
     (instance? SoacScan node)    (:outputs node)
     (instance? SoacStencil node) (:outputs node)
+    (instance? Dot node)         (:outputs node)
     :else nil))
 
 (defn soac-bound
@@ -605,10 +636,15 @@
   "Replace (aget target-sym idx) with replacement-expr in body,
   adjusting index variable from src-idx to dst-idx.
 
-  INDEX-INSENSITIVE (see fusion-support/substitute-aget): matches by array name only and
-  substitutes at ANY index, assuming same-position elementwise producer→consumer fusion.
-  A non-same-index consumer (gather/transpose/offset read) would be mis-fused. Reachable
-  only for the same-index case today; a real guard belongs with the descriptor VALIDATOR."
+  SAME-POSITION ONLY (layout-soundness guard): vertical Screma fusion inlines the producer's body
+  (which computes the intermediate element at the CONSUMER's iteration index dst-idx) in place of
+  the consumer's read. That is correct iff the consumer reads the intermediate at its OWN iteration
+  index — i.e. `(aget target-sym dst-idx)`. A consumer that reads at any other index (a gather /
+  transpose / neighbour / offset read) is NOT elementwise-fusible without a layout convert, and
+  inlining the producer body there would silently compute the wrong element. Rather than mis-fuse
+  (the former index-insensitive behaviour), we FAIL LOUD — the layout-inference pass is where such a
+  read gets a `convert_layout` instead. This never fires for the same-position case that is all that
+  reaches fusion today; it closes the documented hazard for the non-same-position future."
   [body target-sym src-idx dst-idx replacement-expr]
   (walk/postwalk
    (fn [f]
@@ -617,9 +653,16 @@
               (>= (count f) 3)
               (symbol? (second f))
               (= (name target-sym) (name (second f))))
-       (walk/postwalk
-        (fn [g] (if (= g src-idx) dst-idx g))
-        replacement-expr)
+       (let [read-idx (nth f 2)]
+         (when-not (or (= read-idx dst-idx) (= read-idx src-idx))
+           (throw (ex-info (str "Screma fusion: non-same-position read of intermediate '" target-sym
+                                "' at index " (pr-str read-idx) " ≠ iteration index " (pr-str dst-idx)
+                                " — gather/transpose/offset reads are not elementwise-fusible without a"
+                                " layout convert (layout-inference pass); refusing to mis-fuse.")
+                           {:target target-sym :read-idx read-idx :dst-idx dst-idx :src-idx src-idx})))
+         (walk/postwalk
+          (fn [g] (if (= g src-idx) dst-idx g))
+          replacement-expr))
        f))
    body))
 

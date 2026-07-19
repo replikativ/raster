@@ -405,3 +405,30 @@
       (is (some? s) "the single-write let* shape is what the unwrapping exists for")
       (is (= #{'b} (:outputs s)))
       (is (:void? s)))))
+
+;; ── layout-soundness guard: non-same-position fusion fails loud (not silent mis-fuse) ──
+(deftest substitute-aget-refuses-non-same-position-read
+  (let [subst @#'soac/substitute-aget-sym]
+    (testing "same-position read (aget t dst) inlines the producer (unchanged behaviour)"
+      (is (= '(raster.numeric/* p p)
+             (subst '(clojure.core/aget t dst) 't 'src 'dst '(raster.numeric/* p p)))
+          "no aget on the target left → replaced")
+      (is (= 'x (subst 'x 't 'src 'dst '(foo)))  "unrelated body untouched"))
+    (testing "a gather/offset read (aget t (+ dst 1)) FAILS LOUD instead of mis-fusing"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-same-position read"
+            (subst '(clojure.core/aget t (clojure.core/+ dst 1)) 't 'src 'dst '(raster.numeric/* p p)))))))
+
+;; ── Dot node: a correct dependency-graph citizen, excluded from map/reduce lowering ──
+(deftest dot-node-dependency-edges
+  (let [dot (soac/->Dot 1 'c '#{A B} '#{C} '(* m n) 'A 'B 'C 'm 'n 'k :nn 1.0 0.0 nil nil nil)]
+    (testing "Dot carries its C output as a producer edge (closes the documented soac-outputs leak)"
+      (is (= '#{C} (soac/soac-outputs dot)) "C is a producer edge by construction")
+      (is (= '#{A B} (soac/soac-inputs dot)) "A,B are read edges"))
+    (testing "Dot is NOT a generic SOAC (map/reduce lowering skips it) but IS a Dot"
+      (is (false? (soac/soac? dot)))
+      (is (true? (soac/dot? dot))))
+    (testing "free-syms include operands + output (dep graph sees the full footprint)"
+      (is (every? (soac/node-all-free-syms dot) '[A B C])))
+    (testing "the epilogue slot holds a fused same-position consumer lambda or nil"
+      (is (nil? (:epilogue dot)))
+      (is (= '(silu (+ %el bias)) (:lambda (:epilogue (assoc dot :epilogue {:lambda '(silu (+ %el bias))}))))))))

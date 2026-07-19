@@ -16,6 +16,29 @@
    :max-workgroup-size 1024})
 
 ;; ════════════════════════════════════════════════════════════════════════════════
+;; Residency axis → locality cost: schedule-cost-ns prices a resident schedule faster
+;; ════════════════════════════════════════════════════════════════════════════════
+(def ^:private arc-perf-desc
+  (assoc arc-desc :bandwidth-bytes-s 89.6e9
+         :peak-flops {:f16 31.9488e12 :f32 3.9936e12}
+         :cache {:l2 8388608}))
+
+(deftest residency-axis-and-locality-cost
+  (let [dflt (sched/derive-default nil arc-perf-desc)
+        shape {:m 1024 :n 2048 :k 640 :dtype :f16}
+        cost #(sched/schedule-cost-ns % shape arc-perf-desc)]
+    (testing "derive-default carries a :residency axis, default all :dram (conservative = flat)"
+      (is (= {:a :dram :b :dram :c :dram} (:residency dflt))))
+    (testing "keeping the weight B resident is priced faster than all-DRAM"
+      (is (< (cost (assoc-in dflt [:residency :b] :resident))
+             (cost dflt))))
+    (testing "monotone: all-resident ≤ B-resident ≤ all-DRAM (more warm = cheaper)"
+      (let [all-warm (cost (assoc dflt :residency {:a :resident :b :resident :c :resident}))
+            b-warm   (cost (assoc-in dflt [:residency :b] :resident))
+            all-cold (cost dflt)]
+        (is (<= all-warm b-warm all-cold))))))
+
+;; ════════════════════════════════════════════════════════════════════════════════
 ;; T1 — parity: :gemm-precision sugar ≡ :schedule {:precision …} (no device)
 ;; ════════════════════════════════════════════════════════════════════════════════
 
@@ -75,14 +98,18 @@
       (is (true? (sched/feasible? d1 arc-desc)) "depth 1: 256 + 2×1×64 = 384 ≤ 512")
       (is (thrown? clojure.lang.ExceptionInfo (sched/feasible? d3 arc-desc))
           "depth 3: 256 + 2×3×64 = 640 > 512")))
-  (testing "FALSE-NEGATIVE guard: a smaller-budget (subgroup-32) device REJECTS the default f16-xmx"
-    ;; the dangerous case the budget-coupled model missed: on a 128 B/lane device the 256 B/lane
-    ;; accumulator genuinely spills — the fixed-acc model detects it; a budget-coupled acc would
-    ;; have charged acc=budget=128 and passed.
-    (let [sg32 (assoc arc-desc :grf-bytes-per-lane 128 :subgroup-size 32)]
-      (is (thrown? clojure.lang.ExceptionInfo
-                   (sched/feasible? (sched/derive-default nil sg32) sg32))
-          "default f16-xmx tile (256 B/lane acc) does NOT fit a 128 B/lane budget")))
+  (testing "the DERIVED tile is GRF-bound (always fits); a user-PINNED oversized tile is rejected"
+    ;; T3: derive-gemm-tile GRF-bounds the accumulator, so a smaller-budget device gets a SMALLER
+    ;; tile that fits by construction — the default can no longer spill. The gate's live job is to
+    ;; reject an EXPLICIT tile a caller pinned that exceeds this device's budget.
+    (let [small (assoc arc-desc :grf-bytes-per-lane 128)]
+      (is (true? (sched/feasible? (sched/derive-default nil small) small))
+          "the derived default tile fits the 128 B/lane device (GRF-bound, no spill)")
+      (let [pinned (sched/resolve (sched/derive-default nil small)
+                                  {:tile {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32
+                                          :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}}})]
+        (is (thrown? clojure.lang.ExceptionInfo (sched/feasible? pinned small))
+            "a pinned 32×32 tile (256 B/lane acc) does NOT fit a 128 B/lane budget"))))
   (testing "unmodeled precision / stage-space FAIL LOUD (not a silent XMX bind)"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown :precision"
                           (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)

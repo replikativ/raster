@@ -48,8 +48,15 @@
   ([steps desc] (derive-default steps desc {}))
   ([steps desc {:keys [precision]}]
    {:precision (or precision default-precision)
-    :grf   {:mode :grf128}                     ;; axis 8a — OPT-IN, default OFF
-    :stage {:space :none}                      ;; axis 7a — DEAD family, default :none
+    :tile  (hw/derive-gemm-tile desc)          ;; axis 9 — the GEMM tile (T2 derivation), autotunable
+    :grf   {:mode :grf128}                     ;; axis 8a — OPT-IN, default OFF (gate-consumed by feasible?)
+    :stage {:space :none}                      ;; axis 7a — staging space, gate-consumed by feasible?
+    ;; axis 10 — RESIDENCY/placement: which operands stay cache/on-chip resident (WARM) across use vs
+    ;; are DRAM first-touch (COLD). The locality cost term (roofline warm/cold split) reads this via
+    ;; schedule-cost-ns. Default all :dram = conservative (matches the flat-bytes behavior); a
+    ;; fusion / cross-layer-resident schedule flips operands to :resident. The graph-level extension
+    ;; for stationary LLMs (operand resident across the recorded decode sequence) lives here.
+    :residency {:a :dram :b :dram :c :dram}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
             :derived-by :raster.gpu.schedule/derive-default
@@ -101,12 +108,20 @@
 ;; gate unable to detect an accumulator that spills on a smaller budget). The accumulator and the
 ;; staged-operand panel are fixed footprints of the emitted XMX tile; the budget is the device's.
 (def ^:private xmx-f16-acc-bytes-per-lane
-  "Per-lane accumulator footprint of the emitted f16 XMX tile: 8 float8 = 8×8×4 = 256 B/lane.
-   A CONSTANT of the kernel tile (independent of the device's GRF budget), so the gate detects a
-   tile whose accumulator alone exceeds a smaller-budget device. When descriptor `:matrix {:tile
-   …}` lands (HIP/CUDA follow-up) this is derived as tile_m/lane × tile_n × 4; 256 is the current
-   Arc XMX tile."
+  "Fallback per-lane accumulator footprint of the f16 XMX tile when the schedule carries no explicit
+   :tile: 8 float8 = 8×8×4 = 256 B/lane (the Arc default). A CONSTANT of the kernel tile (independent
+   of the device's GRF budget). With an explicit :tile the gate uses `tile-acc-bytes-per-lane`
+   instead — the ACTUAL emitted tile, so a bigger tile on a smaller-GRF device is caught."
   256)
+
+(defn- tile-acc-bytes-per-lane
+  "Per-lane f16 accumulator footprint of an explicit GEMM :tile — sg-m·sg-n f32 accumulators spread
+   across the subgroup = (sg-m·sg-n/subgroup)·4 B/lane. This is what the emitter actually allocates
+   in registers, so the gate charges the real tile (not the 256 constant). nil if no tile."
+  [schedule]
+  (when-let [{:keys [sg-m sg-n matrix]} (:tile schedule)]
+    (let [sg (long (:subgroup matrix 16))]
+      (quot (* (long sg-m) (long sg-n) 4) sg))))
 
 (def ^:private operand-panel-bytes-per-lane
   "Per-lane footprint of ONE register-staged operand panel (a quarter of the f16 accumulator tile).
@@ -124,13 +139,15 @@
       base)))
 
 (defn- acc-bytes-per-lane
-  "Accumulator footprint per lane by precision — a fixed kernel-tile property. f16-xmx uses the
-   full XMX accumulator tile; :f32-scalar a quarter of it (no wide MMA accumulator)."
+  "Accumulator footprint per lane by precision. Prefers the ACTUAL emitted :tile (T2/T3 —
+   tile-acc-bytes-per-lane); falls back to the Arc-default constant when no tile is pinned. f16-xmx
+   uses the full XMX accumulator tile; :f32-scalar a quarter of it (no wide MMA accumulator)."
   [schedule]
-  (case (:precision schedule)
-    :f16-xmx    xmx-f16-acc-bytes-per-lane
-    :f32-scalar (quot xmx-f16-acc-bytes-per-lane 4)
-    xmx-f16-acc-bytes-per-lane))
+  (let [full (or (tile-acc-bytes-per-lane schedule) xmx-f16-acc-bytes-per-lane)]
+    (case (:precision schedule)
+      :f16-xmx    full
+      :f32-scalar (quot full 4)
+      full)))
 
 (defn- register-staged-bytes-per-lane
   "GRF charge of the staging schedule. ONLY :space :register consumes the register file; :slm /
@@ -185,6 +202,28 @@
                        :register-staged-bytes-per-lane staged
                        :schedule schedule})))
     true))
+
+;; ================================================================
+;; Analytic cost — the LOCALITY roofline consumes the :residency axis
+;; ================================================================
+
+(defn schedule-cost-ns
+  "Predicted device time (ns) for a GEMM `shape` {:m :n :k :dtype} under `schedule` on `desc`, via
+   the locality roofline. Splits operand bytes into WARM (schedule :residency :resident → cache/
+   on-chip) and COLD (:dram → first-touch), so a schedule that keeps operands resident (fusion,
+   cross-layer residency) is priced faster — the capability the flat roofline lacked. This is the
+   function the cost-guided chooser / autotune seed rank schedules with. Returns nil when the
+   descriptor carries no bandwidth/peak-flops (the roofline abstains rather than fabricating)."
+  [schedule {:keys [m n k dtype] :or {dtype :f16}} desc]
+  (let [res      (:residency schedule)
+        elem-b   (case dtype (:f16 :half) 2 (:f32 :float) 4 (:f64 :double) 8 2)
+        ;; row-major operand footprints: A[m×k] B[k×n] C[m×n]
+        ob       {:a (* (long m) (long k) elem-b) :b (* (long k) (long n) elem-b) :c (* (long m) (long n) elem-b)}
+        warm?    (fn [o] (= :resident (get res o :dram)))
+        cold     (reduce + 0 (for [o [:a :b :c] :when (not (warm? o))] (ob o)))
+        warm     (reduce + 0 (for [o [:a :b :c] :when (warm? o)] (ob o)))]
+    (hw/roofline-time-ns desc {:flops (* 2 (long m) (long n) (long k))
+                               :cold-bytes cold :warm-bytes warm :dtype dtype})))
 
 ;; ================================================================
 ;; Convenience — the whole stage-1→2→3 pipeline

@@ -292,6 +292,29 @@
 (defn get-dim-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:shape :dim-rule]))
 
+(defn register-layout-rule!
+  "Register the LAYOUT facet for an op — the memory/register layout its operands (or result)
+   require, derived from (op-idx, arg-layouts, dtype, hardware-descriptor). The layout-inference
+   pass queries this to ANCHOR a layout (a dot pins its operands to :dot-operand, an expensive
+   load pins :blocked-coalesced); ops without a rule default to row-major. A per-op facet, so it
+   composes with the buffer/shape/placement facets rather than a separate registry. Mirrors
+   register-result-type!/register-dim-rule!. `rule`: (fn [op-idx arg-layouts dtype desc] -> layout)."
+  [op-sym rule]
+  (register-op-descriptor! op-sym {:layout {:rule rule}}))
+
+(defn layout-rule
+  "The layout rule fn for op-sym, or nil. Resolves mangled/devirtualized names (like get-placement)."
+  [op-sym]
+  (when-let [[descriptor _] (resolve-op-descriptor op-sym)]
+    (get-in descriptor [:layout :rule])))
+
+(defn operand-layout
+  "The layout op-sym requires for operand `op-idx` given its arg layouts, dtype and hardware
+   descriptor — or nil (the caller then defaults to row-major). The anchor query the
+   layout-inference pass runs at each op."
+  [op-sym op-idx arg-layouts dtype desc]
+  (when-let [r (layout-rule op-sym)] (r op-idx arg-layouts dtype desc)))
+
 (defn mutating-op?
   "True if op-sym is a mutating operation.
    Checks op-descriptor registry first, then falls back to !-suffix convention.
@@ -771,6 +794,49 @@
             float?    (list 'float (double id))
             :else     (double id)))))))
 
+;; --- Analytic cost (:cost facet; hardware-guided fusion profitability) ---
+
+(defn register-cost!
+  "Register an op's per-application analytic cost as the :cost facet:
+     {:flops n}   — flop-equivalent weight of ONE application of the op.
+   Bytes are NOT declared here — the fusion pricer derives memory traffic from
+   the op's array reads/writes × dtype. PORTABLE: a relative flop-equivalent
+   weight, never a hardware instruction count; the Abstract Machine / roofline
+   prices it. The weight doubles as the cheap-vs-expensive BUCKET the fusion
+   profitability test reads (arithmetic ≈ 1, division ≈ 4, transcendental ≈ 10):
+   fusing a transcendental producer into N consumers recomputes 10·N flops, which
+   the regime test must see to decline the fusion. One entry per op, like
+   register-algebra!."
+  [op-sym cost]
+  (register-op-descriptor! op-sym {:cost cost}))
+
+(defn cost-facet
+  "The :cost facet for op-sym ({:flops n}), or nil. Exact-symbol lookup; callers
+   query with the SEMANTIC op (descriptor/semantic-op), never a mangled impl name."
+  [op-sym]
+  (:cost (get-op-descriptor op-sym)))
+
+;; Flop-equivalent weights, registered for every surface variant (bare /
+;; clojure.core / raster.numeric / raster.math), mirroring register-algebra!.
+;; Cheap arithmetic = 1; division is multi-cycle; transcendentals are the
+;; "expensive" bucket the fusion cost test uses to decline recompute-heavy
+;; fan-out fusions. Unregistered ops price as nil → the pricer treats them
+;; conservatively (unknown cost never enables a fusion).
+(let [numeric-weights {'+ 1 '- 1 '* 1 'min 1 'max 1 'abs 1 '/ 4 'fma 2}
+      math-weights    {'sqrt 6 'exp 10 'log 10 'sin 10 'cos 10 'tan 10 'tanh 10
+                       'asin 10 'acos 10 'atan 10 'sinh 10 'cosh 10 'pow 10}]
+  (doseq [[base w] numeric-weights
+          v (cond-> [base
+                     (symbol "clojure.core" (name base))
+                     (symbol "raster.numeric" (name base))]
+              (contains? #{'min 'max} base) (conj (symbol "Math" (name base))))]
+    (register-cost! v {:flops w}))
+  (doseq [[base w] math-weights
+          v [base
+             (symbol "raster.math" (name base))
+             (symbol "Math" (name base))]]
+    (register-cost! v {:flops w})))
+
 ;; --- Result-type inference (:result-type facet) ---
 
 (def ^:private array-tag->element-tag
@@ -924,7 +990,7 @@
    results, no error, GPU only.
 
    Honoring alpha/beta instead of rejecting is NOT the cheap kernel-arg change it looks
-   like. emit-gemm-nonsquare-kernel already accepts :alpha/:beta (baking the shape and
+   like. emit-gemm-tiled already accepts :alpha/:beta (baking the shape and
    passing the values as runtime args), but:
      - the XMX kernel CACHE keys on c-dtype alone, and the scalar + split-k combine
        kernels have no alpha/beta at all (the split-k emitter explicitly THROWS on

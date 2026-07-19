@@ -31,21 +31,110 @@
 (defonce ^:private device-registry (atom {}))
 (defonce ^:private initialized? (atom false))
 
+;; `device` is defined below (with the query API) but the calibration disk-cache above it
+;; references it — forward-declare so this file compiles top-down from a cold classloader.
+(declare device)
+
+;; The :measured layer — per-device microbench results (raster.runtime.microbench/calibrate-*!)
+;; that OVERRIDE probed/catalogue values in descriptor-for. Kept here (the probe/measure domain)
+;; so core.hardware reads it without a cycle. (Disk persistence is a later refinement.)
+(defonce ^:private measured-registry (atom {}))
+
+(defn set-measured!
+  "Store a device's measured hardware map (from a microbench calibration)."
+  [device-id measured]
+  (swap! measured-registry assoc device-id measured))
+
+(defn measured-for
+  "The stored :measured map for a device, or nil if it hasn't been calibrated."
+  [device-id]
+  (get @measured-registry device-id))
+
+;; --- calibration disk cache (measure-once, keyed by device identity × version) ---------------
+
+(def calibration-version
+  "Bump when the microbench methodology changes, invalidating on-disk calibrations."
+  1)
+
+(defn device-signature
+  "A stable identity string for a device: name + the caps that affect measured performance. Two
+   machines with the same signature share a calibration; a different CPU/GPU/version gets a fresh
+   one (the disk-cache key discipline from XLA/Inductor)."
+  [device-id]
+  (let [d (device device-id)
+        caps (:capabilities d)]
+    (pr-str [(:name d)
+             (select-keys caps [:cores :arch :simd-width :total-eus :threads-per-eu
+                                :sm-count :compute-capability :global-memory-bytes])
+             calibration-version])))
+
+(defn- calibration-file ^File [device-id]
+  (io/file (System/getProperty "user.home") ".raster" "calibration"
+           (str (format "%08x" (hash (device-signature device-id))) ".edn")))
+
+(defn save-calibration!
+  "Persist a device's measured map to disk (atomic: temp file → rename), keyed by its signature."
+  [device-id measured]
+  (let [f (calibration-file device-id)]
+    (io/make-parents f)
+    (let [tmp (File/createTempFile "cal" ".edn" (.getParentFile f))]
+      (spit tmp (pr-str {:signature (device-signature device-id) :measured measured}))
+      (.renameTo tmp f))
+    measured))
+
+(defn load-calibration!
+  "Load a device's on-disk calibration into the measured-registry IF the signature matches (same
+   machine + calibration version). Returns the measured map or nil. Safe to call on startup."
+  [device-id]
+  (let [f (calibration-file device-id)]
+    (when (.exists f)
+      (try
+        (let [{:keys [signature measured]} (read-string (slurp f))]
+          (when (= signature (device-signature device-id))
+            (set-measured! device-id measured)
+            measured))
+        (catch Exception _ nil)))))
+
 ;; ================================================================
 ;; CPU detection (pure JVM)
 ;; ================================================================
 
-(defn- parse-cpuinfo-linux
-  "Parse /proc/cpuinfo for model name and cache sizes (Linux only)."
-  []
+(defn- read-proc-lines
+  "Read a /proc file as a vector of lines. MUST NOT use `slurp` — /proc files report no size and
+   `FileInputStream.available()` errors on them (kernel-dependent); a BufferedReader/line-seq reads
+   fine. Returns nil on any failure (non-Linux, permission)."
+  [path]
   (try
-    (let [content (slurp "/proc/cpuinfo")
-          lines (str/split-lines content)
-          model-line (first (filter #(str/starts-with? % "model name") lines))
-          model-name (when model-line
-                       (str/trim (second (str/split model-line #":\s*" 2))))]
-      {:model-name model-name})
-    (catch Exception _ {})))
+    (with-open [r (java.io.BufferedReader. (java.io.FileReader. ^String path))]
+      (vec (line-seq r)))
+    (catch Exception _ nil)))
+
+(defn- parse-cpuinfo-linux
+  "Parse /proc/cpuinfo for model name (Linux only)."
+  []
+  (let [lines (read-proc-lines "/proc/cpuinfo")
+        model-line (first (filter #(str/starts-with? % "model name") lines))
+        model-name (when model-line
+                     (str/trim (second (str/split model-line #":\s*" 2))))]
+    (cond-> {} model-name (assoc :model-name model-name))))
+
+(def ^:private cpuinfo-feature-map
+  "Kernel /proc/cpuinfo flag → raster SIMD-feature keyword. Only the flags the compiler's
+   hardware model cares about (dtype dot-reduce + vector width tier)."
+  {"avx"          :avx     "avx2"        :avx2      "fma"        :fma
+   "avx512f"      :avx512f "sse4_2"      :sse4-2
+   "avx_vnni"     :avx-vnni "avx512_vnni" :avx512-vnni "amx_int8" :amx-int8 "amx_tile" :amx-tile
+   "f16c"         :f16c    "avx512bf16"  :avx512-bf16})
+
+(defn- parse-cpu-features-linux
+  "Parse the `flags` line of /proc/cpuinfo into a set of raster SIMD-feature keywords (Linux only).
+   Drives :has-native-dot-reduce (VNNI) and dtype legality — the coarse arch-string heuristic
+   claims int-dot-reduce for ALL x86, which is wrong for pre-VNNI parts. Empty set on non-Linux."
+  []
+  (let [lines (read-proc-lines "/proc/cpuinfo")
+        flag-line (first (filter #(str/starts-with? % "flags") lines))
+        flags (when flag-line (set (str/split (str/trim (second (str/split flag-line #":\s*" 2))) #"\s+")))]
+    (into #{} (keep cpuinfo-feature-map) (or flags #{}))))
 
 (defn- parse-cache-sizes-linux
   "Read cache sizes from /sys/devices/system/cpu (Linux only)."
@@ -101,6 +190,7 @@
         linux? (and os-name (str/starts-with? (str/lower-case os-name) "linux"))
         cpuinfo (if linux? (parse-cpuinfo-linux) {})
         caches (if linux? (parse-cache-sizes-linux) {})
+        features (if linux? (parse-cpu-features-linux) #{})
         simd (detect-simd-width)
         model-name (or (:model-name cpuinfo) (str arch " CPU"))]
     {:id :cpu:0
@@ -112,11 +202,13 @@
                      :simd-width (:simd-width simd)
                      :simd-width-float (:simd-width-float simd)
                      :arch arch}
+                    (when (seq features) {:simd-features features})
                     (when (:cache-l1 caches) {:cache-l1 (:cache-l1 caches)})
                     (when (:cache-l2 caches) {:cache-l2 (:cache-l2 caches)})
                     (when (:cache-l3 caches) {:cache-l3 (:cache-l3 caches)}))
      :source {:simd-width (:source simd)
               :cores :detected
+              :features (if (seq features) :detected :unavailable)
               :cache (if (seq caches) :detected :unavailable)}}))
 
 ;; ================================================================
@@ -359,136 +451,6 @@
     (str "sm" major minor)))
 
 ;; ================================================================
-;; Optimal launch config (hardware-aware)
-;; ================================================================
-
-(defn- enumerate-block-sizes
-  "Generate candidate block sizes as multiples of warp-size up to max-tpb.
-  Includes powers of 2 and powers-of-2 * 3 (Halide-inspired tiling enumeration)."
-  [ws max-tpb]
-  (let [pow2s (take-while #(<= % max-tpb) (iterate #(* 2 %) ws))
-        pow2x3 (filter #(<= % max-tpb) (map #(* 3 %) pow2s))
-        all (sort (distinct (concat pow2s pow2x3)))]
-    (filter #(zero? (rem % ws)) all)))
-
-(defn optimal-block-size
-  "Compute optimal CUDA block size for n elements on a device.
-  Uses tiling enumeration (Halide-inspired): generates candidate block sizes
-  as powers of 2 (+ factor 3), scores by estimated occupancy.
-  Falls back to 256/512 when no device info available."
-  [device-id n & {:keys [reduction?] :or {reduction? false}}]
-  (ensure-init!)
-  (let [ws (warp-size device-id)
-        max-tpb (max-threads-per-block device-id)
-        dev (device device-id)
-        caps (:capabilities dev)
-        max-warps-per-sm (or (:max-warps-per-sm caps) 64)
-        max-blocks-per-sm (or (:max-blocks-per-sm caps) 32)
-        candidates (enumerate-block-sizes ws max-tpb)]
-    (if (and dev (> (count candidates) 1))
-      ;; Score each candidate by occupancy and pick best
-      (let [scored (map (fn [bs]
-                          (let [warps-per-block (quot bs ws)
-                                blocks-by-warps (quot max-warps-per-sm warps-per-block)
-                                blocks-per-sm (min max-blocks-per-sm blocks-by-warps)
-                                active-warps (* blocks-per-sm warps-per-block)
-                                occupancy (/ (double active-warps) max-warps-per-sm)
-                                ;; Prefer larger blocks for reductions (fewer partial results)
-                                score (if reduction?
-                                        (* occupancy (Math/log (double bs)))
-                                        occupancy)]
-                            {:block-size bs :occupancy occupancy :score score}))
-                        candidates)
-            best (apply max-key :score scored)]
-        (:block-size best))
-      ;; Fallback
-      (let [preferred (if reduction? 512 256)]
-        (* ws (quot (min max-tpb (max ws preferred)) ws))))))
-
-(defn optimal-grid-size
-  "Compute optimal CUDA grid size for n elements and block-size.
-  Uses occupancy-aware calculation: blocks-per-SM * SM-count * waves.
-  With grid-stride loops, the grid cap is a performance knob, not correctness."
-  [device-id n block-size & {:keys [reduction?] :or {reduction? false}}]
-  (ensure-init!)
-  (let [sm (or (sm-count device-id) 108)
-        ws (warp-size device-id)
-        max-warps-per-sm (or (get-in (device device-id) [:capabilities :max-warps-per-sm]) 64)
-        max-blocks-per-sm (or (get-in (device device-id) [:capabilities :max-blocks-per-sm]) 32)
-        warps-per-block (quot block-size ws)
-        blocks-per-sm (min max-blocks-per-sm (quot max-warps-per-sm warps-per-block))
-        waves (if reduction? 1 2)
-        target-grid (* blocks-per-sm sm waves)
-        needed (int (Math/ceil (/ (double n) block-size)))]
-    (min needed target-grid)))
-
-(defn optimal-launch-config
-  "Compute hardware-optimal CUDA launch config for n elements.
-  Returns {:block-size int :grid-size int :shared-mem int} or nil
-  if n is too small for GPU."
-  [device-id n & {:keys [reduction? min-elements]
-                  :or {reduction? false min-elements 1024}}]
-  (when (>= n min-elements)
-    (let [block-size (optimal-block-size device-id n :reduction? reduction?)
-          grid-size (optimal-grid-size device-id n block-size :reduction? reduction?)
-          shared-mem (if reduction?
-                       ;; Reduction: shared mem = block-size * sizeof(element)
-                       (* block-size 8)  ;; 8 bytes for double
-                       0)]
-      {:block-size block-size
-       :grid-size grid-size
-       :shared-mem shared-mem})))
-
-;; ================================================================
-;; Occupancy estimation
-;; ================================================================
-
-(defn estimate-occupancy
-  "Estimate theoretical GPU occupancy from resource usage.
-  device-id: CUDA device keyword
-  resource-usage: {:registers-per-thread int :shared-mem int :block-size int}
-
-  Returns {:occupancy float :blocks-per-sm int :limiting-factor kw}"
-  [device-id {:keys [registers-per-thread shared-mem block-size]}]
-  (ensure-init!)
-  (let [dev (device device-id)
-        caps (:capabilities dev)
-        max-tpb (or (:max-threads-per-block caps) 1024)
-        warp-sz (or (:warp-size caps) 32)
-        ;; These are typical limits for modern NVIDIA GPUs
-        max-warps-per-sm (or (:max-warps-per-sm caps) 64)
-        max-blocks-per-sm (or (:max-blocks-per-sm caps) 32)
-        shared-mem-per-sm (or (:shared-memory-per-sm caps)
-                              (* 4 (or (:shared-memory-per-block caps) 49152)))
-        registers-per-sm (or (:registers-per-sm caps) 65536)
-        ;; Blocks limited by block size
-        warps-per-block (int (Math/ceil (/ (double block-size) warp-sz)))
-        blocks-by-warps (quot max-warps-per-sm warps-per-block)
-        ;; Blocks limited by shared memory
-        blocks-by-smem (if (and shared-mem (pos? shared-mem))
-                         (quot shared-mem-per-sm shared-mem)
-                         max-blocks-per-sm)
-        ;; Blocks limited by registers
-        regs-per-block (* registers-per-thread block-size)
-        blocks-by-regs (if (and registers-per-thread (pos? registers-per-thread))
-                         (quot registers-per-sm regs-per-block)
-                         max-blocks-per-sm)
-        ;; Actual blocks per SM
-        blocks-per-sm (min max-blocks-per-sm blocks-by-warps blocks-by-smem blocks-by-regs)
-        ;; Occupancy
-        active-warps (* blocks-per-sm warps-per-block)
-        occupancy (/ (double active-warps) max-warps-per-sm)
-        ;; Limiting factor
-        limiting (cond
-                   (= blocks-per-sm blocks-by-smem) :shared-memory
-                   (= blocks-per-sm blocks-by-regs) :registers
-                   (= blocks-per-sm blocks-by-warps) :warps
-                   :else :block-limit)]
-    {:occupancy (min 1.0 occupancy)
-     :blocks-per-sm blocks-per-sm
-     :limiting-factor limiting}))
-
-;; ================================================================
 ;; Level Zero capability queries
 ;; ================================================================
 
@@ -512,88 +474,6 @@
   [device-id]
   (ensure-init!)
   (or (get-in (device device-id) [:capabilities :shared-local-memory]) 65536))
-
-(defn optimal-workgroup-size
-  "Compute optimal workgroup size for n elements on a Level Zero device.
-  Uses EU count + subgroup sizes for occupancy-based selection.
-
-  Level Zero model: EUs × threads-per-EU ÷ subgroup-size = max concurrent subgroups.
-  Each workgroup is dispatched to one or more EUs."
-  [device-id n & {:keys [reduction?] :or {reduction? false}}]
-  (ensure-init!)
-  (let [dev (device device-id)
-        caps (:capabilities dev)
-        sg-size (or (:simd-width caps) 16)
-        max-wg (or (:max-workgroup-size caps) 1024)
-        eus (or (:total-eus caps) 64)
-        threads-per-eu (or (:threads-per-eu caps) 8)
-        ;; Candidate workgroup sizes: multiples of subgroup size
-        candidates (take-while #(<= % max-wg)
-                               (iterate #(* 2 %) sg-size))
-        ;; Score by occupancy: prefer sizes that fill EUs well
-        scored (map (fn [wg]
-                      (let [subgroups-per-wg (quot wg sg-size)
-                            max-concurrent-sgs (* eus threads-per-eu (/ 1 sg-size))
-                            wgs-per-eu (max 1 (quot threads-per-eu subgroups-per-wg))
-                            occupancy (min 1.0 (/ (* wgs-per-eu subgroups-per-wg sg-size)
-                                                  (* threads-per-eu 1.0)))
-                            ;; Prefer larger groups for reductions
-                            score (if reduction?
-                                    (* occupancy (Math/log (double wg)))
-                                    occupancy)]
-                        {:workgroup-size wg :occupancy occupancy :score score}))
-                    candidates)
-        best (apply max-key :score scored)]
-    (:workgroup-size best)))
-
-(defn optimal-group-count
-  "Compute optimal group count (grid size) for n elements and workgroup size.
-  With grid-stride loops, caps at EU-count × waves."
-  [device-id n workgroup-size & {:keys [reduction?] :or {reduction? false}}]
-  (ensure-init!)
-  (let [eus (or (total-eus device-id) 64)
-        waves (if reduction? 1 2)
-        target-groups (* eus waves)
-        needed (int (Math/ceil (/ (double n) workgroup-size)))]
-    (min needed target-groups)))
-
-(defn kernel-launch-worthwhile?
-  "Check if GPU kernel launch is worthwhile for n elements.
-  Based on kernel launch overhead (~10µs) vs compute time.
-  Returns true if GPU is expected to be faster than CPU."
-  [device-id n]
-  (ensure-init!)
-  (let [dev (device device-id)
-        caps (:capabilities dev)
-        eus (or (:total-eus caps) 64)
-        ;; Empirical: need ~100 elements per EU to amortize launch overhead
-        min-elements (* eus 100)]
-    (>= n min-elements)))
-
-(defn roofline-bound
-  "Determine if a kernel is compute-bound or memory-bound using the roofline model.
-  ops: total floating-point operations
-  bytes: total memory bytes accessed
-  Returns {:bound :compute-bound|:memory-bound
-           :expected-throughput-gflops double
-           :arithmetic-intensity double}"
-  [device-id ops bytes]
-  (ensure-init!)
-  (let [dev (device device-id)
-        caps (:capabilities dev)
-        peak-flops (or (:peak-flops-dp caps) 249.6e9)
-        bandwidth (or (:memory-bandwidth-gb-s caps) 89.6)
-        bandwidth-bytes (* bandwidth 1e9)
-        ai (if (pos? bytes) (/ (double ops) bytes) Double/POSITIVE_INFINITY)
-        ridge-point (/ peak-flops bandwidth-bytes)
-        bound (if (< ai ridge-point) :memory-bound :compute-bound)
-        expected (if (= bound :memory-bound)
-                   (* ai bandwidth)          ;; memory-limited: AI × BW
-                   (/ peak-flops 1e9))]       ;; compute-limited: peak
-    {:bound bound
-     :expected-throughput-gflops expected
-     :arithmetic-intensity ai
-     :ridge-point ridge-point}))
 
 ;; ================================================================
 ;; Memory topology

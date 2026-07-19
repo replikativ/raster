@@ -138,19 +138,31 @@
 
    "Intel(R) Arc(TM) Graphics"  ;; Lunar Lake integrated (Arc 140V)
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 64
     :threads-per-eu 8
     :simd-width 16
     :subgroup-sizes [16 32]
     :max-workgroup-size 1024
     :shared-local-memory 131072       ;; 128 KB SLM
+    :cache-l2 8388608                 ;; 8 MB L2 (Xe2 LLC) — the residency threshold for the locality
+                                      ;; cost term: a working set ≤ this stays WARM, above it goes cold
+                                      ;; (measured: proj operands ~7.5 MB fit → 70% peak; 24-pair cold
+                                      ;; set ~194 MB evicts → 20%, the 3.5× dram-cold-penalty).
     :global-memory-bytes 15946350592  ;; ~14.9 GB shared LPDDR5x
     :memory-bandwidth-gb-s 89.6      ;; LPDDR5x 8533 MT/s × 128-bit
     :peak-flops-dp 249.6e9           ;; 64 EUs × 1950 MHz × 2 FMA
-    :peak-flops-sp 3993.6e9}         ;; 64 × 1950 × 2 × 16 SIMD
+    :peak-flops-sp 3993.6e9          ;; 64 × 1950 × 2 × 16 SIMD
+    ;; XMX DPAS f16 = 8× the FP32 vector rate on Xe2 (int8 = 16× → ~64 TOPS, matching
+    ;; Intel's Arc 140V spec). WITHOUT this the descriptor's :f16 peak falls back to the
+    ;; f32 value (~4 TF), so balance-for(:f16) computes the WRONG roofline ridge and the
+    ;; AM misclassifies every XMX-GEMM as memory-bound. Measured: emit-gemm-tiled hits
+    ;; 13.8 TF at 2048³ = ~43% of this peak (~66% of oneDNN) — the B1 headroom.
+    :peak-flops-hp 31948.8e9}        ;; 8 × peak-flops-sp (Xe2 XMX f16:FP32 = 8:1)
 
    "Arc A770"
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 512
     :threads-per-eu 8
     :simd-width 16
@@ -164,6 +176,7 @@
 
    "Arc B580"
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 320
     :threads-per-eu 8
     :simd-width 16
@@ -177,6 +190,7 @@
 
    "Data Center GPU Max"  ;; Intel PVC (Ponte Vecchio)
    {:device-type :level-zero
+    :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}  ;; XMX DPAS (f16 in, f32 accum)
     :total-eus 512
     :threads-per-eu 8
     :simd-width 16

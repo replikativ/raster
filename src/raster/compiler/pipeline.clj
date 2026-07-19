@@ -62,6 +62,7 @@
             [raster.compiler.ad.mode-select :as mode-select]
             [raster.compiler.passes.parallel.device :as device]
             [clojure.walk :as walk]
+            [raster.compiler.core.hardware :as core-hw]
             [raster.runtime.hardware :as hardware]
             [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.invariants :as invariants]
@@ -741,13 +742,23 @@
   horizontal (independent same-bound maps), iterated to fixpoint.
   Falls back to par-fusion for non-let* forms.
   Returns {:form :stats}."
-  [form _opts]
+  [form opts]
   (if (form/binding-form? form)
     (let [[let-sym bindings-vec & body-exprs] form
           pairs (vec (partition 2 bindings-vec))
           nodes (soac/let-bindings->nodes pairs)
           graph (soac-graph/build-fusion-graph nodes)
-          [fused-graph stats] (soac-graph/fusion-fixpoint graph)
+          ;; Hardware-GUIDED fusion: project the target to an Abstract Machine so the
+          ;; vertical chooser can DECLINE unprofitable rematerialization (cost model,
+          ;; not a device — see soac-graph/vertical-fusion-profitable?). Only for GPU
+          ;; targets, where the locality gap is measured and over-fusion into monster
+          ;; kernels is the documented failure mode; CPU/no-target → am nil → the
+          ;; chooser is legality-only, byte-identical to before. Descriptor failure
+          ;; degrades to nil (no decline), never breaks compilation.
+          am (when (device/gpu-target? (:target-device opts))
+               (try (core-hw/abstract-machine (core-hw/descriptor-for (:target-device opts)))
+                    (catch Throwable _ nil)))
+          [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
           new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
           new-bindings (vec (mapcat identity new-pairs))]
       {:form (list* let-sym new-bindings body-exprs)

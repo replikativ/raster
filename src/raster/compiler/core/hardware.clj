@@ -50,31 +50,99 @@
 ;; Host detection
 ;; ---------------------------------------------------------------------------
 
-(defn descriptor-for
+(defn- merge-measured
+  "Overlay a device's :measured microbench layer (raster.runtime.microbench) onto the probed/
+   analytic descriptor: measured bandwidth / peak-flops / launch-overhead OVERRIDE the guess, the
+   whole map is kept under :measured for inspection, and its provenance is carried. This is the
+   feedback edge — measurement improving the readable model, not a cache beside it."
+  [desc device-id]
+  (if-let [m (rt/measured-for device-id)]
+    (cond-> (assoc desc :measured m)
+      (:bandwidth-bytes-s m)  (assoc :bandwidth-bytes-s (:bandwidth-bytes-s m))
+      (:peak-flops m)         (update :peak-flops merge (:peak-flops m))
+      (:launch-overhead-ns m) (assoc :launch-overhead-ns (:launch-overhead-ns m))
+      (:provenance m)         (update :provenance merge (:provenance m)))
+    desc))
+
+(defn- gpu-arch-str [caps]
+  (str (some-> (:arch caps) name) (some-> (:gfx-arch caps) name)))
+
+(defn- amd-cdna? [caps]
+  (let [a (gpu-arch-str caps)]
+    (or (= :mfma (get-in caps [:matrix :family]))
+        (.startsWith a "gfx9")            ;; CDNA: gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
+        (.startsWith a "gfx94"))))
+
+(defn- gpu-reg-budget-per-lane
+  "Per-lane register-file budget the schedule/tile GRF gate charges against — vendor-specific
+   (differ ~4×, so a single formula mis-sizes tiles cross-vendor). Intel Xe grf128 = 128 regs × 32 B
+   / subgroup; NVIDIA = 255 regs × 4 B (per-thread WMMA fragment); AMD CDNA = 256 VGPRs × 4 B. Keyed
+   off probed caps (compute-capability → NVIDIA; a gfx9 arch / :mfma matrix → AMD; else Intel)."
+  [caps flanes]
+  (cond
+    (:compute-capability caps) 1020
+    (amd-cdna? caps)           1024
+    :else (long (quot (* 128 32) (max 1 flanes)))))
+
+(defn- build-descriptor
   "Project a runtime.hardware device into the planner's HardwareDescriptor — the SINGLE
    detection source (runtime.hardware owns the probing; this adds the compiler's analytic
    fields). CPU and GPU via one path (subsumes the old from-gpu-device-info). The
    register count follows the width (AVX-512 -> 32 zmm, else 16 ymm; GPU is GRF-backed);
    native int-dot-reduce is x86 vpdpbusd / GPU dp4a; LLC comes from the detected L3 (or
-   GPU global mem); balance uses Halide-style defaults."
+   GPU global mem); balance uses Halide-style defaults. The :measured layer is overlaid by
+   descriptor-for (below)."
   [device-id]
   (let [caps   (:capabilities (rt/device device-id))
         gpu?   (not= (rt/device-type device-id) :cpu)
         flanes (long (if gpu? (rt/subgroup-size device-id)
                          (rt/simd-lanes device-id :float)))   ;; f32 lanes / subgroup
-        vbits  (* flanes 32)]
+        vbits  (* flanes 32)
+        ;; PERFORMANCE quantities — bandwidth / per-dtype peak-flops / cache hierarchy — projected
+        ;; from whatever the probe or the shipped catalogue supplied (runtime.hardware merges the
+        ;; catalogue into caps). These are the roofline inputs (balance-for / roofline-time-ns).
+        ;; A CPU probe carries no bandwidth/flops (not statically knowable) → they are simply
+        ;; ABSENT here and the analytic fns fall back to :balance; the :measured layer (Phase 1)
+        ;; fills them from a microbenchmark and OVERWRITES the analytic guess.
+        bw-gb  (:memory-bandwidth-gb-s caps)
+        peak-flops (into {} (remove (comp nil? val))
+                         {:f32 (:peak-flops-sp caps) :float (:peak-flops-sp caps)
+                          :f64 (:peak-flops-dp caps) :double (:peak-flops-dp caps)
+                          :f16 (:peak-flops-hp caps) :half (:peak-flops-hp caps)})
+        cache  (into {} (remove (comp nil? val))
+                     {:l1 (:cache-l1 caps) :l2 (:cache-l2 caps) :l3 (:cache-l3 caps)
+                      :slm (when gpu? (:shared-local-memory caps))})
+        ;; GPU occupancy inputs the launch-geometry derivations (workgroup-size / group-count /
+        ;; block-size / grid-size) read — present-only, projected from caps. Intel Level-Zero uses
+        ;; :total-eus/:threads-per-eu; NVIDIA CUDA uses :sm-count/:max-warps-per-sm/:max-blocks-per-sm.
+        gpu-geo (when gpu?
+                  (into {} (remove (comp nil? val))
+                        {:total-eus (:total-eus caps) :threads-per-eu (:threads-per-eu caps)
+                         :sm-count (:sm-count caps) :fpus-per-core (:fpus-per-core caps)
+                         :max-warps-per-sm (:max-warps-per-sm caps) :max-blocks-per-sm (:max-blocks-per-sm caps)
+                         :registers-per-block (:registers-per-block caps)
+                         :shared-memory-per-block (:shared-memory-per-block caps)}))]
     (cond-> {:device-type (if gpu? :gpu :cpu)
              :device-id   device-id
              :vector-bits vbits
              :has-native-dot-reduce
              (if gpu? true
-                 (let [a (str (:arch caps))]
-                   (boolean (or (.contains a "amd64") (.contains a "x86")))))
+                 ;; x86 has a widening int-dot-reduce ONLY with AVX-VNNI (vpdpbusd). Prefer the
+                 ;; probed feature set (correct: a pre-VNNI Haswell is x86 yet lacks vpdpbusd);
+                 ;; fall back to the coarse arch heuristic only when features weren't probed.
+                 (let [feats (:simd-features caps)
+                       a (str (:arch caps))]
+                   (if feats
+                     (boolean (some feats [:avx-vnni :avx512-vnni :vnni]))
+                     (boolean (or (.contains a "amd64") (.contains a "x86"))))))
              :num-vector-registers (if gpu? 128 (if (>= vbits 512) 32 16))
              :llc-bytes   (or (:cache-l3 caps)
                               (when gpu? (:global-memory-bytes caps))
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
+      bw-gb           (assoc :bandwidth-bytes-s (* (double bw-gb) 1e9))
+      (seq peak-flops) (assoc :peak-flops peak-flops)
+      (seq cache)     (assoc :cache cache)
       gpu? (assoc :integrated? (boolean (:integrated? caps))
                   :subgroup-size flanes
                   ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. INTEL Xe/Xe2
@@ -82,14 +150,29 @@
                   ;; 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the budget the schedule
                   ;; feasibility gate (raster.gpu.schedule/feasible?) charges the accumulator +
                   ;; register staging against.
-                  ;; NOTE (vendor-specificity, HIP/CUDA follow-up): 128×32 is the Intel-Xe-grf128
-                  ;; constant. NVIDIA (255 regs × 4 B / warp 32 ≈ 1020 B/lane) and AMD VGPR budgets
-                  ;; differ ~8× — this value is only correct for Intel targets until it is derived
-                  ;; from per-vendor caps (with descriptor :vendor/:arch). The gate must not be
-                  ;; trusted for a non-Intel descriptor yet. (:num-vector-registers above is a
-                  ;; CPU-shaped placeholder; this is the Intel GPU value.)
-                  :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
+                  ;; Per-vendor (gpu-reg-budget-per-lane): Intel Xe grf128 128×32/subgroup, NVIDIA
+                  ;; 255×4 (per-thread fragment), AMD CDNA 256 VGPRs×4. A single formula mis-sizes
+                  ;; the tile cross-vendor (the budgets differ ~4×), so derive-gemm-tile GRF-bounds
+                  ;; against the right register file per family. (Supersedes the earlier Intel-only
+                  ;; 128×32 placeholder that #75's HIP/CUDA NOTE flagged for exactly this follow-up.)
+                  :grf-bytes-per-lane (gpu-reg-budget-per-lane caps flanes)
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
+      ;; MATRIX UNIT (systolic array) — the hardware matrix-multiply shape {:family :m :n :k
+      ;; :subgroup}, e.g. Intel XMX DPAS 8×16×16. A catalogue fact (not always probeable); the
+      ;; GEMM tile generator (derive-gemm-tile) reads it to size the accumulator tile + K-unroll,
+      ;; and the emitter keys its instruction family off :family (:dpas vs a WGMMA/MFMA fork).
+      (and gpu? (:matrix caps)) (assoc :matrix (:matrix caps))
+      ;; NVIDIA: derive the WMMA matrix shape from compute capability — every cc≥7.0 part has Tensor
+      ;; Cores with the universal 16×16×16 f16 WMMA fragment (warp 32), so it need not be catalogued
+      ;; per-part. (An explicit :matrix in caps wins — this only fills the gap.)
+      (and gpu? (nil? (:matrix caps)) (:compute-capability caps)
+           (>= (long (first (:compute-capability caps))) 7))
+      (assoc :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
+      ;; AMD CDNA (gfx9): Matrix Cores with the f16 16×16×16 MFMA (v_mfma_f32_16x16x16f16),
+      ;; wavefront 64. Derived from the gfx arch when not explicitly catalogued.
+      (and gpu? (nil? (:matrix caps)) (amd-cdna? caps))
+      (assoc :matrix {:family :mfma :m 16 :n 16 :k 16 :subgroup 64})
+      (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
       ;; shape, so it belongs on the descriptor rather than as a literal at each launch site
@@ -104,6 +187,13 @@
       (assoc :machine-lanes (* (long (:total-eus caps))
                                (long (:threads-per-eu caps))
                                (long (or (:simd-width caps) (rt/subgroup-size device-id))))))))
+
+(defn descriptor-for
+  "The HardwareDescriptor for `device-id`: the probed/analytic model (build-descriptor) with the
+   :measured microbench layer overlaid (measurement OVERRIDES the guess, tagged in :provenance).
+   This is the single entry the planner reads — probe ⊕ catalogue ⊕ measured ⊕ derived."
+  [device-id]
+  (merge-measured (build-descriptor device-id) device-id))
 
 (defn host-descriptor
   "The descriptor for the running host CPU (projected from runtime.hardware :cpu:0)."
@@ -212,16 +302,94 @@
   [desc elem-type]
   (if (>= (natural-lanes desc elem-type) 8) 8 4))
 
+;; ---------------------------------------------------------------------------
+;; Roofline — the analytic performance model (XLA gpu_performance_model shape).
+;; Every input is a descriptor field, so it improves transparently as the
+;; :measured layer (Phase 1) overwrites the probed/catalogue/default constants.
+;; ---------------------------------------------------------------------------
+
+(defn peak-flops-for
+  "Peak FLOP/s for `dtype` on this target (from probe/catalogue/measured), or nil if unknown.
+   f16/half falls back to f32 when the target reports no separate half-rate."
+  [desc dtype]
+  (let [pf (:peak-flops desc)]
+    (or (get pf dtype)
+        (case dtype
+          (:float :f32) (:f32 pf)
+          (:double :f64) (:f64 pf)
+          (:half :f16) (or (:f16 pf) (:f32 pf))   ;; no half-rate reported → f32 ceiling (conservative)
+          nil))))
+
+(defn balance-for
+  "The roofline RIDGE (flops/byte) for `dtype`: peak-flops(dtype) / bandwidth — the arithmetic
+   intensity above which a kernel is compute-bound. PRECISION-DEPENDENT (the f16 ridge is far above
+   the f64 ridge on a mixed-rate GPU), derived from the descriptor's bandwidth+peak-flops when both
+   are present; falls back to the scalar :balance default only when they are absent. Fixes the bug
+   where a single :balance constant misclassifies every non-default-precision kernel."
+  [desc dtype]
+  (let [pf (peak-flops-for desc dtype)
+        bw (:bandwidth-bytes-s desc)]
+    (if (and pf bw (pos? (double bw)))
+      (/ (double pf) (double bw))
+      (double (:balance desc 40)))))
+
 (defn roofline-regime
-  "Memory-bound vs compute-bound by arithmetic intensity vs machine balance.
-   AI = flops/bytes; AI < balance -> :memory-bound (stream schedule); else
-   :compute-bound (tile schedule). Generalizes classify-regime: a decode GEMV
-   (flops ~= bytes, AI ~= 1 << balance) is memory-bound; a prefill GEMM reusing
-   each weight M times raises AI above balance."
-  [desc {:keys [flops bytes]}]
-  (if (< (/ (double flops) (double (max 1 bytes))) (double (:balance desc)))
-    :memory-bound
-    :compute-bound))
+  "Memory-bound vs compute-bound by arithmetic intensity vs the ridge. AI = flops/bytes;
+   AI < ridge -> :memory-bound (stream schedule), else :compute-bound (tile schedule).
+   The 3-arg form uses the PRECISION-AWARE ridge (`balance-for`); the 2-arg form keeps the legacy
+   scalar :balance (back-compat for callers with no dtype)."
+  ([desc {:keys [flops bytes]}]
+   (if (< (/ (double flops) (double (max 1 bytes))) (double (:balance desc)))
+     :memory-bound :compute-bound))
+  ([desc {:keys [flops bytes]} dtype]
+   (if (< (/ (double flops) (double (max 1 bytes))) (balance-for desc dtype))
+     :memory-bound :compute-bound)))
+
+(def ^:private memory-compute-parallelism
+  "Overlap fraction of the compute and memory ceilings (XLA kMemoryComputeParallelism): exec is a
+   SOFT roofline elbow ≈ max(compute,mem), not their sum."
+  0.95)
+
+(def ^:private default-launch-overhead-ns
+  "Per-kernel dispatch tax (XLA kKernelLaunchOverhead = 1µs) — the term that makes fusion pay for
+   itself analytically (fewer kernels ⇒ less tax). Overwritten by a measured empty-kernel ping."
+  1000.0)
+
+(def default-dram-cold-penalty
+  "Effective-bandwidth penalty for a COLD (DRAM first-touch) operand vs a WARM (cache/on-chip
+   resident) one. Arc 140V MEASURED: a GEMM runs at 70% of XMX peak with L2-warm operands but 20%
+   cold (b1_gemm_leaf_measured) — a 3.5× effective-bandwidth gap that tiling/num_stages did NOT move.
+   The roofline's flat bytes/bandwidth term is blind to this; the LOCALITY split below charges warm
+   bytes at `penalty×` the bandwidth so a schedule that keeps operands resident (fusion / cross-layer
+   residency) is correctly priced faster. Overridable per descriptor via :dram-cold-penalty."
+  3.5)
+
+(defn roofline-time-ns
+  "Analytic runtime estimate in ns (XLA overlap roofline). compute = flops/peak-flops(dtype);
+   mem = cold-bytes/bandwidth + warm-bytes/(penalty·bandwidth); exec = compute + mem −
+   0.95·min(compute,mem) + n-kernels·launch-tax. Returns nil when the descriptor has no
+   bandwidth/peak-flops yet. This is the ranker the schedule search prices candidates with;
+   measurement sharpens every term.
+
+   LOCALITY: pass `:cold-bytes` (DRAM first-touch: fresh weights/activations) and `:warm-bytes`
+   (cache/on-chip resident: fused intermediates, cross-layer-resident operands) separately — the
+   schedule decides the split. Warm bytes are charged at `penalty×` the bandwidth (measured 3.5× on
+   Arc). Back-compat: a plain `:bytes` is treated as ALL cold (the prior flat behavior)."
+  [desc {:keys [flops bytes cold-bytes warm-bytes dtype n-kernels launch-overhead-ns]
+         :or {dtype :f32 n-kernels 1}}]
+  (let [pf (peak-flops-for desc dtype)
+        bw (:bandwidth-bytes-s desc)]
+    (when (and pf bw (pos? (double pf)) (pos? (double bw)))
+      (let [penalty    (double (:dram-cold-penalty desc default-dram-cold-penalty))
+            cold       (double (or cold-bytes bytes 0))     ;; plain :bytes ⇒ all cold (back-compat)
+            warm       (double (or warm-bytes 0))
+            compute-ns (* (/ (double flops) (double pf)) 1e9)
+            mem-ns     (* (+ (/ cold (double bw))
+                             (/ warm (* penalty (double bw)))) 1e9)
+            overlap    (* memory-compute-parallelism (min compute-ns mem-ns))
+            tax        (* (long n-kernels)
+                          (double (or launch-overhead-ns (:launch-overhead-ns desc) default-launch-overhead-ns)))]
+        (+ compute-ns mem-ns (- overlap) tax)))))
 
 (defn reduce-intrinsic
   "The native widening-int-dot reduce instruction available on this target, or
@@ -229,3 +397,209 @@
    exact opcode are resolved at emit time against the lane count.)"
   [desc]
   (if (:has-native-dot-reduce desc) :dpbusd :scalar))
+
+(defn abstract-machine
+  "Project a hardware descriptor to the closed ABSTRACT MACHINE (AM) — the only
+   hardware view the TARGET-NEUTRAL SOAC layer may read. It carries the portable
+   parameters a fusion/schedule decision reasons about — bandwidth, per-dtype
+   peak-flops and roofline ridge, lane width, register bytes per lane, matrix-unit
+   SHAPE+presence, launch tax — and STRIPS the device-flavoured facts: the matrix
+   instruction :family (:dpas/:mma/:mfma), the device id, and the vendor. Those are
+   read by the emitter BELOW the firewall, never by soac-fuse. Threaded into
+   pass-soac-fuse via opts so a fusion decision is hardware-GUIDED without the pass
+   ever naming a device — 'reason about bandwidth/lane widths, not about Arc'.
+   The AM is a firewall by CONVENTION (soac-fuse takes this map, not the descriptor),
+   not by construction — *descriptor* remains globally reachable; the discipline is
+   that SOAC-level passes accept an AM argument and never call descriptor-for."
+  [desc]
+  (let [pf (:peak-flops desc)
+        bw (:bandwidth-bytes-s desc)
+        mx (:matrix desc)]
+    {:bandwidth-bytes-s bw
+     :peak-flops        pf
+     :ridge             (when (and pf bw)
+                          (into {} (map (fn [dt] [dt (balance-for desc dt)])) (keys pf)))
+     :lane-width        (:subgroup-size desc)
+     :reg-bytes-per-lane (:grf-bytes-per-lane desc)
+     ;; LOCALITY inputs: the LLC capacity a working set must fit to stay WARM, the SLM tile budget,
+     ;; and the measured cold/warm effective-bandwidth penalty. The residency/fusion schedule reads
+     ;; these to decide which operands are resident (warm) vs DRAM first-touch (cold).
+     :llc-bytes         (or (get-in desc [:cache :l3]) (get-in desc [:cache :l2]) (:llc-bytes desc))
+     :slm-bytes         (get-in desc [:cache :slm])
+     :dram-cold-penalty (:dram-cold-penalty desc default-dram-cold-penalty)
+     ;; matrix SHAPE + presence only — the instruction :family is deliberately dropped
+     :matrix            (when mx (assoc (select-keys mx [:m :n :k]) :present? true))
+     :launch-tax-ns     (:launch-overhead-ns desc)}))
+
+;; ---------------------------------------------------------------------------
+;; Occupancy-scored launch geometry — the SINGLE implementation. These read the
+;; descriptor (probe ⊕ catalogue ⊕ measured); runtime.hardware/optimal-* delegate
+;; here so there is one occupancy model, not two. The math is occupancy-maximizing
+;; over subgroup/warp-multiple candidates (Halide-style enumeration).
+;; ---------------------------------------------------------------------------
+
+(defn- enumerate-multiples
+  "Candidate sizes = multiples of `unit` up to `max-size` (powers of 2, plus ×3 — the
+   Halide tiling enumeration), filtered to exact multiples of `unit`."
+  [unit max-size]
+  (let [pow2s (take-while #(<= % max-size) (iterate #(* 2 %) unit))
+        pow2x3 (filter #(<= % max-size) (map #(* 3 %) pow2s))]
+    (filter #(zero? (rem % unit)) (sort (distinct (concat pow2s pow2x3))))))
+
+(defn workgroup-size
+  "Intel Level-Zero occupancy-optimal workgroup size for `n` elements. EU model:
+   EUs × threads-per-EU ÷ subgroup = max concurrent subgroups; score candidates by how
+   well they fill the EUs (reductions prefer larger groups). Reads :subgroup-size,
+   :max-workgroup-size, :total-eus, :threads-per-eu off the descriptor."
+  [desc n & {:keys [reduction?] :or {reduction? false}}]
+  (let [sg-size (long (:subgroup-size desc 16))
+        max-wg  (long (:max-workgroup-size desc 1024))
+        threads-per-eu (long (:threads-per-eu desc 8))
+        ;; powers-of-2 multiples of the subgroup (the Level-Zero workgroup enumeration; block-size's
+        ;; CUDA path additionally tries ×3 tiles — kept distinct to preserve the prior behavior).
+        candidates (take-while #(<= % max-wg) (iterate #(* 2 %) sg-size))
+        scored (map (fn [wg]
+                      (let [subgroups-per-wg (quot wg sg-size)
+                            wgs-per-eu (max 1 (quot threads-per-eu subgroups-per-wg))
+                            occupancy (min 1.0 (/ (* wgs-per-eu subgroups-per-wg sg-size)
+                                                  (* threads-per-eu 1.0)))
+                            score (if reduction? (* occupancy (Math/log (double wg))) occupancy)]
+                        {:workgroup-size wg :score score}))
+                    candidates)]
+    (:workgroup-size (apply max-key :score scored))))
+
+(defn group-count
+  "Level-Zero group count (grid) for `n` and `wg`: capped at EU-count × waves (grid-stride)."
+  [desc n wg & {:keys [reduction?] :or {reduction? false}}]
+  (let [eus (long (:total-eus desc 64))
+        waves (if reduction? 1 2)
+        needed (int (Math/ceil (/ (double n) (double wg))))]
+    (min needed (* eus waves))))
+
+(defn derive-gemm-tile
+  "The default XMX-GEMM tile for a descriptor — {:block-m :block-n :sg-m :sg-n :block-k :matrix},
+   the argument map for raster...opencl-codegen/emit-gemm-tiled. DERIVED, not hardcoded:
+
+     - per-subgroup accumulator tile (sg-m×sg-n) is GRF-BOUND: it holds sg-m·sg-n/subgroup f32
+       accumulators per lane, so sg-m·sg-n ≤ grf-bytes-per-lane·subgroup/4. Take the largest square
+       tile under that cap, rounded DOWN to the matrix M_i/N_i granularity.
+     - workgroup tile is `wg-subgroups` (default 16 = a 4×4 subgroup grid) copies of the sg-tile.
+     - K-unroll is 2× the matrix K (double-buffered DPAS depth).
+
+   On the Arc 140V descriptor (matrix 8×16×16, GRF 256 B/lane, subgroup 16) this yields exactly the
+   hand-tuned 128×128 / 32×32 / K32 config — the T1 default — with zero magic numbers. Other Intel
+   parts (different GRF/subgroup) get a correctly-rescaled tile from the same rule. `opts` may pass
+   :wg-subgroups to override the workgroup subgroup count (the occupancy knob T3 autotunes)."
+  ([desc] (derive-gemm-tile desc {}))
+  ([desc opts]
+   (let [{:keys [m n k subgroup] :or {m 8 n 16 k 16 subgroup 16}} (:matrix desc)
+         grf     (long (:grf-bytes-per-lane desc 256))
+         sg      (long subgroup)
+         acc-cap (quot (* grf sg) 4)                 ;; max sg-m·sg-n (f32 accumulators)
+         ;; Cap the warp/subgroup tile at 4 matrix-fragments per dimension. Filling the WHOLE
+         ;; register file with accumulators (the raw acc-cap) starves the operand + pipeline
+         ;; registers — pathological on NVIDIA/AMD (their register files are ~4× Intel's, so the
+         ;; raw cap yields an 80×80+ warp tile). 4 fragments keeps Intel at its validated 32×32 (its
+         ;; budget already caps it there) and gives NVIDIA/AMD a sane 64×64 STARTING tile the
+         ;; on-device autotuner refines (unvalidated here — no NVIDIA/AMD GPU).
+         side    (min (long (Math/sqrt (double acc-cap)))
+                      (* 4 (max (long m) (long n))))
+         sg-m    (* m (max 1 (quot side m)))         ;; round down to M_i multiple
+         sg-n    (* n (max 1 (quot side n)))         ;; round down to N_i multiple
+         wg-sub  (long (:wg-subgroups opts 16))
+         side-sg (max 1 (long (Math/sqrt (double wg-sub))))]
+     {:block-m (* sg-m side-sg)
+      :block-n (* sg-n side-sg)
+      :sg-m sg-m :sg-n sg-n
+      :block-k (* 2 k)
+      :num-stages 3                             ;; pipelining depth (prefetch distance); T4 axis
+      :matrix (:matrix desc {:family :dpas :m m :n n :k k :subgroup subgroup})})))
+
+(defn max-stages-for
+  "The pipelining-depth ceiling for a GEMM `tile` on `desc` — the SLM-bounded num_stages. A
+   software-pipelined GEMM keeps `stages` in-flight copies of the K-panel operands; a SLM-STAGED
+   kernel (the CUDA/HIP fork, or a future Intel SLM variant) needs `stages` × (A-panel + B-panel)
+   bytes of shared memory, so stages ≤ SLM-capacity / panel-bytes. Returns that cap (≥ 2).
+
+   NOTE the current Intel kernel stages via the hardware 2D-block PREFETCH queue, not SLM — there
+   the depth is a prefetch distance and this SLM cap is an upper advisory bound, not a hard limit;
+   for the SLM-staged fork it is load-bearing (a deeper pipeline than SLM holds fails to compile)."
+  [desc tile]
+  (let [{:keys [block-m block-n block-k]} tile
+        slm (long (:shared-local-memory desc (:slm-bytes desc 65536)))
+        ;; one pipeline stage stages an A K-panel (block-m×block-k) + a B K-panel (block-k×block-n),
+        ;; f16 = 2 bytes each.
+        panel-bytes (* 2 (+ (* (long block-m) (long block-k))
+                            (* (long block-k) (long block-n))))]
+    (max 2 (quot slm (max 1 panel-bytes)))))
+
+(defn gemm-tile-candidates
+  "A CURATED set of valid GEMM tiles for `desc` — the autotuner's search space for the tile axis.
+   Not a free ×2/÷2 product (that explodes and yields non-divisible / register-spilling tiles):
+   the per-subgroup accumulator tile stays at the GRF-bound derived size, and only the WORKGROUP
+   block (occupancy) and K-unroll (pipeline depth) vary — the two axes with real, measurable
+   headroom. Every candidate keeps block divisible by the subgroup tile and workgroup ≤
+   max-workgroup-size, so all are feasible by construction."
+  [desc]
+  (let [base (derive-gemm-tile desc)
+        {:keys [sg-m sg-n block-k matrix]} base
+        max-wg (long (:max-workgroup-size desc 1024))
+        sg     (long (:subgroup matrix 16))
+        wg-ok? (fn [{:keys [block-m block-n]}]
+                 (<= (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)) sg) max-wg))]
+    (->> [base
+          (assoc base :block-m sg-m :block-n sg-n)                    ;; 1 subgroup — max workgroups (small problems)
+          (assoc base :block-m (* 2 sg-m) :block-n (* 2 sg-n))        ;; 4 subgroups
+          (assoc base :block-m (* 2 (:block-m base)))                 ;; taller M block
+          (assoc base :block-n (* 2 (:block-n base)))                 ;; wider N block
+          (assoc base :block-k (* 2 block-k))                         ;; deeper K unroll
+          (assoc base :block-k (max (long (:k matrix 16)) (quot block-k 2))) ;; shallower K
+          (assoc base :num-stages (min 4 (max-stages-for desc base))) ;; deeper pipeline (T4), SLM-capped
+          (assoc base :num-stages 2)]                                ;; shallower pipeline
+         (filter wg-ok?)
+         (filter (fn [t] (<= (long (:num-stages t 3)) (max-stages-for desc t)))) ;; SLM bound
+         distinct
+         vec)))
+
+(defn block-size
+  "NVIDIA CUDA occupancy-optimal block size for `n`. warp-multiple candidates scored by
+   occupancy against :max-warps-per-sm/:max-blocks-per-sm. Falls back to 256/512."
+  [desc n & {:keys [reduction?] :or {reduction? false}}]
+  (let [ws (long (:subgroup-size desc 32))          ;; warp size
+        max-tpb (long (:max-workgroup-size desc 1024))
+        max-warps (long (:max-warps-per-sm desc 64))
+        max-blocks (long (:max-blocks-per-sm desc 32))
+        candidates (enumerate-multiples ws max-tpb)]
+    (if (> (count candidates) 1)
+      (:block-size
+       (apply max-key :score
+              (map (fn [bs]
+                     (let [warps-per-block (quot bs ws)
+                           blocks-per-sm (min max-blocks (quot max-warps warps-per-block))
+                           occupancy (/ (double (* blocks-per-sm warps-per-block)) max-warps)
+                           score (if reduction? (* occupancy (Math/log (double bs))) occupancy)]
+                       {:block-size bs :score score}))
+                   candidates)))
+      (let [preferred (if reduction? 512 256)]
+        (* ws (quot (min max-tpb (max ws preferred)) ws))))))
+
+(defn grid-size
+  "NVIDIA CUDA grid size for `n` and `block`: blocks-per-SM × SM-count × waves, capped at needed."
+  [desc n block & {:keys [reduction?] :or {reduction? false}}]
+  (let [sm (long (:sm-count desc 108))
+        ws (long (:subgroup-size desc 32))
+        max-warps (long (:max-warps-per-sm desc 64))
+        max-blocks (long (:max-blocks-per-sm desc 32))
+        warps-per-block (quot block ws)
+        blocks-per-sm (min max-blocks (quot max-warps warps-per-block))
+        waves (if reduction? 1 2)]
+    (min (int (Math/ceil (/ (double n) block))) (* blocks-per-sm sm waves))))
+
+(defn launch-config
+  "CUDA launch config {:block-size :grid-size :shared-mem} for `n`, or nil when `n` is below
+   `min-elements` (too small to be worth a GPU launch). shared-mem = block × 8 for reductions."
+  [desc n & {:keys [reduction? min-elements] :or {reduction? false min-elements 1024}}]
+  (when (>= n min-elements)
+    (let [bs (block-size desc n :reduction? reduction?)
+          gs (grid-size desc n bs :reduction? reduction?)]
+      {:block-size bs :grid-size gs :shared-mem (if reduction? (* bs 8) 0)})))

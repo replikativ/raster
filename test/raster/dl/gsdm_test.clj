@@ -398,16 +398,51 @@
       (is (.contains src "beta"))
       (is (.contains src "num_groups")))))
 
-(deftest gemm-nonsquare-kernel-test
-  (testing "non-square GEMM kernel generates valid OpenCL"
+(deftest gemm-epilogue-store-splice
+  (testing "emit-gemm-tiled :epilogue splices into the store slot; byte-identical when absent"
     (require 'raster.compiler.backend.gpu.opencl-codegen)
-    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-nonsquare-kernel)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
+          plain (emit "g" :c-dtype :float)
+          biased (emit "gb" :c-dtype :float
+                       :epilogue-params ", __global const half* restrict bias"
+                       :epilogue (fn [acc _row col] (str acc " + (float)bias[" col "]")))]
+      (is (.contains ^String plain "C[row*N+col] = (acc00.s0);")
+          "no epilogue → store line byte-identical to the plain GEMM")
+      (is (.contains ^String biased "C[row*N+col] = (acc00.s0 + (float)bias[col]);")
+          "epilogue folds the bias into the store expression")
+      (is (.contains ^String biased "__global const half* restrict bias")
+          "epilogue operand becomes a kernel parameter")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emit "bad" :c-dtype :float :beta 1.0 :epilogue (fn [a _ _] a)))
+          "epilogue + beta≠0 (both write the store) is rejected"))))
+
+(deftest transpose-kernel-layout-driven-byte-identical
+  (testing "the transpose kernel is now LAYOUT-DRIVEN (indices from layout/layout->offset) yet emits
+            the byte-identical row-major index line — the first place a layout drives codegen"
+    (require 'raster.compiler.backend.gpu.opencl-codegen)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)]
+      (doseq [dt [:float :double :half]]
+        (is (.contains ^String (emit "t" :dtype dt) "out[j * rows + i] = in[i * cols + j];")
+            (str "layout-driven transpose index must be byte-identical for " dt))))))
+
+(deftest gemm-tiled-kernel-test
+  (testing "tile-parametric GEMM kernel generates valid OpenCL"
+    (require 'raster.compiler.backend.gpu.opencl-codegen)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
           src (emit "gemm_test")]
       (is (string? src))
       (is (.contains src "gemm_test"))
       (is (.contains src "intel_sub_group_f16_f16_matrix_mad_k16"))
-      (is (.contains src "col0 < N"))
-      (is (.contains src "col1 < N")))))
+      (is (.contains src "intel_reqd_sub_group_size(16)"))
+      (is (.contains src "col < N"))
+      (testing "the tile is parametric, not baked — divisibility is enforced"
+        (is (thrown? clojure.lang.ExceptionInfo (emit "bad" :sg-m 30)))
+        (testing "a non-default tile changes the accumulator count (proof of parametricity)"
+          (let [big (emit "big" :block-m 128 :block-n 128 :sg-m 32 :sg-n 32)
+                small (emit "small" :block-m 64 :block-n 64 :sg-m 32 :sg-n 32)]
+            ;; 32×32 SG over an 8×16 DPAS → 4 M-subtiles × 2 N-subtiles = acc00..acc31
+            (is (.contains big "acc31"))
+            (is (.contains small "acc31"))))))))
 
 ;; ================================================================
 ;; FP16 buffer tests

@@ -1,6 +1,7 @@
 (ns raster.hardware-test
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as chw]
             [raster.runtime.hardware-catalogue :as catalogue]))
 
 ;; Reset hardware state between tests
@@ -99,27 +100,22 @@
 ;; Launch config
 ;; ================================================================
 
-(deftest optimal-launch-config-test
-  (testing "Returns nil for small n"
-    (hw/init!)
-    (hw/register-target-device! :cuda:0 {:name "NVIDIA A100"})
-    (is (nil? (hw/optimal-launch-config :cuda:0 100))))
-
-  (testing "Returns config for large n"
-    (hw/init!)
-    (hw/register-target-device! :cuda:0 {:name "NVIDIA A100"})
-    (let [cfg (hw/optimal-launch-config :cuda:0 100000)]
-      (is (some? cfg))
-      (is (pos? (:block-size cfg)))
-      (is (zero? (rem (:block-size cfg) 32)))  ;; multiple of warp-size
-      (is (pos? (:grid-size cfg)))
-      (is (= 0 (:shared-mem cfg)))))
-
-  (testing "Reduction config has shared memory"
-    (hw/init!)
-    (hw/register-target-device! :cuda:0 {:name "NVIDIA A100"})
-    (let [cfg (hw/optimal-launch-config :cuda:0 100000 :reduction? true)]
-      (is (pos? (:shared-mem cfg))))))
+(deftest launch-config-test
+  ;; launch geometry now lives in core.hardware (descriptor-taking) — one implementation, no
+  ;; runtime.hardware duplicate. Tested against a hand-built A100-shaped descriptor (device-free).
+  (let [desc {:device-type :gpu :subgroup-size 32 :max-workgroup-size 1024
+              :sm-count 108 :max-warps-per-sm 64 :max-blocks-per-sm 32}]
+    (testing "nil for small n (below the min-elements launch floor)"
+      (is (nil? (chw/launch-config desc 100))))
+    (testing "config for large n"
+      (let [cfg (chw/launch-config desc 100000)]
+        (is (some? cfg))
+        (is (pos? (:block-size cfg)))
+        (is (zero? (rem (:block-size cfg) 32)) "block-size is a multiple of the warp/subgroup")
+        (is (pos? (:grid-size cfg)))
+        (is (= 0 (:shared-mem cfg)))))
+    (testing "reduction config carries shared memory"
+      (is (pos? (:shared-mem (chw/launch-config desc 100000 :reduction? true)))))))
 
 ;; ================================================================
 ;; Catalogue

@@ -17,6 +17,7 @@
     (kernel-launch-config 100000 :device-id :ze:0)"
   (:require [clojure.string :as str]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.backend.gpu.c-emit :as ce]))
 
 ;; ================================================================
@@ -387,16 +388,31 @@
 ;; Transpose kernel
 ;; ================================================================
 
-(defn emit-transpose-kernel
-  "Generate an OpenCL 2D matrix transpose kernel.
-  Reads from row-major in[i*cols + j], writes to out[j*rows + i].
-  Each work-item handles one element.
+(defn- render-c-index
+  "Render a layout->offset index S-expression to C infix (matches the hand-written kernel strings:
+   `(+ (* i cols) j)` → \"i * cols + j\"). Index arithmetic only (+ and *, symbols/ints)."
+  [e]
+  (cond
+    (symbol? e) (name e)
+    (number? e) (str e)
+    (seq? e)    (let [[op a b] e]
+                  (str (render-c-index a) " " (case op + "+" * "*" (str op)) " " (render-c-index b)))
+    :else       (str e)))
 
-  kernel-name: string name
-  dtype: :double or :float (default :float)
-  Returns OpenCL C source string."
+(defn emit-transpose-kernel
+  "Generate an OpenCL 2D matrix transpose kernel. LAYOUT-DRIVEN: the read/write indices are computed
+   from the layout facet (`layout/layout->offset`), not hand-written — a transpose is exactly a
+   `convert_layout` between a row-major input [rows,cols] and its transposed output [cols,rows]. The
+   emitted string is byte-identical to the former hand-written `out[j*rows+i] = in[i*cols+j]`; this
+   is the first place a layout DRIVES codegen (the Stage-1 transpose-as-convert seam, proven here).
+
+  dtype: :double | :float | :half (default :float). Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))]
+  (let [ctype  (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
+        in-l   (layout/row-major '[rows cols] dtype)          ;; input row-major
+        out-l  (layout/row-major '[cols rows] dtype)          ;; output row-major, transposed extents
+        in-idx  (render-c-index (layout/layout->offset in-l  '[i j]))   ;; "i * cols + j"
+        out-idx (render-c-index (layout/layout->offset out-l '[j i]))]  ;; "j * rows + i"
     (str (extension-pragmas dtype)
          "__kernel void " kernel-name
          "(__global const " ctype "* restrict in,"
@@ -407,7 +423,7 @@
          "    for (int idx = gid; idx < total; idx += get_global_size(0)) {\n"
          "        int i = idx / cols;\n"
          "        int j = idx % cols;\n"
-         "        out[j * rows + i] = in[i * cols + j];\n"
+         "        out[" out-idx "] = in[" in-idx "];\n"
          "    }\n"
          "}\n")))
 
@@ -603,257 +619,118 @@
          "}\n")))
 
 ;; ================================================================
-;; Non-square XMX GEMM kernel (V20-style with full boundary handling)
+;; Non-square XMX GEMM kernel — tile-parametric generator
 ;; ================================================================
 
-(defn emit-gemm-nonsquare-kernel
-  "Generate a tiled GEMM kernel using Intel XMX DPAS instructions.
-  Handles arbitrary M, N, K dimensions with full boundary checking.
-  Computes C = A * B (FP16 in, FP32 accumulator, FP16 out).
-
-  Tile per workgroup: 128M × 128N, 16 subgroups (4×4 grid).
-  Each subgroup: 32M × 32N tile (4 M-tiles × 2 N-tiles of 8×16).
-  K-loop: processes 32 K per iteration (2 K-steps of 16).
-  Uses 2D block I/O for hardware OOB clamping on loads.
-
-  kernel-name: string name for the kernel
-  Options:
-    :alpha   - scalar multiplier (default 1.0)
-    :beta    - accumulation factor (default 0.0, C = alpha*A*B + beta*C)
-    :c-dtype - output type, :half or :float (default :half)
-    :split-k? - SPLIT-K variant (default false): a THIRD grid dimension over
-                k-chunks. Workgroup (x,y,z) reduces only k ∈ [z·KC, min(K,(z+1)·KC))
-                and writes its PARTIAL C tile to C + z·M·N (so C is a
-                [splits, M, N] f32 partials buffer, combined by
-                emit-gemm-splitk-reduce-kernel). This is the schedule fix for a
-                GEMM whose (M,N) tiling cannot fill the machine — e.g. the tied-
-                embedding backward dx[13,640] = dlogits[13,262144]·E[262144,640]
-                launches ceil(640/128)·ceil(13/128) = 5 workgroups (of the ~32 that
-                fill this iGPU) each doing a k=262144 serial reduction. Splitting k
-                multiplies the workgroup count without changing the total DRAM
-                traffic (each (n-tile, k-chunk) block of B is still read once).
-                Adds an `int KC` kernel arg. :split-k? forces :c-dtype :float
-                (partials must accumulate in f32). Only valid with beta = 0.
-    :batched? - BATCHED variant (default false): the SAME (M,N) tiling but with a
-                THIRD grid dimension over `batch` independent slabs — grid z = slab
-                index. A/B/C are contiguous [batch, M, K] / [batch, K, N] / [batch,
-                M, N] buffers; each workgroup offsets its A/B/C base by its slab
-                (z·M·K, z·K·N, z·M·N). This is the schedule fix for a GEMM whose
-                per-slab (M,N) tiling cannot fill the machine but where there are
-                MANY slabs — e.g. attention dV[b]=W[b]ᵀ·dO[b] over 64 heads at
-                m=k=64,n=256: one slab is 1×2=2 workgroups (of the ~32 that fill the
-                iGPU), but 64 slabs = 128 workgroups fill it, feeding the DPAS array
-                across ALL slabs. No extra kernel arg — batch = grid-z extent, set at
-                launch. Mutually exclusive with :split-k? (both claim grid z)."
-  [kernel-name & {:keys [alpha beta c-dtype split-k? batched?]
-                  :or {alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false}}]
-  (when (and split-k? (not= beta 0.0))
-    (throw (ex-info "split-k GEMM requires beta = 0 (partials are summed by the reduce kernel)"
-                    {:beta beta})))
-  (when (and split-k? batched?)
-    (throw (ex-info "batched and split-k GEMM both claim grid-z — mutually exclusive" {})))
-  (let [c-dtype (if split-k? :float c-dtype)
-        c-type (if (= c-dtype :float) "float" "half")
-        c-size (if (= c-dtype :float) 4 2)
-        store-cast (if (= c-dtype :float) "" "(half)")
-        ;; upper bound of THIS workgroup's k-range: the full K normally, the k-chunk
-        ;; end under split-k. Only the LOOP bounds and the A-prefetch guard use it —
-        ;; the 2D-block reads keep the full M/K/N extents (they are the hardware OOB
-        ;; clamp of the whole matrix, not of this workgroup's slice).
-        kend (if split-k? "k_hi" "K")]
-    (str
-     "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
-     "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n"
-     "\n"
-     "// Non-square GEMM: C[M×N] = A[M×K] × B[K×N]\n"
-     "// Tile: 128×128 per workgroup, 16 subgroups (4×4), K-unroll ×2\n"
-     (when split-k? "// SPLIT-K: grid z = k-chunk; C is a [splits, M, N] f32 partials buffer\n")
-     "\n"
-     "__attribute__((intel_reqd_sub_group_size(16)))\n"
-     "__kernel void " kernel-name "(\n"
-     "    __global const half* restrict A,\n"
-     "    __global const half* restrict B,\n"
-     "    __global " c-type "* restrict C,\n"
-     "    int M, int N, int K"
-     (when split-k? ", int KC")
-     (when (not= alpha 1.0) ", float alpha")
-     (when (not= beta 0.0) ", float beta")
-     ") {\n"
-     "    int sg_id = get_sub_group_id();\n"
-     "    int sg_lid = get_sub_group_local_id();\n"
-     "    int sg_row = sg_id / 4;\n"
-     "    int sg_col = sg_id % 4;\n"
-     "\n"
-     "    int m_base = get_group_id(1) * 128 + sg_row * 32;\n"
-     "    int n_base0 = get_group_id(0) * 128 + sg_col * 32;\n"
-     "    int n_base1 = n_base0 + 16;\n"
-     "\n"
-     ;; A subgroup whose M-tile is entirely past M writes nothing (every store is
-     ;; guarded by `row < M`), and likewise for an N-tile past N (`col < N`) — so
-     ;; either condition alone makes the subgroup pure waste. The old `&&` kept
-     ;; those subgroups grinding the whole K-loop (and re-reading B): at M=13 that
-     ;; is 3 of every 4 subgroups. There are no barriers/SLM in this kernel, so a
-     ;; per-subgroup early return is safe.
-     "    // Early exit if this subgroup's tile contributes no in-range element\n"
-     "    if (m_base >= M || n_base0 >= N) return;\n"
-     "\n"
-     (when batched?
-       (str
-        "    // BATCHED: grid-z selects the slab; offset each operand to its base.\n"
-        "    long slab = get_group_id(2);\n"
-        "    A += slab * (long)M * (long)K;\n"
-        "    B += slab * (long)K * (long)N;\n"
-        "    C += slab * (long)M * (long)N;\n"
-        "\n"))
-     (when split-k?
-       (str
-        "    // this workgroup's k-slice\n"
-        "    int k_lo = get_group_id(2) * KC;\n"
-        "    if (k_lo >= K) return;\n"
-        "    int k_hi = k_lo + KC; if (k_hi > K) k_hi = K;\n"
-        "    C += (long)get_group_id(2) * (long)M * (long)N;\n"
-        "\n"))
-     "    // 8 accumulators: 4 M-tiles × 2 N-tiles\n"
-     "    float8 acc00=0.0f, acc10=0.0f, acc20=0.0f, acc30=0.0f;\n"
-     "    float8 acc01=0.0f, acc11=0.0f, acc21=0.0f, acc31=0.0f;\n"
-     "\n"
-     "    int a_wb = K * 2, a_pb = K * 2;\n"
-     "    int b_wb = N * 2, b_pb = N * 2;\n"
-     "\n"
-     "    // Prefetch first 3 K-steps of A (from this workgroup's k origin)\n"
-     "    for (int p = 0; p < 3 && " (if split-k? "k_lo + " "") "p * 16 < " kend "; p++) {\n"
-     "        int pk = " (if split-k? "k_lo + " "") "p * 16;\n"
-     "        for (int m = 0; m < 4; m++)\n"
-     "            intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
-     "                (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
-     "    }\n"
-     "\n"
-     "    // Main K-loop: 32 K elements per iteration (2 K-steps)\n"
-     "    int k = " (if split-k? "k_lo" "0") ";\n"
-     "    for (; k + 31 < " kend "; k += 32) {\n"
-     "        // K-step 1: k\n"
-     "        int pk = k + 48;\n"
-     "        if (pk < " kend ") {\n"
-     "            for (int m = 0; m < 4; m++)\n"
-     "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
-     "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
-     "        }\n"
-     "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
-     "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k)));\n"
-     "        ushort8 a0, a1, a2, a3;\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base), &a0);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+8), &a1);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+16), &a2);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+24), &a3);\n"
-     "        short8 sa0=as_short8(a0), sa1=as_short8(a1), sa2=as_short8(a2), sa3=as_short8(a3);\n"
-     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
-     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
-     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
-     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
-     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
-     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
-     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
-     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
-     "\n"
-     "        // K-step 2: k+16\n"
-     "        int k2 = k + 16;\n"
-     "        pk = k2 + 48;\n"
-     "        if (pk < " kend ") {\n"
-     "            for (int m = 0; m < 4; m++)\n"
-     "                intel_sub_group_2d_block_prefetch_16b_8r16x1c(\n"
-     "                    (__global void*)A, a_wb, M, a_pb, (int2)(pk, m_base + m * 8));\n"
-     "        }\n"
-     "        bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k2)));\n"
-     "        bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k2)));\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base), &a0);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+8), &a1);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+16), &a2);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k2, m_base+24), &a3);\n"
-     "        sa0=as_short8(a0); sa1=as_short8(a1); sa2=as_short8(a2); sa3=as_short8(a3);\n"
-     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
-     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
-     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
-     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
-     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
-     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
-     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
-     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
-     "    }\n"
-     "\n"
-     "    // Remainder K-steps (k-range not a multiple of 32)\n"
-     "    for (; k < " kend "; k += 16) {\n"
-     "        int8 bp0 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base0, k)));\n"
-     "        int8 bp1 = as_int8(intel_subgroup_block_read_transform_u16_k16(\n"
-     "            (__global void*)B, b_wb, K, b_pb, (int2)(n_base1, k)));\n"
-     "        ushort8 a0, a1, a2, a3;\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base), &a0);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+8), &a1);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+16), &a2);\n"
-     "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(k, m_base+24), &a3);\n"
-     "        short8 sa0=as_short8(a0), sa1=as_short8(a1), sa2=as_short8(a2), sa3=as_short8(a3);\n"
-     "        acc00 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp0, acc00);\n"
-     "        acc10 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp0, acc10);\n"
-     "        acc20 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp0, acc20);\n"
-     "        acc30 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp0, acc30);\n"
-     "        acc01 = intel_sub_group_f16_f16_matrix_mad_k16(sa0, bp1, acc01);\n"
-     "        acc11 = intel_sub_group_f16_f16_matrix_mad_k16(sa1, bp1, acc11);\n"
-     "        acc21 = intel_sub_group_f16_f16_matrix_mad_k16(sa2, bp1, acc21);\n"
-     "        acc31 = intel_sub_group_f16_f16_matrix_mad_k16(sa3, bp1, acc31);\n"
-     "    }\n"
-     "\n"
-     "    // Store with full M/N boundary checks\n"
-     "    #pragma unroll\n"
-     "    for (int t = 0; t < 4; t++) {\n"
-     "        float8 a0r = (t==0)?acc00:(t==1)?acc10:(t==2)?acc20:acc30;\n"
-     "        float8 a1r = (t==0)?acc01:(t==1)?acc11:(t==2)?acc21:acc31;\n"
-     "        int row_base = m_base + t * 8;\n"
-     "        #pragma unroll\n"
-     "        for (int i = 0; i < 8; i++) {\n"
-     "            int row = row_base + i;\n"
-     "            if (row < M) {\n"
-     "                float v0, v1;\n"
-     "                switch(i) {\n"
-     "                    case 0: v0=a0r.s0; v1=a1r.s0; break;\n"
-     "                    case 1: v0=a0r.s1; v1=a1r.s1; break;\n"
-     "                    case 2: v0=a0r.s2; v1=a1r.s2; break;\n"
-     "                    case 3: v0=a0r.s3; v1=a1r.s3; break;\n"
-     "                    case 4: v0=a0r.s4; v1=a1r.s4; break;\n"
-     "                    case 5: v0=a0r.s5; v1=a1r.s5; break;\n"
-     "                    case 6: v0=a0r.s6; v1=a1r.s6; break;\n"
-     "                    case 7: v0=a0r.s7; v1=a1r.s7; break;\n"
-     "                }\n"
-     (if (not= beta 0.0)
-       (str
-        "                int col0 = n_base0 + sg_lid;\n"
-        "                int col1 = n_base1 + sg_lid;\n"
-        "                if (col0 < N) {\n"
-        "                    float old = (float)C[row * N + col0];\n"
-        "                    C[row * N + col0] = " store-cast "("
-        (if (not= alpha 1.0) "alpha * " "") "v0 + beta * old);\n"
-        "                }\n"
-        "                if (col1 < N) {\n"
-        "                    float old = (float)C[row * N + col1];\n"
-        "                    C[row * N + col1] = " store-cast "("
-        (if (not= alpha 1.0) "alpha * " "") "v1 + beta * old);\n"
-        "                }\n")
-       (str
-        "                int col0 = n_base0 + sg_lid;\n"
-        "                int col1 = n_base1 + sg_lid;\n"
-        "                if (col0 < N)\n"
-        "                    C[row * N + col0] = " store-cast "("
-        (if (not= alpha 1.0) "alpha * " "") "v0);\n"
-        "                if (col1 < N)\n"
-        "                    C[row * N + col1] = " store-cast "("
-        (if (not= alpha 1.0) "alpha * " "") "v1);\n"))
-     "            }\n"
-     "        }\n"
-     "    }\n"
-     "}\n")))
+(defn emit-gemm-tiled
+  "Tile-PARAMETRIC XMX GEMM generator (C = A·B, FP16 in, FP32 accumulate). The tile geometry
+   (workgroup BLOCK_M×BLOCK_N, per-subgroup SG_M×SG_N, K-step BLOCK_K, prefetch depth) is COMPUTED,
+   not hardcoded; the DPAS instruction shape (M_i×N_i×K_i) + subgroup size come from the :matrix
+   descriptor. The Arc default (128×128, 32×32, K 32, DPAS 8×16×16, subgroup 16) reproduces the
+   original hand-unrolled kernel bit-for-bit (validated over plain/split-k/batched paths); varying
+   the tile is bit-invariant since each output element's K-reduction is the same DPAS sequence. The
+   Intel DPAS builtins are fixed here; a different vendor's matrix instruction (WGMMA/MFMA) is a
+   separate emitter keyed by :matrix :family (the one genuine fork). Handles arbitrary M,N,K with
+   full boundary checking; supports alpha/beta, c-dtype, split-k? (grid-z partials) and batched?
+   (grid-z slabs)."
+  [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? batched? prefetch
+                         epilogue epilogue-params epilogue-helpers]
+                  :or {block-m 128 block-n 128 sg-m 32 sg-n 32 block-k 32
+                       matrix {:m 8 :n 16 :k 16 :subgroup 16}
+                       alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false prefetch 3}}]
+  ;; EPILOGUE (feature 4 store-splice): `epilogue` is (fn [acc-c row-c col-c] -> C-expr) that
+  ;; transforms the accumulator value into the stored value — a bias/activation/residual/dequant
+  ;; folded into the store slot (which already has row/col in scope), eliminating a separate
+  ;; elementwise kernel + a DRAM round-trip of C. `epilogue-params` is a C param-decl string for the
+  ;; epilogue's operand arrays (e.g. ", __global const float* restrict bias"); `epilogue-helpers` is
+  ;; C source prepended (e.g. a silu_f definition). When `epilogue` is nil the emitted string is
+  ;; byte-identical to the plain GEMM. Mutually exclusive with beta≠0 (an accumulating store).
+  (let [{mi :m ni :n ki :k sg :subgroup} matrix]
+    (doseq [[nm a b] [["sg-m/M_i" sg-m mi] ["sg-n/N_i" sg-n ni] ["block-m/sg-m" block-m sg-m]
+                      ["block-n/sg-n" block-n sg-n] ["block-k/K_i" block-k ki]]]
+      (when-not (zero? (rem a b))
+        (throw (ex-info (str "emit-gemm-tiled: " nm " not divisible (" a "/" b ")") {:tile [block-m block-n sg-m sg-n block-k] :matrix matrix}))))
+    (when (and split-k? (not= beta 0.0))
+      (throw (ex-info "split-k GEMM requires beta = 0" {:beta beta})))
+    (when (and epilogue (not= beta 0.0))
+      (throw (ex-info "epilogue and beta≠0 are mutually exclusive (both write the store slot)" {:beta beta})))
+    (when (and epilogue split-k?)
+      (throw (ex-info "epilogue fuses into the final store; not valid on split-k partials" {})))
+    (when (and split-k? batched?)
+      (throw (ex-info "batched and split-k both claim grid-z — mutually exclusive" {})))
+    (let [nms (quot sg-m mi) nns (quot sg-n ni)      ;; M/N subtiles per subgroup
+          ncols (quot block-n sg-n)                   ;; subgroup columns
+          ksteps (quot block-k ki)
+          c-dtype (if split-k? :float c-dtype)
+          c-type (if (= c-dtype :float) "float" "half")
+          store-cast (if (= c-dtype :float) "" "(half)")
+          kend (if split-k? "k_hi" "K")
+          accT (str "float" mi)
+          ms (range nms) ns (range nns)
+          amul (fn [m] (if (zero? m) "m_base" (str "m_base+" (* m mi))))
+          kstep (fn [kpos]
+                  (str "        { int pk = " kpos " + " (* prefetch ki) ";\n"
+                       "          if (pk < " kend ") {\n"
+                       (apply str (for [m ms] (str "            intel_sub_group_2d_block_prefetch_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(pk, " (amul m) "));\n")))
+                       "          } }\n"
+                       (apply str (for [n ns] (str "        bp" n " = as_int8(intel_subgroup_block_read_transform_u16_k16((__global void*)B, b_wb, K, b_pb, (int2)(n_base" n ", " kpos ")));\n")))
+                       (apply str (for [m ms] (str "        intel_sub_group_2d_block_read_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" kpos ", " (amul m) "), &a" m ");\n")))
+                       (apply str (for [m ms] (str "        sa" m " = as_short8(a" m ");\n")))
+                       (apply str (for [m ms n ns] (str "        acc" m n " = intel_sub_group_f16_f16_matrix_mad_k16(sa" m ", bp" n ", acc" m n ");\n")))))]
+      (str
+       "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
+       "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n\n"
+       (when epilogue-helpers (str epilogue-helpers "\n"))
+       "// Tiled GEMM (parametric): WG " block-m "x" block-n ", SG " sg-m "x" sg-n ", K " block-k
+       ", DPAS " mi "x" ni "x" ki ", sg " sg "\n"
+       "__attribute__((intel_reqd_sub_group_size(" sg ")))\n"
+       "__kernel void " kernel-name "(\n"
+       "    __global const half* restrict A,\n    __global const half* restrict B,\n"
+       "    __global " c-type "* restrict C,\n    int M, int N, int K"
+       (when split-k? ", int KC") (when (not= alpha 1.0) ", float alpha") (when (not= beta 0.0) ", float beta")
+       epilogue-params
+       ") {\n"
+       "    int sg_id = get_sub_group_id();\n    int sg_lid = get_sub_group_local_id();\n"
+       "    int sg_row = sg_id / " ncols ";\n    int sg_col = sg_id % " ncols ";\n"
+       "    int m_base = get_group_id(1) * " block-m " + sg_row * " sg-m ";\n"
+       (apply str (for [n ns] (str "    int n_base" n " = get_group_id(0) * " block-n " + sg_col * " sg-n (when (pos? n) (str " + " (* n ni))) ";\n")))
+       "    if (m_base >= M || n_base0 >= N) return;\n"
+       (when batched?
+         "    long slab = get_group_id(2);\n    A += slab*(long)M*(long)K;\n    B += slab*(long)K*(long)N;\n    C += slab*(long)M*(long)N;\n")
+       (when split-k?
+         "    int k_lo = get_group_id(2) * KC;\n    if (k_lo >= K) return;\n    int k_hi = k_lo + KC; if (k_hi > K) k_hi = K;\n    C += (long)get_group_id(2) * (long)M * (long)N;\n")
+       (apply str (for [m ms] (str "    " accT " " (str/join ", " (for [n ns] (str "acc" m n "=0.0f"))) ";\n")))
+       "    int a_wb = K * 2, a_pb = K * 2;\n    int b_wb = N * 2, b_pb = N * 2;\n"
+       "    ushort8 " (str/join ", " (for [m ms] (str "a" m))) ";\n"
+       "    short8 " (str/join ", " (for [m ms] (str "sa" m))) ";\n"
+       "    int8 " (str/join ", " (for [n ns] (str "bp" n))) ";\n"
+       (apply str (for [p (range prefetch)]
+                    (str "    if (" (when split-k? "k_lo + ") (* p ki) " < " kend ") {\n"
+                         (apply str (for [m ms] (str "        intel_sub_group_2d_block_prefetch_16b_8r16x1c((__global void*)A, a_wb, M, a_pb, (int2)(" (when split-k? "k_lo + ") (* p ki) ", " (amul m) "));\n")))
+                         "    }\n")))
+       "    int k = " (if split-k? "k_lo" "0") ";\n"
+       "    for (; k + " (dec block-k) " < " kend "; k += " block-k ") {\n"
+       (apply str (for [ks (range ksteps)] (kstep (if (zero? ks) "k" (str "k + " (* ks ki))))))
+       "    }\n"
+       "    for (; k < " kend "; k += " ki ") {\n"
+       (kstep "k")
+       "    }\n"
+       (apply str
+              (for [m ms i (range mi)]
+                (str "    { int row = m_base + " (+ (* m mi) i) ";\n      if (row < M) {\n"
+                     (apply str (for [n ns]
+                                  (let [acc-expr (str (when (not= alpha 1.0) "alpha * ") "acc" m n ".s" i)]
+                                    (str "        { int col = n_base" n " + sg_lid;\n          if (col < N) "
+                                         (cond
+                                           (not= beta 0.0)
+                                           (str "{ float old=(float)C[row*N+col]; C[row*N+col] = " store-cast "(" acc-expr " + beta*old); }\n")
+                                           epilogue
+                                           (str "C[row*N+col] = " store-cast "(" (epilogue acc-expr "row" "col") ");\n")
+                                           :else
+                                           (str "C[row*N+col] = " store-cast "(" acc-expr ");\n"))
+                                         "        }\n"))))
+                     "      }\n    }\n")))
+       "}\n"))))
 
 (defn emit-gemm-splitk-reduce-kernel
   "Second stage of a split-k GEMM: C[i] = Σ_s partials[s·MN + i], i < MN = M·N.
@@ -903,11 +780,13 @@
   (when (>= n min-elements)
     (if device-id
       (try
-        (require 'raster.runtime.hardware)
-        (let [hw-wg ((resolve 'raster.runtime.hardware/optimal-workgroup-size)
-                     device-id n :reduction? reduction?)
-              hw-gc ((resolve 'raster.runtime.hardware/optimal-group-count)
-                     device-id n hw-wg :reduction? reduction?)
+        (require 'raster.runtime.hardware 'raster.compiler.core.hardware)
+        ((resolve 'raster.runtime.hardware/init!))
+        (let [desc ((resolve 'raster.compiler.core.hardware/descriptor-for) device-id)
+              hw-wg ((resolve 'raster.compiler.core.hardware/workgroup-size)
+                     desc n :reduction? reduction?)
+              hw-gc ((resolve 'raster.compiler.core.hardware/group-count)
+                     desc n hw-wg :reduction? reduction?)
               local-mem (if reduction? (* hw-wg 8) 0)]
           {:workgroup-size hw-wg :group-count hw-gc :local-mem local-mem})
         (catch Exception _
