@@ -282,3 +282,103 @@
        :n-phases 2
        :identity-val identity-val
        :c-op c-op})))
+
+;; ================================================================
+;; Segmented reduction (contraction) → OpenCL — the multi-axis SegSpace path
+;; ================================================================
+
+(defn generate-segmented-reduce-kernel
+  "NAIVE segmented reduction (a contraction) → OpenCL. One work-item per SEGMENT (free-axis
+   tuple); each sequentially folds over the reduced (innermost) axis. segment-dims = the
+   free/parallel axes, reduced-dim = the contracted axis (Futhark innermost-reduced
+   convention). Emits: decompose the flat segment id into the free indices (row-major via
+   suffix products), loop over the reduced axis accumulating the combine's element (the
+   product), store out[seg]. This is the multi-axis SegSpace emit path the 1-D emitters
+   never handled; NAIVE (one thread/output) — the substrate the BlkRegTiling-style tiling
+   pass optimizes. Combine op/element detection mirrors generate-segred-kernel (a shared
+   helper is a later dedup). Bounds must be symbols or int literals in this prototype."
+  [segred out-sym & {:keys [dtype kernel-name-prefix]
+                     :or {dtype :double kernel-name-prefix "contract"}}]
+  (let [space    (:space segred)
+        seg-dims (segop/seg-space-segment-dims space)   ; free (parallel) axes, outer→inner
+        red-dim  (segop/seg-space-reduced-dim space)    ; contracted axis (innermost)
+        _ (when (empty? seg-dims)
+            (throw (ex-info "segmented-reduce: no segment dims — use generate-segred-kernel for a full reduction"
+                            {:space space})))
+        dtype (or (:dtype segred) dtype)
+        ctype (get codegen/opencl-type-map dtype "double")
+        {:keys [acc init lambda]} (:reduce-op segred)
+        lambda (ce/normalize-array-prims lambda)
+        ;; combine op + element detection (mirrors generate-segred-kernel)
+        op-sym (when (seq? lambda) (descriptor/semantic-op lambda))
+        normalized-op (get {'+ '+ 'clojure.core/+ '+ 'raster.numeric/+ '+
+                            '* '* 'clojure.core/* '* 'raster.numeric/* '*
+                            'max 'max 'clojure.core/max 'max 'Math/max 'max 'raster.numeric/max 'max
+                            'min 'min 'clojure.core/min 'min 'Math/min 'min 'raster.numeric/min 'min}
+                           op-sym op-sym)
+        c-op (condp = normalized-op '+ "+" '* "*" 'max "fmax" 'min "fmin"
+                    (throw (ex-info (str "segmented-reduce: unsupported combine op " op-sym
+                                         " — need an associative op (+ * max min)")
+                                    {:op op-sym :lambda lambda})))
+        c-combine (fn [a b] (if (#{"fmax" "fmin"} c-op)
+                              (str c-op "(" a ", " b ")")
+                              (str "(" a " " c-op " " b ")")))
+        op-args (vec (when (seq? lambda) (descriptor/call-args lambda)))
+        acc-at? (fn [a] (or (= a acc) (and (seq? a) (= 'double (first a)) (= acc (second a)))))
+        elem-expr (when (>= (count op-args) 2)
+                    (let [a0 (nth op-args 0) a1 (nth op-args 1)]
+                      (cond (acc-at? a0) a1 (acc-at? a1) a0 :else nil)))
+        _ (when (nil? elem-expr)
+            (throw (ex-info "segmented-reduce: could not isolate the element (non-acc) operand"
+                            {:lambda lambda :acc acc})))
+        ;; params
+        arr-params (vec (sort-by name (:inputs segred)))
+        scl-params (vec (sort-by name (:scalars segred)))
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        bound-c (fn [b] (cond (symbol? b) (ce/c-symbol b)
+                              (number? b) (str b)
+                              :else (throw (ex-info "segmented-reduce: bound must be a symbol or int in this prototype"
+                                                    {:bound b}))))
+        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        scl-param-str (str/join ", " (map (fn [s] (str "int " (ce/c-symbol s))) scl-params))
+        all-params (str/join ", " (remove empty?
+                                          [arr-param-str (str "__global " ctype "* restrict out") scl-param-str]))
+        seg-bound-cs (mapv (fn [d] (bound-c (:bound d))) seg-dims)
+        nseg-c (str/join " * " seg-bound-cs)
+        ;; row-major decompose: idx_p = (seg / product(bounds after p)) % bound_p
+        decomp (str/join "\n"
+                         (map-indexed
+                          (fn [p d]
+                            (let [after (drop (inc p) seg-bound-cs)
+                                  div (if (seq after) (str "(seg / (" (str/join " * " after) "))") "seg")
+                                  rhs (if (seq after) (str div " % " (bound-c (:bound d))) (str "seg % " (bound-c (:bound d))))]
+                              (str "    int " (ce/c-symbol (:name d)) " = " rhs ";")))
+                          seg-dims))
+        ;; ce/emit-expr renders the primary index sym as the C var "idx" (its convention);
+        ;; the reduced-axis loop var MUST therefore be named "idx" so the body's references
+        ;; to the reduced index resolve. Free indices render by their own c-symbol names.
+        red-bound-c (bound-c (:bound red-dim))
+        int-vars (into #{} (map #(symbol (name %)))
+                       (concat (map :name seg-dims) [(:name red-dim)] scl-params))
+        arr-sym-set (set (map #(symbol (name %)) arr-params))
+        elem-str (binding [ce/*emit-config* ce/opencl-config
+                           ce/*scalar-type* ctype
+                           ce/*int-vars* (into ce/*int-vars* int-vars)]
+                   (ce/emit-expr (ce/adapt-casts-for-dtype elem-expr dtype) (:name red-dim) arr-sym-set))
+        source (str (codegen/extension-pragmas dtype)
+                    "__kernel void " kernel-name "(" all-params ") {\n"
+                    "    int seg = get_global_id(0);\n"
+                    "    if (seg >= " nseg-c ") return;\n"
+                    decomp "\n"
+                    "    " ctype " acc = " (str init) ";\n"
+                    "    for (int idx = 0; idx < " red-bound-c "; idx++) {\n"
+                    "        acc = " (c-combine "acc" elem-str) ";\n"
+                    "    }\n"
+                    "    out[seg] = acc;\n"
+                    "}\n")]
+    {:kernel-name kernel-name
+     :source source
+     :array-params arr-params
+     :scalar-params scl-params
+     :dtype dtype
+     :c-op c-op}))
