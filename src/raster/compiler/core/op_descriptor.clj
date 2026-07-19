@@ -292,6 +292,29 @@
 (defn get-dim-rule [op-sym]
   (get-in (get-op-descriptor op-sym) [:shape :dim-rule]))
 
+(defn register-layout-rule!
+  "Register the LAYOUT facet for an op — the memory/register layout its operands (or result)
+   require, derived from (op-idx, arg-layouts, dtype, hardware-descriptor). The layout-inference
+   pass queries this to ANCHOR a layout (a dot pins its operands to :dot-operand, an expensive
+   load pins :blocked-coalesced); ops without a rule default to row-major. A per-op facet, so it
+   composes with the buffer/shape/placement facets rather than a separate registry. Mirrors
+   register-result-type!/register-dim-rule!. `rule`: (fn [op-idx arg-layouts dtype desc] -> layout)."
+  [op-sym rule]
+  (register-op-descriptor! op-sym {:layout {:rule rule}}))
+
+(defn layout-rule
+  "The layout rule fn for op-sym, or nil. Resolves mangled/devirtualized names (like get-placement)."
+  [op-sym]
+  (when-let [[descriptor _] (resolve-op-descriptor op-sym)]
+    (get-in descriptor [:layout :rule])))
+
+(defn operand-layout
+  "The layout op-sym requires for operand `op-idx` given its arg layouts, dtype and hardware
+   descriptor — or nil (the caller then defaults to row-major). The anchor query the
+   layout-inference pass runs at each op."
+  [op-sym op-idx arg-layouts dtype desc]
+  (when-let [r (layout-rule op-sym)] (r op-idx arg-layouts dtype desc)))
+
 (defn mutating-op?
   "True if op-sym is a mutating operation.
    Checks op-descriptor registry first, then falls back to !-suffix convention.
