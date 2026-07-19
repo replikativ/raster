@@ -53,3 +53,44 @@
       (let [t (hw/roofline-time-ns desc (assoc k :n-kernels 2 :launch-overhead-ns 50.0))
             t0 (hw/roofline-time-ns desc (assoc k :n-kernels 0))]
         (is (< 99.0 (- t t0) 101.0) "2×50ns measured tax")))))
+
+;; --- B0a: how the roofline must be APPLIED to price a fusion (validated vs measurement) ---
+;; A training linear A[M×640]·B[640×2048] → C, then a bias add. We MEASURED epilogue fusion
+;; (fold the bias into the GEMM store, one kernel) vs unfused (two kernels, C round-trips):
+;;   M=1 → +0.8%, M=128 → −3.2%, M=512 → +14.6%, M=1024 → +17.7% (device-event median, this session).
+;; Two lessons the pricer (B3) MUST encode, both asserted here:
+;;  (1) Price a fusion as the SUM OF PER-KERNEL roofline times — NOT sum-the-traffic-then-overlap-once.
+;;      The naive single-overlap form overlaps the *separate* bias kernel's memory with the GEMM's
+;;      compute, which inverts the trend (predicts fusion helps MOST at M=1, least at M=1024 — the
+;;      opposite of measured). Per-kernel pricing recovers the correct trend: tiny win at M=1, large
+;;      win at big M.
+;;  (2) The roofline is a directional SEED, never the arbiter: even priced per-kernel it predicts
+;;      ~+22% at M=128 where measurement showed a −3.2% REGRESSION. That sign flip is an occupancy
+;;      effect the FLOP+byte+launch model is structurally blind to → measurement gates the decision.
+(deftest roofline-fusion-pricing-is-per-kernel
+  (let [N 2048 K 640
+        gemm-flops (fn [M] (* 2 M K N))
+        q-gemm (fn [M] (+ (* M K 2) (* K N 2) (* M N 4)))        ;; A(f16)+B(f16)+Cwrite(f32)
+        q-bias (fn [M] (+ (* M N 4) (* M N 4) (* N 4)))          ;; Cread+Cwrite+bias
+        naive%   (fn [M]                                          ;; WRONG: one overlap over summed traffic
+                   (let [u (hw/roofline-time-ns desc {:flops (gemm-flops M)
+                                                      :bytes (+ (q-gemm M) (q-bias M)) :dtype :f32 :n-kernels 2})
+                         f (hw/roofline-time-ns desc {:flops (gemm-flops M)
+                                                      :bytes (+ (q-gemm M) (* N 4)) :dtype :f32 :n-kernels 1})]
+                     (* 100.0 (/ (- u f) u))))
+        perk%    (fn [M]                                          ;; RIGHT: sum of per-kernel times
+                   (let [u (+ (hw/roofline-time-ns desc {:flops (gemm-flops M) :bytes (q-gemm M) :dtype :f32 :n-kernels 1})
+                              (hw/roofline-time-ns desc {:flops (* M N) :bytes (q-bias M) :dtype :f32 :n-kernels 1}))
+                         f (hw/roofline-time-ns desc {:flops (gemm-flops M)
+                                                      :bytes (+ (q-gemm M) (* N 4)) :dtype :f32 :n-kernels 1})]
+                     (* 100.0 (/ (- u f) u))))]
+    (testing "naive summed-then-overlapped pricing INVERTS the trend (documents the trap)"
+      (is (> (naive% 1) (naive% 1024))
+          "the wrong model predicts fusion helps more at M=1 than M=1024 — opposite of measured"))
+    (testing "per-kernel pricing recovers the measured trend: small win at M=1, large at big M"
+      (is (< (perk% 1) 5.0)   "M=1: near-neutral (measured +0.8%)")
+      (is (> (perk% 512) 15.0) "M=512: substantial (measured +14.6%)")
+      (is (< (perk% 1) (perk% 512)) "monotone up with M, unlike the naive model"))
+    (testing "roofline is only a SEED — it cannot see the M=128 occupancy regression"
+      (is (pos? (perk% 128))
+          "roofline predicts a WIN at M=128, but measurement showed −3.2% → measurement must gate"))))
