@@ -605,10 +605,15 @@
   "Replace (aget target-sym idx) with replacement-expr in body,
   adjusting index variable from src-idx to dst-idx.
 
-  INDEX-INSENSITIVE (see fusion-support/substitute-aget): matches by array name only and
-  substitutes at ANY index, assuming same-position elementwise producer→consumer fusion.
-  A non-same-index consumer (gather/transpose/offset read) would be mis-fused. Reachable
-  only for the same-index case today; a real guard belongs with the descriptor VALIDATOR."
+  SAME-POSITION ONLY (layout-soundness guard): vertical Screma fusion inlines the producer's body
+  (which computes the intermediate element at the CONSUMER's iteration index dst-idx) in place of
+  the consumer's read. That is correct iff the consumer reads the intermediate at its OWN iteration
+  index — i.e. `(aget target-sym dst-idx)`. A consumer that reads at any other index (a gather /
+  transpose / neighbour / offset read) is NOT elementwise-fusible without a layout convert, and
+  inlining the producer body there would silently compute the wrong element. Rather than mis-fuse
+  (the former index-insensitive behaviour), we FAIL LOUD — the layout-inference pass is where such a
+  read gets a `convert_layout` instead. This never fires for the same-position case that is all that
+  reaches fusion today; it closes the documented hazard for the non-same-position future."
   [body target-sym src-idx dst-idx replacement-expr]
   (walk/postwalk
    (fn [f]
@@ -617,9 +622,16 @@
               (>= (count f) 3)
               (symbol? (second f))
               (= (name target-sym) (name (second f))))
-       (walk/postwalk
-        (fn [g] (if (= g src-idx) dst-idx g))
-        replacement-expr)
+       (let [read-idx (nth f 2)]
+         (when-not (or (= read-idx dst-idx) (= read-idx src-idx))
+           (throw (ex-info (str "Screma fusion: non-same-position read of intermediate '" target-sym
+                                "' at index " (pr-str read-idx) " ≠ iteration index " (pr-str dst-idx)
+                                " — gather/transpose/offset reads are not elementwise-fusible without a"
+                                " layout convert (layout-inference pass); refusing to mis-fuse.")
+                           {:target target-sym :read-idx read-idx :dst-idx dst-idx :src-idx src-idx})))
+         (walk/postwalk
+          (fn [g] (if (= g src-idx) dst-idx g))
+          replacement-expr))
        f))
    body))
 

@@ -405,3 +405,15 @@
       (is (some? s) "the single-write let* shape is what the unwrapping exists for")
       (is (= #{'b} (:outputs s)))
       (is (:void? s)))))
+
+;; ── layout-soundness guard: non-same-position fusion fails loud (not silent mis-fuse) ──
+(deftest substitute-aget-refuses-non-same-position-read
+  (let [subst @#'soac/substitute-aget-sym]
+    (testing "same-position read (aget t dst) inlines the producer (unchanged behaviour)"
+      (is (= '(raster.numeric/* p p)
+             (subst '(clojure.core/aget t dst) 't 'src 'dst '(raster.numeric/* p p)))
+          "no aget on the target left → replaced")
+      (is (= 'x (subst 'x 't 'src 'dst '(foo)))  "unrelated body untouched"))
+    (testing "a gather/offset read (aget t (+ dst 1)) FAILS LOUD instead of mis-fusing"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"non-same-position read"
+            (subst '(clojure.core/aget t (clojure.core/+ dst 1)) 't 'src 'dst '(raster.numeric/* p p)))))))
