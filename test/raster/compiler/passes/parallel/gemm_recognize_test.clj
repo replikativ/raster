@@ -157,30 +157,6 @@
       (is (= 'A (:A r)))
       (is (= 'B (:B r))))))
 
-;; ── redomap->dot: the matcher descriptor becomes the Dot IR node (Dot's first real
-;; producer; Feature 4 defined the node + a test but nothing constructed it). This is
-;; what the resident Screma-level recognizer (Design B) will emit in place of SOACs.
-(deftest redomap-to-dot-node
-  (let [desc (gr/match-gemm-loop-nest (gemm '(+ (* i k) p) '(+ (* p n) j)))
-        dot  (gr/redomap->dot 7 'gemm-out desc)]
-    (testing "produces a Dot IR record, NOT a generic SOAC (map/reduce lowering skips it)"
-      (is (instance? raster.compiler.ir.soac.Dot dot))
-      (is (soac/dot? dot))
-      (is (not (soac/soac? dot))))
-    (testing "carries operands/dims/variant from the descriptor"
-      (is (= ['A 'B 'C] [(:A dot) (:B dot) (:C dot)]))
-      (is (= ['m 'n 'k] [(:m dot) (:n dot) (:k dot)]))
-      (is (= :nn (:variant dot)))
-      (is (= [1.0 0.0] [(:alpha dot) (:beta dot)])))
-    (testing "dep-graph fields: inputs {A B}, outputs {C} (the producer edge), bound m*n"
-      (is (= #{'A 'B} (:inputs dot)))
-      (is (= #{'C} (:outputs dot)))
-      (is (= '(clojure.core/* m n) (:bound dot))))
-    (testing "epilogue + layout start nil (later vertical fusion / transpose-elim fill them)"
-      (is (nil? (:epilogue dot)))
-      (is (nil? (:layout-a dot)))
-      (is (nil? (:layout-b dot))))))
-
 ;; ── Design B: the Screma/SoacMap-level recognizer (the RESIDENT front door). A
 ;; par-form matmul lowers to ONE SoacMap with the outer (i,j) inlined as
 ;; (quot ij N)/(rem ij N) in the operand indices. Built + tested against the REAL
@@ -214,8 +190,4 @@
       (is (nil? (gr/match-gemm-screma
                  (par-matmul-soacmap
                   '(aset C ij (loop [acc 0.0 p 0]
-                                (if (< p k) (recur (+ acc (* (aget A ij) (aget B ij))) (inc p)) acc)))))))))
-  (testing "the Screma recognizer feeds redomap->dot — Screma → descriptor → Dot node"
-    (let [dot (gr/redomap->dot 3 'c (gr/match-gemm-screma (par-matmul-soacmap nn-body)))]
-      (is (instance? raster.compiler.ir.soac.Dot dot))
-      (is (= ['A 'B 'C 'm 'n 'k] [(:A dot) (:B dot) (:C dot) (:m dot) (:n dot) (:k dot)])))))
+                                (if (< p k) (recur (+ acc (* (aget A ij) (aget B ij))) (inc p)) acc))))))))))

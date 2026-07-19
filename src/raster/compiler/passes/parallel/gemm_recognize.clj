@@ -194,8 +194,9 @@
    else nil. Recognizes the :nn shape (A row-major(quot idx N, p, K); B
    row-major(p, rem idx N, N)); declines transposes/other shapes (sound — narrower,
    never a false positive). CONSERVATIVE proven-or-nil: a false positive would emit a
-   tiled XMX kernel for a non-GEMM SoacMap (a silent miscompile). `redomap->dot` turns
-   the result into the Dot node the resident emit consumes."
+   tiled XMX kernel for a non-GEMM SoacMap (a silent miscompile). The descriptor is the
+   GEMM *schedule payload* — the resident pass attaches it as a `:gemm` facet on this
+   SoacMap (Design S), which then dispatches to emit-gemm-tiled while staying a SOAC."
   [node]
   (when (and (instance? raster.compiler.ir.soac.SoacMap node)
              (= 1 (count (:outputs node))))
@@ -221,15 +222,3 @@
                                   {:variant :nn :A (:arr gA) :B (:arr gB) :C c-sym
                                    :m m :n nB :k k :alpha 1.0 :beta 0.0})))))))))]
           (or (assign-nn ga gb) (assign-nn gb ga)))))))
-
-(defn redomap->dot
-  "Build the Dot IR node (the late-recognizer OUTPUT, Feature 4) from a
-   match-gemm-* descriptor + the binding id/sym. This is Dot's first real producer:
-   the node was defined with dep-graph + epilogue-emit support but never constructed
-   outside a test. inputs = {A B}, outputs = {C} (the producer edge that closes the
-   soac-outputs leak), bound = m*n, alpha/beta from the descriptor, epilogue/layout
-   nil (later vertical fusion / transpose-elim fill them). This is what the resident
-   Screma-level recognizer (Design B) emits in place of the map/reduce SOACs."
-  [id sym {:keys [A B C m n k variant alpha beta]}]
-  (soac/->Dot id sym #{A B} #{C} (list 'clojure.core/* m n)
-              A B C m n k variant (or alpha 1.0) (or beta 0.0) nil nil nil))
