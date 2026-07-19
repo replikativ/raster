@@ -103,3 +103,21 @@
   (testing "not a nested dotimes at all → nil"
     (is (nil? (gr/match-gemm-loop-nest '(dotimes [i m] (aset C i (aget A i))))))
     (is (nil? (gr/match-gemm-loop-nest '(+ 1 2))))))
+
+;; ── binding-level entry point (do-unwrap + :result-sym for rewrite-gemm) ──────────
+(deftest binding-level-match-gemm-redomap
+  (let [nest (gemm '(+ (* i k) p) '(+ (* p n) j))]
+    (testing "a bare nested-dotimes binding value → result-sym defaults to the output C"
+      (is (= 'C (:result-sym (gr/match-gemm-redomap nest)))))
+    (testing "a (do (dotimes …) Cout) wrapper → result-sym is the do's tail buffer"
+      (let [r (gr/match-gemm-redomap (list 'do nest 'Cout))]
+        (is (= :nn (:variant r)))
+        (is (= 'C (:C r)))
+        (is (= 'Cout (:result-sym r)))))
+    (testing "the descriptor still carries the full rewrite-gemm contract"
+      (is (= #{:variant :A :B :C :m :k :n :alpha :beta :result-sym}
+             (set (keys (gr/match-gemm-redomap nest))))))
+    (testing "a non-GEMM do body → nil"
+      (is (nil? (gr/match-gemm-redomap '(do (dotimes [i n] (aset C i (aget A i))) C)))))
+    (testing "a plain non-loop expr → nil"
+      (is (nil? (gr/match-gemm-redomap '(+ 1 2)))))))

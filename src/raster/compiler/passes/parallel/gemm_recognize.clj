@@ -112,7 +112,7 @@
       (when (and (seq? body) (contains? aset-syms (first body)) (= 4 (count body)))
         (let [[_ c-sym idx-c stored] body]
           (when (and (symbol? c-sym)
-                     (pat/row-major-linear-index? idx-c i j n))   ;; C[i,j], m×n
+                     (pat/row-major-linear-index? idx-c i j n))    ;; C[i,j], m×n
             ;; strip an optional store cast, then split off an accumulating (β=1) add.
             (let [uncast (if (and (seq? stored) (= 2 (count stored))
                                   (contains? value-casts (first stored)))
@@ -138,3 +138,22 @@
                                :A (:arr gA) :B (:arr gB) :C c-sym
                                :m m :n n :k k :alpha 1.0 :beta beta})))]
                   (or (assign ga gb) (assign gb ga)))))))))))
+
+(defn match-gemm-redomap
+  "Match a GEMM redomap as it appears in a let* BINDING VALUE — either a bare
+   nested `dotimes`, or a `(do … (dotimes …) result)` wrapper (the matmul writes C
+   as a side effect, then yields the result buffer). Returns the match-gemm-loop-nest
+   descriptor augmented with :result-sym (the do's tail expr, or C when the store is
+   the tail) — the exact shape gpu-plan/rewrite-gemm consumes, so the redomap front
+   door reuses the BLAS emission path verbatim. nil if not a GEMM redomap."
+  [expr]
+  (let [[nest tail] (if (and (seq? expr) (= 'do (first expr)))
+                      (let [body (rest expr)]
+                        [(some #(when (and (seq? %) (= 'dotimes (first %))) %) body)
+                         (last body)])
+                      [expr nil])]
+    (when nest
+      (when-let [d (match-gemm-loop-nest nest)]
+        ;; result-sym = the do's tail buffer, unless the tail IS the store dotimes
+        ;; itself (no explicit result) — then the output C is the result.
+        (assoc d :result-sym (if (and (some? tail) (not= tail nest)) tail (:C d)))))))
