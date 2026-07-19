@@ -95,7 +95,7 @@
     (or (get @kern-cache ck)
         (let [kname (str "gemm_cold_" (if tile (tile-tag tile) (if large-grf? "grf256" "grf128")))
               src   (if tile
-                      (apply cg/emit-gemm-tiled kname :c-dtype :half
+                      (apply cg/emit-gemm-tiled kname :c-dtype :half :prefetch (:num-stages tile 3)
                              (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
                       ;; no tile → emit-gemm-tiled at its DEFAULT geometry (block 128, wg 256 —
                       ;; matches the historical baseline; the old hand emit-gemm-nonsquare-kernel
