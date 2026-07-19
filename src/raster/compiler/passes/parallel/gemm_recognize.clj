@@ -47,11 +47,22 @@
         {:sym sym :bound bound :body (first body)}))))
 
 (defn- aget-affine
-  "(aget arr idx-expr) → {:arr :idx}, else nil. idx-expr may be affine (not bare)."
+  "An array read `(aget arr idx-expr)` → {:arr :idx}, else nil. idx-expr may be
+   affine (not bare). Handles BOTH the literal head and a devirtualized
+   `(.invk impl arr idx)` whose :raster.op/original is an aget op — so the matcher
+   fires whether or not the walker has lowered array reads by this pipeline stage.
+   A missed match is only a missed offload (safe-fail), never a miscompile."
   [form]
-  (when (and (seq? form) (contains? aget-syms (first form)) (= 3 (count form))
-             (symbol? (second form)))
-    {:arr (second form) :idx (nth form 2)}))
+  (when (seq? form)
+    (cond
+      ;; literal (aget arr idx)
+      (and (contains? aget-syms (first form)) (= 3 (count form)) (symbol? (second form)))
+      {:arr (second form) :idx (nth form 2)}
+      ;; devirtualized (.invk impl arr idx) with :raster.op/original an aget op
+      (contains? aget-syms (descriptor/semantic-op form))
+      (let [args (descriptor/call-args form)]
+        (when (and (= 2 (count args)) (symbol? (first args)))
+          {:arr (first args) :idx (second args)})))))
 
 (defn- a-variant
   "Transpose of the A operand from its index shape, or nil.

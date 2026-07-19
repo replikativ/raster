@@ -121,3 +121,37 @@
       (is (nil? (gr/match-gemm-redomap '(do (dotimes [i n] (aset C i (aget A i))) C)))))
     (testing "a plain non-loop expr → nil"
       (is (nil? (gr/match-gemm-redomap '(+ 1 2)))))))
+
+;; ── the matcher must fire whether or not the walker has devirtualized array reads
+;; by the gpu-plan stage: numeric ops arrive as (.invk impl … {:raster.op/original …})
+;; and aget MAY too. aget-affine handles both; a missed match is safe-fail (no offload).
+(defn- dv
+  "A devirtualized (.invk impl args…) call carrying :raster.op/original, as the walker emits."
+  [orig & args]
+  (with-meta (apply list '.invk 'impl args) {:raster.op/original orig}))
+
+(deftest matches-devirtualized-forms
+  (testing "numeric ops as .invk (aget still literal) → matches (semantic-op resolves them)"
+    (let [f (list 'dotimes '[i m] (list 'dotimes '[j n]
+                  (list 'aset 'C '(+ (* i n) j)
+                        (list 'loop ['acc 0.0 'p 0]
+                              (list 'if '(< p k)
+                                    (list 'recur (dv 'raster.numeric/+ 'acc
+                                                     (dv 'raster.numeric/* '(aget A (+ (* i k) p)) '(aget B (+ (* p n) j))))
+                                          '(inc p))
+                                    'acc)))))]
+      (is (= :nn (:variant (gr/match-gemm-loop-nest f))))))
+  (testing "aget ALSO devirtualized → still matches (aget-affine handles .invk aget)"
+    (let [f (list 'dotimes '[i m] (list 'dotimes '[j n]
+                  (list 'aset 'C '(+ (* i n) j)
+                        (list 'loop ['acc 0.0 'p 0]
+                              (list 'if '(< p k)
+                                    (list 'recur (dv 'raster.numeric/+ 'acc
+                                                     (dv 'raster.numeric/* (dv 'raster.arrays/aget 'A '(+ (* i k) p))
+                                                         (dv 'raster.arrays/aget 'B '(+ (* p n) j))))
+                                          '(inc p))
+                                    'acc)))))
+          r (gr/match-gemm-loop-nest f)]
+      (is (= :nn (:variant r)))
+      (is (= 'A (:A r)))
+      (is (= 'B (:B r))))))
