@@ -1953,6 +1953,56 @@
     (.set gc I32 8 (int 1))
     bnd))
 
+;; ── FUSED-EPILOGUE GEMM (feature 4 — C = epilogue(A·B, row, col)) ───────────────
+;; One kernel for GEMM + a same-position elementwise consumer (bias/act/residual), the
+;; training-M win (~15-18% at M≥512, measured). The epilogue is BAKED into the kernel at
+;; emit time (emit-gemm-tiled :epilogue) and its operand buffers appended to the launch args.
+(def ^:private gemm-epilogue-cache (atom {}))
+
+(defn- ensure-gemm-epilogue-kernel!
+  "Compile + cache a GEMM kernel with a fused epilogue, keyed by [c-dtype tile epi-key].
+   `epilogue` is {:key :params :fn :helpers} (the emit-gemm-tiled :epilogue* args)."
+  [c-dtype tile {:keys [key params fn helpers]}]
+  (ensure-init!)
+  (or (get @gemm-epilogue-cache [c-dtype tile key])
+      (let [kname (str "gemm_epi_" (name key) "_" (name c-dtype) "_" (tile-signature tile))
+            emit  (do (require 'raster.compiler.backend.gpu.opencl-codegen)
+                      (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled))
+            cl-src (apply emit kname :c-dtype c-dtype :prefetch (:num-stages tile 3)
+                          :epilogue fn :epilogue-params params :epilogue-helpers helpers
+                          (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
+            spv (do (require 'raster.compiler.support.spirv-cache)
+                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                     cl-src :device (:device-id-hex @state)))
+            module (load-module! spv)
+            entry {:module module :kernel-name kname}]
+        (swap! gemm-epilogue-cache assoc [c-dtype tile key] entry)
+        entry)))
+
+(defn bind-registered-gemm-epilogue!
+  "Bind a fused-epilogue GEMM: C = epilogue(A·B, row, col). `epilogue` is {:key :params :fn :helpers
+   :operands [buffers]} — the operand buffers (bias/residual) are appended to the launch args after
+   (A B C M N K), matching :params. Same launch geometry as bind-registered-gemm-tiled!."
+  [a b c m n k c-dtype tile epilogue]
+  (when-let [bd (:dtype c)]
+    (when (not= bd c-dtype)
+      (throw (ex-info (str "bind-registered-gemm-epilogue!: output buffer dtype " bd " ≠ kernel dtype " c-dtype) {}))))
+  (let [{:keys [module kernel-name]} (ensure-gemm-epilogue-kernel! c-dtype tile epilogue)
+        {:keys [block-m block-n sg-m sg-n matrix]} tile
+        sg   (long (:subgroup matrix 16))
+        n-subgroups (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)))
+        wg   (* n-subgroups sg)
+        kh   (create-kernel-fresh module kernel-name)
+        args (vec (concat [(:segment a) (:segment b) (:segment c)
+                           {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+                          (map :segment (:operands epilogue))))
+        bnd  (bind-kernel-2d! kh [wg 1] args)
+        gc ^MemorySegment (:gc-seg bnd)]
+    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
+    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
+    (.set gc I32 8 (int 1))
+    bnd))
+
 ;; ── SPLIT-K GEMM (the low-occupancy-shape schedule) ────────────────────────────
 ;; A GEMM whose (M,N) tiling yields fewer workgroups than fill the machine —
 ;; ceil(N/128)·ceil(M/128) — cannot be rescued by a better inner loop: the machine

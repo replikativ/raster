@@ -82,3 +82,30 @@
             (is (= (seq dflt) (seq t64))  "block 64×64 tile ≡ default (bit-identical)")
             (is (= (seq dflt) (seq tk64)) "block-k 64 tile ≡ default (bit-identical)")))
         (finally (FB a16) (FB b16))))))
+
+(deftest fused-epilogue-gemm-binder
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "fused-epilogue GEMM (bind-registered-gemm-epilogue!): C = A·B + bias")
+    (let [ze   (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
+          hw   (do (require 'raster.compiler.core.hardware) (find-ns 'raster.compiler.core.hardware))
+          r    (fn [s] @(ns-resolve ze s))
+          _    ((r 'ensure-init!))
+          f16  (r 'buffer-of-floats-as-half) MB (r 'make-buffer) RG (r 'record-graph!)
+          RP (r 'replay-graph!) DG (r 'destroy-graph!) BA (r 'buffer->array) FB (r 'free-buffer!)
+          bind (r 'bind-registered-gemm-epilogue!)
+          tile ((ns-resolve hw 'derive-gemm-tile) ((ns-resolve hw 'descriptor-for) :ze:0))
+          m 64 n 128 k 256 rng (java.util.Random. 3)
+          mk (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (* 0.1 (.nextGaussian rng))))) a))
+          A (mk (* m k)) B (mk (* k n)) bias (mk n)
+          a16 (f16 A) b16 (f16 B) biasbuf (f16 bias) c (MB (* m n) :float)
+          epi {:key :bias :params ", __global const half* restrict bias"
+               :fn (fn [acc _row col] (str acc " + (float)bias[" col "]")) :operands [biasbuf]}]
+      (try
+        (RP (RG [{:bound (bind a16 b16 c m n k :float tile epi) :kernel-name "gemm_epi_bias_float"}]))
+        (let [gpu (BA c) h (fn [x] (Float/float16ToFloat (Float/floatToFloat16 (float x)))) ref (float-array (* m n))]
+          (dotimes [i m] (dotimes [j n]
+            (let [s (loop [p 0 acc 0.0] (if (< p k) (recur (inc p) (+ acc (* (double (h (aget A (+ (* i k) p)))) (double (h (aget B (+ (* p n) j))))))) acc))]
+              (aset ref (+ (* i n) j) (float (+ s (double (h (aget bias j)))))))))
+          (let [maxrel (reduce max 0.0 (map (fn [a b] (/ (Math/abs (- (double a) (double b))) (+ 0.05 (Math/abs (double b))))) gpu ref))]
+            (is (< maxrel 1.0e-3) (str "fused C=A·B+bias must match CPU ref within f16 tol (max-rel " maxrel ")"))))
+        (finally (FB a16) (FB b16) (FB biasbuf) (FB c))))))
