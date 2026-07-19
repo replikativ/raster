@@ -633,10 +633,18 @@
    separate emitter keyed by :matrix :family (the one genuine fork). Handles arbitrary M,N,K with
    full boundary checking; supports alpha/beta, c-dtype, split-k? (grid-z partials) and batched?
    (grid-z slabs)."
-  [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? batched? prefetch]
+  [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? batched? prefetch
+                         epilogue epilogue-params epilogue-helpers]
                   :or {block-m 128 block-n 128 sg-m 32 sg-n 32 block-k 32
                        matrix {:m 8 :n 16 :k 16 :subgroup 16}
                        alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false prefetch 3}}]
+  ;; EPILOGUE (feature 4 store-splice): `epilogue` is (fn [acc-c row-c col-c] -> C-expr) that
+  ;; transforms the accumulator value into the stored value — a bias/activation/residual/dequant
+  ;; folded into the store slot (which already has row/col in scope), eliminating a separate
+  ;; elementwise kernel + a DRAM round-trip of C. `epilogue-params` is a C param-decl string for the
+  ;; epilogue's operand arrays (e.g. ", __global const float* restrict bias"); `epilogue-helpers` is
+  ;; C source prepended (e.g. a silu_f definition). When `epilogue` is nil the emitted string is
+  ;; byte-identical to the plain GEMM. Mutually exclusive with beta≠0 (an accumulating store).
   (let [{mi :m ni :n ki :k sg :subgroup} matrix]
     (doseq [[nm a b] [["sg-m/M_i" sg-m mi] ["sg-n/N_i" sg-n ni] ["block-m/sg-m" block-m sg-m]
                       ["block-n/sg-n" block-n sg-n] ["block-k/K_i" block-k ki]]]
@@ -644,6 +652,10 @@
         (throw (ex-info (str "emit-gemm-tiled: " nm " not divisible (" a "/" b ")") {:tile [block-m block-n sg-m sg-n block-k] :matrix matrix}))))
     (when (and split-k? (not= beta 0.0))
       (throw (ex-info "split-k GEMM requires beta = 0" {:beta beta})))
+    (when (and epilogue (not= beta 0.0))
+      (throw (ex-info "epilogue and beta≠0 are mutually exclusive (both write the store slot)" {:beta beta})))
+    (when (and epilogue split-k?)
+      (throw (ex-info "epilogue fuses into the final store; not valid on split-k partials" {})))
     (when (and split-k? batched?)
       (throw (ex-info "batched and split-k both claim grid-z — mutually exclusive" {})))
     (let [nms (quot sg-m mi) nns (quot sg-n ni)      ;; M/N subtiles per subgroup
@@ -668,6 +680,7 @@
       (str
        "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
        "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n\n"
+       (when epilogue-helpers (str epilogue-helpers "\n"))
        "// Tiled GEMM (parametric): WG " block-m "x" block-n ", SG " sg-m "x" sg-n ", K " block-k
        ", DPAS " mi "x" ni "x" ki ", sg " sg "\n"
        "__attribute__((intel_reqd_sub_group_size(" sg ")))\n"
@@ -675,6 +688,7 @@
        "    __global const half* restrict A,\n    __global const half* restrict B,\n"
        "    __global " c-type "* restrict C,\n    int M, int N, int K"
        (when split-k? ", int KC") (when (not= alpha 1.0) ", float alpha") (when (not= beta 0.0) ", float beta")
+       epilogue-params
        ") {\n"
        "    int sg_id = get_sub_group_id();\n    int sg_lid = get_sub_group_local_id();\n"
        "    int sg_row = sg_id / " ncols ";\n    int sg_col = sg_id % " ncols ";\n"
@@ -705,11 +719,16 @@
               (for [m ms i (range mi)]
                 (str "    { int row = m_base + " (+ (* m mi) i) ";\n      if (row < M) {\n"
                      (apply str (for [n ns]
-                                  (str "        { int col = n_base" n " + sg_lid;\n          if (col < N) "
-                                       (if (not= beta 0.0)
-                                         (str "{ float old=(float)C[row*N+col]; C[row*N+col] = " store-cast "(" (when (not= alpha 1.0) "alpha * ") "acc" m n ".s" i " + beta*old); }\n")
-                                         (str "C[row*N+col] = " store-cast "(" (when (not= alpha 1.0) "alpha * ") "acc" m n ".s" i ");\n"))
-                                       "        }\n")))
+                                  (let [acc-expr (str (when (not= alpha 1.0) "alpha * ") "acc" m n ".s" i)]
+                                    (str "        { int col = n_base" n " + sg_lid;\n          if (col < N) "
+                                         (cond
+                                           (not= beta 0.0)
+                                           (str "{ float old=(float)C[row*N+col]; C[row*N+col] = " store-cast "(" acc-expr " + beta*old); }\n")
+                                           epilogue
+                                           (str "C[row*N+col] = " store-cast "(" (epilogue acc-expr "row" "col") ");\n")
+                                           :else
+                                           (str "C[row*N+col] = " store-cast "(" acc-expr ");\n"))
+                                         "        }\n"))))
                      "      }\n    }\n")))
        "}\n"))))
 

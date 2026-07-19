@@ -398,6 +398,24 @@
       (is (.contains src "beta"))
       (is (.contains src "num_groups")))))
 
+(deftest gemm-epilogue-store-splice
+  (testing "emit-gemm-tiled :epilogue splices into the store slot; byte-identical when absent"
+    (require 'raster.compiler.backend.gpu.opencl-codegen)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
+          plain (emit "g" :c-dtype :float)
+          biased (emit "gb" :c-dtype :float
+                       :epilogue-params ", __global const half* restrict bias"
+                       :epilogue (fn [acc _row col] (str acc " + (float)bias[" col "]")))]
+      (is (.contains ^String plain "C[row*N+col] = (acc00.s0);")
+          "no epilogue → store line byte-identical to the plain GEMM")
+      (is (.contains ^String biased "C[row*N+col] = (acc00.s0 + (float)bias[col]);")
+          "epilogue folds the bias into the store expression")
+      (is (.contains ^String biased "__global const half* restrict bias")
+          "epilogue operand becomes a kernel parameter")
+      (is (thrown? clojure.lang.ExceptionInfo
+                   (emit "bad" :c-dtype :float :beta 1.0 :epilogue (fn [a _ _] a)))
+          "epilogue + beta≠0 (both write the store) is rejected"))))
+
 (deftest transpose-kernel-layout-driven-byte-identical
   (testing "the transpose kernel is now LAYOUT-DRIVEN (indices from layout/layout->offset) yet emits
             the byte-identical row-major index line — the first place a layout drives codegen"
