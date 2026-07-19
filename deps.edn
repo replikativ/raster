@@ -15,8 +15,21 @@
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"
                     "-XX:ReservedCodeCacheSize=512m"]
-         :main-opts ["-m" "cognitect.test-runner"]
+         ;; -e :perf EXCLUDES the ^:perf regression-gate ratchet from CI (JDK-24,
+         ;; no Valhalla/GPU → not a representative machine). Run it with -M:perf
+         ;; on the Valhalla+Arc box. See raster.perf.regression-gate-test.
+         :main-opts ["-m" "cognitect.test-runner" "-e" ":perf"]
          :exec-fn cognitect.test-runner.api/test}
+  ;; The perf-regression ratchet — INCLUDES only ^:perf, opposite of :test. Local
+  ;; only (Valhalla+GPU). `-M:perf` gates against the committed baseline;
+  ;; `-M:perf --update-baseline` re-seeds after an intended speedup.
+  :perf {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/tag "v0.5.1" :git/sha "dfb30dd"}}
+         :jvm-opts ["--enable-native-access=ALL-UNNAMED"
+                    "--add-modules=jdk.incubator.vector"
+                    "-Xss8m" "-XX:ReservedCodeCacheSize=512m"]
+         :main-opts ["-m" "cognitect.test-runner" "-i" ":perf"]}
   :dev {:extra-paths ["test" "dev" "notebooks" "examples"]
         :extra-deps {org.scicloj/kindly {:mvn/version "4-beta23"}
                      org.scicloj/clay {:mvn/version "2.0.13"}
