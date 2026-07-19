@@ -17,6 +17,7 @@
     (kernel-launch-config 100000 :device-id :ze:0)"
   (:require [clojure.string :as str]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.backend.gpu.c-emit :as ce]))
 
 ;; ================================================================
@@ -387,16 +388,31 @@
 ;; Transpose kernel
 ;; ================================================================
 
-(defn emit-transpose-kernel
-  "Generate an OpenCL 2D matrix transpose kernel.
-  Reads from row-major in[i*cols + j], writes to out[j*rows + i].
-  Each work-item handles one element.
+(defn- render-c-index
+  "Render a layout->offset index S-expression to C infix (matches the hand-written kernel strings:
+   `(+ (* i cols) j)` → \"i * cols + j\"). Index arithmetic only (+ and *, symbols/ints)."
+  [e]
+  (cond
+    (symbol? e) (name e)
+    (number? e) (str e)
+    (seq? e)    (let [[op a b] e]
+                  (str (render-c-index a) " " (case op + "+" * "*" (str op)) " " (render-c-index b)))
+    :else       (str e)))
 
-  kernel-name: string name
-  dtype: :double or :float (default :float)
-  Returns OpenCL C source string."
+(defn emit-transpose-kernel
+  "Generate an OpenCL 2D matrix transpose kernel. LAYOUT-DRIVEN: the read/write indices are computed
+   from the layout facet (`layout/layout->offset`), not hand-written — a transpose is exactly a
+   `convert_layout` between a row-major input [rows,cols] and its transposed output [cols,rows]. The
+   emitted string is byte-identical to the former hand-written `out[j*rows+i] = in[i*cols+j]`; this
+   is the first place a layout DRIVES codegen (the Stage-1 transpose-as-convert seam, proven here).
+
+  dtype: :double | :float | :half (default :float). Returns OpenCL C source string."
   [kernel-name & {:keys [dtype] :or {dtype :float}}]
-  (let [ctype (if (= dtype :half) "half" (get opencl-type-map dtype "float"))]
+  (let [ctype  (if (= dtype :half) "half" (get opencl-type-map dtype "float"))
+        in-l   (layout/row-major '[rows cols] dtype)          ;; input row-major
+        out-l  (layout/row-major '[cols rows] dtype)          ;; output row-major, transposed extents
+        in-idx  (render-c-index (layout/layout->offset in-l  '[i j]))   ;; "i * cols + j"
+        out-idx (render-c-index (layout/layout->offset out-l '[j i]))]  ;; "j * rows + i"
     (str (extension-pragmas dtype)
          "__kernel void " kernel-name
          "(__global const " ctype "* restrict in,"
@@ -407,7 +423,7 @@
          "    for (int idx = gid; idx < total; idx += get_global_size(0)) {\n"
          "        int i = idx / cols;\n"
          "        int j = idx % cols;\n"
-         "        out[j * rows + i] = in[i * cols + j];\n"
+         "        out[" out-idx "] = in[" in-idx "];\n"
          "    }\n"
          "}\n")))
 

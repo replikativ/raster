@@ -398,6 +398,15 @@
       (is (.contains src "beta"))
       (is (.contains src "num_groups")))))
 
+(deftest transpose-kernel-layout-driven-byte-identical
+  (testing "the transpose kernel is now LAYOUT-DRIVEN (indices from layout/layout->offset) yet emits
+            the byte-identical row-major index line — the first place a layout drives codegen"
+    (require 'raster.compiler.backend.gpu.opencl-codegen)
+    (let [emit (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-transpose-kernel)]
+      (doseq [dt [:float :double :half]]
+        (is (.contains ^String (emit "t" :dtype dt) "out[j * rows + i] = in[i * cols + j];")
+            (str "layout-driven transpose index must be byte-identical for " dt))))))
+
 (deftest gemm-tiled-kernel-test
   (testing "tile-parametric GEMM kernel generates valid OpenCL"
     (require 'raster.compiler.backend.gpu.opencl-codegen)
