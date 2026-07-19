@@ -794,6 +794,49 @@
             float?    (list 'float (double id))
             :else     (double id)))))))
 
+;; --- Analytic cost (:cost facet; hardware-guided fusion profitability) ---
+
+(defn register-cost!
+  "Register an op's per-application analytic cost as the :cost facet:
+     {:flops n}   — flop-equivalent weight of ONE application of the op.
+   Bytes are NOT declared here — the fusion pricer derives memory traffic from
+   the op's array reads/writes × dtype. PORTABLE: a relative flop-equivalent
+   weight, never a hardware instruction count; the Abstract Machine / roofline
+   prices it. The weight doubles as the cheap-vs-expensive BUCKET the fusion
+   profitability test reads (arithmetic ≈ 1, division ≈ 4, transcendental ≈ 10):
+   fusing a transcendental producer into N consumers recomputes 10·N flops, which
+   the regime test must see to decline the fusion. One entry per op, like
+   register-algebra!."
+  [op-sym cost]
+  (register-op-descriptor! op-sym {:cost cost}))
+
+(defn cost-facet
+  "The :cost facet for op-sym ({:flops n}), or nil. Exact-symbol lookup; callers
+   query with the SEMANTIC op (descriptor/semantic-op), never a mangled impl name."
+  [op-sym]
+  (:cost (get-op-descriptor op-sym)))
+
+;; Flop-equivalent weights, registered for every surface variant (bare /
+;; clojure.core / raster.numeric / raster.math), mirroring register-algebra!.
+;; Cheap arithmetic = 1; division is multi-cycle; transcendentals are the
+;; "expensive" bucket the fusion cost test uses to decline recompute-heavy
+;; fan-out fusions. Unregistered ops price as nil → the pricer treats them
+;; conservatively (unknown cost never enables a fusion).
+(let [numeric-weights {'+ 1 '- 1 '* 1 'min 1 'max 1 'abs 1 '/ 4 'fma 2}
+      math-weights    {'sqrt 6 'exp 10 'log 10 'sin 10 'cos 10 'tan 10 'tanh 10
+                       'asin 10 'acos 10 'atan 10 'sinh 10 'cosh 10 'pow 10}]
+  (doseq [[base w] numeric-weights
+          v (cond-> [base
+                     (symbol "clojure.core" (name base))
+                     (symbol "raster.numeric" (name base))]
+              (contains? #{'min 'max} base) (conj (symbol "Math" (name base))))]
+    (register-cost! v {:flops w}))
+  (doseq [[base w] math-weights
+          v [base
+             (symbol "raster.math" (name base))
+             (symbol "Math" (name base))]]
+    (register-cost! v {:flops w})))
+
 ;; --- Result-type inference (:result-type facet) ---
 
 (def ^:private array-tag->element-tag
