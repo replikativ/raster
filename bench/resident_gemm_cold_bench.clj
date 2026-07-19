@@ -81,32 +81,51 @@
 ;; plain baseline resident GEMM (:c-dtype :half — matches bind-registered-gemm!'s
 ;; default; f16 C write is half the DRAM traffic of f32, reproducing the resident path).
 (def ^:private kern-cache (atom {}))
+(defn- tile-tag [{:keys [block-m block-n block-k]}]
+  (str "b" block-m "x" block-n "k" block-k))
 (defn build-kernel!
-  "Compile+cache the resident gemm_nonsquare_float kernel for `config`.
-   Returns {:module :kname}. config keys:
+  "Compile+cache the resident GEMM kernel for `config`.
+   Returns {:module :kname :tile}. config keys:
+     :tile        a derive-gemm-tile map {:block-m :block-n :sg-m :sg-n :block-k :matrix}
+                  → builds the TILE-PARAMETRIC emit-gemm-tiled kernel (B1 tile comparison).
+                  Absent → the plain hand emit-gemm-nonsquare-kernel baseline (block 128).
      :large-grf?  EXPERIMENTAL build-flag comparand (default false, gated nowhere)."
-  [{:keys [large-grf?] :as _config}]
-  (let [ck [large-grf?]]
+  [{:keys [large-grf? tile] :as _config}]
+  (let [ck [large-grf? tile]]
     (or (get @kern-cache ck)
-        (let [kname (str "gemm_cold_" (if large-grf? "grf256" "grf128"))
-              src   (cg/emit-gemm-nonsquare-kernel kname :c-dtype :half)
+        (let [kname (str "gemm_cold_" (if tile (tile-tag tile) (if large-grf? "grf256" "grf128")))
+              src   (if tile
+                      (apply cg/emit-gemm-tiled kname :c-dtype :half
+                             (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
+                      ;; no tile → emit-gemm-tiled at its DEFAULT geometry (block 128, wg 256 —
+                      ;; matches the historical baseline; the old hand emit-gemm-nonsquare-kernel
+                      ;; was removed when the tile-parametric generator replaced it in T1).
+                      (cg/emit-gemm-tiled kname :c-dtype :half))
               spirv (spv/compile-opencl-to-spirv src :device @device-hex)
-              build-flags (when large-grf? "-ze-opt-large-register-file")
-              module (ze/load-module! spirv :spirv build-flags)
-              entry {:module module :kname kname}]
+              _ (when large-grf?
+                  (throw (ex-info ":large-grf? unsupported — the -ze-opt-large-register-file build-flag path was removed from load-module!; re-add flag plumbing to compile/load to use it" {})))
+              module (ze/load-module! spirv :spirv)
+              entry {:module module :kname kname :tile tile}]
           (swap! kern-cache assoc ck entry)
           entry))))
 
 ;; ── resident buffer plumbing ───────────────────────────────────────────────────────
-(defn- bind-gemm! [module kname a16 b16 c m n k]
+;; `tile` (or nil for the plain block-128 baseline) drives the workgroup size and grid,
+;; mirroring bind-registered-gemm-tiled!: wg = n-subgroups × subgroup, grid = ceil(n/bn) ×
+;; ceil(m/bm). A wrong wg/grid for the tile geometry = garbage output, so this MUST match
+;; the tile the kernel was emitted for.
+(defn- bind-gemm! [module kname a16 b16 c m n k tile]
   (let [kh (ze/create-kernel-fresh module kname)
         m (long m) n (long n) k (long k)
+        {:keys [block-m block-n sg-m sg-n matrix] :or {block-m 128 block-n 128 sg-m 32 sg-n 32}} (or tile {})
+        sg (long (:subgroup matrix 16))
+        wg (if tile (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)) sg) 256)
         args [(:segment a16) (:segment b16) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd (ze/bind-kernel-2d! kh [256 1] args)
+        bnd (ze/bind-kernel-2d! kh [wg 1] args)
         gc ^java.lang.foreign.MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))
-    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))
+    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
+    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
     (.set gc I32 8 (int 1))
     bnd))
 
@@ -128,11 +147,11 @@
   "Record ONE graph of `launches` back-to-back GEMM launches (barriers serialize them).
    `pair-of` maps launch index -> a buffer pair. Identical launch cadence for warm/cold;
    the GPU stays boosted across the whole sequence, so only cache temperature differs."
-  [module kname m n k launches pair-of]
+  [module kname m n k launches pair-of tile]
   (ze/record-graph!
    (mapv (fn [i]
            (let [p (pair-of i)]
-             {:bound (bind-gemm! module kname (:a p) (:b p) (:c p) m n k)
+             {:bound (bind-gemm! module kname (:a p) (:b p) (:c p) m n k tile)
               :kernel-name kname}))
          (range launches))
    {:profile? true}))
@@ -159,11 +178,11 @@
          wpair   (alloc-pair m n k)                                  ;; shared warm pair
          entries (vec (map-indexed
                        (fn [i c]
-                         (let [{:keys [module kname]} (build-kernel! c)
+                         (let [{:keys [module kname tile]} (build-kernel! c)
                                label (or (:label c) (str "cfg" i))]
                            {:label label
-                            :cold (record-seq-graph module kname m n k launches (fn [j] (nth pairs j)))
-                            :warm (record-seq-graph module kname m n k launches (constantly wpair))}))
+                            :cold (record-seq-graph module kname m n k launches (fn [j] (nth pairs j)) tile)
+                            :warm (record-seq-graph module kname m n k launches (constantly wpair) tile)}))
                        configs))
          acc (atom (into {} (for [e entries] [(:label e) {:cold [] :warm []}])))]
      ;; interleaved warmup — every graph, several rounds, for thermal/clock steady state
