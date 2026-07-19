@@ -20,6 +20,7 @@
    [raster.compiler.core.op-descriptor :as op]
    [raster.compiler.passes.parallel.device :as device]
    [raster.compiler.passes.parallel.patterns :as patterns]
+   [raster.compiler.passes.parallel.gemm-recognize :as gemm-recognize]
    [raster.compiler.backend.gpu.opencl-codegen :as codegen]))
 
 ;; ================================================================
@@ -264,6 +265,19 @@
                      (into acc (conj bs [sym result-sym]))))
                   ;; Can't classify — keep original
                  (conj acc [sym expr]))
+
+                ;; GEMM REDOMAP (matmul written in the raster language, no BLAS call) →
+                ;; the SAME rewrite-gemm/emit-gemm-tiled path. #38: the redomap front door
+                ;; converges with the BLAS-name-match instead of falling through to the
+                ;; naive per-element SegOp kernel. gemm-info carries the identical
+                ;; {:variant :A :B :C :m :k :n :alpha :beta :result-sym} contract.
+               (gemm-recognize/match-gemm-redomap expr)
+               (let [gemm-info (gemm-recognize/match-gemm-redomap expr)
+                     {:keys [bindings kernels result-sym]}
+                     (rewrite-gemm gemm-info buf-plan dtype kernel-counter)]
+                 (swap! gemm-rewrites inc)
+                 (swap! all-kernels into kernels)
+                 (into acc (conj (vec bindings) [sym result-sym])))
 
                 ;; Nested dotimes transpose → GPU transpose kernel
                (patterns/match-do-wrapped-transpose expr)
