@@ -5,7 +5,8 @@
    extractions (all four transpose variants, α/β) and — load-bearing — the
    NEGATIVE cases that MUST reject."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.passes.parallel.gemm-recognize :as gr]))
+            [raster.compiler.passes.parallel.gemm-recognize :as gr]
+            [raster.compiler.ir.soac :as soac]))
 
 ;; Canonical row-major GEMM redomap: C[m×n] = A[m×k]·B[k×n].
 ;;   outer dotimes i∈[0,m), j∈[0,n); C at row-major (i,j,n)
@@ -155,3 +156,27 @@
       (is (= :nn (:variant r)))
       (is (= 'A (:A r)))
       (is (= 'B (:B r))))))
+
+;; ── redomap->dot: the matcher descriptor becomes the Dot IR node (Dot's first real
+;; producer; Feature 4 defined the node + a test but nothing constructed it). This is
+;; what the resident Screma-level recognizer (Design B) will emit in place of SOACs.
+(deftest redomap-to-dot-node
+  (let [desc (gr/match-gemm-loop-nest (gemm '(+ (* i k) p) '(+ (* p n) j)))
+        dot  (gr/redomap->dot 7 'gemm-out desc)]
+    (testing "produces a Dot IR record, NOT a generic SOAC (map/reduce lowering skips it)"
+      (is (instance? raster.compiler.ir.soac.Dot dot))
+      (is (soac/dot? dot))
+      (is (not (soac/soac? dot))))
+    (testing "carries operands/dims/variant from the descriptor"
+      (is (= ['A 'B 'C] [(:A dot) (:B dot) (:C dot)]))
+      (is (= ['m 'n 'k] [(:m dot) (:n dot) (:k dot)]))
+      (is (= :nn (:variant dot)))
+      (is (= [1.0 0.0] [(:alpha dot) (:beta dot)])))
+    (testing "dep-graph fields: inputs {A B}, outputs {C} (the producer edge), bound m*n"
+      (is (= #{'A 'B} (:inputs dot)))
+      (is (= #{'C} (:outputs dot)))
+      (is (= '(clojure.core/* m n) (:bound dot))))
+    (testing "epilogue + layout start nil (later vertical fusion / transpose-elim fill them)"
+      (is (nil? (:epilogue dot)))
+      (is (nil? (:layout-a dot)))
+      (is (nil? (:layout-b dot))))))

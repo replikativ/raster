@@ -21,6 +21,7 @@
    `dotimes` matmul. A Screma-level lift (Design B, catches par/map+par/reduce
    dense) reuses this same index/variance/extraction core."
   (:require [raster.compiler.passes.parallel.patterns :as pat]
+            [raster.compiler.ir.soac :as soac]
             [raster.compiler.core.op-descriptor :as descriptor]))
 
 (def ^:private canonical-add #{'+ 'clojure.core/+ 'raster.numeric/+})
@@ -168,3 +169,15 @@
         ;; result-sym = the do's tail buffer, unless the tail IS the store dotimes
         ;; itself (no explicit result) — then the output C is the result.
         (assoc d :result-sym (if (and (some? tail) (not= tail nest)) tail (:C d)))))))
+
+(defn redomap->dot
+  "Build the Dot IR node (the late-recognizer OUTPUT, Feature 4) from a
+   match-gemm-* descriptor + the binding id/sym. This is Dot's first real producer:
+   the node was defined with dep-graph + epilogue-emit support but never constructed
+   outside a test. inputs = {A B}, outputs = {C} (the producer edge that closes the
+   soac-outputs leak), bound = m*n, alpha/beta from the descriptor, epilogue/layout
+   nil (later vertical fusion / transpose-elim fill them). This is what the resident
+   Screma-level recognizer (Design B) emits in place of the map/reduce SOACs."
+  [id sym {:keys [A B C m n k variant alpha beta]}]
+  (soac/->Dot id sym #{A B} #{C} (list 'clojure.core/* m n)
+              A B C m n k variant (or alpha 1.0) (or beta 0.0) nil nil nil))
