@@ -15,11 +15,15 @@
                     "--add-modules=jdk.incubator.vector"
                     "-Xss8m"
                     "-XX:ReservedCodeCacheSize=512m"]
-         ;; -e :perf EXCLUDES the ^:perf regression-gate ratchet from CI (JDK-24,
-         ;; no Valhalla/GPU → not a representative machine). Run it with -M:perf
-         ;; on the Valhalla+Arc box. See raster.perf.regression-gate-test.
+         ;; EXCLUDE the ^:perf regression-gate ratchet from CI (JDK-24, no Valhalla/
+         ;; GPU → not a representative perf machine). Run it with -M:perf on the
+         ;; Valhalla+Arc box. See raster.perf.regression-gate-test. NOTE: the
+         ;; exclusion must be set on BOTH invocation paths — `-M:test` reads
+         ;; :main-opts (-e :perf); CircleCI runs `-X:test` which reads :exec-fn +
+         ;; :exec-args, so the same exclusion goes there as {:excludes [:perf]}.
          :main-opts ["-m" "cognitect.test-runner" "-e" ":perf"]
-         :exec-fn cognitect.test-runner.api/test}
+         :exec-fn cognitect.test-runner.api/test
+         :exec-args {:excludes [:perf]}}
   ;; The perf-regression ratchet — INCLUDES only ^:perf, opposite of :test. Local
   ;; only (Valhalla+GPU). `-M:perf` gates against the committed baseline;
   ;; `-M:perf --update-baseline` re-seeds after an intended speedup.
