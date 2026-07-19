@@ -14,9 +14,10 @@
   (testing "matmul :nn emits one-thread-per-segment + k-loop + combine + store"
     (let [src (emit '(raster.par/contract C [[i m] [j n]] [[l k]]
                        (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))))]
-      (testing "segment id + bounds guard (num-segments = m*n)"
+      (testing "segment id + trailing count guard (num-segments passed as _nseg)"
         (is (str/includes? src "int seg = get_global_id(0)"))
-        (is (str/includes? src "seg >= m * n")))
+        (is (str/includes? src "seg >= _nseg"))
+        (is (str/includes? src "int _nseg")))
       (testing "row-major decompose of the segment id into free indices i,j"
         ;; i = (seg / n) % m ; j = seg % n
         (is (re-find #"int i = \(seg / \(n\)\) % m;" src))
@@ -37,7 +38,7 @@
   (testing "1 free axis (matvec): decompose is just seg % m, num-segments = m"
     (let [src (emit '(raster.par/contract y [[i m]] [[l k]]
                        (* (aget A (+ (* i k) l)) (aget x l))))]
-      (is (str/includes? src "seg >= m"))
+      (is (str/includes? src "seg >= _nseg"))
       (is (re-find #"int i = seg % m;" src))
       (is (str/includes? src "for (int idx = 0; idx < k; idx++)")))))
 

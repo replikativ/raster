@@ -341,10 +341,13 @@
                                                     {:bound b}))))
         arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
         scl-param-str (str/join ", " (map (fn [s] (str "int " (ce/c-symbol s))) scl-params))
+        ;; Trailing `int _nseg` (= number of segments = launch count) matches the generic
+        ;; emitter convention (generate-segmap-kernel's `int _n_bound`) and the arg order
+        ;; invoke-registered-kernel builds (inputs, output, scalars, count).
         all-params (str/join ", " (remove empty?
-                                          [arr-param-str (str "__global " ctype "* restrict out") scl-param-str]))
+                                          [arr-param-str (str "__global " ctype "* restrict out")
+                                           scl-param-str "int _nseg"]))
         seg-bound-cs (mapv (fn [d] (bound-c (:bound d))) seg-dims)
-        nseg-c (str/join " * " seg-bound-cs)
         ;; row-major decompose: idx_p = (seg / product(bounds after p)) % bound_p
         decomp (str/join "\n"
                          (map-indexed
@@ -368,7 +371,7 @@
         source (str (codegen/extension-pragmas dtype)
                     "__kernel void " kernel-name "(" all-params ") {\n"
                     "    int seg = get_global_id(0);\n"
-                    "    if (seg >= " nseg-c ") return;\n"
+                    "    if (seg >= _nseg) return;\n"
                     decomp "\n"
                     "    " ctype " acc = " (str init) ";\n"
                     "    for (int idx = 0; idx < " red-bound-c "; idx++) {\n"
