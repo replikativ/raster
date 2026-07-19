@@ -49,8 +49,14 @@
   ([steps desc {:keys [precision]}]
    {:precision (or precision default-precision)
     :tile  (hw/derive-gemm-tile desc)          ;; axis 9 — the GEMM tile (T2 derivation), autotunable
-    :grf   {:mode :grf128}                     ;; axis 8a — OPT-IN, default OFF
-    :stage {:space :none}                      ;; axis 7a — DEAD family, default :none
+    :grf   {:mode :grf128}                     ;; axis 8a — OPT-IN, default OFF (gate-consumed by feasible?)
+    :stage {:space :none}                      ;; axis 7a — staging space, gate-consumed by feasible?
+    ;; axis 10 — RESIDENCY/placement: which operands stay cache/on-chip resident (WARM) across use vs
+    ;; are DRAM first-touch (COLD). The locality cost term (roofline warm/cold split) reads this via
+    ;; schedule-cost-ns. Default all :dram = conservative (matches the flat-bytes behavior); a
+    ;; fusion / cross-layer-resident schedule flips operands to :resident. The graph-level extension
+    ;; for stationary LLMs (operand resident across the recorded decode sequence) lives here.
+    :residency {:a :dram :b :dram :c :dram}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
             :derived-by :raster.gpu.schedule/derive-default
@@ -196,6 +202,28 @@
                        :register-staged-bytes-per-lane staged
                        :schedule schedule})))
     true))
+
+;; ================================================================
+;; Analytic cost — the LOCALITY roofline consumes the :residency axis
+;; ================================================================
+
+(defn schedule-cost-ns
+  "Predicted device time (ns) for a GEMM `shape` {:m :n :k :dtype} under `schedule` on `desc`, via
+   the locality roofline. Splits operand bytes into WARM (schedule :residency :resident → cache/
+   on-chip) and COLD (:dram → first-touch), so a schedule that keeps operands resident (fusion,
+   cross-layer residency) is priced faster — the capability the flat roofline lacked. This is the
+   function the cost-guided chooser / autotune seed rank schedules with. Returns nil when the
+   descriptor carries no bandwidth/peak-flops (the roofline abstains rather than fabricating)."
+  [schedule {:keys [m n k dtype] :or {dtype :f16}} desc]
+  (let [res      (:residency schedule)
+        elem-b   (case dtype (:f16 :half) 2 (:f32 :float) 4 (:f64 :double) 8 2)
+        ;; row-major operand footprints: A[m×k] B[k×n] C[m×n]
+        ob       {:a (* (long m) (long k) elem-b) :b (* (long k) (long n) elem-b) :c (* (long m) (long n) elem-b)}
+        warm?    (fn [o] (= :resident (get res o :dram)))
+        cold     (reduce + 0 (for [o [:a :b :c] :when (not (warm? o))] (ob o)))
+        warm     (reduce + 0 (for [o [:a :b :c] :when (warm? o)] (ob o)))]
+    (hw/roofline-time-ns desc {:flops (* 2 (long m) (long n) (long k))
+                               :cold-bytes cold :warm-bytes warm :dtype dtype})))
 
 ;; ================================================================
 ;; Convenience — the whole stage-1→2→3 pipeline

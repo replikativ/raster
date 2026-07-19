@@ -16,6 +16,29 @@
    :max-workgroup-size 1024})
 
 ;; ════════════════════════════════════════════════════════════════════════════════
+;; Residency axis → locality cost: schedule-cost-ns prices a resident schedule faster
+;; ════════════════════════════════════════════════════════════════════════════════
+(def ^:private arc-perf-desc
+  (assoc arc-desc :bandwidth-bytes-s 89.6e9
+         :peak-flops {:f16 31.9488e12 :f32 3.9936e12}
+         :cache {:l2 8388608}))
+
+(deftest residency-axis-and-locality-cost
+  (let [dflt (sched/derive-default nil arc-perf-desc)
+        shape {:m 1024 :n 2048 :k 640 :dtype :f16}
+        cost #(sched/schedule-cost-ns % shape arc-perf-desc)]
+    (testing "derive-default carries a :residency axis, default all :dram (conservative = flat)"
+      (is (= {:a :dram :b :dram :c :dram} (:residency dflt))))
+    (testing "keeping the weight B resident is priced faster than all-DRAM"
+      (is (< (cost (assoc-in dflt [:residency :b] :resident))
+             (cost dflt))))
+    (testing "monotone: all-resident ≤ B-resident ≤ all-DRAM (more warm = cheaper)"
+      (let [all-warm (cost (assoc dflt :residency {:a :resident :b :resident :c :resident}))
+            b-warm   (cost (assoc-in dflt [:residency :b] :resident))
+            all-cold (cost dflt)]
+        (is (<= all-warm b-warm all-cold))))))
+
+;; ════════════════════════════════════════════════════════════════════════════════
 ;; T1 — parity: :gemm-precision sugar ≡ :schedule {:precision …} (no device)
 ;; ════════════════════════════════════════════════════════════════════════════════
 
