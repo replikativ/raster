@@ -64,6 +64,26 @@
       (:provenance m)         (update :provenance merge (:provenance m)))
     desc))
 
+(defn- gpu-arch-str [caps]
+  (str (some-> (:arch caps) name) (some-> (:gfx-arch caps) name)))
+
+(defn- amd-cdna? [caps]
+  (let [a (gpu-arch-str caps)]
+    (or (= :mfma (get-in caps [:matrix :family]))
+        (.startsWith a "gfx9")            ;; CDNA: gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
+        (.startsWith a "gfx94"))))
+
+(defn- gpu-reg-budget-per-lane
+  "Per-lane register-file budget the schedule/tile GRF gate charges against — vendor-specific
+   (differ ~4×, so a single formula mis-sizes tiles cross-vendor). Intel Xe grf128 = 128 regs × 32 B
+   / subgroup; NVIDIA = 255 regs × 4 B (per-thread WMMA fragment); AMD CDNA = 256 VGPRs × 4 B. Keyed
+   off probed caps (compute-capability → NVIDIA; a gfx9 arch / :mfma matrix → AMD; else Intel)."
+  [caps flanes]
+  (cond
+    (:compute-capability caps) 1020
+    (amd-cdna? caps)           1024
+    :else (long (quot (* 128 32) (max 1 flanes)))))
+
 (defn- build-descriptor
   "Project a runtime.hardware device into the planner's HardwareDescriptor — the SINGLE
    detection source (runtime.hardware owns the probing; this adds the compiler's analytic
@@ -130,13 +150,11 @@
                   ;; 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the budget the schedule
                   ;; feasibility gate (raster.gpu.schedule/feasible?) charges the accumulator +
                   ;; register staging against.
-                  ;; NOTE (vendor-specificity, HIP/CUDA follow-up): 128×32 is the Intel-Xe-grf128
-                  ;; constant. NVIDIA (255 regs × 4 B / warp 32 ≈ 1020 B/lane) and AMD VGPR budgets
-                  ;; differ ~8× — this value is only correct for Intel targets until it is derived
-                  ;; from per-vendor caps (with descriptor :vendor/:arch). The gate must not be
-                  ;; trusted for a non-Intel descriptor yet. (:num-vector-registers above is a
-                  ;; CPU-shaped placeholder; this is the Intel GPU value.)
-                  :grf-bytes-per-lane (long (quot (* 128 32) (max 1 flanes)))
+                  ;; Per-vendor (gpu-reg-budget-per-lane): Intel Xe grf128 128×32/subgroup, NVIDIA
+                  ;; 255×4 (per-thread fragment), AMD CDNA 256 VGPRs×4. A single formula mis-sizes
+                  ;; the tile cross-vendor (the budgets differ ~4×), so derive-gemm-tile GRF-bounds
+                  ;; against the right register file per family.
+                  :grf-bytes-per-lane (gpu-reg-budget-per-lane caps flanes)
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
       ;; MATRIX UNIT (systolic array) — the hardware matrix-multiply shape {:family :m :n :k
       ;; :subgroup}, e.g. Intel XMX DPAS 8×16×16. A catalogue fact (not always probeable); the
@@ -149,6 +167,10 @@
       (and gpu? (nil? (:matrix caps)) (:compute-capability caps)
            (>= (long (first (:compute-capability caps))) 7))
       (assoc :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
+      ;; AMD CDNA (gfx9): Matrix Cores with the f16 16×16×16 MFMA (v_mfma_f32_16x16x16f16),
+      ;; wavefront 64. Derived from the gfx arch when not explicitly catalogued.
+      (and gpu? (nil? (:matrix caps)) (amd-cdna? caps))
+      (assoc :matrix {:family :mfma :m 16 :n 16 :k 16 :subgroup 64})
       (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
@@ -422,7 +444,14 @@
          grf     (long (:grf-bytes-per-lane desc 256))
          sg      (long subgroup)
          acc-cap (quot (* grf sg) 4)                 ;; max sg-m·sg-n (f32 accumulators)
-         side    (long (Math/sqrt (double acc-cap))) ;; largest square side
+         ;; Cap the warp/subgroup tile at 4 matrix-fragments per dimension. Filling the WHOLE
+         ;; register file with accumulators (the raw acc-cap) starves the operand + pipeline
+         ;; registers — pathological on NVIDIA/AMD (their register files are ~4× Intel's, so the
+         ;; raw cap yields an 80×80+ warp tile). 4 fragments keeps Intel at its validated 32×32 (its
+         ;; budget already caps it there) and gives NVIDIA/AMD a sane 64×64 STARTING tile the
+         ;; on-device autotuner refines (unvalidated here — no NVIDIA/AMD GPU).
+         side    (min (long (Math/sqrt (double acc-cap)))
+                      (* 4 (max (long m) (long n))))
          sg-m    (* m (max 1 (quot side m)))         ;; round down to M_i multiple
          sg-n    (* n (max 1 (quot side n)))         ;; round down to N_i multiple
          wg-sub  (long (:wg-subgroups opts 16))
