@@ -385,3 +385,95 @@
      :scalar-params scl-params
      :dtype dtype
      :c-op c-op}))
+
+;; ================================================================
+;; Block-tiled + __local-staged contraction (BlkRegTiling, block-tile level)
+;; ================================================================
+
+(defn- syms-in [expr] (set (filter symbol? (tree-seq coll? seq expr))))
+
+(defn generate-tiled-contraction-kernel
+  "BLOCK-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, block-tile
+   level — no register/DPAS tiling yet). Square T×T tiles; workgroup = T×T threads (one
+   output/thread); cooperatively stage A/B tiles into __local, loop the contracted axis in
+   T-chunks. Zero-padded loads + a guarded store handle non-tile-divisible dims.
+
+   Prototype scope: EXACTLY 2 free axes (the tiled M×N output) + 1 contracted axis, LITERAL
+   dims, a sum-of-two-agets element (GEMM-shape redomap). The operands are assigned row/col
+   by which DECLARED axis their index depends on (row: free0+contract, not free1; col:
+   contract+free1, not free0) — the variance test made trivial by the declared axes, no
+   recognition. This is the perf substrate under DPAS tensorize (step 4).
+
+   Requires a 2-D launch: workgroup [T T], grid [ceil(N/T) ceil(M/T)] (group-id(0)=col/N,
+   group-id(1)=row/M). Returns {:kernel-name :source :array-params :dtype :tile :dims [M N L]}."
+  [segred out-sym & {:keys [dtype tile] :or {dtype :double tile 16}}]
+  (let [space    (:space segred)
+        seg-dims (segop/seg-space-segment-dims space)
+        red-dim  (segop/seg-space-reduced-dim space)
+        _ (assert (= 2 (count seg-dims)) "tiled-contraction: exactly 2 free axes (prototype)")
+        [fi fj] seg-dims
+        M (:bound fi) N (:bound fj) L (:bound red-dim)
+        _ (assert (every? number? [M N L]) "tiled-contraction: literal dims (prototype)")
+        i-sym (:name fi) j-sym (:name fj) l-sym (:name red-dim)
+        dtype (or (:dtype segred) dtype)
+        ctype (get codegen/opencl-type-map dtype "double")
+        {:keys [init lambda]} (:reduce-op segred)
+        lambda (ce/normalize-array-prims lambda)
+        op-sym (when (seq? lambda) (descriptor/semantic-op lambda))
+        _ (assert (#{'+ 'clojure.core/+ 'raster.numeric/+} op-sym)
+                  "tiled-contraction: combine must be + / sum-of-products (prototype)")
+        acc-sym (:acc (:reduce-op segred))
+        acc-at? (fn [a] (or (= a acc-sym) (and (seq? a) (= 'double (first a)) (= acc-sym (second a)))))
+        op-args (vec (descriptor/call-args lambda))
+        elem (let [a0 (nth op-args 0) a1 (nth op-args 1)] (if (acc-at? a0) a1 a0))
+        _ (assert (and (seq? elem) (#{'* 'clojure.core/* 'raster.numeric/*} (descriptor/semantic-op elem)))
+                  "tiled-contraction: element must be a product of two agets (prototype)")
+        parts (fn [e] (let [e (ce/normalize-array-prims e)]
+                        (assert (and (seq? e) (= 'aget (first e))) "tiled-contraction: product operand must be an aget")
+                        {:arr (nth e 1) :idx (nth e 2)}))
+        [pa pb] (mapv parts (descriptor/call-args elem))
+        dep? (fn [idx s] (contains? (syms-in idx) s))
+        rc  (fn [x y] (when (and (dep? (:idx x) i-sym) (dep? (:idx x) l-sym) (not (dep? (:idx x) j-sym))
+                                 (dep? (:idx y) l-sym) (dep? (:idx y) j-sym) (not (dep? (:idx y) i-sym)))
+                        [x y]))
+        [rowop colop] (or (rc pa pb) (rc pb pa)
+                          (throw (ex-info "tiled-contraction: operands don't match A(i,l)·B(l,j) variance"
+                                          {:pa pa :pb pb})))
+        T (long tile)
+        kernel-name (str "tiled_contract_" (gensym ""))
+        arr-params (vec (sort-by name (:inputs segred)))
+        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        arr-sym-set (set (map #(symbol (name %)) arr-params))
+        dummy (gensym "z__")
+        emit-load (fn [{:keys [arr idx]}]
+                    (binding [ce/*emit-config* ce/opencl-config
+                              ce/*scalar-type* ctype
+                              ce/*int-vars* (into ce/*int-vars* (map #(symbol (name %)) [i-sym j-sym l-sym]))]
+                      (ce/emit-expr (list 'aget arr idx) dummy arr-sym-set)))
+        row-load (emit-load rowop)   ; uses C vars i, l
+        col-load (emit-load colop)   ; uses C vars l, j
+        src (str (codegen/extension-pragmas dtype)
+                 "__kernel void " kernel-name "(" arr-param-str
+                 ", __global " ctype "* restrict out) {\n"
+                 "    __local " ctype " As[" T "][" T "];\n"
+                 "    __local " ctype " Bs[" T "][" T "];\n"
+                 "    int li = get_local_id(1);\n"
+                 "    int lj = get_local_id(0);\n"
+                 "    int " (ce/c-symbol i-sym) " = get_group_id(1) * " T " + li;\n"
+                 "    int " (ce/c-symbol j-sym) " = get_group_id(0) * " T " + lj;\n"
+                 "    " ctype " acc = " (str init) ";\n"
+                 "    for (int l0 = 0; l0 < " L "; l0 += " T ") {\n"
+                 "        { int " (ce/c-symbol l-sym) " = l0 + lj; As[li][lj] = ((" (ce/c-symbol i-sym) " < " M ") && (" (ce/c-symbol l-sym) " < " L ")) ? " row-load " : 0.0; }\n"
+                 "        { int " (ce/c-symbol l-sym) " = l0 + li; Bs[li][lj] = ((" (ce/c-symbol l-sym) " < " L ") && (" (ce/c-symbol j-sym) " < " N ")) ? " col-load " : 0.0; }\n"
+                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                 "        for (int t = 0; t < " T "; t++) { acc = acc + As[li][t] * Bs[t][lj]; }\n"
+                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                 "    }\n"
+                 "    if ((" (ce/c-symbol i-sym) " < " M ") && (" (ce/c-symbol j-sym) " < " N ")) { out[" (ce/c-symbol i-sym) " * " N " + " (ce/c-symbol j-sym) "] = acc; }\n"
+                 "}\n")]
+    {:kernel-name kernel-name
+     :source src
+     :array-params arr-params
+     :dtype dtype
+     :tile T
+     :dims [M N L]}))
