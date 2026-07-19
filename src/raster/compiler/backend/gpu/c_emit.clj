@@ -70,12 +70,16 @@
    :atan2-name "atan"})
 
 (def hip-config
+  ;; CUDA/HIP device code is C++: fabs/fmax/fmin have BOTH float and double overloads, so the
+  ;; unsuffixed names are correct for either dtype. The -f-suffixed forms (fabsf/…) would compile
+  ;; on both vendors for a DOUBLE kernel via implicit narrowing and silently discard ~29 mantissa
+  ;; bits — a "compiles on both, computes differently from OpenCL" miscompile. Match opencl-config.
   {:cast-style      :c
    :atomic-add-int  "atomicAdd"
    :atomic-add-float "atomicAdd"
-   :float-abs       "fabsf"
-   :float-max       "fmaxf"
-   :float-min       "fminf"
+   :float-abs       "fabs"
+   :float-max       "fmax"
+   :float-min       "fmin"
    :float-suffix?   true})
 
 ;; ================================================================

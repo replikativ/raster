@@ -153,7 +153,8 @@
                   ;; Per-vendor (gpu-reg-budget-per-lane): Intel Xe grf128 128×32/subgroup, NVIDIA
                   ;; 255×4 (per-thread fragment), AMD CDNA 256 VGPRs×4. A single formula mis-sizes
                   ;; the tile cross-vendor (the budgets differ ~4×), so derive-gemm-tile GRF-bounds
-                  ;; against the right register file per family.
+                  ;; against the right register file per family. (Supersedes the earlier Intel-only
+                  ;; 128×32 placeholder that #75's HIP/CUDA NOTE flagged for exactly this follow-up.)
                   :grf-bytes-per-lane (gpu-reg-budget-per-lane caps flanes)
                   :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
       ;; MATRIX UNIT (systolic array) — the hardware matrix-multiply shape {:family :m :n :k

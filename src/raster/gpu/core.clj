@@ -1298,6 +1298,39 @@
            (contains? (:buffers @sess) result-key))
       (assoc result-sym (download sess result-key)))))
 
+(defn replay-program!
+  "Replay a bound program WITHOUT downloading any output — the device-value path (S4).
+   Refreshes only :input array params (same as run-program!), replays the recorded graph, and
+   returns the session. Output/:state/:result buffers stay RESIDENT; the caller wraps them as
+   DeviceArrays (raster.gpu.value) and downloads explicitly only when a host value is needed.
+   This is what `raster.gpu.compiled/invoke-compiled` calls — run-program!'s upload+replay with
+   the host round-trip removed. `resident-key` (below) resolves the buffer key for a param/result
+   symbol so the wrapper can fetch the live buffer via `buffer`."
+  [sess prog-or-handle args]
+  (let [{:keys [descriptor roles graph param->key profile?]}
+        (resolve-program sess prog-or-handle)
+        {:keys [all-params array-params]} descriptor
+        device-id (:device-id @sess)
+        argmap (zipmap all-params args)
+        replay-fn (rt-resolve device-id "replay-graph!")]
+    (doseq [p array-params :when (= :input (get roles p :input))]
+      (upload! sess (get param->key p) (get argmap p)))
+    (replay-fn graph)
+    (when profile?
+      (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
+        (reset-fn graph)))
+    sess))
+
+(defn resident-key
+  "Resolve the session buffer key for a param/result symbol of a bound program — the seam
+   `raster.gpu.compiled` uses to fetch a live resident buffer (via `buffer`) and wrap it as a
+   DeviceArray. Handles array params (param->key) and the functional :result-sym (result-key)."
+  [sess prog-or-handle sym]
+  (let [{:keys [param->key result-key descriptor]} (resolve-program sess prog-or-handle)]
+    (or (get param->key sym)
+        (when (= sym (:result-sym descriptor)) result-key)
+        (keyword (name sym)))))
+
 (defn profile-program!
   "The profiling twin of run-program!: same upload → replay → download sequence over a program
    bound with {:profile? true}, but reads the per-kernel DEVICE timestamps the replay produced.
