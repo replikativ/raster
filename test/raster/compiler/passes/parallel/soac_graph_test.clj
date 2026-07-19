@@ -395,3 +395,61 @@
         (when r-node
           (is (contains? (:inputs r-node) 'a)
               "Fused result should read from 'a' directly"))))))
+
+;; ================================================================
+;; #40 — cost-guided vertical fusion (decline-only, hardware-guided)
+;; ================================================================
+;;
+;; The profitability conjunct DECLINES a legal-but-unprofitable vertical fusion.
+;; It is the LAST conjunct of the legality `and`, so it can only turn a `true`
+;; into `false` — the chosen fusion set is a SUBSET of the legal set
+;; (F_chosen ⊆ F_legal) by construction. These are DEVICE-FREE: two hand-built
+;; Abstract Machines (a compute-poor CPU-shaped one, a compute-rich XMX-Arc one)
+;; stand in for a probe, exercising the roofline crossover
+;; `recompute-flops ≤ elem-bytes × ridge(dtype)` both ways.
+
+(def ^:private poor-am
+  "Compute-poor / bandwidth-rich: ridge(f64)=2 → threshold 8 B × 2 = 16 flop-equiv.
+   A ~30-flop transcendental producer exceeds it → rematerialization declined."
+  {:ridge {:f64 2.0}})
+
+(def ^:private rich-am
+  "Compute-rich XMX Arc: ridge(f16)≈356 → threshold 2 B × 356 = 712 flop-equiv.
+   The SAME 30-flop producer fits comfortably → fusion kept (recompute is free
+   relative to the scarce bandwidth)."
+  {:ridge {:f16 356.0}})
+
+(defn- vfuse
+  "Vertical fusion count for a graph under an (optional) AM + dtype."
+  [pairs am dtype]
+  (:vertical (second (sg/fusion-fixpoint (make-graph pairs) am dtype))))
+
+(deftest cost-guided-fusion-is-decline-only
+  (let [expensive [['a '(raster.par/map! a i n double (exp (exp (exp (aget x i)))))]   ;; 30 flops
+                   ['b '(raster.par/map! b i n double (* (aget a i) 2.0))]
+                   ['c '(raster.par/map! c i n double (+ (aget a i) 1.0))]]            ;; a fans out to b,c
+        sole [['a '(raster.par/map! a i n double (exp (exp (exp (aget x i)))))]        ;; 30 flops
+              ['b '(raster.par/map! b i n double (* (aget a i) 2.0))]]                 ;; a → b only
+        cheap [['a '(raster.par/map! a i n double (* (aget x i) 2.0))]                 ;; 1 flop
+               ['b '(raster.par/map! b i n double (* (aget a i) 2.0))]
+               ['c '(raster.par/map! c i n double (+ (aget a i) 1.0))]]]
+    (testing "no AM (CPU / no-target path) is byte-identical to legality alone"
+      (is (= (:vertical (second (sg/fusion-fixpoint (make-graph expensive))))
+             (vfuse expensive nil :f64))
+          "2-arg fixpoint ≡ 4-arg with am=nil"))
+    (testing "F_chosen ⊆ F_legal — the cost conjunct never GROWS the fusion set"
+      (doseq [g [expensive sole cheap]]
+        (is (<= (vfuse g poor-am :f64) (vfuse g nil :f64))
+            "declines are a subset; cost can only remove fusions, never add")))
+    (testing "expensive multi-consumer producer: DECLINED on a compute-poor machine"
+      (is (= 2 (vfuse expensive nil :f64)) "both a→b, a→c legal")
+      (is (= 0 (vfuse expensive poor-am :f64))
+          "30 flops > 16 threshold → rematerialization declined for both consumers"))
+    (testing "SAME graph, compute-rich XMX target: fusion KEPT (target-aware crossover)"
+      (is (= 2 (vfuse expensive rich-am :f16))
+          "30 flops ≤ 712 threshold → recompute is cheap vs bandwidth → fuse"))
+    (testing "SOLE-consumer expensive producer is a pure win — fused even on the poor machine"
+      (is (= (vfuse sole nil :f64) (vfuse sole poor-am :f64))
+          "compute MOVES (not duplicated) and the array is deleted → never declined"))
+    (testing "cheap producer fuses on every target (1 flop ≪ threshold)"
+      (is (= (vfuse cheap nil :f64) (vfuse cheap poor-am :f64))))))

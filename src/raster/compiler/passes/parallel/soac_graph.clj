@@ -13,6 +13,7 @@
   (:require [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.schedule-support :as schedule-support]
+            [raster.compiler.core.op-descriptor :as opd]
             [clojure.set :as set]))
 
 ;; ================================================================
@@ -319,6 +320,66 @@
                   (reachable? graph rid node-id)))
            nodes))))
 
+;; ================================================================
+;; PROFITABILITY tier (decline-only) — the hardware-GUIDED fusion chooser.
+;; Reads the portable :cost facet (flop-equivalent op weights) + the Abstract
+;; Machine ridge — NEVER a device. Appended as the last conjunct of the legality
+;; `and` so it can only DECLINE a legal fusion, never ENABLE one → the chosen
+;; fusion set is a subset of the legal set (F_chosen ⊆ F_legal) by construction.
+;; ================================================================
+
+(defn- lambda-flops
+  "Sum the :cost-facet flop-equivalent weights of every operator APPLICATION in a
+   kernel body. Op heads are qualified semantic symbols (raster.numeric/+,
+   raster.math/exp — the walker emits qualified). Unknown ops contribute 0: an
+   unknown cost must never INFLATE recompute and fabricate a decline, so the
+   conservative direction is to under-count (keep fusing). Portable flop-equiv,
+   priced by the AM, not a hardware instruction count."
+  [body]
+  (let [total (atom 0)]
+    (letfn [(walk [form]
+              (when (seq? form)
+                (let [h (first form)]
+                  (when (symbol? h)
+                    (swap! total + (long (:flops (opd/cost-facet h) 0)))))
+                (doseq [x form] (walk x))))]
+      (walk body))
+    @total))
+
+(defn- elem-bytes
+  "Byte width of the AM's working element dtype (GPU training default :f16)."
+  [dtype]
+  (case dtype (:f16 :half) 2 (:f32 :float) 4 (:f64 :double) 8 2))
+
+(defn vertical-fusion-profitable?
+  "PROFITABILITY (decline-only). A MULTI-consumer vertical fusion inlines the
+   producer body into THIS consumer while the producer stays alive for its other
+   consumers — it DUPLICATES compute to save one intermediate array read. The
+   roofline crossover: fuse iff the per-element recompute fits in the time to read
+   one element, i.e.
+
+       recompute-flops ≤ elem-bytes × ridge(dtype).
+
+   Derivation: saved = bound·elem/bw, cost = bound·recompute/peak-flops; fuse iff
+   saved ≥ cost ⟺ elem/bw ≥ recompute/peak-flops ⟺ recompute ≤ elem·(peak-flops/bw)
+   = elem·ridge. `bound` and bandwidth CANCEL, so the test is bound-free (robust to
+   symbolic bounds). Target-AWARE: an expensive producer declines on a
+   bandwidth-rich/compute-poor CPU but fuses on compute-rich XMX Arc.
+
+   Returns true (FUSE) whenever it cannot PROVE a loss — no AM (no target / CPU
+   path), a SOLE consumer (compute MOVES, never duplicates, and the array is
+   deleted → pure win), a non-Map producer, or an unknown ridge. So the conjunct
+   only ever DECLINES, and the no-AM path is byte-identical to today."
+  [graph producer-id consumer-id am dtype]
+  (or (nil? am)
+      (empty? (other-consumers graph producer-id consumer-id))   ;; sole consumer → pure win
+      (let [producer (get (:nodes graph) producer-id)
+            ridge    (get-in am [:ridge dtype])]
+        (or (nil? ridge)
+            (not (instance? raster.compiler.ir.soac.SoacMap producer))
+            (<= (lambda-flops (:lambda producer))
+                (* (elem-bytes dtype) (double ridge)))))))
+
 (defn can-fuse-vertically?
   "Check if producer can be vertically fused into consumer.
 
@@ -335,8 +396,15 @@
 
   Multi-consumer: When the producer has other consumers, fusion is still
   legal — the producer stays alive, and its body is inlined into this
-  consumer (avoiding one array load). This follows Futhark's approach."
-  [graph producer-id consumer-id]
+  consumer (avoiding one array load). This follows Futhark's approach.
+
+  The 5-arg form adds the PROFITABILITY conjunct: an Abstract Machine + working
+  dtype let a hardware-guided cost model DECLINE a legal-but-unprofitable fusion
+  (see vertical-fusion-profitable?). The 3-arg form passes am=nil → no decline,
+  byte-identical to legality alone (the CPU / no-target path)."
+  ([graph producer-id consumer-id]
+   (can-fuse-vertically? graph producer-id consumer-id nil nil))
+  ([graph producer-id consumer-id am dtype]
   (let [nodes (:nodes graph)
         producer (get nodes producer-id)
         consumer (get nodes consumer-id)
@@ -380,7 +448,11 @@
       ;; Pinning it keeps the reduce→broadcast→map boundary materialized — without this,
       ;; introducing a par/reduce (matching the element bound) lets the broadcast map smear
       ;; the reduce-derived scalar across consumers and cascade into monster kernels.
-     (not (depends-on-reduce? graph producer-id)))))
+     (not (depends-on-reduce? graph producer-id))
+      ;; 8. PROFITABILITY (decline-only): with an AM supplied, decline a legal fusion
+      ;; the locality roofline says loses (expensive multi-consumer rematerialization).
+      ;; Last conjunct → can only turn a true into false, never the reverse.
+     (vertical-fusion-profitable? graph producer-id consumer-id am dtype)))))
 
 (defn- fuse-vertical-scan-map
   "Fuse Scan producer into Map consumer by folding the map's body into
@@ -776,15 +848,16 @@
 ;; ================================================================
 
 (defn- apply-vertical-fusions
-  "Apply all legal vertical fusions in one pass. Returns [graph count]."
-  [graph]
+  "Apply all legal (and, when an AM is supplied, profitable) vertical fusions in
+   one pass. Returns [graph count]."
+  [graph am dtype]
   (loop [g graph fused 0]
-    ;; Find first legal vertical fusion
+    ;; Find first legal (+ profitable) vertical fusion
     (let [candidate
           (first
            (for [[from to typ] (:edges g)
                  :when (= typ :dep)
-                 :when (can-fuse-vertically? g from to)]
+                 :when (can-fuse-vertically? g from to am dtype)]
              [from to]))]
       (if candidate
         (recur (fuse-vertical g (first candidate) (second candidate))
@@ -803,13 +876,20 @@
 (defn fusion-fixpoint
   "Alternate vertical and horizontal fusion passes until no more fusions.
   Returns [FusionGraph stats-map].
-  stats-map: {:vertical N :horizontal N :iterations N}"
-  [graph]
+  stats-map: {:vertical N :horizontal N :iterations N}
+
+  The 2-arg form is legality-only (byte-identical to before this pass gained a
+  cost model). The 4-arg form threads an Abstract Machine + working dtype so the
+  vertical chooser can DECLINE unprofitable rematerialization (see
+  vertical-fusion-profitable?). Horizontal fusion is unaffected — it merges
+  independent same-bound maps and never duplicates compute."
+  ([graph] (fusion-fixpoint graph nil nil))
+  ([graph am dtype]
   (loop [g graph
          total-v 0
          total-h 0
          iters 0]
-    (let [[g1 v-count] (apply-vertical-fusions g)
+    (let [[g1 v-count] (apply-vertical-fusions g am dtype)
           [g2 h-count] (apply-horizontal-fusions g1)]
       (if (and (zero? v-count) (zero? h-count))
         [g2 {:vertical (+ total-v v-count)
@@ -818,4 +898,4 @@
         (recur g2
                (+ total-v v-count)
                (+ total-h h-count)
-               (inc iters))))))
+               (inc iters)))))))
