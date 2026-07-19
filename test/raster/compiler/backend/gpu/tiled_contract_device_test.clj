@@ -61,6 +61,37 @@
       (MemorySegment/copy oseg 0 (MemorySegment/ofArray out) 0 out-bytes)
       {:gpu (vec out) :cpu (vec (ref-matmul A B m k n))})))
 
+(defn- run-regtiled
+  "Emit the register-tiled kernel for m×n×k, launch on device, return {:gpu :cpu}."
+  [m k n]
+  (let [ze (find-ns 'raster.gpu.ze-runtime)
+        register! (ns-resolve ze 'register-kernel!)
+        ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
+        alloc (ns-resolve ze 'alloc-shared)
+        launch-2d! (ns-resolve ze 'launch-2d!)
+        A (double-array (map double (range (* m k))))
+        B (double-array (map #(* 0.5 (double %)) (range (* k n))))
+        form (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
+                   (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
+                         (list 'aget 'B (list '+ (list '* 'l n) 'j))))
+        sr (cl/contract-form->segred form)
+        {:keys [kernel-name source block micro workgroup]}
+        (sco/generate-regtiled-contraction-kernel sr 'C)
+        [bm bn _] block
+        [wgx wgy] workgroup
+        _ (register! kernel-name {:source source :dtype :double})
+        {:keys [kernel-handle]} (ensure-loaded! kernel-name)
+        [aseg _] (upload! A)
+        [bseg _] (upload! B)
+        out-bytes (* m n 8)
+        oseg (alloc out-bytes)
+        gcx (long (Math/ceil (/ (double n) bn)))
+        gcy (long (Math/ceil (/ (double m) bm)))]
+    (launch-2d! kernel-handle [wgx wgy] [gcx gcy] [aseg bseg oseg])
+    (let [out (double-array (* m n))]
+      (MemorySegment/copy oseg 0 (MemorySegment/ofArray out) 0 out-bytes)
+      {:gpu (vec out) :cpu (vec (ref-matmul A B m k n))})))
+
 (defn- approx-eq? [xs ys]
   (and (= (count xs) (count ys))
        (every? true? (map (fn [a b] (< (Math/abs (- (double a) (double b))) 1.0e-9)) xs ys))))
@@ -78,3 +109,17 @@
       (testing "skewed dims (17×48×5)"
         (let [{:keys [gpu cpu]} (run-tiled 17 48 5)]
           (is (approx-eq? gpu cpu) "skewed"))))))
+
+(deftest regtiled-contraction-matches-cpu-on-device
+  (if-not @gpu?
+    (println "[skip] regtiled-contraction-device: no GPU device available")
+    (do
+      (testing "block-divisible dims (128×64×256)"
+        (let [{:keys [gpu cpu]} (run-regtiled 128 256 64)]
+          (is (approx-eq? gpu cpu) (str "divisible: GPU " (take 4 gpu) " vs CPU " (take 4 cpu)))))
+      (testing "non-divisible dims (100×70×33) — boundary + partial micro-tiles"
+        (let [{:keys [gpu cpu]} (run-regtiled 100 33 70)]
+          (is (approx-eq? gpu cpu) (str "boundary: GPU " (take 4 gpu) " vs CPU " (take 4 cpu)))))
+      (testing "tiny dims (5×7×3) — everything is boundary"
+        (let [{:keys [gpu cpu]} (run-regtiled 5 3 7)]
+          (is (approx-eq? gpu cpu) "tiny"))))))

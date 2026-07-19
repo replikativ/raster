@@ -477,3 +477,123 @@
      :dtype dtype
      :tile T
      :dims [M N L]}))
+
+;; ================================================================
+;; Register-tiled + __local-staged contraction (BlkRegTiling, register level)
+;; ================================================================
+
+(defn- analyze-contraction
+  "Shared structural analysis for the tiled contraction emitters. Prototype scope: 2 free
+   axes + 1 contract, LITERAL dims, sum-of-two-agets element. Returns dims (M N L), axis
+   syms, dtype/ctype, init, array params, and the row/col operand LOAD strings (row uses C
+   vars i-sym,l-sym; col uses l-sym,j-sym — the caller declares them with the right values).
+   Operands are assigned by DECLARED-axis dependence (no recognition). (generate-tiled-
+   contraction-kernel predates this and still inlines the same logic — dedup TODO.)"
+  [segred dtype]
+  (let [space (:space segred)
+        seg-dims (segop/seg-space-segment-dims space)
+        red-dim  (segop/seg-space-reduced-dim space)
+        _ (assert (= 2 (count seg-dims)) "tiled: exactly 2 free axes (prototype)")
+        [fi fj] seg-dims
+        M (:bound fi) N (:bound fj) L (:bound red-dim)
+        _ (assert (every? number? [M N L]) "tiled: literal dims (prototype)")
+        i-sym (:name fi) j-sym (:name fj) l-sym (:name red-dim)
+        dtype (or (:dtype segred) dtype)
+        ctype (get codegen/opencl-type-map dtype "double")
+        {:keys [init lambda]} (:reduce-op segred)
+        lambda (ce/normalize-array-prims lambda)
+        _ (assert (#{'+ 'clojure.core/+ 'raster.numeric/+} (descriptor/semantic-op lambda))
+                  "tiled: combine must be + (prototype)")
+        acc-sym (:acc (:reduce-op segred))
+        acc-at? (fn [a] (or (= a acc-sym) (and (seq? a) (= 'double (first a)) (= acc-sym (second a)))))
+        op-args (vec (descriptor/call-args lambda))
+        elem (let [a0 (nth op-args 0) a1 (nth op-args 1)] (if (acc-at? a0) a1 a0))
+        _ (assert (and (seq? elem) (#{'* 'clojure.core/* 'raster.numeric/*} (descriptor/semantic-op elem)))
+                  "tiled: element must be a product of two agets (prototype)")
+        parts (fn [e] (let [e (ce/normalize-array-prims e)]
+                        (assert (and (seq? e) (= 'aget (first e))) "tiled: operand must be an aget")
+                        {:arr (nth e 1) :idx (nth e 2)}))
+        [pa pb] (mapv parts (descriptor/call-args elem))
+        dep? (fn [idx s] (contains? (syms-in idx) s))
+        rc (fn [x y] (when (and (dep? (:idx x) i-sym) (dep? (:idx x) l-sym) (not (dep? (:idx x) j-sym))
+                                (dep? (:idx y) l-sym) (dep? (:idx y) j-sym) (not (dep? (:idx y) i-sym)))
+                       [x y]))
+        [rowop colop] (or (rc pa pb) (rc pb pa)
+                          (throw (ex-info "tiled: operands don't match A(i,l)·B(l,j) variance" {:pa pa :pb pb})))
+        arr-params (vec (sort-by name (:inputs segred)))
+        arr-sym-set (set (map #(symbol (name %)) arr-params))
+        dummy (gensym "z__")
+        emit-load (fn [{:keys [arr idx]}]
+                    (binding [ce/*emit-config* ce/opencl-config
+                              ce/*scalar-type* ctype
+                              ce/*int-vars* (into ce/*int-vars* (map #(symbol (name %)) [i-sym j-sym l-sym]))]
+                      (ce/emit-expr (list 'aget arr idx) dummy arr-sym-set)))]
+    {:M M :N N :L L :i-sym i-sym :j-sym j-sym :l-sym l-sym
+     :dtype dtype :ctype ctype :init init :arr-params arr-params
+     :row-load (emit-load rowop) :col-load (emit-load colop)}))
+
+(defn generate-regtiled-contraction-kernel
+  "REGISTER-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, register
+   level). Block tile BM×BN over the output, BK contraction chunk; each thread owns a
+   TM×TN register micro-tile of outputs (workgroup (BM/TM)×(BN/TN) threads). Cooperative
+   flattened staging of A/B into __local, then a register-blocked inner MAC (acc[TM][TN] +=
+   a[TM]·b[TN]). Zero-padded loads + guarded store handle non-divisible dims. The register
+   tile is precisely the fragment a DPAS/tensorize step (step 4) will consume.
+
+   Prototype scope as analyze-contraction. Requires a 2-D launch: workgroup [BN/TN BM/TM],
+   grid [ceil(N/BN) ceil(M/BM)]. Returns {:kernel-name :source :array-params :dtype :block
+   [BM BN BK] :micro [TM TN] :workgroup [x y] :dims [M N L]}."
+  [segred out-sym & {:keys [dtype bm bn bk tm tn]
+                     :or {dtype :double bm 64 bn 64 bk 16 tm 4 tn 4}}]
+  (let [{:keys [M N L i-sym j-sym l-sym ctype init arr-params row-load col-load]}
+        (analyze-contraction segred dtype)
+        _ (assert (and (zero? (rem bm tm)) (zero? (rem bn tn)))
+                  "regtiled: BM%TM and BN%TN must be 0")
+        nt-row (quot bm tm) nt-col (quot bn tn) NT (* nt-row nt-col)
+        i-c (ce/c-symbol i-sym) j-c (ce/c-symbol j-sym) l-c (ce/c-symbol l-sym)
+        kernel-name (str "regtiled_contract_" (gensym ""))
+        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        src (str (codegen/extension-pragmas (or (:dtype segred) dtype))
+                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out) {\n"
+                 "    __local " ctype " As[" bm "][" bk "];\n"
+                 "    __local " ctype " Bs[" bk "][" bn "];\n"
+                 "    int tr = get_local_id(1);\n"
+                 "    int tc = get_local_id(0);\n"
+                 "    int tid = tr * " nt-col " + tc;\n"
+                 "    int block_i = get_group_id(1) * " bm ";\n"
+                 "    int block_j = get_group_id(0) * " bn ";\n"
+                 "    " ctype " acc[" tm "][" tn "];\n"
+                 "    for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) acc[m][n] = " (str init) ";\n"
+                 "    for (int l0 = 0; l0 < " L "; l0 += " bk ") {\n"
+                 "        for (int idx = tid; idx < " (* bm bk) "; idx += " NT ") {\n"
+                 "            int r = idx / " bk "; int c = idx % " bk ";\n"
+                 "            int " i-c " = block_i + r; int " l-c " = l0 + c;\n"
+                 "            As[r][c] = ((" i-c " < " M ") && (" l-c " < " L ")) ? " row-load " : 0.0;\n"
+                 "        }\n"
+                 "        for (int idx = tid; idx < " (* bk bn) "; idx += " NT ") {\n"
+                 "            int r = idx / " bn "; int c = idx % " bn ";\n"
+                 "            int " l-c " = l0 + r; int " j-c " = block_j + c;\n"
+                 "            Bs[r][c] = ((" l-c " < " L ") && (" j-c " < " N ")) ? " col-load " : 0.0;\n"
+                 "        }\n"
+                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                 "        for (int t = 0; t < " bk "; t++) {\n"
+                 "            " ctype " a[" tm "]; " ctype " b[" tn "];\n"
+                 "            for (int m = 0; m < " tm "; m++) a[m] = As[tr*" tm "+m][t];\n"
+                 "            for (int n = 0; n < " tn "; n++) b[n] = Bs[t][tc*" tn "+n];\n"
+                 "            for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) acc[m][n] = acc[m][n] + a[m] * b[n];\n"
+                 "        }\n"
+                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                 "    }\n"
+                 "    for (int m = 0; m < " tm "; m++) for (int n = 0; n < " tn "; n++) {\n"
+                 "        int gr = block_i + tr*" tm " + m; int gc = block_j + tc*" tn " + n;\n"
+                 "        if ((gr < " M ") && (gc < " N ")) out[gr * " N " + gc] = acc[m][n];\n"
+                 "    }\n"
+                 "}\n")]
+    {:kernel-name kernel-name
+     :source src
+     :array-params arr-params
+     :dtype (or (:dtype segred) dtype)
+     :block [bm bn bk]
+     :micro [tm tn]
+     :workgroup [nt-col nt-row]
+     :dims [M N L]}))
