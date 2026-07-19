@@ -379,6 +379,33 @@
   [desc]
   (if (:has-native-dot-reduce desc) :dpbusd :scalar))
 
+(defn abstract-machine
+  "Project a hardware descriptor to the closed ABSTRACT MACHINE (AM) — the only
+   hardware view the TARGET-NEUTRAL SOAC layer may read. It carries the portable
+   parameters a fusion/schedule decision reasons about — bandwidth, per-dtype
+   peak-flops and roofline ridge, lane width, register bytes per lane, matrix-unit
+   SHAPE+presence, launch tax — and STRIPS the device-flavoured facts: the matrix
+   instruction :family (:dpas/:mma/:mfma), the device id, and the vendor. Those are
+   read by the emitter BELOW the firewall, never by soac-fuse. Threaded into
+   pass-soac-fuse via opts so a fusion decision is hardware-GUIDED without the pass
+   ever naming a device — 'reason about bandwidth/lane widths, not about Arc'.
+   The AM is a firewall by CONVENTION (soac-fuse takes this map, not the descriptor),
+   not by construction — *descriptor* remains globally reachable; the discipline is
+   that SOAC-level passes accept an AM argument and never call descriptor-for."
+  [desc]
+  (let [pf (:peak-flops desc)
+        bw (:bandwidth-bytes-s desc)
+        mx (:matrix desc)]
+    {:bandwidth-bytes-s bw
+     :peak-flops        pf
+     :ridge             (when (and pf bw)
+                          (into {} (map (fn [dt] [dt (balance-for desc dt)])) (keys pf)))
+     :lane-width        (:subgroup-size desc)
+     :reg-bytes-per-lane (:grf-bytes-per-lane desc)
+     ;; matrix SHAPE + presence only — the instruction :family is deliberately dropped
+     :matrix            (when mx (assoc (select-keys mx [:m :n :k]) :present? true))
+     :launch-tax-ns     (:launch-overhead-ns desc)}))
+
 ;; ---------------------------------------------------------------------------
 ;; Occupancy-scored launch geometry — the SINGLE implementation. These read the
 ;; descriptor (probe ⊕ catalogue ⊕ measured); runtime.hardware/optimal-* delegate

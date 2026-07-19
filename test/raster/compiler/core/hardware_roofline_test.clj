@@ -94,3 +94,23 @@
     (testing "roofline is only a SEED — it cannot see the M=128 occupancy regression"
       (is (pos? (perk% 128))
           "roofline predicts a WIN at M=128, but measurement showed −3.2% → measurement must gate"))))
+
+;; --- The Abstract Machine firewall: SOAC layer reasons over params, never a device ---
+(deftest abstract-machine-projection
+  (let [dpas-desc (assoc desc :subgroup-size 16 :grf-bytes-per-lane 8192
+                         :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                         :vendor :intel :arch :xe2 :launch-overhead-ns 900.0)
+        am (hw/abstract-machine dpas-desc)]
+    (testing "carries the portable parameters a fusion/schedule decision needs"
+      (is (= 89.6e9 (:bandwidth-bytes-s am)))
+      (is (= 16 (:lane-width am)))
+      (is (= 8192 (:reg-bytes-per-lane am)))
+      (is (= 900.0 (:launch-tax-ns am)))
+      (is (< 44.0 (get-in am [:ridge :f32]) 45.0) "precision-aware ridge is projected"))
+    (testing "matrix carries SHAPE + presence but NOT the device-flavoured :family"
+      (is (= {:m 8 :n 16 :k 16 :present? true} (:matrix am)))
+      (is (nil? (:family (:matrix am)))))
+    (testing "the firewall strips device identity — no vendor/arch/device-id leaks through"
+      (is (not-any? #(contains? am %) [:family :vendor :arch :device-id :device-type])))
+    (testing "a descriptor with no matrix unit projects :matrix nil (capability absent)"
+      (is (nil? (:matrix (hw/abstract-machine desc)))))))
