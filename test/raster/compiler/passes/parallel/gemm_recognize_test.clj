@@ -180,3 +180,42 @@
       (is (nil? (:epilogue dot)))
       (is (nil? (:layout-a dot)))
       (is (nil? (:layout-b dot))))))
+
+;; ── Design B: the Screma/SoacMap-level recognizer (the RESIDENT front door). A
+;; par-form matmul lowers to ONE SoacMap with the outer (i,j) inlined as
+;; (quot ij N)/(rem ij N) in the operand indices. Built + tested against the REAL
+;; soac/let-bindings->nodes output, not a hand-form.
+(defn- par-matmul-soacmap
+  "Lower a par/map-void! matmul body to its SoacMap (as the resident pipeline sees it)."
+  [body]
+  (first (soac/let-bindings->nodes
+          [['_ (list 'raster.par/map-void! 'ij '(clojure.core/* m n) body)]])))
+
+(def ^:private nn-body
+  '(let [i (clojure.core/quot ij n) j (clojure.core/rem ij n)]
+     (aset C ij (loop [acc 0.0 p 0]
+                  (if (< p k)
+                    (recur (+ acc (* (aget A (clojure.core/+ (clojure.core/* i k) p))
+                                     (aget B (clojure.core/+ (clojure.core/* p n) j)))) (inc p))
+                    acc)))))
+
+(deftest screma-level-gemm-recognizer
+  (testing "a flat par-form matmul SoacMap → the :nn GEMM descriptor (m/n/k from quot/rem)"
+    (is (= {:variant :nn :A 'A :B 'B :C 'C :m 'm :n 'n :k 'k :alpha 1.0 :beta 0.0}
+           (gr/match-gemm-screma (par-matmul-soacmap nn-body)))))
+  (testing "SOUND rejections"
+    (testing "single-array reduce (no product) → nil"
+      (is (nil? (gr/match-gemm-screma
+                 (par-matmul-soacmap
+                  '(let [i (clojure.core/quot ij n) j (clojure.core/rem ij n)]
+                     (aset C ij (loop [acc 0.0 p 0]
+                                  (if (< p k) (recur (+ acc (aget A (clojure.core/+ (clojure.core/* i k) p))) (inc p)) acc)))))))))
+    (testing "both operands at the same flat index (elementwise, no contraction structure) → nil"
+      (is (nil? (gr/match-gemm-screma
+                 (par-matmul-soacmap
+                  '(aset C ij (loop [acc 0.0 p 0]
+                                (if (< p k) (recur (+ acc (* (aget A ij) (aget B ij))) (inc p)) acc)))))))))
+  (testing "the Screma recognizer feeds redomap->dot — Screma → descriptor → Dot node"
+    (let [dot (gr/redomap->dot 3 'c (gr/match-gemm-screma (par-matmul-soacmap nn-body)))]
+      (is (instance? raster.compiler.ir.soac.Dot dot))
+      (is (= ['A 'B 'C 'm 'n 'k] [(:A dot) (:B dot) (:C dot) (:m dot) (:n dot) (:k dot)])))))
