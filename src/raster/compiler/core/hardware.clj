@@ -354,19 +354,37 @@
    itself analytically (fewer kernels ⇒ less tax). Overwritten by a measured empty-kernel ping."
   1000.0)
 
+(def default-dram-cold-penalty
+  "Effective-bandwidth penalty for a COLD (DRAM first-touch) operand vs a WARM (cache/on-chip
+   resident) one. Arc 140V MEASURED: a GEMM runs at 70% of XMX peak with L2-warm operands but 20%
+   cold (b1_gemm_leaf_measured) — a 3.5× effective-bandwidth gap that tiling/num_stages did NOT move.
+   The roofline's flat bytes/bandwidth term is blind to this; the LOCALITY split below charges warm
+   bytes at `penalty×` the bandwidth so a schedule that keeps operands resident (fusion / cross-layer
+   residency) is correctly priced faster. Overridable per descriptor via :dram-cold-penalty."
+  3.5)
+
 (defn roofline-time-ns
   "Analytic runtime estimate in ns (XLA overlap roofline). compute = flops/peak-flops(dtype);
-   mem = bytes/bandwidth; exec = compute + mem − 0.95·min(compute,mem) + n-kernels·launch-tax.
-   Returns nil when the descriptor has no bandwidth/peak-flops yet (nothing probed or measured) —
-   the caller then has no estimate rather than a fabricated one. This is the ranker the schedule
-   search (Phase 2) prices candidates with; measurement (Phase 1) sharpens every term."
-  [desc {:keys [flops bytes dtype n-kernels launch-overhead-ns]
+   mem = cold-bytes/bandwidth + warm-bytes/(penalty·bandwidth); exec = compute + mem −
+   0.95·min(compute,mem) + n-kernels·launch-tax. Returns nil when the descriptor has no
+   bandwidth/peak-flops yet. This is the ranker the schedule search prices candidates with;
+   measurement sharpens every term.
+
+   LOCALITY: pass `:cold-bytes` (DRAM first-touch: fresh weights/activations) and `:warm-bytes`
+   (cache/on-chip resident: fused intermediates, cross-layer-resident operands) separately — the
+   schedule decides the split. Warm bytes are charged at `penalty×` the bandwidth (measured 3.5× on
+   Arc). Back-compat: a plain `:bytes` is treated as ALL cold (the prior flat behavior)."
+  [desc {:keys [flops bytes cold-bytes warm-bytes dtype n-kernels launch-overhead-ns]
          :or {dtype :f32 n-kernels 1}}]
   (let [pf (peak-flops-for desc dtype)
         bw (:bandwidth-bytes-s desc)]
     (when (and pf bw (pos? (double pf)) (pos? (double bw)))
-      (let [compute-ns (* (/ (double flops) (double pf)) 1e9)
-            mem-ns     (* (/ (double bytes) (double bw)) 1e9)
+      (let [penalty    (double (:dram-cold-penalty desc default-dram-cold-penalty))
+            cold       (double (or cold-bytes bytes 0))     ;; plain :bytes ⇒ all cold (back-compat)
+            warm       (double (or warm-bytes 0))
+            compute-ns (* (/ (double flops) (double pf)) 1e9)
+            mem-ns     (* (+ (/ cold (double bw))
+                             (/ warm (* penalty (double bw)))) 1e9)
             overlap    (* memory-compute-parallelism (min compute-ns mem-ns))
             tax        (* (long n-kernels)
                           (double (or launch-overhead-ns (:launch-overhead-ns desc) default-launch-overhead-ns)))]
@@ -402,6 +420,12 @@
                           (into {} (map (fn [dt] [dt (balance-for desc dt)])) (keys pf)))
      :lane-width        (:subgroup-size desc)
      :reg-bytes-per-lane (:grf-bytes-per-lane desc)
+     ;; LOCALITY inputs: the LLC capacity a working set must fit to stay WARM, the SLM tile budget,
+     ;; and the measured cold/warm effective-bandwidth penalty. The residency/fusion schedule reads
+     ;; these to decide which operands are resident (warm) vs DRAM first-touch (cold).
+     :llc-bytes         (or (get-in desc [:cache :l3]) (get-in desc [:cache :l2]) (:llc-bytes desc))
+     :slm-bytes         (get-in desc [:cache :slm])
+     :dram-cold-penalty (:dram-cold-penalty desc default-dram-cold-penalty)
      ;; matrix SHAPE + presence only — the instruction :family is deliberately dropped
      :matrix            (when mx (assoc (select-keys mx [:m :n :k]) :present? true))
      :launch-tax-ns     (:launch-overhead-ns desc)}))

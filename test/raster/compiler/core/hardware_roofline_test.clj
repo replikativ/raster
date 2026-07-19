@@ -95,6 +95,30 @@
       (is (pos? (perk% 128))
           "roofline predicts a WIN at M=128, but measurement showed −3.2% → measurement must gate"))))
 
+;; --- Locality split: warm (resident) bytes cost `penalty`× less than cold (DRAM) bytes ---
+;; Reproduces the MEASURED Arc warm/cold gap (b1_gemm_leaf_measured: 70% peak L2-warm, 20% cold)
+;; inside the roofline, so a schedule that keeps operands resident is priced faster. proj shape.
+(deftest roofline-locality-split
+  (let [ld (assoc desc :peak-flops {:f16 31.9488e12 :f32 3.9936e12 :float 3.9936e12}
+                  :bandwidth-bytes-s 89.6e9)
+        M 1024 K 640 N 2048
+        flops (* 2 M K N)
+        op-bytes (+ (* M K 2) (* K N 2) (* M N 2))       ;; A+B+C all f16 ≈ 7.5 MB
+        cold (hw/roofline-time-ns ld {:flops flops :cold-bytes op-bytes :dtype :f16})
+        warm (hw/roofline-time-ns ld {:flops flops :warm-bytes op-bytes :dtype :f16})
+        mem-cold (/ (double op-bytes) 89.6e9)
+        mem-warm (/ (double op-bytes) (* 3.5 89.6e9))]
+    (testing "warm memory traffic is charged penalty× (3.5×) less than cold"
+      (is (< 3.4 (/ mem-cold mem-warm) 3.6)))
+    (testing "cold total time exceeds warm (the schedule that keeps operands resident wins)"
+      (is (> cold warm)))
+    (testing "plain :bytes is back-compat = all cold"
+      (is (= (hw/roofline-time-ns ld {:flops flops :bytes op-bytes :dtype :f16})
+             (hw/roofline-time-ns ld {:flops flops :cold-bytes op-bytes :dtype :f16}))))
+    (testing "penalty is overridable per descriptor"
+      (is (some? (hw/roofline-time-ns (assoc ld :dram-cold-penalty 2.0)
+                                      {:flops flops :warm-bytes op-bytes :dtype :f16}))))))
+
 ;; --- The Abstract Machine firewall: SOAC layer reasons over params, never a device ---
 (deftest abstract-machine-projection
   (let [dpas-desc (assoc desc :subgroup-size 16 :grf-bytes-per-lane 8192

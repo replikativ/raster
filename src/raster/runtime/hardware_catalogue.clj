@@ -145,6 +145,10 @@
     :subgroup-sizes [16 32]
     :max-workgroup-size 1024
     :shared-local-memory 131072       ;; 128 KB SLM
+    :cache-l2 8388608                 ;; 8 MB L2 (Xe2 LLC) — the residency threshold for the locality
+                                      ;; cost term: a working set ≤ this stays WARM, above it goes cold
+                                      ;; (measured: proj operands ~7.5 MB fit → 70% peak; 24-pair cold
+                                      ;; set ~194 MB evicts → 20%, the 3.5× dram-cold-penalty).
     :global-memory-bytes 15946350592  ;; ~14.9 GB shared LPDDR5x
     :memory-bandwidth-gb-s 89.6      ;; LPDDR5x 8533 MT/s × 128-bit
     :peak-flops-dp 249.6e9           ;; 64 EUs × 1950 MHz × 2 FMA
