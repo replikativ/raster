@@ -51,7 +51,8 @@
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.opencl-codegen :as cg]
             [raster.compiler.support.spirv-cache :as spv]
-            [raster.runtime.hardware :as hw])
+            [raster.runtime.hardware :as hw]
+            [clojure.string :as str])
   (:import [java.lang.foreign MemorySegment ValueLayout]))
 
 (def ^:private I32 ValueLayout/JAVA_INT)
@@ -180,6 +181,30 @@
        (bind! module kname [256 1] args
               (long (Math/ceil (/ (double n) 128.0))) (long (Math/ceil (/ (double m) 128.0))) 1)))})
 
+(def ^:private dpas-spec
+  "The DPAS/XMX-tensorized SOAC contraction — sourced from the segred via the legality gate,
+   f16. This is the apples-to-apples proof that the SOAC path reproduces the golden GEMM:
+   for a canonical matmul the gate accepts and emits the golden body, so a near-tie with
+   golden-gemm-f16 is the 'general emitter, no lost performance' result. Requires N%8==0 and
+   K%8==0 (the DPAS block-read pitch alignment the gate enforces)."
+  {:label "dpas-soac-f16" :dtype :half
+   :bind
+   (fn [m n k triple]
+     (let [sr (cl/contract-form->segred (matmul-form m n k) :dtype :half)
+           {:keys [kernel-name source array-params tensorized reason]}
+           (sco/generate-dpas-contraction-kernel sr 'C)
+           _ (when-not tensorized
+               (throw (ex-info (str "dpas-spec: gate rejected this shape (" reason
+                                    ") — DPAS needs N%8==0 & K%8==0, canonical orientation")
+                               {:m m :n n :k k :reason reason})))
+           {:keys [module kname]} (compile-src! [:dpas] kernel-name source)
+           ;; array-params = [row col] binding order; for the matmul row=A, col=B.
+           bufs (mapv (fn [s] (:segment (get triple (keyword (str/lower-case (name s)))))) array-params)
+           args (into bufs [(:segment (:c triple))
+                            {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}])]
+       (bind! module kname [256 1] args
+              (long (Math/ceil (/ (double n) 128.0))) (long (Math/ceil (/ (double m) 128.0))) 1)))})
+
 ;; ── cadence graph over a spec (mirrors resident-gemm-cold-bench/record-seq-graph) ─────
 (defn- record-seq-graph
   "Record ONE graph of `launches` back-to-back launches of `spec` (barriers serialize).
@@ -201,14 +226,17 @@
    rows are not a fair FLOP race; see ns doc).
 
    shape:   {:name :m :k :n}
-   opts:    :dtype (:double) — element type for the SOAC ladder
+   opts:    :dtype (:double) — element type for the portable SOAC ladder (naive/block/regtiled)
             :golden? (false) — include the f16 golden GEMM reference line
+            :dpas?   (false) — include the DPAS-tensorized SOAC kernel (f16; the apples-to-
+                     apples comparand to golden; needs N%8==0 & K%8==0)
             :specs   — override the spec list entirely
             :launches (24) :reps (10) :warmup (6)"
-  [{:keys [m n k name]} & {:keys [dtype golden? specs launches reps warmup]
-                           :or {dtype :double golden? false launches 24 reps 10 warmup 6}}]
+  [{:keys [m n k name]} & {:keys [dtype golden? dpas? specs launches reps warmup]
+                           :or {dtype :double golden? false dpas? false launches 24 reps 10 warmup 6}}]
   (let [specs (or specs
                   (cond-> [(naive-spec dtype) (block-spec dtype 16) (regtiled-spec dtype)]
+                    dpas?   (conj dpas-spec)
                     golden? (conj golden-spec)))
         ;; per-spec buffers at its own dtype (cold triples distinct; warm shared)
         entries (mapv (fn [spec]

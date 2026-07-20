@@ -530,7 +530,11 @@
                       (ce/emit-expr (list 'aget arr idx) dummy arr-sym-set)))]
     {:M M :N N :L L :i-sym i-sym :j-sym j-sym :l-sym l-sym
      :dtype dtype :ctype ctype :init init :arr-params arr-params
-     :row-load (emit-load rowop) :col-load (emit-load colop)}))
+     :row-load (emit-load rowop) :col-load (emit-load colop)
+     ;; operand arrays + index exprs (for orientation analysis, e.g. DPAS tensorize):
+     ;; rowop is the A(i,l) operand (→ A slot), colop the B(l,j) operand (→ B slot).
+     :row-arr (:arr rowop) :row-idx (:idx rowop)
+     :col-arr (:arr colop) :col-idx (:idx colop)}))
 
 (defn generate-regtiled-contraction-kernel
   "REGISTER-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, register
@@ -597,3 +601,93 @@
      :micro [tm tn]
      :workgroup [nt-col nt-row]
      :dims [M N L]}))
+
+;; ================================================================
+;; DPAS/XMX-tensorized contraction (PEAK) — raster's edge over Futhark
+;; ================================================================
+
+(defn- canonical-rowmajor?
+  "Does affine index `idx` equal `(+ (* outer stride) inner)` (row-major, leading dim
+   `stride`)? outer/inner are axis syms, stride the expected leading extent (a number).
+   Order-agnostic on both the + and the *. Returns true/false."
+  [idx outer stride inner]
+  (let [idx (ce/normalize-array-prims idx)
+        add? #(and (seq? %) (#{'+ 'clojure.core/+ 'raster.numeric/+} (first %)))
+        mul? #(and (seq? %) (#{'* 'clojure.core/* 'raster.numeric/*} (first %)))]
+    (boolean
+     (when (and (add? idx) (= 3 (count idx)))
+       (let [[_ a b] idx
+             [prod other] (cond (mul? a) [a b] (mul? b) [b a] :else [nil nil])]
+         (when (and prod (= other inner) (= 3 (count prod)))
+           (let [[_ p q] prod]
+             (or (and (= p outer) (= q stride))
+                 (and (= q outer) (= p stride))))))))))
+
+(defn dpas-contraction-legal?
+  "The tensorize LEGALITY GATE: is `segred` a contraction that lowers to the DPAS/XMX
+   matmul body? This is where the recognizer's affine-invariance core rehomes — but stated
+   as a *legality check on already-declared axes*, not a recognition. Returns {:ok true …}
+   with the extracted operands/dims, or {:ok false :reason kw} so the caller falls back to
+   the portable register-tiled kernel.
+
+   Conditions (Arc DPAS): exactly 2 free + 1 contract axis, element = product of two agets,
+   BOTH operands in canonical row-major orientation (A[i,l]=i·L+l ⇒ [M,L]; B[l,j]=l·N+j ⇒
+   [L,N]) so the golden 2D-block reads address them correctly, dtype ∈ DPAS types (Arc:
+   half; bf16/int8 are future variants), and the operand PITCHES are 16-byte-aligned —
+   N·2 and K·2 multiples of 16 ⇔ N%8==0 and K%8==0 for f16. The pitch condition is a HARD
+   hardware constraint of intel_sub_group_2d_block_read: a mis-aligned pitch (e.g. N=70,
+   K=124) SILENTLY MISCOMPILES ~80% of outputs (device-verified) — production GEMM shapes
+   (N∈{640,1024,2048}) are all N%8==0 so never hit it, but a general contraction can, and
+   the gate must reject it so the caller falls back to the register-tiled kernel (which
+   handles arbitrary dims). M (the block-read HEIGHT) is unconstrained. Transposed operands
+   (:tn/:nt) and a batch axis are legal extensions the golden body already has flags for —
+   rejected here as :non-canonical-orientation / :not-a-contraction until wired."
+  [segred dtype]
+  (let [dtype (or (:dtype segred) dtype)
+        pitch-ok? (fn [d] (and (number? d) (zero? (mod (long d) 8))))]
+    (if-not (#{:half :float16} dtype)
+      {:ok false :reason :dtype-not-dpas :dtype dtype}
+      (try
+        (let [{:keys [M N L i-sym j-sym l-sym row-idx col-idx row-arr col-arr arr-params]}
+              (analyze-contraction segred dtype)]
+          (cond
+            (not (canonical-rowmajor? row-idx i-sym L l-sym))
+            {:ok false :reason :non-canonical-orientation :operand :row :idx row-idx}
+            (not (canonical-rowmajor? col-idx l-sym N j-sym))
+            {:ok false :reason :non-canonical-orientation :operand :col :idx col-idx}
+            (not (pitch-ok? N))   ; B pitch = N·2 bytes must be 16-byte aligned
+            {:ok false :reason :n-pitch-unaligned :N N}
+            (not (pitch-ok? L))   ; A pitch = K·2 bytes must be 16-byte aligned
+            {:ok false :reason :k-pitch-unaligned :L L}
+            :else
+            {:ok true :M M :N N :L L :row-arr row-arr :col-arr col-arr :arr-params arr-params}))
+        (catch clojure.lang.ExceptionInfo e
+          {:ok false :reason :not-a-contraction :msg (.getMessage e)})))))
+
+(defn generate-dpas-contraction-kernel
+  "DPAS/XMX-tensorized contraction → OpenCL (PEAK; raster's edge over Futhark's portable
+   ~50-70%-peak tiling). The general, IR-driven contribution is the LEGALITY GATE +
+   operand-orientation analysis (dpas-contraction-legal?); the DPAS BODY is the validated
+   emit-gemm-nonsquare-kernel reused verbatim (f16-in / f32-acc / f16-out, 128×128 tiles,
+   16 subgroups, K16 mad). The SOAC IR decides WHICH input is the row operand (→ A slot) vs
+   col operand (→ B slot) and the dims to launch with — so a batched or transposed
+   contraction re-tensorizes through the golden's :batched?/:split-k? variants rather than a
+   separate hand kernel. NON-gemm-specific at the IR boundary; peak at the hardware boundary.
+
+   Returns {:kernel-name :source :array-params [row-arr col-arr] :dims [M N L] :dtype :half
+            :tensorized true}  — NB: :array-params is in [row col] BINDING order (row's
+   buffer → A slot, col's → B slot, out → C), NOT sorted-by-name. Returns
+   {:tensorized false :reason …} when the gate rejects (caller falls back to regtiled)."
+  [segred out-sym & {:keys [dtype] :or {dtype :half}}]
+  (let [gate (dpas-contraction-legal? segred dtype)]
+    (if-not (:ok gate)
+      {:tensorized false :reason (:reason gate) :detail gate}
+      (let [{:keys [M N L row-arr col-arr]} gate
+            kernel-name (str "dpas_contract_" (gensym ""))
+            source (codegen/emit-gemm-nonsquare-kernel kernel-name :c-dtype :half)]
+        {:kernel-name kernel-name
+         :source source
+         :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
+         :dims [M N L]
+         :dtype :half
+         :tensorized true}))))
