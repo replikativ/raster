@@ -3113,6 +3113,74 @@
           (aset cd i (double (aget tmp-floats i))))
         C))))
 
+(defn- stage-operand!
+  "Copy host array `arr` (double[]/float[]) of `nel` elements into cached shared memory for
+  [kernel-name k], converting to f16 when `half?`. Returns the MemorySegment."
+  ^MemorySegment [^String kernel-name k arr nel half? esize]
+  (let [nel (long nel) esize (long esize)]
+   (if half?
+    (let [shorts (ensure-arr kernel-name (keyword (str (name k) "-sh")) nel)
+          seg (ensure-seg kernel-name k (* nel 2))]
+      (if (instance? (Class/forName "[F") arr)
+        (let [^floats af arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (aget af i))))))
+        (let [^doubles ad arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (float (aget ad i))))))))
+      (MemorySegment/copy (MemorySegment/ofArray shorts) 0 seg 0 (* nel 2))
+      seg)
+    (let [seg (ensure-seg kernel-name k (* nel esize))]
+      (MemorySegment/copy (MemorySegment/ofArray arr) 0 seg 0 (* nel esize))
+      seg))))
+
+(defn- readback-operand!
+  "Copy `nel` elements from shared segment `seg` back into host array `out`, converting from
+  f16 when `half?`."
+  [^MemorySegment seg out nel half? esize]
+  (let [nel (long nel) esize (long esize)]
+   (if half?
+    (if (instance? (Class/forName "[F") out)
+      (let [^floats of out] (dotimes [i nel] (aset of i (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))
+      (let [^doubles od out] (dotimes [i nel] (aset od i (double (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))))
+    (MemorySegment/copy seg 0 (MemorySegment/ofArray out) 0 (* nel esize)))
+  out))
+
+(defn invoke-registered-contraction!
+  "Pipeline-friendly tensor contraction: launch a routed contraction kernel (the descriptor
+  from contract-route/route-contraction) over host arrays or DeviceBuffers with a 2D grid.
+  This is the resident/host-staging analog of invoke-registered-kernel for the 2-operand
+  contraction shape C[m×n] = Σ_k A[m×k]·B[k×n]. The routing brain already chose DPAS-vs-
+  regtiled and the dtype; this just stages + launches.
+
+  inputs      : [A B] host arrays (double[]/float[]) or DeviceBuffers, in :array-params order
+  out         : host array or DeviceBuffer for C[m×n]
+  dtype       : element type (:half converts operands to f16 for the DPAS/XMX leaf)
+  [m n k]     : dims
+  wg          : [x y] workgroup (DPAS [256 1]; regtiled [nt-col nt-row])
+  grid        : [gx gy] group counts
+  n-scalar-dims: # trailing int dim params the kernel takes (DPAS=3 → [m n k]; regtiled=0)"
+  [^String kernel-name inputs out dtype [m n k] wg grid n-scalar-dims]
+  (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
+        m (long m) n (long n) k (long k)
+        half? (boolean (#{:half :float16} dtype))
+        esize (long (get dtype-byte-sizes dtype 8))
+        in-elems [(* m k) (* k n)]
+        dev-inputs (mapv (fn [arr idx nel]
+                           (if (device-buffer? arr)
+                             (:segment ^DeviceBuffer arr)
+                             (stage-operand! kernel-name (keyword (str "c-in-" idx)) arr nel half? esize)))
+                         inputs (range) in-elems)
+        out-elems (* m n)
+        out-buffer? (device-buffer? out)
+        out-seg (if out-buffer? (:segment ^DeviceBuffer out)
+                    (ensure-seg kernel-name :c-out (* out-elems (if half? 2 esize))))
+        scalar-args (case (long n-scalar-dims)
+                      3 [{:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
+                      0 [])
+        all-args (vec (concat dev-inputs [out-seg] scalar-args))
+        [gx gy] grid]
+    (launch-2d! kernel-handle wg [gx gy] all-args)
+    (when-not out-buffer?
+      (readback-operand! out-seg out out-elems half? esize))
+    out))
+
 (defn invoke-gpu-transpose!
   "Transpose matrix on GPU via registered kernel. Zero CPU↔GPU copies.
   in-buf: DeviceBuffer [rows x cols] row-major
