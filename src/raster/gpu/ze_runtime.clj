@@ -961,7 +961,10 @@
         (aset out i (double (.get seg ValueLayout/JAVA_INT (long (* i 4))))))
       :long
       (dotimes [i n]
-        (aset out i (double (.get seg ValueLayout/JAVA_LONG (long (* i 8)))))))
+        (aset out i (double (.get seg ValueLayout/JAVA_LONG (long (* i 8))))))
+      (:byte :int8)
+      (dotimes [i n]
+        (aset out i (double (.get seg ValueLayout/JAVA_BYTE (long i))))))
     out))
 
 (defn copy-doubles-to-fp16!
@@ -2254,8 +2257,8 @@
 (def ^:private transpose-cache (atom {}))
 
 (defn- ensure-transpose-kernel!
-  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float). Returns
-   {:module :kernel :kernel-name}."
+  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float | :byte). Generic
+   on element width via opencl-type-map (:byte → char). Returns {:module :kernel :kernel-name}."
   [dtype]
   (ensure-init!)
   (or (get @transpose-cache dtype)
@@ -2275,7 +2278,11 @@
 (defn bind-registered-transpose!
   "Bind a 2D transpose kernel (in[rows,cols] → out[cols,rows], row-major) over RESIDENT buffers
   for recording — used to realize dgemm-nt!/-tn! by transposing an operand before the :nn XMX
-  GEMM. dtype :half (default) | :float. Returns a bound {:kernel :gc-seg} map."
+  GEMM, and to prepare an int8 :nt operand for the dp4a peak leaf (B3-insert). dtype :half
+  (default) | :float | :byte (int8). The kernel transposes at ELEMENT granularity for its dtype:
+  for int8 operands it MUST be bound :byte — transposing at :int (packed int32) granularity
+  would permute packed words and scramble dp4a's K-packing (silent garbage). Returns a bound
+  {:kernel :gc-seg} map."
   ([in out rows cols] (bind-registered-transpose! in out rows cols :half))
   ([in out rows cols dtype]
    (let [{:keys [module kernel-name]} (ensure-transpose-kernel! dtype)
