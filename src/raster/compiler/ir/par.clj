@@ -328,6 +328,12 @@
     (and (seq? form) (= 'raster.par/reduce (first form)))
     (expand-par-forms (expand-par-reduce form))
 
+    ;; contract = an annotated redomap; the CPU/correctness fallback is its macro expansion
+    ;; (a sequential dotimes over the free space of a per-tuple reduce over the contract axis).
+    ;; Delegating to macroexpand-1 keeps ONE source of truth (the raster.par/contract macro).
+    (and (seq? form) (= 'raster.par/contract (first form)))
+    (expand-par-forms (macroexpand-1 form))
+
     (and (seq? form) (= 'raster.par/scan (first form)))
     (expand-par-forms (expand-par-scan form))
 
@@ -378,6 +384,7 @@
        (contains? #{'raster.par/pmap 'par/pmap
                     'raster.par/map! 'par/map!
                     'raster.par/map2! 'par/map2!
+                    'raster.par/contract 'par/contract
                     'raster.par/reduce 'par/reduce
                     'raster.par/reduce-into 'par/reduce-into
                     'raster.par/scan 'par/scan

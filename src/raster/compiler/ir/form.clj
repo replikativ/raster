@@ -86,7 +86,10 @@
              (some? (namespace head))
              (.startsWith ^String (namespace head) "raster.par"))
         (let [n (name head)
-              mutating? (.endsWith n "!")]
+              ;; `contract` writes+returns its `out` buffer (arg 0) even though it does not
+              ;; end in `!` — it is redomap-shaped (an annotated fused map+reduce into out),
+              ;; so its return type is arg 0 like the mutating `*!` forms, not arg 1.
+              mutating? (or (.endsWith n "!") (= n "contract"))]
           {:kind :par :introduces-scope? true :liftable? false :head head
            :return-type-arg (if mutating? 0 1)})
 

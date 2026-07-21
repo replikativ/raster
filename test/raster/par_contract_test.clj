@@ -94,3 +94,24 @@
       (let [relu (par/map [idx (* m n)] (Math/max 0.0 (aget C idx)))
             gemm (ref-matmul-nn A B m k n)]
         (is (= (vec relu) (mapv #(Math/max 0.0 (double %)) (vec gemm))))))))
+
+;; ── A0: par/contract registered as a first-class par form ──────────────────────────
+(deftest a0-contract-is-a-par-form
+  (require '[raster.compiler.ir.par :as irpar] '[raster.compiler.ir.form :as form])
+  (let [cform '(raster.par/contract C [[i 4] [j 3]] [[l 2]]
+                 (clojure.core/* (clojure.core/aget A (clojure.core/+ (clojure.core/* i 2) l))
+                                 (clojure.core/aget B (clojure.core/+ (clojure.core/* l 3) j))))
+        par-form? (resolve 'raster.compiler.ir.par/par-form?)
+        expand (resolve 'raster.compiler.ir.par/expand-par-forms)
+        form-info (resolve 'raster.compiler.ir.form/form-info)]
+    (testing "recognized as a par form (qualified + alias)"
+      (is (par-form? cform))
+      (is (par-form? '(par/contract C [[i 4]] [[l 2]] x))))
+    (testing "form-info returns arg 0 (out) — redomap-shaped, not arg 1 (free-axes)"
+      (is (= 0 (:return-type-arg (form-info cform))))
+      (is (= :par (:kind (form-info cform)))))
+    (testing "expand-par-forms (CPU fallback) computes the matmul"
+      (let [A (double-array [1 2 3 4 5 6 7 8]) B (double-array [1 2 3 4 5 6]) C (double-array 12)
+            f (eval (list 'fn '[A B C] (expand cform)))]
+        (f A B C)
+        (is (= (vec C) (mapv double [9 12 15 19 26 33 29 40 51 39 54 69])))))))
