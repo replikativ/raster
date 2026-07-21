@@ -165,11 +165,10 @@
   [out free-axes contract-axes body & {:keys [init combine] :or {init 0.0 combine '+}}]
   (assert (and (vector? free-axes) (pos? (count free-axes)))
           "par/contract: free-axes must be a non-empty vector of [idx bound]")
-  (assert (and (vector? contract-axes) (= 1 (count contract-axes)))
-          "par/contract: prototype supports exactly one contracted axis")
+  (assert (and (vector? contract-axes) (<= (count contract-axes) 1))
+          "par/contract: 0 contract axes (outer product/map) or exactly 1 (prototype; n≥2 via flattening is A1c)")
   (let [free-syms   (mapv first free-axes)
         int-bounds  (mapv (fn [[_ b]] `(int ~b)) free-axes)
-        [k-sym k-bound] (first contract-axes)
         f-sym   (gensym "f__")
         out-sym (gensym "out__")
         F-sym   (gensym "F__")
@@ -186,16 +185,24 @@
                                       (clojure.core/quot ~f-sym ~(suffix p))
                                       ~(nth int-bounds p))])
                              (range nfree) free-syms))]
-    `(let [~out-sym ~out
-           ~F-sym   ~F-expr]
-       (dotimes [~f-sym ~F-sym]
-         (let [~@decomp]
-           (clojure.core/aset ~out-sym ~f-sym
-                              (loop [~k-sym 0 ~acc-sym ~init]
-                                (if (clojure.core/< ~k-sym (int ~k-bound))
-                                  (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~body))
-                                  ~acc-sym)))))
-       ~out-sym)))
+    (if (empty? contract-axes)
+      ;; 0 contract axes → pure map (outer product / broadcast): out[f] = body.
+      `(let [~out-sym ~out ~F-sym ~F-expr]
+         (dotimes [~f-sym ~F-sym]
+           (let [~@decomp]
+             (clojure.core/aset ~out-sym ~f-sym ~body)))
+         ~out-sym)
+      ;; 1 contract axis → contraction: reduce `body` over the contracted axis.
+      (let [[k-sym k-bound] (first contract-axes)]
+        `(let [~out-sym ~out ~F-sym ~F-expr]
+           (dotimes [~f-sym ~F-sym]
+             (let [~@decomp]
+               (clojure.core/aset ~out-sym ~f-sym
+                                  (loop [~k-sym 0 ~acc-sym ~init]
+                                    (if (clojure.core/< ~k-sym (int ~k-bound))
+                                      (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~body))
+                                      ~acc-sym)))))
+           ~out-sym)))))
 
 (defmacro scan
   "Parallel prefix scan (inclusive). When compiled (eval'd), expands to

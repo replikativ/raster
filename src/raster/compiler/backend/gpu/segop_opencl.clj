@@ -387,6 +387,50 @@
      :dtype dtype
      :c-op c-op}))
 
+(defn generate-segmap-nd-kernel
+  "N-D pure map → OpenCL: an OUTER PRODUCT / broadcast / elementwise contraction with ZERO
+   contract axes. One work-item per output element; decompose the flat index into the free
+   indices (row-major, outer→inner) and write out[seg] = body. This is the empty-reduce
+   projection of a contraction — the SegMap counterpart of generate-segmented-reduce-kernel.
+   The SegMap's space dims are ALL free/output axes (no reduced dim). Trailing `int _nseg`
+   count param (matches the generic emitter convention)."
+  [segmap out-sym & {:keys [dtype] :or {dtype :double}}]
+  (let [dims (segop/seg-space-dims (:space segmap))   ; all free (no reduced dim)
+        dtype (or (:dtype segmap) dtype)
+        ctype (get codegen/opencl-type-map dtype "double")
+        body (ce/normalize-array-prims (:lambda segmap))
+        arr-params (vec (sort-by name (:inputs segmap)))
+        arr-sym-set (set (map #(symbol (name %)) arr-params))
+        kernel-name (str "segmap_nd_" (gensym ""))
+        bound-c (fn [b] (cond (symbol? b) (ce/c-symbol b)
+                              (number? b) (str b)
+                              :else (throw (ex-info "segmap-nd: bound must be symbol or int" {:bound b}))))
+        dim-cs (mapv (fn [d] (bound-c (:bound d))) dims)
+        decomp (str/join "\n"
+                         (map-indexed
+                          (fn [p d]
+                            (let [after (drop (inc p) dim-cs)
+                                  rhs (if (seq after)
+                                        (str "(seg / (" (str/join " * " after) ")) % " (bound-c (:bound d)))
+                                        (str "seg % " (bound-c (:bound d))))]
+                              (str "    int " (ce/c-symbol (:name d)) " = " rhs ";")))
+                          dims))
+        int-vars (into #{} (map #(symbol (name (:name %)))) dims)
+        dummy (gensym "z__")
+        body-str (binding [ce/*emit-config* ce/opencl-config
+                           ce/*scalar-type* ctype
+                           ce/*int-vars* (into ce/*int-vars* int-vars)]
+                   (ce/emit-expr (ce/adapt-casts-for-dtype body dtype) dummy arr-sym-set))
+        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        src (str (codegen/extension-pragmas dtype)
+                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out, int _nseg) {\n"
+                 "    int seg = get_global_id(0);\n"
+                 "    if (seg >= _nseg) return;\n"
+                 decomp "\n"
+                 "    out[seg] = " body-str ";\n"
+                 "}\n")]
+    {:kernel-name kernel-name :source src :array-params arr-params :dtype dtype}))
+
 ;; ================================================================
 ;; Block-tiled + __local-staged contraction (BlkRegTiling, block-tile level)
 ;; ================================================================

@@ -101,3 +101,59 @@
     (is (= :regtiled (:strategy (route/route-contraction (matmul-form 128 128 128) :dtype :double))))
     (is (route/par-contract-form? (matmul-form 8 8 8)))
     (is (not (route/par-contract-form? '(raster.par/map! a i 8 body))))))
+
+;; ── A1a: 0-contract (outer product → SegMap) + n-free (batch → naive segred) ──────────
+(defn- launch-1d-routed
+  "Launch a routed 1-D contraction (segmap / naive-segred) with a trailing nseg count."
+  [r bufs out-buf nseg]
+  (let [ze (find-ns 'raster.gpu.ze-runtime)
+        register! (ns-resolve ze 'register-kernel!)
+        ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
+        launch-2d! (ns-resolve ze 'launch-2d!)
+        buf->doubles (ns-resolve ze 'buffer->double-array)
+        _ (register! (:kernel-name r) {:source (:source r) :dtype (:dtype r)})
+        {:keys [kernel-handle]} (ensure-loaded! (:kernel-name r))
+        args (into (mapv #(:segment (get bufs %)) (:array-params r))
+                   [(:segment out-buf) {:type :int :value (int nseg)}])]
+    (launch-2d! kernel-handle (:wg r) (:grid r) args)
+    (vec (buf->doubles out-buf))))
+
+(defn- mk-f64 [xs] (let [ze (find-ns 'raster.gpu.ze-runtime)
+                         mk (ns-resolve ze 'make-buffer) a->b (ns-resolve ze 'array->buffer!)]
+                     (a->b (mk (count xs) :double) (double-array (map double xs)))))
+(defn- out-f64 [n] ((ns-resolve (find-ns 'raster.gpu.ze-runtime) 'make-buffer) n :double))
+
+(deftest a1a-zero-contract-routes-to-segmap-outer-product
+  (if-not @gpu?
+    (println "[skip] a1a-segmap: no GPU")
+    (testing "0 contract axes → :segmap; C[i,j]=a[i]·b[j] == reference on device"
+      (let [a [1 2 3 4] b [10 20 30]
+            form (list 'raster.par/contract 'C [['i 4] ['j 3]] []
+                       (list '* (list 'aget 'a 'i) (list 'aget 'b 'j)))
+            r (route/route-contraction form :dtype :double)
+            gpu (launch-1d-routed r {'a (mk-f64 a) 'b (mk-f64 b)} (out-f64 12) 12)
+            cpu (vec (for [i (range 4) j (range 3)] (double (* (nth a i) (nth b j)))))]
+        (is (= :segmap (:strategy r)))
+        (is (= gpu cpu))))))
+
+(deftest a1a-n-free-routes-to-naive-segred
+  (if-not @gpu?
+    (println "[skip] a1a-naive-segred: no GPU")
+    (testing "3 free + 1 contract (batch matmul) → :naive-segred; == reference on device"
+      (let [B 2 M 4 N 3 K 5
+            Ad (double-array (map #(* 0.1 (double %)) (range (* B M K))))
+            Bd (double-array (map #(* 0.2 (double %)) (range (* B K N))))
+            form (list 'raster.par/contract 'C [['bb B] ['i M] ['j N]] [['l K]]
+                       (list '* (list 'aget 'A (list '+ (list '* (list '+ (list '* 'bb M) 'i) K) 'l))
+                             (list 'aget 'B (list '+ (list '* (list '+ (list '* 'bb K) 'l) N) 'j))))
+            r (route/route-contraction form :dtype :double)
+            ze (find-ns 'raster.gpu.ze-runtime)
+            abuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* B M K) :double) Ad)
+            bbuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* B K N) :double) Bd)
+            gpu (launch-1d-routed r {'A abuf 'B bbuf} (out-f64 (* B M N)) (* B M N))
+            cpu (vec (for [bb (range B) i (range M) j (range N)]
+                       (reduce + (for [l (range K)]
+                                   (* (aget Ad (+ (* (+ (* bb M) i) K) l))
+                                      (aget Bd (+ (* (+ (* bb K) l) N) j)))))))]
+        (is (= :naive-segred (:strategy r)))
+        (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))

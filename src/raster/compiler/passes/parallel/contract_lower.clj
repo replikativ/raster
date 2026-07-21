@@ -27,7 +27,7 @@
         _ (assert (and (vector? free-axes) (pos? (count free-axes)))
                   "contract-lower: free-axes must be a non-empty vector")
         _ (assert (and (vector? contract-axes) (= 1 (count contract-axes)))
-                  "contract-lower: prototype supports exactly one contracted axis")
+                  "contract-lower: contract-form->segred needs exactly 1 contract axis (0 → contract-form->segmap; n≥2 → flatten, A1c)")
         _ (assert (symbol? out) "contract-lower: out must be a symbol")
         [k-sym k-bound] (first contract-axes)
         free-dims (mapv (fn [[s b]] {:name s :bound b}) free-axes)
@@ -53,3 +53,32 @@
                     grid
                     :segmented
                     dtype)))
+
+(defn contract-form->segmap
+  "Parse a 0-CONTRACT `(raster.par/contract out [[i mi] …] [] body)` form → a SegMap (a pure
+   N-D map = outer product / broadcast / elementwise). The free axes ARE the map/output space
+   (row-major, outer→inner); `body` is the map element. This is the empty-reduce projection of
+   the same contraction node (Futhark: a Map is a Screma with an empty reduce list; Dex: an
+   outer product is a `for` with no accumulator)."
+  [form & {:keys [id dtype grid] :or {id 0 dtype :double grid nil}}]
+  (let [[_ out free-axes contract-axes body] form
+        _ (assert (and (vector? free-axes) (pos? (count free-axes)))
+                  "contract-lower: free-axes must be a non-empty vector")
+        _ (assert (empty? contract-axes)
+                  "contract-form->segmap: expects ZERO contract axes (use contract-form->segred otherwise)")
+        _ (assert (symbol? out) "contract-lower: out must be a symbol")
+        free-dims (mapv (fn [[s b]] {:name s :bound b}) free-axes)
+        space (segop/make-seg-space-nd free-dims)
+        arrays (set (ir-par/collect-aget-arrays body))
+        inputs (disj arrays out)
+        bound-syms (into #{} (filter symbol?) (mapv second free-axes))]
+    (segop/->SegMap id space
+                    (segop/->SegLevel :thread :virtual)
+                    body                ; map lambda = the element expression
+                    inputs
+                    #{out}
+                    (set/difference bound-syms arrays #{out})
+                    grid
+                    dtype
+                    out
+                    nil)))

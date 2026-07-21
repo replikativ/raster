@@ -23,13 +23,48 @@
 
 (defn- ceil-div [a b] (long (Math/ceil (/ (double a) (double b)))))
 
+(declare route-2free-1contract)
+
 (defn route-contraction
   "Route a contraction form to the hardware-optimal kernel via the DPAS legality gate.
    dtype selects the element type of the intended kernel (:half tries DPAS; anything else,
    or a gate rejection, falls back to the register-tiled portable kernel at that dtype)."
   [contract-form & {:keys [dtype] :or {dtype :half}}]
   (let [out-sym (second contract-form)
-        sr (cl/contract-form->segred contract-form :dtype dtype)
+        free-axes (nth contract-form 2)
+        contract-axes (nth contract-form 3)
+        n-free (count free-axes)
+        n-contract (count contract-axes)
+        nseg (reduce * 1 (map second free-axes))]   ; product of free bounds (literal dims)
+    (cond
+      ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
+      (zero? n-contract)
+      (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
+            {:keys [kernel-name source array-params]} (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
+        {:strategy :segmap
+         :kernel-name kernel-name :source source :array-params array-params
+         :dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+         :scalar-args [{:type :int :value (int nseg)}] :dims [nseg]})
+
+      ;; n free + 1 contract, n≠2 → naive segmented reduce (device-proven; handles n free) (1-D)
+      (and (= 1 n-contract) (not= 2 n-free))
+      (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+            {:keys [kernel-name source array-params]} (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)]
+        {:strategy :naive-segred
+         :kernel-name kernel-name :source source :array-params array-params
+         :dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+         :scalar-args [{:type :int :value (int nseg)}] :dims [nseg]})
+
+      (> n-contract 1)
+      (throw (ex-info "route-contraction: n≥2 contract axes not yet supported (A1c — flatten)"
+                      {:n-contract n-contract}))
+
+      ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled)
+      :else
+      (route-2free-1contract contract-form out-sym dtype))))
+
+(defn- route-2free-1contract [contract-form out-sym dtype]
+  (let [sr (cl/contract-form->segred contract-form :dtype dtype)
         dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype)]
     (if (:tensorized dpas)
       (let [[M N _L] (:dims dpas)]
