@@ -697,41 +697,61 @@
 ;; ================================================================
 
 (defn generate-quant-contraction-kernel
-  "QUANT (int8) contraction → OpenCL. The SAME SegRed skeleton as the f16/f64 ladder, but
-   with the facets a quantized matmul adds:
-     • WIDENING accumulate — int8 operands, int32 accumulator (int8's key op is widening,
-       not same-width: char×char must not accumulate in char);
-     • a dequant EPILOGUE — out = scale · acc (per-tensor scale; f32 output).
-   This demonstrates that quantized matmul is the SAME contraction abstraction with different
-   (operand-dtype, accumulate-dtype, output-dtype, epilogue) facets — nothing structurally new.
-   The dp4a / int8-DPAS packed dot is the tensorize LEAF (the perf layer, analogous to f16's
-   DPAS); this is the NAIVE correctness substrate (one work-item/output). Canonical row-major
-   orientation only, validated by reusing analyze-contraction + the DPAS gate's orientation
-   check. NOTE: int8/int32 are not yet in the opencl dtype facet map (float-centric); the C
-   types are explicit here — adding those facets is part of the real quant generalization."
-  [segred out-sym & {:keys [scale] :or {scale 1.0}}]
-  (let [{:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
-        (analyze-contraction segred :int8)
+  "QUANT contraction → OpenCL. The SAME SegRed skeleton as the f16/f64 ladder — nothing
+   structurally new — carrying the facets a quantized matmul adds:
+     • WIDENING accumulate — int8 operands, int32 accumulator (int8's key op is widening, not
+       same-width: char×char must not accumulate in char);
+     • a DECODE SCHEME on the operands + a dequant EPILOGUE.
+
+   TYPES ARE GENERIC, not quant-specific: the operand dtype is :byte (=int8, `int8_t`), the
+   accumulate dtype :int (=int32), the output :float — all pulled from the ONE dtype facet
+   map (dtype-info), so widening is just a dtype PAIR, not a special type. What IS quant-
+   specific is the `scheme` — a DECODE descriptor (scale, per-operand zero-point; extensible
+   to block-size / q4 packing) that is NOT a native dtype (q8_0/q4_k have no C type; they
+   decode to int + scale). It generates the operand decode + the dequant epilogue:
+       out = scale · Σ_l (A[i,l] − a-zp)·(B[l,j] − b-zp)
+   (symmetric per-tensor int8 ⇒ zero-points 0). This decode scheme IS the operand load-lambda
+   — the same slot the register-tiled path can fuse (the fusion frontier). The dp4a / int8-
+   DPAS packed dot is the tensorize LEAF (perf layer, analogous to f16's DPAS); this is the
+   NAIVE correctness substrate. Canonical row-major orientation only (reuses analyze-
+   contraction + the DPAS gate's orientation check).
+
+   scheme: {:scale s (default 1.0), :a-zp z (0), :b-zp z (0)}."
+  [segred out-sym & {:keys [scheme] :or {scheme {}}}]
+  (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
+        {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
+        (analyze-contraction segred :byte)
         _ (assert (canonical-rowmajor? row-idx i-sym L l-sym)
                   "quant: row operand must be [M,L] row-major (A[i,l]=i·L+l)")
         _ (assert (canonical-rowmajor? col-idx l-sym N j-sym)
                   "quant: col operand must be [L,N] row-major (B[l,j]=l·N+j)")
+        ;; C types from the ONE dtype facet map — generic int8/int32/float, not quant types.
+        op-ctype  (get codegen/opencl-type-map :byte)   ; int8 storage (int8_t; signed)
+        acc-ctype (get codegen/opencl-type-map :int)    ; int32 widening accumulate
+        out-ctype (get codegen/opencl-type-map :float)  ; dequant output
         A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
+        ;; per-operand decode = widen to acc dtype, then subtract zero-point (the load-lambda)
+        decode (fn [arr idx zp]
+                 (let [w (str "(" acc-ctype ")" arr "[" idx "]")]
+                   (if (zero? zp) w (str "(" w " - " zp ")"))))
+        a-term (decode A (str "i * " L " + l") a-zp)
+        b-term (decode B (str "l * " N " + j") b-zp)
         kernel-name (str "quant_contract_" (gensym ""))
-        src (str "__kernel void " kernel-name "(__global const char* restrict " A
-                 ", __global const char* restrict " B
-                 ", __global float* restrict out, float scale, int _nseg) {\n"
+        src (str "__kernel void " kernel-name "(__global const " op-ctype "* restrict " A
+                 ", __global const " op-ctype "* restrict " B
+                 ", __global " out-ctype "* restrict out, " out-ctype " scale, int _nseg) {\n"
                  "    int seg = get_global_id(0);\n"
                  "    if (seg >= _nseg) return;\n"
                  "    int i = (seg / " N ") % " M ";\n"
                  "    int j = seg % " N ";\n"
-                 "    int acc = 0;\n"                      ; WIDENING: int32 accumulator
+                 "    " acc-ctype " acc = 0;\n"              ; WIDENING: int32 accumulator
                  "    for (int l = 0; l < " L "; l++) {\n"
-                 "        acc += (int)" A "[i * " L " + l] * (int)" B "[l * " N " + j];\n"
+                 "        acc += " a-term " * " b-term ";\n" ; decode + widening MAC
                  "    }\n"
-                 "    out[seg] = scale * (float)acc;\n"    ; dequant epilogue
+                 "    out[seg] = scale * (" out-ctype ")acc;\n"   ; dequant epilogue
                  "}\n")]
     {:kernel-name kernel-name :source src
      :array-params [row-arr col-arr]
-     :dtype :int8 :acc-dtype :int32 :out-dtype :float
-     :scale scale :dims [M N L]}))
+     :dtype :byte :acc-dtype :int :out-dtype :float
+     :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
+     :dims [M N L]}))

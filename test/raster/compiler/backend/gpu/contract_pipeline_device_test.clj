@@ -27,9 +27,14 @@
 
 (defn- compile+run
   "Run a matmul par/contract form through opencl-pass at `dt`, register the emitted kernel,
-   compile the marker to a fn, launch on device, return {:head :max-abs-diff}."
+   compile the marker to a fn, launch on device, return {:head :max-abs-diff}.
+   Uses :compile-spirv? false → the kernel is compiled at RUNTIME by the Level Zero driver
+   (via register-kernel! :source → ensure-kernel-loaded!). NB: the offline ocloc path
+   (:compile-spirv? true) cannot compile the DPAS intel_sub_group_2d_block_* intrinsics —
+   a pre-existing ocloc/AOT limitation for the tensorized leaf, tracked separately; the
+   driver path used here is the runtime path production takes for these kernels."
   [dt m k n]
-  (let [{:keys [form kernels]} (ocl/opencl-pass (matmul-form m n k) :dtype dt :compile-spirv? true)
+  (let [{:keys [form kernels]} (ocl/opencl-pass (matmul-form m n k) :dtype dt :compile-spirv? false)
         _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype])))
         f (eval (list 'fn '[A B C] form))
         A (double-array (map #(* 0.1 (- (double (mod % 7)) 3.0)) (range (* m k))))
