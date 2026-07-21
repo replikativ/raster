@@ -106,7 +106,42 @@
                 0
                 (range (count labels)))))
 
+;; ================================================================
+;; einsum → contract  (B1: the bridge from the general einsum surface to the
+;; SOAC contraction path — free = output labels, contract = summed labels)
+;; ================================================================
+
+(defn einsum->contract-form
+  "Lower a 2-operand einsum to a `(raster.par/contract out free-axes contract-axes body)` form,
+   the bridge from the general einsum surface to the contraction path (B1). free-axes = the
+   OUTPUT labels (in output order → the row-major write gives the right layout, A3); contract-
+   axes = labels that appear in the inputs but not the output (summed); body = the product of
+   the two operand agets, each indexed by its strided affine index expression. `dim-map` maps
+   each label → its extent; `out-sym` / `in-syms` name the output + the two input arrays in the
+   emitted form. Routing the result through `contract-route/route-contraction` sends it to the
+   peak leaves (DPAS/dp4a) or the portable fallback. n-operand einsum decomposes to a sequence
+   of these pairwise steps (B2)."
+  [subscript dim-map out-sym in-syms]
+  (let [{:keys [inputs output]} (parse-subscript subscript)
+        _ (assert (= 2 (count inputs))
+                  "einsum->contract-form: exactly 2 operands (pairwise; n-operand path = B2)")
+        all-labels (distinct (mapcat identity inputs))
+        contract-labels (vec (remove (set output) all-labels))
+        lsym (fn [l] (symbol (name l)))
+        axis (fn [l] [(lsym l) (dim-map l)])
+        idx-expr (fn [labels]
+                   (let [strides (compute-strides labels dim-map)
+                         terms (map (fn [l s] (if (= 1 (long s)) (lsym l) (list '* (lsym l) s)))
+                                    labels strides)]
+                     (cond (empty? terms) 0
+                           (= 1 (count terms)) (first terms)
+                           :else (cons '+ terms))))
+        body (list '* (list 'aget (nth in-syms 0) (idx-expr (nth inputs 0)))
+                   (list 'aget (nth in-syms 1) (idx-expr (nth inputs 1))))]
+    (list 'raster.par/contract out-sym (mapv axis output) (mapv axis contract-labels) body)))
+
 (defn einsum
+
   "Einstein summation on tensors.
 
   subscript: String like \"ij,jk->ik\" (explicit output) or \"ij,ji\" (implicit).
