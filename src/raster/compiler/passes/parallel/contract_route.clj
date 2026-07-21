@@ -23,13 +23,15 @@
 
 (defn- ceil-div [a b] (long (Math/ceil (/ (double a) (double b)))))
 
-(declare route-2free-1contract)
+(declare route-2free-1contract route-quant)
 
 (defn route-contraction
   "Route a contraction form to the hardware-optimal kernel via the DPAS legality gate.
-   dtype selects the element type of the intended kernel (:half tries DPAS; anything else,
-   or a gate rejection, falls back to the register-tiled portable kernel at that dtype)."
-  [contract-form & {:keys [dtype] :or {dtype :half}}]
+   dtype selects the element type of the intended kernel (:half tries DPAS; :byte/:int8 tries
+   the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
+   anything else, or a gate rejection, falls back to the register-tiled portable kernel).
+   scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
+  [contract-form & {:keys [dtype scheme] :or {dtype :half scheme {:scale 1.0}}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
         contract-axes (nth contract-form 3)
@@ -37,6 +39,10 @@
         n-contract (count contract-axes)
         nseg (reduce * 1 (map second free-axes))]   ; product of free bounds (literal dims)
     (cond
+      ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
+      (#{:byte :int8} dtype)
+      (route-quant contract-form out-sym scheme n-free n-contract nseg)
+
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
@@ -88,3 +94,35 @@
          :grid [(ceil-div N bn) (ceil-div M bm)]
          :scalar-args []                             ; regtiled bakes dims → no scalar params
          :dims (:dims rt)}))))
+
+(defn- quant-descriptor
+  "A launch descriptor for an int8 quant leaf (dp4a or quant-naive). Both are 1-D kernels with
+   signature (…arrays…, out(f32), float scale, int _nseg): int8 operands in, dequantized f32 out."
+  [strategy k out-dtype scale nseg]
+  {:strategy strategy
+   :kernel-name (:kernel-name k) :source (:source k)
+   :array-params (:array-params k)          ; [row col] binding order (dp4a) / sorted (quant)
+   :dtype :byte :out-dtype out-dtype
+   :scheme (:scheme k)
+   :wg [256 1] :grid [(ceil-div nseg 256) 1]
+   :scalar-args [{:type :float :value (float scale)} {:type :int :value (int nseg)}]
+   :dims (:dims k)})
+
+(defn- route-quant
+  "Route an int8 (:byte) contraction. 2-free/1-contract: try the dp4a peak leaf (requires the
+   :nt operand layout — B stored [N,K], K-contiguous, K%4==0); if that orientation isn't met,
+   fall to the quant naive-widening kernel (:nn). The emitters ASSERT their own layout
+   requirements, so a thrown AssertionError is the (clean) 'not this leaf' signal — dp4a and
+   quant-naive are complementary (:nt vs :nn). Non-2-free / multi-contract int8 is deferred."
+  [contract-form out-sym scheme n-free n-contract nseg]
+  (let [scale (get scheme :scale 1.0)]
+    (if (and (= 2 n-free) (= 1 n-contract))
+      (let [sr (cl/contract-form->segred contract-form :dtype :byte)
+            dp4a (try (sco/generate-dp4a-contraction-kernel sr out-sym :scheme scheme)
+                      (catch AssertionError _ nil))]
+        (if dp4a
+          (quant-descriptor :dp4a dp4a :float scale nseg)          ; :nt → peak int8 leaf
+          (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
+            (quant-descriptor :quant-naive q :float scale nseg))))  ; :nn → naive widening
+      (throw (ex-info "route-quant: int8 supported for 2 free + 1 contract axes (C1 first cut)"
+                      {:n-free n-free :n-contract n-contract})))))

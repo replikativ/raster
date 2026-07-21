@@ -200,3 +200,49 @@
             cpu (vec (for [kk (range N) ii (range M)]
                        (reduce + (for [jj (range K)] (* (aget Ad (+ (* ii K) jj)) (aget Bd (+ (* jj N) kk)))))))]
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
+
+;; ── C1-nt: int8 routes to the quant leaves (dp4a for :nt, quant-naive for :nn) ─────────
+(defn- launch-int8-routed [r bufs]
+  (let [ze (find-ns 'raster.gpu.ze-runtime)
+        [gx gy] (:grid r)
+        m*n (reduce * (:dims r))
+        o ((ns-resolve ze 'make-buffer) m*n :float)]
+    ((ns-resolve ze 'register-kernel!) (:kernel-name r) {:source (:source r) :dtype :byte})
+    (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
+          args (into (mapv #(:segment (get bufs %)) (:array-params r))
+                     (into [(:segment o)] (:scalar-args r)))]
+      ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) [gx gy] args)
+      (vec ((ns-resolve ze 'buffer->float-array) o)))))
+
+(defn- mk-i8 [xs] (let [ze (find-ns 'raster.gpu.ze-runtime)]
+                    ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (count xs) :byte)
+                     (byte-array (map byte xs)))))
+
+(deftest c1-int8-routes-to-quant-leaves
+  (if-not @gpu?
+    (println "[skip] c1-int8-quant-routing: no GPU")
+    (let [M 4 K 8 N 4 scale 0.01
+          Ab (mapv #(byte (- (mod % 255) 127)) (range (* M K)))
+          Bv (mapv #(byte (- (mod (* 3 %) 255) 127)) (range (* N K)))  ; reused as [N,K] and [K,N]
+          Aget (fn [i] (nth Ab i)) Bget (fn [i] (nth Bv i))
+          close? (fn [xs ys] (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-4) xs ys)))]
+      (testing ":nt (B stored [N,K]) → :dp4a peak leaf; int8 matmul dequant == reference"
+        (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                         (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                               (list 'aget 'B (list '+ (list '* 'j K) 'l))))
+              r (route/route-contraction form :dtype :byte :scheme {:scale scale})
+              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)})
+              cpu (for [i (range M) j (range N)]
+                    (* scale (reduce + (for [l (range K)] (* (int (Aget (+ (* i K) l))) (int (Bget (+ (* j K) l))))))))]
+          (is (= :dp4a (:strategy r)))
+          (is (close? gpu cpu))))
+      (testing ":nn (B stored [K,N]) → :quant-naive widening leaf; == reference"
+        (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                         (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                               (list 'aget 'B (list '+ (list '* 'l N) 'j))))
+              r (route/route-contraction form :dtype :byte :scheme {:scale scale})
+              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)})
+              cpu (for [i (range M) j (range N)]
+                    (* scale (reduce + (for [l (range K)] (* (int (Aget (+ (* i K) l))) (int (Bget (+ (* l N) j))))))))]
+          (is (= :quant-naive (:strategy r)))
+          (is (close? gpu cpu)))))))
