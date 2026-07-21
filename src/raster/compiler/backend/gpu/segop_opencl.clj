@@ -10,6 +10,7 @@
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.ir.segop :as segop]
             [clojure.string :as str]))
 
@@ -753,5 +754,57 @@
     {:kernel-name kernel-name :source src
      :array-params [row-arr col-arr]
      :dtype :byte :acc-dtype :int :out-dtype :float
+     :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
+     :dims [M N L]}))
+
+(defn generate-dp4a-contraction-kernel
+  "DP4A-tensorized int8 contraction → OpenCL — the int8 PEAK LEAF (analogous to f16's DPAS
+   leaf). Uses the dp4a int8×4 dot-accumulate primitive (rstr_dp4a: 4 int8 MACs into an int32
+   in one op; native dp4a is a drop-in). This is where int8 quant reaches peak, the same way
+   generate-dpas-contraction-kernel is f16's peak.
+
+   PER-LEAF LAYOUT REQUIREMENT: dp4a packs 4 int8 along the contract axis into a 32-bit word,
+   so BOTH operands must be K-contiguous. A[M,K] row-major is (A[i,l]=i·K+l, K contiguous);
+   B must therefore be [N,K] TRANSPOSED (B[j,l]=j·K+l) — the :nt orientation, DIFFERENT from
+   f16-DPAS's :nn. The required operand layout is a property of the TENSORIZE LEAF, not the
+   contraction — the gate dispatches (dtype, leaf) → layout. K must be a multiple of 4.
+
+   Operands are reinterpreted at launch as int[] (4 packed int8 per int; the USM bytes are
+   identical to the int8 buffer). Symmetric quant only for now (zero-points fold into a
+   correction term — future). scheme: {:scale s}."
+  [segred out-sym & {:keys [scheme] :or {scheme {}}}]
+  (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
+        {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
+        (analyze-contraction segred :byte)
+        _ (assert (zero? (mod L 4)) "dp4a: contract axis K must be a multiple of 4 (int8×4 packing)")
+        _ (assert (canonical-rowmajor? row-idx i-sym L l-sym)
+                  "dp4a: row operand must be [M,K] row-major (A[i,l]=i·K+l)")
+        _ (assert (canonical-rowmajor? col-idx j-sym L l-sym)
+                  "dp4a: col operand must be [N,K] TRANSPOSED (B[j,l]=j·K+l) — dp4a needs both operands K-contiguous")
+        _ (assert (and (zero? a-zp) (zero? b-zp))
+                  "dp4a leaf: symmetric quant only (zero-points fold into a correction term — future)")
+        A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
+        KP (quot L 4)                            ; packed contract length (int8×4 words)
+        acc-ctype (get codegen/opencl-type-map :int)
+        out-ctype (get codegen/opencl-type-map :float)
+        helper (:c-helper-src (intrinsics/descriptor 'dp4a))
+        kernel-name (str "dp4a_contract_" (gensym ""))
+        src (str helper
+                 "__kernel void " kernel-name "(__global const int* restrict " A
+                 ", __global const int* restrict " B
+                 ", __global " out-ctype "* restrict out, " out-ctype " scale, int _nseg) {\n"
+                 "    int seg = get_global_id(0);\n"
+                 "    if (seg >= _nseg) return;\n"
+                 "    int i = (seg / " N ") % " M ";\n"
+                 "    int j = seg % " N ";\n"
+                 "    " acc-ctype " acc = 0;\n"
+                 "    for (int p = 0; p < " KP "; p++) {\n"
+                 "        acc = rstr_dp4a(" A "[i * " KP " + p], " B "[j * " KP " + p], acc);\n"
+                 "    }\n"
+                 "    out[seg] = scale * (" out-ctype ")acc;\n"
+                 "}\n")]
+    {:kernel-name kernel-name :source src
+     :array-params [row-arr col-arr]
+     :dtype :byte :acc-dtype :int :out-dtype :float :packed :int8x4
      :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
      :dims [M N L]}))
