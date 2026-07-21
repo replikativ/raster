@@ -691,3 +691,47 @@
          :dims [M N L]
          :dtype :half
          :tensorized true}))))
+
+;; ================================================================
+;; QUANT (int8) contraction — the SAME skeleton, WIDENING facet
+;; ================================================================
+
+(defn generate-quant-contraction-kernel
+  "QUANT (int8) contraction → OpenCL. The SAME SegRed skeleton as the f16/f64 ladder, but
+   with the facets a quantized matmul adds:
+     • WIDENING accumulate — int8 operands, int32 accumulator (int8's key op is widening,
+       not same-width: char×char must not accumulate in char);
+     • a dequant EPILOGUE — out = scale · acc (per-tensor scale; f32 output).
+   This demonstrates that quantized matmul is the SAME contraction abstraction with different
+   (operand-dtype, accumulate-dtype, output-dtype, epilogue) facets — nothing structurally new.
+   The dp4a / int8-DPAS packed dot is the tensorize LEAF (the perf layer, analogous to f16's
+   DPAS); this is the NAIVE correctness substrate (one work-item/output). Canonical row-major
+   orientation only, validated by reusing analyze-contraction + the DPAS gate's orientation
+   check. NOTE: int8/int32 are not yet in the opencl dtype facet map (float-centric); the C
+   types are explicit here — adding those facets is part of the real quant generalization."
+  [segred out-sym & {:keys [scale] :or {scale 1.0}}]
+  (let [{:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
+        (analyze-contraction segred :int8)
+        _ (assert (canonical-rowmajor? row-idx i-sym L l-sym)
+                  "quant: row operand must be [M,L] row-major (A[i,l]=i·L+l)")
+        _ (assert (canonical-rowmajor? col-idx l-sym N j-sym)
+                  "quant: col operand must be [L,N] row-major (B[l,j]=l·N+j)")
+        A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
+        kernel-name (str "quant_contract_" (gensym ""))
+        src (str "__kernel void " kernel-name "(__global const char* restrict " A
+                 ", __global const char* restrict " B
+                 ", __global float* restrict out, float scale, int _nseg) {\n"
+                 "    int seg = get_global_id(0);\n"
+                 "    if (seg >= _nseg) return;\n"
+                 "    int i = (seg / " N ") % " M ";\n"
+                 "    int j = seg % " N ";\n"
+                 "    int acc = 0;\n"                      ; WIDENING: int32 accumulator
+                 "    for (int l = 0; l < " L "; l++) {\n"
+                 "        acc += (int)" A "[i * " L " + l] * (int)" B "[l * " N " + j];\n"
+                 "    }\n"
+                 "    out[seg] = scale * (float)acc;\n"    ; dequant epilogue
+                 "}\n")]
+    {:kernel-name kernel-name :source src
+     :array-params [row-arr col-arr]
+     :dtype :int8 :acc-dtype :int32 :out-dtype :float
+     :scale scale :dims [M N L]}))
