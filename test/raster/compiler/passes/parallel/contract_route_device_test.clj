@@ -157,3 +157,24 @@
                                       (aget Bd (+ (* (+ (* bb K) l) N) j)))))))]
         (is (= :naive-segred (:strategy r)))
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
+
+(deftest a1c-multi-contract-flattens-and-routes-to-naive-segred
+  (if-not @gpu?
+    (println "[skip] a1c-multi-contract: no GPU")
+    (testing "2 contract axes → flattened → :naive-segred; C[i]=Σ_{l1,l2} A[i,l1,l2]·V[l1,l2] == ref"
+      (let [I 4
+            A (double-array (map #(* 0.1 (double %)) (range (* I 2 3))))
+            V (double-array (map #(* 0.5 (double %)) (range 6)))
+            form (list 'raster.par/contract 'C [['i I]] [['l1 2] ['l2 3]]
+                       (list '* (list 'aget 'A (list '+ (list '* 'i 6) (list '* 'l1 3) 'l2))
+                             (list 'aget 'V (list '+ (list '* 'l1 3) 'l2))))
+            r (route/route-contraction form :dtype :double)
+            ze (find-ns 'raster.gpu.ze-runtime)
+            abuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* I 2 3) :double) A)
+            vbuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) 6 :double) V)
+            gpu (launch-1d-routed r {'A abuf 'V vbuf} (out-f64 I) I)
+            cpu (vec (for [i (range I)]
+                       (reduce + (for [l1 (range 2) l2 (range 3)]
+                                   (* (aget A (+ (* i 6) (* l1 3) l2)) (aget V (+ (* l1 3) l2)))))))]
+        (is (= :naive-segred (:strategy r)))
+        (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))

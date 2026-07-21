@@ -165,8 +165,8 @@
   [out free-axes contract-axes body & {:keys [init combine] :or {init 0.0 combine '+}}]
   (assert (and (vector? free-axes) (pos? (count free-axes)))
           "par/contract: free-axes must be a non-empty vector of [idx bound]")
-  (assert (and (vector? contract-axes) (<= (count contract-axes) 1))
-          "par/contract: 0 contract axes (outer product/map) or exactly 1 (prototype; n≥2 via flattening is A1c)")
+  (assert (vector? contract-axes)
+          "par/contract: contract-axes must be a vector (0 → outer product/map; n≥1 → contraction, n≥2 flattened)")
   (let [free-syms   (mapv first free-axes)
         int-bounds  (mapv (fn [[_ b]] `(int ~b)) free-axes)
         f-sym   (gensym "f__")
@@ -192,15 +192,19 @@
            (let [~@decomp]
              (clojure.core/aset ~out-sym ~f-sym ~body)))
          ~out-sym)
-      ;; 1 contract axis → contraction: reduce `body` over the contracted axis.
-      (let [[k-sym k-bound] (first contract-axes)]
+      ;; n≥1 contract axes → contraction: reduce `body` over the (flattened) contracted axis.
+      ;; flatten-contract-axes collapses n≥2 axes into one flat index k-sym and substitutes
+      ;; each original contract index in the body (one source of truth with the compiler path).
+      (let [[k-sym k-bound sbody]
+            ((requiring-resolve 'raster.compiler.passes.parallel.contract-lower/flatten-contract-axes)
+             contract-axes body)]
         `(let [~out-sym ~out ~F-sym ~F-expr]
            (dotimes [~f-sym ~F-sym]
              (let [~@decomp]
                (clojure.core/aset ~out-sym ~f-sym
                                   (loop [~k-sym 0 ~acc-sym ~init]
                                     (if (clojure.core/< ~k-sym (int ~k-bound))
-                                      (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~body))
+                                      (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~sbody))
                                       ~acc-sym)))))
            ~out-sym)))))
 

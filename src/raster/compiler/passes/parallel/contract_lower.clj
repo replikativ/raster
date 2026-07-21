@@ -12,7 +12,34 @@
    `SoacReduce` fuses its map into the combine (see soac-lower/reduce-op-info)."
   (:require [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.par :as ir-par]
-            [clojure.set :as set]))
+            [clojure.set :as set]
+            [clojure.walk :as walk]))
+
+(defn flatten-contract-axes
+  "Flatten n≥1 contract axes into ONE innermost reduced dim (the A0 convention, endorsed by
+   Futhark's single-width Screma). Returns [k-sym k-bound body'] where k-sym is the single
+   flat reduced index, k-bound its extent (product of the contract bounds), and body' the
+   `body` with each original contract index li substituted by its row-major decomposition of
+   the flat index: li = (kflat / prod(bounds after i)) mod bound_i. For a single contract axis
+   this is the identity. The naive segmented emitter then loops the single k-sym unchanged."
+  [contract-axes body]
+  (if (= 1 (count contract-axes))
+    (let [[[k-sym k-bound]] contract-axes] [k-sym k-bound body])
+    (let [flat-sym (gensym "kflat__")
+          bounds   (mapv second contract-axes)
+          k-bound  (if (every? number? bounds) (reduce * bounds)
+                       (reduce (fn [a b] (list 'clojure.core/* a b)) bounds))
+          suffix   (fn [p] (let [after (subvec bounds (inc p))]
+                             (cond (empty? after) 1
+                                   (every? number? after) (reduce * after)
+                                   :else (reduce (fn [a b] (list 'clojure.core/* a b)) after))))
+          subst    (into {} (map-indexed
+                             (fn [p [s _]]
+                               [s (list 'clojure.core/rem
+                                        (list 'clojure.core/quot flat-sym (suffix p))
+                                        (nth bounds p))])
+                             contract-axes))]
+      [flat-sym k-bound (walk/postwalk-replace subst body)])))
 
 (defn contract-form->segred
   "Parse `(raster.par/contract out [[i mi] …] [[k mk]] body & opts)` → a segmented SegRed.
@@ -26,10 +53,11 @@
         combine (get opts-map :combine '+)
         _ (assert (and (vector? free-axes) (pos? (count free-axes)))
                   "contract-lower: free-axes must be a non-empty vector")
-        _ (assert (and (vector? contract-axes) (= 1 (count contract-axes)))
-                  "contract-lower: contract-form->segred needs exactly 1 contract axis (0 → contract-form->segmap; n≥2 → flatten, A1c)")
+        _ (assert (and (vector? contract-axes) (pos? (count contract-axes)))
+                  "contract-lower: contract-form->segred needs ≥1 contract axis (0 → contract-form->segmap)")
         _ (assert (symbol? out) "contract-lower: out must be a symbol")
-        [k-sym k-bound] (first contract-axes)
+        ;; n≥2 contract axes → flatten into one innermost reduced dim + substitute indices.
+        [k-sym k-bound body] (flatten-contract-axes contract-axes body)
         free-dims (mapv (fn [[s b]] {:name s :bound b}) free-axes)
         red-dim   {:name k-sym :bound k-bound}
         ;; N-D space: free (segment) dims OUTER, contracted (reduced) dim INNERMOST.
