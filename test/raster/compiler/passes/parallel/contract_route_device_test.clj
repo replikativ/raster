@@ -178,3 +178,25 @@
                                    (* (aget A (+ (* i 6) (* l1 3) l2)) (aget V (+ (* l1 3) l2)))))))]
         (is (= :naive-segred (:strategy r)))
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
+
+;; ── A3: output-axis permutation falls out of free-axis DECLARATION ORDER ──────────────
+(deftest a3-transposed-output-falls-out-of-free-axis-order
+  (if-not @gpu?
+    (println "[skip] a3-transposed-output: no GPU")
+    (testing "einsum ij,jk->ki (transposed output) is correct by declaring free-axes [k i]"
+      ;; A[M,K]·B[K,N] but output C[N,M] = (A·B)ᵀ: declare free in output order (kk outer, ii inner).
+      ;; The emitter's row-major write over declared free axes yields C[k,i] with no store change.
+      (let [M 3 K 4 N 2
+            Ad (double-array (map #(* 0.1 (double %)) (range (* M K))))
+            Bd (double-array (map #(* 0.2 (double %)) (range (* K N))))
+            form (list 'raster.par/contract 'C [['kk N] ['ii M]] [['jj K]]
+                       (list '* (list 'aget 'A (list '+ (list '* 'ii K) 'jj))
+                             (list 'aget 'B (list '+ (list '* 'jj N) 'kk))))
+            r (route/route-contraction form :dtype :double)
+            ze (find-ns 'raster.gpu.ze-runtime)
+            abuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* M K) :double) Ad)
+            bbuf ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* K N) :double) Bd)
+            gpu (launch-routed r {'A abuf 'B bbuf} (out-f64 (* N M)))
+            cpu (vec (for [kk (range N) ii (range M)]
+                       (reduce + (for [jj (range K)] (* (aget Ad (+ (* ii K) jj)) (aget Bd (+ (* jj N) kk)))))))]
+        (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
