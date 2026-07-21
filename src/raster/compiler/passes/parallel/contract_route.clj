@@ -31,7 +31,7 @@
    the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
    scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
-  [contract-form & {:keys [dtype scheme] :or {dtype :half scheme {:scale 1.0}}}]
+  [contract-form & {:keys [dtype scheme prefer-peak?] :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
         contract-axes (nth contract-form 3)
@@ -41,7 +41,7 @@
     (cond
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
-      (route-quant contract-form out-sym scheme n-free n-contract nseg)
+      (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
 
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
@@ -108,21 +108,55 @@
    :scalar-args [{:type :float :value (float scale)} {:type :int :value (int nseg)}]
    :dims (:dims k)})
 
+(defn- nn-matmul->nt-plan
+  "B3-insert: turn a canonical :nn int8 matmul form C[i,j]=Σ_l A[i,l]·B[l,j] (B stored [K,N])
+   into the dp4a-ready :nt form + a byte-transpose PRE-STEP that produces Bᵀ[N,K]. Returns
+   {:nt-form :pre-step} or nil if the form isn't a canonical 2-operand matmul. The col operand
+   (its index contains the free1 axis j) is the one transposed; row operand A stays [M,K]."
+  [contract-form]
+  (let [[_ _out free-axes contract-axes body] contract-form]
+    (when (and (= 2 (count free-axes)) (= 1 (count contract-axes))
+               (seq? body) (= '* (first body)) (= 3 (count body)))
+      (let [[i-sym M] (first free-axes) [j-sym N] (second free-axes) [l-sym K] (first contract-axes)
+            agets (filter #(and (seq? %) (= 'aget (first %))) (rest body))]
+        (when (= 2 (count agets))
+          (let [syms-of (fn [g] (set (filter symbol? (tree-seq coll? seq (nth g 2)))))
+                col (first (filter #(contains? (syms-of %) j-sym) agets))
+                row (first (filter #(contains? (syms-of %) i-sym) agets))]
+            (when (and col row (not= col row))
+              (let [row-arr (nth row 1) col-arr (nth col 1)
+                    col-t (symbol (str (name col-arr) "__t"))   ; the transposed col operand
+                    nt-body (list '* (list 'aget row-arr (list '+ (list '* i-sym K) l-sym))
+                                  (list 'aget col-t (list '+ (list '* j-sym K) l-sym)))]
+                {:nt-form (list 'raster.par/contract (second contract-form)
+                                [[i-sym M] [j-sym N]] [[l-sym K]] nt-body)
+                 ;; transpose the ORIGINAL col operand [K,N] → [N,K] at BYTE granularity
+                 :pre-step {:op :transpose :src col-arr :dst col-t :rows K :cols N :dtype :byte}}))))))))
+
 (defn- route-quant
   "Route an int8 (:byte) contraction. 2-free/1-contract: try the dp4a peak leaf (requires the
    :nt operand layout — B stored [N,K], K-contiguous, K%4==0); if that orientation isn't met,
-   fall to the quant naive-widening kernel (:nn). The emitters ASSERT their own layout
+   either INSERT a byte-transpose pre-step so :nn reaches dp4a (B3-insert, `prefer-peak?`), or
+   fall to the quant naive-widening kernel (:nn, default). The emitters ASSERT their own layout
    requirements, so a thrown AssertionError is the (clean) 'not this leaf' signal — dp4a and
    quant-naive are complementary (:nt vs :nn). Non-2-free / multi-contract int8 is deferred."
-  [contract-form out-sym scheme n-free n-contract nseg]
+  [contract-form out-sym scheme n-free n-contract nseg prefer-peak?]
   (let [scale (get scheme :scale 1.0)]
     (if (and (= 2 n-free) (= 1 n-contract))
       (let [sr (cl/contract-form->segred contract-form :dtype :byte)
             dp4a (try (sco/generate-dp4a-contraction-kernel sr out-sym :scheme scheme)
                       (catch AssertionError _ nil))]
-        (if dp4a
-          (quant-descriptor :dp4a dp4a :float scale nseg)          ; :nt → peak int8 leaf
-          (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
-            (quant-descriptor :quant-naive q :float scale nseg))))  ; :nn → naive widening
+        (cond
+          dp4a  (quant-descriptor :dp4a dp4a :float scale nseg)     ; :nt → peak int8 leaf
+          ;; :nn + prefer-peak? → transpose col operand, then dp4a (B3-insert)
+          prefer-peak?
+          (if-let [{:keys [nt-form pre-step]} (nn-matmul->nt-plan contract-form)]
+            (let [srt (cl/contract-form->segred nt-form :dtype :byte)
+                  k (sco/generate-dp4a-contraction-kernel srt out-sym :scheme scheme)]
+              (assoc (quant-descriptor :dp4a k :float scale nseg) :pre-steps [pre-step]))
+            (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
+              (quant-descriptor :quant-naive q :float scale nseg)))
+          :else (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
+                  (quant-descriptor :quant-naive q :float scale nseg))))  ; :nn → naive widening
       (throw (ex-info "route-quant: int8 supported for 2 free + 1 contract axes (C1 first cut)"
                       {:n-free n-free :n-contract n-contract})))))
