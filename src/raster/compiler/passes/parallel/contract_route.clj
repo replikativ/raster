@@ -14,7 +14,9 @@
    :array-params (binding order), :dtype, :wg [x y], :grid [gx gy], :scalar-args [{:type :int
    :value n}…], :dims [M N L]}."
   (:require [raster.compiler.passes.parallel.contract-lower :as cl]
-            [raster.compiler.backend.gpu.segop-opencl :as sco]))
+            [raster.compiler.backend.gpu.segop-opencl :as sco]
+            [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.ir.axis-map :as am]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -134,30 +136,73 @@
    :out-elems nseg
    :dims (:dims k)})
 
-(defn- nn-matmul->nt-plan
-  "B3-insert: turn a canonical :nn int8 matmul form C[i,j]=Σ_l A[i,l]·B[l,j] (B stored [K,N])
-   into the dp4a-ready :nt form + a byte-transpose PRE-STEP that produces Bᵀ[N,K]. Returns
-   {:nt-form :pre-step} or nil if the form isn't a canonical 2-operand matmul. The col operand
-   (its index contains the free1 axis j) is the one transposed; row operand A stays [M,K]."
-  [contract-form]
-  (let [[_ _out free-axes contract-axes body] contract-form]
+(defn- operand-map
+  "The declared axis-map for `arr` if the form carries :maps, else DERIVE one by checking the
+   aget index against the canonical row-major layout for `expected-axes`. Returns nil when the
+   index is NOT that layout — which is the point: the old rewrite ASSUMED canonical strides and
+   silently miscompiled a non-canonical operand."
+  [contract-form arr idx expected-axes extents]
+  (let [opts (apply hash-map (drop 5 contract-form))
+        declared (get-in opts [:maps arr])]
+    (cond
+      declared (when (am/canonical? declared expected-axes) declared)
+      :else (let [cand (am/of-axes (mapv vector expected-axes extents))]
+              (when (am/index-matches? cand idx) cand)))))
+
+(defn- retarget-to-layout
+  "Rewrite a 2-operand contraction so `arr`'s operand has the layout the LEAF requires, inserting
+   a physical transpose pre-step for the difference. The general form of the old :nn→:nt special
+   case: the required layout is declared by the leaf, the actual layout comes from the operand's
+   map, and the mismatch is `am/permutation` — not a hand-written index rewrite.
+
+   VERIFIES the operand's actual layout before rewriting (the previous version substituted
+   assumed canonical strides having only checked which axis SYMBOLS appeared, so a [K,M]-strided
+   or batch-offset operand silently computed the wrong thing). Returns {:form :pre-step} or nil.
+
+   Scope: a 2-free/1-contract product of two agets whose col operand needs group transposition."
+  [contract-form required-col-axes dtype]
+  (let [[_ out free-axes contract-axes body] contract-form]
     (when (and (= 2 (count free-axes)) (= 1 (count contract-axes))
-               (seq? body) (= '* (first body)) (= 3 (count body)))
+               (seq? body) (#{'* 'clojure.core/* 'raster.numeric/*} (first body)) (= 3 (count body)))
       (let [[i-sym M] (first free-axes) [j-sym N] (second free-axes) [l-sym K] (first contract-axes)
-            agets (filter #(and (seq? %) (= 'aget (first %))) (rest body))]
+            ext {i-sym M j-sym N l-sym K}
+            agets (mapv ce/normalize-array-prims (rest body))
+            agets (filterv #(and (seq? %) (= 'aget (first %))) agets)]
         (when (= 2 (count agets))
           (let [syms-of (fn [g] (set (filter symbol? (tree-seq coll? seq (nth g 2)))))
-                col (first (filter #(contains? (syms-of %) j-sym) agets))
-                row (first (filter #(contains? (syms-of %) i-sym) agets))]
+                col (first (filter #(and (contains? (syms-of %) j-sym)
+                                         (not (contains? (syms-of %) i-sym))) agets))
+                row (first (filter #(and (contains? (syms-of %) i-sym)
+                                         (not (contains? (syms-of %) j-sym))) agets))]
             (when (and col row (not= col row))
-              (let [row-arr (nth row 1) col-arr (nth col 1)
-                    col-t (symbol (str (name col-arr) "__t"))   ; the transposed col operand
-                    nt-body (list '* (list 'aget row-arr (list '+ (list '* i-sym K) l-sym))
-                                  (list 'aget col-t (list '+ (list '* j-sym K) l-sym)))]
-                {:nt-form (list 'raster.par/contract (second contract-form)
-                                [[i-sym M] [j-sym N]] [[l-sym K]] nt-body)
-                 ;; transpose the ORIGINAL col operand [K,N] → [N,K] at BYTE granularity
-                 :pre-step {:op :transpose :src col-arr :dst col-t :rows K :cols N :dtype :byte}}))))))))
+              (let [col-arr (nth col 1)
+                    actual-axes [l-sym j-sym]          ; the :nn storage we can retarget from
+                    cmap (operand-map contract-form col-arr (nth col 2) actual-axes
+                                      (mapv ext actual-axes))
+                    want (am/of-axes (mapv (fn [a] [a (ext a)]) required-col-axes))]
+                ;; only proceed when the ACTUAL layout is verified and the difference is a
+                ;; genuine 2-D group transposition
+                (when (and cmap (am/transposed-2d? cmap want))
+                  (let [col-t (gensym (str (name col-arr) "__t"))
+                        new-body (list '* row (list 'aget col-t (am/index-expr want)))]
+                    {:form (list 'raster.par/contract out free-axes contract-axes new-body
+                                 :maps (assoc (get (apply hash-map (drop 5 contract-form)) :maps {})
+                                              col-t want))
+                     :pre-step {:op :transpose :src col-arr :dst col-t
+                                :rows (ext l-sym) :cols (ext j-sym) :dtype dtype}}))))))))))
+
+(defn- quant-naive!
+  "The int8 naive-widening leaf, with a CLEAR error when the operand layout isn't one it can
+   index. There is no correct generic fallback for int8: the generic naive segred accumulates in
+   the element type, and int8×int8 must widen to int32 — so we fail loudly rather than emit a
+   silently-wrong kernel."
+  [sr out-sym scheme]
+  (try (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)
+       (catch clojure.lang.ExceptionInfo e
+         (throw (ex-info (str "int8 contraction: no quant leaf handles this operand layout ("
+                              (:reason (ex-data e)) "). int8 requires canonical row-major operands"
+                              " (A[i,l]=i·K+l, B[l,j]=l·N+j) or, for dp4a, B[j,l]=j·K+l.")
+                         (assoc (ex-data e) :dtype :byte) e)))))
 
 (defn- route-quant
   "Route an int8 (:byte) contraction. 2-free/1-contract: try the dp4a peak leaf (requires the
@@ -171,18 +216,17 @@
     (if (and (= 2 n-free) (= 1 n-contract))
       (let [sr (cl/contract-form->segred contract-form :dtype :byte)
             dp4a (try (sco/generate-dp4a-contraction-kernel sr out-sym :scheme scheme)
-                      (catch AssertionError _ nil))]
+                      (catch clojure.lang.ExceptionInfo _ nil))]
         (cond
           dp4a  (quant-descriptor :dp4a dp4a :float scale nseg)     ; :nt → peak int8 leaf
           ;; :nn + prefer-peak? → transpose col operand, then dp4a (B3-insert)
           prefer-peak?
-          (if-let [{:keys [nt-form pre-step]} (nn-matmul->nt-plan contract-form)]
-            (let [srt (cl/contract-form->segred nt-form :dtype :byte)
+          (if-let [{form* :form pre-step :pre-step}
+                   (retarget-to-layout contract-form '[j l] :byte)]   ; dp4a needs B as [N,K]
+            (let [srt (cl/contract-form->segred form* :dtype :byte)
                   k (sco/generate-dp4a-contraction-kernel srt out-sym :scheme scheme)]
               (assoc (quant-descriptor :dp4a k :float scale nseg) :pre-steps [pre-step]))
-            (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
-              (quant-descriptor :quant-naive q :float scale nseg)))
-          :else (let [q (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)]
-                  (quant-descriptor :quant-naive q :float scale nseg))))  ; :nn → naive widening
+            (quant-descriptor :quant-naive (quant-naive! sr out-sym scheme) :float scale nseg))
+          :else (quant-descriptor :quant-naive (quant-naive! sr out-sym scheme) :float scale nseg)))
       (throw (ex-info "route-quant: int8 supported for 2 free + 1 contract axes (C1 first cut)"
                       {:n-free n-free :n-contract n-contract})))))

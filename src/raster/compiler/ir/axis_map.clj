@@ -119,6 +119,23 @@
     (when (and (= (count fk) (count tk)) (= (set fk) (set tk)) (apply distinct? fk))
       (mapv #(.indexOf ^java.util.List fk %) tk))))
 
+(defn- canonicalize-ops
+  "Normalize +/* heads (bare, clojure.core, raster.numeric) so index expressions from different
+   producers compare structurally."
+  [e]
+  (cond (seq? e) (let [h (first e)
+                       h' (get '{+ + clojure.core/+ + raster.numeric/+ +
+                                 * * clojure.core/* * raster.numeric/* *} h h)]
+                   (cons h' (map canonicalize-ops (rest e))))
+        :else e))
+
+(defn index-matches?
+  "Does `idx-expr` equal this map's generated index, modulo operator qualification? This is the
+   VERIFICATION step: a leaf may only assume an operand's layout if the operand's actual index
+   expression provably is that layout."
+  [amap idx-expr]
+  (= (canonicalize-ops idx-expr) (canonicalize-ops (index-expr amap))))
+
 (defn transposed-2d?
   "True when `to` is `from` with its two groups swapped (the 2-D transpose case a physical
    transpose kernel realizes)."

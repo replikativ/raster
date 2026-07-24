@@ -69,13 +69,13 @@
       (is (str/includes? source "const int* restrict A"))      ; operands reinterpreted as packed int
       (is (str/includes? source "p < 16"))))                   ; KP = K/4 = 16
   (testing "gate: K must be a multiple of 4, and B must be [N,K] transposed"
-    (is (thrown? AssertionError
+    (is (thrown? clojure.lang.ExceptionInfo
                  (sco/generate-dp4a-contraction-kernel (cl/contract-form->segred (dp4a-form 8 8 6) :dtype :byte) 'C)))
     ;; B in [K,N] (non-transposed, B[l,j]=l·N+j) → not K-contiguous → rejected
     (let [bad (list 'raster.par/contract 'C [['i 8] ['j 8]] [['l 8]]
                     (list '* (list 'aget 'A (list '+ (list '* 'i 8) 'l))
                           (list 'aget 'B (list '+ (list '* 'l 8) 'j))))]
-      (is (thrown? AssertionError
+      (is (thrown? clojure.lang.ExceptionInfo
                    (sco/generate-dp4a-contraction-kernel (cl/contract-form->segred bad :dtype :byte) 'C))))))
 
 (deftest dp4a-contraction-matches-ref-on-device

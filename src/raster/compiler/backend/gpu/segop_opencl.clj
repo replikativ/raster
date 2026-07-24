@@ -783,10 +783,12 @@
   (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
         {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
         (analyze-contraction segred :byte)
-        _ (assert (canonical-rowmajor? row-idx i-sym L l-sym)
-                  "quant: row operand must be [M,L] row-major (A[i,l]=i·L+l)")
-        _ (assert (canonical-rowmajor? col-idx l-sym N j-sym)
-                  "quant: col operand must be [L,N] row-major (B[l,j]=l·N+j)")
+        _ (when-not (canonical-rowmajor? row-idx i-sym L l-sym)
+            (throw (ex-info "quant: row operand must be [M,K] row-major"
+                            {:reason :non-canonical-row :idx row-idx})))
+        _ (when-not (canonical-rowmajor? col-idx l-sym N j-sym)
+            (throw (ex-info "quant: col operand must be [K,N] row-major"
+                            {:reason :non-canonical-col :idx col-idx})))
         ;; C types from the ONE dtype facet map — generic int8/int32/float, not quant types.
         op-ctype  (get codegen/opencl-type-map :byte)   ; int8 storage (int8_t; signed)
         acc-ctype (get codegen/opencl-type-map :int)    ; int32 widening accumulate
@@ -837,13 +839,14 @@
   (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
         {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
         (analyze-contraction segred :byte)
-        _ (assert (zero? (mod L 4)) "dp4a: contract axis K must be a multiple of 4 (int8×4 packing)")
-        _ (assert (canonical-rowmajor? row-idx i-sym L l-sym)
-                  "dp4a: row operand must be [M,K] row-major (A[i,l]=i·K+l)")
-        _ (assert (canonical-rowmajor? col-idx j-sym L l-sym)
-                  "dp4a: col operand must be [N,K] TRANSPOSED (B[j,l]=j·K+l) — dp4a needs both operands K-contiguous")
-        _ (assert (and (zero? a-zp) (zero? b-zp))
-                  "dp4a leaf: symmetric quant only (zero-points fold into a correction term — future)")
+        _ (when-not (zero? (mod L 4))
+            (throw (ex-info "dp4a: K must be a multiple of 4" {:reason :k-not-mult-4 :K L})))
+        _ (when-not (canonical-rowmajor? row-idx i-sym L l-sym)
+            (throw (ex-info "dp4a: row operand must be [M,K] row-major" {:reason :non-canonical-row})))
+        _ (when-not (canonical-rowmajor? col-idx j-sym L l-sym)
+            (throw (ex-info "dp4a: col operand must be [N,K] (K-contiguous)" {:reason :non-nt-orientation})))
+        _ (when-not (and (zero? a-zp) (zero? b-zp))
+            (throw (ex-info "dp4a: symmetric quant only" {:reason :asymmetric-zp})))
         A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
         KP (quot L 4)                            ; packed contract length (int8×4 words)
         acc-ctype (get codegen/opencl-type-map :int)

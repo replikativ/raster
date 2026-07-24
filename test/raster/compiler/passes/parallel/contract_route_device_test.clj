@@ -276,3 +276,33 @@
         (is (= 1 (count (:pre-steps r))))
         (is (= :byte (:dtype (first (:pre-steps r)))))            ; byte-granularity transpose
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-4) gpu cpu)))))))
+
+(deftest b3insert-refuses-to-retarget-an-unverified-layout
+  ;; device-free. The previous :nn→:nt rewrite substituted ASSUMED canonical strides having only
+  ;; checked which axis SYMBOLS appeared, so an operand with different strides silently computed
+  ;; the wrong result. The map-based retarget VERIFIES the actual index against the layout first.
+  (testing "col operand with non-canonical strides is NOT retargeted (falls back)"
+    (let [M 4 N 4 K 8
+          ;; B indexed as (l + j*K*2) — same symbols, WRONG strides for a [K,N] operand
+          bad (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                    (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                          (list 'aget 'B (list '+ (list '* 'j (* K 2)) 'l))))
+          r (try (route/route-contraction bad :dtype :byte :scheme {:scale 0.01} :prefer-peak? true)
+                 (catch clojure.lang.ExceptionInfo _ {:strategy :rejected :pre-steps []}))]
+      (is (not= :dp4a (:strategy r)) "must not claim the peak leaf on an unverified layout")
+      (is (empty? (:pre-steps r)))))
+  (testing "an int8 operand layout NO leaf can index fails loudly (never silently miscompiles)"
+    (let [M 4 N 4 K 8
+          bad (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                    (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                          (list 'aget 'B (list '+ (list '* 'j (* K 2)) 'l))))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no quant leaf handles"
+                            (route/route-contraction bad :dtype :byte :scheme {:scale 0.01})))))
+  (testing "the canonical :nn form IS retargeted (transpose pre-step + dp4a)"
+    (let [M 4 N 4 K 8
+          ok (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                   (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                         (list 'aget 'B (list '+ (list '* 'l N) 'j))))
+          r (route/route-contraction ok :dtype :byte :scheme {:scale 0.01} :prefer-peak? true)]
+      (is (= :dp4a (:strategy r)))
+      (is (= 1 (count (:pre-steps r)))))))
