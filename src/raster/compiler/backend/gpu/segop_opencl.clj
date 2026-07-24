@@ -719,7 +719,7 @@
   "DPAS/XMX-tensorized contraction → OpenCL (PEAK; raster's edge over Futhark's portable
    ~50-70%-peak tiling). The general, IR-driven contribution is the LEGALITY GATE +
    operand-orientation analysis (dpas-contraction-legal?); the DPAS BODY is the validated
-   emit-gemm-nonsquare-kernel reused verbatim (f16-in / f32-acc / f16-out, 128×128 tiles,
+   emit-gemm-tiled reused verbatim (f16-in / f32-acc / f16-out, tile-parametric,
    16 subgroups, K16 mad). The SOAC IR decides WHICH input is the row operand (→ A slot) vs
    col operand (→ B slot) and the dims to launch with — so a batched or transposed
    contraction re-tensorizes through the golden's :batched?/:split-k? variants rather than a
@@ -735,12 +735,23 @@
       {:tensorized false :reason (:reason gate) :detail gate}
       (let [{:keys [M N L row-arr col-arr]} gate
             kernel-name (str "dpas_contract_" (gensym ""))
-            source (codegen/emit-gemm-nonsquare-kernel kernel-name :c-dtype :half)]
+            ;; tile geometry (defaults reproduce the original hand kernel bit-for-bit); returned
+            ;; so the ROUTER derives wg/grid from it instead of hardcoding 128/256 in a 2nd place.
+            tile {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32 :subgroup 16}
+            source (codegen/emit-gemm-tiled kernel-name :c-dtype :half
+                                            :block-m (:block-m tile) :block-n (:block-n tile)
+                                            :sg-m (:sg-m tile) :sg-n (:sg-n tile)
+                                            :block-k (:block-k tile))]
         {:kernel-name kernel-name
          :source source
          :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
          :dims [M N L]
          :dtype :half
+         :tile tile
+         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × subgroup size
+         :workgroup [(* (quot (:block-m tile) (:sg-m tile))
+                        (quot (:block-n tile) (:sg-n tile))
+                        (:subgroup tile)) 1]
          :tensorized true}))))
 
 ;; ================================================================

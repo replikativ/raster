@@ -93,14 +93,15 @@
    (let [sr (cl/contract-form->segred contract-form :dtype dtype)
          dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype)]
     (if (:tensorized dpas)
-      (let [[M N _L] (:dims dpas)]
+      (let [[M N _L] (:dims dpas)
+            {:keys [block-m block-n]} (:tile dpas)]
         {:strategy :dpas
          :kernel-name (:kernel-name dpas)
          :source (:source dpas)
          :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
          :dtype :half :out-dtype :half :out-elems (* M N)
-         :wg [256 1]
-         :grid [(ceil-div N 128) (ceil-div M 128)]   ; [gc-n gc-m] (group-id0=N, id1=M)
+         :wg (:workgroup dpas)                       ; derived from the emitted tile
+         :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
          :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
          :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel

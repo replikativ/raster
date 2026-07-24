@@ -2,7 +2,7 @@
   "Cadence-controlled COLD/WARM benchmark for the SOAC contraction ladder
    (par/contract → segmented SegRed → naive / block-tiled / register-tiled OpenCL),
    measured on the SAME rigorous method as `resident-gemm-cold-bench` and against the
-   golden `emit-gemm-nonsquare-kernel` (the resident XMX GEMM) as the reference line.
+   golden `emit-gemm-tiled` (the resident XMX GEMM) as the reference line.
 
    WHY THIS EXISTS
    ---------------
@@ -169,12 +169,12 @@
               (long (Math/ceil (/ (double n) bn))) (long (Math/ceil (/ (double m) bm))) 1)))})
 
 (def ^:private golden-spec
-  "The hand-written resident XMX GEMM (emit-gemm-nonsquare-kernel), f16 — the reference line."
+  "The hand-written resident XMX GEMM (emit-gemm-tiled), f16 — the reference line."
   {:label "golden-gemm-f16" :dtype :half
    :bind
    (fn [m n k triple]
      (let [kname "gemm_nonsquare_bench"
-           src (cg/emit-gemm-nonsquare-kernel kname :c-dtype :half)
+           src (cg/emit-gemm-tiled kname :c-dtype :half)
            {:keys [module kname]} (compile-src! [:golden] kname src)
            args [(:segment (:a triple)) (:segment (:b triple)) (:segment (:c triple))
                  {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]]
