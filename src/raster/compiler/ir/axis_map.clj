@@ -1,0 +1,126 @@
+(ns raster.compiler.ir.axis-map
+  "Indexing maps: how an operand's PHYSICAL index is built from the ITERATION axes.
+
+   This is the one abstraction MLIR's `linalg.generic` has that our `par/contract` lacked.
+   `par/contract` already carries the other two thirds — `iterator_types` (free axes = parallel,
+   contract axes = reduction) and the body region — but the *indexing map* was implicit inside
+   the body's `aget` index arithmetic and had to be recovered by pattern-matching. With the map
+   declared, orientation is DATA: `:nn` vs `:nt` is `[[i][l]] · [[l][j]]` vs `[[i][l]] · [[j][l]]`,
+   not a special case. The map is literally the einsum subscript, kept instead of discarded.
+
+   REPRESENTATION — `{:groups [[[i M]] [[l K]]]}`:
+     • one GROUP per physical dimension, outer→inner (row-major across groups);
+     • each group is a vector of `[axis-sym extent]` pairs, row-major WITHIN the group.
+   A multi-axis group is a MERGE (einops `\"b (c h) w\"` → `[[[b B]] [[c C] [h H]] [[w W]]]`);
+   reading a merged dim back as separate iteration axes is a SPLIT. So split/merge need no extra
+   machinery — they are one nesting level in the same structure. Also covers, for free:
+     transpose  — reorder groups            broadcast — omit an axis
+     batch      — extra leading group       diagonal  — repeat an axis
+
+   Extents may be numbers or symbols; index expressions fold to constants when everything is
+   literal and stay symbolic otherwise."
+  (:refer-clojure :exclude [shape]))
+
+;; ── construction ────────────────────────────────────────────────────────────────────
+(defn of-axes
+  "Map for a plain (non-merged) operand: one axis per physical dim.
+   (of-axes '[[i M] [l K]]) => {:groups [[[i M]] [[l K]]]}"
+  [axis-extent-pairs]
+  {:groups (mapv vector axis-extent-pairs)})
+
+(defn of-groups
+  "Map from explicit groups (each a vector of [axis extent] pairs)."
+  [groups]
+  {:groups (mapv vec groups)})
+
+;; ── queries ─────────────────────────────────────────────────────────────────────────
+(defn- mul
+  "Product that folds literals and stays symbolic otherwise."
+  [xs]
+  (let [xs (remove #(= 1 %) xs)]
+    (cond (empty? xs) 1
+          (every? number? xs) (reduce * xs)
+          (= 1 (count xs)) (first xs)
+          :else (let [nums (filter number? xs) syms (remove number? xs)
+                      k (reduce * 1 nums)]
+                  (if (= 1 k) (cons 'clojure.core/* syms)
+                      (cons 'clojure.core/* (cons k syms)))))))
+
+(defn group-extent [group] (mul (map second group)))
+
+(defn shape
+  "Physical shape: one extent per group."
+  [amap]
+  (mapv group-extent (:groups amap)))
+
+(defn n-elements [amap] (mul (shape amap)))
+
+(defn axes
+  "Flat list of iteration-axis symbols in map order (atomic order)."
+  [amap]
+  (vec (for [g (:groups amap) [a _] g] a)))
+
+(defn rank [amap] (count (:groups amap)))
+
+;; ── index generation (the single source of row-major decomposition) ──────────────────
+(defn- rowmajor
+  "Row-major flat index over `[[expr extent] …]` outer→inner: Σ_p expr_p × Π_{q>p} extent_q.
+   Folds literals; emits `clojure.core` index arithmetic (integer index math, per CLAUDE.md)."
+  [pairs]
+  (let [v (vec pairs)
+        n (count v)
+        terms (keep-indexed
+               (fn [p [e _]]
+                 (let [suf (mul (map second (subvec v (inc p) n)))]
+                   (cond (= 0 e) nil
+                         (= 1 suf) e
+                         :else (list 'clojure.core/* e suf))))
+               v)
+        ;; Flatten nested sums so that two maps with the same ATOMIC order produce a
+        ;; STRUCTURALLY identical index expression — that syntactic equality is what makes
+        ;; "a regroup is a pure reinterpretation, no data movement" checkable by `=`.
+        terms (mapcat (fn [t] (if (and (seq? t) (= 'clojure.core/+ (first t))) (rest t) [t]))
+                      (remove nil? terms))]
+    (case (count terms)
+      0 0
+      1 (first terms)
+      (cons 'clojure.core/+ terms))))
+
+(defn index-expr
+  "The operand's flat physical index as an S-expression of the iteration-axis symbols.
+   Row-major across groups; row-major within each group (so a merged group `[c h]` contributes
+   `c*H + h`). This is THE row-major decomposition — emitters call it instead of re-deriving."
+  [amap]
+  (rowmajor (for [g (:groups amap)]
+              [(rowmajor (for [[a e] g] [a e])) (group-extent g)])))
+
+;; ── layout relations (what the gate and the rearrange-inserter ask) ──────────────────
+(defn canonical?
+  "Is this map the plain row-major layout over `expected-axes` (in that order, unmerged)?
+   Replaces the ad-hoc `(+ (* outer stride) inner)` pattern match: a comparison, not a regex."
+  [amap expected-axes]
+  (= (mapv (fn [g] (mapv first g)) (:groups amap))
+     (mapv vector expected-axes)))
+
+(defn same-atomic-order?
+  "True when two maps visit the SAME atomic axes in the same order and differ only in grouping.
+   Then one is a pure RESHAPE of the other — a reinterpretation with NO data movement, which is
+   exactly the case a rearrange-elision pass may drop."
+  [a b]
+  (= (axes a) (axes b)))
+
+(defn permutation
+  "The permutation of `from`'s groups that yields `to`'s group order, or nil when `to` is not a
+   reordering of `from` (different axis sets, or a regroup rather than a reorder). Used to turn a
+   layout MISMATCH into a concrete transpose — the general form of the old :nn→:nt special case."
+  [from to]
+  (let [fk (mapv (fn [g] (mapv first g)) (:groups from))
+        tk (mapv (fn [g] (mapv first g)) (:groups to))]
+    (when (and (= (count fk) (count tk)) (= (set fk) (set tk)) (apply distinct? fk))
+      (mapv #(.indexOf ^java.util.List fk %) tk))))
+
+(defn transposed-2d?
+  "True when `to` is `from` with its two groups swapped (the 2-D transpose case a physical
+   transpose kernel realizes)."
+  [from to]
+  (= [1 0] (permutation from to)))

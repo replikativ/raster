@@ -5,6 +5,7 @@
    is the bridge that unifies einsum with the peak GEMM path — no interpreted loop."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.einsum :as es]
+            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.passes.parallel.contract-route :as route]))
 
 (def ^:private gpu?
@@ -13,10 +14,14 @@
               (catch Throwable _ false))))
 
 (deftest einsum-lowers-to-contract-form
-  (testing "matmul ij,jk->ik → canonical contract form"
-    (is (= '(raster.par/contract C [[i 3] [k 2]] [[j 4]]
-              (* (aget A (+ (* i 4) j)) (aget B (+ (* j 2) k))))
-           (es/einsum->contract-form "ij,jk->ik" {:i 3 :j 4 :k 2} 'C '[A B]))))
+  (testing "matmul ij,jk->ik → canonical contract form (indices generated FROM the map,
+            so they carry qualified index arithmetic; the subscript is kept as :maps)"
+    (let [f (es/einsum->contract-form "ij,jk->ik" {:i 3 :j 4 :k 2} 'C '[A B])]
+      (is (= '[[i 3] [k 2]] (nth f 2)))
+      (is (= '[[j 4]] (nth f 3)))
+      (is (= '(* (aget A (clojure.core/+ (clojure.core/* i 4) j))
+                 (aget B (clojure.core/+ (clojure.core/* j 2) k)))
+             (nth f 4)))))
   (testing "transposed output ij,jk->ki → free axes in output order [k i]"
     (is (= '[[k 2] [i 3]] (nth (es/einsum->contract-form "ij,jk->ki" {:i 3 :j 4 :k 2} 'C '[A B]) 2))))
   (testing "batch bij,bjk->bik → 3 free axes + 1 contract"
@@ -63,3 +68,52 @@
                                                     (aget Bbd (+ (* (+ (* b K) j) N) k))))))]
           (is (= :naive-segred s))
           (is (close? r ref)))))))
+
+;; ── Phase 1/2: rearrange (transpose / split / merge) as a MAP application ──────────────
+(deftest rearrange-lowers-to-contract-via-maps
+  (testing "transpose \"i j -> j i\": free axes in output order, body at the INPUT map's index"
+    (let [f (es/rearrange->contract-form "i j -> j i" {:i 2 :j 3} 'o 'x)]
+      (is (= '[[j 3] [i 2]] (nth f 2)))                ; free axes = output atomic order
+      (is (= [] (nth f 3)))                             ; 0 contract axes
+      (is (= '(aget x (clojure.core/+ (clojure.core/* i 3) j)) (nth f 4)))))
+  (testing "merge \"b c h -> b (c h)\": a regroup does not change the flat index (elidable copy)"
+    (let [f (es/rearrange->contract-form "b c h -> b (c h)" {:b 2 :c 3 :h 4} 'o 'x)
+          maps (apply hash-map (drop 5 f))]
+      (is (am/same-atomic-order? (get-in maps [:maps 'x]) (get-in maps [:maps 'o])))
+      (is (= (am/index-expr (get-in maps [:maps 'x]))
+             (am/index-expr (get-in maps [:maps 'o]))))))
+  (testing "split is the inverse pattern and is equally an index-identity"
+    (let [f (es/rearrange->contract-form "b (c h) -> b c h" {:b 2 :c 3 :h 4} 'o 'x)
+          maps (apply hash-map (drop 5 f))]
+      (is (am/same-atomic-order? (get-in maps [:maps 'x]) (get-in maps [:maps 'o])))))
+  (testing "einsum carries its subscript as :maps (orientation is data, not a pattern match)"
+    (let [f (es/einsum->contract-form "ij,jk->ik" {:i 3 :j 4 :k 2} 'C '[A B])
+          maps (:maps (apply hash-map (drop 5 f)))]
+      (is (am/canonical? (get maps 'A) '[i j]))
+      (is (am/canonical? (get maps 'B) '[j k]))
+      (is (am/canonical? (get maps 'C) '[i k]))))
+  (testing "einsum ij,jk->ki records the TRANSPOSED output map"
+    (let [f (es/einsum->contract-form "ij,jk->ki" {:i 3 :j 4 :k 2} 'C '[A B])
+          maps (:maps (apply hash-map (drop 5 f)))]
+      (is (am/canonical? (get maps 'C) '[k i])))))
+
+(deftest rearrange-runs-on-device
+  (if-not @gpu?
+    (println "[skip] rearrange-device: no GPU")
+    (testing "transpose \"i j -> j i\" routes (0-contract → :segmap) and matches reference"
+      (let [I 3 J 4
+            xs (vec (map double (range (* I J))))
+            ze (find-ns 'raster.gpu.ze-runtime)
+            xb ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (* I J) :double)
+                (double-array xs))
+            r (route/route-contraction (es/rearrange->contract-form "i j -> j i" {:i I :j J} 'o 'x)
+                                       :dtype :double)
+            o ((ns-resolve ze 'make-buffer) (* I J) :double)]
+        ((ns-resolve ze 'register-kernel!) (:kernel-name r) {:source (:source r) :dtype :double})
+        (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
+              args (into (mapv #(:segment ({'x xb} %)) (:array-params r))
+                         (into [(:segment o)] (:scalar-args r)))]
+          ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) (:grid r) args)
+          (is (= :segmap (:strategy r)))
+          (is (= (vec ((ns-resolve ze 'buffer->double-array) o))
+                 (vec (for [j (range J) i (range I)] (nth xs (+ (* i J) j)))))))))))

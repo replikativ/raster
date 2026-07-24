@@ -22,6 +22,7 @@
             [raster.arrays :refer [aget aset alength aclone] :as ra]
             [raster.ad.templates :as tmpl]
             [raster.par :as par]
+            [raster.compiler.ir.axis-map :as am]
             [clojure.string :as str]))
 
 ;; ================================================================
@@ -111,6 +112,8 @@
 ;; SOAC contraction path — free = output labels, contract = summed labels)
 ;; ================================================================
 
+(declare parse-rearrange-pattern)
+
 (defn einsum->contract-form
   "Lower a 2-operand einsum to a `(raster.par/contract out free-axes contract-axes body)` form,
    the bridge from the general einsum surface to the contraction path (B1). free-axes = the
@@ -129,16 +132,51 @@
         contract-labels (vec (remove (set output) all-labels))
         lsym (fn [l] (symbol (name l)))
         axis (fn [l] [(lsym l) (dim-map l)])
-        idx-expr (fn [labels]
-                   (let [strides (compute-strides labels dim-map)
-                         terms (map (fn [l s] (if (= 1 (long s)) (lsym l) (list '* (lsym l) s)))
-                                    labels strides)]
-                     (cond (empty? terms) 0
-                           (= 1 (count terms)) (first terms)
-                           :else (cons '+ terms))))
+        ;; The einsum subscript IS the indexing map — build it and let axis-map generate the
+        ;; index, instead of hand-rolling strides and then discarding the labels.
+        operand-map (fn [labels] (am/of-axes (mapv axis labels)))
+        maps (zipmap in-syms (map operand-map inputs))
+        idx-expr (fn [labels] (am/index-expr (operand-map labels)))
         body (list '* (list 'aget (nth in-syms 0) (idx-expr (nth inputs 0)))
                    (list 'aget (nth in-syms 1) (idx-expr (nth inputs 1))))]
-    (list 'raster.par/contract out-sym (mapv axis output) (mapv axis contract-labels) body)))
+    ;; :maps carries the declared per-operand layout downstream (orientation as DATA — the gate
+    ;; compares maps instead of pattern-matching the body's index arithmetic).
+    (list 'raster.par/contract out-sym (mapv axis output) (mapv axis contract-labels) body
+          :maps (assoc maps out-sym (operand-map output)))))
+
+;; ================================================================
+;; rearrange → contract  (Phase 2: split/merge/transpose as a map application)
+;; ================================================================
+
+(defn rearrange->contract-form
+  "Lower an einops-style `rearrange` to a 0-contract `par/contract` form — transpose, split,
+   merge and any composition thereof, with NO new machinery: it is one map applied to another.
+
+     (rearrange->contract-form \"b c h w -> b (c h) w\" {:b 2 :c 3 :h 4 :w 5} 'out 'in)
+
+   The FREE axes are the output's atomic axes in output order (so the contraction's row-major
+   write produces the output layout, A3); the body reads the input at ITS map's index. Because a
+   regroup does not change the flat index, a pure merge/split emits an identity copy — which the
+   layout pass can then elide entirely (`am/same-atomic-order?`)."
+  [pattern dim-map out-sym in-sym]
+  (let [{:keys [left right]} (parse-rearrange-pattern pattern)
+        ;; the shared parser yields :name | [:group [:a :b]] tokens — one token per PHYSICAL dim
+        token->group (fn [tok] (if (keyword? tok) [tok] (second tok)))
+        in-groups (mapv token->group left)
+        out-groups (mapv token->group right)
+        axis (fn [l] [(symbol (name l)) (or (dim-map l)
+                                            (throw (ex-info "rearrange: unknown axis extent"
+                                                            {:axis l :dims dim-map})))])
+        grp (fn [g] (mapv axis g))
+        in-map (am/of-groups (mapv grp in-groups))
+        out-map (am/of-groups (mapv grp out-groups))
+        free-axes (mapv axis (apply concat out-groups))]
+    (when-not (= (set (am/axes in-map)) (set (am/axes out-map)))
+      (throw (ex-info "rearrange: output axes must match input axes"
+                      {:pattern pattern :in (am/axes in-map) :out (am/axes out-map)})))
+    (list 'raster.par/contract out-sym free-axes []
+          (list 'aget in-sym (am/index-expr in-map))
+          :maps {in-sym in-map out-sym out-map})))
 
 (defn einsum
 
