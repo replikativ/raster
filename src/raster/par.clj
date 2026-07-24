@@ -148,7 +148,8 @@
     out          — output array; length = product of free-axis bounds, ROW-MAJOR over
                    the free axes in declared order (outer→inner)
     free-axes    — [[idx-sym bound] ...] the parallel output axes (≥1)
-    contract-axes— [[idx-sym bound] ...] the reduced axes (prototype: exactly one)
+    contract-axes— [[idx-sym bound] ...] the reduced axes: 0 (outer product / pure map),
+                   1, or n (n≥2 are flattened into one innermost reduced dim)
     body         — the summand expression; may reference every free and contract idx
     opts         — :init (accumulator init, default 0.0), :combine (default +)
 

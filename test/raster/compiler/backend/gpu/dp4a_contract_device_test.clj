@@ -84,7 +84,7 @@
     (do
       (testing "int8 dp4a matmul (128×64×256) == reference"
         (let [{:keys [gpu cpu]} (run-dp4a 128 64 256 0.01)]
-          (is (rel-close? gpu cpu 1.0e-4) (str "gpu " (take 3 gpu) " vs cpu " (take 3 cpu)))))
+          (is (rel-close? gpu cpu 1.0e-6) (str "gpu " (take 3 gpu) " vs cpu " (take 3 cpu)))))
       (testing "non-square, K multiple of 4 (100×32×70)"
         (let [{:keys [gpu cpu]} (run-dp4a 100 32 70 0.005)]
-          (is (rel-close? gpu cpu 1.0e-4) "non-square"))))))
+          (is (rel-close? gpu cpu 1.0e-6) "non-square"))))))

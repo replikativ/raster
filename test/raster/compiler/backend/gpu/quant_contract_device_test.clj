@@ -89,10 +89,10 @@
     (do
       (testing "symmetric int8 matmul (128×96×128) dequant == reference"
         (let [{:keys [gpu cpu]} (run-quant 128 96 128 {:scale 0.01})]
-          (is (rel-close? gpu cpu 1.0e-4) (str "gpu " (take 3 gpu) " vs cpu " (take 3 cpu)))))
+          (is (rel-close? gpu cpu 1.0e-6) (str "gpu " (take 3 gpu) " vs cpu " (take 3 cpu)))))
       (testing "non-square int8 (100×70×64)"
         (let [{:keys [gpu cpu]} (run-quant 100 70 64 {:scale 0.005})]
-          (is (rel-close? gpu cpu 1.0e-4) "non-square")))
+          (is (rel-close? gpu cpu 1.0e-6) "non-square")))
       (testing "ASYMMETRIC int8 with zero-points (96×80×64) == reference"
         (let [{:keys [gpu cpu]} (run-quant 96 80 64 {:scale 0.008 :a-zp 7 :b-zp -4})]
-          (is (rel-close? gpu cpu 1.0e-4) "asymmetric zero-point"))))))
+          (is (rel-close? gpu cpu 1.0e-6) "asymmetric zero-point"))))))

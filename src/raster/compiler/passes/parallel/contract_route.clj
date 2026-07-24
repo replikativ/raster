@@ -10,9 +10,11 @@
    opencl-pass makes when it meets a contraction; kept in ONE place so the gate's hardware
    knowledge lives with the emitters, not scattered across passes.
 
-   Returns a launch-ready descriptor: {:strategy :dpas|:regtiled, :kernel-name, :source,
-   :array-params (binding order), :dtype, :wg [x y], :grid [gx gy], :scalar-args [{:type :int
-   :value n}…], :dims [M N L]}."
+   Returns a launch-ready descriptor. Strategies: :segmap (0 contract axes), :naive-segred
+   (general), :regtiled (portable tiled), :dpas (f16 peak), :dp4a (int8 peak), :quant-naive
+   (int8 widening). Keys: :kernel-name :source :array-params (binding order) :dtype :out-dtype
+   :out-elems :wg [x y] :grid [gx gy] :scalar-args [{:type :value}…] :dims, plus optional
+   :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
   (:require [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]

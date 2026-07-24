@@ -2,7 +2,7 @@
   "W1 step 2a: lower a `(raster.par/contract out free-axes contract-axes body …)` FORM
    to a segmented `SegRed`.
 
-   segment-dims = the free (parallel/output) axes; reduced-dim = the contracted axis
+   segment-dims = the free (parallel/output) axes; reduced-dim = the (flattened) contracted axis
    (Futhark convention: the INNERMOST SegSpace dim is the reduced one). Because the
    free/contract split is DECLARED in the surface form, this lowering is deterministic —
    no index-expression recognition, no variance test. The naive segmented emitter and,

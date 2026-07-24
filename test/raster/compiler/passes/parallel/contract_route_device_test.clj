@@ -225,7 +225,9 @@
           Ab (mapv #(byte (- (mod % 255) 127)) (range (* M K)))
           Bv (mapv #(byte (- (mod (* 3 %) 255) 127)) (range (* N K)))  ; reused as [N,K] and [K,N]
           Aget (fn [i] (nth Ab i)) Bget (fn [i] (nth Bv i))
-          close? (fn [xs ys] (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-4) xs ys)))]
+          close? (fn [xs ys] (every? true? (map #(< (/ (Math/abs (- (double %1) (double %2)))
+                                                       (max 1.0 (Math/abs (double %2)))) 1.0e-6)
+                                                 xs ys)))]
       (testing ":nt (B stored [N,K]) → :dp4a peak leaf; int8 matmul dequant == reference"
         (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                          (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
@@ -275,7 +277,8 @@
         (is (= :dp4a (:strategy r)))
         (is (= 1 (count (:pre-steps r))))
         (is (= :byte (:dtype (first (:pre-steps r)))))            ; byte-granularity transpose
-        (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-4) gpu cpu)))))))
+        (is (every? true? (map #(< (/ (Math/abs (- (double %1) (double %2)))
+                                      (max 1.0 (Math/abs (double %2)))) 1.0e-6) gpu cpu)))))))
 
 (deftest b3insert-refuses-to-retarget-an-unverified-layout
   ;; device-free. The previous :nn→:nt rewrite substituted ASSUMED canonical strides having only
@@ -306,3 +309,40 @@
           r (route/route-contraction ok :dtype :byte :scheme {:scale 0.01} :prefer-peak? true)]
       (is (= :dp4a (:strategy r)))
       (is (= 1 (count (:pre-steps r)))))))
+
+(deftest all-routing-decisions-are-device-free
+  ;; The strategy choices are pure emit — they must be checkable without a GPU, so CI validates
+  ;; the routing brain even where it cannot run kernels. (Previously every strategy assertion sat
+  ;; inside an `if-not @gpu?` guard and was skipped entirely off-device.)
+  (let [strategy (fn [form & opts] (:strategy (apply route/route-contraction form opts)))]
+    (testing "0 contract axes → :segmap"
+      (is (= :segmap (strategy '(raster.par/contract C [[i 4] [j 3]] []
+                                  (* (aget a i) (aget b j))) :dtype :double))))
+    (testing "n free ≠ 2 → :naive-segred"
+      (is (= :naive-segred (strategy '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
+                                        (* (aget A x) (aget B y))) :dtype :double))))
+    (testing "n ≥ 2 contract axes → :naive-segred (flattened)"
+      (is (= :naive-segred (strategy '(raster.par/contract C [[i 4]] [[l1 2] [l2 3]]
+                                        (* (aget A x) (aget V y))) :dtype :double))))
+    (testing "2 free + 1 contract: f16 canonical → :dpas, f64 → :regtiled"
+      (is (= :dpas (strategy (matmul-form 128 128 128) :dtype :half)))
+      (is (= :regtiled (strategy (matmul-form 128 128 128) :dtype :double))))
+    (testing "int8 :nt → :dp4a, :nn → :quant-naive, :nn + prefer-peak? → :dp4a + transpose"
+      (let [nt '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
+                  (* (aget A (+ (* i 8) l)) (aget B (+ (* j 8) l))))
+            nn '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
+                  (* (aget A (+ (* i 8) l)) (aget B (+ (* l 4) j))))]
+        (is (= :dp4a (strategy nt :dtype :byte)))
+        (is (= :quant-naive (strategy nn :dtype :byte)))
+        (let [r (route/route-contraction nn :dtype :byte :prefer-peak? true)]
+          (is (= :dp4a (:strategy r)))
+          (is (= :byte (:dtype (first (:pre-steps r))))))))
+    (testing "every descriptor carries the full launch contract"
+      (doseq [[label r] [[:segmap (route/route-contraction
+                                   '(raster.par/contract C [[i 4] [j 3]] [] (* (aget a i) (aget b j)))
+                                   :dtype :double)]
+                         [:dpas (route/route-contraction (matmul-form 128 128 128) :dtype :half)]
+                         [:regtiled (route/route-contraction (matmul-form 128 128 128) :dtype :double)]]]
+        (is (every? some? [(:kernel-name r) (:source r) (:array-params r) (:dtype r)
+                           (:out-dtype r) (:out-elems r) (:wg r) (:grid r) (:scalar-args r)])
+            (str label " descriptor incomplete"))))))
