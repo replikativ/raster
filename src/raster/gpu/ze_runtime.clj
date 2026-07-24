@@ -3156,36 +3156,38 @@
   contraction shape C[m×n] = Σ_k A[m×k]·B[k×n]. The routing brain already chose DPAS-vs-
   regtiled and the dtype; this just stages + launches.
 
-  inputs      : [A B] host arrays (double[]/float[]) or DeviceBuffers, in :array-params order
-  out         : host array or DeviceBuffer for C[m×n]
-  dtype       : element type (:half converts operands to f16 for the DPAS/XMX leaf)
-  [m n k]     : dims
-  wg          : [x y] workgroup (DPAS [256 1]; regtiled [nt-col nt-row])
-  grid        : [gx gy] group counts
-  n-scalar-dims: # trailing int dim params the kernel takes (DPAS=3 → [m n k]; regtiled=0)"
-  [^String kernel-name inputs out dtype [m n k] wg grid n-scalar-dims]
+  Takes the routed descriptor's values INTACT — no reconstruction from dims (which only worked
+  for the two 2-operand strategies and crashed on the rest). Input sizes come from the arrays
+  themselves (alength), so any operand arity/shape works.
+
+  inputs      : host arrays (double[]/float[]/byte[]) or DeviceBuffers, in :array-params order
+  out         : host array or DeviceBuffer for the result
+  dtype       : OPERAND element type (:half converts operands to f16 for the DPAS/XMX leaf)
+  out-dtype   : RESULT element type (differs from dtype for quant: int8 in, f32 out)
+  out-elems   : number of result elements
+  wg          : [x y] workgroup   grid : [gx gy] group counts
+  scalar-args : the descriptor's :scalar-args, passed straight through to launch-2d!"
+  [^String kernel-name inputs out dtype out-dtype out-elems wg grid scalar-args]
   (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
-        m (long m) n (long n) k (long k)
+        out-elems (long out-elems)
         half? (boolean (#{:half :float16} dtype))
         esize (long (get dtype-byte-sizes dtype 8))
-        in-elems [(* m k) (* k n)]
-        dev-inputs (mapv (fn [arr idx nel]
+        out-half? (boolean (#{:half :float16} out-dtype))
+        out-esize (long (get dtype-byte-sizes out-dtype 8))
+        dev-inputs (mapv (fn [arr idx]
                            (if (device-buffer? arr)
                              (:segment ^DeviceBuffer arr)
-                             (stage-operand! kernel-name (keyword (str "c-in-" idx)) arr nel half? esize)))
-                         inputs (range) in-elems)
-        out-elems (* m n)
+                             (stage-operand! kernel-name (keyword (str "c-in-" idx))
+                                             arr (java.lang.reflect.Array/getLength arr) half? esize)))
+                         inputs (range))
         out-buffer? (device-buffer? out)
         out-seg (if out-buffer? (:segment ^DeviceBuffer out)
-                    (ensure-seg kernel-name :c-out (* out-elems (if half? 2 esize))))
-        scalar-args (case (long n-scalar-dims)
-                      3 [{:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-                      0 [])
+                    (ensure-seg kernel-name :c-out (* out-elems out-esize)))
         all-args (vec (concat dev-inputs [out-seg] scalar-args))
         [gx gy] grid]
     (launch-2d! kernel-handle wg [gx gy] all-args)
     (when-not out-buffer?
-      (readback-operand! out-seg out out-elems half? esize))
+      (readback-operand! out-seg out out-elems out-half? out-esize))
     out))
 
 (defn invoke-gpu-transpose!

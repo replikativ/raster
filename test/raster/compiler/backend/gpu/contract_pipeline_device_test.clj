@@ -62,3 +62,51 @@
       (testing "pitch-unaligned f16 (N=70) falls back to register-tiled and matches CPU"
         (let [{:keys [max-abs-diff]} (compile+run :half 128 96 70)]
           (is (< max-abs-diff 2.0e-2) (str "regtiled-f16 fallback maxdiff " max-abs-diff)))))))
+
+;; ── Phase 0: EVERY routed strategy survives the pipeline (descriptor passed through intact) ──
+;; Before the descriptor fix, only :dpas (3 scalar-args) and :regtiled (0) worked: the invoke
+;; reconstructed scalar-args from a `case` with no default and destructured [m n k] from :dims,
+;; so :segmap / :naive-segred (1 scalar-arg, :dims [nseg]) crashed, and quant's f32 output was
+;; staged at int8 size (4× undersized).
+(defn- run-form [form dt args-map out-len]
+  (let [{:keys [form kernels]} (ocl/opencl-pass form :dtype dt :compile-spirv? false)
+        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype])))
+        syms (vec (keys args-map))
+        f (eval (list 'fn (conj syms 'C) form))]
+    (apply f (conj (mapv args-map syms) (double-array out-len)))))
+
+(deftest phase0-all-strategies-survive-the-pipeline
+  (if-not @gpu?
+    (println "[skip] phase0-strategies: no GPU")
+    (do
+      (testing ":segmap (0-contract outer product) through opencl-pass → device"
+        (let [a (double-array [1 2 3 4]) b (double-array [10 20 30])
+              form (list 'raster.par/contract 'C [['i 4] ['j 3]] []
+                         (list '* (list 'raster.arrays/aget 'a 'i) (list 'raster.arrays/aget 'b 'j)))
+              out (run-form form :double {'a a 'b b} 12)
+              ref (vec (for [i (range 4) j (range 3)] (* (aget a i) (aget b j))))]
+          (is (= (vec out) ref))))
+      (testing ":naive-segred (3 free axes, batch matmul) through opencl-pass → device"
+        (let [B 2 M 3 N 2 K 4
+              A (double-array (map #(* 0.1 (double %)) (range (* B M K))))
+              Bd (double-array (map #(* 0.2 (double %)) (range (* B K N))))
+              form (list 'raster.par/contract 'C [['bb B] ['i M] ['j N]] [['l K]]
+                         (list '* (list 'raster.arrays/aget 'A (list '+ (list '* (list '+ (list '* 'bb M) 'i) K) 'l))
+                               (list 'raster.arrays/aget 'Bm (list '+ (list '* (list '+ (list '* 'bb K) 'l) N) 'j))))
+              out (run-form form :double {'A A 'Bm Bd} (* B M N))
+              ref (vec (for [bb (range B) i (range M) j (range N)]
+                         (reduce + (for [l (range K)] (* (aget A (+ (* (+ (* bb M) i) K) l))
+                                                         (aget Bd (+ (* (+ (* bb K) l) N) j)))))))]
+          (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) out ref))))))))
+
+(deftest phase0-symbolic-bounds-route-without-crashing
+  ;; device-free: symbolic axis bounds previously threw ClassCastException in route-contraction
+  ;; before any branch was taken (which made raster.linalg.contract/contract-mm un-routable).
+  (testing "symbolic free-axis bounds produce a descriptor with symbolic out-elems/grid"
+    (let [r ((requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
+             '(raster.par/contract C [[i m] [j n]] [[l k]]
+                (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+             :dtype :double)]
+      (is (some? (:out-elems r)))
+      (is (not (number? (:out-elems r))))            ; carried symbolically
+      (is (contains? #{:regtiled :naive-segred} (:strategy r))))))

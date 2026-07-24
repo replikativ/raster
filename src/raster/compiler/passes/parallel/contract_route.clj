@@ -21,7 +21,13 @@
   [form]
   (and (seq? form) (= 'raster.par/contract (first form))))
 
-(defn- ceil-div [a b] (long (Math/ceil (/ (double a) (double b)))))
+(defn- ceil-div
+  "⌈a/b⌉. `a` may be a SYMBOLIC expression (symbolic axis bounds) — then the quotient is built
+   as a form the call site evaluates at runtime, mirroring how par/map!'s `bound` is handled."
+  [a b]
+  (if (number? a)
+    (long (Math/ceil (/ (double a) (double b))))
+    (list 'quot (list 'clojure.core/+ a (dec (long b))) (long b))))
 
 (declare route-2free-1contract route-quant)
 
@@ -37,7 +43,15 @@
         contract-axes (nth contract-form 3)
         n-free (count free-axes)
         n-contract (count contract-axes)
-        nseg (reduce * 1 (map second free-axes))]   ; product of free bounds (literal dims)
+        ;; Number of output elements = product of the free-axis bounds. Bounds may be SYMBOLS
+        ;; (contract-lower supports them and puts them in :scalars), so build the product
+        ;; symbolically and only fold to an int when every bound is a literal.
+        free-bounds (map second free-axes)
+        nseg (if (every? number? free-bounds)
+               (reduce * 1 free-bounds)
+               (reduce (fn [a b] (list 'clojure.core/* a b)) free-bounds))
+        ;; memoized so the cond's test arm doesn't regenerate the kernel
+        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype))]
     (cond
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
@@ -49,33 +63,42 @@
             {:keys [kernel-name source array-params]} (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
         {:strategy :segmap
          :kernel-name kernel-name :source source :array-params array-params
-         :dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-         :scalar-args [{:type :int :value (int nseg)}] :dims [nseg]})
+         :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+         :scalar-args [{:type :int :value nseg}] :out-elems nseg :dims [nseg]})
 
-      ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled)
-      (and (= 2 n-free) (= 1 n-contract))
-      (route-2free-1contract contract-form out-sym dtype)
+      ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled).
+      ;; Returns nil when the form fails a TENSORIZE structural precondition (symbolic dims,
+      ;; non-+ combine, non-product element …) — then we fall through to the general naive
+      ;; leaf rather than hard-failing a perfectly legal contraction.
+      (and (= 2 n-free) (= 1 n-contract) (tensorize-plan))
+      (tensorize-plan)
 
-      ;; everything else (n-free≠2 with 1 contract, OR n≥2 contract axes) → naive segmented
-      ;; reduce. contract-form->segred flattens n≥2 contract axes into one innermost dim.
+      ;; everything else (n-free≠2, n≥2 contract axes, or a tensorize-ineligible 2-free form)
+      ;; → naive segmented reduce (general: any dtype, symbolic dims, any assoc combine).
+      ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
       :else
       (let [sr (cl/contract-form->segred contract-form :dtype dtype)
             {:keys [kernel-name source array-params]} (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)]
         {:strategy :naive-segred
          :kernel-name kernel-name :source source :array-params array-params
-         :dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-         :scalar-args [{:type :int :value (int nseg)}] :dims [nseg]}))))
+         :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+         :scalar-args [{:type :int :value nseg}] :out-elems nseg :dims [nseg]}))))
 
-(defn- route-2free-1contract [contract-form out-sym dtype]
-  (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-        dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype)]
+(defn- route-2free-1contract
+  "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.
+   Returns nil if the form fails a structural precondition of BOTH (the emitters signal that
+   with ex-info) — the caller then routes to the general naive leaf."
+  [contract-form out-sym dtype]
+  (try
+   (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+         dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype)]
     (if (:tensorized dpas)
       (let [[M N _L] (:dims dpas)]
         {:strategy :dpas
          :kernel-name (:kernel-name dpas)
          :source (:source dpas)
          :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
-         :dtype :half
+         :dtype :half :out-dtype :half :out-elems (* M N)
          :wg [256 1]
          :grid [(ceil-div N 128) (ceil-div M 128)]   ; [gc-n gc-m] (group-id0=N, id1=M)
          :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
@@ -89,11 +112,12 @@
          :kernel-name (:kernel-name rt)
          :source (:source rt)
          :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
-         :dtype (:dtype rt)
+         :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
          :wg (:workgroup rt)
          :grid [(ceil-div N bn) (ceil-div M bm)]
          :scalar-args []                             ; regtiled bakes dims → no scalar params
-         :dims (:dims rt)}))))
+         :dims (:dims rt)})))
+   (catch clojure.lang.ExceptionInfo _ nil)))
 
 (defn- quant-descriptor
   "A launch descriptor for an int8 quant leaf (dp4a or quant-naive). Both are 1-D kernels with
@@ -105,7 +129,8 @@
    :dtype :byte :out-dtype out-dtype
    :scheme (:scheme k)
    :wg [256 1] :grid [(ceil-div nseg 256) 1]
-   :scalar-args [{:type :float :value (float scale)} {:type :int :value (int nseg)}]
+   :scalar-args [{:type :float :value (float scale)} {:type :int :value nseg}]
+   :out-elems nseg
    :dims (:dims k)})
 
 (defn- nn-matmul->nt-plan

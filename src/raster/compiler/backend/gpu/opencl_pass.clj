@@ -182,15 +182,19 @@
                   k (register-kernel! {:kernel-name (:kernel-name r) :source (:source r)
                                        :dtype (:dtype r)}
                                       :ze-contracts)]
+              ;; Pass the descriptor through INTACT — scalar-args as data (the exact shape
+              ;; launch-2d! wants), explicit out-dtype/out-elems. Any :strategy works; the
+              ;; old (count scalar-args) + [m n k] reconstruction only covered :dpas/:regtiled.
               (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
                     (:kernel-name k)
-                    (vec (:array-params r))       ; [A B] operand symbols (vector literal evaluates them)
+                    (vec (:array-params r))       ; operand symbols (vector literal evaluates them)
                     out-sym
                     (:dtype r)
-                    (vec (:dims r))               ; [m n k]
+                    (:out-dtype r)
+                    (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
                     (vec (:wg r))
                     (vec (:grid r))
-                    (count (:scalar-args r))))     ; 3 (DPAS: m n k params) or 0 (regtiled: baked)
+                    (vec (:scalar-args r))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the
