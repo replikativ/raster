@@ -119,31 +119,81 @@
     (when (and (= (count fk) (count tk)) (= (set fk) (set tk)) (apply distinct? fk))
       (mapv #(.indexOf ^java.util.List fk %) tk))))
 
-(defn- canonicalize-ops
-  "Normalize index expressions so ones from different producers compare structurally:
-   unify +/* heads (bare, clojure.core, raster.numeric) and FLATTEN nested sums, since `+` is
-   associative and a hand-written index nests it differently than `rowmajor` emits it
-   (`(+ (* i K) (+ (* blk B) t))` vs `(+ (* i K) (* blk B) t)`). Without the flattening,
-   `index-matches?` would reject correct declarations and push callers to skip verification —
-   worse than the brittleness it was meant to catch. Products are NOT reassociated or folded, so
-   `(* (* i 2) 3)` still fails to match `(* i 6)`; that is a deliberate limit, not an oversight."
-  [e]
-  (if (seq? e)
-    (let [h (first e)
-          h' (get '{+ + clojure.core/+ + raster.numeric/+ +
-                    * * clojure.core/* * raster.numeric/* *} h h)
-          args (map canonicalize-ops (rest e))]
-      (if (= '+ h')
-        (cons '+ (mapcat (fn [a] (if (and (seq? a) (= '+ (first a))) (rest a) [a])) args))
-        (cons h' args)))
-    e))
+(defn- op-head
+  "Unify +/* heads (bare, clojure.core, raster.numeric)."
+  [h] (get '{+ + clojure.core/+ + raster.numeric/+ +
+             * * clojure.core/* * raster.numeric/* *} h h))
+
+;; ── affine normal form: ONE canonicalization for index expressions ───────────────────
+;; An index expression is normalized to {atom → polynomial-coefficient}, where an atom is an
+;; ITERATION AXIS (or an opaque subterm such as quot/mod/rem/aget) and a coefficient is a map
+;; from a sorted vector of symbolic factors to a number — so `(* i k)` and `(* k i)`, and
+;; `(+ (* i K) (+ (* b B) t))` and `(+ (* i K) (* b B) t)`, all normalize to one value.
+;;
+;; WHY NORMALIZE RATHER THAN COMPARE STRUCTURALLY. This file previously carried TWO relations
+;; that accepted DIFFERENT languages: a hand-rolled pattern match that was +/*-order-agnostic but
+;; could not see merged groups, and a structural comparison that flattened nested sums but
+;; rejected commuted ones. A legal :nt operand written `(+ l (* j K))` therefore passed one gate
+;; and was rejected by the other — reaching no leaf at all. And an over-strict relation is worse
+;; than a lax one here: it rejects CORRECT declarations, which teaches callers to skip
+;; verification, and a skipped gate is a silent one.
+;;
+;; `axes` is required because `(* i k)` is ambiguous without it — axis × extent, or axis × axis.
+;; Symbols in `axes` are atoms; every other symbol is a coefficient factor.
+(defn- p* [a b]
+  (reduce (fn [acc [sa ca]]
+            (reduce (fn [acc [sb cb]]
+                      (update acc (vec (sort-by str (concat sa sb))) (fnil + 0) (* ca cb)))
+                    acc b))
+          {} a))
+(defn- p+ [a b] (into {} (remove (comp zero? val)) (merge-with + a b)))
+(def ^:private p-one {[] 1})
+
+(defn affine
+  "Index expression → `{atom → coeff-polynomial}` (the constant term keyed `::one`), or nil when
+   the expression is not affine in `axes` (e.g. an axis multiplied by an axis). quot/mod/rem and
+   nested agets are treated as OPAQUE atoms and never distributed through — distributing them
+   would make two different gathers compare equal, which is a silent wrong-operand bug."
+  [e axes]
+  (let [axes (set axes)
+        opaque (fn [x] [::opaque (pr-str x)])
+        aff (fn aff [e]
+              (cond
+                (number? e) {::one {[] e}}
+                (symbol? e) (if (axes e) {e p-one} {::one {[e] 1}})
+                (seq? e)
+                (let [h (op-head (first e)) args (rest e)]
+                  (cond
+                    (= '+ h) (reduce (fn [acc a] (when-let [x (aff a)] (when acc (merge-with p+ acc x))))
+                                     {} args)
+                    (= '* h) (reduce (fn [acc a]
+                                       (when-let [x (aff a)]
+                                         (when acc
+                                           ;; affine × affine is affine only if at most one side
+                                           ;; carries an axis
+                                           (let [ax? (fn [m] (some #(not= ::one %) (keys m)))]
+                                             (when-not (and (ax? acc) (ax? x))
+                                               (let [[base other] (if (ax? acc) [acc x] [x acc])
+                                                     k (get other ::one)]
+                                                 (when k
+                                                   (into {} (map (fn [[a c]] [a (p* c k)])) base))))))))
+                                     {::one p-one} args)
+                    :else {(opaque e) p-one}))
+                :else {(opaque e) p-one}))]
+    (some->> (aff e) (into {} (remove (comp empty? val))))))
+
+(defn index=
+  "Do two index expressions denote the same element for all values of `axes`? The single index
+   relation — replaces the two divergent ones. Returns false when either side is non-affine."
+  [a b axes]
+  (let [pa (affine a axes) pb (affine b axes)]
+    (boolean (and pa pb (= pa pb)))))
 
 (defn index-matches?
-  "Does `idx-expr` equal this map's generated index, modulo operator qualification? This is the
-   VERIFICATION step: a leaf may only assume an operand's layout if the operand's actual index
-   expression provably is that layout."
+  "Does `idx-expr` equal this map's generated index? The VERIFICATION step: a leaf may only assume
+   an operand's layout if the operand's actual index provably IS that layout."
   [amap idx-expr]
-  (= (canonicalize-ops idx-expr) (canonicalize-ops (index-expr amap))))
+  (index= idx-expr (index-expr amap) (axes amap)))
 
 (defn transposed-2d?
   "True when `to` is `from` with its two groups swapped (the 2-D transpose case a physical

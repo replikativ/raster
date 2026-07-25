@@ -10,6 +10,7 @@
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.dtype :as dt]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.ir.axis-map :as am]
@@ -56,8 +57,8 @@
         body (ce/normalize-array-prims (:lambda segmap))
         cast-fn (:cast-fn segmap)
         out-dtype (or (:dtype segmap) dtype)
-        default-ctype (get codegen/opencl-type-map dtype "double")
-        out-ctype (get codegen/opencl-type-map out-dtype "double")
+        default-ctype (dt/ctype :opencl dtype)
+        out-ctype (dt/ctype :opencl out-dtype)
         ;; (2) per-array element types: declared (array-types) ∪ body :tag metadata
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
@@ -167,7 +168,7 @@
         lambda (ce/normalize-array-prims lambda)
         dtype (or (:dtype segred) dtype)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
-        ctype (get codegen/opencl-type-map dtype "double")
+        ctype (dt/ctype :opencl dtype)
         arr-params (vec (sort-by name (:inputs segred)))
         scl-params (vec (sort-by name (:scalars segred)))
         ;; Detect reduction op from lambda — unwrap let to find op, keep let for elem
@@ -312,7 +313,7 @@
             (throw (ex-info "segmented-reduce: no segment dims — use generate-segred-kernel for a full reduction"
                             {:space space})))
         dtype (or (:dtype segred) dtype)
-        ctype (get codegen/opencl-type-map dtype "double")
+        ctype (dt/ctype :opencl dtype)
         {:keys [acc init lambda]} (:reduce-op segred)
         lambda (ce/normalize-array-prims lambda)
         ;; combine op + element detection (mirrors generate-segred-kernel)
@@ -402,7 +403,7 @@
   [segmap out-sym & {:keys [dtype] :or {dtype :double}}]
   (let [dims (segop/seg-space-dims (:space segmap))   ; all free (no reduced dim)
         dtype (or (:dtype segmap) dtype)
-        ctype (get codegen/opencl-type-map dtype "double")
+        ctype (dt/ctype :opencl dtype)
         body (ce/normalize-array-prims (:lambda segmap))
         arr-params (vec (sort-by name (:inputs segmap)))
         arr-sym-set (set (map #(symbol (name %)) arr-params))
@@ -527,7 +528,7 @@
             (throw (ex-info "tensorize: needs literal dims" {:reason :symbolic-dims :dims [M N L]})))
         i-sym (:name fi) j-sym (:name fj) l-sym (:name red-dim)
         dtype (or (:dtype segred) dtype)
-        ctype (get codegen/opencl-type-map dtype "double")
+        ctype (dt/ctype :opencl dtype)
         {:keys [init lambda]} (:reduce-op segred)
         lambda (ce/normalize-array-prims lambda)
         _ (when-not (#{'+ 'clojure.core/+ 'raster.numeric/+} (descriptor/semantic-op lambda))
@@ -636,21 +637,16 @@
 ;; ================================================================
 
 (defn- canonical-rowmajor?
-  "Does affine index `idx` equal `(+ (* outer stride) inner)` (row-major, leading dim
-   `stride`)? outer/inner are axis syms, stride the expected leading extent (a number).
-   Order-agnostic on both the + and the *. Returns true/false."
+  "Does affine index `idx` equal `(+ (* outer stride) inner)` (row-major, leading dim `stride`)?
+
+   ONE RELATION. This used to be a hand-rolled pattern match that was +/*-order-agnostic but could
+   only see a literal 3-element sum, while `am/index-matches?` flattened nested sums but compared
+   terms positionally. The two accepted DIFFERENT languages, so a legal :nt operand written
+   `(+ l (* j K))` passed one gate and was rejected by the other — reaching no leaf at all. Both
+   now normalize to the same affine form, which accepts every arithmetically-identical spelling."
   [idx outer stride inner]
-  (let [idx (ce/normalize-array-prims idx)
-        add? #(and (seq? %) (#{'+ 'clojure.core/+ 'raster.numeric/+} (first %)))
-        mul? #(and (seq? %) (#{'* 'clojure.core/* 'raster.numeric/*} (first %)))]
-    (boolean
-     (when (and (add? idx) (= 3 (count idx)))
-       (let [[_ a b] idx
-             [prod other] (cond (mul? a) [a b] (mul? b) [b a] :else [nil nil])]
-         (when (and prod (= other inner) (= 3 (count prod)))
-           (let [[_ p q] prod]
-             (or (and (= p outer) (= q stride))
-                 (and (= q outer) (= p stride))))))))))
+  (am/index-matches? (am/of-axes [[outer 1] [inner stride]])
+                     (ce/normalize-array-prims idx)))
 
 (defn dpas-contraction-legal?
   "The tensorize LEGALITY GATE: is `segred` a contraction that lowers to the DPAS/XMX
@@ -674,7 +670,7 @@
   [segred dtype]
   (let [dtype (or (:dtype segred) dtype)
         pitch-ok? (fn [d] (and (number? d) (zero? (mod (long d) 8))))]
-    (if-not (#{:half :float16} dtype)
+    (if-not (and (dt/known? dtype) (= :half (dt/canon dtype)))
       {:ok false :reason :dtype-not-dpas :dtype dtype}
       (try
         (let [{:keys [M N L i-sym j-sym l-sym row-idx col-idx row-arr col-arr arr-params]}
@@ -755,7 +751,7 @@
    warps-per-CTA × elem-bytes / 4 registers for the accumulator; the epilogue's live values must
    fit in the remaining budget (Triton clamps accumulator traffic at maxnreg/2 to avoid spilling)."
   [{:keys [operands]} out-dtype [M N] tile]
-  (let [bytes-of (fn [dt] (long (get {:double 8 :float 4 :half 2 :float16 2 :int 4 :byte 1} dt 4)))
+  (let [bytes-of (fn [d] (long (dt/bytes-of d)))   ; one registry, not a private table
         cb (bytes-of out-dtype)
         c-elems (* (long M) (long N))
         operand-bytes (reduce + 0 (for [{:keys [dtype] :or {dtype :float}} operands]
@@ -793,7 +789,7 @@
         _ (when-not (:ok legal)
             (throw (ex-info (str "epilogue-splice: illegal epilogue (" (:reason legal) ")")
                             (assoc legal :expr expr))))
-        ctype (get codegen/opencl-type-map dtype "float")
+        ctype (dt/ctype :opencl dtype)
         arr-syms (set (map (comp #(symbol (name %)) :sym) operands))
         int-vars (into #{} (map #(symbol (name %))) [i-sym j-sym])
         ;; substitute each operand's aget index from its declared map (maps, not pattern-matching)
@@ -814,10 +810,10 @@
         params (apply str
                       (concat
                        (for [{:keys [sym dtype] :or {dtype :float}} operands]
-                         (str ", __global const " (get codegen/opencl-type-map dtype "float")
+                         (str ", __global const " (dt/ctype :opencl dtype)
                               "* restrict " (ce/c-symbol sym)))
                        (for [{:keys [sym dtype] :or {dtype :float}} scalars]
-                         (str ", " (get codegen/opencl-type-map dtype "float") " " (ce/c-symbol sym)))))]
+                         (str ", " (dt/ctype :opencl dtype) " " (ce/c-symbol sym)))))]
     {:epilogue (fn [acc-expr row col]
                  (-> emitted
                      (str/replace acc-token (str "(" acc-expr ")"))
@@ -1048,11 +1044,30 @@
         int-acc? (contains? #{:int :long :int32} (:dtype inner-stage))
         agets (into {} (keep (fn [f] (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
                                       [(second f) (nth f 2)]))
-                             (tree-seq coll? seq body)))]
+                             (tree-seq coll? seq body)))
+        ;; THE BODY IS DISCARDED when this leaf fires — the whole summand is replaced by one
+        ;; rstr_dp4a call. So the gate must account for EVERY term first: a body carrying any
+        ;; factor beyond the two declared operands (a mask, a third tensor) would be silently
+        ;; dropped, with the extra array still declared as an unread kernel param. Require the
+        ;; body to be exactly the product of the two declared operands' agets.
+        declared-syms (set (map :sym operands))
+        body-terms (when (and (seq? body) (descriptor/multiplication-op? (descriptor/semantic-op body)))
+                     (vec (descriptor/call-args body)))
+        exact-product?
+        (and body-terms
+             (= 2 (count body-terms))
+             (every? (fn [t] (and (seq? t) (= 'aget (first t))
+                                  (contains? declared-syms (second t))))
+                     body-terms))]
     (cond
       (not= 2 (count operands)) {:ok false :reason :dp4a-needs-two-declared-operands}
       (not (every? :map operands)) {:ok false :reason :operand-without-a-declared-map}
-      (not (#{:byte :int8} dtype)) {:ok false :reason :dp4a-needs-int8-operands :dtype dtype}
+      (not (and (dt/known? dtype) (= :byte (dt/canon dtype))))
+      {:ok false :reason :dp4a-needs-int8-operands :dtype dtype}
+      (not exact-product?)
+      {:ok false :reason :body-has-unmodeled-terms
+       :detail "this leaf replaces the body with a single hardware op; any term beyond the two declared operands would be silently dropped"
+       :body body :declared (vec declared-syms)}
       (not int-acc?) {:ok false :reason :inner-stage-accumulator-not-integral
                       :dtype (:dtype inner-stage)}
       :else
@@ -1103,12 +1118,20 @@
             :lift-operands}. :array-params is the body's inputs; :lift-operands are the EXTRA
    scale arrays, bound after them — surfaced because omitting them from a launch descriptor is
    an arity bug (the signature has them either way)."
-  [{:keys [free-axes stages body inputs dtype out-dtype operands tensorize-inner?]
+  [{:keys [free-axes stages body inputs dtype out-dtype operands tensorize-inner? contract-axes]
     :or {dtype :float out-dtype :float} :as spec} out-sym]
-  (let [legal (cstage/stages-legal? stages (mapv (juxt :axis :extent) stages))
+  (let [;; The stage list is checked against the axes the FORM DECLARED, never against axes derived
+        ;; from the stages themselves. Deriving them made the span rule unfireable, and a stage list
+        ;; that under-covers the contract space emitted a kernel summing a FRACTION of the terms
+        ;; while par/contract's CPU path summed all of them — a silent divergence between two
+        ;; consumers of one form. A gate must not validate its own arguments.
+        _ (when (nil? contract-axes)
+            (throw (ex-info "staged contraction: :contract-axes is required — the stage list can only be validated against the axes the form declared"
+                            {:reason :missing-declared-contract-axes :stages stages})))
+        legal (cstage/stages-legal? stages contract-axes)
         _ (when-not (:ok legal)
             (throw (ex-info (str "staged contraction: illegal stages (" (:reason legal) ")")
-                            (assoc legal :stages stages))))
+                            (assoc legal :stages stages :contract-axes contract-axes))))
         stages (vec stages)
         ;; TENSORIZE THE INNER STAGE: the innermost accumulation is already an exact int32 sum over
         ;; a short K-contiguous run, which is exactly dp4a's shape. Requested explicitly (a schedule
@@ -1121,7 +1144,7 @@
                g))
         ;; packed operands are READ as int32 words (4 int8 each); the buffer bytes are unchanged
         op-ctype  (get codegen/opencl-type-map (if tz :int dtype) "float")
-        out-ctype (get codegen/opencl-type-map out-dtype "float")
+        out-ctype (dt/ctype :opencl out-dtype)
         lift-ops (cstage/lift-operands stages)
         idx-of (cstage/stage-index-exprs stages)
         ;; every axis in scope is an int loop/decompose variable
@@ -1142,7 +1165,7 @@
         inner-loop
         (fn [indent acc]
           (let [{:keys [dtype init axis extent]} (peek stages)
-                t (get codegen/opencl-type-map dtype "float")
+                t (dt/ctype :opencl dtype)
                 [loop-var bound step]
                 (if tz [(:p-sym tz) (:packed-extent tz) "dp4a"] [axis extent "scalar"])
                 pad (apply str (repeat indent " "))]
@@ -1166,7 +1189,7 @@
         nest (reduce
               (fn [inner-src d]
                 (let [{:keys [dtype init axis extent lift]} (nth stages d)
-                      t (get codegen/opencl-type-map dtype "float")
+                      t (dt/ctype :opencl dtype)
                       lift' (cstage/substitute-operand-indices lift idx-of)
                       ;; splice the level-below accumulator in for `inner`
                       lift'' (walk/postwalk-replace {'inner (symbol (acc-name (inc d)))} lift')]
@@ -1185,7 +1208,7 @@
         params (str (str/join ", " (for [a inputs]
                                      (str "__global const " op-ctype "* restrict " (ce/c-symbol a))))
                     (apply str (for [{:keys [sym dtype] :or {dtype :float}} lift-ops]
-                                 (str ", __global const " (get codegen/opencl-type-map dtype "float")
+                                 (str ", __global const " (dt/ctype :opencl dtype)
                                       "* restrict " (ce/c-symbol sym))))
                     ", __global " out-ctype "* restrict out, int _nseg")
         src (str (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))

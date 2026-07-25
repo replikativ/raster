@@ -20,7 +20,8 @@
    ARGUMENT (probed OR supplied) so target-aware compilation is 'pass a different descriptor',
    not a retrofit — the Intel-GRF vs AMD-VGPR budget flows through the same gate."
   (:refer-clojure :exclude [resolve])
-  (:require [raster.compiler.core.hardware :as hw]))
+  (:require [raster.compiler.core.dtype :as dt]
+            [raster.compiler.core.hardware :as hw]))
 
 ;; ================================================================
 ;; Stage 1 — derive-default
@@ -215,8 +216,12 @@
    function the cost-guided chooser / autotune seed rank schedules with. Returns nil when the
    descriptor carries no bandwidth/peak-flops (the roofline abstains rather than fabricating)."
   [schedule {:keys [m n k dtype] :or {dtype :f16}} desc]
+  (when-not (dt/known? dtype)
+    ;; a cost model abstains rather than fabricating a width — the private table this replaces
+    ;; silently returned 2 bytes for every dtype it did not know, including int8
+    (throw (ex-info "schedule-cost-ns: unknown dtype" {:reason :unknown-dtype :dtype dtype})))
   (let [res      (:residency schedule)
-        elem-b   (case dtype (:f16 :half) 2 (:f32 :float) 4 (:f64 :double) 8 2)
+        elem-b   (dt/bytes-of dtype)
         ;; row-major operand footprints: A[m×k] B[k×n] C[m×n]
         ob       {:a (* (long m) (long k) elem-b) :b (* (long k) (long n) elem-b) :c (* (long m) (long n) elem-b)}
         warm?    (fn [o] (= :resident (get res o :dram)))

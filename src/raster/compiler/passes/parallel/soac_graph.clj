@@ -10,7 +10,8 @@
     :dep     — consumer reads producer's array output (fusible)
     :inf-dep — consumer reads producer's scalar output (infusible)
     :cons    — consumer mutates array producer reads (anti-dep)"
-  (:require [raster.compiler.ir.soac :as soac]
+  (:require [raster.compiler.core.dtype :as dt]
+            [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.schedule-support :as schedule-support]
             [raster.compiler.core.op-descriptor :as opd]
@@ -347,9 +348,12 @@
     @total))
 
 (defn- elem-bytes
-  "Byte width of the AM's working element dtype (GPU training default :f16)."
+  "Byte width of the AM's working element dtype (GPU training default :f16), from the ONE dtype
+   registry — the private table this replaces had no :byte branch and priced int8 at 2 bytes.
+   Returns nil for a dtype the compiler cannot spell, so the caller ABSTAINS: this is a cost
+   model, and a cost model may decline to answer but must never throw or fabricate."
   [dtype]
-  (case dtype (:f16 :half) 2 (:f32 :float) 4 (:f64 :double) 8 2))
+  (when (dt/known? dtype) (dt/bytes-of dtype)))
 
 (defn vertical-fusion-profitable?
   "PROFITABILITY (decline-only). A MULTI-consumer vertical fusion inlines the
@@ -374,11 +378,13 @@
   (or (nil? am)
       (empty? (other-consumers graph producer-id consumer-id))   ;; sole consumer → pure win
       (let [producer (get (:nodes graph) producer-id)
-            ridge    (get-in am [:ridge dtype])]
+            ridge    (get-in am [:ridge dtype])
+            eb       (elem-bytes dtype)]
         (or (nil? ridge)
+            (nil? eb)                    ; unspellable dtype ⇒ abstain (fuse), never throw
             (not (instance? raster.compiler.ir.soac.SoacMap producer))
             (<= (lambda-flops (:lambda producer))
-                (* (elem-bytes dtype) (double ridge)))))))
+                (* (long eb) (double ridge)))))))
 
 (defn can-fuse-vertically?
   "Check if producer can be vertically fused into consumer.

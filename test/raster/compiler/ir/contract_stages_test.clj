@@ -135,3 +135,44 @@
               {:axis t :extent 32 :dtype :int :init 0}]]
       (is (:ok (cs/stages-legal? s '[[blk nb] [t 32]])))
       (is (= '(clojure.core/* 32 nb) (cs/contract-extent s))))))
+
+;; ── the oracle: a stage list must SPAN the axes the form declared ────────────────────
+(deftest stages-must-span-the-declared-contract-space
+  (testing "axis names matching is not enough — extents must span the declared space.
+            A stage of extent 4 against a declared extent of 32 emitted a kernel summing an
+            EIGHTH of the terms while the interpreted path summed all of them: two consumers of
+            one form disagreeing silently."
+    (is (= :stage-extents-do-not-span-the-contract-axes
+           (:reason (cs/stages-legal?
+                     '[{:axis blk :extent 2 :dtype :float :init 0.0 :lift inner}
+                       {:axis t :extent 4 :dtype :int :init 0}]
+                     '[[blk 2] [t 32]]))))
+    (is (:ok (cs/stages-legal?
+              '[{:axis blk :extent 2 :dtype :float :init 0.0 :lift inner}
+                {:axis t :extent 32 :dtype :int :init 0}]
+              '[[blk 2] [t 32]]))
+        "…and the spanning list is legal"))
+  (testing "the failure names both sides, so the diagnostic is actionable"
+    (let [r (cs/stages-legal? '[{:axis l :extent 8 :dtype :float :init 0.0}] '[[l 64]])]
+      (is (= 8 (:spans r)))
+      (is (= 64 (:declared r))))))
+
+;; hoisted OUT of a GPU-gated device test: this is the only assertion anywhere that pins
+;; multi-axis map substitution, and behind a GPU gate it never ran in CI. A mutation making
+;; stage-index-exprs always return the bare axis survived every CI-visible assertion.
+(deftest flat-equivalent-substitutes-multi-axis-operand-maps
+  (testing "an operand indexed by a FREE axis and a STAGE axis gets its declared 2-D index,
+            not the bare stage axis"
+    (let [stages '[{:axis blk :extent 4 :dtype :float :init 0.0
+                    :lift (raster.numeric/* inner (aget da _) (aget db _))
+                    :operands [{:sym da :map {:groups [[[i 4]] [[blk 4]]]}}
+                               {:sym db :map {:groups [[[j 6]] [[blk 4]]]}}]}
+                   {:axis t :extent 32 :dtype :int :init 0}]
+          b '(raster.numeric/* (aget a ia) (aget b ib))]
+      (is (= '(raster.numeric/* (raster.numeric/* (aget a ia) (aget b ib))
+                                (aget da (clojure.core/+ (clojure.core/* i 4) blk))
+                                (aget db (clojure.core/+ (clojure.core/* j 4) blk)))
+             (cs/flat-equivalent stages b)))
+      (is (= '{da (clojure.core/+ (clojure.core/* i 4) blk)
+               db (clojure.core/+ (clojure.core/* j 4) blk)}
+             (cs/stage-index-exprs stages))))))
