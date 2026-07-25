@@ -1721,11 +1721,11 @@
               c (list 'raster.dl.loss/mse-grad pred target 1.0 n)))}
 
    'raster.par/dot-product
-   ;; c is a SCALAR cotangent; scale's alpha is annotated Double, so widen
-   ;; explicitly (a float-typed seed dispatches [Float floats] otherwise —
-   ;; exact widening, the array dtype is preserved by scale's (All [T])).
-   {0 (fn [[_a b] c] (list 'raster.par/scale (list 'double c) b))
-    1 (fn [[a _b] c] (list 'raster.par/scale (list 'double c) a))}
+   ;; c is a SCALAR cotangent. par/scale's alpha is now (All [T])-typed, so the cotangent
+   ;; flows through at the array's element type — no explicit widening wrapper needed
+   ;; (previously `(double c)` was injected purely to satisfy a Double annotation).
+   {0 (fn [[_a b] c] (list 'raster.par/scale c b))
+    1 (fn [[a _b] c] (list 'raster.par/scale c a))}
 
    'raster.par/scale
    {0 (fn [[_alpha x] c] (list 'raster.par/dot-product c x))

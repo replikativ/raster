@@ -355,17 +355,17 @@
                                            [dx nil]]))})
 
 ;; --- Leaky ReLU ---
-(deftm leaky-relu (All [T] [x :- (Array T) n :- Long alpha :- Double]
+(deftm leaky-relu (All [T] [x :- (Array T) n :- Long alpha :- T]
                        :- (Array T)
                        (broadcast [x] (if (>= x 0.0) x (* alpha x)))))
 
 ;; In-place leaky-relu: writes into pre-allocated out
-(deftm leaky-relu! (All [T] [x :- (Array T) out :- (Array T) n :- Long alpha :- Double]
+(deftm leaky-relu! (All [T] [x :- (Array T) out :- (Array T) n :- Long alpha :- T]
                         :- (Array T)
                         (broadcast [x] (if (>= x 0.0) x (* alpha x)))))
 
 ;; leaky-relu': x>=0 ? 1 : alpha
-(deftm leaky-relu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long alpha :- Double]
+(deftm leaky-relu-backward (All [T] [dy :- (Array T) x :- (Array T) n :- Long alpha :- T]
                                 :- (Array T)
                                 (let [dx (alloc-like dy n)]
                                   (dotimes [i n]
