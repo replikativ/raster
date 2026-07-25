@@ -165,11 +165,24 @@
   Example (C[m,n] = A[m,k]·B[k,n], row-major):
     (raster.par/contract C [[i m] [j n]] [[l k]]
       (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))"
-  [out free-axes contract-axes body & {:keys [init combine] :or {init 0.0 combine '+}}]
+  [out free-axes contract-axes body & {:keys [init combine stages] :or {init 0.0 combine '+}}]
   (assert (vector? free-axes) "par/contract: free-axes must be a vector of [idx bound]")
   (assert (vector? contract-axes)
           "par/contract: contract-axes must be a vector (0 → outer product/map; n≥1 → contraction, n≥2 flattened)")
-  (let [free-syms   (mapv first free-axes)
+  (let [;; A STAGED contract axis (:stages) is a SCHEDULE: the multi-level accumulate is equal, in
+        ;; exact arithmetic, to the flat contraction whose body absorbed the lift factors, so the
+        ;; interpreted expansion runs THAT and needs no staged implementation. Ignoring :stages
+        ;; here would silently drop the lift factors (e.g. every per-block quant scale) — a wrong
+        ;; answer, not a slower one. See compiler/ir/contract_stages.clj; the GPU leaf that
+        ;; actually schedules the levels is segop-opencl/generate-staged-contraction-kernel.
+        _ (when (seq stages)
+            (let [legal ((requiring-resolve 'raster.compiler.ir.contract-stages/stages-legal?)
+                         stages contract-axes)]
+              (assert (:ok legal) (str "par/contract: illegal :stages (" (:reason legal) ")"))))
+        body (if (seq stages)
+               ((requiring-resolve 'raster.compiler.ir.contract-stages/flat-equivalent) stages body)
+               body)
+        free-syms   (mapv first free-axes)
         int-bounds  (mapv (fn [[_ b]] `(int ~b)) free-axes)
         f-sym   (gensym "f__")
         out-sym (gensym "out__")

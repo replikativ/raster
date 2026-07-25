@@ -13,6 +13,7 @@
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.contract-stages :as cstage]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -426,14 +427,21 @@
                            ce/*int-vars* (into ce/*int-vars* int-vars)]
                    (ce/emit-expr (ce/adapt-casts-for-dtype body dtype) dummy arr-sym-set))
         arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        ;; SYMBOLIC axis bounds must be DECLARED as int params, exactly as the segmented-reduce
+        ;; sibling does — the decompose above emits their names, so without this the kernel
+        ;; references undeclared identifiers and fails to compile.
+        scl-params (vec (sort-by name (:scalars segmap)))
+        scl-param-str (str/join "" (map (fn [s] (str ", int " (ce/c-symbol s))) scl-params))
         src (str (codegen/extension-pragmas dtype)
-                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out, int _nseg) {\n"
+                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out"
+                 scl-param-str ", int _nseg) {\n"
                  "    int seg = get_global_id(0);\n"
                  "    if (seg >= _nseg) return;\n"
                  decomp "\n"
                  "    out[seg] = " body-str ";\n"
                  "}\n")]
-    {:kernel-name kernel-name :source src :array-params arr-params :dtype dtype}))
+    {:kernel-name kernel-name :source src :array-params arr-params
+     :scalar-params scl-params :dtype dtype}))
 
 ;; ================================================================
 ;; Block-tiled + __local-staged contraction (BlkRegTiling, block-tile level)
@@ -996,3 +1004,125 @@
      :dtype :byte :acc-dtype :int :out-dtype :float :packed :int8x4
      :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
      :dims [M N L]}))
+
+;; ── staged (multi-level) contraction ────────────────────────────────────────────────
+(defn- flat-decompose-c
+  "C declarations recovering each free index from the flat segment id `seg`, row-major:
+   idx_p = (seg / Π bounds-after-p) % bound_p, with the innermost simplifying to `seg % bound`.
+   ONE source for the row-major decompose. (Debt: three older copies of this arithmetic remain
+   inline — generate-segmented-reduce-kernel, generate-segmap-nd-kernel, and the two quant
+   kernels — and should collapse onto this helper; not done here to keep their emitted text
+   provably byte-identical.)"
+  [free-axes]
+  (let [v (vec free-axes) n (count v)]
+    (str/join "\n"
+              (map-indexed
+               (fn [p [sym bound]]
+                 (let [after (map second (subvec v (inc p) n))
+                       div (if (seq after) (str "(seg / (" (str/join " * " after) "))") "seg")]
+                   (str "    int " (ce/c-symbol sym) " = " div " % " bound ";")))
+               v))))
+
+(defn generate-staged-contraction-kernel
+  "STAGED contraction → OpenCL: a reduction accumulating in N levels, each with its own
+   accumulator dtype, with a `lift` splicing each level's partial sum into the level above.
+   This is the shape every block-quantized format needs and the flat leaves cannot express —
+   an int32 MAC inside the block, a float accumulate across blocks (see ir/contract-stages).
+   2 stages = q8_0/q4_0, 3 = k-quants, 1 = the flat contraction (so this emitter subsumes it).
+
+   The emitted nest is exactly the schedule `backend/cpu/quant.clj` already uses on CPU and
+   llama.cpp hand-writes per format — here it comes from the stage list, not from a kernel per
+   format. Domain-agnostic: no scale/zero-point/format concept appears below; a stage is an
+   accumulator dtype plus a lift expression, and the lift's operand arrays are indexed by their
+   DECLARED axis-maps (never by inferred strides).
+
+   Spec:
+     {:free-axes [[i M] [j N]]      ;; output axes, outer→inner (any rank ≥ 1)
+      :stages    [outer … inner]    ;; see ir/contract-stages for the stage shape
+      :body      <expr>             ;; the summand, over the free + stage axes
+      :inputs    [a b]              ;; the body's operand arrays
+      :dtype     :byte              ;; the body operands' element dtype
+      :out-dtype :float}
+
+   Returns {:kernel-name :source :array-params :dtype :out-dtype :dims :stages :out-elems
+            :lift-operands}. :array-params is the body's inputs; :lift-operands are the EXTRA
+   scale arrays, bound after them — surfaced because omitting them from a launch descriptor is
+   an arity bug (the signature has them either way)."
+  [{:keys [free-axes stages body inputs dtype out-dtype]
+    :or {dtype :float out-dtype :float}} out-sym]
+  (let [legal (cstage/stages-legal? stages (mapv (juxt :axis :extent) stages))
+        _ (when-not (:ok legal)
+            (throw (ex-info (str "staged contraction: illegal stages (" (:reason legal) ")")
+                            (assoc legal :stages stages))))
+        stages (vec stages)
+        op-ctype  (get codegen/opencl-type-map dtype "float")
+        out-ctype (get codegen/opencl-type-map out-dtype "float")
+        lift-ops (cstage/lift-operands stages)
+        idx-of (cstage/stage-index-exprs stages)
+        ;; every axis in scope is an int loop/decompose variable
+        int-vars (into #{} (map (comp symbol name))
+                       (concat (map first free-axes) (map :axis stages)))
+        arr-syms (into #{} (map (comp symbol name)) (concat inputs (map :sym lift-ops)))
+        emit (fn [expr]
+               (binding [ce/*emit-config* ce/opencl-config
+                         ce/*scalar-type* out-ctype
+                         ce/*int-vars* (into ce/*int-vars* int-vars)]
+                 (ce/emit-expr expr (gensym "z__") arr-syms)))
+        acc-name (fn [d] (str "acc_" d))
+        ;; innermost accumulates the body; each outer accumulates its lift with `inner` bound to
+        ;; the accumulator one level down. Built inside-out.
+        n (count stages)
+        inner-most (let [{:keys [dtype init axis extent]} (peek stages)
+                         t (get codegen/opencl-type-map dtype "float")]
+                     (str "        " t " " (acc-name (dec n)) " = " (or init 0) ";\n"
+                          "        for (int " (ce/c-symbol axis) " = 0; "
+                          (ce/c-symbol axis) " < " extent "; " (ce/c-symbol axis) "++) {\n"
+                          "            " (acc-name (dec n)) " += " (emit body) ";\n"
+                          "        }\n"))
+        nest (reduce
+              (fn [inner-src d]
+                (let [{:keys [dtype init axis extent lift]} (nth stages d)
+                      t (get codegen/opencl-type-map dtype "float")
+                      lift' (cstage/substitute-operand-indices lift idx-of)
+                      ;; splice the level-below accumulator in for `inner`
+                      lift'' (walk/postwalk-replace {'inner (symbol (acc-name (inc d)))} lift')]
+                  (str "    " t " " (acc-name d) " = " (or init 0) ";\n"
+                       "    for (int " (ce/c-symbol axis) " = 0; "
+                       (ce/c-symbol axis) " < " extent "; " (ce/c-symbol axis) "++) {\n"
+                       inner-src
+                       "        " (acc-name d) " += " (emit lift'') ";\n"
+                       "    }\n")))
+              inner-most
+              (reverse (range (dec n))))
+        ;; a single stage has no lift, so its accumulator is the whole nest, unindented
+        nest (if (= 1 n)
+               (let [{:keys [dtype init axis extent]} (peek stages)
+                     t (get codegen/opencl-type-map dtype "float")]
+                 (str "    " t " " (acc-name 0) " = " (or init 0) ";\n"
+                      "    for (int " (ce/c-symbol axis) " = 0; "
+                      (ce/c-symbol axis) " < " extent "; " (ce/c-symbol axis) "++) {\n"
+                      "        " (acc-name 0) " += " (emit body) ";\n"
+                      "    }\n"))
+               nest)
+        n-out (am/n-elements (am/of-axes (vec free-axes)))
+        kernel-name (str "staged_contract_" (gensym ""))
+        params (str (str/join ", " (for [a inputs]
+                                     (str "__global const " op-ctype "* restrict " (ce/c-symbol a))))
+                    (apply str (for [{:keys [sym dtype] :or {dtype :float}} lift-ops]
+                                 (str ", __global const " (get codegen/opencl-type-map dtype "float")
+                                      "* restrict " (ce/c-symbol sym))))
+                    ", __global " out-ctype "* restrict out, int _nseg")
+        src (str "__kernel void " kernel-name "(" params ") {\n"
+                 "    int seg = get_global_id(0);\n"
+                 "    if (seg >= _nseg) return;\n"
+                 (flat-decompose-c free-axes) "\n"
+                 nest
+                 "    out[seg] = (" out-ctype ")" (acc-name 0) ";\n"
+                 "}\n")]
+    {:kernel-name kernel-name :source src
+     :array-params (vec inputs)
+     :lift-operands (mapv :sym lift-ops)
+     :dtype dtype :out-dtype out-dtype
+     :stages stages
+     :out-elems n-out
+     :dims (mapv second free-axes)}))
