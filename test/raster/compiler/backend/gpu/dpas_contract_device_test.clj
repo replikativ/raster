@@ -181,3 +181,41 @@
           ;; f16 store on both sides; compare at f16 tolerance
           (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 3.0e-2) fused ref))
               (str "fused " (take 4 fused) " vs two-pass " (take 4 ref))))))))
+
+;; ── Q2b: epilogue LEGALITY + the honest cost model (device-free) ───────────────────────
+(deftest epilogue-legality-refuses-the-cases-that-would-miscompile
+  (let [am (requiring-resolve 'raster.compiler.ir.axis-map/of-axes)
+        bias {:acc 'acc :expr (list 'raster.numeric/+ 'acc (list 'aget 'bias 'j))
+              :operands [{:sym 'bias :map (am [['j 512]]) :dtype :float}]}]
+    (testing "a bias/activation epilogue is legal"
+      (is (:ok (sco/epilogue-legal? bias))))
+    (testing "the accumulator must appear exactly once (>1 duplicates the reduction result)"
+      (is (= :accumulator-used-more-than-once
+             (:reason (sco/epilogue-legal? {:acc 'acc :expr (list 'raster.numeric/* 'acc 'acc)}))))
+      (is (= :epilogue-ignores-accumulator
+             (:reason (sco/epilogue-legal? {:acc 'acc :expr (list 'aget 'bias 'j)})))))
+    (testing "a reduction inside the epilogue is refused with its own reason (re-tiling, not yet done)"
+      (is (= :reduction-in-epilogue
+             (:reason (sco/epilogue-legal? {:acc 'acc :expr (list 'raster.par/reduce 'a 0.0 'i 8 'acc)})))))
+    (testing "layout/distribution-changing ops are refused"
+      (is (= :layout-changing-op-in-epilogue
+             (:reason (sco/epilogue-legal? {:acc 'acc :expr (list 'raster.par/scan 'o 'a 0.0 'i 8 nil 'acc)})))))
+    (testing "epilogue-splice itself enforces legality (fails loud, never silently miscompiles)"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"illegal epilogue"
+            (sco/epilogue-splice {:acc 'acc :expr (list 'raster.numeric/* 'acc 'acc)} '[i j] :float))))))
+
+(deftest epilogue-cost-reflects-the-eliminated-round-trip
+  (let [hw (requiring-resolve 'raster.compiler.core.hardware/derive-gemm-tile)
+        am (requiring-resolve 'raster.compiler.ir.axis-map/of-axes)
+        bias {:acc 'acc :expr (list 'raster.numeric/+ 'acc (list 'aget 'bias 'j))
+              :operands [{:sym 'bias :map (am [['j 512]]) :dtype :float}]}
+        c (sco/epilogue-cost bias :half [256 512] (hw {}))]
+    (testing "fusing an epilogue REMOVES traffic (it does not duplicate work)"
+      (is (:profitable c))
+      (is (< (:fused-bytes c) (:unfused-bytes c)))
+      ;; unfused ≈ write C + read C + write C = 3·M·N·2 bytes; fused ≈ just the operand read
+      (is (= (* 3 256 512 2) (- (:unfused-bytes c) (* 512 4))))
+      (is (= (* 512 4) (:fused-bytes c)))
+      (is (> (:saved-bytes c) 700000)))
+    (testing "accumulator register estimate follows the derived tile (sg-m·sg-n/subgroup)"
+      (is (= 64 (:acc-regs c))))))
