@@ -11,6 +11,7 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.hardware :as hw]
             [raster.compiler.ir.segop :as segop]
             [clojure.string :as str]))
 
@@ -695,29 +696,36 @@
             :tensorized true}  — NB: :array-params is in [row col] BINDING order (row's
    buffer → A slot, col's → B slot, out → C), NOT sorted-by-name. Returns
    {:tensorized false :reason …} when the gate rejects (caller falls back to regtiled)."
-  [segred out-sym & {:keys [dtype] :or {dtype :half}}]
+  [segred out-sym & {:keys [dtype desc tile] :or {dtype :half}}]
   (let [gate (dpas-contraction-legal? segred dtype)]
     (if-not (:ok gate)
       {:tensorized false :reason (:reason gate) :detail gate}
       (let [{:keys [M N L row-arr col-arr]} gate
             kernel-name (str "dpas_contract_" (gensym ""))
-            ;; tile geometry (defaults reproduce the original hand kernel bit-for-bit); returned
-            ;; so the ROUTER derives wg/grid from it instead of hardcoding 128/256 in a 2nd place.
-            tile {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32 :subgroup 16}
+            ;; TILE GEOMETRY IS DERIVED FROM THE HARDWARE DESCRIPTOR, never hardcoded: the
+            ;; per-subgroup accumulator tile is GRF-bound and rounded to the matrix (DPAS)
+            ;; fragment granularity, so a part with a different GRF budget / subgroup size /
+            ;; matrix shape gets a correctly rescaled tile from the same rule. An explicit
+            ;; `tile` (e.g. an autotune result via hw/gemm-tile-candidates) overrides.
+            ;; hw/derive-gemm-tile's own defaults reproduce the Arc 140V config, so passing no
+            ;; descriptor is equivalent to the previous literal — with zero magic numbers here.
+            tile (or tile (hw/derive-gemm-tile (or desc {})))
+            sg (long (get-in tile [:matrix :subgroup] 16))
             source (codegen/emit-gemm-tiled kernel-name :c-dtype :half
                                             :block-m (:block-m tile) :block-n (:block-n tile)
                                             :sg-m (:sg-m tile) :sg-n (:sg-n tile)
-                                            :block-k (:block-k tile))]
+                                            :block-k (:block-k tile)
+                                            :matrix (:matrix tile))]
         {:kernel-name kernel-name
          :source source
          :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
          :dims [M N L]
          :dtype :half
          :tile tile
-         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × subgroup size
+         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × the matrix subgroup size
          :workgroup [(* (quot (:block-m tile) (:sg-m tile))
                         (quot (:block-n tile) (:sg-n tile))
-                        (:subgroup tile)) 1]
+                        sg) 1]
          :tensorized true}))))
 
 ;; ================================================================
