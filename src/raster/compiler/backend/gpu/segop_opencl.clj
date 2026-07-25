@@ -1023,6 +1023,61 @@
                    (str "    int " (ce/c-symbol sym) " = " div " % " bound ";")))
                v))))
 
+(defn staged-inner-dp4a-legal?
+  "Can the INNERMOST stage of a staged contraction be tensorized with dp4a (4 int8 MACs into an
+   int32 in one op)? Returns {:ok true :packed-maps {sym amap} :packed-extent n} or
+   {:ok false :reason kw}.
+
+   This is the int8 PEAK leaf for block-quant, and it is the same structure llama.cpp hand-writes:
+   the inner stage is already an exact int32 accumulation over a short K-contiguous run, which is
+   precisely dp4a's shape. Because the stage list says which axis the inner accumulation runs over,
+   there is nothing to recognize — the gate only has to CHECK.
+
+   Required, and the failure each check prevents:
+     • declared operand axis-maps. Tensorizing needs to know each operand's innermost axis; per the
+       compiler's declare-don't-pattern-match rule that is data, not inference.
+     • each map must VERIFIABLY equal the operand's actual index in the body (am/index-matches?).
+       Assuming a layout while having checked only the axis symbols is how a transpose rewrite
+       silently miscompiled before; a leaf may only assume what it has proved.
+     • the inner stage's axis must be the INNERMOST axis of both maps — dp4a packs 4 consecutive
+       elements along the contraction, so both operands must be contiguous in it (the :nt layout).
+     • int8 operands, integral inner accumulator (widening as a dtype pair).
+     • the inner extent must be a literal multiple of 4, else the packed load is mis-strided."
+  [{:keys [stages body operands dtype]}]
+  (let [inner-stage (peek (vec stages))
+        int-acc? (contains? #{:int :long :int32} (:dtype inner-stage))
+        agets (into {} (keep (fn [f] (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
+                                      [(second f) (nth f 2)]))
+                             (tree-seq coll? seq body)))]
+    (cond
+      (not= 2 (count operands)) {:ok false :reason :dp4a-needs-two-declared-operands}
+      (not (every? :map operands)) {:ok false :reason :operand-without-a-declared-map}
+      (not (#{:byte :int8} dtype)) {:ok false :reason :dp4a-needs-int8-operands :dtype dtype}
+      (not int-acc?) {:ok false :reason :inner-stage-accumulator-not-integral
+                      :dtype (:dtype inner-stage)}
+      :else
+      (or
+       ;; the declared map must PROVABLY be the operand's actual index expression
+       (first (keep (fn [{:keys [sym map]}]
+                      (let [idx (get agets sym)]
+                        (cond
+                          (nil? idx) {:ok false :reason :declared-operand-not-read-by-the-body :sym sym}
+                          (not (am/index-matches? map idx))
+                          {:ok false :reason :declared-map-does-not-match-the-body-index
+                           :sym sym :declared (am/index-expr map) :actual idx}
+                          (not= (:axis inner-stage) (am/innermost-axis map))
+                          {:ok false :reason :inner-stage-axis-is-not-contiguous
+                           :sym sym :innermost (am/innermost-axis map) :axis (:axis inner-stage)}
+                          :else nil)))
+                    operands))
+       (let [p-sym (gensym "p__")
+             packed (into {} (for [{:keys [sym map]} operands]
+                               [sym (am/pack-innermost map 4 p-sym)]))]
+         (if (some nil? (vals packed))
+           {:ok false :reason :inner-extent-not-a-multiple-of-4 :extent (:extent inner-stage)}
+           {:ok true :packed-maps packed :p-sym p-sym
+            :packed-extent (quot (long (:extent inner-stage)) 4)}))))))
+
 (defn generate-staged-contraction-kernel
   "STAGED contraction → OpenCL: a reduction accumulating in N levels, each with its own
    accumulator dtype, with a `lift` splicing each level's partial sum into the level above.
@@ -1048,20 +1103,31 @@
             :lift-operands}. :array-params is the body's inputs; :lift-operands are the EXTRA
    scale arrays, bound after them — surfaced because omitting them from a launch descriptor is
    an arity bug (the signature has them either way)."
-  [{:keys [free-axes stages body inputs dtype out-dtype]
-    :or {dtype :float out-dtype :float}} out-sym]
+  [{:keys [free-axes stages body inputs dtype out-dtype operands tensorize-inner?]
+    :or {dtype :float out-dtype :float} :as spec} out-sym]
   (let [legal (cstage/stages-legal? stages (mapv (juxt :axis :extent) stages))
         _ (when-not (:ok legal)
             (throw (ex-info (str "staged contraction: illegal stages (" (:reason legal) ")")
                             (assoc legal :stages stages))))
         stages (vec stages)
-        op-ctype  (get codegen/opencl-type-map dtype "float")
+        ;; TENSORIZE THE INNER STAGE: the innermost accumulation is already an exact int32 sum over
+        ;; a short K-contiguous run, which is exactly dp4a's shape. Requested explicitly (a schedule
+        ;; choice), then GATED — a rejection falls back to the scalar nest, never to a wrong kernel.
+        tz (when tensorize-inner?
+             (let [g (staged-inner-dp4a-legal? spec)]
+               (when-not (:ok g)
+                 (throw (ex-info (str "staged contraction: cannot tensorize inner stage ("
+                                      (:reason g) ")") g)))
+               g))
+        ;; packed operands are READ as int32 words (4 int8 each); the buffer bytes are unchanged
+        op-ctype  (get codegen/opencl-type-map (if tz :int dtype) "float")
         out-ctype (get codegen/opencl-type-map out-dtype "float")
         lift-ops (cstage/lift-operands stages)
         idx-of (cstage/stage-index-exprs stages)
         ;; every axis in scope is an int loop/decompose variable
         int-vars (into #{} (map (comp symbol name))
-                       (concat (map first free-axes) (map :axis stages)))
+                       (concat (map first free-axes) (map :axis stages)
+                               (when tz [(:p-sym tz)])))
         arr-syms (into #{} (map (comp symbol name)) (concat inputs (map :sym lift-ops)))
         emit (fn [expr]
                (binding [ce/*emit-config* ce/opencl-config
@@ -1072,13 +1138,31 @@
         ;; innermost accumulates the body; each outer accumulates its lift with `inner` bound to
         ;; the accumulator one level down. Built inside-out.
         n (count stages)
-        inner-most (let [{:keys [dtype init axis extent]} (peek stages)
-                         t (get codegen/opencl-type-map dtype "float")]
-                     (str "        " t " " (acc-name (dec n)) " = " (or init 0) ";\n"
-                          "        for (int " (ce/c-symbol axis) " = 0; "
-                          (ce/c-symbol axis) " < " extent "; " (ce/c-symbol axis) "++) {\n"
-                          "            " (acc-name (dec n)) " += " (emit body) ";\n"
-                          "        }\n"))
+        ;; ONE description of the innermost loop, used at both nesting depths.
+        inner-loop
+        (fn [indent acc]
+          (let [{:keys [dtype init axis extent]} (peek stages)
+                t (get codegen/opencl-type-map dtype "float")
+                [loop-var bound step]
+                (if tz [(:p-sym tz) (:packed-extent tz) "dp4a"] [axis extent "scalar"])
+                pad (apply str (repeat indent " "))]
+            (str pad t " " acc " = " (or init 0) ";\n"
+                 pad "for (int " (ce/c-symbol loop-var) " = 0; "
+                 (ce/c-symbol loop-var) " < " bound "; " (ce/c-symbol loop-var) "++) {\n"
+                 pad "    " acc
+                 (if (= "dp4a" step)
+                   ;; 4 int8 MACs into the int32 accumulator per op; indices come from the PACKED
+                   ;; maps, so the stride rescaling is the axis-map algebra's, not hand-written.
+                   (str " = rstr_dp4a("
+                        (str/join ", " (for [{:keys [sym]} operands]
+                                         (str (ce/c-symbol sym) "["
+                                              (emit (am/index-expr (get (:packed-maps tz) sym)))
+                                              "]")))
+                        ", " acc ")")
+                   (str " += " (emit body)))
+                 ";\n"
+                 pad "}\n")))
+        inner-most (inner-loop 8 (acc-name (dec n)))
         nest (reduce
               (fn [inner-src d]
                 (let [{:keys [dtype init axis extent lift]} (nth stages d)
@@ -1095,15 +1179,7 @@
               inner-most
               (reverse (range (dec n))))
         ;; a single stage has no lift, so its accumulator is the whole nest, unindented
-        nest (if (= 1 n)
-               (let [{:keys [dtype init axis extent]} (peek stages)
-                     t (get codegen/opencl-type-map dtype "float")]
-                 (str "    " t " " (acc-name 0) " = " (or init 0) ";\n"
-                      "    for (int " (ce/c-symbol axis) " = 0; "
-                      (ce/c-symbol axis) " < " extent "; " (ce/c-symbol axis) "++) {\n"
-                      "        " (acc-name 0) " += " (emit body) ";\n"
-                      "    }\n"))
-               nest)
+        nest (if (= 1 n) (inner-loop 4 (acc-name 0)) nest)
         n-out (am/n-elements (am/of-axes (vec free-axes)))
         kernel-name (str "staged_contract_" (gensym ""))
         params (str (str/join ", " (for [a inputs]
@@ -1112,7 +1188,8 @@
                                  (str ", __global const " (get codegen/opencl-type-map dtype "float")
                                       "* restrict " (ce/c-symbol sym))))
                     ", __global " out-ctype "* restrict out, int _nseg")
-        src (str "__kernel void " kernel-name "(" params ") {\n"
+        src (str (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))
+                 "__kernel void " kernel-name "(" params ") {\n"
                  "    int seg = get_global_id(0);\n"
                  "    if (seg >= _nseg) return;\n"
                  (flat-decompose-c free-axes) "\n"
@@ -1124,5 +1201,8 @@
      :lift-operands (mapv :sym lift-ops)
      :dtype dtype :out-dtype out-dtype
      :stages stages
+     ;; the operand buffers are BOUND unchanged; only the kernel's view of them widens
+     :tensorized (boolean tz)
+     :packed (when tz :int8x4)
      :out-elems n-out
      :dims (mapv second free-axes)}))

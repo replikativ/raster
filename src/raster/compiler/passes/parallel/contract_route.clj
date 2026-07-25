@@ -150,7 +150,7 @@
    the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
    scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
-  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue stages]
+  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue stages operands]
                     :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
@@ -170,6 +170,9 @@
         form-opts (apply hash-map (drop 5 contract-form))
         epilogue (or epilogue (:epilogue form-opts))
         stages (or stages (:stages (apply hash-map (drop 5 contract-form))))
+        ;; declared operand axis-maps, needed to tensorize a staged inner stage (the gate VERIFIES
+        ;; them against the body rather than trusting them)
+        operands (or operands (:operands (apply hash-map (drop 5 contract-form))))
         tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile epilogue))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
@@ -182,13 +185,20 @@
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
       (and (seq stages) (> (count stages) 1))
-      (let [k (sco/generate-staged-contraction-kernel
-               {:free-axes free-axes :stages stages
-                :body (nth contract-form 4)
-                :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
-                :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
-                                            :float)}
-               out-sym)]
+      (let [;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
+            ;; MACs per int32 op) — the int8 peak leaf, and the same shape llama.cpp hand-writes.
+            ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
+            ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
+            spec {:free-axes free-axes :stages stages
+                  :body (nth contract-form 4)
+                  :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
+                  :operands operands
+                  :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
+                                              :float)}
+            tz? (and prefer-peak? (seq operands)
+                     (:ok (sco/staged-inner-dp4a-legal? spec)))
+            k (sco/generate-staged-contraction-kernel
+               (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
         {:strategy :staged-segred
          :kernel-name (:kernel-name k) :source (:source k)
          :array-params (:array-params k)
@@ -197,6 +207,8 @@
          :dtype (:dtype k) :out-dtype (:out-dtype k)
          :out-elems (:out-elems k)
          :stages (:stages k)
+         ;; the operand BUFFERS are bound unchanged; only the kernel's view of them widens to int32
+         :tensorized (:tensorized k) :packed (:packed k)
          :scalar-args [{:type :int :value nseg}]
          :wg [256 1]
          :grid [(ceil-div nseg 256) 1]})
