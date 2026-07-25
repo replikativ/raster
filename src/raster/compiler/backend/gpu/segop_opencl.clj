@@ -11,6 +11,10 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.hardware :as hw]
+            [raster.compiler.ir.axis-map :as am]
+            [clojure.walk :as walk]
+            [clojure.set]
             [raster.compiler.ir.segop :as segop]
             [clojure.string :as str]))
 
@@ -677,9 +681,142 @@
             (not (pitch-ok? L))   ; A pitch = K·2 bytes must be 16-byte aligned
             {:ok false :reason :k-pitch-unaligned :L L}
             :else
-            {:ok true :M M :N N :L L :row-arr row-arr :col-arr col-arr :arr-params arr-params}))
+            ;; i-sym/j-sym are the FREE axes; an epilogue binds them to the store slot's row/col
+            {:ok true :M M :N N :L L :i-sym i-sym :j-sym j-sym
+             :row-arr row-arr :col-arr col-arr :arr-params arr-params}))
         (catch clojure.lang.ExceptionInfo e
           {:ok false :reason :not-a-contraction :msg (.getMessage e)})))))
+
+(def ^:private epilogue-forbidden-ops
+  "Ops that cannot appear in a store-spliced epilogue because they force a distribution/layout
+   change of the accumulator (Triton's blocked-only / anchor set): a scan, a NON-associative
+   reduction, a permuting reshape, or an atomic. An associative reduction is not forbidden outright
+   — it is a RE-TILING decision (distribute the accumulator so the reduction is warp-local) which
+   we do not implement yet, so it is refused here with its own reason."
+  '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
+     raster.par/reduce raster.par/reduce-into raster.par/contract})
+
+(defn epilogue-legal?
+  "Legality of splicing `expr` into the contraction's STORE slot. Returns {:ok true} or
+   {:ok false :reason kw}. Distilled from Halide / XLA / Triton / MLIR-linalg:
+
+     • the epilogue is emitted strictly AFTER the reduction loop closes. Placing it inside forces
+       accumulator multi-buffering under software pipelining — a silent 2x on the most expensive
+       resource. Our splice is in the store slot, so this holds by construction; it is asserted
+       here so a future change cannot quietly break it.
+     • no op that forces a layout/distribution change: scan, non-associative reduce, permuting
+       reshape, atomic. A reduction in the epilogue is a re-tiling decision (redistribute the
+       accumulator so the reduce is warp-local) — legal in principle, unimplemented, so refused
+       with :reduction-in-epilogue rather than silently miscompiled.
+     • the accumulator must appear exactly ONCE: more than one use duplicates the reduction result
+       through the epilogue expression, which is the recompute case the ceilings guard against."
+  [{:keys [acc expr]}]
+  (let [nodes (tree-seq coll? seq expr)
+        heads (into #{} (keep #(when (seq? %) (first %))) nodes)
+        acc-uses (count (filter #(= acc %) nodes))]
+    (cond
+      (zero? acc-uses)                     {:ok false :reason :epilogue-ignores-accumulator}
+      (> acc-uses 1)                       {:ok false :reason :accumulator-used-more-than-once}
+      (some #{'raster.par/reduce 'raster.par/reduce-into} heads)
+      {:ok false :reason :reduction-in-epilogue}
+      (seq (clojure.set/intersection heads epilogue-forbidden-ops))
+      {:ok false :reason :layout-changing-op-in-epilogue
+       :ops (clojure.set/intersection heads epilogue-forbidden-ops)}
+      :else {:ok true})))
+
+(defn epilogue-cost
+  "Byte-traffic model for splicing an epilogue into the contraction's store, and the register
+   pressure it adds. Returns {:fused-bytes :unfused-bytes :saved-bytes :profitable :acc-regs}.
+
+   NOTE ON A TEST THAT DOES NOT TRANSFER. Halide's `is_func_trivial_to_inline`
+   (1 + sizeof(out) >= arith + bytes) is a PRODUCER-INLINING test: should I duplicate a producer's
+   work at each consumer, paying recompute? Applied to an epilogue it gives the wrong answer — it
+   scores a bias-add as unprofitable (call 3 vs inline 6 at f16) because it charges the bias LOAD
+   without crediting the eliminated round-trip. Epilogue (output) fusion is the opposite direction:
+   it REMOVES traffic rather than duplicating work.
+
+       unfused:  write C  +  read C  +  read operands  +  write C   ~ 3·M·N + operands
+       fused:    read operands                                     ~ operands
+
+   So an epilogue is profitable whenever it is legal and fits in registers — which is why Triton
+   and XLA fuse epilogues unconditionally and gate on legality + register pressure instead. The
+   recompute ceilings (8x CPU / 10x GPU) and the multi-consumer refusal belong to the PRODUCER
+   direction; the analogue here is `epilogue-legal?`'s accumulator-used-once rule.
+
+   Register estimate follows Triton's closed form: elems-per-thread × threads-per-warp ×
+   warps-per-CTA × elem-bytes / 4 registers for the accumulator; the epilogue's live values must
+   fit in the remaining budget (Triton clamps accumulator traffic at maxnreg/2 to avoid spilling)."
+  [{:keys [operands]} out-dtype [M N] tile]
+  (let [bytes-of (fn [dt] (long (get {:double 8 :float 4 :half 2 :float16 2 :int 4 :byte 1} dt 4)))
+        cb (bytes-of out-dtype)
+        c-elems (* (long M) (long N))
+        operand-bytes (reduce + 0 (for [{:keys [dtype] :or {dtype :float}} operands]
+                                    (* (long N) (bytes-of dtype))))
+        unfused (+ (* 3 c-elems cb) operand-bytes)   ; write + read + write, plus operand reads
+        fused   operand-bytes
+        ;; accumulator registers per lane: (block-m·block-n / (subgroups·subgroup)) f32 values
+        {:keys [block-m block-n sg-m sg-n]} tile
+        sg (long (get-in tile [:matrix :subgroup] 16))
+        acc-regs (when (and block-m block-n sg-m sg-n)
+                   (quot (* (long sg-m) (long sg-n)) sg))]
+    {:fused-bytes fused :unfused-bytes unfused
+     :saved-bytes (- unfused fused)
+     :profitable (< fused unfused)
+     :acc-regs acc-regs}))
+
+(defn epilogue-splice
+  "Build the (fn [acc-expr row col] -> C-expr) + param-decls + helpers that emit-gemm-tiled's
+   store-splice expects, from a DOMAIN-AGNOSTIC spec. The compiler learns no op names: the spec is
+   just an EXPRESSION over the accumulator and some operands, each operand carrying its own
+   axis-map, so bias / activation / residual / dequant-scale are all the same mechanism and
+   COMPOSE by nesting (one bigger expression), per CLAUDE.md's domain-agnostic-passes rule.
+
+     {:acc  acc            ;; symbol standing for the contraction's accumulator
+      :expr <s-expr>       ;; e.g. (raster.numeric/* (raster.numeric/+ acc (aget bias j)) s)
+      :operands [{:sym bias :map <axis-map over the FREE axes> :dtype :float}]
+      :scalars  [{:sym s :dtype :float}]      ;; optional uniform scalars
+      :helpers  <C source string>}  ;; optional, prepended (e.g. a silu_f definition)
+
+   `free-syms` are the contraction's two free-axis symbols, bound to the store slot's `row`/`col`
+   C variables — so an operand's axis-map generates its index exactly as in the kernel body.
+   Returns {:epilogue fn :epilogue-params str :epilogue-helpers str|nil}."
+  [{:keys [acc expr operands scalars helpers] :as spec} [i-sym j-sym] dtype]
+  (let [legal (epilogue-legal? spec)
+        _ (when-not (:ok legal)
+            (throw (ex-info (str "epilogue-splice: illegal epilogue (" (:reason legal) ")")
+                            (assoc legal :expr expr))))
+        ctype (get codegen/opencl-type-map dtype "float")
+        arr-syms (set (map (comp #(symbol (name %)) :sym) operands))
+        int-vars (into #{} (map #(symbol (name %))) [i-sym j-sym])
+        ;; substitute each operand's aget index from its declared map (maps, not pattern-matching)
+        idx-of (into {} (for [{:keys [sym map]} operands] [sym (am/index-expr map)]))
+        expr' (walk/postwalk
+               (fn [f] (if (and (seq? f) (= 'aget (first f)) (contains? idx-of (second f)))
+                         (list 'aget (second f) (get idx-of (second f)))
+                         f))
+               expr)
+        acc-token (str "__acc_" (name (gensym "")))
+        ;; emit once with a distinctive token standing in for the accumulator, then splice the
+        ;; real acc C-expression in at call time (the hook supplies it per store slot)
+        emitted (binding [ce/*emit-config* ce/opencl-config
+                          ce/*scalar-type* ctype
+                          ce/*int-vars* (into ce/*int-vars* int-vars)]
+                  (ce/emit-expr (walk/postwalk-replace {acc (symbol acc-token)} expr')
+                                (gensym "z__") arr-syms))
+        params (apply str
+                      (concat
+                       (for [{:keys [sym dtype] :or {dtype :float}} operands]
+                         (str ", __global const " (get codegen/opencl-type-map dtype "float")
+                              "* restrict " (ce/c-symbol sym)))
+                       (for [{:keys [sym dtype] :or {dtype :float}} scalars]
+                         (str ", " (get codegen/opencl-type-map dtype "float") " " (ce/c-symbol sym)))))]
+    {:epilogue (fn [acc-expr row col]
+                 (-> emitted
+                     (str/replace acc-token (str "(" acc-expr ")"))
+                     (str/replace (re-pattern (str "\\b" (ce/c-symbol i-sym) "\\b")) row)
+                     (str/replace (re-pattern (str "\\b" (ce/c-symbol j-sym) "\\b")) col)))
+     :epilogue-params params
+     :epilogue-helpers helpers}))
 
 (defn generate-dpas-contraction-kernel
   "DPAS/XMX-tensorized contraction → OpenCL (PEAK; raster's edge over Futhark's portable
@@ -695,29 +832,46 @@
             :tensorized true}  — NB: :array-params is in [row col] BINDING order (row's
    buffer → A slot, col's → B slot, out → C), NOT sorted-by-name. Returns
    {:tensorized false :reason …} when the gate rejects (caller falls back to regtiled)."
-  [segred out-sym & {:keys [dtype] :or {dtype :half}}]
+  [segred out-sym & {:keys [dtype desc tile epilogue] :or {dtype :half}}]
   (let [gate (dpas-contraction-legal? segred dtype)]
     (if-not (:ok gate)
       {:tensorized false :reason (:reason gate) :detail gate}
       (let [{:keys [M N L row-arr col-arr]} gate
             kernel-name (str "dpas_contract_" (gensym ""))
-            ;; tile geometry (defaults reproduce the original hand kernel bit-for-bit); returned
-            ;; so the ROUTER derives wg/grid from it instead of hardcoding 128/256 in a 2nd place.
-            tile {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32 :subgroup 16}
-            source (codegen/emit-gemm-tiled kernel-name :c-dtype :half
-                                            :block-m (:block-m tile) :block-n (:block-n tile)
-                                            :sg-m (:sg-m tile) :sg-n (:sg-n tile)
-                                            :block-k (:block-k tile))]
+            ;; TILE GEOMETRY IS DERIVED FROM THE HARDWARE DESCRIPTOR, never hardcoded: the
+            ;; per-subgroup accumulator tile is GRF-bound and rounded to the matrix (DPAS)
+            ;; fragment granularity, so a part with a different GRF budget / subgroup size /
+            ;; matrix shape gets a correctly rescaled tile from the same rule. An explicit
+            ;; `tile` (e.g. an autotune result via hw/gemm-tile-candidates) overrides.
+            ;; hw/derive-gemm-tile's own defaults reproduce the Arc 140V config, so passing no
+            ;; descriptor is equivalent to the previous literal — with zero magic numbers here.
+            tile (or tile (hw/derive-gemm-tile (or desc {})))
+            sg (long (get-in tile [:matrix :subgroup] 16))
+            ;; EPILOGUE FUSION: fold the consumer expression into the store slot, so a
+            ;; bias/activation/residual/dequant costs no extra kernel and no DRAM round-trip of C.
+            ep (when epilogue
+                 (epilogue-splice epilogue
+                                  [(:i-sym gate) (:j-sym gate)]
+                                  (get epilogue :dtype :float)))
+            source (apply codegen/emit-gemm-tiled kernel-name
+                          (concat [:c-dtype :half
+                                   :block-m (:block-m tile) :block-n (:block-n tile)
+                                   :sg-m (:sg-m tile) :sg-n (:sg-n tile)
+                                   :block-k (:block-k tile) :matrix (:matrix tile)]
+                                  (when ep [:epilogue (:epilogue ep)
+                                            :epilogue-params (:epilogue-params ep)
+                                            :epilogue-helpers (:epilogue-helpers ep)])))]
         {:kernel-name kernel-name
          :source source
          :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
          :dims [M N L]
          :dtype :half
          :tile tile
-         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × subgroup size
+         :epilogue-params (when ep (:epilogue-params ep))
+         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × the matrix subgroup size
          :workgroup [(* (quot (:block-m tile) (:sg-m tile))
                         (quot (:block-n tile) (:sg-n tile))
-                        (:subgroup tile)) 1]
+                        sg) 1]
          :tensorized true}))))
 
 ;; ================================================================

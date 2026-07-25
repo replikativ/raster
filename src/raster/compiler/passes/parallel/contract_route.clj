@@ -41,7 +41,8 @@
    the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
    scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
-  [contract-form & {:keys [dtype scheme prefer-peak?] :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
+  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue]
+                    :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
         contract-axes (nth contract-form 3)
@@ -55,11 +56,34 @@
                (reduce * 1 free-bounds)
                (reduce (fn [a b] (list 'clojure.core/* a b)) free-bounds))
         ;; memoized so the cond's test arm doesn't regenerate the kernel
-        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype))]
+        ;; a fused contraction carries its epilogue in the form's trailing opts (par-fusion's
+        ;; fuse-contract-map puts it there); an explicit :epilogue kwarg overrides.
+        form-opts (apply hash-map (drop 5 contract-form))
+        epilogue (or epilogue (:epilogue form-opts))
+        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile epilogue))]
     (cond
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
       (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
+
+      ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
+      ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
+      ;; SegSpace then has only the reduced dim — exactly the 1-D shape (seg-space-1d?) that
+      ;; generate-segred-kernel's two-phase tree reduction already consumes, so no new emitter.
+      ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
+      ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
+      (zero? n-free)
+      (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+            k (sco/generate-segred-kernel sr out-sym :dtype dtype)
+            red-bound (second (first contract-axes))]
+        {:strategy :full-reduce
+         :invoke :reduction
+         :kernel-name (:kernel-name k) :source (:source k)
+         :array-params (:array-params k)
+         :dtype dtype :out-dtype dtype :out-elems 1
+         :n-phases (:n-phases k)
+         :reduce-bound red-bound          ; element count the reduction spans
+         :scalar-args [] :dims [1]})
 
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
@@ -92,10 +116,11 @@
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.
    Returns nil if the form fails a structural precondition of BOTH (the emitters signal that
    with ex-info) — the caller then routes to the general naive leaf."
-  [contract-form out-sym dtype]
+  [contract-form out-sym dtype desc tile epilogue]
   (try
    (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-         dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype)]
+         dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype :desc desc :tile tile
+                                                    :epilogue epilogue)]
     (if (:tensorized dpas)
       (let [[M N _L] (:dims dpas)
             {:keys [block-m block-n]} (:tile dpas)]
@@ -104,7 +129,9 @@
          :source (:source dpas)
          :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
          :dtype :half :out-dtype :half :out-elems (* M N)
-         :wg (:workgroup dpas)                       ; derived from the emitted tile
+         :tile (:tile dpas)                          ; the DERIVED tile actually emitted
+         :fused-epilogue (boolean epilogue)
+         :wg (:workgroup dpas)                       ; derived from that tile
          :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
          :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
          :dims (:dims dpas)})

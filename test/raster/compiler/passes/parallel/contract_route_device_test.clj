@@ -346,3 +346,37 @@
         (is (every? some? [(:kernel-name r) (:source r) (:array-params r) (:dtype r)
                            (:out-dtype r) (:out-elems r) (:wg r) (:grid r) (:scalar-args r)])
             (str label " descriptor incomplete"))))))
+
+;; ── Q1: the emitted tile is DERIVED from the hardware descriptor, never hardcoded ─────
+;; The DPAS leaf previously hardcoded {128 128 32 32 32, subgroup 16}. That constant happens to
+;; equal the Arc 140V derivation, so it worked here and no test caught it — but on a part with a
+;; different GRF budget / subgroup size / matrix shape it would emit a wrong-for-the-hardware
+;; tile while the production GEMM path adapted correctly. These are the tests that catch that.
+(deftest tile-is-derived-from-the-hardware-descriptor
+  (let [mm (matmul-form 256 512 128)
+        hw (requiring-resolve 'raster.compiler.core.hardware/derive-gemm-tile)]
+    (testing "no descriptor ⇒ hw/derive-gemm-tile's own defaults (the Arc config) — a NO-OP swap"
+      (let [r (route/route-contraction mm :dtype :half)]
+        (is (= (hw {}) (:tile r)))
+        (is (= {:block-m 128 :block-n 128 :sg-m 32 :sg-n 32 :block-k 32}
+               (select-keys (:tile r) [:block-m :block-n :sg-m :sg-n :block-k]))
+            "must still reproduce the hand-tuned Arc tile")
+        (is (= [256 1] (:wg r)))
+        (is (= [4 2] (:grid r)))))                     ; ceil(512/128), ceil(256/128)
+    (testing "a part with HALF the GRF and subgroup 8 gets a rescaled tile AND launch geometry"
+      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+            r (route/route-contraction mm :dtype :half :desc small)]
+        (is (= {:block-m 64 :block-n 64 :sg-m 16 :sg-n 16 :block-k 32}
+               (select-keys (:tile r) [:block-m :block-n :sg-m :sg-n :block-k])))
+        (is (= [128 1] (:wg r)) "workgroup = (bm/sgm)·(bn/sgn)·subgroup = 4·4·8")
+        (is (= [8 4] (:grid r)) "grid follows the smaller block tile")))
+    (testing "an explicit tile (e.g. an autotune result) overrides the derivation"
+      (let [t (hw {} {:wg-subgroups 4})
+            r (route/route-contraction mm :dtype :half :tile t)]
+        (is (= t (:tile r)))
+        (is (not= (:block-m (hw {})) (:block-m t)) "the override must actually differ")))
+    (testing "the emitted kernel source carries the derived tile, not a constant"
+      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+            src (:source (route/route-contraction mm :dtype :half :desc small))]
+        (is (re-find #"intel_reqd_sub_group_size\(8\)" src)
+            "subgroup size must follow the descriptor into the kernel attribute")))))
