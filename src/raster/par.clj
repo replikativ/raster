@@ -530,19 +530,19 @@
 ;; Element-wise operations: (All [T]) — body uses broadcast which is type-polymorphic
 (deftm axpy
   "Compute y + alpha*x element-wise (BLAS axpy)."
-  (All [T] [alpha :- Double,
+  (All [T] [alpha :- T,
             x :- (Array T), y :- (Array T)] :- (Array T)
        (broadcast [x y] (+ y (* alpha x)))))
 
 (deftm scale
   "Scale array x by scalar alpha element-wise."
-  (All [T] [alpha :- Double,
+  (All [T] [alpha :- T,
             x :- (Array T)] :- (Array T)
        (broadcast [x] (* alpha x))))
 
 (deftm fill
   "Fill every element of out with val."
-  (All [T] [out :- (Array T), val :- Double] :- (Array T)
+  (All [T] [out :- (Array T), val :- T] :- (Array T)
        (dotimes [i (alength out)]
          (aset out i val))
        out))

@@ -406,14 +406,14 @@
          out)))
 
 (deftm scale! "Scale array a by scalar c, storing result in out. Returns out."
-  (All [T] [out :- (Array T), c :- Double, a :- (Array T)]
+  (All [T] [out :- (Array T), c :- T, a :- (Array T)]
        :- (Array T)
        (let [n (alength out)]
          (dotimes [i n] (aset out i (clojure.core/* c (aget a i))))
          out)))
 
 (deftm axpy! "Compute a + c*b element-wise, storing result in out. Returns out."
-  (All [T] [out :- (Array T), a :- (Array T), c :- Double, b :- (Array T)]
+  (All [T] [out :- (Array T), a :- (Array T), c :- T, b :- (Array T)]
        :- (Array T)
        (let [n (alength out)]
          (dotimes [i n] (aset out i (clojure.core/+ (aget a i) (clojure.core/* c (aget b i)))))

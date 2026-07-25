@@ -30,7 +30,7 @@
 
 ;; SGD: in-place weight update (mutating — param is shared state)
 (deftm sgd-step! (All [T] [param :- (Array T), grad :- (Array T),
-                           n :- Long, lr :- Double] :- (Array T)
+                           n :- Long, lr :- T] :- (Array T)
                       (dotimes [i (alength param)]
                         (aset param i (- (aget param i) (* lr (aget grad i)))))
                       param))
@@ -48,8 +48,8 @@
 
 (deftm adam-step! (All [T] [param :- (Array T) grad :- (Array T)
                             m :- (Array T) v :- (Array T)
-                            n :- Long lr :- Double beta1 :- Double beta2 :- Double
-                            eps :- Double t :- Long] :- (Array T)
+                            n :- Long lr :- T beta1 :- T beta2 :- T
+                            eps :- T t :- Long] :- (Array T)
                        (let [bc1 (- 1.0 (n/pow beta1 t))
                              bc2 (- 1.0 (n/pow beta2 t))]
                          (dotimes [i n]
@@ -71,8 +71,8 @@
 
 (deftm adamw-step! (All [T] [param :- (Array T) grad :- (Array T)
                              m :- (Array T) v :- (Array T)
-                             n :- Long lr :- Double beta1 :- Double beta2 :- Double
-                             eps :- Double weight-decay :- Double t :- Long]
+                             n :- Long lr :- T beta1 :- T beta2 :- T
+                             eps :- T weight-decay :- T t :- Long]
                         :- (Array T)
                         (let [bc1 (- 1.0 (n/pow beta1 t))
                               bc2 (- 1.0 (n/pow beta2 t))]
@@ -109,7 +109,7 @@
 
 ;; EMA: in-place state update (mutating — shadow is shared state)
 (deftm ema-update! (All [T] [shadow :- (Array T), param :- (Array T),
-                             n :- Long, mu :- Double] :- (Array T)
+                             n :- Long, mu :- T] :- (Array T)
                         (dotimes [i (alength shadow)]
                           (aset shadow i (+ (* mu (aget shadow i)) (* (- 1.0 mu) (aget param i)))))
                         shadow))
@@ -174,9 +174,11 @@
       (let [{:keys [m v t]} (get state name)
             step (swap! t inc)
             n (alength param)]
-        (adam-step! param grad m v n (double lr)
-                    (double beta1) (double beta2)
-                    (double eps) (long step)))))
+        ;; The optimizer kernels are (All [T]); convert each scalar to the PARAM's element
+        ;; type here — the boundary where "what precision is my learning rate" belongs.
+        (adam-step! param grad m v n (n/oftype param lr)
+                    (n/oftype param beta1) (n/oftype param beta2)
+                    (n/oftype param eps) (long step)))))
   params)
 
 ;; ================================================================
@@ -249,17 +251,20 @@
         (let [n (alength param)]
           (case (:type state)
             :sgd
-            (sgd-step! param grad n lr)
+            (sgd-step! param grad n (n/oftype param lr))
 
             :adam
             (let [{:keys [m v t]} (get (:params-state state) name)
                   t-val (swap! t inc)]
-              (adam-step! param grad m v n lr beta1 beta2 eps t-val))
+              (adam-step! param grad m v n (n/oftype param lr) (n/oftype param beta1)
+                          (n/oftype param beta2) (n/oftype param eps) t-val))
 
             :adamw
             (let [{:keys [m v t]} (get (:params-state state) name)
                   t-val (swap! t inc)]
-              (adamw-step! param grad m v n lr beta1 beta2 eps weight-decay t-val))))))
+              (adamw-step! param grad m v n (n/oftype param lr) (n/oftype param beta1)
+                           (n/oftype param beta2) (n/oftype param eps)
+                           (n/oftype param weight-decay) t-val))))))
     params))
 
 (defn get-lr
