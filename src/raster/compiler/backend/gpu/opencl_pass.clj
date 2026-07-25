@@ -12,6 +12,7 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
+            [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.backend.gpu.par-opencl :as legacy]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
@@ -114,7 +115,7 @@
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
   (let [top-scalar-types (merge (or (:scalar-types (meta form)) {}) scalar-types)
         top-array-types (merge (or (:array-types (meta form)) {}) array-types)
-        stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :fallback 0})
+        stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0 :fallback 0})
         kernels (atom [])
 
         register-kernel!
@@ -169,6 +170,31 @@
                           out
                           (vec (:scalar-params k))
                           bound)))))
+
+            ;; === par/contract — tensor contraction, routed through the DPAS legality gate ===
+            ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX
+            ;; tensorize when legal (canonical f16 matmul, pitch-aligned) → peak (byte-identical
+            ;; to the hand GEMM front door); otherwise the portable register-tiled kernel (any
+            ;; dtype, arbitrary dims). Emits a 2D invoke-registered-contraction! marker.
+            (croute/par-contract-form? form)
+            (let [out-sym (second form)
+                  r (croute/route-contraction form :dtype dtype)
+                  k (register-kernel! {:kernel-name (:kernel-name r) :source (:source r)
+                                       :dtype (:dtype r)}
+                                      :ze-contracts)]
+              ;; Pass the descriptor through INTACT — scalar-args as data (the exact shape
+              ;; launch-2d! wants), explicit out-dtype/out-elems. Any :strategy works; the
+              ;; old (count scalar-args) + [m n k] reconstruction only covered :dpas/:regtiled.
+              (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                    (:kernel-name k)
+                    (vec (:array-params r))       ; operand symbols (vector literal evaluates them)
+                    out-sym
+                    (:dtype r)
+                    (:out-dtype r)
+                    (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
+                    (vec (:wg r))
+                    (vec (:grid r))
+                    (vec (:scalar-args r))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the

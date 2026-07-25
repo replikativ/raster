@@ -961,7 +961,10 @@
         (aset out i (double (.get seg ValueLayout/JAVA_INT (long (* i 4))))))
       :long
       (dotimes [i n]
-        (aset out i (double (.get seg ValueLayout/JAVA_LONG (long (* i 8)))))))
+        (aset out i (double (.get seg ValueLayout/JAVA_LONG (long (* i 8))))))
+      (:byte :int8)
+      (dotimes [i n]
+        (aset out i (double (.get seg ValueLayout/JAVA_BYTE (long i))))))
     out))
 
 (defn copy-doubles-to-fp16!
@@ -2254,8 +2257,8 @@
 (def ^:private transpose-cache (atom {}))
 
 (defn- ensure-transpose-kernel!
-  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float). Returns
-   {:module :kernel :kernel-name}."
+  "Lazily compile + cache a 2D transpose kernel for a dtype (:half | :float | :byte). Generic
+   on element width via opencl-type-map (:byte → char). Returns {:module :kernel :kernel-name}."
   [dtype]
   (ensure-init!)
   (or (get @transpose-cache dtype)
@@ -2275,7 +2278,11 @@
 (defn bind-registered-transpose!
   "Bind a 2D transpose kernel (in[rows,cols] → out[cols,rows], row-major) over RESIDENT buffers
   for recording — used to realize dgemm-nt!/-tn! by transposing an operand before the :nn XMX
-  GEMM. dtype :half (default) | :float. Returns a bound {:kernel :gc-seg} map."
+  GEMM, and to prepare an int8 :nt operand for the dp4a peak leaf (B3-insert). dtype :half
+  (default) | :float | :byte (int8). The kernel transposes at ELEMENT granularity for its dtype:
+  for int8 operands it MUST be bound :byte — transposing at :int (packed int32) granularity
+  would permute packed words and scramble dp4a's K-packing (silent garbage). Returns a bound
+  {:kernel :gc-seg} map."
   ([in out rows cols] (bind-registered-transpose! in out rows cols :half))
   ([in out rows cols dtype]
    (let [{:keys [module kernel-name]} (ensure-transpose-kernel! dtype)
@@ -3112,6 +3119,76 @@
         (dotimes [i c-elems]
           (aset cd i (double (aget tmp-floats i))))
         C))))
+
+(defn- stage-operand!
+  "Copy host array `arr` (double[]/float[]) of `nel` elements into cached shared memory for
+  [kernel-name k], converting to f16 when `half?`. Returns the MemorySegment."
+  ^MemorySegment [^String kernel-name k arr nel half? esize]
+  (let [nel (long nel) esize (long esize)]
+   (if half?
+    (let [shorts (ensure-arr kernel-name (keyword (str (name k) "-sh")) nel)
+          seg (ensure-seg kernel-name k (* nel 2))]
+      (if (instance? (Class/forName "[F") arr)
+        (let [^floats af arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (aget af i))))))
+        (let [^doubles ad arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (float (aget ad i))))))))
+      (MemorySegment/copy (MemorySegment/ofArray shorts) 0 seg 0 (* nel 2))
+      seg)
+    (let [seg (ensure-seg kernel-name k (* nel esize))]
+      (MemorySegment/copy (MemorySegment/ofArray arr) 0 seg 0 (* nel esize))
+      seg))))
+
+(defn- readback-operand!
+  "Copy `nel` elements from shared segment `seg` back into host array `out`, converting from
+  f16 when `half?`."
+  [^MemorySegment seg out nel half? esize]
+  (let [nel (long nel) esize (long esize)]
+   (if half?
+    (if (instance? (Class/forName "[F") out)
+      (let [^floats of out] (dotimes [i nel] (aset of i (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))
+      (let [^doubles od out] (dotimes [i nel] (aset od i (double (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))))
+    (MemorySegment/copy seg 0 (MemorySegment/ofArray out) 0 (* nel esize)))
+  out))
+
+(defn invoke-registered-contraction!
+  "Pipeline-friendly tensor contraction: launch a routed contraction kernel (the descriptor
+  from contract-route/route-contraction) over host arrays or DeviceBuffers with a 2D grid.
+  This is the resident/host-staging analog of invoke-registered-kernel for the 2-operand
+  contraction shape C[m×n] = Σ_k A[m×k]·B[k×n]. The routing brain already chose DPAS-vs-
+  regtiled and the dtype; this just stages + launches.
+
+  Takes the routed descriptor's values INTACT — no reconstruction from dims (which only worked
+  for the two 2-operand strategies and crashed on the rest). Input sizes come from the arrays
+  themselves (alength), so any operand arity/shape works.
+
+  inputs      : host arrays (double[]/float[]/byte[]) or DeviceBuffers, in :array-params order
+  out         : host array or DeviceBuffer for the result
+  dtype       : OPERAND element type (:half converts operands to f16 for the DPAS/XMX leaf)
+  out-dtype   : RESULT element type (differs from dtype for quant: int8 in, f32 out)
+  out-elems   : number of result elements
+  wg          : [x y] workgroup   grid : [gx gy] group counts
+  scalar-args : the descriptor's :scalar-args, passed straight through to launch-2d!"
+  [^String kernel-name inputs out dtype out-dtype out-elems wg grid scalar-args]
+  (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
+        out-elems (long out-elems)
+        half? (boolean (#{:half :float16} dtype))
+        esize (long (get dtype-byte-sizes dtype 8))
+        out-half? (boolean (#{:half :float16} out-dtype))
+        out-esize (long (get dtype-byte-sizes out-dtype 8))
+        dev-inputs (mapv (fn [arr idx]
+                           (if (device-buffer? arr)
+                             (:segment ^DeviceBuffer arr)
+                             (stage-operand! kernel-name (keyword (str "c-in-" idx))
+                                             arr (java.lang.reflect.Array/getLength arr) half? esize)))
+                         inputs (range))
+        out-buffer? (device-buffer? out)
+        out-seg (if out-buffer? (:segment ^DeviceBuffer out)
+                    (ensure-seg kernel-name :c-out (* out-elems out-esize)))
+        all-args (vec (concat dev-inputs [out-seg] scalar-args))
+        [gx gy] grid]
+    (launch-2d! kernel-handle wg [gx gy] all-args)
+    (when-not out-buffer?
+      (readback-operand! out-seg out out-elems out-half? out-esize))
+    out))
 
 (defn invoke-gpu-transpose!
   "Transpose matrix on GPU via registered kernel. Zero CPU↔GPU copies.

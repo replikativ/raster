@@ -138,6 +138,77 @@
            (recur (inc ~idx-sym) ~body-expr)
            ~acc-sym)))))
 
+(defmacro contract
+  "Explicit tensor contraction (SOAC). Declares FREE (parallel/output) axes and
+  CONTRACTED (reduced) axes separately — the reliable, unambiguous scheduling signal
+  that a `Screma`/`SegRed` carries as parallel-vs-reduction structure (vs a nested
+  map+reduce where the reduce hides inside the map-lambda and must be recognized).
+
+  Form: (raster.par/contract out [[i mi] [j mj] ...] [[k mk]] body)
+    out          — output array; length = product of free-axis bounds, ROW-MAJOR over
+                   the free axes in declared order (outer→inner)
+    free-axes    — [[idx-sym bound] ...] the parallel output axes (≥1)
+    contract-axes— [[idx-sym bound] ...] the reduced axes: 0 (outer product / pure map),
+                   1, or n (n≥2 are flattened into one innermost reduced dim)
+    body         — the summand expression; may reference every free and contract idx
+    opts         — :init (accumulator init, default 0.0), :combine (default +)
+
+  Semantics: for each free index tuple f, out[flat(f)] = combine-fold over the
+  contracted axis of body. The COMPILER recognizes the `raster.par/contract` form
+  directly (free/contract axes are explicit → no index-expr matching), lifting it to a
+  segmented reduction the tiling pass consumes. This macro is the interpreted runtime
+  fallback; it is fully compositional because it lowers to a segmented Screma, so its
+  output fuses with downstream SOACs (epilogue) like any reduction.
+
+  Example (C[m,n] = A[m,k]·B[k,n], row-major):
+    (raster.par/contract C [[i m] [j n]] [[l k]]
+      (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))"
+  [out free-axes contract-axes body & {:keys [init combine] :or {init 0.0 combine '+}}]
+  (assert (and (vector? free-axes) (pos? (count free-axes)))
+          "par/contract: free-axes must be a non-empty vector of [idx bound]")
+  (assert (vector? contract-axes)
+          "par/contract: contract-axes must be a vector (0 → outer product/map; n≥1 → contraction, n≥2 flattened)")
+  (let [free-syms   (mapv first free-axes)
+        int-bounds  (mapv (fn [[_ b]] `(int ~b)) free-axes)
+        f-sym   (gensym "f__")
+        out-sym (gensym "out__")
+        F-sym   (gensym "F__")
+        acc-sym (gensym "acc__")
+        nfree   (count free-axes)
+        F-expr  (clojure.core/reduce (fn [a b] `(clojure.core/* ~a ~b)) int-bounds)
+        ;; row-major decompose flat f into each free index:
+        ;;   idx_p = (f / (product of bounds after p)) mod bound_p
+        suffix  (fn [p] (let [after (subvec int-bounds (inc p))]
+                          (if (empty? after) 1
+                              (clojure.core/reduce (fn [a b] `(clojure.core/* ~a ~b)) after))))
+        decomp  (vec (mapcat (fn [p sym]
+                               [sym `(clojure.core/rem
+                                      (clojure.core/quot ~f-sym ~(suffix p))
+                                      ~(nth int-bounds p))])
+                             (range nfree) free-syms))]
+    (if (empty? contract-axes)
+      ;; 0 contract axes → pure map (outer product / broadcast): out[f] = body.
+      `(let [~out-sym ~out ~F-sym ~F-expr]
+         (dotimes [~f-sym ~F-sym]
+           (let [~@decomp]
+             (clojure.core/aset ~out-sym ~f-sym ~body)))
+         ~out-sym)
+      ;; n≥1 contract axes → contraction: reduce `body` over the (flattened) contracted axis.
+      ;; flatten-contract-axes collapses n≥2 axes into one flat index k-sym and substitutes
+      ;; each original contract index in the body (one source of truth with the compiler path).
+      (let [[k-sym k-bound sbody]
+            ((requiring-resolve 'raster.compiler.passes.parallel.contract-lower/flatten-contract-axes)
+             contract-axes body)]
+        `(let [~out-sym ~out ~F-sym ~F-expr]
+           (dotimes [~f-sym ~F-sym]
+             (let [~@decomp]
+               (clojure.core/aset ~out-sym ~f-sym
+                                  (loop [~k-sym 0 ~acc-sym ~init]
+                                    (if (clojure.core/< ~k-sym (int ~k-bound))
+                                      (recur (clojure.core/inc ~k-sym) (~combine ~acc-sym ~sbody))
+                                      ~acc-sym)))))
+           ~out-sym)))))
+
 (defmacro scan
   "Parallel prefix scan (inclusive). When compiled (eval'd), expands to
   a plain sequential loop. The compiler pipeline can optimize the
