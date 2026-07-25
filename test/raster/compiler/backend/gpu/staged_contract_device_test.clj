@@ -17,6 +17,7 @@
    float, so it is asserted with `=`, not a tolerance. Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.contract-stages :as cs]
+            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.backend.gpu.segop-opencl :as sco]))
 
 (def ^:private gpu?
@@ -92,7 +93,7 @@
 (defn- run-staged
   "Emit, register and launch a staged contraction; return the device output vector. `lift-arrays`
    maps each lift operand symbol → its float array, bound in the emitter's declared order."
-  [stages body-expr ^bytes a ^bytes b lift-arrays]
+  [stages body-expr ^bytes a ^bytes b lift-arrays & [extra]]
   (let [ze (find-ns 'raster.gpu.ze-runtime)
         register! (ns-resolve ze 'register-kernel!)
         ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
@@ -102,8 +103,9 @@
         launch-2d! (ns-resolve ze 'launch-2d!)
         {:keys [kernel-name source array-params lift-operands out-elems]}
         (sco/generate-staged-contraction-kernel
-         {:free-axes [['i M] ['j N]] :stages stages :body body-expr
-          :inputs '[a b] :dtype :byte :out-dtype :float}
+         (merge {:free-axes [['i M] ['j N]] :stages stages :body body-expr
+                 :inputs '[a b] :dtype :byte :out-dtype :float}
+                extra)
          'out)
         _ (assert (= '[a b] array-params))
         _ (register! kernel-name {:source source :dtype :byte})
@@ -239,3 +241,69 @@
                     {:axis 't :extent B :dtype :int :init 0}]
            :body body :inputs '[a b] :dtype :byte :out-dtype :float}
           'out)))))
+
+;; ── the int8 PEAK leaf: tensorize the inner stage with dp4a ──────────────────────────
+(def ^:private body-maps
+  ;; a[i,(blk t)] and b[j,(blk t)] — both K-CONTIGUOUS in the inner stage axis, which is what dp4a
+  ;; requires (the :nt layout). Declared, then VERIFIED against the body by the gate.
+  {'a (am/of-groups [[['i M]] [['blk NB] ['t B]]])
+   'b (am/of-groups [[['j N]] [['blk NB] ['t B]]])})
+
+(deftest dp4a-tensorized-inner-stage-matches-the-scalar-nest
+  (if-not @gpu?
+    (println "  [skip] no GPU — dp4a staged inner-stage device test")
+    (let [da (pow2-scales (* M NB) 0)
+          db (pow2-scales (* N NB) 3)
+          ;; body built FROM the declared maps, so declaration and use cannot drift
+          body' (list 'raster.numeric/*
+                      (list 'aget 'a (am/index-expr (get body-maps 'a)))
+                      (list 'aget 'b (am/index-expr (get body-maps 'b))))
+          operands [{:sym 'a :map (get body-maps 'a)} {:sym 'b :map (get body-maps 'b)}]
+          scalar (run-staged two-stage body' a-data b-data {'da da 'db db})
+          packed (run-staged two-stage body' a-data b-data {'da da 'db db}
+                             {:operands operands :tensorize-inner? true})
+          ref (vec (ref-staged a-data b-data da db))]
+      (testing "dp4a and the scalar nest agree EXACTLY — int32 accumulation is exact, so any
+                difference would be a real defect, not rounding"
+        (is (= scalar packed)))
+      (testing "…and both match the host reference"
+        (is (= ref packed)))
+      (testing "non-trivial result"
+        (is (some #(not (zero? %)) packed))))))
+
+(deftest dp4a-gate-refuses-rather-than-miscompiling
+  (let [good-a (get body-maps 'a) good-b (get body-maps 'b)
+        body' (list 'raster.numeric/*
+                    (list 'aget 'a (am/index-expr good-a))
+                    (list 'aget 'b (am/index-expr good-b)))
+        spec {:free-axes [['i M] ['j N]] :stages two-stage :body body'
+              :inputs '[a b] :dtype :byte :out-dtype :float
+              :operands [{:sym 'a :map good-a} {:sym 'b :map good-b}]}]
+    (testing "the honest case is legal"
+      (is (:ok (sco/staged-inner-dp4a-legal? spec))))
+    (testing "a MISDECLARED operand map is caught, not trusted — assuming a layout while having
+              checked only the axis symbols is how a transpose rewrite silently miscompiled before"
+      (is (= :declared-map-does-not-match-the-body-index
+             (:reason (sco/staged-inner-dp4a-legal?
+                       (assoc-in spec [:operands 0 :map]
+                                 (am/of-groups [[['i M]] [['t B] ['blk NB]]])))))))
+    (testing "an operand that is NOT contiguous in the inner stage axis cannot be packed"
+      (let [nn-b (am/of-groups [[['blk NB] ['t B]] [['j N]]])]   ; b[(blk t), j] — j innermost
+        (is (= :inner-stage-axis-is-not-contiguous
+               (:reason (sco/staged-inner-dp4a-legal?
+                         (-> spec
+                             (assoc-in [:operands 1 :map] nn-b)
+                             (assoc :body (list 'raster.numeric/*
+                                                (list 'aget 'a (am/index-expr good-a))
+                                                (list 'aget 'b (am/index-expr nn-b)))))))))))
+    (testing "a float inner accumulator is not a dp4a shape"
+      (is (= :inner-stage-accumulator-not-integral
+             (:reason (sco/staged-inner-dp4a-legal?
+                       (assoc-in spec [:stages 1 :dtype] :float))))))
+    (testing "requesting tensorize when illegal THROWS — it never silently degrades to scalar,
+              because a silent degradation is an invisible perf cliff"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"cannot tensorize inner stage"
+           (sco/generate-staged-contraction-kernel
+            (assoc spec :tensorize-inner? true
+                   :operands [{:sym 'a :map good-a}]) 'out))))))

@@ -69,3 +69,27 @@
       (is (= '(clojure.core/+ (clojure.core/* i k) l) (am/index-expr m)))
       (is (= '[m k] (am/shape m)))
       (is (= '(clojure.core/* m k) (am/n-elements m))))))
+
+(deftest index-verification-normalizes-sum-associativity
+  (testing "a hand-nested index still verifies against the flat form the map generates —
+            otherwise the gate would reject correct declarations and get bypassed"
+    (let [m (am/of-groups '[[[i 4]] [[blk 4] [t 32]]])]
+      (is (= '(clojure.core/+ (clojure.core/* i 128) (clojure.core/* blk 32) t)
+             (am/index-expr m)))
+      (is (am/index-matches? m '(clojure.core/+ (clojure.core/* i 128)
+                                                (clojure.core/+ (clojure.core/* blk 32) t)))
+          "nested sum")
+      (is (am/index-matches? m '(+ (* i 128) (+ (* blk 32) t)))
+          "…and bare operator heads")
+      (is (not (am/index-matches? m '(clojure.core/+ (clojure.core/* i 128) t)))
+          "a genuinely different index must still be rejected"))))
+
+(deftest packing-reinterprets-the-buffer-as-wider-words
+  (testing "pack-innermost rescales every stride by dividing ONE extent"
+    (let [m (am/of-groups '[[[i 4]] [[blk 4] [t 32]]])]
+      (is (= '(clojure.core/+ (clojure.core/* i 32) (clojure.core/* blk 8) p)
+             (am/index-expr (am/pack-innermost m 4 'p))))
+      (is (= 't (am/innermost-axis m)))))
+  (testing "refuse a non-divisible or symbolic innermost extent instead of mis-striding"
+    (is (nil? (am/pack-innermost (am/of-groups '[[[i 4]] [[t 30]]]) 4 'p)))
+    (is (nil? (am/pack-innermost (am/of-axes '[[i 4] [t k]]) 4 'p)))))
