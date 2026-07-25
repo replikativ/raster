@@ -150,10 +150,49 @@
                              ["ij->i"        {:i 2 :j 3}            '[A]]
                              ["ii->i"        {:i 3}                 '[A]]]]
         (is (expressible? sub dm syms) (str sub " should be expressible"))))
-    (testing "NOT YET expressible: scalar output needs 0 free axes (G2), and fails LOUD"
+    (testing "EXPRESSIBLE: scalar output too — the (0 free, n contract) reduction cell (G2)"
       (doseq [[sub dm syms] [["ij->"  {:i 2 :j 3} '[A]]
                              ["ii->"  {:i 3}      '[A]]
                              ["i,i->" {:i 3}      '[A B]]]]
-        (is (not (expressible? sub dm syms)) (str sub " is G2, must not silently succeed"))
-        (is (thrown-with-msg? AssertionError #"scalar output"
-                              (es/einsum->contract-form sub dm 'O syms)))))))
+        (is (expressible? sub dm syms) (str sub " should be expressible"))))
+    (testing "COVERAGE IS COMPLETE: every subscript in einsum's own test suite lowers"
+      (doseq [[sub dm syms] [["ij,jk->ik" {:i 2 :j 3 :k 4} '[A B]]
+                             ["bij,bjk->bik" {:b 2 :i 2 :j 3 :k 4} '[A B]]
+                             ["ij,ij->ij" {:i 2 :j 3} '[A B]] ["i,j->ij" {:i 2 :j 3} '[A B]]
+                             ["i,i->" {:i 3} '[A B]] ["ij->ji" {:i 2 :j 3} '[A]]
+                             ["ij->i" {:i 2 :j 3} '[A]] ["ij->" {:i 2 :j 3} '[A]]
+                             ["ii->" {:i 3} '[A]] ["ii->i" {:i 3} '[A]]]]
+        (is (expressible? sub dm syms) (str sub " — all 10 einsum-test subscripts must lower"))))))
+
+;; ── G2: SCALAR output — the (0 free, n contract) cell of contract's algebra ───────────
+;; contract's algebra has four cells: (n free, 0 contract) = map, (n, n) = contraction,
+;; (0, n) = FULL REDUCTION, and 0 free axes is a legal result in that algebra — so the
+;; primitive supports it. It needs no new IR or emitter: the SegSpace degenerates to the 1-D
+;; shape (segop/seg-space-1d?) that the existing two-phase tree reduction already consumes.
+(deftest scalar-output-is-the-reduction-cell
+  (testing "the macro: 0 free axes = the empty product, one iteration, writes out[0]"
+    (let [A (double-array [1 2 3 4]) B (double-array [1 2 3 4]) O (double-array 1)]
+      (raster.par/contract O [] [[i 4]]
+                           (clojure.core/* (clojure.core/aget A i) (clojure.core/aget B i)))
+      (is (= 30.0 (aget O 0)))))                          ; dot product
+  (testing "sum over all axes (2 contract axes, flattened)"
+    (let [A (double-array [1 2 3 4 5 6]) O (double-array 1)]
+      (raster.par/contract O [] [[i 6]] (clojure.core/aget A i))
+      (is (= 21.0 (aget O 0)))))
+  (testing "trace: a repeated label gives the diagonal, reduced to a scalar"
+    (let [M (double-array [1 2 3 4 5 6 7 8 9]) O (double-array 1)]
+      (raster.par/contract O [] [[i 3]]
+                           (clojure.core/aget M (clojure.core/+ (clojure.core/* i 3) i)))
+      (is (= 15.0 (aget O 0)))))
+  (testing "einsum lowers all three scalar-output subscripts"
+    (doseq [[sub dm syms] [["i,i->" {:i 3} '[A B]] ["ij->" {:i 2 :j 3} '[A]] ["ii->" {:i 3} '[A]]]]
+      (let [f (es/einsum->contract-form sub dm 'O syms)]
+        (is (= [] (nth f 2)) (str sub " has 0 free axes"))
+        (is (seq (nth f 3)) (str sub " contracts at least one axis")))))
+  (testing "the router sends it to the two-phase reduction, with its own invoke protocol"
+    (let [r ((requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
+             '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i))) :dtype :double)]
+      (is (= :full-reduce (:strategy r)))
+      (is (= :reduction (:invoke r)))
+      (is (= 2 (:n-phases r)))
+      (is (= 1 (:out-elems r))))))

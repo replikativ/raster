@@ -61,6 +61,25 @@
       (#{:byte :int8} dtype)
       (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
 
+      ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
+      ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
+      ;; SegSpace then has only the reduced dim — exactly the 1-D shape (seg-space-1d?) that
+      ;; generate-segred-kernel's two-phase tree reduction already consumes, so no new emitter.
+      ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
+      ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
+      (zero? n-free)
+      (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+            k (sco/generate-segred-kernel sr out-sym :dtype dtype)
+            red-bound (second (first contract-axes))]
+        {:strategy :full-reduce
+         :invoke :reduction
+         :kernel-name (:kernel-name k) :source (:source k)
+         :array-params (:array-params k)
+         :dtype dtype :out-dtype dtype :out-elems 1
+         :n-phases (:n-phases k)
+         :reduce-bound red-bound          ; element count the reduction spans
+         :scalar-args [] :dims [1]})
+
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)

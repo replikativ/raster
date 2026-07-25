@@ -51,8 +51,9 @@
         opts-map (apply hash-map opts)
         init (get opts-map :init 0.0)
         combine (get opts-map :combine '+)
-        _ (assert (and (vector? free-axes) (pos? (count free-axes)))
-                  "contract-lower: free-axes must be a non-empty vector")
+        ;; ZERO free axes is legal: the SegSpace then has only the reduced dim, i.e. exactly the
+        ;; 1-D shape (segop/seg-space-1d?) that the full-reduction emitter consumes.
+        _ (assert (vector? free-axes) "contract-lower: free-axes must be a vector")
         _ (assert (and (vector? contract-axes) (pos? (count contract-axes)))
                   "contract-lower: contract-form->segred needs ≥1 contract axis (0 → contract-form->segmap)")
         _ (assert (symbol? out) "contract-lower: out must be a symbol")

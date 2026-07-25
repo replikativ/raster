@@ -148,6 +148,8 @@
     out          — output array; length = product of free-axis bounds, ROW-MAJOR over
                    the free axes in declared order (outer→inner)
     free-axes    — [[idx-sym bound] ...] the parallel output axes (≥1)
+    free-axes    — [[idx-sym bound] ...] the parallel/output axes. ZERO free axes is legal and
+                   means a FULL REDUCTION to a scalar, written to out[0].
     contract-axes— [[idx-sym bound] ...] the reduced axes: 0 (outer product / pure map),
                    1, or n (n≥2 are flattened into one innermost reduced dim)
     body         — the summand expression; may reference every free and contract idx
@@ -164,8 +166,7 @@
     (raster.par/contract C [[i m] [j n]] [[l k]]
       (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))"
   [out free-axes contract-axes body & {:keys [init combine] :or {init 0.0 combine '+}}]
-  (assert (and (vector? free-axes) (pos? (count free-axes)))
-          "par/contract: free-axes must be a non-empty vector of [idx bound]")
+  (assert (vector? free-axes) "par/contract: free-axes must be a vector of [idx bound]")
   (assert (vector? contract-axes)
           "par/contract: contract-axes must be a vector (0 → outer product/map; n≥1 → contraction, n≥2 flattened)")
   (let [free-syms   (mapv first free-axes)
@@ -175,7 +176,12 @@
         F-sym   (gensym "F__")
         acc-sym (gensym "acc__")
         nfree   (count free-axes)
-        F-expr  (clojure.core/reduce (fn [a b] `(clojure.core/* ~a ~b)) int-bounds)
+        ;; Product over the free axes. ZERO free axes is the empty product = 1: the output is a
+        ;; single element and the generic expansion degenerates to one iteration writing out[0] —
+        ;; i.e. a FULL REDUCTION, the (0 free, n contract) cell of contract's algebra.
+        F-expr  (if (empty? int-bounds)
+                  1
+                  (clojure.core/reduce (fn [a b] `(clojure.core/* ~a ~b)) int-bounds))
         ;; row-major decompose flat f into each free index:
         ;;   idx_p = (f / (product of bounds after p)) mod bound_p
         suffix  (fn [p] (let [after (subvec int-bounds (inc p))]

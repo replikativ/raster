@@ -182,6 +182,13 @@
                   k (register-kernel! {:kernel-name (:kernel-name r) :source (:source r)
                                        :dtype (:dtype r)}
                                       :ze-contracts)]
+              ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
+              ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
+              (if (= :reduction (:invoke r))
+                (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
+                      (:kernel-name k)
+                      (vec (:array-params r))
+                      (:reduce-bound r))
               ;; Pass the descriptor through INTACT — scalar-args as data (the exact shape
               ;; launch-2d! wants), explicit out-dtype/out-elems. Any :strategy works; the
               ;; old (count scalar-args) + [m n k] reconstruction only covered :dpas/:regtiled.
@@ -194,7 +201,7 @@
                     (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
                     (vec (:wg r))
                     (vec (:grid r))
-                    (vec (:scalar-args r))))
+                    (vec (:scalar-args r)))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the

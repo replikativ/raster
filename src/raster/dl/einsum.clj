@@ -129,15 +129,12 @@
    the result through `contract-route/route-contraction` sends it to the peak leaves (DPAS/dp4a)
    or the portable fallback. n-operand einsum decomposes to a sequence of pairwise steps (B2).
 
-   NOT yet expressible: a SCALAR output (`ij->`, `ii->`, `i,i->`) — that needs 0 free axes, which
-   `par/contract` does not admit; tracked separately (G2)."
+   SCALAR output (`ij->`, `ii->`, `i,i->`) is expressible: 0 free axes is the full-reduction cell
+   of contract's algebra, and lowers to the 1-D SegRed the two-phase reduction emitter consumes."
   [subscript dim-map out-sym in-syms]
   (let [{:keys [inputs output]} (parse-subscript subscript)
         _ (assert (<= 1 (count inputs) 2)
                   "einsum->contract-form: 1 (unary) or 2 (pairwise) operands; n-operand path = B2")
-        _ (assert (seq output)
-                  (str "einsum->contract-form: scalar output (0 free axes) is not expressible as a "
-                       "par/contract yet — see G2. subscript: " subscript))
         all-labels (distinct (mapcat identity inputs))
         contract-labels (vec (remove (set output) all-labels))
         lsym (fn [l] (symbol (name l)))
