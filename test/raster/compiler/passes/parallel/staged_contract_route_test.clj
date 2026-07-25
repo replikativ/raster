@@ -121,3 +121,45 @@
                                                :stages [{:axis blk :extent 2 :dtype :float :init 0.0
                                                          :lift (raster.numeric/* 2.0 3.0)}
                                                         {:axis t :extent 4 :dtype :double :init 0.0}])))))))
+
+;; ── peak: the router tensorizes the inner stage when asked and legal ─────────────────
+(defn- nt-maps []
+  {'a {:groups [[['i M]] [['blk NB] ['t B]]]}
+   'b {:groups [[['j N]] [['blk NB] ['t B]]]}})
+
+(defn- staged-form-with-maps []
+  (let [ms (nt-maps)
+        idx (fn [m] ((requiring-resolve 'raster.compiler.ir.axis-map/index-expr) m))]
+    (concat (take 4 (staged-form :byte))
+            [(list 'raster.numeric/*
+                   (list 'aget 'a (idx (get ms 'a)))
+                   (list 'aget 'b (idx (get ms 'b))))]
+            (drop 5 (staged-form :byte))
+            [:operands [{:sym 'a :map (get ms 'a)} {:sym 'b :map (get ms 'b)}]])))
+
+(deftest prefer-peak-tensorizes-the-inner-stage
+  (let [form (staged-form-with-maps)
+        peak (cr/route-contraction form :dtype :byte :prefer-peak? true)
+        base (cr/route-contraction form :dtype :byte)]
+    (testing "with peak requested the inner stage becomes dp4a"
+      (is (:tensorized peak))
+      (is (= :int8x4 (:packed peak)))
+      (is (re-find #"rstr_dp4a" (:source peak))))
+    (testing "without it, the scalar nest — same descriptor SHAPE either way, so the caller binds
+              the same buffers; only the kernel's view of them widens"
+      (is (not (:tensorized base)))
+      (is (not (re-find #"rstr_dp4a" (:source base))))
+      (is (= (:array-params base) (:array-params peak)))
+      (is (= (:lift-operands base) (:lift-operands peak)))
+      (is (= (:out-elems base) (:out-elems peak)))
+      (is (= (:scalar-args base) (:scalar-args peak))))
+    (testing "both descriptors passed validate-descriptor on the way out"
+      (is (some? (:kernel-name peak)))
+      (is (some? (:kernel-name base))))))
+
+(deftest peak-without-declared-maps-falls-back-instead-of-guessing
+  (testing "no operand maps → no tensorize, because the gate has nothing to VERIFY; it must not
+            infer the layout from the index arithmetic"
+    (let [r (cr/route-contraction (staged-form :byte) :dtype :byte :prefer-peak? true)]
+      (is (= :staged-segred (:strategy r)))
+      (is (not (:tensorized r))))))
