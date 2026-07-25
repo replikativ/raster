@@ -426,14 +426,21 @@
                            ce/*int-vars* (into ce/*int-vars* int-vars)]
                    (ce/emit-expr (ce/adapt-casts-for-dtype body dtype) dummy arr-sym-set))
         arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
+        ;; SYMBOLIC axis bounds must be DECLARED as int params, exactly as the segmented-reduce
+        ;; sibling does — the decompose above emits their names, so without this the kernel
+        ;; references undeclared identifiers and fails to compile.
+        scl-params (vec (sort-by name (:scalars segmap)))
+        scl-param-str (str/join "" (map (fn [s] (str ", int " (ce/c-symbol s))) scl-params))
         src (str (codegen/extension-pragmas dtype)
-                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out, int _nseg) {\n"
+                 "__kernel void " kernel-name "(" arr-param-str ", __global " ctype "* restrict out"
+                 scl-param-str ", int _nseg) {\n"
                  "    int seg = get_global_id(0);\n"
                  "    if (seg >= _nseg) return;\n"
                  decomp "\n"
                  "    out[seg] = " body-str ";\n"
                  "}\n")]
-    {:kernel-name kernel-name :source src :array-params arr-params :dtype dtype}))
+    {:kernel-name kernel-name :source src :array-params arr-params
+     :scalar-params scl-params :dtype dtype}))
 
 ;; ================================================================
 ;; Block-tiled + __local-staged contraction (BlkRegTiling, block-tile level)

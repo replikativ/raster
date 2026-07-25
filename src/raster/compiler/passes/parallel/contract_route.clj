@@ -15,7 +15,8 @@
    (int8 widening). Keys: :kernel-name :source :array-params (binding order) :dtype :out-dtype
    :out-elems :wg [x y] :grid [gx gy] :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
-  (:require [raster.compiler.passes.parallel.contract-lower :as cl]
+  (:require [clojure.string :as str]
+            [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.ir.axis-map :as am]))
@@ -32,6 +33,98 @@
   (if (number? a)
     (long (Math/ceil (/ (double a) (double b))))
     (list 'quot (list 'clojure.core/+ a (dec (long b))) (long b))))
+
+(defn kernel-signature-params
+  "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
+   launch descriptor against the kernel it actually describes."
+  [src]
+  (when-let [i (str/index-of src "__kernel void")]
+    (let [open (str/index-of src "(" i)
+          ;; scan to the matching close paren
+          close (loop [k (inc open) depth 1]
+                  (cond (>= k (count src)) nil
+                        (= \( (.charAt ^String src k)) (recur (inc k) (inc depth))
+                        (= \) (.charAt ^String src k)) (if (= 1 depth) k (recur (inc k) (dec depth)))
+                        :else (recur (inc k) depth)))]
+      (when close
+        (->> (str/split (subs src (inc open) close) #",")
+             (map str/trim)
+             (remove str/blank?)
+             vec)))))
+
+(defn validate-descriptor
+  "Check a launch descriptor against the kernel source it describes, and THROW on a mismatch.
+
+   The bug class this exists for has now bitten twice: a descriptor that under-describes the kernel
+   fails at LAUNCH, not at compile — the kernel is valid C, the caller simply binds the wrong number
+   of arguments. First occurrence: invoke-registered-contraction! reconstructed scalar-args from a
+   `case` with no default, so four of six strategies crashed. Second: an epilogue's operand arrays
+   were declared in the signature but absent from the descriptor, so a caller bound 6 args to a
+   7-arg kernel. Both are mechanically detectable by comparing the emitted signature with what the
+   descriptor says to bind, which is what this does.
+
+   Pointer params must equal (array-params + 1 output + epilogue-operands). The rest depends on the
+   INVOKE PROTOCOL, of which there are two — writing this validator is what forced them to be stated
+   explicitly instead of living implicitly in two call sites:
+
+     default (:invoke nil)  invoke-registered-contraction! binds :scalar-args positionally and
+                            launches with :wg/:grid — so all three must be present and match.
+     :invoke :reduction     invoke-reduction-kernel supplies the kernel's single trailing count
+                            param from :reduce-bound and computes its own two-phase launch geometry
+                            — so :scalar-args must be EMPTY and :wg/:grid ABSENT.
+
+   Returns the descriptor unchanged when consistent."
+  [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands
+           out-elems wg grid invoke reduce-bound] :as d}]
+  (let [params (kernel-signature-params source)
+        _ (when (nil? params)
+            (throw (ex-info "contract descriptor: no __kernel signature found in source"
+                            {:strategy strategy :kernel-name kernel-name})))
+        ptr? (fn [p] (str/includes? p "*"))
+        n-ptr (count (filter ptr? params))
+        n-scalar (count (remove ptr? params))
+        expect-ptr (+ (count array-params) 1 (count epilogue-operands))
+        ;; TWO invoke protocols, made explicit here because the validator forced the question:
+        ;;   :invoke nil (default) — invoke-registered-contraction! binds :scalar-args positionally,
+        ;;                           so they must match the kernel's scalar params exactly.
+        ;;   :invoke :reduction    — invoke-reduction-kernel supplies the kernel's single trailing
+        ;;                           count param itself, from :reduce-bound; :scalar-args stays empty.
+        expect-scalar (if (= :reduction invoke) 1 (count scalar-args))]
+    (cond
+      (not= n-ptr expect-ptr)
+      (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
+                           "descriptor binds " expect-ptr " (" (count array-params) " operands + out"
+                           (when (seq epilogue-operands)
+                             (str " + " (count epilogue-operands) " epilogue")) ")")
+                      {:strategy strategy :kernel-name kernel-name :params params
+                       :array-params array-params :epilogue-operands epilogue-operands}))
+      (not= n-scalar expect-scalar)
+      (throw (ex-info (str "contract descriptor: kernel takes " n-scalar " scalar params but the "
+                           (if (= :reduction invoke)
+                             "reduction invoke supplies 1 (the count, from :reduce-bound)"
+                             (str "descriptor supplies " expect-scalar " scalar-args")))
+                      {:strategy strategy :kernel-name kernel-name :params params
+                       :invoke invoke :scalar-args scalar-args}))
+      (and (= :reduction invoke) (seq scalar-args))
+      (throw (ex-info "contract descriptor: :invoke :reduction must leave :scalar-args empty (the count comes from :reduce-bound)"
+                      {:strategy strategy :scalar-args scalar-args}))
+      (nil? out-elems)
+      (throw (ex-info "contract descriptor: :out-elems is required (the invoke sizes the output with it)"
+                      {:strategy strategy}))
+      ;; wg/grid belong to the 2-D launch contract only. The reduction invoke computes its own
+      ;; two-phase geometry, so a :reduction descriptor legitimately carries neither — a third
+      ;; protocol difference this validator forced into the open rather than leaving implicit.
+      (and (not= :reduction invoke)
+           (not (and (vector? wg) (= 2 (count wg)) (vector? grid) (= 2 (count grid)))))
+      (throw (ex-info "contract descriptor: :wg and :grid must both be 2-element vectors"
+                      {:strategy strategy :wg wg :grid grid}))
+      (and (= :reduction invoke) (or (some? wg) (some? grid)))
+      (throw (ex-info "contract descriptor: :invoke :reduction must not carry :wg/:grid (the invoke owns the two-phase launch)"
+                      {:strategy strategy :wg wg :grid grid}))
+      (and (= :reduction invoke) (nil? reduce-bound))
+      (throw (ex-info "contract descriptor: :invoke :reduction requires :reduce-bound"
+                      {:strategy strategy}))
+      :else d)))
 
 (declare route-2free-1contract route-quant)
 
@@ -61,7 +154,11 @@
         form-opts (apply hash-map (drop 5 contract-form))
         epilogue (or epilogue (:epilogue form-opts))
         tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile epilogue))]
-    (cond
+    ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
+    ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
+    ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
+    (validate-descriptor
+     (cond
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
       (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
@@ -88,11 +185,14 @@
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
-            {:keys [kernel-name source array-params]} (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
+            {:keys [kernel-name source array-params scalar-params]}
+            (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
         {:strategy :segmap
          :kernel-name kernel-name :source source :array-params array-params
          :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-         :scalar-args [{:type :int :value nseg}] :out-elems nseg :dims [nseg]})
+         :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
+                            {:type :int :value nseg})
+         :out-elems nseg :dims [nseg]})
 
       ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled).
       ;; Returns nil when the form fails a TENSORIZE structural precondition (symbolic dims,
@@ -106,11 +206,16 @@
       ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
       :else
       (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-            {:keys [kernel-name source array-params]} (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)]
+            {:keys [kernel-name source array-params scalar-params]}
+            (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)]
         {:strategy :naive-segred
          :kernel-name kernel-name :source source :array-params array-params
          :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-         :scalar-args [{:type :int :value nseg}] :out-elems nseg :dims [nseg]}))))
+         ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
+         ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
+         :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
+                            {:type :int :value nseg})
+         :out-elems nseg :dims [nseg]})))))
 
 (defn- route-2free-1contract
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.

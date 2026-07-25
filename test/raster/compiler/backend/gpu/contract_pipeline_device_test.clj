@@ -109,4 +109,13 @@
              :dtype :double)]
       (is (some? (:out-elems r)))
       (is (not (number? (:out-elems r))))            ; carried symbolically
-      (is (contains? #{:regtiled :naive-segred} (:strategy r))))))
+      (is (contains? #{:regtiled :naive-segred} (:strategy r)))
+      ;; STRENGTHENED: the original assertion only checked that routing did not CRASH, which let a
+      ;; real bug through — the descriptor supplied 1 scalar arg where the kernel declares 4
+      ;; (int k, int m, int n, int _nseg), so a caller would have mis-bound at launch. The
+      ;; descriptor validator caught it; assert usability here, not merely non-crashing.
+      (is (= 4 (count (:scalar-args r)))
+          "the symbolic axis bounds must be bound as int params, before the trailing count")
+      (is (= '[k m n] (mapv :value (butlast (:scalar-args r))))
+          "…in the kernel's declared (name-sorted) order")
+      (is (= (:out-elems r) (:value (last (:scalar-args r))))))))
