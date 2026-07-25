@@ -120,14 +120,23 @@
       (mapv #(.indexOf ^java.util.List fk %) tk))))
 
 (defn- canonicalize-ops
-  "Normalize +/* heads (bare, clojure.core, raster.numeric) so index expressions from different
-   producers compare structurally."
+  "Normalize index expressions so ones from different producers compare structurally:
+   unify +/* heads (bare, clojure.core, raster.numeric) and FLATTEN nested sums, since `+` is
+   associative and a hand-written index nests it differently than `rowmajor` emits it
+   (`(+ (* i K) (+ (* blk B) t))` vs `(+ (* i K) (* blk B) t)`). Without the flattening,
+   `index-matches?` would reject correct declarations and push callers to skip verification —
+   worse than the brittleness it was meant to catch. Products are NOT reassociated or folded, so
+   `(* (* i 2) 3)` still fails to match `(* i 6)`; that is a deliberate limit, not an oversight."
   [e]
-  (cond (seq? e) (let [h (first e)
-                       h' (get '{+ + clojure.core/+ + raster.numeric/+ +
-                                 * * clojure.core/* * raster.numeric/* *} h h)]
-                   (cons h' (map canonicalize-ops (rest e))))
-        :else e))
+  (if (seq? e)
+    (let [h (first e)
+          h' (get '{+ + clojure.core/+ + raster.numeric/+ +
+                    * * clojure.core/* * raster.numeric/* *} h h)
+          args (map canonicalize-ops (rest e))]
+      (if (= '+ h')
+        (cons '+ (mapcat (fn [a] (if (and (seq? a) (= '+ (first a))) (rest a) [a])) args))
+        (cons h' args)))
+    e))
 
 (defn index-matches?
   "Does `idx-expr` equal this map's generated index, modulo operator qualification? This is the
@@ -177,3 +186,32 @@
               (core-op? h 'quot)     (when (seq outer) (of-axes outer))
               :else nil))
       :else nil)))
+
+;; ── packing: reinterpreting a buffer as wider words ─────────────────────────────────
+(defn pack-innermost
+  "Reinterpret the buffer this map indexes as words holding `factor` consecutive elements, e.g. a
+   `char*` read as `int*` (4 int8 per int32, what dp4a consumes). The bytes are unchanged; only the
+   INDEXING changes, and the change is entirely local to the map: the innermost axis's extent is
+   divided by `factor` and the axis renamed to `new-sym` (which now counts words, not elements).
+
+   Everything else follows from row-major arithmetic and needs no special case — each outer group's
+   stride is expressed as a product that already contains the innermost extent, so dividing that one
+   extent rescales every stride correctly. `(index-expr (pack-innermost m 4 'p))` is therefore the
+   packed index, with no separate derivation.
+
+   Returns nil when the innermost extent is not a literal multiple of `factor` — the caller must
+   then refuse to tensorize rather than emit a mis-strided load."
+  [amap factor new-sym]
+  (let [groups (:groups amap)
+        gi (dec (count groups))
+        g (nth groups gi)
+        ai (dec (count g))
+        [_ e] (nth g ai)]
+    (when (and (number? e) (zero? (mod (long e) (long factor))))
+      {:groups (assoc groups gi (assoc g ai [new-sym (quot (long e) (long factor))]))})))
+
+(defn innermost-axis
+  "The last atomic axis in map order — the one with stride 1. A tensorize leaf that packs along the
+   contraction must check that THIS is the axis it means to pack."
+  [amap]
+  (peek (axes amap)))
