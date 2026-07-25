@@ -121,3 +121,63 @@
       (is (= :n-pitch-unaligned (:reason (sco/generate-dpas-contraction-kernel n-bad 'C))))
       (is (= :k-pitch-unaligned (:reason (sco/generate-dpas-contraction-kernel k-bad 'C))))
       (is (false? (:tensorized (sco/generate-dpas-contraction-kernel n-bad 'C)))))))
+
+;; ── Q2: EPILOGUE FUSION — fold bias+activation into the peak kernel's store slot ───────
+;; emit-gemm-tiled exposes a store-splice hook; the contraction path now drives it from a
+;; DOMAIN-AGNOSTIC spec (an expression over the accumulator + operands carrying axis-maps), so
+;; bias / activation / residual / dequant are one mechanism and compose by nesting. The win is a
+;; whole elementwise kernel and a DRAM round-trip of C removed.
+(defn- silu ^double [^double x] (/ x (+ 1.0 (Math/exp (- x)))))
+
+(deftest epilogue-fusion-matches-unfused-two-pass
+  (if-not @gpu?
+    (println "[skip] epilogue-fusion-device: no GPU")
+    (let [ze (find-ns 'raster.gpu.ze-runtime)
+          register! (ns-resolve ze 'register-kernel!)
+          ensure! (ns-resolve ze 'ensure-kernel-loaded!)
+          make-buffer (ns-resolve ze 'make-buffer)
+          halfs (ns-resolve ze 'buffer-of-floats-as-half)
+          arr->buf! (ns-resolve ze 'array->buffer!)
+          launch-2d! (ns-resolve ze 'launch-2d!)
+          buf->d (ns-resolve ze 'buffer->double-array)
+          am (requiring-resolve 'raster.compiler.ir.axis-map/of-axes)
+          M 128 K 64 N 128
+          Ad (double-array (map #(* 0.05 (- (double (mod % 7)) 3.0)) (range (* M K))))
+          Bd (double-array (map #(* 0.05 (- (double (mod % 5)) 2.0)) (range (* K N))))
+          biasd (float-array (map #(float (* 0.01 (- (mod % 9) 4))) (range N)))
+          sr (cl/contract-form->segred (matmul-form M N K) :dtype :half)
+          ep {:acc 'acc
+              :expr (list 'silu_f (list 'raster.numeric/+ 'acc (list 'aget 'bias 'j)))
+              :operands [{:sym 'bias :map (am [['j N]]) :dtype :float}]
+              :helpers "inline float silu_f(float x){ return x / (1.0f + native_exp(-x)); }"}
+          run (fn [k extra-args out]
+                (register! (:kernel-name k) {:source (:source k) :dtype :half})
+                (let [{:keys [kernel-handle]} (ensure! (:kernel-name k))
+                      abuf (halfs (float-array (map float Ad)))
+                      bbuf (halfs (float-array (map float Bd)))
+                      args (into [(:segment abuf) (:segment bbuf) (:segment out)
+                                  {:type :int :value M} {:type :int :value N} {:type :int :value K}]
+                                 extra-args)]
+                  (launch-2d! kernel-handle (:workgroup k)
+                              [(long (Math/ceil (/ (double N) (:block-n (:tile k)))))
+                               (long (Math/ceil (/ (double M) (:block-m (:tile k)))))]
+                              args)
+                  (vec (buf->d out))))
+          plain-k (sco/generate-dpas-contraction-kernel sr 'C)
+          fused-k (sco/generate-dpas-contraction-kernel sr 'C :epilogue ep)
+          bias-buf (arr->buf! (make-buffer N :float) biasd)
+          unfused (run plain-k [] (make-buffer (* M N) :half))
+          fused   (run fused-k [(:segment bias-buf)] (make-buffer (* M N) :half))]
+      (testing "the fused kernel gains the operand param and the helper"
+        (is (str/includes? (:source fused-k) "restrict bias"))
+        (is (str/includes? (:source fused-k) "silu_f(float x)"))
+        (is (str/includes? (:source fused-k) "silu_f(((acc00.s0) + bias[col]))")
+            "the axis-map's j must bind to the store slot's col"))
+      (testing "fused result == unfused GEMM followed by a separate bias+silu pass"
+        ;; the two-pass reference: read C back, then apply the epilogue on the host
+        (let [ref (vec (map-indexed (fn [idx v] (silu (+ (double v) (aget biasd (mod idx N)))))
+                                    unfused))]
+          (is (= (count ref) (count fused)))
+          ;; f16 store on both sides; compare at f16 tolerance
+          (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 3.0e-2) fused ref))
+              (str "fused " (take 4 fused) " vs two-pass " (take 4 ref))))))))
