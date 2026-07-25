@@ -11,7 +11,8 @@
   intermediate elimination is safe.
 
   Design informed by Futhark's fusion via dependency graphs."
-  (:require [raster.compiler.core.op-descriptor :as descriptor]
+  (:require [clojure.walk]
+            [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.passes.parallel.descriptors :as desc]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
@@ -130,6 +131,77 @@
                   ;; Can't fuse, keep as-is
                   (recur (inc i) (conj result [sym expr]) fused skip-set)))
               ;; Not a map — keep as-is
+              (recur (inc i) (conj result [sym expr]) fused skip-set))))))))
+
+(defn- agets-on-arrays
+  "Every (aget arr idx) node in `expr`, as a set of the array symbols read."
+  [expr]
+  (into #{} (keep #(when (and (seq? %) (= 'aget (first %))) (second %)))
+        (tree-seq coll? seq expr)))
+
+(defn fuse-contract-map
+  "Fuse a contraction followed by an ELEMENTWISE map over its output into ONE contraction whose
+   `:epilogue` carries the map's body — the store-splice the tile-parametric GEMM emitter exposes.
+
+  Before (2 kernels, and a full DRAM round-trip of C):
+    C   (raster.par/contract C [[i m] [j n]] [[l k]] (* (aget A ..) (aget B ..)))
+    out (raster.par/map! out t (* m n) nil (silu (aget C t)))
+
+  After (1 kernel; C never reaches memory):
+    out (raster.par/contract out [[i m] [j n]] [[l k]] (* (aget A ..) (aget B ..))
+                            :epilogue {:acc acc :expr (silu acc)})
+
+  FIRST CUT — the map body may read only the contraction's output (plus scalars/literals), i.e. a
+  pure activation/scale. That is the dominant `linear → activation` shape and needs no index
+  recovery. A body reading OTHER arrays (e.g. a per-column bias) needs its flat map index decomposed
+  into the contraction's free axes to build the operand's axis-map; until that exists such an
+  epilogue must be supplied explicitly (segop-opencl/epilogue-splice takes operands with maps).
+
+  Legality is delegated to segop-opencl/epilogue-legal? at emit time (accumulator used exactly once,
+  no reduction/layout-changing op, spliced strictly after the reduction loop).
+
+  Returns {:bindings new-bindings :fused count} or nil."
+  [bindings-vec body-exprs]
+  (let [pairs (vec (partition 2 bindings-vec))
+        n (count pairs)
+        contract? (fn [e] (and (seq? e) (= 'raster.par/contract (first e))))]
+    (loop [i 0 result [] fused 0 skip-set #{}]
+      (if (>= i n)
+        (when (pos? fused) {:bindings (vec (mapcat identity result)) :fused fused})
+        (if (contains? skip-set i)
+          (recur (inc i) result fused skip-set)
+          (let [[sym expr] (nth pairs i)]
+            (if (contract? expr)
+              (let [c-out (second expr)
+                    already-fused? (contains? (set (drop 5 expr)) :epilogue)
+                    map-idx (when-not already-fused?
+                              (first (keep-indexed
+                                      (fn [j [_s e]]
+                                        (when (> j i)
+                                          (when-let [mi (desc/map-form-info e)]
+                                            (when (and (aget-reads-sym? (:body mi) c-out)
+                                                       ;; first cut: body reads ONLY the contraction output
+                                                       (= #{c-out} (agets-on-arrays (:body mi))))
+                                              j))))
+                                      pairs)))
+                    safe? (and map-idx
+                               (not (sym-used-outside? c-out pairs body-exprs i map-idx)))]
+                (if safe?
+                  (let [[msym mexpr] (nth pairs map-idx)
+                        mi (desc/map-form-info mexpr)
+                        acc-sym (gensym "acc__")
+                        ;; (aget C <map-idx>) → the accumulator symbol
+                        ep-expr (clojure.walk/postwalk
+                                 (fn [f] (if (and (seq? f) (= 'aget (first f)) (= c-out (second f)))
+                                           acc-sym f))
+                                 (:body mi))
+                        fused-form (concat (list 'raster.par/contract (:out mi))
+                                           (drop 2 (take 5 expr))
+                                           (drop 5 expr)
+                                           [:epilogue {:acc acc-sym :expr ep-expr}])]
+                    (recur (inc i) (conj result [msym (apply list fused-form)])
+                           (inc fused) (conj skip-set map-idx)))
+                  (recur (inc i) (conj result [sym expr]) fused skip-set)))
               (recur (inc i) (conj result [sym expr]) fused skip-set))))))))
 
 ;; ================================================================

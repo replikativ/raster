@@ -219,3 +219,38 @@
       (is (> (:saved-bytes c) 700000)))
     (testing "accumulator register estimate follows the derived tile (sg-m·sg-n/subgroup)"
       (is (= 64 (:acc-regs c))))))
+
+;; ── Q3: the fusion pass DISCOVERS the epilogue (contract → elementwise map ⇒ one kernel) ──
+(deftest fusion-pass-discovers-contract-epilogue
+  (let [pf (requiring-resolve 'raster.compiler.passes.parallel.par-fusion/fuse-contract-map)
+        route (requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
+        M 128 N 128 K 64
+        mm (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
+                 (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
+                       (list 'aget 'B (list '+ (list '* 'l N) 'j))))
+        bindings ['C mm
+                  'out (list 'raster.par/map! 'out 't (* M N) nil
+                             (list 'silu_f (list 'aget 'C 't)))]]
+    (testing "contract + elementwise map collapse into ONE contract carrying an :epilogue"
+      (let [r (pf bindings [])
+            fused (second (:bindings r))
+            opts (apply hash-map (drop 5 fused))]
+        (is (= 1 (:fused r)))
+        (is (= 2 (count (:bindings r))) "4 bindings → 2: the intermediate is gone")
+        (is (= 'raster.par/contract (first fused)))
+        (is (= 'out (second fused)) "the fused contraction writes the map's target directly")
+        (is (some? (:epilogue opts)))
+        (is (= (list 'silu_f (:acc (:epilogue opts))) (:expr (:epilogue opts)))
+            "the map body becomes the epilogue, with (aget C t) → the accumulator")))
+    (testing "the routed descriptor reports the fusion and splices it into the store"
+      (let [fused (second (:bindings (pf bindings [])))
+            r (route fused :dtype :half)]
+        (is (:fused-epilogue r))
+        (is (str/includes? (:source r) "silu_f((acc00.s0))")
+            "the epilogue must appear in the STORE slot, not a second kernel")))
+    (testing "REFUSALS: an already-fused contract, and a map reading other arrays"
+      (let [bias-map ['C mm
+                      'out (list 'raster.par/map! 'out 't (* M N) nil
+                                 (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'bias 't)))]]
+        (is (nil? (pf bias-map []))
+            "a body reading OTHER arrays needs flat-index→free-axis decomposition; must not fuse yet")))))
