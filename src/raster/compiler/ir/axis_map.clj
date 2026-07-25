@@ -141,3 +141,39 @@
    transpose kernel realizes)."
   [from to]
   (= [1 0] (permutation from to)))
+
+;; ── flat index → free-axis map (what an epilogue's operands need) ────────────────────
+;; A contraction's consumer is usually a 1-D map over the FLAT output: `(par/map! out t (* M N) …)`
+;; with `t = i·N + j` for free axes [[i M] [j N]]. To fuse that map as an epilogue we must express
+;; each operand's index in terms of the free axes instead of `t`. These are the broadcast shapes
+;; that appear in practice; anything else returns nil so the caller refuses to fuse rather than
+;; guessing (an operand indexed wrongly is a silent miscompile).
+
+(defn- core-op? [h & names] (contains? (set (mapcat (fn [n] [n (symbol "clojure.core" (name n))
+                                                             (symbol "raster.numeric" (name n))]) names)) h))
+
+(defn flat-index->map
+  "Interpret `idx-expr`, an index expression in the flat map variable `t`, as an axis-map over the
+   contraction's `free-axes` (a vector of [sym extent], outer→inner). Recognized:
+
+     t              → the full output layout           (elementwise operand, e.g. a residual)
+     (mod  t Ninner)→ the innermost axis only          (per-column broadcast, e.g. a bias)
+     (rem  t Ninner)→ same
+     (quot t Ninner)→ the outer axes only              (per-row broadcast, e.g. a row scale)
+     <constant/none>→ nil
+
+   Returns an axis-map, or nil when the shape is not recognized."
+  [idx-expr t free-axes]
+  (let [fa (vec free-axes)
+        n-inner (second (peek fa))
+        outer (vec (butlast fa))]
+    (cond
+      (= idx-expr t) (of-axes fa)
+      (and (seq? idx-expr) (= 3 (count idx-expr))
+           (= t (second idx-expr))
+           (= n-inner (nth idx-expr 2)))
+      (let [h (first idx-expr)]
+        (cond (core-op? h 'mod 'rem) (of-axes [(peek fa)])
+              (core-op? h 'quot)     (when (seq outer) (of-axes outer))
+              :else nil))
+      :else nil)))

@@ -248,9 +248,18 @@
         (is (:fused-epilogue r))
         (is (str/includes? (:source r) "silu_f((acc00.s0))")
             "the epilogue must appear in the STORE slot, not a second kernel")))
-    (testing "REFUSALS: an already-fused contract, and a map reading other arrays"
-      (let [bias-map ['C mm
-                      'out (list 'raster.par/map! 'out 't (* M N) nil
-                                 (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'bias 't)))]]
-        (is (nil? (pf bias-map []))
-            "a body reading OTHER arrays needs flat-index→free-axis decomposition; must not fuse yet")))))
+    (testing "a body reading OTHER arrays now fuses too (flat-index→free-axis decomposition)"
+      ;; This assertion previously required a REFUSAL. That limitation is gone: an operand's flat
+      ;; index is decomposed into the contraction's free axes, so bias/residual/row-scale fuse.
+      ;; See epilogue-operand-fusion-test for the full matrix; here we only pin that it no longer
+      ;; refuses, so the two suites cannot drift apart.
+      (let [resid ['C mm
+                   'out (list 'raster.par/map! 'out 't (* M N) nil
+                              (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't)))]]
+        (is (some? (pf resid [])) "an elementwise residual operand fuses")))
+    (testing "REFUSAL that remains valid: an operand index we cannot decompose"
+      (let [bad ['C mm
+                 'out (list 'raster.par/map! 'out 't (* M N) nil
+                            (list 'raster.numeric/+ (list 'aget 'C 't)
+                                  (list 'aget 'bias (list 'mod 't 7))))]]
+        (is (nil? (pf bad [])) "an unrecognized stride must refuse, never guess")))))
