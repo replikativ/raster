@@ -437,6 +437,10 @@
 
 (defn- syms-in [expr] (set (filter symbol? (tree-seq coll? seq expr))))
 
+;; analyze-contraction is defined below (next to the register-tiled emitter that also uses it);
+;; declared here because the block-tiled emitter above it shares the same analysis.
+(declare analyze-contraction)
+
 (defn generate-tiled-contraction-kernel
   "BLOCK-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, block-tile
    level — no register/DPAS tiling yet). Square T×T tiles; workgroup = T×T threads (one
