@@ -23,6 +23,7 @@
             [raster.ad.templates :as tmpl]
             [raster.par :as par]
             [raster.compiler.ir.axis-map :as am]
+            [clojure.set]
             [clojure.string :as str]))
 
 ;; ================================================================
@@ -143,6 +144,105 @@
     ;; compares maps instead of pattern-matching the body's index arithmetic).
     (list 'raster.par/contract out-sym (mapv axis output) (mapv axis contract-labels) body
           :maps (assoc maps out-sym (operand-map output)))))
+
+;; ================================================================
+;; n-operand einsum → a PATH of pairwise contractions  (B2)
+;;
+;; Generality via DECOMPOSITION, never a monolithic general kernel: an n-operand einsum becomes
+;; an ordered sequence of 2-operand contractions, each of which is a `par/contract` the gate can
+;; send to a peak leaf. Follows opt_einsum: the per-step index algebra is pure set arithmetic,
+;; and the order is chosen greedily by memory-removed.
+;; ================================================================
+
+(defn pair-contraction
+  "The index algebra for contracting operands `i` and `j` out of `operand-labels`, given the
+   final `output` labels (opt_einsum's `find_contraction`, helpers.py:51-104):
+
+     touched = the pair's labels          (the step's full iteration space)
+     keep    = labels needed DOWNSTREAM   (in `output`, or in any surviving operand)
+     sum     = labels appearing ONLY in this pair  (the contracted axes)
+
+   `keep` is ordered by first appearance across the pair, so the intermediate's layout matches
+   input-appearance order — opt_einsum's trick for making later steps need no transpose.
+   Returns {:keep [labels] :sum [labels] :remaining [label-vectors incl. the new intermediate]}."
+  [operand-labels i j output]
+  (let [n (count operand-labels)
+        li (nth operand-labels i) lj (nth operand-labels j)
+        touched (vec (distinct (concat li lj)))
+        others (keep-indexed (fn [k v] (when-not (or (= k i) (= k j)) v)) operand-labels)
+        downstream (into (set output) (mapcat identity others))
+        keep (vec (filter downstream touched))
+        sum (vec (remove (set keep) touched))
+        remaining (conj (vec others) keep)]
+    {:keep keep :sum sum :remaining remaining}))
+
+(defn- extent-of [dim-map labels] (reduce (fn [a l] (* a (long (dim-map l)))) 1 labels))
+
+(defn contraction-path
+  "Greedy contraction ORDER for an n-operand einsum (opt_einsum's `greedy`, paths.py:599).
+   Considers only pairs that SHARE a label, scores each by memory-removed
+   `size(result) − size(a) − size(b)` (paths.py:311 `cost_memory_removed`), and takes the
+   minimum, tie-broken by operand index so the path is deterministic.
+
+   Returns a vector of `[i j]` pairs, each indexing the CURRENT (shrinking) operand list — the
+   step's result is appended, so later pairs index the reduced list. A 1- or 2-operand einsum
+   yields `[]` or `[[0 1]]`."
+  [operand-labels output dim-map]
+  (loop [labels (vec operand-labels) path []]
+    (if (<= (count labels) 1)
+      path
+      (let [n (count labels)
+            cands (for [i (range n) j (range (inc i) n)
+                        :when (seq (clojure.set/intersection (set (nth labels i)) (set (nth labels j))))]
+                    [i j])
+            cands (if (seq cands) cands (for [i (range n) j (range (inc i) n)] [i j]))
+            scored (map (fn [[i j]]
+                          (let [{:keys [keep]} (pair-contraction labels i j output)]
+                            [(- (extent-of dim-map keep)
+                                (extent-of dim-map (nth labels i))
+                                (extent-of dim-map (nth labels j)))
+                             i j]))
+                        cands)
+            [_ bi bj] (first (sort-by (fn [[c i j]] [c i j]) scored))
+            {:keys [remaining]} (pair-contraction labels bi bj output)]
+        (recur remaining (conj path [bi bj]))))))
+
+(defn einsum->contract-steps
+  "Lower an n-operand einsum to an ORDERED sequence of pairwise `par/contract` steps (B2).
+   Each step is exactly what `einsum->contract-form` produces for 2 operands, so each is routable
+   to a peak leaf; intermediates are fresh gensyms. Returns
+
+     {:steps [{:out sym :labels [...] :shape [...] :form <par/contract form>} …]
+      :result sym       ;; the final step's output (== `out-sym` for the last step)
+      :path [[i j] …]}
+
+   The LAST step's free axes are the requested `output` labels, so no trailing transpose is
+   needed; earlier steps keep input-appearance order (see `pair-contraction`)."
+  [subscript dim-map out-sym in-syms]
+  (let [{:keys [inputs output]} (parse-subscript subscript)
+        _ (assert (= (count inputs) (count in-syms))
+                  "einsum->contract-steps: one input symbol per subscript operand")
+        path (contraction-path inputs output dim-map)]
+    (loop [labels (vec inputs) syms (vec in-syms) todo path steps []]
+      (if (empty? todo)
+        {:steps steps :result (if (seq steps) (:out (peek steps)) (first syms)) :path path}
+        (let [[i j] (first todo)
+              last? (= 1 (count todo))
+              {:keys [keep sum remaining]} (pair-contraction labels i j output)
+              ;; the FINAL step must land on the requested output layout
+              keep (if last? (vec output) keep)
+              step-out (if last? out-sym (gensym "t__"))
+              sub (str (apply str (map name (nth labels i))) ","
+                       (apply str (map name (nth labels j))) "->"
+                       (apply str (map name keep)))
+              form (einsum->contract-form sub dim-map step-out
+                                          [(nth syms i) (nth syms j)])
+              others-syms (keep-indexed (fn [k v] (when-not (or (= k i) (= k j)) v)) syms)]
+          (recur (vec (concat (butlast remaining) [keep]))
+                 (vec (concat others-syms [step-out]))
+                 (rest todo)
+                 (conj steps {:out step-out :labels keep
+                              :shape (mapv dim-map keep) :form form})))))))
 
 ;; ================================================================
 ;; rearrange → contract  (Phase 2: split/merge/transpose as a map application)
