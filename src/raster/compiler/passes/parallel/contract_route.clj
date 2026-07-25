@@ -131,6 +131,9 @@
          :dtype :half :out-dtype :half :out-elems (* M N)
          :tile (:tile dpas)                          ; the DERIVED tile actually emitted
          :fused-epilogue (boolean epilogue)
+         ;; extra kernel args the epilogue needs, in signature order (after out + the dims)
+         :epilogue-operands (:epilogue-operands dpas)
+         :epilogue-params (:epilogue-params dpas)
          :wg (:workgroup dpas)                       ; derived from that tile
          :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
          :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params

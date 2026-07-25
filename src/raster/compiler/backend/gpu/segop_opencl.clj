@@ -867,7 +867,11 @@
          :dims [M N L]
          :dtype :half
          :tile tile
+         ;; The epilogue's operand arrays are EXTRA kernel params, appended AFTER the dims.
+         ;; Surfaced so a caller binds them — the signature has them either way, so omitting
+         ;; them from the descriptor would be a launch-arity bug (6 args bound to a 7-arg kernel).
          :epilogue-params (when ep (:epilogue-params ep))
+         :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
          ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × the matrix subgroup size
          :workgroup [(* (quot (:block-m tile) (:sg-m tile))
                         (quot (:block-n tile) (:sg-n tile))

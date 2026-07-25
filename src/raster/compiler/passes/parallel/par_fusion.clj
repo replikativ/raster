@@ -14,6 +14,7 @@
   (:require [clojure.walk]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.passes.parallel.descriptors :as desc]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.schedule-support :as schedule-support]
@@ -151,11 +152,12 @@
     out (raster.par/contract out [[i m] [j n]] [[l k]] (* (aget A ..) (aget B ..))
                             :epilogue {:acc acc :expr (silu acc)})
 
-  FIRST CUT — the map body may read only the contraction's output (plus scalars/literals), i.e. a
-  pure activation/scale. That is the dominant `linear → activation` shape and needs no index
-  recovery. A body reading OTHER arrays (e.g. a per-column bias) needs its flat map index decomposed
-  into the contraction's free axes to build the operand's axis-map; until that exists such an
-  epilogue must be supplied explicitly (segop-opencl/epilogue-splice takes operands with maps).
+  A body reading OTHER arrays (a per-column bias, a per-row scale, an elementwise residual) is
+  fused too: each such operand's index is decomposed from the map's FLAT variable into the
+  contraction's free axes via axis-map/flat-index->map, which yields the operand's own axis-map so
+  epilogue-splice can re-index it against the store slot's row/col. An operand whose index is not
+  one of the recognized broadcast shapes, or which is read at more than one index, is REFUSED — a
+  wrongly-indexed operand is a silent miscompile, so guessing is not an option.
 
   Legality is delegated to segop-opencl/epilogue-legal? at emit time (accumulator used exactly once,
   no reduction/layout-changing op, spliced strictly after the reduction loop).
@@ -174,14 +176,30 @@
             (if (contract? expr)
               (let [c-out (second expr)
                     already-fused? (contains? (set (drop 5 expr)) :epilogue)
+                    free-axes (nth expr 2)
+                    ;; every OTHER array the map body reads must have an index we can express in
+                    ;; the contraction's free axes; otherwise we refuse (a wrongly-indexed operand
+                    ;; is a silent miscompile, so guessing is not an option)
+                    operands-of (fn [mi]
+                                  (let [t (:idx mi)
+                                        others (disj (agets-on-arrays (:body mi)) c-out)
+                                        resolved (for [a others
+                                                       :let [idxs (distinct
+                                                                   (keep #(when (and (seq? %) (= 'aget (first %))
+                                                                                     (= a (second %)))
+                                                                            (nth % 2))
+                                                                         (tree-seq coll? seq (:body mi))))]]
+                                                   (when (= 1 (count idxs))
+                                                     (when-let [m (am/flat-index->map (first idxs) t free-axes)]
+                                                       {:sym a :map m})))]
+                                    (when (every? some? resolved) (vec resolved))))
                     map-idx (when-not already-fused?
                               (first (keep-indexed
                                       (fn [j [_s e]]
                                         (when (> j i)
                                           (when-let [mi (desc/map-form-info e)]
                                             (when (and (aget-reads-sym? (:body mi) c-out)
-                                                       ;; first cut: body reads ONLY the contraction output
-                                                       (= #{c-out} (agets-on-arrays (:body mi))))
+                                                       (some? (operands-of mi)))
                                               j))))
                                       pairs)))
                     safe? (and map-idx
@@ -190,15 +208,18 @@
                   (let [[msym mexpr] (nth pairs map-idx)
                         mi (desc/map-form-info mexpr)
                         acc-sym (gensym "acc__")
-                        ;; (aget C <map-idx>) → the accumulator symbol
+                        ;; (aget C <map-idx>) → the accumulator symbol; every other operand keeps
+                        ;; its aget, and epilogue-splice re-indexes it from the declared axis-map
                         ep-expr (clojure.walk/postwalk
                                  (fn [f] (if (and (seq? f) (= 'aget (first f)) (= c-out (second f)))
                                            acc-sym f))
                                  (:body mi))
+                        ops (operands-of mi)
                         fused-form (concat (list 'raster.par/contract (:out mi))
                                            (drop 2 (take 5 expr))
                                            (drop 5 expr)
-                                           [:epilogue {:acc acc-sym :expr ep-expr}])]
+                                           [:epilogue (cond-> {:acc acc-sym :expr ep-expr}
+                                                        (seq ops) (assoc :operands ops))])]
                     (recur (inc i) (conj result [msym (apply list fused-form)])
                            (inc fused) (conj skip-set map-idx)))
                   (recur (inc i) (conj result [sym expr]) fused skip-set)))
