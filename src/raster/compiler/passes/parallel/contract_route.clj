@@ -34,6 +34,16 @@
     (long (Math/ceil (/ (double a) (double b))))
     (list 'quot (list 'clojure.core/+ a (dec (long b))) (long b))))
 
+(defn- contract-operand-arrays
+  "The array symbols the contraction BODY reads, i.e. every `(aget arr …)` target. These are the
+   contraction's own operands; a staged contraction's per-stage scale arrays are NOT among them —
+   those are declared on the stages and surfaced separately as :lift-operands, so the two groups
+   cannot be confused at bind time."
+  [body]
+  (distinct (keep (fn [f] (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
+                            (second f)))
+                  (tree-seq coll? seq body))))
+
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
    launch descriptor against the kernel it actually describes."
@@ -74,7 +84,7 @@
                             — so :scalar-args must be EMPTY and :wg/:grid ABSENT.
 
    Returns the descriptor unchanged when consistent."
-  [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands
+  [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands
            out-elems wg grid invoke reduce-bound] :as d}]
   (let [params (kernel-signature-params source)
         _ (when (nil? params)
@@ -83,7 +93,10 @@
         ptr? (fn [p] (str/includes? p "*"))
         n-ptr (count (filter ptr? params))
         n-scalar (count (remove ptr? params))
-        expect-ptr (+ (count array-params) 1 (count epilogue-operands))
+        ;; EXTRA operand arrays are pointer params too, whichever seam declared them: an
+        ;; epilogue's (bias/residual/scale, appended after the dims) or a staged contraction's
+        ;; lift operands (the per-block scales, bound between the operands and the output).
+        expect-ptr (+ (count array-params) 1 (count epilogue-operands) (count lift-operands))
         ;; TWO invoke protocols, made explicit here because the validator forced the question:
         ;;   :invoke nil (default) — invoke-registered-contraction! binds :scalar-args positionally,
         ;;                           so they must match the kernel's scalar params exactly.
@@ -95,9 +108,12 @@
       (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
                            "descriptor binds " expect-ptr " (" (count array-params) " operands + out"
                            (when (seq epilogue-operands)
-                             (str " + " (count epilogue-operands) " epilogue")) ")")
+                             (str " + " (count epilogue-operands) " epilogue"))
+                           (when (seq lift-operands)
+                             (str " + " (count lift-operands) " lift")) ")")
                       {:strategy strategy :kernel-name kernel-name :params params
-                       :array-params array-params :epilogue-operands epilogue-operands}))
+                       :array-params array-params :epilogue-operands epilogue-operands
+                       :lift-operands lift-operands}))
       (not= n-scalar expect-scalar)
       (throw (ex-info (str "contract descriptor: kernel takes " n-scalar " scalar params but the "
                            (if (= :reduction invoke)
@@ -134,7 +150,7 @@
    the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
    scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
-  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue]
+  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue stages]
                     :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
@@ -153,12 +169,38 @@
         ;; fuse-contract-map puts it there); an explicit :epilogue kwarg overrides.
         form-opts (apply hash-map (drop 5 contract-form))
         epilogue (or epilogue (:epilogue form-opts))
+        stages (or stages (:stages (apply hash-map (drop 5 contract-form))))
         tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile epilogue))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
     (validate-descriptor
      (cond
+      ;; STAGED contract axis → the multi-level accumulate leaf. Checked FIRST because staging is
+      ;; a property of the reduction itself, not of the dtype: it is what lets a block-quantized
+      ;; format (int32 MAC inside the block, float accumulate across blocks) be expressed in the
+      ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
+      ;; accumulator. 1 stage is the flat case and is left to them.
+      (and (seq stages) (> (count stages) 1))
+      (let [k (sco/generate-staged-contraction-kernel
+               {:free-axes free-axes :stages stages
+                :body (nth contract-form 4)
+                :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
+                :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
+                                            :float)}
+               out-sym)]
+        {:strategy :staged-segred
+         :kernel-name (:kernel-name k) :source (:source k)
+         :array-params (:array-params k)
+         ;; the per-stage scale arrays are EXTRA pointer params — surfaced so a caller binds them
+         :lift-operands (:lift-operands k)
+         :dtype (:dtype k) :out-dtype (:out-dtype k)
+         :out-elems (:out-elems k)
+         :stages (:stages k)
+         :scalar-args [{:type :int :value nseg}]
+         :wg [256 1]
+         :grid [(ceil-div nseg 256) 1]})
+
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
       (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
