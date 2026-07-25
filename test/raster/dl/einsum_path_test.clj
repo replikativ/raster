@@ -102,3 +102,58 @@
       (is (= 1 (count (:steps plan))))
       (is (= (es/einsum->contract-form "ij,jk->ik" {:i 2 :j 3 :k 4} 'OUT '[A B])
              (:form (first (:steps plan))))))))
+
+;; ── G1: UNARY einsums (transpose / axis-reduction / diagonal) ────────────────────────
+(deftest unary-einsums-lower-and-compute
+  (testing "ij->ji is a 0-contract transpose; body reads the INPUT map's index"
+    (let [f (es/einsum->contract-form "ij->ji" {:i 2 :j 3} 'O '[A])]
+      (is (= '[[j 3] [i 2]] (nth f 2)))          ; free axes in OUTPUT order
+      (is (= [] (nth f 3)))
+      (is (= '(aget A (clojure.core/+ (clojure.core/* i 3) j)) (nth f 4)))))
+  (testing "ij->i reduces the summed axis"
+    (let [f (es/einsum->contract-form "ij->i" {:i 2 :j 3} 'O '[A])]
+      (is (= '[[i 2]] (nth f 2)))
+      (is (= '[[j 3]] (nth f 3)))))
+  (testing "ii->i is the DIAGONAL — a repeated label makes the axis-map emit i·N + i"
+    (let [f (es/einsum->contract-form "ii->i" {:i 3} 'O '[A])]
+      (is (= '[[i 3]] (nth f 2)))
+      (is (= [] (nth f 3)))
+      (is (= '(aget A (clojure.core/+ (clojure.core/* i 3) i)) (nth f 4)))))
+  (testing "a unary einsum yields exactly ONE step (the greedy path is empty)"
+    (let [plan (es/einsum->contract-steps "ij->ji" {:i 2 :j 3} 'O '[A])]
+      (is (= 1 (count (:steps plan))))
+      (is (= [] (:path plan)))
+      (is (= 'O (:result plan)))))
+  (testing "executing the unary steps == reference"
+    (let [A (double-array [1 2 3 4 5 6])            ; 2×3
+          B (double-array [1 2 3 4 5 6 7 8 9])]     ; 3×3
+      (is (= (run-steps (es/einsum->contract-steps "ij->ji" {:i 2 :j 3} 'O '[A]) {'A A})
+             (vec (for [j (range 3) i (range 2)] (aget A (+ (* i 3) j))))))
+      (is (= (run-steps (es/einsum->contract-steps "ij->i" {:i 2 :j 3} 'O '[A]) {'A A})
+             (vec (for [i (range 2)] (reduce + (for [j (range 3)] (aget A (+ (* i 3) j))))))))
+      (is (= (run-steps (es/einsum->contract-steps "ii->i" {:i 3} 'O '[B]) {'B B})
+             (vec (for [i (range 3)] (aget B (+ (* i 3) i)))))))))
+
+;; ── coverage ledger: what the contract path expresses, asserted EXPLICITLY ───────────
+;; "Properly covered" has to be checkable, not claimed. This pins the current frontier so it
+;; cannot silently regress, and names the remaining gap (G2: scalar output / 0 free axes).
+(deftest coverage-ledger-of-the-contract-path
+  (let [expressible? (fn [sub dm syms]
+                       (try (es/einsum->contract-form sub dm 'O syms) true
+                            (catch Throwable _ false)))]
+    (testing "EXPRESSIBLE: binary contractions, broadcasts, and all unary forms"
+      (doseq [[sub dm syms] [["ij,jk->ik"    {:i 2 :j 3 :k 4}       '[A B]]
+                             ["bij,bjk->bik" {:b 2 :i 2 :j 3 :k 4}  '[A B]]
+                             ["ij,ij->ij"    {:i 2 :j 3}            '[A B]]
+                             ["i,j->ij"      {:i 2 :j 3}            '[A B]]
+                             ["ij->ji"       {:i 2 :j 3}            '[A]]
+                             ["ij->i"        {:i 2 :j 3}            '[A]]
+                             ["ii->i"        {:i 3}                 '[A]]]]
+        (is (expressible? sub dm syms) (str sub " should be expressible"))))
+    (testing "NOT YET expressible: scalar output needs 0 free axes (G2), and fails LOUD"
+      (doseq [[sub dm syms] [["ij->"  {:i 2 :j 3} '[A]]
+                             ["ii->"  {:i 3}      '[A]]
+                             ["i,i->" {:i 3}      '[A B]]]]
+        (is (not (expressible? sub dm syms)) (str sub " is G2, must not silently succeed"))
+        (is (thrown-with-msg? AssertionError #"scalar output"
+                              (es/einsum->contract-form sub dm 'O syms)))))))

@@ -116,19 +116,28 @@
 (declare parse-rearrange-pattern)
 
 (defn einsum->contract-form
-  "Lower a 2-operand einsum to a `(raster.par/contract out free-axes contract-axes body)` form,
-   the bridge from the general einsum surface to the contraction path (B1). free-axes = the
+  "Lower a 1- or 2-operand einsum to a `(raster.par/contract out free-axes contract-axes body)`
+   form — the bridge from the general einsum surface to the contraction path (B1). free-axes = the
    OUTPUT labels (in output order → the row-major write gives the right layout, A3); contract-
-   axes = labels that appear in the inputs but not the output (summed); body = the product of
-   the two operand agets, each indexed by its strided affine index expression. `dim-map` maps
-   each label → its extent; `out-sym` / `in-syms` name the output + the two input arrays in the
-   emitted form. Routing the result through `contract-route/route-contraction` sends it to the
-   peak leaves (DPAS/dp4a) or the portable fallback. n-operand einsum decomposes to a sequence
-   of these pairwise steps (B2)."
+   axes = labels that appear in the inputs but not the output (summed); body = a single operand
+   `aget` (unary) or the product of the two (binary), each indexed by its strided affine index
+   expression. `dim-map` maps each label → its extent; `out-sym` / `in-syms` name the output +
+   the input arrays in the emitted form.
+
+   UNARY covers transpose (`ij->ji`), axis reduction (`ij->i`) and — with no extra machinery —
+   the DIAGONAL (`ii->i`), because a repeated label makes the axis-map emit `i·N + i`. Routing
+   the result through `contract-route/route-contraction` sends it to the peak leaves (DPAS/dp4a)
+   or the portable fallback. n-operand einsum decomposes to a sequence of pairwise steps (B2).
+
+   NOT yet expressible: a SCALAR output (`ij->`, `ii->`, `i,i->`) — that needs 0 free axes, which
+   `par/contract` does not admit; tracked separately (G2)."
   [subscript dim-map out-sym in-syms]
   (let [{:keys [inputs output]} (parse-subscript subscript)
-        _ (assert (= 2 (count inputs))
-                  "einsum->contract-form: exactly 2 operands (pairwise; n-operand path = B2)")
+        _ (assert (<= 1 (count inputs) 2)
+                  "einsum->contract-form: 1 (unary) or 2 (pairwise) operands; n-operand path = B2")
+        _ (assert (seq output)
+                  (str "einsum->contract-form: scalar output (0 free axes) is not expressible as a "
+                       "par/contract yet — see G2. subscript: " subscript))
         all-labels (distinct (mapcat identity inputs))
         contract-labels (vec (remove (set output) all-labels))
         lsym (fn [l] (symbol (name l)))
@@ -138,8 +147,10 @@
         operand-map (fn [labels] (am/of-axes (mapv axis labels)))
         maps (zipmap in-syms (map operand-map inputs))
         idx-expr (fn [labels] (am/index-expr (operand-map labels)))
-        body (list '* (list 'aget (nth in-syms 0) (idx-expr (nth inputs 0)))
-                   (list 'aget (nth in-syms 1) (idx-expr (nth inputs 1))))]
+        operand (fn [k] (list 'aget (nth in-syms k) (idx-expr (nth inputs k))))
+        body (if (= 1 (count inputs))
+               (operand 0)                          ; unary: transpose / reduce / diagonal
+               (list '* (operand 0) (operand 1)))]  ; binary: the contracted product
     ;; :maps carries the declared per-operand layout downstream (orientation as DATA — the gate
     ;; compares maps instead of pattern-matching the body's index arithmetic).
     (list 'raster.par/contract out-sym (mapv axis output) (mapv axis contract-labels) body
@@ -223,6 +234,13 @@
         _ (assert (= (count inputs) (count in-syms))
                   "einsum->contract-steps: one input symbol per subscript operand")
         path (contraction-path inputs output dim-map)]
+    ;; A UNARY einsum has no pair to contract, so the greedy path is empty — but the operand still
+    ;; needs transposing/reducing/diagonalizing. Emit the single unary step directly.
+    (if (= 1 (count inputs))
+      (let [form (einsum->contract-form subscript dim-map out-sym in-syms)]
+        {:steps [{:out out-sym :labels (vec output)
+                  :shape (mapv dim-map output) :form form}]
+         :result out-sym :path []})
     (loop [labels (vec inputs) syms (vec in-syms) todo path steps []]
       (if (empty? todo)
         {:steps steps :result (if (seq steps) (:out (peek steps)) (first syms)) :path path}
@@ -242,7 +260,7 @@
                  (vec (concat others-syms [step-out]))
                  (rest todo)
                  (conj steps {:out step-out :labels keep
-                              :shape (mapv dim-map keep) :form form})))))))
+                              :shape (mapv dim-map keep) :form form}))))))))
 
 ;; ================================================================
 ;; rearrange → contract  (Phase 2: split/merge/transpose as a map application)
