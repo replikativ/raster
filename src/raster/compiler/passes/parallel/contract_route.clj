@@ -19,7 +19,8 @@
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
-            [raster.compiler.ir.axis-map :as am]))
+            [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.contraction-facts :as cf]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -190,9 +191,10 @@
             ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
             ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
             spec {:free-axes free-axes :stages stages
-                  ;; the axes the FORM declared — the stage list is validated against THESE, never
-                  ;; against axes re-derived from the stages (which made the span rule unfireable)
-                  :contract-axes contract-axes
+                  ;; the axes the FORM declared, read off FACTS — a single derivation whose only
+                  ;; input is the form, so there is no separately-computed value to pass
+                  ;; inconsistently (which is what made the span rule unfireable)
+                  :contract-axes (:contract-axes (cf/contraction-facts contract-form :dtype dtype))
                   :body (nth contract-form 4)
                   :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
                   :operands operands
