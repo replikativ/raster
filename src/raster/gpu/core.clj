@@ -860,13 +860,15 @@
 
    Callers: bind-program! (the binder) and gemm_splitk_test (the executable spec). ONE
    copy — the policy is not re-implemented anywhere."
-  ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs)))))
-  ([m n k fill-wgs target-wgs]
-   (let [{:keys [block-m block-n block-k]}
-         ((requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
-          (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
-                (:device-id @(requiring-resolve 'raster.gpu.ze-runtime/state)))
-               (catch Throwable _ nil)))
+  ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs))) nil))
+  ([m n k fill-wgs target-wgs] (gemm-schedule m n k fill-wgs target-wgs nil))
+  ([m n k fill-wgs target-wgs tile]
+   (let [;; The tile is a PARAMETER, not a global read. Reaching into raster.gpu.ze-runtime/state
+         ;; here made a backend-neutral policy depend on the Level-Zero backend — so an :ocl program
+         ;; would schedule from the ZE device's descriptor — and `descriptor-for` is TOTAL for an
+         ;; unknown id (it fabricates a GPU descriptor rather than throwing), so the try/catch
+         ;; guarded a failure that cannot happen while the real one passed through silently.
+         {:keys [block-m block-n block-k]} (or tile (hw/gemm-tile-for nil))
          ;; the split-k policy's occupancy estimate and K-chunk quantum are the SAME tile the
          ;; kernel is emitted with — they were independent `/128.0` and `*32` literals, so a tile
          ;; change silently decoupled the policy from the kernel it schedules

@@ -1131,6 +1131,12 @@
 ;; GPU GEMM (non-square XMX)
 ;; ================================================================
 
+;; Forward refs: the DEFAULT GEMM doors delegate to the tile-parametric ones defined below, so that
+;; the emitted kernel and the launch grid always come from one tile. Declared here because Clojure
+;; resolves at read time and a cold JVM (unlike a warm REPL, where the var is already interned) fails
+;; loudly on a forward reference — this file has now hit that three times.
+(declare ensure-gemm-kernel-tiled! bind-registered-gemm-tiled!)
+
 (def ^:private gemm-cache
   "Cache for compiled GEMM kernels, keyed by C-output dtype (:half | :float).
    Each entry is {:module :kernel :kernel-name}. (A/B are always fp16 in.)"
@@ -1175,8 +1181,12 @@
 
   Returns C."
   [a b c m n k]
-  (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
-        {:keys [block-m block-n]} (gemm-tile)
+  (let [;; the tile that the KERNEL is emitted with — ensure-gemm-kernel! takes no tile, so it is
+        ;; emit-gemm-tiled's default. Deriving the grid from a DIFFERENT (device) tile would leave
+        ;; the tail rows of C unwritten on any part whose derived block-m differs.
+        tile (gemm-tile)
+        {:keys [kernel]} (ensure-gemm-kernel-tiled! :half tile)
+        {:keys [block-m block-n]} tile
         gc-m (int (Math/ceil (/ (double m) (double block-m))))
         gc-n (int (Math/ceil (/ (double n) (double block-n))))
         args [(:segment a) (:segment b) (:segment c)
@@ -1885,7 +1895,8 @@
   "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
   command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
   call). A:[m×k] B:[k×n] C:[m×n], all fp16 (:half) resident buffers, row-major. Returns a bound
-  {:kernel :gc-seg …} map (128×128 XMX tiles → gc = ceil(n/128) × ceil(m/128)). A fresh kernel
+  {:kernel :gc-seg …} map; the tile comes from `gemm-tile` (compiler.core.hardware/gemm-tile-for),
+  and BOTH the emitted kernel and the launch grid are derived from it. A fresh kernel
   handle per binding (LZ kernel args are mutable handle state → shared handles clobber)."
   ([a b c m n k] (bind-registered-gemm! a b c m n k :half))
   ([a b c m n k c-dtype]
@@ -1898,21 +1909,18 @@
                             " — a mismatched write reads back as garbage. Allocate C as " c-dtype
                             " or pass the matching c-dtype.")
                        {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
-   (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
-         kh (create-kernel-fresh module kernel-name)
-         m (long m) n (long n) k (long k)
-         args [(:segment a) (:segment b) (:segment c)
-               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-         bnd (bind-kernel-2d! kh [256 1] args)
-         gc ^MemorySegment (:gc-seg bnd)]
-     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n (gemm-tile)))))))   ;; X = gc-n
-     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m (gemm-tile)))))))   ;; Y = gc-m
-     (.set gc I32 8 (int 1))
-     bnd)))
+   ;; DELEGATE to the tile-parametric door. Deriving the GRID from the device tile while the KERNEL
+   ;; came from emit-gemm-tiled's :or literals is worse than hardcoding both: on a part whose probed
+   ;; :simd-width is not 16, grf-bytes-per-lane changes, the derived block-m becomes 160, and a grid
+   ;; sized for 160-row blocks against a kernel emitting 128-row blocks leaves the tail rows of C
+   ;; NEVER WRITTEN — silent garbage. bind-registered-gemm-tiled! emits AND launches from one tile
+   ;; (and derives the workgroup as n-subgroups x subgroup rather than a literal 256), so kernel and
+   ;; geometry agree by construction.
+   (bind-registered-gemm-tiled! a b c (long m) (long n) (long k) c-dtype (gemm-tile))))
 
 ;; ── TILE-PARAMETRIC GEMM (autotune-facing) ─────────────────────────────────────
-;; The default bind-registered-gemm! above emits the derived-default tile (hardcoded 128/256
-;; launch). This path takes an EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune
+;; bind-registered-gemm! above delegates here with the device-derived tile. This path takes an
+;; EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune
 ;; candidate) and DERIVES the launch geometry from it — the regular form: workgroup = subgroups ×
 ;; subgroup-size, grid = ceil(n/block-n) × ceil(m/block-m). At the derived-default tile it produces
 ;; the identical launch, so this is a strict generalization of the hardcoded path.
@@ -2082,6 +2090,11 @@
               {:type :int :value (int k)} {:type :int :value (int kc)}]
         bnd (bind-kernel-2d! kh [256 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
+    ;; CONSISTENT BY CONSTRUCTION, and must stay that way: this door's kernel is emitted with NO
+    ;; tile (emit-gemm-tiled's :or defaults = 128/128), so the literal 128 here MATCHES it. Do not
+    ;; "unify" this grid onto gemm-tile-for without also passing the tile to the emit above — that
+    ;; one-sided change is exactly what left the tail rows of C unwritten on a part whose derived
+    ;; block-m is 160.
     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
     (.set gc I32 8 (int splits))                             ;; Z = k-chunks
@@ -2147,6 +2160,11 @@
               {:type :int :value (int k)}]
         bnd (bind-kernel-2d! kh [256 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
+    ;; CONSISTENT BY CONSTRUCTION, and must stay that way: this door's kernel is emitted with NO
+    ;; tile (emit-gemm-tiled's :or defaults = 128/128), so the literal 128 here MATCHES it. Do not
+    ;; "unify" this grid onto gemm-tile-for without also passing the tile to the emit above — that
+    ;; one-sided change is exactly what left the tail rows of C unwritten on a part whose derived
+    ;; block-m is 160.
     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
     (.set gc I32 8 (int batch))                              ;; Z = slabs
@@ -3113,6 +3131,8 @@
         c-elems (* m n)
         c-seg (ensure-seg kernel-name :gemm-c-seg (* c-elems 4))
         ;; 2D launch config
+        ;; the registered kernel's tile is whatever registered it; the literal matches the default
+        ;; emit. Same rule as above — convert emit and grid together, never one alone.
         gc-m (int (Math/ceil (/ (double m) 128.0)))
         gc-n (int (Math/ceil (/ (double n) 128.0)))
         args [a-seg b-seg c-seg
