@@ -897,6 +897,16 @@
       (not (every? :map operands)) {:ok false :reason :operand-without-a-declared-map}
       (not (and (dt/known? dtype) (= :byte (dt/canon dtype))))
       {:ok false :reason :dp4a-needs-int8-operands :dtype dtype}
+      ;; A :decode is a LOAD-LAMBDA applied by substituting into the body — and this leaf discards
+      ;; the body, replacing the whole summand with one rstr_dp4a call. So a zero-point would be
+      ;; silently dropped: Σ a·b instead of Σ(a−za)(b−zb), wrong by a constant-plus-linear term with
+      ;; no diagnostic. Load-bearing, since q4_0/q8_0 carry zero-points 8 and 128. Same underlying
+      ;; reason as :body-has-unmodeled-terms below — the body is not evaluated here.
+      (some :decode operands)
+      {:ok false :reason :decode-on-a-body-replacing-leaf
+       :detail "this leaf replaces the body with a single hardware op, so a per-operand :decode (e.g. a zero-point) would be silently dropped"
+       :decoded (mapv :sym (filter :decode operands))}
+
       (not exact-product?)
       {:ok false :reason :body-has-unmodeled-terms
        :detail "this leaf replaces the body with a single hardware op; any term beyond the two declared operands would be silently dropped"

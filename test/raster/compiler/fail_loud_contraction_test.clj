@@ -127,3 +127,26 @@
                      :epilogue {:acc 'acc :expr '(raster.numeric/* acc 2.0)})]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"silently dropped"
                             (cr/route-contraction form :dtype :double))))))
+
+(deftest dp4a-refuses-a-decode-it-would-discard
+  ;; The dp4a leaf replaces the whole summand with one hardware op, so a per-operand :decode — the
+  ;; load-lambda where a zero-point lives — would be silently dropped: Σ a·b instead of
+  ;; Σ(a−za)(b−zb). Load-bearing, since q4_0/q8_0 zero-points are 8 and 128.
+  (let [am (requiring-resolve 'raster.compiler.ir.axis-map/of-groups)
+        idx (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)
+        gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+        ma (am [['[i 4]] ['[blk 4] '[t 32]]])
+        mb (am [['[j 4]] ['[blk 4] '[t 32]]])
+        base {:stages [{:axis 'blk :extent 4 :dtype :float :init 0.0 :lift 'inner}
+                       {:axis 't :extent 32 :dtype :int :init 0}]
+              :dtype :byte
+              :body (list 'raster.numeric/* (list 'aget 'a (idx ma)) (list 'aget 'b (idx mb)))}]
+    (testing "no decode → the peak leaf is legal"
+      (is (:ok (gate (assoc base :operands [{:sym 'a :map ma} {:sym 'b :map mb}])))))
+    (testing "a zero-point on either operand → refused by name, not silently dropped"
+      (is (= :decode-on-a-body-replacing-leaf
+             (:reason (gate (assoc base :operands [{:sym 'a :map ma :decode '(clojure.core/- x 8)}
+                                                   {:sym 'b :map mb}])))))
+      (is (= :decode-on-a-body-replacing-leaf
+             (:reason (gate (assoc base :operands [{:sym 'a :map ma}
+                                                   {:sym 'b :map mb :decode '(clojure.core/- x 128)}]))))))))
