@@ -3072,31 +3072,6 @@
 
 (defonce ^:private ror-rename-counter (atom 0))
 
-(defn- alpha-rename-bound
-  "α-rename every let*-bound symbol in a FLAT binding vector to a globally
-  unique name (\"__gp<N>\" suffix, monotonic defonce counter), preserving
-  each binding sym's :raster.type/tag on all occurrences.
-
-  Why: a reified gradient program FREEZES symbols minted under one
-  `with-ad-gensym` scope (counter starts at 0). A LATER AD pass over the
-  frozen program starts a fresh counter, and its ANF lifts mint the same
-  names — silently REBINDING inner syms mid-program (e.g. a float[] anf__2
-  rebound to a Double ANF temp → ClassCastException, or worse a silent
-  wrong gradient). Globally-unique renames make the frozen program safe to
-  re-enter with any gensym state."
-  [bindings tail]
-  (let [bound (vec (take-nth 2 bindings))
-        smap (into {}
-                   (map (fn [s]
-                          [s (with-meta
-                               (symbol (str (name s) "__gp" (swap! ror-rename-counter inc)))
-                               (meta s))]))
-                   bound)
-        rename (fn [form] (walk/postwalk-replace smap form))]
-    [(vec (mapcat (fn [[s init]] [(get smap s s) (rename init)])
-                  (partition 2 bindings)))
-     (rename tail)]))
-
 (defn ^clojure.lang.IFn reified-grad
   "Reify ∂f/∂param of a scalar deftm as a deftm-style meta-fn — the
   double-backward (reverse-over-reverse) composition surface (#72).
@@ -3147,10 +3122,9 @@
         ;; (lower-composites) and reify-pullback each open their OWN
         ;; with-ad-gensym; run BOTH under one shared counter so reify-pullback
         ;; continues from ad-prepare's high-water mark instead of resetting to 0
-        ;; and re-minting colliding anf__ temps. The alpha-rename-bound below
-        ;; assumes its input bindings are already unique — it collapses (not
-        ;; separates) any duplicate bound name — so the collision must be
-        ;; prevented HERE, upstream of the rename.
+        ;; and re-minting colliding anf__ temps. (The old local rename ALSO required its input
+        ;; bindings to be unique, since it collapsed duplicates; util/alpha-convert does not, so
+        ;; this shared counter is now belt-and-braces rather than load-bearing for that reason.)
         {:keys [fwd-bindings result-sym body-sym pullback-form]}
         (call-with-shared-ad-gensym
          (fn [] (reify-pullback (ad-prepare (first walked-body)) diff-params)))
@@ -3169,10 +3143,18 @@
                               ['dy__rad 1.0]
                               rev-bindings
                               tail-bindings))
-        ;; α-rename: the frozen program must survive a fresh-countered
-        ;; second AD pass (see alpha-rename-bound).
-        [bindings' tail'] (alpha-rename-bound bindings tail)
-        form (list 'let* bindings' tail')
+        ;; α-rename so the frozen program survives a fresh-countered second AD pass: a reified
+        ;; gradient FREEZES symbols minted under one `with-ad-gensym` scope, and a later pass starts a
+        ;; fresh counter that re-mints the same `anf__` names, silently rebinding inner syms.
+        ;;
+        ;; util/alpha-convert, not a local rename. The previous local version built its map with
+        ;; `(into {} …)` over the bound names, so a name bound TWICE collapsed to one entry and the
+        ;; first binding's uses read the second's value — a silent wrong gradient. Its docstring and
+        ;; this call site both stated "assumes the bindings are already unique"; nothing asserted it.
+        ;; alpha-convert has no such precondition (util_test pins the separation), renames nested
+        ;; binders too (consistent renaming is semantics-preserving), and carries binder metadata onto
+        ;; every reference — which is what preserved :raster.type/tag before.
+        form (util/alpha-convert (list 'let* bindings tail))
         fn-params (cond-> all-params array-param? (conj c-sym))
         source-ns (or (:ns m) *ns*)
         qualified (inf/qualify-body-symbols form source-ns (set fn-params))
