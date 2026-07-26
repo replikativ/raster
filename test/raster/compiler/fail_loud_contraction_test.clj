@@ -61,15 +61,69 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"silently dropped"
                             (cr/route-contraction form :dtype :double))))))
 
-(deftest the-decompose-mangles-symbolic-bound-names
-  (testing "a bound named `n-cols` was emitted raw as `(seg / (n-cols))` — valid C computing
-            `n - cols`. Bounds go through c-symbol like every other emitted symbol."
-    (let [m (am/of-axes '[[i 4] [l 8]])]
-      ;; exercised through a literal-bound kernel: the mangling path must not alter literals
-      (is (re-find #"\(seg / \(2\)\) % 2"
-                   (:source (sco/generate-staged-contraction-kernel
-                             {:free-axes '[[i 2] [j 2]] :contract-axes '[[l 8]]
-                              :stages [{:axis 'l :extent 8 :dtype :float :init 0.0}]
-                              :body '(raster.numeric/* (aget a l) (aget b l))
-                              :inputs '[a b] :dtype :float :out-dtype :float}
-                             'out)))))))
+(deftest the-decompose-is-row-major-and-distinguishably-so
+  ;; MUTATION-PROVEN INADEQUATE, and this is the replacement. The previous version asserted
+  ;;     (re-find #"\(seg / \(2\)\) % 2" src)     with free axes [[i 2] [j 2]]
+  ;; Both extents were 2, so row-major and column-major emit the SAME two lines with the axes
+  ;; swapped — a one-line regex over a symmetric shape cannot tell them apart. Flipping
+  ;; flat-decompose-c to column-major left 101 CI-visible contraction assertions passing.
+  ;;
+  ;; Fix: ASYMMETRIC extents, and assert each axis's own line, so the two orderings differ.
+  (let [src (:source (sco/generate-staged-contraction-kernel
+                      {:free-axes '[[i 3] [j 5]] :contract-axes '[[l 8]]
+                       :stages [{:axis 'l :extent 8 :dtype :float :init 0.0}]
+                       :body '(raster.numeric/* (aget a l) (aget b l))
+                       :inputs '[a b] :dtype :float :out-dtype :float}
+                      'out))]
+    (testing "outer axis divides by the product of the extents INSIDE it, then mods by its own"
+      (is (re-find #"int i = \(seg / \(5\)\) % 3;" src)))
+    (testing "innermost axis is a bare mod — no division"
+      (is (re-find #"int j = seg % 5;" src)))
+    (testing "and the column-major spelling is ABSENT (this is what the old test could not say)"
+      (is (not (re-find #"int i = seg % 3;" src)))
+      (is (not (re-find #"int j = \(seg / \(3\)\) % 5;" src))))))
+
+(deftest symbolic-bounds-are-refused-not-mangled
+  ;; The bug the old test NAMED was a symbolic bound (`n-cols` emitted raw as `(seg / (n-cols))`,
+  ;; valid C computing `n - cols`) — but its fixture passed only literals, so it exercised nothing.
+  ;; Symbolic bounds are now refused outright by this emitter, so assert THAT.
+  (testing "a symbolic free-axis bound is refused rather than emitted undeclared"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"symbolic bounds are not supported"
+         (sco/generate-staged-contraction-kernel
+          {:free-axes '[[i n-cols] [j 5]] :contract-axes '[[l 8]]
+           :stages [{:axis 'l :extent 8 :dtype :float :init 0.0}]
+           :body '(raster.numeric/* (aget a l) (aget b l))
+           :inputs '[a b] :dtype :float :out-dtype :float}
+          'out)))))
+
+;; ── producer-side assertions: a widened channel is only a fix if something fills it ──────
+(deftest full-reduce-descriptor-carries-its-combine
+  ;; A previous commit "fixed" the silent-sum by widening the REGISTRATION to pass the whole
+  ;; descriptor through. That was a no-op: the descriptor did not contain :c-op/:identity-val —
+  ;; generate-segred-kernel returned them into a local that route-contraction discarded. The
+  ;; consumer-side assertion could not catch it; only this producer-side one can.
+  (testing ":combine max reaches the descriptor as fmax + its identity, not defaulted to +/0.0"
+    (let [r (cr/route-contraction
+             (list 'raster.par/contract 'O [] [['l 8]]
+                   (list 'raster.numeric/* (list 'aget 'a 'l) (list 'aget 'b 'l))
+                   :combine 'max :init -1.0e30)
+             :dtype :double)]
+      (is (= :full-reduce (:strategy r)))
+      (is (= "fmax" (:c-op r)))
+      (is (= Double/NEGATIVE_INFINITY (:identity-val r))
+          "the identity must be the op's, not 0.0 — summing max-partials from 0.0 is wrong for
+           all-negative data"))))
+
+(deftest epilogue-refused-on-the-shape-production-actually-produces
+  ;; The first version of this guard blacklisted shapes and so exempted (2 free, 1 contract) — the
+  ;; ONLY shape production produces. The form fell through to :regtiled, which has no store splice,
+  ;; and the epilogue was dropped. Refuse by ABSENCE of splice support instead.
+  (testing "an epilogue on an f64 2-free/1-contract contraction is refused, not dropped"
+    (let [form (list 'raster.par/contract 'C [['i 4] ['j 4]] [['l 8]]
+                     (list 'raster.numeric/*
+                           (list 'aget 'A (list 'clojure.core/+ (list 'clojure.core/* 'i 8) 'l))
+                           (list 'aget 'B (list 'clojure.core/+ (list 'clojure.core/* 'l 4) 'j)))
+                     :epilogue {:acc 'acc :expr '(raster.numeric/* acc 2.0)})]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"silently dropped"
+                            (cr/route-contraction form :dtype :double))))))

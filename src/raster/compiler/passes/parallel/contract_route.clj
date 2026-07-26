@@ -150,6 +150,29 @@
 
 (declare route-2free-1contract route-quant)
 
+(def ^:private splice-capable-strategies
+  "Strategies whose emitter has a store splice, and can therefore honour an :epilogue.
+   A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
+   blacklist got this wrong twice, most recently by exempting the only shape production produces.
+   `:dpas` splices through emit-gemm-tiled; the three staged-emitter strategies splice at the store
+   (which is how a quant dequant scale is expressed since :scheme was deleted)."
+  #{:dpas :dp4a :quant-naive :staged-segred})
+
+(defn- epilogue-honoured-or-refused
+  "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
+   silently — the consumer's computation vanishes with no error.
+
+   Decided AFTER routing, on the strategy actually chosen, because a pre-routing shape test got this
+   wrong twice: a shape blacklist exempted (2 free, 1 contract) — the only shape production produces
+   — and a version keyed on the tensorize plan forced that plan early and refused shapes DPAS would
+   have accepted. The chosen strategy is the only reliable witness of whether a splice exists."
+  [epilogue d]
+  (when (and (seq epilogue) (not (contains? splice-capable-strategies (:strategy d))))
+    (throw (ex-info (str "contraction: strategy " (:strategy d) " has no store splice, so its "
+                         ":epilogue would be silently dropped")
+                    {:reason :epilogue-unsupported-by-this-leaf :strategy (:strategy d)})))
+  d)
+
 (defn route-contraction
   "Route a contraction form to the hardware-optimal kernel via the DPAS legality gate.
    dtype selects the element type of the intended kernel (:half tries DPAS; :byte/:int8 tries
@@ -185,7 +208,9 @@
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
     (validate-descriptor
-     (cond
+     (epilogue-honoured-or-refused
+      epilogue
+      (cond
       ;; STAGED contract axis → the multi-level accumulate leaf. Checked FIRST because staging is
       ;; a property of the reduction itself, not of the dtype: it is what lets a block-quantized
       ;; format (int32 MAC inside the block, float accumulate across blocks) be expressed in the
@@ -253,20 +278,15 @@
          :array-params (:array-params k)
          :dtype dtype :out-dtype dtype :out-elems 1
          :n-phases (:n-phases k)
+         ;; CARRY THE COMBINE. invoke-reduction-kernel reads :c-op/:identity-val from the kernel
+         ;; REGISTRY for its host-side final combine, defaulting to `+`/0.0. Widening the
+         ;; registration to pass the whole descriptor through (as a previous commit did) is a no-op
+         ;; unless the descriptor actually contains them — generate-segred-kernel returns them into
+         ;; a local that was discarded here. Without this, a multi-workgroup `:combine max` or `*`
+         ;; silently SUMS its per-group partials.
+         :c-op (:c-op k) :identity-val (:identity-val k)
          :reduce-bound red-bound          ; element count the reduction spans
          :scalar-args [] :dims [1]})
-
-      ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
-      ;; :segmap and the :else fallback have no store splice, so an :epilogue reaching them was
-      ;; silently DROPPED — the consumer's computation vanished with no error. fuse-contract-map
-      ;; already produces such forms (no rank restriction), and it is one line in par-fusion-pass
-      ;; away from being live, so this refuses now rather than after.
-      (and (seq epilogue) (or (zero? n-contract)
-                              (not (and (= 2 n-free) (= 1 n-contract)))))
-      (throw (ex-info (str "contraction: this leaf has no store splice, so its :epilogue would be "
-                           "silently dropped (n-free " n-free ", n-contract " n-contract ")")
-                      {:reason :epilogue-unsupported-by-this-leaf
-                       :n-free n-free :n-contract n-contract}))
 
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
@@ -300,7 +320,7 @@
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
          :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
                             {:type :int :value nseg})
-         :out-elems nseg :dims [nseg]})))))
+         :out-elems nseg :dims [nseg]}))))))
 
 (defn- route-2free-1contract
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.
