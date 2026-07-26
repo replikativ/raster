@@ -27,8 +27,16 @@
     (is (< 44.0 (hw/balance-for desc :f32) 45.0) "f32 ridge ~44.6")
     (is (< 2.7 (hw/balance-for desc :f64) 2.9) "f64 ridge ~2.79")
     (is (> (hw/balance-for desc :f32) (* 10 (hw/balance-for desc :f64)))))
-  (testing "falls back to the scalar :balance default when bandwidth/flops are absent"
-    (is (= 60.0 (hw/balance-for no-perf-desc :f32)))))
+  (testing "ABSTAINS when bandwidth/flops are absent, rather than substituting the scalar :balance"
+    ;; The old fallback fabricated an f32-ish ridge for every dtype it did not know: int8 got 60,
+    ;; two orders below any plausible dp4a ridge, and a CPU descriptor carries no peak-flops at all
+    ;; so every CPU ridge was invented. `roofline-time-ns` already abstained honestly; this matches
+    ;; it. A cost model may decline to answer — it must not make one up.
+    (is (nil? (hw/balance-for no-perf-desc :f32)))
+    (is (nil? (hw/roofline-regime no-perf-desc {:flops 1000 :bytes 10} :f32))
+        "and the precision-aware regime abstains with it")
+    (is (some? (hw/roofline-regime no-perf-desc {:flops 1000 :bytes 10}))
+        "the 2-arg legacy form still answers from the scalar :balance — it has callers")))
 
 (deftest regime-fixes-the-single-balance-bug
   ;; a 256³ GEMM: AI = 2·256³ / (3·256²·4) = 42.67 — BETWEEN the f64 ridge (2.8) and f32 ridge (44.6)

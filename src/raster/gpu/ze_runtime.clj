@@ -1156,6 +1156,17 @@
         (swap! gemm-cache assoc c-dtype entry)
         entry)))
 
+(defn- gemm-tile
+  "The GEMM tile for this device, from the ONE source (compiler.core.hardware/gemm-tile-for).
+   Launch geometry MUST be derived from the same tile the kernel was emitted with — the `/128.0`
+   literals this replaces were a second, independent spelling of block-m/block-n, so any tile change
+   would have silently mismatched kernel and grid."
+  []
+  (let [f (requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
+        d (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for) (:device-id @state))
+               (catch Throwable _ nil))]
+    (f d)))
+
 (defn gemm!
   "GPU matrix multiply: C = A × B using XMX DPAS instructions.
   A: FP16 DeviceBuffer [M×K], B: FP16 DeviceBuffer [K×N],
@@ -1165,8 +1176,9 @@
   Returns C."
   [a b c m n k]
   (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
-        gc-m (int (Math/ceil (/ (double m) 128.0)))
-        gc-n (int (Math/ceil (/ (double n) 128.0)))
+        {:keys [block-m block-n]} (gemm-tile)
+        gc-m (int (Math/ceil (/ (double m) (double block-m))))
+        gc-n (int (Math/ceil (/ (double n) (double block-n))))
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)}
               {:type :int :value (int n)}
@@ -1893,8 +1905,8 @@
                {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
          bnd (bind-kernel-2d! kh [256 1] args)
          gc ^MemorySegment (:gc-seg bnd)]
-     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
-     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n (gemm-tile)))))))   ;; X = gc-n
+     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m (gemm-tile)))))))   ;; Y = gc-m
      (.set gc I32 8 (int 1))
      bnd)))
 
