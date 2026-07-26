@@ -129,3 +129,63 @@
             (when (and (= (count terms) (count args))
                        (= syms (set (map :sym terms))))
               (vec terms))))))))
+
+(defn- permutations
+  "All orderings of `xs`. Operand counts here are 2 (occasionally 3), so the factorial cost is
+   irrelevant and an explicit search is clearer than a variance heuristic."
+  [xs]
+  (if (<= (count xs) 1)
+    (list (vec xs))
+    (for [i (range (count xs))
+          rest-perm (permutations (concat (take i xs) (drop (inc i) xs)))]
+      (into [(nth xs i)] rest-perm))))
+
+;; ── leaf layout requirements as DATA ────────────────────────────────────────────────
+(def leaf-layouts
+  "Each tensorize leaf's required operand layout, as ROLE → the axis roles that index it,
+   outer→inner. `:nn` and `:nt` are not concepts here — they are two different data rows:
+
+     :dpas / :quant  row A[i,l]  col B[l,j]   → col is [:contract0 :free1]
+     :dp4a           row A[i,l]  col B[j,l]   → col is [:free1 :contract0]  (K-contiguous)
+
+   The required layout is a property of the LEAF (dp4a packs 4 int8 along the contraction, so both
+   operands must be contiguous in it), never of the contraction. Adding a layout — a batch axis, a
+   merged group, a `:tn` orientation — is a row edit, not a new predicate. This replaces three
+   hand-written checks that called one pattern-matcher with six different argument orders."
+  {:dpas        {:row [:free0 :contract0] :col [:contract0 :free1]}
+   :quant-naive {:row [:free0 :contract0] :col [:contract0 :free1]}
+   :dp4a        {:row [:free0 :contract0] :col [:free1 :contract0]}})
+
+(defn- role-map
+  "The axis-map a role-spec denotes, e.g. [:free0 :contract0] → of-axes [[i M] [l L]] (index i·L+l)."
+  [facts axis-roles]
+  (am/of-axes (mapv (fn [r] [(get-in facts [:roles r]) (get-in facts [:dims r])]) axis-roles)))
+
+(defn check-layout
+  "Assign the body's operands to a leaf's declared roles BY VERIFICATION, and return
+   {:ok true :bindings {role sym}} or {:ok false :reason :layout …}.
+
+   This replaces the variance test (\"row is the operand depending on free0+contract but not
+   free1\"). An operand is the row operand because its index PROVABLY IS the row layout — not
+   because of which axes it happens to mention. Every candidate assignment is checked, so a leaf
+   cannot be handed an operand whose layout was assumed rather than proved.
+
+   `required` is a `leaf-layouts` entry."
+  [facts required]
+  (when-not (facts? facts)
+    (throw (ex-info "check-layout: expected contraction-facts" {:reason :raster/bug})))
+  (let [ops (:operands facts)
+        roles (vec (keys required))]
+    (if (not= (count ops) (count roles))
+      {:ok false :reason :operand-count
+       :required (count roles) :actual (count ops) :operands (mapv :sym ops)}
+      (let [fits? (fn [assignment]
+                    (every? (fn [[role op]]
+                              (am/index-matches? (role-map facts (get required role)) (:idx op)))
+                            assignment))
+            candidates (map #(zipmap roles %) (permutations ops))]
+        (if-let [hit (first (filter fits? candidates))]
+          {:ok true :bindings (into {} (map (fn [[r o]] [r (:sym o)])) hit)}
+          {:ok false :reason :layout
+           :required (into {} (map (fn [r] [r (am/index-expr (role-map facts (get required r)))])) roles)
+           :actual (mapv (juxt :sym :idx) ops)})))))

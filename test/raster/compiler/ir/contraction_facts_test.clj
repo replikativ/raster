@@ -78,3 +78,51 @@
                         (cf/contraction-facts (concat (form) [:dangling]))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"free-axes must be a vector"
                         (cf/contraction-facts (list 'raster.par/contract 'out '(i 4) [['l 8]] body)))))
+
+;; ── leaf layout requirements as data rows, not three hand-written predicates ─────────
+(defn- mm-form [col-idx]
+  (list 'raster.par/contract 'C [['i 4] ['j 6]] [['l 8]]
+        (list 'raster.numeric/*
+              (list 'aget 'A (list 'clojure.core/+ (list 'clojure.core/* 'i 8) 'l))
+              (list 'aget 'B col-idx))))
+(def ^:private nn-idx '(clojure.core/+ (clojure.core/* l 6) j))   ; B[l,j]
+(def ^:private nt-idx '(clojure.core/+ (clojure.core/* j 8) l))   ; B[j,l] — K-contiguous
+
+(deftest orientation-is-a-data-row
+  (let [nn (cf/contraction-facts (mm-form nn-idx))
+        nt (cf/contraction-facts (mm-form nt-idx))]
+    (testing ":nn satisfies the dpas/quant row, not the dp4a row"
+      (is (:ok (cf/check-layout nn (:dpas cf/leaf-layouts))))
+      (is (:ok (cf/check-layout nn (:quant-naive cf/leaf-layouts))))
+      (is (= :layout (:reason (cf/check-layout nn (:dp4a cf/leaf-layouts))))))
+    (testing ":nt satisfies the dp4a row (both operands K-contiguous), not dpas"
+      (is (:ok (cf/check-layout nt (:dp4a cf/leaf-layouts))))
+      (is (= :layout (:reason (cf/check-layout nt (:dpas cf/leaf-layouts))))))
+    (testing "the two rows differ ONLY in the col operand's axis order"
+      (is (= [:free0 :contract0] (get-in cf/leaf-layouts [:dpas :row])
+                                 (get-in cf/leaf-layouts [:dp4a :row])))
+      (is (= [:contract0 :free1] (get-in cf/leaf-layouts [:dpas :col])))
+      (is (= [:free1 :contract0] (get-in cf/leaf-layouts [:dp4a :col]))))))
+
+(deftest role-assignment-is-by-verification-not-by-variance
+  (testing "operands written in the OTHER order still bind correctly — an operand is the row
+            operand because its index provably IS the row layout, not because of which axes it
+            mentions (which is what the variance heuristic tested)"
+    (let [swapped (cf/contraction-facts
+                   (list 'raster.par/contract 'C [['i 4] ['j 6]] [['l 8]]
+                         (list 'raster.numeric/*
+                               (list 'aget 'B nn-idx)
+                               (list 'aget 'A '(clojure.core/+ (clojure.core/* i 8) l)))))]
+      (is (= '{:row A :col B} (:bindings (cf/check-layout swapped (:dpas cf/leaf-layouts)))))))
+  (testing "a commuted index spelling binds too (one affine relation underneath)"
+    (let [commuted (cf/contraction-facts (mm-form '(clojure.core/+ j (clojure.core/* l 6))))]
+      (is (:ok (cf/check-layout commuted (:dpas cf/leaf-layouts))))))
+  (testing "a wrong operand count is named, not guessed at"
+    (let [three (cf/contraction-facts
+                 (list 'raster.par/contract 'C [['i 4] ['j 6]] [['l 8]]
+                       (list 'raster.numeric/* (list 'aget 'A 'l) (list 'aget 'B 'l)
+                                               (list 'aget 'D 'l))))]
+      (is (= :operand-count (:reason (cf/check-layout three (:dpas cf/leaf-layouts)))))))
+  (testing "check-layout refuses a hand-built map — it requires real facts"
+    (is (thrown? clojure.lang.ExceptionInfo
+                 (cf/check-layout {:operands [] :roles {}} (:dpas cf/leaf-layouts))))))
