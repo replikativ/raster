@@ -841,122 +841,6 @@
 ;; QUANT (int8) contraction — the SAME skeleton, WIDENING facet
 ;; ================================================================
 
-(defn generate-quant-contraction-kernel
-  "QUANT contraction → OpenCL. The SAME SegRed skeleton as the f16/f64 ladder — nothing
-   structurally new — carrying the facets a quantized matmul adds:
-     • WIDENING accumulate — int8 operands, int32 accumulator (int8's key op is widening, not
-       same-width: char×char must not accumulate in char);
-     • a DECODE SCHEME on the operands + a dequant EPILOGUE.
-
-   TYPES ARE GENERIC, not quant-specific: the operand dtype is :byte (=int8, `int8_t`), the
-   accumulate dtype :int (=int32), the output :float — all pulled from the ONE dtype facet
-   map (dtype-info), so widening is just a dtype PAIR, not a special type. What IS quant-
-   specific is the `scheme` — a DECODE descriptor (scale, per-operand zero-point; extensible
-   to block-size / q4 packing) that is NOT a native dtype (q8_0/q4_k have no C type; they
-   decode to int + scale). It generates the operand decode + the dequant epilogue:
-       out = scale · Σ_l (A[i,l] − a-zp)·(B[l,j] − b-zp)
-   (symmetric per-tensor int8 ⇒ zero-points 0). This decode scheme IS the operand load-lambda
-   — the same slot the register-tiled path can fuse (the fusion frontier). The dp4a / int8-
-   DPAS packed dot is the tensorize LEAF (perf layer, analogous to f16's DPAS); this is the
-   NAIVE correctness substrate. Canonical row-major orientation only (reuses analyze-
-   contraction + the DPAS gate's orientation check).
-
-   scheme: {:scale s (default 1.0), :a-zp z (0), :b-zp z (0)}."
-  [segred out-sym & {:keys [scheme] :or {scheme {}}}]
-  (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
-        {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
-        (analyze-contraction segred :byte)
-        _ (when-not (canonical-rowmajor? row-idx i-sym L l-sym)
-            (throw (ex-info "quant: row operand must be [M,K] row-major"
-                            {:reason :non-canonical-row :idx row-idx})))
-        _ (when-not (canonical-rowmajor? col-idx l-sym N j-sym)
-            (throw (ex-info "quant: col operand must be [K,N] row-major"
-                            {:reason :non-canonical-col :idx col-idx})))
-        ;; C types from the ONE dtype facet map — generic int8/int32/float, not quant types.
-        op-ctype  (get codegen/opencl-type-map :byte)   ; int8 storage (int8_t; signed)
-        acc-ctype (get codegen/opencl-type-map :int)    ; int32 widening accumulate
-        out-ctype (get codegen/opencl-type-map :float)  ; dequant output
-        A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
-        ;; per-operand decode = widen to acc dtype, then subtract zero-point (the load-lambda)
-        decode (fn [arr idx zp]
-                 (let [w (str "(" acc-ctype ")" arr "[" idx "]")]
-                   (if (zero? zp) w (str "(" w " - " zp ")"))))
-        a-term (decode A (str "i * " L " + l") a-zp)
-        b-term (decode B (str "l * " N " + j") b-zp)
-        kernel-name (str "quant_contract_" (gensym ""))
-        src (str "__kernel void " kernel-name "(__global const " op-ctype "* restrict " A
-                 ", __global const " op-ctype "* restrict " B
-                 ", __global " out-ctype "* restrict out, " out-ctype " scale, int _nseg) {\n"
-                 "    int seg = get_global_id(0);\n"
-                 "    if (seg >= _nseg) return;\n"
-                 "    int i = (seg / " N ") % " M ";\n"
-                 "    int j = seg % " N ";\n"
-                 "    " acc-ctype " acc = 0;\n"              ; WIDENING: int32 accumulator
-                 "    for (int l = 0; l < " L "; l++) {\n"
-                 "        acc += " a-term " * " b-term ";\n" ; decode + widening MAC
-                 "    }\n"
-                 "    out[seg] = scale * (" out-ctype ")acc;\n"   ; dequant epilogue
-                 "}\n")]
-    {:kernel-name kernel-name :source src
-     :array-params [row-arr col-arr]
-     :dtype :byte :acc-dtype :int :out-dtype :float
-     :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
-     :dims [M N L]}))
-
-(defn generate-dp4a-contraction-kernel
-  "DP4A-tensorized int8 contraction → OpenCL — the int8 PEAK LEAF (analogous to f16's DPAS
-   leaf). Uses the dp4a int8×4 dot-accumulate primitive (rstr_dp4a: 4 int8 MACs into an int32
-   in one op; native dp4a is a drop-in). This is where int8 quant reaches peak, the same way
-   generate-dpas-contraction-kernel is f16's peak.
-
-   PER-LEAF LAYOUT REQUIREMENT: dp4a packs 4 int8 along the contract axis into a 32-bit word,
-   so BOTH operands must be K-contiguous. A[M,K] row-major is (A[i,l]=i·K+l, K contiguous);
-   B must therefore be [N,K] TRANSPOSED (B[j,l]=j·K+l) — the :nt orientation, DIFFERENT from
-   f16-DPAS's :nn. The required operand layout is a property of the TENSORIZE LEAF, not the
-   contraction — the gate dispatches (dtype, leaf) → layout. K must be a multiple of 4.
-
-   Operands are reinterpreted at launch as int[] (4 packed int8 per int; the USM bytes are
-   identical to the int8 buffer). Symmetric quant only for now (zero-points fold into a
-   correction term — future). scheme: {:scale s}."
-  [segred out-sym & {:keys [scheme] :or {scheme {}}}]
-  (let [{:keys [scale a-zp b-zp] :or {scale 1.0 a-zp 0 b-zp 0}} scheme
-        {:keys [M N L i-sym j-sym l-sym row-arr col-arr row-idx col-idx]}
-        (analyze-contraction segred :byte)
-        _ (when-not (zero? (mod L 4))
-            (throw (ex-info "dp4a: K must be a multiple of 4" {:reason :k-not-mult-4 :K L})))
-        _ (when-not (canonical-rowmajor? row-idx i-sym L l-sym)
-            (throw (ex-info "dp4a: row operand must be [M,K] row-major" {:reason :non-canonical-row})))
-        _ (when-not (canonical-rowmajor? col-idx j-sym L l-sym)
-            (throw (ex-info "dp4a: col operand must be [N,K] (K-contiguous)" {:reason :non-nt-orientation})))
-        _ (when-not (and (zero? a-zp) (zero? b-zp))
-            (throw (ex-info "dp4a: symmetric quant only" {:reason :asymmetric-zp})))
-        A (ce/c-symbol row-arr) B (ce/c-symbol col-arr)
-        KP (quot L 4)                            ; packed contract length (int8×4 words)
-        acc-ctype (get codegen/opencl-type-map :int)
-        out-ctype (get codegen/opencl-type-map :float)
-        helper (:c-helper-src (intrinsics/descriptor 'dp4a))
-        kernel-name (str "dp4a_contract_" (gensym ""))
-        src (str helper
-                 "__kernel void " kernel-name "(__global const int* restrict " A
-                 ", __global const int* restrict " B
-                 ", __global " out-ctype "* restrict out, " out-ctype " scale, int _nseg) {\n"
-                 "    int seg = get_global_id(0);\n"
-                 "    if (seg >= _nseg) return;\n"
-                 "    int i = (seg / " N ") % " M ";\n"
-                 "    int j = seg % " N ";\n"
-                 "    " acc-ctype " acc = 0;\n"
-                 "    for (int p = 0; p < " KP "; p++) {\n"
-                 "        acc = rstr_dp4a(" A "[i * " KP " + p], " B "[j * " KP " + p], acc);\n"
-                 "    }\n"
-                 "    out[seg] = scale * (" out-ctype ")acc;\n"
-                 "}\n")]
-    {:kernel-name kernel-name :source src
-     :array-params [row-arr col-arr]
-     :dtype :byte :acc-dtype :int :out-dtype :float :packed :int8x4
-     :scheme (merge {:scale scale :a-zp a-zp :b-zp b-zp} scheme)
-     :dims [M N L]}))
-
-;; ── staged (multi-level) contraction ────────────────────────────────────────────────
 (defn- flat-decompose-c
   "C declarations recovering each free index from the flat segment id `seg`, row-major:
    idx_p = (seg / Π bounds-after-p) % bound_p, with the innermost simplifying to `seg % bound`.
@@ -1064,7 +948,8 @@
             :lift-operands}. :array-params is the body's inputs; :lift-operands are the EXTRA
    scale arrays, bound after them — surfaced because omitting them from a launch descriptor is
    an arity bug (the signature has them either way)."
-  [{:keys [free-axes stages body inputs dtype out-dtype operands tensorize-inner? contract-axes]
+  [{:keys [free-axes stages body inputs dtype out-dtype operands tensorize-inner? contract-axes
+           epilogue]
     :or {dtype :float out-dtype :float} :as spec} out-sym]
   (let [;; The stage list is checked against the axes the FORM DECLARED, never against axes derived
         ;; from the stages themselves. Deriving them made the span rule unfireable, and a stage list
@@ -1104,6 +989,30 @@
                          ce/*int-vars* (into ce/*int-vars* int-vars)]
                  (ce/emit-expr expr (gensym "z__") arr-syms)))
         acc-name (fn [d] (str "acc_" d))
+        ;; PER-OPERAND DECODE — the load-lambda. `:decode` is an expression in `x`, standing for the
+        ;; raw load, applied to that operand's every read. This is where a zero-point subtraction
+        ;; belongs: `Σ(a-za)(b-zb)` is exact on the load path and needs no correction reductions,
+        ;; whereas a per-tensor SCALE factors out of the sum entirely and belongs in the epilogue.
+        ;; WIDENING is deliberately NOT expressed here — it is the dtype PAIR (operand dtype +
+        ;; accumulator dtype), and hiding it in a lambda would blind the tensorize gate to the very
+        ;; pair it dispatches on.
+        decodes (into {} (keep (fn [{:keys [sym decode]}] (when decode [sym decode]))) operands)
+        body (if (empty? decodes)
+               body
+               (walk/postwalk
+                (fn [f] (if (and (seq? f) (= 'aget (first f)) (contains? decodes (second f)))
+                          (walk/postwalk-replace {'x f} (get decodes (second f)))
+                          f))
+                body))
+        ;; EPILOGUE — the store splice. An epilogue is a lift on a virtual outermost level of
+        ;; extent 1, which is why it needs no linearity (nothing to distribute over one iteration)
+        ;; while a real stage lift does. Gives this emitter the dequant scale that the two quant
+        ;; leaves hardwired into their store lines.
+        ep (when epilogue
+             (when-not (= 2 (count free-axes))
+               (throw (ex-info "staged contraction: an epilogue needs exactly 2 free axes (the store slot binds row/col)"
+                               {:reason :epilogue-needs-2-free :n-free (count free-axes)})))
+             (epilogue-splice epilogue (mapv first free-axes) (or (:dtype epilogue) out-dtype)))
         ;; innermost accumulates the body; each outer accumulates its lift with `inner` bound to
         ;; the accumulator one level down. Built inside-out.
         n (count stages)
@@ -1156,18 +1065,30 @@
                     (apply str (for [{:keys [sym dtype] :or {dtype :float}} lift-ops]
                                  (str ", __global const " (dt/ctype :opencl dtype)
                                       "* restrict " (ce/c-symbol sym))))
-                    ", __global " out-ctype "* restrict out, int _nseg")
+                    ", __global " out-ctype "* restrict out"
+                    (when ep (:epilogue-params ep))
+                    ", int _nseg")
         src (str (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))
+                 (when ep (:epilogue-helpers ep))
                  "__kernel void " kernel-name "(" params ") {\n"
                  "    int seg = get_global_id(0);\n"
                  "    if (seg >= _nseg) return;\n"
                  (flat-decompose-c free-axes) "\n"
                  nest
-                 "    out[seg] = (" out-ctype ")" (acc-name 0) ";\n"
+                 "    out[seg] = "
+                 (let [acc (str "(" out-ctype ")" (acc-name 0))]
+                   (if ep
+                     ((:epilogue ep) acc
+                      (ce/c-symbol (first (first free-axes)))
+                      (ce/c-symbol (first (second free-axes))))
+                     acc))
+                 ";\n"
                  "}\n")]
     {:kernel-name kernel-name :source src
      :array-params (vec inputs)
      :lift-operands (mapv :sym lift-ops)
+     :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
+     :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))
      :dtype dtype :out-dtype out-dtype
      :stages stages
      ;; the operand buffers are BOUND unchanged; only the kernel's view of them widens

@@ -202,17 +202,24 @@
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
 
 ;; ── C1-nt: int8 routes to the quant leaves (dp4a for :nt, quant-naive for :nn) ─────────
-(defn- launch-int8-routed [r bufs]
-  (let [ze (find-ns 'raster.gpu.ze-runtime)
+(defn- launch-int8-routed
+  "Launch a routed int8 descriptor. `scalars` supplies a value per `:epilogue-scalars`, bound in
+   SLOT ORDER: operands…, out, epilogue scalars…, trailing count. (That order is the descriptor's
+   contract; the ABI datum in the plan makes it data rather than a convention each caller repeats.)"
+  ([r bufs] (launch-int8-routed r bufs {}))
+  ([r bufs scalars]
+   (let [ze (find-ns 'raster.gpu.ze-runtime)
         [gx gy] (:grid r)
-        m*n (reduce * (:dims r))
-        o ((ns-resolve ze 'make-buffer) m*n :float)]
+        o ((ns-resolve ze 'make-buffer) (:out-elems r) :float)]
     ((ns-resolve ze 'register-kernel!) (:kernel-name r) {:source (:source r) :dtype :byte})
     (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
-          args (into (mapv #(:segment (get bufs %)) (:array-params r))
-                     (into [(:segment o)] (:scalar-args r)))]
+          args (-> (mapv #(:segment (get bufs %)) (:array-params r))
+                   (conj (:segment o))
+                   (into (mapv (fn [sym] {:type :float :value (float (get scalars sym))})
+                               (:epilogue-scalars r)))
+                   (into (:scalar-args r)))]
       ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) [gx gy] args)
-      (vec ((ns-resolve ze 'buffer->float-array) o)))))
+      (vec ((ns-resolve ze 'buffer->float-array) o))))))
 
 (defn- mk-i8 [xs] (let [ze (find-ns 'raster.gpu.ze-runtime)]
                     ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (count xs) :byte)
@@ -231,9 +238,11 @@
       (testing ":nt (B stored [N,K]) → :dp4a peak leaf; int8 matmul dequant == reference"
         (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                          (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
-                               (list 'aget 'B (list '+ (list '* 'j K) 'l))))
-              r (route/route-contraction form :dtype :byte :scheme {:scale scale})
-              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)})
+                               (list 'aget 'B (list '+ (list '* 'j K) 'l)))
+                         :epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                    :scalars [{:sym 's :dtype :float}]})
+              r (route/route-contraction form :dtype :byte)
+              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)} {'s scale})
               cpu (for [i (range M) j (range N)]
                     (* scale (reduce + (for [l (range K)] (* (int (Aget (+ (* i K) l))) (int (Bget (+ (* j K) l))))))))]
           (is (= :dp4a (:strategy r)))
@@ -241,9 +250,11 @@
       (testing ":nn (B stored [K,N]) → :quant-naive widening leaf; == reference"
         (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                          (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
-                               (list 'aget 'B (list '+ (list '* 'l N) 'j))))
-              r (route/route-contraction form :dtype :byte :scheme {:scale scale})
-              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)})
+                               (list 'aget 'B (list '+ (list '* 'l N) 'j)))
+                         :epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                    :scalars [{:sym 's :dtype :float}]})
+              r (route/route-contraction form :dtype :byte)
+              gpu (launch-int8-routed r {'A (mk-i8 Ab) 'B (mk-i8 Bv)} {'s scale})
               cpu (for [i (range M) j (range N)]
                     (* scale (reduce + (for [l (range K)] (* (int (Aget (+ (* i K) l))) (int (Bget (+ (* l N) j))))))))]
           (is (= :quant-naive (:strategy r)))
@@ -268,10 +279,12 @@
             Bnn (mapv #(byte (- (mod (* 3 %) 255) 127)) (range (* K N)))   ; [K,N] (:nn)
             form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                        (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
-                             (list 'aget 'B (list '+ (list '* 'l N) 'j))))
-            r (route/route-contraction form :dtype :byte :scheme {:scale scale} :prefer-peak? true)
+                             (list 'aget 'B (list '+ (list '* 'l N) 'j)))
+                       :epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                  :scalars [{:sym 's :dtype :float}]})
+            r (route/route-contraction form :dtype :byte :prefer-peak? true)
             bufs (reduce exec-pre-step {'A (mk-i8 Ab) 'B (mk-i8 Bnn)} (:pre-steps r))
-            gpu (launch-int8-routed r bufs)
+            gpu (launch-int8-routed r bufs {'s scale})
             cpu (for [i (range M) j (range N)]
                   (* scale (reduce + (for [l (range K)] (* (int (nth Ab (+ (* i K) l))) (int (nth Bnn (+ (* l N) j))))))))]
         (is (= :dp4a (:strategy r)))
@@ -290,23 +303,29 @@
           bad (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                     (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
                           (list 'aget 'B (list '+ (list '* 'j (* K 2)) 'l))))
-          r (try (route/route-contraction bad :dtype :byte :scheme {:scale 0.01} :prefer-peak? true)
+          r (try (route/route-contraction bad :dtype :byte :prefer-peak? true)
                  (catch clojure.lang.ExceptionInfo _ {:strategy :rejected :pre-steps []}))]
       (is (not= :dp4a (:strategy r)) "must not claim the peak leaf on an unverified layout")
       (is (empty? (:pre-steps r)))))
-  (testing "an int8 operand layout NO leaf can index fails loudly (never silently miscompiles)"
+  (testing "an operand layout no PEAK leaf can index now falls back to the scalar nest, which has
+            no layout requirement at all — it emits the declared body verbatim, so the result is
+            correct rather than refused. (It used to throw \"no quant leaf handles\"; that message
+            belonged to a hand-written orientation gate on a leaf that no longer exists.)"
     (let [M 4 N 4 K 8
           bad (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                     (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
-                          (list 'aget 'B (list '+ (list '* 'j (* K 2)) 'l))))]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"no quant leaf handles"
-                            (route/route-contraction bad :dtype :byte :scheme {:scale 0.01})))))
+                          (list 'aget 'B (list '+ (list '* 'j (* K 2)) 'l))))
+          r (route/route-contraction bad :dtype :byte)]
+      (is (= :quant-naive (:strategy r)))
+      (is (not (:tensorized r)))
+      ;; and the emitted body indexes B exactly as declared — stride 2K, not an assumed K
+      (is (re-find #"B\[\(\(j \* 16\) \+ l\)\]" (:source r)))))
   (testing "the canonical :nn form IS retargeted (transpose pre-step + dp4a)"
     (let [M 4 N 4 K 8
           ok (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                    (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
                          (list 'aget 'B (list '+ (list '* 'l N) 'j))))
-          r (route/route-contraction ok :dtype :byte :scheme {:scale 0.01} :prefer-peak? true)]
+          r (route/route-contraction ok :dtype :byte :prefer-peak? true)]
       (is (= :dp4a (:strategy r)))
       (is (= 1 (count (:pre-steps r)))))))
 

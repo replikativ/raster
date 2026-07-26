@@ -8,6 +8,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.backend.gpu.segop-opencl :as sco])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -44,9 +45,21 @@
         launch-2d! (ns-resolve ze 'launch-2d!)
         A (byte-array (map #(byte (- (mod % 255) 127)) (range (* m k))))
         B (byte-array (map #(byte (- (mod (* 3 %) 255) 127)) (range (* k n))))
-        sr (cl/contract-form->segred (matmul-form m n k) :dtype :byte)
-        {:keys [kernel-name source array-params]} (sco/generate-quant-contraction-kernel sr 'C :scheme scheme)
+        ;; The scale and zero-points are ordinary FORM DATA now — an :epilogue and a per-operand
+        ;; :decode — not a `:scheme` record with a private scale channel. Routed through
+        ;; route-contraction because there is no int8-specific emitter left: this is the staged
+        ;; emitter with one int32 contract level.
+        form (concat (matmul-form m n k)
+                     [:epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                 :scalars [{:sym 's :dtype :float}]}]
+                     (when-not (and (zero? a-zp) (zero? b-zp))
+                       [:decode (cond-> {}
+                                  (not (zero? a-zp)) (assoc 'A (list 'clojure.core/- 'x a-zp))
+                                  (not (zero? b-zp)) (assoc 'B (list 'clojure.core/- 'x b-zp)))]))
+        {:keys [kernel-name source array-params epilogue-scalars]}
+        (route/route-contraction form :dtype :byte)
         _ (assert (= '[A B] array-params))
+        _ (assert (= '[s] epilogue-scalars) "the scale is a surfaced epilogue scalar")
         _ (register! kernel-name {:source source :dtype :byte})
         {:keys [kernel-handle]} (ensure-loaded! kernel-name)
         abuf (arr->buf! (make-buffer (* m k) :byte) A)
@@ -66,22 +79,33 @@
 (deftest quant-contraction-emits-generic-types-and-scheme
   (testing "types come from the GENERIC dtype facet map (not quant-specific); scheme carries semantics"
     (let [sr (cl/contract-form->segred (matmul-form 64 64 64) :dtype :byte)
-          {:keys [source dtype acc-dtype out-dtype array-params scheme]}
-          (sco/generate-quant-contraction-kernel sr 'C :scheme {:scale 0.02})]
+          {:keys [source dtype out-dtype array-params epilogue-scalars]}
+          (route/route-contraction (concat (matmul-form 4 6 8)
+                                           [:epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                                       :scalars [{:sym 's :dtype :float}]}])
+                                   :dtype :byte)]
       (is (= :byte dtype))     ; int8 operand = the generic :byte dtype (int8_t)
-      (is (= :int acc-dtype))  ; int32 accumulate = the generic :int dtype
       (is (= :float out-dtype))
       (is (= '[A B] array-params))
-      (is (= 0.02 (:scale scheme)))
+      (is (= '[s] epilogue-scalars))                         ; the scale, as an epilogue scalar
       (is (str/includes? source "const char* restrict A"))   ; :byte → opencl "char"
-      (is (str/includes? source "int acc = 0"))              ; :int widening accumulator
-      (is (str/includes? source "(int)A["))                  ; widen operand to acc dtype
-      (is (str/includes? source "out[seg] = scale * (float)acc"))))  ; dequant epilogue
+      (is (re-find #"int acc_0 = 0" source))                 ; :int widening accumulator
+      ;; NB no explicit (int) cast: char*char integer-promotes to int in C, so the widening the old
+      ;; kernel spelled out is implied by the dtype PAIR (:byte operands, :int accumulator)
+      (is (re-find #"acc_0 \+= \(A\[" source))
+      (is (re-find #"out\[seg\] = \(\(\(float\)acc_0\) \* s\)" source))))  ; dequant epilogue
   (testing "zero-point extends the decode scheme (asymmetric quant) — subtract in the load"
     (let [sr (cl/contract-form->segred (matmul-form 32 32 32) :dtype :byte)
-          src (:source (sco/generate-quant-contraction-kernel sr 'C :scheme {:scale 0.1 :a-zp 5 :b-zp -3}))]
-      (is (str/includes? src "((int)A[i * 32 + l] - 5)"))
-      (is (str/includes? src "((int)B[l * 32 + j] - -3)")))))
+          src (:source (route/route-contraction
+                        (concat (matmul-form 4 6 8)
+                                [:epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                            :scalars [{:sym 's :dtype :float}]}
+                                 :decode {'A '(clojure.core/- x 5) 'B '(clojure.core/- x -3)}])
+                        :dtype :byte))]
+      ;; the zero-point is a per-operand :decode on the LOAD path — exact, and needing no
+      ;; correction reductions (a scale, which factors out of the sum, is the epilogue instead)
+      (is (re-find #"\(A\[\(\(i \* 8\) \+ l\)\] - 5\)" src))
+      (is (re-find #"\(B\[\(\(l \* 6\) \+ j\)\] - -3\)" src)))))
 
 (deftest quant-contraction-matches-ref-on-device
   (if-not @gpu?
