@@ -1156,6 +1156,17 @@
         (swap! gemm-cache assoc c-dtype entry)
         entry)))
 
+(defn- gemm-tile
+  "The GEMM tile for this device, from the ONE source (compiler.core.hardware/gemm-tile-for).
+   Launch geometry MUST be derived from the same tile the kernel was emitted with — the `/128.0`
+   literals this replaces were a second, independent spelling of block-m/block-n, so any tile change
+   would have silently mismatched kernel and grid."
+  []
+  (let [f (requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
+        d (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for) (:device-id @state))
+               (catch Throwable _ nil))]
+    (f d)))
+
 (defn gemm!
   "GPU matrix multiply: C = A × B using XMX DPAS instructions.
   A: FP16 DeviceBuffer [M×K], B: FP16 DeviceBuffer [K×N],
@@ -1869,17 +1880,6 @@
         bnd (bind-kernel! kernel-handle wg all-args)]
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
     bnd))
-
-(defn- gemm-tile
-  "The GEMM tile for this device, from the ONE source (compiler.core.hardware/gemm-tile-for).
-   Launch geometry MUST be derived from the same tile the kernel was emitted with — the `/128.0`
-   literals this replaces were a second, independent spelling of block-m/block-n, so any tile change
-   would have silently mismatched kernel and grid."
-  []
-  (let [f (requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
-        d (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for) (:device-id @state))
-               (catch Throwable _ nil))]
-    (f d)))
 
 (defn bind-registered-gemm!
   "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
