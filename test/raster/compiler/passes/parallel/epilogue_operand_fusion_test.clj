@@ -120,3 +120,11 @@
           (is (= (count ref) (count fused)))
           (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 3.0e-2) fused ref))
               (str "fused " (take 4 fused) " vs two-pass " (take 4 ref))))))))
+
+;; NOTE (deferred to the epilogue-gate work): an operand or scalar sharing a name with a free axis
+;; is an ILL-FORMED spec, not something to preserve. Probed: axis `s` + scalar `s` emits `acc * row`
+;; — valid C, wrong number, silent — and no substitution mechanism can resolve it, because the spec
+;; keeps one symbol namespace for three C-level roles (operand arrays and scalars become kernel
+;; params; free axes become store-slot locals). The fix is `:operand-shadows-free-axis` in
+;; epilogue-legal?, plus a matching DECLINE in fuse-contract-map so fusion backs off to two kernels
+;; rather than the emitter throwing on a program that compiles today.
