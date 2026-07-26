@@ -1,6 +1,7 @@
 (ns raster.compiler.core.util
   "Shared utilities for the compiler pipeline."
   (:require [clojure.set :as set]
+            [raster.compiler.core.op-descriptor :as od]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]))
 
@@ -292,6 +293,46 @@
     (set? form) (into (empty form) (map #(uniquify* env bound %) form))
     :else form))
 
+(defn scope-blind-substitution-safe?
+  "Is a scope-BLIND symbol substitution of `smap` over `expr` provably equivalent to the
+   capture-avoiding `subst-syms`?
+
+   A hot pass may legitimately want the blind version — it is measured ~4x faster than `subst-syms`
+   on a 300-binding ANF form, because `subst-syms` recomputes the free set of every smap value at
+   every binder it crosses. What it may NOT do is assume the precondition. Blind substitution
+   diverges in exactly three ways, and this checks all three:
+
+     • KEY capture — a binder in `expr` rebinds an smap key. Blind substitution keeps rewriting
+       inside that scope, and rewrites the BINDER itself: substituting {k → HIJACKED} over
+       `(fn* [k] …)` yields `(fn* [HIJACKED] …)`.
+     • VALUE capture — a binder shadows a name that is free in an smap VALUE, so the substituted
+       value silently starts referring to the inner binding instead of the outer one.
+     • `quote` — blind substitution descends into quoted data and rewrites it as if it were code.
+
+   Callers that get `false` must use `subst-syms`. The cost here is one binder scan plus ONE free-set
+   computation over the smap values (versus one per binder inside `subst-syms`), so checking and then
+   taking the fast path stays well ahead of the safe path."
+  [smap expr]
+  (if (empty? smap)
+    true
+    (let [dangerous (into (set (keys smap)) (smap-value-frees smap))
+          safe (volatile! true)]
+      ((fn go [e]
+         (when @safe
+           (cond
+             (and (seq? e) (= 'quote (first e))) (vreset! safe false)
+             (seq? e)
+             (do (when-let [{:keys [scopes]} (form/scope-info e)]
+                   (doseq [{:keys [binders]} scopes
+                           b binders
+                           :when (and (symbol? b) (contains? dangerous b))]
+                     (vreset! safe false)))
+                 (run! go e))
+             (coll? e) (run! go e)
+             :else nil)))
+       expr)
+      @safe)))
+
 (defn uniquify-rebindings
   "SSA-normalize let*/loop* REBINDINGS: rename any binder that SHADOWS a name
    already in scope (seeded with `params`) to a fresh name, capture-avoidingly
@@ -389,3 +430,112 @@
          m (cond-> (or original-meta {})
              op (assoc :raster.op/original op))]
      (with-meta (list* '.invk impl-sym args) m))))
+
+(defn void-form?
+  "Does this form have NO return value — i.e. is it a statement rather than an expression?
+
+   Reads the walker/TC-stamped `:raster.type/tag` first: if the form has a return type it is not
+   void. Falls back to the op-descriptor registry for the compiler primitives (`aset`, `collect!`)
+   that pass through the walker as opaque macros."
+  [expr]
+  (and (seq? expr)
+       (not (:raster.type/tag (meta expr)))
+       (od/void-op? (first expr))))
+
+(defn effectful?
+  "Does `expr` contain a side-effecting (void) operation anywhere?
+
+   The layer-neutral purity predicate for beta-reduction decisions. Recognizes both the surface
+   spelling (`void-form?`) and the DEVIRTUALIZED array write — an intermediate's `aset`
+   materializes to `(.invk aset-impl …)`, which a head-only check misses, so an effectful binding
+   would be inlined and its effect duplicated or reordered.
+
+   `quote` is opaque: quoted data is not code to be scanned for effects."
+  [expr]
+  (boolean
+   (and (seq? expr)
+        (not= 'quote (first expr))
+        (or (void-form? expr)
+            (and (= '.invk (first expr))
+                 (od/aset-op? (:raster.op/original (meta expr))))
+            (some effectful? (rest expr))))))
+
+(defn binding-env
+  "A `let*` binding vector → the substitution env that beta-reduces it: {sym → init}, with each
+   init already carrying the substitutions of the bindings BEFORE it (`let*` is sequential).
+
+   Built with `subst-syms`, so an init that rebinds an earlier name internally is not corrupted.
+   Split out because one caller (the SOAC lowerer) has already destructured the let and recursed
+   into its body, so it needs the env rather than the whole-form rewrite."
+  [bindings]
+  (reduce (fn [m [s init]] (assoc m s (subst-syms m init)))
+          {} (partition 2 bindings)))
+
+(defn inline-pure-lets
+  "Beta-reduce `let*`/`let` bindings into their body — the ONE implementation of this rewrite.
+
+   Consolidates three copies that each used `walk/postwalk-replace` and each carried a different,
+   unstated precondition: the GPU expression emitter's (the only one with a purity gate), the SOAC
+   lowerer's (`walker bindings are SSA`), and the CPU SIMD emitter's (which additionally kept only
+   the LAST body form, silently discarding the effects of the earlier ones).
+
+   Three things this does that `walk/postwalk-replace` inside `walk/prewalk` did not:
+
+     • substitutes via `subst-syms`, so a nested rebinding of an inlined name — or a name that also
+       appears in a binder or array position — cannot be corrupted;
+     • preserves metadata on every rebuilt form. `clojure.walk` rebuilds seqs with `(apply list …)`
+       and drops meta, which in this pipeline discards TC `:raster.type/tag` stamps AND the
+       `:raster.op/original` stamps that `effectful?` itself reads — so the old version could defeat
+       its own purity gate on a second pass;
+     • reaches a FIXPOINT bottom-up. `prewalk` never revisits the form a reduction produces, so a
+       `let*` exposed by inlining survived.
+
+   opts:
+     :pure?      (fn [init] -> boolean) — is this binding's value inlinable? Defaults to
+                 `(complement effectful?)` plus a refusal of loop-valued inits. The default is the
+                 REAL gate, not `(constantly true)`: the whole point of consolidating is that the
+                 two callers which lacked a gate gain one.
+     :on-impure  (fn [sym init] -> any) — called for the first non-inlinable binding; its value is
+                 discarded, so it must escape (throw / bail). Default throws. The GPU vectorizer
+                 passes its `vec-bail!` to fall back to a scalar loop.
+     :deep?      rewrite nested lets throughout the form (default true) rather than only a
+                 top-level chain.
+
+   A multi-form body becomes `(do …)`. It is NOT reduced to its last form: that silently drops the
+   earlier forms' effects. A consumer that cannot emit `do` must refuse loudly instead."
+  [expr & {:keys [pure? on-impure deep?] :or {deep? true}}]
+  (let [pure? (or pure?
+                  (fn [init] (not (or (effectful? init)
+                                      (and (seq? init) (form/loop-head? (first init)))))))
+        let-form? (fn [f] (and (seq? f) (form/let-head? (first f))
+                               (not (form/loop-head? (first f)))))
+        reduce-one
+        (fn [form]
+          (let [[_ bindings & body] form
+                pairs (partition 2 bindings)]
+            (when-let [[bs bv] (first (remove (comp pure? second) pairs))]
+              (if on-impure
+                (on-impure bs bv)
+                (throw (ex-info "inline-pure-lets: binding value is not inlinable"
+                                {:reason :impure-binding :sym bs :init bv})))
+              ;; on-impure returned instead of escaping — that would silently inline an effect
+              (throw (ex-info "inline-pure-lets: :on-impure must escape, it returned normally"
+                              {:reason :raster/bug :sym bs :init bv})))
+            (let [env (binding-env bindings)
+                  body' (mapv #(subst-syms env %) body)]
+              (if (= 1 (count body'))
+                (first body')
+                (with-meta (cons 'do body') (meta form))))))
+        ;; bottom-up, metadata-preserving, quote-opaque descent. Not clojure.walk: it drops meta.
+        go (fn go [f]
+             (cond
+               (and (seq? f) (= 'quote (first f))) f
+               (seq? f) (let [f' (remake-from f (map go f))]
+                          (if (let-form? f') (recur (reduce-one f')) f'))
+               (vector? f) (with-meta (mapv go f) (meta f))
+               (map? f) (with-meta (into (empty f) (map (fn [[k v]] [(go k) (go v)])) f) (meta f))
+               (set? f) (with-meta (into (empty f) (map go) f) (meta f))
+               :else f))]
+    (if deep?
+      (go expr)
+      (loop [e expr] (if (let-form? e) (recur (reduce-one e)) e)))))
