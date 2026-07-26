@@ -455,58 +455,6 @@
 ;; declared here because the block-tiled emitter above it shares the same analysis.
 (declare analyze-contraction)
 
-(defn generate-tiled-contraction-kernel
-  "BLOCK-TILED + __local-staged contraction → OpenCL (Futhark BlkRegTiling, block-tile
-   level — no register/DPAS tiling yet). Square T×T tiles; workgroup = T×T threads (one
-   output/thread); cooperatively stage A/B tiles into __local, loop the contracted axis in
-   T-chunks. Zero-padded loads + a guarded store handle non-tile-divisible dims.
-
-   Prototype scope: EXACTLY 2 free axes (the tiled M×N output) + 1 contracted axis, LITERAL
-   dims, a sum-of-two-agets element (GEMM-shape redomap). The operands are assigned row/col
-   by which DECLARED axis their index depends on (row: free0+contract, not free1; col:
-   contract+free1, not free0) — the variance test made trivial by the declared axes, no
-   recognition. This is the perf substrate under DPAS tensorize (step 4).
-
-   Requires a 2-D launch: workgroup [T T], grid [ceil(N/T) ceil(M/T)] (group-id(0)=col/N,
-   group-id(1)=row/M). Returns {:kernel-name :source :array-params :dtype :tile :dims [M N L]}."
-  [segred out-sym & {:keys [dtype tile] :or {dtype :double tile 16}}]
-  (let [{:keys [M N L i-sym j-sym l-sym ctype init arr-params row-load col-load]}
-        (analyze-contraction segred dtype)
-        dtype (or (:dtype segred) dtype)
-        T (long tile)
-        i-c (ce/c-symbol i-sym) j-c (ce/c-symbol j-sym) l-c (ce/c-symbol l-sym)
-        kernel-name (str "tiled_contract_" (gensym ""))
-        arr-param-str (str/join ", " (map (fn [s] (str "__global const " ctype "* restrict " (ce/c-symbol s))) arr-params))
-        src (str (codegen/extension-pragmas dtype)
-                 "__kernel void " kernel-name "(" arr-param-str
-                 ", __global " ctype "* restrict out) {\n"
-                 "    __local " ctype " As[" T "][" T "];\n"
-                 "    __local " ctype " Bs[" T "][" T "];\n"
-                 "    int li = get_local_id(1);\n"
-                 "    int lj = get_local_id(0);\n"
-                 "    int " (ce/c-symbol i-sym) " = get_group_id(1) * " T " + li;\n"
-                 "    int " (ce/c-symbol j-sym) " = get_group_id(0) * " T " + lj;\n"
-                 "    " ctype " acc = " (str init) ";\n"
-                 "    for (int l0 = 0; l0 < " L "; l0 += " T ") {\n"
-                 "        { int " (ce/c-symbol l-sym) " = l0 + lj; As[li][lj] = ((" (ce/c-symbol i-sym) " < " M ") && (" (ce/c-symbol l-sym) " < " L ")) ? " row-load " : 0.0; }\n"
-                 "        { int " (ce/c-symbol l-sym) " = l0 + li; Bs[li][lj] = ((" (ce/c-symbol l-sym) " < " L ") && (" (ce/c-symbol j-sym) " < " N ")) ? " col-load " : 0.0; }\n"
-                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                 "        for (int t = 0; t < " T "; t++) { acc = acc + As[li][t] * Bs[t][lj]; }\n"
-                 "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                 "    }\n"
-                 "    if ((" (ce/c-symbol i-sym) " < " M ") && (" (ce/c-symbol j-sym) " < " N ")) { out[" (ce/c-symbol i-sym) " * " N " + " (ce/c-symbol j-sym) "] = acc; }\n"
-                 "}\n")]
-    {:kernel-name kernel-name
-     :source src
-     :array-params arr-params
-     :dtype dtype
-     :tile T
-     :dims [M N L]}))
-
-;; ================================================================
-;; Register-tiled + __local-staged contraction (BlkRegTiling, register level)
-;; ================================================================
-
 (defn- analyze-contraction
   "Shared structural analysis for the tiled contraction emitters. Prototype scope: 2 free
    axes + 1 contract, LITERAL dims, sum-of-two-agets element. Returns dims (M N L), axis
@@ -877,6 +825,12 @@
          ;; them from the descriptor would be a launch-arity bug (6 args bound to a 7-arg kernel).
          :epilogue-params (when ep (:epilogue-params ep))
          :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
+         ;; …and its SCALARS. epilogue-splice has always emitted these into the signature, but
+         ;; nothing surfaced them, so any epilogue carrying a `:scalars` entry tripped
+         ;; validate-descriptor's scalar count and threw. That unusable capability is exactly why
+         ;; `:scheme` had to invent a private per-tensor scale channel instead of being an
+         ;; epilogue. Surfacing them makes the scale expressible where it belongs.
+         :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))
          ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × the matrix subgroup size
          :workgroup [(* (quot (:block-m tile) (:sg-m tile))
                         (quot (:block-n tile) (:sg-n tile))

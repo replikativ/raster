@@ -86,7 +86,7 @@
 
    Returns the descriptor unchanged when consistent."
   [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands
-           out-elems wg grid invoke reduce-bound] :as d}]
+           epilogue-scalars out-elems wg grid invoke reduce-bound] :as d}]
   (let [params (kernel-signature-params source)
         _ (when (nil? params)
             (throw (ex-info "contract descriptor: no __kernel signature found in source"
@@ -103,7 +103,12 @@
         ;;                           so they must match the kernel's scalar params exactly.
         ;;   :invoke :reduction    — invoke-reduction-kernel supplies the kernel's single trailing
         ;;                           count param itself, from :reduce-bound; :scalar-args stays empty.
-        expect-scalar (if (= :reduction invoke) 1 (count scalar-args))]
+        ;; an epilogue's SCALARS are kernel scalar params too — they are emitted into the
+        ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
+        ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
+        expect-scalar (if (= :reduction invoke)
+                        1
+                        (+ (count scalar-args) (count epilogue-scalars)))]
     (cond
       (not= n-ptr expect-ptr)
       (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
