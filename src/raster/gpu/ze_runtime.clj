@@ -1165,8 +1165,9 @@
   Returns C."
   [a b c m n k]
   (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
-        gc-m (int (Math/ceil (/ (double m) 128.0)))
-        gc-n (int (Math/ceil (/ (double n) 128.0)))
+        {:keys [block-m block-n]} (gemm-tile)
+        gc-m (int (Math/ceil (/ (double m) (double block-m))))
+        gc-n (int (Math/ceil (/ (double n) (double block-n))))
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)}
               {:type :int :value (int n)}
@@ -1869,6 +1870,17 @@
     (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
     bnd))
 
+(defn- gemm-tile
+  "The GEMM tile for this device, from the ONE source (compiler.core.hardware/gemm-tile-for).
+   Launch geometry MUST be derived from the same tile the kernel was emitted with — the `/128.0`
+   literals this replaces were a second, independent spelling of block-m/block-n, so any tile change
+   would have silently mismatched kernel and grid."
+  []
+  (let [f (requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
+        d (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for) (:device-id @state))
+               (catch Throwable _ nil))]
+    (f d)))
+
 (defn bind-registered-gemm!
   "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
   command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
@@ -1893,8 +1905,8 @@
                {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
          bnd (bind-kernel-2d! kh [256 1] args)
          gc ^MemorySegment (:gc-seg bnd)]
-     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
-     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n (gemm-tile)))))))   ;; X = gc-n
+     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m (gemm-tile)))))))   ;; Y = gc-m
      (.set gc I32 8 (int 1))
      bnd)))
 

@@ -862,19 +862,28 @@
    copy — the policy is not re-implemented anywhere."
   ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs)))))
   ([m n k fill-wgs target-wgs]
-   (let [base (* (Math/ceil (/ (double n) 128.0))
-                 (Math/ceil (/ (double m) 128.0)))]
+   (let [{:keys [block-m block-n block-k]}
+         ((requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
+          (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
+                (:device-id @(requiring-resolve 'raster.gpu.ze-runtime/state)))
+               (catch Throwable _ nil)))
+         ;; the split-k policy's occupancy estimate and K-chunk quantum are the SAME tile the
+         ;; kernel is emitted with — they were independent `/128.0` and `*32` literals, so a tile
+         ;; change silently decoupled the policy from the kernel it schedules
+         base (* (Math/ceil (/ (double n) (double block-n)))
+                 (Math/ceil (/ (double m) (double block-m))))]
      (if (>= base (double fill-wgs))
        [1 k]                              ;; already fills the machine
        (let [want (long (Math/ceil (/ (double target-wgs) base)))
-             ;; each chunk must be a multiple of 32 (the K-unroll) and at least
+             ;; each chunk must be a multiple of the K-unroll (block-k) and at least
              ;; *gemm-splitk-min-chunk* long, or the per-chunk fixed cost (A prefetch + the
              ;; store of a full partial C tile) swamps the reduction it does.
              cap (quot (long k) (long *gemm-splitk-min-chunk*))
              s (min want cap (long *gemm-splitk-max-splits*))]
          (if (< s 2)
            [1 k]
-           (let [kc (* 32 (quot (+ (quot (long k) s) 31) 32))]
+           (let [ku (long block-k)
+                 kc (* ku (quot (+ (quot (long k) s) (dec ku)) ku))]
              [(quot (+ (long k) kc -1) kc) kc])))))))
 
 (defn bind-program!

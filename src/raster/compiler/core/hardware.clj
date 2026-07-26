@@ -324,14 +324,16 @@
   "The roofline RIDGE (flops/byte) for `dtype`: peak-flops(dtype) / bandwidth — the arithmetic
    intensity above which a kernel is compute-bound. PRECISION-DEPENDENT (the f16 ridge is far above
    the f64 ridge on a mixed-rate GPU), derived from the descriptor's bandwidth+peak-flops when both
-   are present; falls back to the scalar :balance default only when they are absent. Fixes the bug
-   where a single :balance constant misclassifies every non-default-precision kernel."
+   are present. ABSTAINS (nil) when either is missing, rather than substituting the scalar :balance
+   constant: that substitution fabricated an f32-ish ridge for every dtype it did not know — int8 got
+   60, two orders below any plausible dp4a ridge, and CPU descriptors carry no peak-flops at all so
+   EVERY CPU ridge was invented. `roofline-time-ns` already abstains honestly; this now matches it.
+   A cost model may decline to answer; it must not make one up."
   [desc dtype]
   (let [pf (peak-flops-for desc dtype)
         bw (:bandwidth-bytes-s desc)]
-    (if (and pf bw (pos? (double bw)))
-      (/ (double pf) (double bw))
-      (double (:balance desc 40)))))
+    (when (and pf bw (pos? (double bw)))
+      (/ (double pf) (double bw)))))
 
 (defn roofline-regime
   "Memory-bound vs compute-bound by arithmetic intensity vs the ridge. AI = flops/bytes;
@@ -342,8 +344,9 @@
    (if (< (/ (double flops) (double (max 1 bytes))) (double (:balance desc)))
      :memory-bound :compute-bound))
   ([desc {:keys [flops bytes]} dtype]
-   (if (< (/ (double flops) (double (max 1 bytes))) (balance-for desc dtype))
-     :memory-bound :compute-bound)))
+   (when-let [ridge (balance-for desc dtype)]
+     (if (< (/ (double flops) (double (max 1 bytes))) ridge)
+       :memory-bound :compute-bound))))
 
 (def ^:private memory-compute-parallelism
   "Overlap fraction of the compute and memory ceilings (XLA kMemoryComputeParallelism): exec is a
@@ -514,6 +517,31 @@
       :block-k (* 2 k)
       :num-stages 3                             ;; pipelining depth (prefetch distance); T4 axis
       :matrix (:matrix desc {:family :dpas :m m :n n :k k :subgroup subgroup})})))
+
+(def ^:private gemm-tile-cache (atom {}))
+
+(defn gemm-tile-for
+  "THE tile for a GEMM on `desc` — the single source every GEMM door reads.
+
+   Why this exists: `derive-gemm-tile` was reaching nothing that shipped. The two emit front doors
+   took `emit-gemm-tiled`'s own `:or` literals (128/128/32/32/32), the contraction door called
+   `derive-gemm-tile` on an EMPTY descriptor (so Arc constants on every device), and three launch
+   sites computed their grid from a hardcoded `/128.0` with a `*32` K-unroll — five spellings of one
+   number. A kernel emitted with one tile and launched with geometry derived from another is a
+   silent wrong-answer path the moment they diverge.
+
+   `desc` nil (or empty) yields the same default `derive-gemm-tile` already produced, so adopting
+   this is a no-op on Arc and merely CORRECT elsewhere — which is the point: this is de-hardcoding
+   and cross-device correctness, not a speedup. Measured evidence says tile geometry is not the Arc
+   performance lever (128x128 is already optimal there).
+
+   Memoized on the descriptor's tile-relevant facets, since every launch asks."
+  [desc]
+  (let [k (select-keys (or desc {}) [:matrix :grf-bytes-per-lane :subgroup-size :max-workgroup-size])]
+    (or (get @gemm-tile-cache k)
+        (let [t (derive-gemm-tile (or desc {}))]
+          (swap! gemm-tile-cache assoc k t)
+          t))))
 
 (defn max-stages-for
   "The pipelining-depth ceiling for a GEMM `tile` on `desc` — the SLM-bounded num_stages. A

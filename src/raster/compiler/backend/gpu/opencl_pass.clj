@@ -178,7 +178,14 @@
             ;; dtype, arbitrary dims). Emits a 2D invoke-registered-contraction! marker.
             (croute/par-contract-form? form)
             (let [out-sym (second form)
-                  r (croute/route-contraction form :dtype dtype)
+                  ;; pass the REAL descriptor: route-contraction fed `(or desc {})` into
+                  ;; derive-gemm-tile, so the "hardware-derived" tile was derived from an empty map
+                  ;; — Arc constants on every device. device-id is already in scope here.
+                  r (croute/route-contraction
+                     form :dtype dtype
+                     :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
+                                 device-id)
+                                (catch Throwable _ nil)))
                   k (register-kernel! {:kernel-name (:kernel-name r) :source (:source r)
                                        :dtype (:dtype r)}
                                       :ze-contracts)]
