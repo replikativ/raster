@@ -192,7 +192,16 @@
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
       (and (seq stages) (> (count stages) 1))
-      (let [;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
+      (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+            ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
+            ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
+            _ (let [cmb (:combine (cf/contraction-facts contract-form :dtype dtype))]
+                (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
+                  (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
+                                       cmb ") — every accumulator level uses += and a lift's "
+                                       "linearity argument assumes addition")
+                                  {:reason :non-plus-combine-on-staged :combine cmb}))))
+            ;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
             ;; MACs per int32 op) — the int8 peak leaf, and the same shape llama.cpp hand-writes.
             ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
             ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
@@ -248,6 +257,17 @@
          :scalar-args [] :dims [1]})
 
       ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
+      ;; :segmap and the :else fallback have no store splice, so an :epilogue reaching them was
+      ;; silently DROPPED — the consumer's computation vanished with no error. fuse-contract-map
+      ;; already produces such forms (no rank restriction), and it is one line in par-fusion-pass
+      ;; away from being live, so this refuses now rather than after.
+      (and (seq epilogue) (or (zero? n-contract)
+                              (not (and (= 2 n-free) (= 1 n-contract)))))
+      (throw (ex-info (str "contraction: this leaf has no store splice, so its :epilogue would be "
+                           "silently dropped (n-free " n-free ", n-contract " n-contract ")")
+                      {:reason :epilogue-unsupported-by-this-leaf
+                       :n-free n-free :n-contract n-contract}))
+
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
             {:keys [kernel-name source array-params scalar-params]}

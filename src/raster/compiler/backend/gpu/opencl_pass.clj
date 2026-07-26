@@ -186,8 +186,25 @@
                      :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                  device-id)
                                 (catch Throwable _ nil)))
-                  k (register-kernel! {:kernel-name (:kernel-name r) :source (:source r)
-                                       :dtype (:dtype r)}
+                  ;; :pre-steps (an inserted layout transpose) is PRODUCED by route-contraction
+                  ;; under :prefer-peak? but executed by NOTHING — the kernel would index a
+                  ;; transposed layout against an untransposed buffer, a wrong answer with no
+                  ;; diagnostic. Unreachable today (:prefer-peak? is never set here), so refusing
+                  ;; costs nothing now and converts a future silent miscompile into a loud one.
+                  _ (when (seq (:pre-steps r))
+                      (throw (ex-info (str "contraction: descriptor carries :pre-steps, which no "
+                                           "pass executes — the operand would be read untransposed")
+                                      {:reason :raster/fatal :pre-steps (:pre-steps r)})))
+                  ;; Register the ROUTED KERNEL MAP, not three hand-picked keys. Dropping
+                  ;; :c-op/:identity-val made invoke-reduction-kernel fall back to its
+                  ;; `:or {c-op "+" identity-val 0.0}` for the HOST-SIDE FINAL COMBINE — so a
+                  ;; full reduction with :combine max or :combine * spanning more than one
+                  ;; workgroup silently SUMMED the per-group partials. Reachable today: a
+                  ;; 0-free-axis contraction at :float/:double is exactly what this pass routes.
+                  k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
+                                                             :scalar-params :out-dtype])
+                                             {:kernel-name (:kernel-name r) :source (:source r)
+                                              :dtype (:dtype r)})
                                       :ze-contracts)]
               ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
               ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
