@@ -47,6 +47,12 @@
                {:sym 'db :map {:groups [[['j N]] [['blk NB]]]} :dtype :float}]}
    {:axis 't :extent B :dtype :int :init 0}])
 
+(def ^:private two-stage-axes
+  "The contract axes the FORM declares. Stated independently of `two-stage` on purpose: validating
+   a stage list against axes derived from itself is exactly the tautology that let a stage list
+   under-cover its contract space and emit a kernel summing a fraction of the terms."
+  [['blk NB] ['t B]])
+
 ;; ── host references ─────────────────────────────────────────────────────────────────
 (defn- ref-staged
   "The block formula, evaluated exactly as the kernel schedules it: int32 inner, float outer."
@@ -93,7 +99,7 @@
 (defn- run-staged
   "Emit, register and launch a staged contraction; return the device output vector. `lift-arrays`
    maps each lift operand symbol → its float array, bound in the emitter's declared order."
-  [stages body-expr ^bytes a ^bytes b lift-arrays & [extra]]
+  [stages contract-axes body-expr ^bytes a ^bytes b lift-arrays & [extra]]
   (let [ze (find-ns 'raster.gpu.ze-runtime)
         register! (ns-resolve ze 'register-kernel!)
         ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
@@ -103,8 +109,8 @@
         launch-2d! (ns-resolve ze 'launch-2d!)
         {:keys [kernel-name source array-params lift-operands out-elems]}
         (sco/generate-staged-contraction-kernel
-         (merge {:free-axes [['i M] ['j N]] :stages stages :body body-expr
-                 :inputs '[a b] :dtype :byte :out-dtype :float}
+         (merge {:free-axes [['i M] ['j N]] :stages stages :contract-axes contract-axes
+                 :body body-expr :inputs '[a b] :dtype :byte :out-dtype :float}
                 extra)
          'out)
         _ (assert (= '[a b] array-params))
@@ -136,7 +142,7 @@
     (println "  [skip] no GPU — staged contraction device test")
     (let [da (pow2-scales (* M NB) 0)
           db (pow2-scales (* N NB) 3)
-          gpu (run-staged two-stage body a-data b-data {'da da 'db db})
+          gpu (run-staged two-stage two-stage-axes body a-data b-data {'da da 'db db})
           staged (vec (ref-staged a-data b-data da db))
           flat (vec (ref-flat a-data b-data da db))]
       (testing "flat-equivalent derives exactly the flat body ref-flat evaluates by hand"
@@ -150,6 +156,10 @@
             "staging is a schedule: it must not change the value, only the accumulator"))
       (testing "device matches the reference"
         (is (= staged gpu)))
+      (testing "…and matches the FLAT equivalent — the free oracle the design claims but that
+                was never actually asserted (flat was only ever compared to staged, both of them
+                host-side fixtures that touch no production code)"
+        (is (= flat gpu)))
       (testing "the result is actually non-trivial (guards against an all-zero pass)"
         (is (some #(not (zero? %)) gpu))))))
 
@@ -175,7 +185,8 @@
                       (list 'aget 'b (list 'clojure.core/+ (list 'clojure.core/* 'j K) l-expr)))
           dsuper (pow2-scales (* M nsb) 1)
           dsub (pow2-scales (* N nsub) 2)
-          gpu (run-staged stages body3 a-data b-data {'dsuper dsuper 'dsub dsub})
+          gpu (run-staged stages [['sb nsb] ['blk2 nsub] ['t B]] body3 a-data b-data
+                             {'dsuper dsuper 'dsub dsub})
           ;; host reference for the 3-level nest
           ref (let [out (float-array (* M N))]
                 (dotimes [i M]
@@ -211,6 +222,7 @@
           (sco/generate-staged-contraction-kernel
            {:free-axes [['i M] ['j N]]
             :stages [{:axis 'l :extent K :dtype :float :init 0.0}]
+            :contract-axes [['l K]]
             :body (list 'raster.numeric/*
                         (list 'aget 'a (list 'clojure.core/+ (list 'clojure.core/* 'i K) 'l))
                         (list 'aget 'b (list 'clojure.core/+ (list 'clojure.core/* 'j K) 'l)))
@@ -225,7 +237,7 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"lift-discards-inner-accumulator"
          (sco/generate-staged-contraction-kernel
-          {:free-axes [['i M] ['j N]]
+          {:free-axes [['i M] ['j N]] :contract-axes [['blk NB] ['t B]]
            :stages [{:axis 'blk :extent NB :dtype :float :init 0.0
                      :lift '(raster.numeric/* (aget da _) 2.0)
                      :operands [{:sym 'da :map {:groups [[['blk NB]]]}}]}
@@ -235,7 +247,7 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"lift-not-linear-in-inner"
          (sco/generate-staged-contraction-kernel
-          {:free-axes [['i M] ['j N]]
+          {:free-axes [['i M] ['j N]] :contract-axes [['blk NB] ['t B]]
            :stages [{:axis 'blk :extent NB :dtype :float :init 0.0
                      :lift '(raster.numeric/sqrt inner)}
                     {:axis 't :extent B :dtype :int :init 0}]
@@ -259,8 +271,8 @@
                       (list 'aget 'a (am/index-expr (get body-maps 'a)))
                       (list 'aget 'b (am/index-expr (get body-maps 'b))))
           operands [{:sym 'a :map (get body-maps 'a)} {:sym 'b :map (get body-maps 'b)}]
-          scalar (run-staged two-stage body' a-data b-data {'da da 'db db})
-          packed (run-staged two-stage body' a-data b-data {'da da 'db db}
+          scalar (run-staged two-stage two-stage-axes body' a-data b-data {'da da 'db db})
+          packed (run-staged two-stage two-stage-axes body' a-data b-data {'da da 'db db}
                              {:operands operands :tensorize-inner? true})
           ref (vec (ref-staged a-data b-data da db))]
       (testing "dp4a and the scalar nest agree EXACTLY — int32 accumulation is exact, so any
@@ -276,7 +288,8 @@
         body' (list 'raster.numeric/*
                     (list 'aget 'a (am/index-expr good-a))
                     (list 'aget 'b (am/index-expr good-b)))
-        spec {:free-axes [['i M] ['j N]] :stages two-stage :body body'
+        spec {:free-axes [['i M] ['j N]] :stages two-stage :contract-axes two-stage-axes
+              :body body'
               :inputs '[a b] :dtype :byte :out-dtype :float
               :operands [{:sym 'a :map good-a} {:sym 'b :map good-b}]}]
     (testing "the honest case is legal"

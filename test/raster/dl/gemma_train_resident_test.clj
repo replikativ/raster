@@ -32,6 +32,7 @@
             [raster.dl.attention :as attn]
             [raster.dl.loss :as loss]
             [raster.dl.optim :as optim]
+            [raster.numeric :as n]
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
             [raster.compiler.pipeline :as pl]
@@ -141,20 +142,23 @@
         dAg (clojure.core/nth vg 21) dBg (clojure.core/nth vg 22)
         dAu (clojure.core/nth vg 24) dBu (clojure.core/nth vg 25)
         dAd (clojure.core/nth vg 27) dBd (clojure.core/nth vg 28)]
-    (raster.dl.optim/sgd-step! Aq dAq (raster.arrays/alength Aq) lr)
-    (raster.dl.optim/sgd-step! Bq dBq (raster.arrays/alength Bq) lr)
-    (raster.dl.optim/sgd-step! Ak dAk (raster.arrays/alength Ak) lr)
-    (raster.dl.optim/sgd-step! Bk dBk (raster.arrays/alength Bk) lr)
-    (raster.dl.optim/sgd-step! Av dAv (raster.arrays/alength Av) lr)
-    (raster.dl.optim/sgd-step! Bv dBv (raster.arrays/alength Bv) lr)
-    (raster.dl.optim/sgd-step! Ao dAo (raster.arrays/alength Ao) lr)
-    (raster.dl.optim/sgd-step! Bo dBo (raster.arrays/alength Bo) lr)
-    (raster.dl.optim/sgd-step! Ag dAg (raster.arrays/alength Ag) lr)
-    (raster.dl.optim/sgd-step! Bg dBg (raster.arrays/alength Bg) lr)
-    (raster.dl.optim/sgd-step! Au dAu (raster.arrays/alength Au) lr)
-    (raster.dl.optim/sgd-step! Bu dBu (raster.arrays/alength Bu) lr)
-    (raster.dl.optim/sgd-step! Ad dAd (raster.arrays/alength Ad) lr)
-    (raster.dl.optim/sgd-step! Bd dBd (raster.arrays/alength Bd) lr)
+    ;; `lr` is :- Double but the adapters are (Array float): a T-typed scalar must be brought to
+    ;; the element type at the call site (raster.dl.optim:254 does the same). This call site was
+    ;; missed when sgd-step!'s scalar became :- T (#80), so the test has been red on main since.
+    (raster.dl.optim/sgd-step! Aq dAq (raster.arrays/alength Aq) (n/oftype Aq lr))
+    (raster.dl.optim/sgd-step! Bq dBq (raster.arrays/alength Bq) (n/oftype Bq lr))
+    (raster.dl.optim/sgd-step! Ak dAk (raster.arrays/alength Ak) (n/oftype Ak lr))
+    (raster.dl.optim/sgd-step! Bk dBk (raster.arrays/alength Bk) (n/oftype Bk lr))
+    (raster.dl.optim/sgd-step! Av dAv (raster.arrays/alength Av) (n/oftype Av lr))
+    (raster.dl.optim/sgd-step! Bv dBv (raster.arrays/alength Bv) (n/oftype Bv lr))
+    (raster.dl.optim/sgd-step! Ao dAo (raster.arrays/alength Ao) (n/oftype Ao lr))
+    (raster.dl.optim/sgd-step! Bo dBo (raster.arrays/alength Bo) (n/oftype Bo lr))
+    (raster.dl.optim/sgd-step! Ag dAg (raster.arrays/alength Ag) (n/oftype Ag lr))
+    (raster.dl.optim/sgd-step! Bg dBg (raster.arrays/alength Bg) (n/oftype Bg lr))
+    (raster.dl.optim/sgd-step! Au dAu (raster.arrays/alength Au) (n/oftype Au lr))
+    (raster.dl.optim/sgd-step! Bu dBu (raster.arrays/alength Bu) (n/oftype Bu lr))
+    (raster.dl.optim/sgd-step! Ad dAd (raster.arrays/alength Ad) (n/oftype Ad lr))
+    (raster.dl.optim/sgd-step! Bd dBd (raster.arrays/alength Bd) (n/oftype Bd lr))
     Aq))
 
 ;; ── data / config ────────────────────────────────────────────────────────────────
@@ -224,7 +228,7 @@
         (let [vg (apply vg-fn (loss-args cfg st))]
           (doseq [s adapter-syms]
             (optim/sgd-step! (st s) (nth vg (adapter-vg-slot s))
-                             (ra/alength ^floats (st s)) lr))
+                             (ra/alength ^floats (st s)) (n/oftype (st s) lr)))
           (recur (inc k) (conj losses (double (nth vg 0)))))))))
 
 ;; ── the gate ─────────────────────────────────────────────────────────────────────

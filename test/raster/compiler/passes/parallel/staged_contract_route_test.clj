@@ -163,3 +163,36 @@
     (let [r (cr/route-contraction (staged-form :byte) :dtype :byte :prefer-peak? true)]
       (is (= :staged-segred (:strategy r)))
       (is (not (:tensorized r))))))
+
+;; ── the oracle at the router: both defects, refused rather than emitted ──────────────
+(deftest router-refuses-stages-that-do-not-span-the-declared-axes
+  (testing "a stage under-covering its declared extent must be REFUSED, not emitted.
+            Before: routed happily and emitted `for (int t = 0; t < 4` against a declared
+            extent of 32 — the GPU summed 8 of 64 terms while par/contract summed all 64."
+    (let [bad (list 'raster.par/contract 'out [['i 2] ['j 2]] [['blk 2] ['t 32]]
+                    (list 'raster.numeric/* (list 'aget 'a 't) (list 'aget 'b 't))
+                    :stages [{:axis 'blk :extent 2 :dtype :float :init 0.0 :lift 'inner}
+                             {:axis 't :extent 4 :dtype :int :init 0}])]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"illegal stages"
+                            (cr/route-contraction bad :dtype :byte))))))
+
+(deftest dp4a-refuses-a-body-it-would-discard
+  (testing "this leaf replaces the whole summand with one rstr_dp4a call, so a body carrying any
+            factor beyond the two declared operands would be SILENTLY dropped — with the extra
+            array still declared as an unread kernel param."
+    (let [ma {:groups [['[i 4]] ['[blk 4] '[t 32]]]}
+          mb {:groups [['[j 4]] ['[blk 4] '[t 32]]]}
+          idx (requiring-resolve 'raster.compiler.ir.axis-map/index-expr)
+          gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/staged-inner-dp4a-legal?)
+          base {:stages [{:axis 'blk :extent 4 :dtype :float :init 0.0 :lift 'inner}
+                         {:axis 't :extent 32 :dtype :int :init 0}]
+                :operands [{:sym 'a :map ma} {:sym 'b :map mb}]
+                :dtype :byte}
+          pure (list 'raster.numeric/* (list 'aget 'a (idx ma)) (list 'aget 'b (idx mb)))]
+      (is (:ok (gate (assoc base :body pure))) "the exact product is accepted")
+      (is (= :body-has-unmodeled-terms
+             (:reason (gate (assoc base :body (list 'raster.numeric/* pure (list 'aget 'mask 't))))))
+          "an extra factor is refused")
+      (is (= :body-has-unmodeled-terms
+             (:reason (gate (assoc base :body (list 'raster.numeric/+ pure (list 'aget 'c 't))))))
+          "…and so is a non-product body"))))

@@ -43,6 +43,7 @@
    and may reference its own axis plus extra operand arrays, each with a declared axis-map (so a
    scale is indexed by ITS map, not by pattern-matching — same rule as the epilogue seam)."
   (:require [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.core.dtype :as dt]
             [clojure.set :as set]
             [clojure.walk :as walk]))
 
@@ -74,6 +75,8 @@
       (when (= 1 n) (vec (remove #(= inner %) args))))
     :else nil))
 
+(declare contract-extent)
+
 (defn stages-legal?
   "Legality of a staged contract axis. Returns {:ok true} or {:ok false :reason kw …}.
 
@@ -94,8 +97,9 @@
      • no layout/distribution-changing op in a lift."
   [stages contract-axes & {:keys [inner] :or {inner 'inner}}]
   (let [stages (vec stages)
-        int-dtypes #{:int :long :byte :short :uint :int8 :int32}
-        float-dtypes #{:float :double :half :float16}
+        ;; dtype classification comes from the ONE registry. The ad-hoc sets this replaces listed
+        ;; :short/:uint/:int8/:int32/:float16 — four of which no emitter could spell, so the gate
+        ;; blessed accumulator dtypes that silently became "float" C types downstream.
         n (count stages)]
     (cond
       (zero? n) {:ok false :reason :no-stages}
@@ -103,6 +107,16 @@
       (not= (mapv :axis stages) (mapv first contract-axes))
       {:ok false :reason :stages-do-not-match-contract-axes
        :stage-axes (mapv :axis stages) :contract-axes (mapv first contract-axes)}
+
+      ;; EXTENTS too, not just axis names. Comparing symbols alone let a stage under-cover its
+      ;; axis — a stage of extent 4 against a declared extent of 32 emitted a loop summing an
+      ;; EIGHTH of the terms, while the interpreted path summed all of them. The stage list must
+      ;; span exactly the space the form declared.
+      (not= (mapv :extent stages) (mapv second contract-axes))
+      {:ok false :reason :stage-extents-do-not-span-the-contract-axes
+       :stage-extents (mapv :extent stages) :declared-extents (mapv second contract-axes)
+       :spans (contract-extent stages)
+       :declared (am/group-extent (mapv vec contract-axes))}
 
       (some? (:lift (peek stages)))
       {:ok false :reason :innermost-stage-has-a-lift :axis (:axis (peek stages))}
@@ -129,10 +143,15 @@
                :else nil)))
          (butlast stages)))
        ;; dtypes must not narrow outward (inner → outer)
+       ;; an accumulator dtype the compiler cannot spell is a REFUSAL, not a silent substitution
+       (first (keep (fn [{:keys [axis dtype]}]
+                      (when-not (dt/known? dtype)
+                        {:ok false :reason :unknown-stage-accumulator-dtype :axis axis :dtype dtype}))
+                    stages))
        (first
         (keep (fn [[outer inner-st]]
-                (when (and (contains? int-dtypes (:dtype outer))
-                           (contains? float-dtypes (:dtype inner-st)))
+                (when (and (dt/integral? (:dtype outer))
+                           (not (dt/integral? (:dtype inner-st))))
                   {:ok false :reason :narrowing-stage-accumulator
                    :outer (:dtype outer) :inner (:dtype inner-st)}))
               (partition 2 1 stages)))
