@@ -16,6 +16,7 @@
   and the bytecode compiler consumes. Does NOT modify the form structure
   beyond the transformations above — preserves metadata, qualified symbols, etc."
   (:require [raster.compiler.ir.form :as form]
+            [raster.compiler.core.util :as util]
             [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.compiler.passes.scalar.simplify :as simp]
             [raster.core :as rcore]))
@@ -114,6 +115,26 @@
 ;; Partial evaluation - single pass
 ;; ================================================================
 
+(defn- env-safe-in-scope
+  "The const-env entries that may be substituted INSIDE a scope binding `binders`.
+
+   Drops two capture directions, and only the first was previously handled anywhere:
+
+     KEY capture   — a binder rebinds an env KEY, so substituting would replace the scope-local
+                     name (a par index `i` against an outer `{i 99}`).
+     VALUE capture — an env VALUE is free out here but BOUND in there, so substituting moves the
+                     reference from the outer binding to the inner binder. `pe`'s env can hold a
+                     bare symbol (`trivial?` admits symbols), so `{x i}` inside
+                     `(dotimes [i n] … x …)` rewrote `x` to the LOOP INDEX: a well-formed program
+                     computing the wrong thing, with no key collision to notice.
+
+   Dropped rather than alpha-renamed. Renaming would add another substitution surface, and losing a
+   constant here costs one folding opportunity in a rare shape — `util/subst-syms` renames because
+   it must preserve every substitution, whereas a partial evaluator is free to decline."
+  [const-env binders]
+  (let [bs (into #{} (filter symbol?) binders)]
+    (into {} (remove (fn [[k v]] (or (bs k) (some bs (util/free-syms v))))) const-env)))
+
 (defn- pe-let
   "Partially evaluate a let/let*/loop form.
   - Propagate constants into body
@@ -139,7 +160,7 @@
       ;; Loop: PE init exprs but keep all bindings. Don't propagate
       ;; constants into body because recur will change them.
       (let [loop-syms (set (map first binding-pairs))
-            body-env (apply dissoc const-env loop-syms)
+            body-env (env-safe-in-scope const-env loop-syms)
             pe-bindings (vec (mapcat (fn [[sym init]]
                                        [sym (pe-fn init const-env)])
                                      binding-pairs))
@@ -401,7 +422,7 @@
         (form/scope-info form)
         (let [{:keys [scopes outer rebuild]} (form/scope-info form)]
           (rebuild (mapv (fn [{:keys [binders inits body]}]
-                           (let [env' (apply dissoc const-env (filter symbol? binders))]
+                           (let [env' (env-safe-in-scope const-env binders)]
                              {:binders binders
                               :inits (mapv #(pe-pass % env') inits)
                               :body  (mapv #(pe-pass % env') body)}))

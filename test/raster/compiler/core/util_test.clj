@@ -267,3 +267,28 @@
           a' (nth binds 0) b-init (nth binds 3)]
       (is (= a' b-init) "b's init references the renamed a, not a stale name"))))
 
+
+;; ── alpha-convert SEPARATES duplicate bound names; postwalk-replace COLLAPSES them ──
+(deftest alpha-convert-separates-duplicate-bound-names
+  ;; `ad/reverse/alpha-rename-bound` built its rename map with `(into {} (map …))` over the bound
+  ;; names, so a name bound twice kept only the LAST entry: the two distinct bindings collapsed to
+  ;; one and the first binding's uses silently read the second's value — a wrong gradient. Its
+  ;; docstring and call site both stated "assumes its input bindings are already unique"; nothing
+  ;; asserted it. alpha-convert has no such precondition, and this pins that.
+  (testing "a let* binding the same name twice keeps the two bindings distinct"
+    (let [r (util/alpha-convert '(let* [a 1 b (clojure.core/+ a 10)
+                                        a 2 c (clojure.core/+ a 20)]
+                                   (clojure.core/+ b c)))
+          [_ bs _] r
+          bound (vec (take-nth 2 bs))]
+      (is (= 4 (count (distinct bound))) "all four binders are distinct names")
+      (is (apply distinct? bound))
+      ;; b must read the FIRST a, c the SECOND — check by structure, not by name
+      (let [[a1 _ b1 bi a2 _ c1 ci] bs]
+        (is (= (list 'clojure.core/+ a1 10) bi) "b's init reads the first a")
+        (is (= (list 'clojure.core/+ a2 20) ci) "c's init reads the second a")
+        (is (not= a1 a2) "…and those are different symbols"))))
+  (testing "for contrast: postwalk-replace on the same shape collapses them"
+    ;; documents WHY the mechanism was replaced, and would fail if postwalk-replace ever became safe
+    (let [smap (into {} (map (fn [s] [s (gensym (str (name s) "__"))])) '[a b a c])]
+      (is (= 3 (count smap)) "the duplicate `a` yields ONE entry — the collapse, in one line"))))

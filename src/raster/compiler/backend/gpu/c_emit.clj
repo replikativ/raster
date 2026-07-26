@@ -14,6 +14,7 @@
               *scalar-type* \"float\"]
       (emit-expr body idx-sym array-syms \"idx\"))"
   (:require [clojure.string :as str]
+            [raster.compiler.core.util :as util]
             [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -495,30 +496,7 @@
 ;; Side effect detection
 ;; ================================================================
 
-(defn void-form?
-  "True if the form itself is a void (statement-only) operation.
-   Checks walker-stamped :raster.type/tag first — if present, the form has
-   a return type and is not void. Falls back to op-descriptor registry for
-   compiler primitives (aset, collect!) that pass through the walker as
-   opaque macros and are handled directly by GPU codegen."
-  [expr]
-  (and (seq? expr)
-       (not (:raster.type/tag (meta expr)))
-       (descriptor/void-op? (first expr))))
 
-(defn has-side-effects?
-  "Check if an expression tree contains void (side-effect) operations — including
-  DEVIRTUALIZED array writes (.invk aset-impl …), recognized via the walker-stamped
-  :raster.op/original op (an intermediate's aset materializes to .invk, which the
-  surface-op void-form? check would otherwise miss → a side-effecting binding would be
-  wrongly inlined and re-run)."
-  [expr]
-  (cond
-    (not (seq? expr)) false
-    (void-form? expr) true
-    (and (= '.invk (first expr))
-         (descriptor/aset-op? (:raster.op/original (meta expr)))) true
-    :else (some has-side-effects? (rest expr))))
 
 ;; ================================================================
 ;; Backend-specific helpers
@@ -786,11 +764,11 @@
   "Terminal (non-recur) value expression of a loop BODY (a seq of body forms) —
   the value the loop evaluates to when it exits, via form/terminal-value-expr
   over the implicit do. A VOID terminal (a body ending in a statement-only op
-  like aset) yields nil, so callers fall back to *scalar-type*; void-form? is a
+  like aset) yields nil, so callers fall back to *scalar-type*; util/void-form? is a
   GPU-emission concept, so that check lives here, not in ir/form."
   [body]
   (let [t (form/terminal-value-expr (if (= 1 (count body)) (first body) (cons 'do body)))]
-    (when-not (void-form? t) t)))
+    (when-not (util/void-form? t) t)))
 
 (defn- emit-loop-body
   "Emit the body of a loop as C while-body statements. var-types parallels var-names — the
@@ -887,7 +865,7 @@
            " } else { break; }"))
 
     ;; Void terminal (aset, collect!, atomic-add!) -> emit as stmt then break
-    (void-form? expr)
+    (util/void-form? expr)
     (str (emit-stmt expr idx-sym array-syms opencl-idx) " break;")
 
     ;; Terminal expression -> assign to the typed result var (reduction value)
@@ -1005,7 +983,7 @@
                   ;; side-effecting binding into a later loop body re-runs its writes every
                   ;; iteration (silent miscompile).
                   (if (or (multi-use? sym)
-                          (has-side-effects? val)
+                          (util/effectful? val)
                           (and (seq? val-subst) (contains? #{'loop 'loop*} (first val-subst))))
                     (let [base-name (c-symbol sym)
                           prev-count (get seen-names base-name 0)
@@ -1034,7 +1012,7 @@
            leading-body (butlast all-body)
            tail-body (last all-body)
            has-leading? (and (seq leading-body)
-                             (some has-side-effects? leading-body))]
+                             (some util/effectful? leading-body))]
        ;; Emit leading statements + body under the int vars bound by this scope's
        ;; bindings, so references to int-typed locals (index math) type as int.
        (binding [*int-vars* (into *int-vars* ints)]
@@ -1079,7 +1057,7 @@
                   " " (emit-expr last-expr idx-sym array-syms opencl-idx) "; })"))
            ;; GLSL: no statement expressions
            (let [leading (butlast stmts)]
-             (if (some has-side-effects? leading)
+             (if (some util/effectful? leading)
                (throw (ex-info "GLSL: do block has non-tail forms with side effects but statement expressions are not supported"
                                {:expr expr}))
                (emit-expr (last stmts) idx-sym array-syms opencl-idx))))))
@@ -1099,8 +1077,8 @@
            ;; GLSL: emit as ternary with 0 fallback
            (str "((" cond-str ") ? ("
                 (emit-expr then-expr idx-sym array-syms opencl-idx) ") : 0)"))
-         (let [side-effects? (or (has-side-effects? then-expr)
-                                 (has-side-effects? else-expr))]
+         (let [side-effects? (or (util/effectful? then-expr)
+                                 (util/effectful? else-expr))]
            (if (and side-effects? (supports-stmt-expr?))
              (str "({ " *scalar-type* " _r; if (" cond-str ") { "
                   (emit-stmts-with-result then-expr idx-sym array-syms opencl-idx "_r")
@@ -1891,28 +1869,16 @@
       :else nil)))
 
 (defn- inline-pure-lets
-  "Deep-inline EVERY pure let/let* (no side effects, not loops) anywhere in the form,
-  so subscript index expressions are exposed and no scalar local is declared for a
-  value that becomes a vector (a nested let inside a store value would otherwise emit
-  `float x = <float4>` — a type error). A vectorizable straight-line body has only
-  pure bindings; an impure/loop-valued binding throws vec-bail! (→ scalar loop)."
+  "Deep-inline every pure let/let* anywhere in the form, so subscript index expressions are exposed
+  and no scalar local is declared for a value that becomes a vector (a nested let inside a store
+  value would otherwise emit `float x = <float4>` — a type error).
+
+  The rewrite itself is `util/inline-pure-lets` — shared with the SOAC lowerer and the CPU SIMD
+  emitter, whose own copies lacked this purity gate. All this adds is the local refusal channel: a
+  vectorizable straight-line body has only pure bindings, so an impure or loop-valued binding
+  vec-bail!s to the scalar loop rather than throwing."
   [expr]
-  (walk/prewalk
-   (fn [f]
-     (if (and (seq? f) (contains? #{'let 'let*} (first f)))
-       (let [[_ bindings & body] f
-             pairs (partition 2 bindings)]
-         (when (some (fn [[_ v]] (or (has-side-effects? v)
-                                     (and (seq? v) (contains? #{'loop 'loop*} (first v)))))
-                     pairs)
-           (vec-bail!))
-         (let [env (reduce (fn [env [s v]]
-                             (assoc env s (walk/postwalk-replace env v)))
-                           {} pairs)
-               body' (mapv #(walk/postwalk-replace env %) body)]
-           (if (= 1 (count body')) (first body') (cons 'do body'))))
-       f))
-   expr))
+  (util/inline-pure-lets expr :on-impure (fn [_ _] (vec-bail!))))
 
 (defn- aget-form?* [f] (and (seq? f) (>= (count f) 3) (descriptor/aget-op? (first f))))
 (defn- aset-form?* [f] (and (seq? f) (>= (count f) 4) (descriptor/aset-op? (first f))))

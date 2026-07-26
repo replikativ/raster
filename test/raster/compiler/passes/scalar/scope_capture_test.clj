@@ -54,3 +54,30 @@
                               r (dense-into buf)]
                              (clojure.core/alength buf))))]
       (is (= 'n (last out)) "top-level (alength buf) resolves to its alloc size n"))))
+
+;; ================================================================
+;; pe.clj — const-env must not have its VALUES captured either
+;; ================================================================
+;; The tests above cover KEY capture: a binder that rebinds a const-env key. The other half is
+;; VALUE capture: a const-env VALUE that is free in the enclosing scope but BOUND inside this one.
+;; Substituting it moves the reference from the outer binding to the inner binder — a silent wrong
+;; answer, with no key collision to notice. `pe` protected the first half and not the second.
+
+(deftest pe-const-env-value-not-captured-by-par-index
+  (testing "an alias to an OUTER i must not become the par loop's index"
+    ;; `x` aliases the outer `i`; the par form binds its own `i`. Substituting x→i inside the loop
+    ;; body silently reads the loop index instead of the outer value.
+    (let [r (pe/pe-pass '(let* [x i
+                               r (raster.par/map! out i n nil (clojure.core/+ x 1))]
+                           r)
+                        {})]
+      (is (some #{'x} (flatten r))
+          "x must survive inside the loop body (or be renamed) — it must NOT become the loop index")
+      (is (not= '(clojure.core/+ i 1) (last (nth r 1)))
+          "the body must not read the loop index in place of the outer i"))))
+
+(deftest pe-const-env-value-not-captured-by-dotimes-index
+  (testing "the same hazard on dotimes, substituting from a pre-seeded env"
+    (let [r (pe/pe-pass '(dotimes [i n] (clojure.core/aset out i x)) '{x i})]
+      (is (= '(clojure.core/aset out i x) (last r))
+          "x must stay x: substituting it would make the store read the loop index"))))

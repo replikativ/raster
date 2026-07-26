@@ -150,6 +150,29 @@
 
 (declare route-2free-1contract route-quant)
 
+(def ^:private splice-capable-strategies
+  "Strategies whose emitter has a store splice, and can therefore honour an :epilogue.
+   A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
+   blacklist got this wrong twice, most recently by exempting the only shape production produces.
+   `:dpas` splices through emit-gemm-tiled; the three staged-emitter strategies splice at the store
+   (which is how a quant dequant scale is expressed since :scheme was deleted)."
+  #{:dpas :dp4a :quant-naive :staged-segred})
+
+(defn- epilogue-honoured-or-refused
+  "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
+   silently — the consumer's computation vanishes with no error.
+
+   Decided AFTER routing, on the strategy actually chosen, because a pre-routing shape test got this
+   wrong twice: a shape blacklist exempted (2 free, 1 contract) — the only shape production produces
+   — and a version keyed on the tensorize plan forced that plan early and refused shapes DPAS would
+   have accepted. The chosen strategy is the only reliable witness of whether a splice exists."
+  [epilogue d]
+  (when (and (seq epilogue) (not (contains? splice-capable-strategies (:strategy d))))
+    (throw (ex-info (str "contraction: strategy " (:strategy d) " has no store splice, so its "
+                         ":epilogue would be silently dropped")
+                    {:reason :epilogue-unsupported-by-this-leaf :strategy (:strategy d)})))
+  d)
+
 (defn route-contraction
   "Route a contraction form to the hardware-optimal kernel via the DPAS legality gate.
    dtype selects the element type of the intended kernel (:half tries DPAS; :byte/:int8 tries
@@ -185,14 +208,25 @@
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
     (validate-descriptor
-     (cond
+     (epilogue-honoured-or-refused
+      epilogue
+      (cond
       ;; STAGED contract axis → the multi-level accumulate leaf. Checked FIRST because staging is
       ;; a property of the reduction itself, not of the dtype: it is what lets a block-quantized
       ;; format (int32 MAC inside the block, float accumulate across blocks) be expressed in the
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
       (and (seq stages) (> (count stages) 1))
-      (let [;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
+      (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+            ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
+            ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
+            _ (let [cmb (:combine (cf/contraction-facts contract-form :dtype dtype))]
+                (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
+                  (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
+                                       cmb ") — every accumulator level uses += and a lift's "
+                                       "linearity argument assumes addition")
+                                  {:reason :non-plus-combine-on-staged :combine cmb}))))
+            ;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
             ;; MACs per int32 op) — the int8 peak leaf, and the same shape llama.cpp hand-writes.
             ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
             ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
@@ -244,10 +278,16 @@
          :array-params (:array-params k)
          :dtype dtype :out-dtype dtype :out-elems 1
          :n-phases (:n-phases k)
+         ;; CARRY THE COMBINE. invoke-reduction-kernel reads :c-op/:identity-val from the kernel
+         ;; REGISTRY for its host-side final combine, defaulting to `+`/0.0. Widening the
+         ;; registration to pass the whole descriptor through (as a previous commit did) is a no-op
+         ;; unless the descriptor actually contains them — generate-segred-kernel returns them into
+         ;; a local that was discarded here. Without this, a multi-workgroup `:combine max` or `*`
+         ;; silently SUMS its per-group partials.
+         :c-op (:c-op k) :identity-val (:identity-val k)
          :reduce-bound red-bound          ; element count the reduction spans
          :scalar-args [] :dims [1]})
 
-      ;; 0 contract axes → outer product / broadcast → pure N-D SegMap (1-D launch)
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
             {:keys [kernel-name source array-params scalar-params]}
@@ -280,7 +320,7 @@
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
          :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
                             {:type :int :value nseg})
-         :out-elems nseg :dims [nseg]})))))
+         :out-elems nseg :dims [nseg]}))))))
 
 (defn- route-2free-1contract
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.

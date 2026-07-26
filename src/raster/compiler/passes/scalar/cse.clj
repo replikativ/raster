@@ -4,6 +4,7 @@
    Walks forward through bindings, caching expr → first-sym.
    Duplicate expressions become aliases; DCE cleans dead bindings."
   (:require [raster.compiler.passes.scalar.effects :as effects]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.form :as form]))
 
 (defn- normalize-expr
@@ -33,21 +34,32 @@
           (when (and (>= idx 0) (< idx (count v)))
             (clojure.core/nth v idx)))))))
 
-(defn- subst-syms-in
-  "Scope-BLIND symbol substitution. Intentionally NOT the capture-avoiding
-   `util/subst-syms`: cse-let runs only on a FLAT `let*` with gensym-unique
-   binding names (the pipeline guarantees ANF flatness before CSE), so there is
-   no shadowing and blind substitution is both correct and faster. Do NOT use
-   this on nested/un-flattened forms — use `util/subst-syms` there."
+(defn- subst-blind
+  "Scope-BLIND symbol substitution — the fast path, valid only under the precondition that
+   `util/scope-blind-substitution-safe?` checks."
   [smap expr]
   (cond
     (symbol? expr) (get smap expr expr)
-    (seq? expr) (let [new-children (map (partial subst-syms-in smap) expr)]
-                  (if-let [m (meta expr)]
-                    (with-meta (apply list new-children) m)
-                    (apply list new-children)))
-    (vector? expr) (mapv (partial subst-syms-in smap) expr)
+    (seq? expr) (util/remake-from expr (map (partial subst-blind smap) expr))
+    (vector? expr) (mapv (partial subst-blind smap) expr)
     :else expr))
+
+(defn- subst-syms-in
+  "Substitute symbols per `smap` in `expr`.
+
+   cse-let runs on a FLAT `let*` with gensym-unique binding names (the pipeline guarantees ANF
+   flatness before CSE), so scope-blind substitution is normally both correct and ~4x faster than
+   the capture-avoiding `util/subst-syms`. That precondition used to live only in this docstring.
+   Now it is CHECKED, and a form that violates it takes the capture-avoiding path instead of being
+   quietly corrupted — blind substitution rewrites binder positions outright, e.g. {k → v} over
+   `(fn* [k] …)` produces `(fn* [v] …)`.
+
+   So there is one semantics and one optimization guarded by a verified precondition, rather than a
+   second substitution with an assumption attached."
+  [smap expr]
+  (if (util/scope-blind-substitution-safe? smap expr)
+    (subst-blind smap expr)
+    (util/subst-syms smap expr)))
 
 (defn cse-let
   "Apply CSE and constant propagation to a flat let* form.

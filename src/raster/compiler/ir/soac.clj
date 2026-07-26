@@ -12,6 +12,7 @@
     SoacStencil — neighborhood stencil (fixed radius)
     ScalarBinding — non-parallel scalar/allocation binding"
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [clojure.set :as set]
@@ -154,18 +155,6 @@
     (second e)
     e))
 
-(defn- inline-let-bindings
-  "Beta-reduce let* bindings into `expr`: substitute each bound symbol with its
-   definition. Walker-produced bindings are SSA (each symbol bound once, no
-   shadowing), so iterative substitution in reverse order is sound — a later
-   binding referencing an earlier one is resolved when the earlier one is
-   inlined. Duplicates loads (e.g. g=gate[i] used several times), which the C
-   compiler CSEs; the payoff is a single flat expression that the existing
-   aget-substitution fusion + expression emitter handle directly."
-  [binds expr]
-  (reduce (fn [acc [s e]] (walk/postwalk-replace {s e} acc))
-          expr (reverse (partition 2 binds))))
-
 (defn- single-aset-void
   "If a par/map-void! body is a SINGLE in-place write `(aset OUT idx VAL)` whose
    index is exactly the loop index (a 1:1 elementwise write — NOT an offset/scatter
@@ -190,11 +179,20 @@
                (second body) body)]
     (cond
       ;; let*-wrapped write: recurse into the SOLE let body form, then inline the bindings
-      (and (seq? stmt) (contains? #{'let* 'let} (first stmt)))
+      (and (seq? stmt) (form/let-head? (first stmt)))
       (let [[_ binds & lbody] stmt]
-        (when (= 1 (count lbody))
+        (when (and (= 1 (count lbody))
+                   ;; PURITY GATE. This inlining duplicates each binding into the lambda, so an
+                   ;; effectful init would have its effect duplicated or reordered. The old
+                   ;; `postwalk-replace` copy had no gate and rested on an unstated `walker bindings
+                   ;; are SSA` precondition. Refusing here is free: nil ⇒ ScalarBinding ⇒ the legacy
+                   ;; void path, which emits the body as written.
+                   (not-any? util/effectful? (take-nth 2 (rest binds))))
           (when-let [inner (single-aset-void (first lbody) idx-sym)]
-            (update inner :value #(inline-let-bindings binds %)))))
+            ;; capture-avoiding: an init that rebinds an earlier name internally, or a name that
+            ;; also appears in a binder/array position, is not corrupted the way postwalk-replace
+            ;; corrupted it.
+            (update inner :value #(util/subst-syms (util/binding-env binds) %)))))
 
       (descriptor/aset-call? stmt)
       (let [cargs (vec (descriptor/call-args stmt))]   ;; (arr idx-expr val)

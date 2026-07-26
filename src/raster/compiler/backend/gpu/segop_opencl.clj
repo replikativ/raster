@@ -853,9 +853,12 @@
     (str/join "\n"
               (map-indexed
                (fn [p [sym bound]]
-                 (let [after (map second (subvec v (inc p) n))
+                 ;; bounds go through c-symbol too: a symbolic bound named `n-cols` was emitted
+                 ;; raw as `(seg / (n-cols))` — valid C that computes `n - cols`.
+                 (let [bc (fn [b] (if (symbol? b) (ce/c-symbol b) b))
+                       after (map (comp bc second) (subvec v (inc p) n))
                        div (if (seq after) (str "(seg / (" (str/join " * " after) "))") "seg")]
-                   (str "    int " (ce/c-symbol sym) " = " div " % " bound ";")))
+                   (str "    int " (ce/c-symbol sym) " = " div " % " (bc bound) ";")))
                v))))
 
 (defn staged-inner-dp4a-legal?
@@ -894,6 +897,16 @@
       (not (every? :map operands)) {:ok false :reason :operand-without-a-declared-map}
       (not (and (dt/known? dtype) (= :byte (dt/canon dtype))))
       {:ok false :reason :dp4a-needs-int8-operands :dtype dtype}
+      ;; A :decode is a LOAD-LAMBDA applied by substituting into the body — and this leaf discards
+      ;; the body, replacing the whole summand with one rstr_dp4a call. So a zero-point would be
+      ;; silently dropped: Σ a·b instead of Σ(a−za)(b−zb), wrong by a constant-plus-linear term with
+      ;; no diagnostic. Load-bearing, since q4_0/q8_0 carry zero-points 8 and 128. Same underlying
+      ;; reason as :body-has-unmodeled-terms below — the body is not evaluated here.
+      (some :decode operands)
+      {:ok false :reason :decode-on-a-body-replacing-leaf
+       :detail "this leaf replaces the body with a single hardware op, so a per-operand :decode (e.g. a zero-point) would be silently dropped"
+       :decoded (mapv :sym (filter :decode operands))}
+
       (not exact-product?)
       {:ok false :reason :body-has-unmodeled-terms
        :detail "this leaf replaces the body with a single hardware op; any term beyond the two declared operands would be silently dropped"
@@ -959,6 +972,16 @@
         _ (when (nil? contract-axes)
             (throw (ex-info "staged contraction: :contract-axes is required — the stage list can only be validated against the axes the form declared"
                             {:reason :missing-declared-contract-axes :stages stages})))
+        ;; This emitter interpolates extents into the loop bounds and the decompose but declares no
+        ;; scalar params for them, so a symbolic bound emits an UNDECLARED identifier — and
+        ;; validate-descriptor passes it (the counts agree), so it fails only at device build, i.e.
+        ;; never in CI. Its segmented-reduce sibling declares them; until this one does, refuse.
+        _ (let [syms (remove number? (concat (map second free-axes) (map :extent stages)))]
+            (when (seq syms)
+              (throw (ex-info (str "staged contraction: symbolic bounds are not supported by this "
+                                   "emitter (it declares no scalar params for them) — "
+                                   (pr-str (vec syms)))
+                              {:reason :symbolic-bounds-unsupported :bounds (vec syms)}))))
         legal (cstage/stages-legal? stages contract-axes)
         _ (when-not (:ok legal)
             (throw (ex-info (str "staged contraction: illegal stages (" (:reason legal) ")")
@@ -1068,7 +1091,12 @@
                     ", __global " out-ctype "* restrict out"
                     (when ep (:epilogue-params ep))
                     ", int _nseg")
-        src (str (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))
+        src (str
+                 ;; fp64/fp16 need their OpenCL extension enabled. All three sibling emitters emit
+                 ;; this; the staged one did not, so a :double staged contraction — reachable from
+                 ;; opencl_pass, whose default dtype IS :double — emitted `double` with no pragma.
+                 (codegen/extension-pragmas out-dtype dtype)
+                 (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))
                  (when ep (:epilogue-helpers ep))
                  "__kernel void " kernel-name "(" params ") {\n"
                  "    int seg = get_global_id(0);\n"

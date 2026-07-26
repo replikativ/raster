@@ -19,21 +19,32 @@
             [raster.compiler.backend.intrinsics :as in]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.core.util :as util]
             [clojure.string :as str]
             [clojure.walk :as walk]))
 
 (defn- inline-lets
-  "Substitute a let*/let's bindings into its body so the lane expression is a single
-   form (no manual kernel-source inlining needed). SIMD value-lambdas are effect-free,
-   so this is sound; each binding value gets prior substitutions, and nested/sequential
-   lets recurse."
+  "Beta-reduce a lane lambda's let bindings into its body so the lane expression is a single form
+   (no manual kernel-source inlining needed). nil if that is not possible, so the caller keeps the
+   scalar loop.
+
+   The rewrite is `util/inline-pure-lets`, shared with the GPU emitter and the SOAC lowerer. Two
+   things the local copy this replaces got wrong, both silent:
+
+     • it had NO purity gate, resting on the unstated claim that `SIMD value-lambdas are effect-free`
+       — an effectful binding was inlined and its effect duplicated per lane;
+     • it kept only `(last body)`, DISCARDING the earlier forms of a multi-statement body. Those
+       forms are exactly the ones held for their effects, so a store could vanish from the
+       vectorized loop while the scalar loop performed it.
+
+   Both are now refusals: nil ⇒ scalar loop, which is correct by construction."
   [expr]
-  (if (and (seq? expr) (contains? #{'let 'let*} (first expr)))
-    (let [[_ binds & body] expr
-          env (reduce (fn [m [s v]] (assoc m s (walk/postwalk-replace m v)))
-                      {} (partition 2 binds))]
-      (inline-lets (walk/postwalk-replace env (last body))))
-    expr))
+  (try
+    (let [r (util/inline-pure-lets expr)]
+      ;; a `do` means the body had several forms; a lane expression cannot carry statements
+      (when-not (and (seq? r) (= 'do (first r))) r))
+    (catch clojure.lang.ExceptionInfo e
+      (when-not (= :impure-binding (:reason (ex-data e))) (throw e)))))
 
 ;; element keyword → intrinsics vector-facet element key
 (defn- vt-of [dtype] (case dtype :double :f64 :float :f32 :long :i32 :int :i32 nil))
