@@ -31,36 +31,6 @@
     (MemorySegment/copy (MemorySegment/ofArray arr) 0 seg 0 nbytes)
     [seg nbytes]))
 
-(defn- run-tiled
-  "Emit the tiled kernel for m×n×k, launch on device, return the output vector."
-  [m k n]
-  (let [ze (find-ns 'raster.gpu.ze-runtime)
-        register! (ns-resolve ze 'register-kernel!)
-        ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
-        alloc (ns-resolve ze 'alloc-shared)
-        launch-2d! (ns-resolve ze 'launch-2d!)
-        A (double-array (map double (range (* m k))))
-        B (double-array (map #(* 0.5 (double %)) (range (* k n))))
-        form (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
-                   (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
-                         (list 'aget 'B (list '+ (list '* 'l n) 'j))))
-        sr (cl/contract-form->segred form)
-        {:keys [kernel-name source tile]} (sco/generate-tiled-contraction-kernel sr 'C)
-        _ (register! kernel-name {:source source :dtype :double})
-        {:keys [kernel-handle]} (ensure-loaded! kernel-name)
-        [aseg _] (upload! A)
-        [bseg _] (upload! B)
-        out-bytes (* m n 8)
-        oseg (alloc out-bytes)
-        T (long tile)
-        gcx (long (Math/ceil (/ (double n) T)))   ; columns / N
-        gcy (long (Math/ceil (/ (double m) T)))]  ; rows / M
-    ;; args order = sorted inputs [A B] then out
-    (launch-2d! kernel-handle [T T] [gcx gcy] [aseg bseg oseg])
-    (let [out (double-array (* m n))]
-      (MemorySegment/copy oseg 0 (MemorySegment/ofArray out) 0 out-bytes)
-      {:gpu (vec out) :cpu (vec (ref-matmul A B m k n))})))
-
 (defn- run-regtiled
   "Emit the register-tiled kernel for m×n×k, launch on device, return {:gpu :cpu}."
   [m k n]
@@ -96,20 +66,9 @@
   (and (= (count xs) (count ys))
        (every? true? (map (fn [a b] (< (Math/abs (- (double a) (double b))) 1.0e-9)) xs ys))))
 
-(deftest tiled-contraction-matches-cpu-on-device
-  (if-not @gpu?
-    (println "[skip] tiled-contraction-device: no GPU device available")
-    (do
-      (testing "tile-divisible dims (32×32×32)"
-        (let [{:keys [gpu cpu]} (run-tiled 32 32 32)]
-          (is (approx-eq? gpu cpu) (str "divisible: GPU " (take 4 gpu) " vs CPU " (take 4 cpu)))))
-      (testing "non-divisible dims (30×24×20) — boundary padding path"
-        (let [{:keys [gpu cpu]} (run-tiled 30 24 20)]
-          (is (approx-eq? gpu cpu) (str "boundary: GPU " (take 4 gpu) " vs CPU " (take 4 cpu)))))
-      (testing "skewed dims (17×48×5)"
-        (let [{:keys [gpu cpu]} (run-tiled 17 48 5)]
-          (is (approx-eq? gpu cpu) "skewed"))))))
-
+;; NB the block-tiled generator this namespace also covered is gone — it was unreachable from
+;; route-contraction and strictly a `regtiled` with tm=tn=1, so its cases (non-tile-divisible dims,
+;; tiny dims) are carried by the regtiled deftest below rather than by a second emitter.
 (deftest regtiled-contraction-matches-cpu-on-device
   (if-not @gpu?
     (println "[skip] regtiled-contraction-device: no GPU device available")

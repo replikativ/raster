@@ -126,3 +126,28 @@
   (testing "check-layout refuses a hand-built map — it requires real facts"
     (is (thrown? clojure.lang.ExceptionInfo
                  (cf/check-layout {:operands [] :roles {}} (:dpas cf/leaf-layouts))))))
+
+;; ── anti-drift: the data table and the predicate it will replace must AGREE ──────────
+;; `check-layout` is not yet consumed by the gates. That is deliberate — four of the six
+;; orientation call sites live in the quant and dp4a generators, which the next increment deletes
+;; outright, and wiring only the fifth (dpas) would create a dual path. But an unconsumed
+;; capability is how this subsystem drifted in the first place, so the equivalence is PINNED here:
+;; if the table and the live predicate ever disagree on a case, this fails.
+(deftest table-agrees-with-the-live-orientation-gate
+  (let [cases [[:nn nn-idx :dpas true] [:nn nn-idx :dp4a false]
+               [:nt nt-idx :dp4a true] [:nt nt-idx :dpas false]]
+        gate (requiring-resolve 'raster.compiler.backend.gpu.segop-opencl/dpas-contraction-legal?)
+        lower (requiring-resolve 'raster.compiler.passes.parallel.contract-lower/contract-form->segred)]
+    (doseq [[label idx leaf expected] cases]
+      (testing (str label " under " leaf)
+        (is (= expected (boolean (:ok (cf/check-layout (cf/contraction-facts (mm-form idx))
+                                                       (get cf/leaf-layouts leaf)))))
+            "table verdict")))
+    (testing "and the live DPAS gate reaches the same orientation verdict the table does"
+      ;; f64 so the gate's own dtype requirement does not mask the orientation decision
+      (let [nn-sr (lower (mm-form nn-idx) :dtype :half)
+            nt-sr (lower (mm-form nt-idx) :dtype :half)]
+        (is (not= :non-canonical-orientation (:reason (gate nn-sr :half)))
+            ":nn is orientation-legal for dpas (it may still fail on pitch alignment)")
+        (is (= :non-canonical-orientation (:reason (gate nt-sr :half)))
+            ":nt is orientation-ILLEGAL for dpas — same verdict the table gives")))))

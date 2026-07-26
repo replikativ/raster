@@ -79,9 +79,14 @@
         _ (when-not (vector? contract-axes)
             (throw (ex-info "contract form: contract-axes must be a vector" {:reason :malformed-contract-axes})))
         declared (:maps opts)
+        ;; `:decode` is the per-operand LOAD-LAMBDA, an expression in `x` (the raw load). This is
+        ;; where a zero-point subtraction belongs — exact on the load path, needing no correction
+        ;; reductions — whereas a scale that factors out of the sum belongs in the epilogue.
+        decode (:decode opts)
         terms (mapv (fn [{:keys [sym idx]}]
-                      {:sym sym :idx idx
-                       :map (verify-declared-map sym (get declared sym) idx)})
+                      (cond-> {:sym sym :idx idx
+                               :map (verify-declared-map sym (get declared sym) idx)}
+                        (get decode sym) (assoc :decode (get decode sym))))
                     (aget-terms body))
         ;; role → axis symbol, so a leaf contract can say [:free0 :contract0] instead of naming
         ;; the user's own symbols
@@ -189,3 +194,17 @@
           {:ok false :reason :layout
            :required (into {} (map (fn [r] [r (am/index-expr (role-map facts (get required r)))])) roles)
            :actual (mapv (juxt :sym :idx) ops)})))))
+
+(defn layout-maps
+  "For a PASSING `check-layout` verdict, the axis-map of each operand — derived from the layout the
+   verdict proved, keyed by operand symbol.
+
+   This is how a tensorize leaf gets its operand maps without a caller declaring them. The map is
+   verified by construction: `check-layout` only returns bindings after `am/index-matches?` proves
+   each operand's actual index equals the required layout's. So the leaf gets the strongest form of
+   what it needs — a layout that was checked, not asserted — and a form need not carry `:maps` just
+   to reach a peak leaf."
+  [facts required verdict]
+  (when (:ok verdict)
+    (into {} (map (fn [[role sym]] [sym (role-map facts (get required role))]))
+          (:bindings verdict))))

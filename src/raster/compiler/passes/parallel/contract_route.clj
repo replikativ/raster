@@ -86,7 +86,7 @@
 
    Returns the descriptor unchanged when consistent."
   [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands
-           out-elems wg grid invoke reduce-bound] :as d}]
+           epilogue-scalars out-elems wg grid invoke reduce-bound] :as d}]
   (let [params (kernel-signature-params source)
         _ (when (nil? params)
             (throw (ex-info "contract descriptor: no __kernel signature found in source"
@@ -103,7 +103,12 @@
         ;;                           so they must match the kernel's scalar params exactly.
         ;;   :invoke :reduction    — invoke-reduction-kernel supplies the kernel's single trailing
         ;;                           count param itself, from :reduce-bound; :scalar-args stays empty.
-        expect-scalar (if (= :reduction invoke) 1 (count scalar-args))]
+        ;; an epilogue's SCALARS are kernel scalar params too — they are emitted into the
+        ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
+        ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
+        expect-scalar (if (= :reduction invoke)
+                        1
+                        (+ (count scalar-args) (count epilogue-scalars)))]
     (cond
       (not= n-ptr expect-ptr)
       (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
@@ -150,9 +155,10 @@
    dtype selects the element type of the intended kernel (:half tries DPAS; :byte/:int8 tries
    the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
-   scheme = the quant decode descriptor {:scale :a-zp :b-zp} for int8 (default {:scale 1.0})."
-  [contract-form & {:keys [dtype scheme prefer-peak? desc tile epilogue stages operands]
-                    :or {dtype :half scheme {:scale 1.0} prefer-peak? false}}]
+   int8 needs no decode descriptor: a scale is an ordinary :epilogue and a zero-point an ordinary
+   per-operand :decode, both carried on the form like any other contraction data."
+  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands]
+                    :or {dtype :half prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
         contract-axes (nth contract-form 3)
@@ -220,7 +226,7 @@
 
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
       (#{:byte :int8} dtype)
-      (route-quant contract-form out-sym scheme n-free n-contract nseg prefer-peak?)
+      (route-quant contract-form out-sym n-free n-contract nseg prefer-peak?)
 
       ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
@@ -318,20 +324,6 @@
          :dims (:dims rt)})))
    (catch clojure.lang.ExceptionInfo _ nil)))
 
-(defn- quant-descriptor
-  "A launch descriptor for an int8 quant leaf (dp4a or quant-naive). Both are 1-D kernels with
-   signature (…arrays…, out(f32), float scale, int _nseg): int8 operands in, dequantized f32 out."
-  [strategy k out-dtype scale nseg]
-  {:strategy strategy
-   :kernel-name (:kernel-name k) :source (:source k)
-   :array-params (:array-params k)          ; [row col] binding order (dp4a) / sorted (quant)
-   :dtype :byte :out-dtype out-dtype
-   :scheme (:scheme k)
-   :wg [256 1] :grid [(ceil-div nseg 256) 1]
-   :scalar-args [{:type :float :value (float scale)} {:type :int :value nseg}]
-   :out-elems nseg
-   :dims (:dims k)})
-
 (defn- operand-map
   "The declared axis-map for `arr` if the form carries :maps, else DERIVE one by checking the
    aget index against the canonical row-major layout for `expected-axes`. Returns nil when the
@@ -380,49 +372,92 @@
                 ;; genuine 2-D group transposition
                 (when (and cmap (am/transposed-2d? cmap want))
                   (let [col-t (gensym (str (name col-arr) "__t"))
-                        new-body (list '* row (list 'aget col-t (am/index-expr want)))]
-                    {:form (list 'raster.par/contract out free-axes contract-axes new-body
-                                 :maps (assoc (get (apply hash-map (drop 5 contract-form)) :maps {})
-                                              col-t want))
+                        new-body (list '* row (list 'aget col-t (am/index-expr want)))
+                        ;; PRESERVE THE FORM'S OPTS. Rebuilding with only :maps silently dropped
+                        ;; :epilogue, :decode, :init, :combine and :out-dtype — so a retargeted
+                        ;; contraction lost its scale (wrong by a constant factor), and a
+                        ;; `:combine max` became a sum. Carry everything, and re-key the col
+                        ;; operand's entries onto the transposed array.
+                        opts (apply hash-map (drop 5 contract-form))
+                        opts (cond-> (assoc opts :maps (assoc (get opts :maps {}) col-t want))
+                               (get-in opts [:decode col-arr])
+                               (update :decode #(-> % (dissoc col-arr)
+                                                    (assoc col-t (get % col-arr)))))]
+                    {:form (apply list 'raster.par/contract out free-axes contract-axes new-body
+                                  (apply concat opts))
                      :pre-step {:op :transpose :src col-arr :dst col-t
                                 :rows (ext l-sym) :cols (ext j-sym) :dtype dtype}}))))))))))
 
-(defn- quant-naive!
-  "The int8 naive-widening leaf, with a CLEAR error when the operand layout isn't one it can
-   index. There is no correct generic fallback for int8: the generic naive segred accumulates in
-   the element type, and int8×int8 must widen to int32 — so we fail loudly rather than emit a
-   silently-wrong kernel."
-  [sr out-sym scheme]
-  (try (sco/generate-quant-contraction-kernel sr out-sym :scheme scheme)
-       (catch clojure.lang.ExceptionInfo e
-         (throw (ex-info (str "int8 contraction: no quant leaf handles this operand layout ("
-                              (:reason (ex-data e)) "). int8 requires canonical row-major operands"
-                              " (A[i,l]=i·K+l, B[l,j]=l·N+j) or, for dp4a, B[j,l]=j·K+l.")
-                         (assoc (ex-data e) :dtype :byte) e)))))
-
 (defn- route-quant
-  "Route an int8 (:byte) contraction. 2-free/1-contract: try the dp4a peak leaf (requires the
-   :nt operand layout — B stored [N,K], K-contiguous, K%4==0); if that orientation isn't met,
-   either INSERT a byte-transpose pre-step so :nn reaches dp4a (B3-insert, `prefer-peak?`), or
-   fall to the quant naive-widening kernel (:nn, default). The emitters ASSERT their own layout
-   requirements, so a thrown AssertionError is the (clean) 'not this leaf' signal — dp4a and
-   quant-naive are complementary (:nt vs :nn). Non-2-free / multi-contract int8 is deferred."
-  [contract-form out-sym scheme n-free n-contract nseg prefer-peak?]
-  (let [scale (get scheme :scale 1.0)]
-    (if (and (= 2 n-free) (= 1 n-contract))
-      (let [sr (cl/contract-form->segred contract-form :dtype :byte)
-            dp4a (try (sco/generate-dp4a-contraction-kernel sr out-sym :scheme scheme)
-                      (catch clojure.lang.ExceptionInfo _ nil))]
-        (cond
-          dp4a  (quant-descriptor :dp4a dp4a :float scale nseg)     ; :nt → peak int8 leaf
-          ;; :nn + prefer-peak? → transpose col operand, then dp4a (B3-insert)
-          prefer-peak?
-          (if-let [{form* :form pre-step :pre-step}
-                   (retarget-to-layout contract-form '[j l] :byte)]   ; dp4a needs B as [N,K]
-            (let [srt (cl/contract-form->segred form* :dtype :byte)
-                  k (sco/generate-dp4a-contraction-kernel srt out-sym :scheme scheme)]
-              (assoc (quant-descriptor :dp4a k :float scale nseg) :pre-steps [pre-step]))
-            (quant-descriptor :quant-naive (quant-naive! sr out-sym scheme) :float scale nseg))
-          :else (quant-descriptor :quant-naive (quant-naive! sr out-sym scheme) :float scale nseg)))
-      (throw (ex-info "route-quant: int8 supported for 2 free + 1 contract axes (C1 first cut)"
-                      {:n-free n-free :n-contract n-contract})))))
+  "Route an int8 (:byte) contraction — with no int8-specific emitter left.
+
+   THE QUANT LEAVES ARE GONE. `generate-quant-contraction-kernel` and
+   `generate-dp4a-contraction-kernel` were the staged emitter with ONE contract level: an int32
+   accumulator, a zero-point on the load path, a scale at the store. Expressed that way they are the
+   same kernel, so both are deleted and int8 routes through the one emitter.
+
+   `:scheme {:scale :a-zp :b-zp}` is gone too. It was a closed three-field record with a private
+   scale channel, and it existed only because an epilogue's `:scalars` were emitted into the kernel
+   signature but never surfaced in the descriptor. Now the scale is an ordinary `:epilogue` and the
+   zero-point an ordinary per-operand `:decode` — which buys per-ROW and per-COLUMN scales for free
+   (an epilogue operand carries an axis-map) and lets scale compose with bias and activation by
+   nesting one expression. Neither was expressible before.
+
+   Peak-vs-portable is a LAYOUT question answered from the leaf-layouts table rather than a
+   hand-written orientation check: dp4a packs 4 int8 along the contraction, so it needs both operands
+   K-contiguous. If the form does not satisfy that, `prefer-peak?` may insert a byte-transpose to
+   reach it; otherwise the scalar nest runs, which has no layout requirement."
+  [contract-form out-sym n-free n-contract nseg prefer-peak?]
+  (when-not (and (= 2 n-free) (= 1 n-contract))
+    ;; :raster/fatal — falling through to the generic segred would accumulate int8 in int8 and
+    ;; silently overflow, so there is no correct fallback here
+    (throw (ex-info "route-quant: int8 supported for 2 free + 1 contract axes"
+                    {:reason :raster/fatal :n-free n-free :n-contract n-contract})))
+  (let [opts (apply hash-map (drop 5 contract-form))
+        k-extent (second (first (nth contract-form 3)))
+        spec (fn [form tz?]
+               (let [f (cf/contraction-facts form :dtype :byte)
+                     ;; when tensorizing, each operand's map comes from the layout check-layout
+                     ;; PROVED — verified by construction, so no `:maps` declaration is needed to
+                     ;; reach the peak leaf
+                     lmaps (when tz?
+                             (cf/layout-maps f (:dp4a cf/leaf-layouts)
+                                             (cf/check-layout f (:dp4a cf/leaf-layouts))))]
+                 {:free-axes (:free-axes f) :contract-axes (:contract-axes f)
+                  :body (:body f)
+                  ;; ONE contract level, int32 accumulate — the widening is the dtype PAIR
+                  :stages [{:axis (ffirst (:contract-axes f))
+                            :extent (second (first (:contract-axes f)))
+                            :dtype :int :init 0}]
+                  :operands (mapv (fn [o] (cond-> o (get lmaps (:sym o))
+                                                  (assoc :map (get lmaps (:sym o)))))
+                                  (:operands f))
+                  :inputs (vec (sort-by name (contract-operand-arrays (:body f))))
+                  :dtype :byte :out-dtype (get opts :out-dtype :float)
+                  :epilogue (:epilogue f)
+                  :tensorize-inner? tz?}))
+        dp4a-ok? (fn [form]
+                   (and (number? k-extent) (zero? (mod (long k-extent) 4))
+                        (:ok (cf/check-layout (cf/contraction-facts form :dtype :byte)
+                                              (:dp4a cf/leaf-layouts)))))
+        emit (fn [form tz? pre-steps]
+               (let [k (sco/generate-staged-contraction-kernel (spec form tz?) out-sym)]
+                 (cond-> {:strategy (if tz? :dp4a :quant-naive)
+                          :kernel-name (:kernel-name k) :source (:source k)
+                          :array-params (:array-params k)
+                          :lift-operands (:lift-operands k)
+                          :epilogue-operands (:epilogue-operands k)
+                          :epilogue-scalars (:epilogue-scalars k)
+                          :dtype :byte :out-dtype (:out-dtype k)
+                          :out-elems (:out-elems k)
+                          :tensorized (:tensorized k) :packed (:packed k)
+                          :scalar-args [{:type :int :value nseg}]
+                          :wg [256 1] :grid [(ceil-div nseg 256) 1]}
+                   (seq pre-steps) (assoc :pre-steps pre-steps))))]
+    (cond
+      (dp4a-ok? contract-form) (emit contract-form true nil)
+      prefer-peak?
+      (if-let [{form* :form pre-step :pre-step} (retarget-to-layout contract-form '[j l] :byte)]
+        (if (dp4a-ok? form*) (emit form* true [pre-step]) (emit contract-form false nil))
+        (emit contract-form false nil))
+      :else (emit contract-form false nil))))

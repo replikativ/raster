@@ -6,6 +6,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.backend.gpu.segop-opencl :as sco])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -40,9 +41,16 @@
         launch-2d! (ns-resolve ze 'launch-2d!)
         A (byte-array (map #(byte (- (mod % 255) 127)) (range (* m k))))       ; [M,K]
         B (byte-array (map #(byte (- (mod (* 3 %) 255) 127)) (range (* n k)))) ; [N,K]
-        sr (cl/contract-form->segred (dp4a-form m n k) :dtype :byte)
-        {:keys [kernel-name source array-params packed]} (sco/generate-dp4a-contraction-kernel sr 'C :scheme {:scale scale})
-        _ (do (assert (= '[A B] array-params)) (assert (= :int8x4 packed)))
+        ;; no dp4a-specific emitter any more: this is the staged emitter with one int32 contract
+        ;; level, tensorized because the form satisfies the :dp4a row of leaf-layouts. The scale is
+        ;; an ordinary epilogue.
+        form (concat (dp4a-form m n k)
+                     [:epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                                 :scalars [{:sym 's :dtype :float}]}])
+        {:keys [kernel-name source array-params packed strategy]}
+        (route/route-contraction form :dtype :byte)
+        _ (do (assert (= '[A B] array-params)) (assert (= :int8x4 packed))
+              (assert (= :dp4a strategy)))
         _ (register! kernel-name {:source source :dtype :byte})
         {:keys [kernel-handle]} (ensure-loaded! kernel-name)
         abuf (arr->buf! (make-buffer (* m k) :byte) A)   ; int8 bytes; kernel reads as packed int[]
@@ -61,22 +69,27 @@
 
 (deftest dp4a-emits-packed-int8x4-tensorize
   (testing "dp4a kernel packs the contract axis into int8×4 words + uses rstr_dp4a (device-free)"
-    (let [sr (cl/contract-form->segred (dp4a-form 64 64 64) :dtype :byte)
-          {:keys [source packed dtype acc-dtype]} (sco/generate-dp4a-contraction-kernel sr 'C :scheme {:scale 0.01})]
-      (is (= :int8x4 packed)) (is (= :byte dtype)) (is (= :int acc-dtype))
+    (let [{:keys [source packed dtype]}
+          (route/route-contraction
+           (concat (dp4a-form 64 64 64)
+                   [:epilogue {:acc 'acc :expr '(raster.numeric/* acc s)
+                               :scalars [{:sym 's :dtype :float}]}])
+           :dtype :byte)]
+      (is (= :int8x4 packed)) (is (= :byte dtype))
       (is (str/includes? source "inline int rstr_dp4a"))       ; the int8×4 dot helper
-      (is (str/includes? source "acc = rstr_dp4a("))           ; tensorized MAC
+      (is (re-find #"acc_0 = rstr_dp4a\(" source))            ; tensorized MAC
+      (is (re-find #"int acc_0 = 0" source))                   ; int32 widening accumulator
       (is (str/includes? source "const int* restrict A"))      ; operands reinterpreted as packed int
-      (is (str/includes? source "p < 16"))))                   ; KP = K/4 = 16
-  (testing "gate: K must be a multiple of 4, and B must be [N,K] transposed"
-    (is (thrown? clojure.lang.ExceptionInfo
-                 (sco/generate-dp4a-contraction-kernel (cl/contract-form->segred (dp4a-form 8 8 6) :dtype :byte) 'C)))
-    ;; B in [K,N] (non-transposed, B[l,j]=l·N+j) → not K-contiguous → rejected
+      (is (re-find #"< 16;" source))))                         ; KP = K/4 = 16
+  (testing "the layout requirement is now a ROW in leaf-layouts, and a form that misses it falls
+            back to the scalar nest rather than throwing — same verdict, better failure mode"
+    ;; K not a multiple of 4 → cannot pack → scalar nest
+    (is (= :quant-naive (:strategy (route/route-contraction (dp4a-form 8 8 6) :dtype :byte))))
+    ;; B in [K,N] (B[l,j]=l·N+j) → not K-contiguous → scalar nest
     (let [bad (list 'raster.par/contract 'C [['i 8] ['j 8]] [['l 8]]
                     (list '* (list 'aget 'A (list '+ (list '* 'i 8) 'l))
                           (list 'aget 'B (list '+ (list '* 'l 8) 'j))))]
-      (is (thrown? clojure.lang.ExceptionInfo
-                   (sco/generate-dp4a-contraction-kernel (cl/contract-form->segred bad :dtype :byte) 'C))))))
+      (is (= :quant-naive (:strategy (route/route-contraction bad :dtype :byte)))))))
 
 (deftest dp4a-contraction-matches-ref-on-device
   (if-not @gpu?

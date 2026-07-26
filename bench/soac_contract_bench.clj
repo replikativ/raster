@@ -148,7 +148,7 @@
    (fn [m n k triple]
      ;; literal-dim kernel (dims baked in source ⇒ recompile per shape): params A B out.
      (let [sr (cl/contract-form->segred (matmul-form m n k) :dtype dtype)
-           {:keys [kernel-name source]} (sco/generate-tiled-contraction-kernel sr 'C :dtype dtype :tile tile)
+           {:keys [kernel-name source]} (sco/generate-regtiled-contraction-kernel sr 'C :dtype dtype :bm tile :bn tile :bk 16 :tm 1 :tn 1)
            {:keys [module kname]} (compile-src! [:block dtype tile m n k] kernel-name source)
            args [(:segment (:a triple)) (:segment (:b triple)) (:segment (:c triple))]]
        (bind! module kname [tile tile] args
