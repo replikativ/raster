@@ -15,6 +15,7 @@
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as cstage]
+            [raster.compiler.ir.contraction-facts :as cf]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -1046,19 +1047,10 @@
                                       [(second f) (nth f 2)]))
                              (tree-seq coll? seq body)))
         ;; THE BODY IS DISCARDED when this leaf fires — the whole summand is replaced by one
-        ;; rstr_dp4a call. So the gate must account for EVERY term first: a body carrying any
-        ;; factor beyond the two declared operands (a mask, a third tensor) would be silently
-        ;; dropped, with the extra array still declared as an unread kernel param. Require the
-        ;; body to be exactly the product of the two declared operands' agets.
-        declared-syms (set (map :sym operands))
-        body-terms (when (and (seq? body) (descriptor/multiplication-op? (descriptor/semantic-op body)))
-                     (vec (descriptor/call-args body)))
-        exact-product?
-        (and body-terms
-             (= 2 (count body-terms))
-             (every? (fn [t] (and (seq? t) (= 'aget (first t))
-                                  (contains? declared-syms (second t))))
-                     body-terms))]
+        ;; rstr_dp4a call — so the gate must account for EVERY term first. The requirement lives in
+        ;; ir/contraction-facts as `body-product-of`, shared with every other body-replacing leaf,
+        ;; rather than re-derived per gate.
+        exact-product? (some? (cf/body-product-of body (map :sym operands)))]
     (cond
       (not= 2 (count operands)) {:ok false :reason :dp4a-needs-two-declared-operands}
       (not (every? :map operands)) {:ok false :reason :operand-without-a-declared-map}
@@ -1067,7 +1059,7 @@
       (not exact-product?)
       {:ok false :reason :body-has-unmodeled-terms
        :detail "this leaf replaces the body with a single hardware op; any term beyond the two declared operands would be silently dropped"
-       :body body :declared (vec declared-syms)}
+       :body body :declared (mapv :sym operands)}
       (not int-acc?) {:ok false :reason :inner-stage-accumulator-not-integral
                       :dtype (:dtype inner-stage)}
       :else
