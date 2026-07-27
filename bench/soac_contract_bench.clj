@@ -87,13 +87,20 @@
 (defn- matmul-form
   ([m n k] (matmul-form :bare m n k))
   ([spelling m n k]
-   (let [[ag mul add imul] (case spelling
-                             :bare   '[aget * + *]
-                             :walker '[raster.arrays/aget raster.numeric/*
-                                       clojure.core/+ clojure.core/*])]
+   (let [[ag mul add imul cast?] (case spelling
+                                   :bare   '[aget * + * false]
+                                   ;; VERBATIM what `ensure-walked-body!` yields for a deftm whose
+                                   ;; body reads `(ra/aget A (+ (* i k) l))`: the walker's :array-op
+                                   ;; handler qualifies into clojure.core, and extents arrive wrapped
+                                   ;; in `(long …)`. Both details were independently load-bearing —
+                                   ;; the spelling blinded the operand matchers, the cast blinded the
+                                   ;; affine layout check — so a faithful row must carry both.
+                                   :walker '[clojure.core/aget raster.numeric/*
+                                             clojure.core/+ clojure.core/* true])
+         ext (fn [e] (if cast? (list 'long e) e))]
      (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
-           (list mul (list ag 'A (list add (list imul 'i k) 'l))
-                 (list ag 'B (list add (list imul 'l n) 'j)))))))
+           (list mul (list ag 'A (list add (list imul 'i (ext k)) 'l))
+                 (list ag 'B (list add (list imul 'l (ext n)) 'j)))))))
 
 ;; ── buffer plumbing: one A[m×k]·B[k×n]→C[m×n] triple at a given dtype ────────────────
 (def ^:private host-cache (atom {}))
