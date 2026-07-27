@@ -42,7 +42,8 @@
    stage's `:lift` is an expression in the symbol `inner` (the stage-below's accumulated value)
    and may reference its own axis plus extra operand arrays, each with a declared axis-map (so a
    scale is indexed by ITS map, not by pattern-matching — same rule as the epilogue seam)."
-  (:require [raster.compiler.ir.axis-map :as am]
+  (:require [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.ir.axis-map :as am]
             [raster.compiler.core.dtype :as dt]
             [clojure.set :as set]
             [clojure.walk :as walk]))
@@ -177,13 +178,16 @@
   (into {} (for [{:keys [sym map]} (lift-operands stages)] [sym (am/index-expr map)])))
 
 (defn substitute-operand-indices
-  "Rewrite `(aget s _)` → `(aget s <index from s's declared map>)` for every lift operand."
+  "Rewrite `(aget s _)` → `(aget s <index from s's declared map>)` for every lift operand,
+   preserving the read's spelling and metadata.
+
+   Registry-classified: a lift is AUTHOR-WRITTEN data, and CLAUDE.md's emit-qualified rule tells
+   authors to spell the read `raster.arrays/aget` — which the old literal `(= 'aget (first f))`
+   silently ignored, leaving the operand's index as its PLACEHOLDER. That corrupts the emitted
+   kernel AND `flat-equivalent`, which is the interpreter-side semantic reference the staging
+   linearity law is checked against — so the oracle would have agreed with the wrong kernel."
   [expr idx-of]
-  (walk/postwalk
-   (fn [f] (if (and (seq? f) (= 'aget (first f)) (contains? idx-of (second f)))
-             (list 'aget (second f) (get idx-of (second f)))
-             f))
-   expr))
+  (od/rewrite-aget-indices expr idx-of))
 
 (defn flat-equivalent
   "The FLAT contraction body equal (in exact arithmetic) to this staged contraction: every stage's

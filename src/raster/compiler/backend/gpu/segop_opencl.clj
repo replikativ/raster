@@ -10,6 +10,7 @@
   (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.hardware :as hw]
@@ -488,10 +489,19 @@
         elem (let [a0 (nth op-args 0) a1 (nth op-args 1)] (if (acc-at? a0) a1 a0))
         _ (when-not (and (seq? elem) (#{'* 'clojure.core/* 'raster.numeric/*} (descriptor/semantic-op elem)))
             (throw (ex-info "tensorize: element must be a product of two agets" {:reason :non-product-element})))
+        ;; Registry-classified, not `(= 'aget (first e))`: the walker emits `clojure.core/aget`, so
+        ;; the literal match threw here for EVERY compiled deftm — and `route-2free-1contract`'s
+        ;; `(catch ExceptionInfo _ nil)` swallowed the message, silently demoting a canonical matmul
+        ;; to :naive-segred. The throw itself is right; what was wrong was which forms reached it.
         parts (fn [e] (let [e (ce/normalize-array-prims e)]
-                        (when-not (and (seq? e) (= 'aget (first e)))
-                          (throw (ex-info "tensorize: operand must be an aget" {:reason :non-aget-operand})))
-                        {:arr (nth e 1) :idx (nth e 2)}))
+                        (when-not (descriptor/aget-call? e)
+                          (throw (ex-info "tensorize: operand must be an aget"
+                                          {:reason :non-aget-operand :operand e})))
+                        {:arr (descriptor/aget-array-sym e)
+                         ;; canonicalized so the same contraction emits one kernel text whichever
+                         ;; way its body was spelled — the walked dialect's `(long 640)` extents
+                         ;; would otherwise survive into the C for verbatim-index leaves
+                         :idx (descriptor/canonicalize-index (descriptor/aget-index e))}))
         [pa pb] (mapv parts (descriptor/call-args elem))
         dep? (fn [idx s] (contains? (syms-in idx) s))
         rc (fn [x y] (when (and (dep? (:idx x) i-sym) (dep? (:idx x) l-sym) (not (dep? (:idx x) j-sym))
@@ -743,11 +753,7 @@
         int-vars (into #{} (map #(symbol (name %))) [i-sym j-sym])
         ;; substitute each operand's aget index from its declared map (maps, not pattern-matching)
         idx-of (into {} (for [{:keys [sym map]} operands] [sym (am/index-expr map)]))
-        expr' (walk/postwalk
-               (fn [f] (if (and (seq? f) (= 'aget (first f)) (contains? idx-of (second f)))
-                         (list 'aget (second f) (get idx-of (second f)))
-                         f))
-               expr)
+        expr' (descriptor/rewrite-aget-indices expr idx-of)
         acc-token (str "__acc_" (name (gensym "")))
         ;; emit once with a distinctive token standing in for the accumulator, then splice the
         ;; real acc C-expression in at call time (the hook supplies it per store slot)
@@ -884,9 +890,7 @@
   [{:keys [stages body operands dtype]}]
   (let [inner-stage (peek (vec stages))
         int-acc? (contains? #{:int :long :int32} (:dtype inner-stage))
-        agets (into {} (keep (fn [f] (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
-                                      [(second f) (nth f 2)]))
-                             (tree-seq coll? seq body)))
+        agets (into {} (map (juxt :sym :idx)) (descriptor/aget-reads body))
         ;; THE BODY IS DISCARDED when this leaf fires — the whole summand is replaced by one
         ;; rstr_dp4a call — so the gate must account for EVERY term first. The requirement lives in
         ;; ir/contraction-facts as `body-product-of`, shared with every other body-replacing leaf,
@@ -1020,13 +1024,17 @@
         ;; accumulator dtype), and hiding it in a lambda would blind the tensorize gate to the very
         ;; pair it dispatches on.
         decodes (into {} (keep (fn [{:keys [sym decode]}] (when decode [sym decode]))) operands)
+        ;; `x` in a :decode lambda stands for the RAW LOAD. Substituted capture-avoidingly, and the
+        ;; read is matched via the registry — the literal `(= 'aget (first f))` here meant a decode
+        ;; was SILENTLY DROPPED for every walker-spelled operand, emitting `a[l]*b[l]` where the
+        ;; semantics are `(a[l]-zp)*b[l]`. A wrong answer, not a slow one.
         body (if (empty? decodes)
                body
-               (walk/postwalk
-                (fn [f] (if (and (seq? f) (= 'aget (first f)) (contains? decodes (second f)))
-                          (walk/postwalk-replace {'x f} (get decodes (second f)))
-                          f))
-                body))
+               (descriptor/rewrite-aget-reads
+                body
+                (fn [f] (let [arr (descriptor/aget-array-sym f)]
+                          (when (contains? decodes arr)
+                            (util/subst-syms {'x f} (get decodes arr)))))))
         ;; EPILOGUE — the store splice. An epilogue is a lift on a virtual outermost level of
         ;; extent 1, which is why it needs no linearity (nothing to distribute over one iteration)
         ;; while a real stage lift does. Gives this emitter the dequant scale that the two quant

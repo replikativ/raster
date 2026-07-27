@@ -48,11 +48,10 @@
   "Check if body reads from sym via aget."
   [body sym]
   (cond
-    (and (seq? body)
-         (descriptor/aget-op? (first body))
-         (>= (count body) 3)
-         (symbol? (second body))
-         (= (name sym) (name (second body))))
+    ;; descriptor/aget-call? rather than aget-op? on `(first body)`: the latter is blind to a
+    ;; DEVIRTUALIZED read, whose head is `.invk` and whose array sits one position further along.
+    (and (descriptor/aget-call? body)
+         (= (name sym) (name (descriptor/aget-array-sym body))))
     true
 
     (seq? body) (some #(aget-reads-sym? % sym) (rest body))
@@ -135,10 +134,9 @@
               (recur (inc i) (conj result [sym expr]) fused skip-set))))))))
 
 (defn- agets-on-arrays
-  "Every (aget arr idx) node in `expr`, as a set of the array symbols read."
+  "Every array read in `expr`, as the set of array symbols read — every spelling."
   [expr]
-  (into #{} (keep #(when (and (seq? %) (= 'aget (first %))) (second %)))
-        (tree-seq coll? seq expr)))
+  (into #{} (map :sym) (descriptor/aget-reads expr)))
 
 (defn fuse-contract-map
   "Fuse a contraction followed by an ELEMENTWISE map over its output into ONE contraction whose
@@ -183,12 +181,11 @@
                     operands-of (fn [mi]
                                   (let [t (:idx mi)
                                         others (disj (agets-on-arrays (:body mi)) c-out)
+                                        reads (descriptor/aget-reads (:body mi))
                                         resolved (for [a others
                                                        :let [idxs (distinct
-                                                                   (keep #(when (and (seq? %) (= 'aget (first %))
-                                                                                     (= a (second %)))
-                                                                            (nth % 2))
-                                                                         (tree-seq coll? seq (:body mi))))]]
+                                                                   (keep #(when (= a (:sym %)) (:idx %))
+                                                                         reads))]]
                                                    (when (= 1 (count idxs))
                                                      (when-let [m (am/flat-index->map (first idxs) t free-axes)]
                                                        {:sym a :map m})))]
@@ -210,10 +207,16 @@
                         acc-sym (gensym "acc__")
                         ;; (aget C <map-idx>) → the accumulator symbol; every other operand keeps
                         ;; its aget, and epilogue-splice re-indexes it from the declared axis-map
-                        ep-expr (clojure.walk/postwalk
-                                 (fn [f] (if (and (seq? f) (= 'aget (first f)) (= c-out (second f)))
-                                           acc-sym f))
-                                 (:body mi))
+                        ;; Registry-classified AND metadata-preserving. With the literal match,
+                        ;; a walker-spelled `(clojure.core/aget C t)` was left in the epilogue
+                        ;; expression — so `epilogue-legal?`'s accumulator-appears-once rule saw
+                        ;; ZERO uses and the fused kernel would have read C instead of the
+                        ;; accumulator. This must change in lockstep with agets-on-arrays above:
+                        ;; broadening the collectors alone yields a fused epilogue with operands
+                        ;; but no accumulator, which is a silent wrong answer rather than a refusal.
+                        ep-expr (descriptor/rewrite-aget-reads
+                                 (:body mi)
+                                 (fn [f] (when (= c-out (descriptor/aget-array-sym f)) acc-sym)))
                         ops (operands-of mi)
                         fused-form (concat (list 'raster.par/contract (:out mi))
                                            (drop 2 (take 5 expr))

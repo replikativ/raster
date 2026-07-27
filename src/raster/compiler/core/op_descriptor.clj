@@ -629,6 +629,102 @@
   (when (aget-call? form)
     (unwrap-array-arg (first (call-args form)))))
 
+(defn aget-index
+  "The INDEX expression of an aget call (bare, qualified, or devirtualized). nil when `form` is not
+   an aget call.
+
+   Exists so no pass writes `(nth f 2)`. The three spellings put the index at DIFFERENT positions —
+   `(aget A i)` at 2, `(.invk impl A i)` at 3 — so a positional read is correct for at most one of
+   them, and a positional REWRITE silently corrupts the others into `(aget impl idx)`."
+  [form]
+  (when (aget-call? form)
+    (second (call-args form))))
+
+(defn aget-reads
+  "Every array read in `expr`, as `{:sym :idx :form}` in encounter order — recognizing bare `aget`,
+   `clojure.core/aget`, `raster.arrays/aget`, and the walker-DEVIRTUALIZED `(.invk impl arr idx)`
+   alike. `:form` is the matched node, so a caller that must REWRITE it does not re-implement
+   matching.
+
+   THE ONE COLLECTOR for the contraction/fusion vertical. Twelve sites there each spelled this as
+   `(= 'aget (first f))`, which accepts only the BARE form — while the walker actually emits
+   `clojure.core/aget` (walker.clj's :array-op handler qualifies into clojure.core). So on real
+   compiled IR every one of them saw ZERO operands. Measured consequences, all from that:
+
+     • `:half` matmul routed to `:naive-segred` instead of `:dpas` — 577 vs 4357 GFLOP/s on Arc 140V
+       (the routed DPAS path is at parity with the hand-written XMX GEMM, so this is pure loss);
+     • `:byte`/staged emitted SYNTACTICALLY INVALID OpenCL — `staged_contract(, __global float*
+       restrict out, int _nseg)`, a leading comma with the operands missing from the signature while
+       the body still reads them;
+     • a `:decode` zero-point SILENTLY DROPPED, giving `acc += a[l]*b[l]` where the semantics are
+       `(a[l]-zp)*b[l]`.
+
+   Per CLAUDE.md (\"Centralize operator classification\"): passes query the registry, never a local
+   `#{...}` literal. Adding a spelling is a registry edit, not a twelve-file sweep."
+  [expr]
+  (let [out (volatile! [])]
+    ((fn go [f]
+       (cond
+         ;; `quote` is opaque — quoted data is not code, and the REWRITER treats it that way, so a
+         ;; collector that descends into it would report reads the rewriter will never touch.
+         (and (seq? f) (= 'quote (first f))) nil
+         (coll? f) (do (when (aget-call? f)
+                         (let [arr (aget-array-sym f)]
+                           (when (symbol? arr)
+                             (vswap! out conj {:sym arr :idx (aget-index f) :form f}))))
+                       (run! go (if (map? f) (apply concat f) f)))
+         :else nil))
+     expr)
+    @out))
+
+(defn rewrite-aget-index
+  "Return `form` with its aget INDEX replaced by `idx'`, preserving the read's spelling, its
+   argument positions, any trailing args, and its METADATA.
+
+   Metadata is load-bearing here: `:raster.op/original` is what makes a devirtualized read
+   recognizable at all (drop it and `aget-call?` goes blind on the very node just rewritten), and
+   `:raster.type/tag` is what the emitters read instead of re-inferring. `clojure.walk` rebuilds
+   lists with `(apply list …)` and drops meta, which is why this does not go through it."
+  [form idx']
+  (when-not (aget-call? form)
+    (throw (ex-info "rewrite-aget-index: not an array read" {:reason :raster/bug :form form})))
+  (let [pre (if (= '.invk (first form)) 3 2)          ; head+impl+arr, or head+arr
+        head (take pre form)
+        tail (drop (inc pre) form)]                    ; anything after the index
+    (with-meta (concat head [idx'] tail) (meta form))))
+
+(defn rewrite-aget-reads
+  "Rewrite array reads anywhere in `expr`. `replace-fn` receives each matched read node and returns
+   its replacement, or nil to leave it alone. `quote`d data is opaque; metadata on every rebuilt
+   form is preserved.
+
+   This is the rewriter half of `aget-reads`, and it MUST land in the same commit: four sites
+   collect operands and then substitute into them. Broadening only the collector turns a loud
+   refusal (\"epilogue would be silently dropped\") into a SILENT wrong epilogue — an index left as
+   its PLACEHOLDER, an accumulator read left unsubstituted, or a `:decode` zero-point dropped.
+
+   Not `clojure.walk/postwalk`: it rebuilds lists with `(apply list …)` and drops metadata, and the
+   bodies rewritten here flow to emitters that read `:raster.type/tag` and `:raster.op/original`."
+  [expr replace-fn]
+  (letfn [(go [f]
+            (cond
+              (and (seq? f) (= 'quote (first f))) f
+              (seq? f) (or (when (aget-call? f) (replace-fn f))
+                           (with-meta (apply list (map go f)) (meta f)))
+              (vector? f) (with-meta (mapv go f) (meta f))
+              (map? f) (with-meta (into (empty f) (map (fn [[k v]] [(go k) (go v)])) f) (meta f))
+              (set? f) (with-meta (into (empty f) (map go) f) (meta f))
+              :else f))]
+    (go expr)))
+
+(defn rewrite-aget-indices
+  "Rewrite the INDEX of every array read whose array symbol is a key of `idx-of`; other reads are
+   left alone. The common case of `rewrite-aget-reads`."
+  [expr idx-of]
+  (rewrite-aget-reads expr (fn [f] (let [arr (aget-array-sym f)]
+                                     (when (contains? idx-of arr)
+                                       (rewrite-aget-index f (get idx-of arr)))))))
+
 (defn aset-call?
   "True if `form` is an array-write call — bare (aset arr idx val) or
    walker-devirtualized (.invk aset-impl arr idx val)."
@@ -644,11 +740,17 @@
   (when (aset-call? form)
     (unwrap-array-arg (first (call-args form)))))
 
-(defn- unwrap-int-cast
-  "Unwrap an integer cast around an induction-variable reference —
-   (long i) / (int i) → i. The walked/AD-prep dialect wraps loop indices in
-   long casts ((inc (long i))), so step matching must see through them just
-   like idx-matches?/test-index+bound do. Non-cast forms pass through."
+(defn unwrap-int-cast
+  "Unwrap an integer cast around an induction-variable or extent reference —
+   (long i) / (int i) → i. The walked/AD-prep dialect wraps loop indices AND
+   extents in long casts (`(clojure.core/* i (long k))`), so step matching and
+   AFFINE-INDEX matching must see through them just like idx-matches?/
+   test-index+bound do. Non-cast forms pass through.
+
+   Public because `ir/axis-map`'s affine normal form needs exactly this: without
+   it, `(+ (* i (long 128)) l)` is not recognized as the row-major layout, the
+   DPAS orientation gate declines with :non-canonical-orientation, and a walked
+   deftm cannot reach the tensorized leaf even once its operands are found."
   [expr]
   (if (and (seq? expr)
            (contains? #{'long 'int 'clojure.core/long 'clojure.core/int}
@@ -656,6 +758,31 @@
            (= 2 (count expr)))
     (second expr)
     expr))
+
+(defn canonicalize-index
+  "Strip integer casts that wrap a NUMERIC LITERAL, anywhere in an index expression:
+   `(clojure.core/* i (long 640))` → `(clojure.core/* i 640)`.
+
+   Index canonicalization, so that one contraction emits ONE kernel text regardless of how its body
+   was spelled. The walked dialect wraps extents in `(long …)`; a leaf that regenerates the index
+   from an axis-map (DPAS, staged) loses them naturally, but a leaf that emits the body's index
+   VERBATIM (regtiled, naive) carried them through — so two spellings of the same contraction
+   produced C differing by `(long)(640)` vs `640`. Harmless to the compiler, but it breaks the
+   source-identity invariant that is the only assertion strong enough to catch an operand silently
+   missing from a kernel signature.
+
+   Only literal-wrapping casts are removed. A cast around a VARIABLE is left alone: `(long i)` on an
+   int loop counter can be load-bearing for index arithmetic width, and this is not the place to
+   decide that."
+  [expr]
+  (cond
+    (and (seq? expr) (= 'quote (first expr))) expr
+    (seq? expr) (let [u (unwrap-int-cast expr)]
+                  (if (and (not= u expr) (number? u))
+                    u
+                    (with-meta (apply list (map canonicalize-index expr)) (meta expr))))
+    (vector? expr) (with-meta (mapv canonicalize-index expr) (meta expr))
+    :else expr))
 
 (defn affine-step
   "If `expr` is an affine step of the induction variable `idx-sym` — i.e.
