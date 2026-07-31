@@ -299,10 +299,10 @@
          :out-elems nseg :dims [nseg]})
 
       ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled).
-      ;; Returns nil when the form fails a TENSORIZE structural precondition (symbolic dims,
-      ;; non-+ combine, non-product element …) — then we fall through to the general naive
-      ;; leaf rather than hard-failing a perfectly legal contraction.
-      (and (= 2 n-free) (= 1 n-contract) (tensorize-plan))
+      ;; A `{::declines …}` result means BOTH tensorize leaves refused for a documented reason —
+      ;; we fall through to the general naive leaf rather than hard-failing a perfectly legal
+      ;; contraction, and carry the reasons onto that leaf's descriptor.
+      (and (= 2 n-free) (= 1 n-contract) (:strategy (tensorize-plan)))
       (tensorize-plan)
 
       ;; everything else (n-free≠2, n≥2 contract axes, or a tensorize-ineligible 2-free form)
@@ -311,25 +311,99 @@
       :else
       (let [sr (cl/contract-form->segred contract-form :dtype dtype)
             {:keys [kernel-name source array-params scalar-params]}
-            (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)]
+            (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
+            ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
+            ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
+            ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
+            ;; "not eligible".
+            declines (when (and (= 2 n-free) (= 1 n-contract))
+                       (::declines (tensorize-plan)))]
+        (cond->
         {:strategy :naive-segred
+         :declines (vec declines)
          :kernel-name kernel-name :source source :array-params array-params
          :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
          ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
          :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
                             {:type :int :value nseg})
-         :out-elems nseg :dims [nseg]}))))))
+         :out-elems nseg :dims [nseg]}
+          ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
+          ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
+          ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
+          (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))
+
+(def ^:private decline-reasons
+  "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.
+
+   A denylist was written here first and was wrong for the usual reason: it assumed every unknown
+   reason is safe to treat as a decline. `emit-gemm-tiled` throws VALIDATION errors carrying no
+   `:reason` at all (`opencl_codegen.clj:649-660`: `{:tile …}`, `{:beta beta}`, `{}`), so a genuine
+   emitter bug — a non-divisible tile, split-k with beta≠0 — would have been filed as \"this shape
+   is not tiled-leaf shaped\" and silently demoted to `:naive-segred`. That is exactly the
+   loud-to-silent trade this whole change exists to prevent.
+
+   So: only these reasons are declines. Anything else — a different reason, or none — propagates.
+   Adding a gate reason means adding it here; forgetting to is a LOUD failure, which is the safe
+   direction. These are the reasons the legality gates themselves produce; grep `:reason :` in
+   `segop_opencl.clj` to see the full set."
+  #{;; shape / structure — the contraction is fine, it just is not tiled-leaf shaped
+    :symbolic-dims :symbolic-bounds-unsupported :non-plus-combine :non-product-element
+    :non-aget-operand :not-a-contraction :not-2-free :body-has-unmodeled-terms
+    ;; dtype / orientation / alignment
+    :dtype-not-dpas :non-canonical-orientation :n-pitch-unaligned :k-pitch-unaligned
+    ;; declared-operand and quant-leaf legality
+    :operand-without-a-declared-map :missing-declared-contract-axes
+    :declared-operand-not-read-by-the-body :declared-map-does-not-match-the-body-index
+    :dp4a-needs-int8-operands :dp4a-needs-two-declared-operands
+    :decode-on-a-body-replacing-leaf :inner-extent-not-a-multiple-of-4
+    :inner-stage-accumulator-not-integral :inner-stage-axis-is-not-contiguous
+    ;; epilogue legality
+    :epilogue-needs-2-free :epilogue-ignores-accumulator :accumulator-used-more-than-once
+    :reduction-in-epilogue :layout-changing-op-in-epilogue})
+
+(defn- decline
+  "A structured record of ONE leaf declining. `:data` is the gate's own ex-data minus its `:reason`
+   (already lifted) — deliberately small: a descriptor is compared and logged, and stuffing whole
+   forms in here makes diffs unreadable and would poison any future descriptor-derived cache key."
+  [leaf reason message data]
+  (cond-> {:leaf leaf :reason reason}
+    message (assoc :message message)
+    (seq data) (assoc :data data)))
+
+(defn- decline-of
+  "Classify an ExceptionInfo from a leaf gate. Returns a decline record for a WHITELISTED legality
+   reason; RETHROWS anything else — an unrecognized or absent reason is the compiler saying
+   something is wrong, and a violated invariant is not a routing decision."
+  [leaf ^clojure.lang.ExceptionInfo e]
+  (let [reason (:reason (ex-data e))]
+    (when-not (contains? decline-reasons reason) (throw e))
+    (decline leaf reason (.getMessage e) (dissoc (ex-data e) :reason))))
 
 (defn- route-2free-1contract
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.
-   Returns nil if the form fails a structural precondition of BOTH (the emitters signal that
-   with ex-info) — the caller then routes to the general naive leaf."
+
+   Returns a descriptor, or `{::declines [...]}` when BOTH tensorize leaves refuse — the caller then
+   routes to the general naive leaf and carries the declines onto ITS descriptor.
+
+   This used to be `(catch ExceptionInfo _ nil)`. The emitters throw messages as specific as
+   \"tensorize: operand must be an aget\" and \"tensorize: needs literal dims\"; the catch discarded
+   every one of them, so a canonical matmul demoted to `:naive-segred` with NOTHING recorded, and the
+   only way to discover why was to read the emitter source. Two things are true at once and the old
+   shape could express neither: a decline is usually LEGITIMATE (symbolic dims, a non-`+` combine and
+   a non-product body are all perfectly good contractions that merely are not tiled-leaf shaped), and
+   it is always worth REPORTING."
   [contract-form out-sym dtype desc tile epilogue]
-  (try
+  (let [acc (volatile! [])
+        note! (fn [d] (vswap! acc conj d) nil)]
+   (try
    (let [sr (cl/contract-form->segred contract-form :dtype dtype)
          dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype :desc desc :tile tile
                                                     :epilogue epilogue)]
+    (when-not (:tensorized dpas)
+      ;; the DPAS gate DECLINES by returning {:tensorized false :reason …} rather than throwing,
+      ;; so its reason is available without an exception — record it either way
+      (note! (decline :dpas (:reason dpas) nil (dissoc dpas :tensorized :reason))))
     (if (:tensorized dpas)
       (let [[M N _L] (:dims dpas)
             {:keys [block-m block-n]} (:tile dpas)]
@@ -352,7 +426,8 @@
             [bm bn _bk] (:block rt)
             [M N _L] (:dims rt)]
         {:strategy :regtiled
-         :fallback-reason (:reason dpas)
+         :fallback-reason (:reason dpas)             ; kept: existing consumers read it
+         :declines @acc
          :kernel-name (:kernel-name rt)
          :source (:source rt)
          :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
@@ -361,7 +436,11 @@
          :grid [(ceil-div N bn) (ceil-div M bm)]
          :scalar-args []                             ; regtiled bakes dims → no scalar params
          :dims (:dims rt)})))
-   (catch clojure.lang.ExceptionInfo _ nil)))
+   (catch clojure.lang.ExceptionInfo e
+     ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`
+     ;; rethrows :raster/fatal and :raster/bug — those are not routing decisions.
+     (note! (decline-of (if (seq @acc) :regtiled :dpas) e))
+     {::declines @acc}))))
 
 (defn- operand-map
   "The declared axis-map for `arr` if the form carries :maps, else DERIVE one by checking the

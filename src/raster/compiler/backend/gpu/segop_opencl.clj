@@ -816,7 +816,17 @@
                           (concat [:c-dtype :half
                                    :block-m (:block-m tile) :block-n (:block-n tile)
                                    :sg-m (:sg-m tile) :sg-n (:sg-n tile)
-                                   :block-k (:block-k tile) :matrix (:matrix tile)]
+                                   :block-k (:block-k tile) :matrix (:matrix tile)
+                                   ;; PIPELINE DEPTH. Omitting this pinned every routed kernel to
+                                   ;; emit-gemm-tiled's `:or prefetch 3` while the schedule, the
+                                   ;; SLM-capped feasibility filter and the autotuner all believed
+                                   ;; :num-stages was live — so tiles differing ONLY in :num-stages
+                                   ;; emitted identical source, and a tuner "measuring" that axis was
+                                   ;; measuring noise. The resident door has always passed it
+                                   ;; (ze_runtime `:prefetch (:num-stages tile 3)`); this door had
+                                   ;; not, which is the schema-without-emission that CLAUDE.md and
+                                   ;; north-star §10 forbid.
+                                   :prefetch (:num-stages tile 3)]
                                   (when ep [:epilogue (:epilogue ep)
                                             :epilogue-params (:epilogue-params ep)
                                             :epilogue-helpers (:epilogue-helpers ep)])))]
