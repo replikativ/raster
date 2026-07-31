@@ -48,10 +48,12 @@
      (soac-contract-bench/compare-ladder {:name \"proj\" :m 1024 :k 640 :n 2048} :golden? true)"
   (:require [raster.gpu.ze-runtime :as ze]
             [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.opencl-codegen :as cg]
             [raster.compiler.support.spirv-cache :as spv]
             [raster.runtime.hardware :as hw]
+            [raster.compiler.core.hardware :as chw]
             [clojure.string :as str])
   (:import [java.lang.foreign MemorySegment ValueLayout]))
 
@@ -73,10 +75,32 @@
 (defn- gflops [ms m n k] (/ (* 2.0 m k n) (* ms 1.0e6)))
 
 ;; ── the matmul contraction form (C[i,j] = Σ_l A[i,l]·B[l,j]) ─────────────────────────
-(defn- matmul-form [m n k]
-  (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
-        (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
-              (list 'aget 'B (list '+ (list '* 'l n) 'j)))))
+;; TWO SPELLINGS, because the ROUTING DEPENDS ON THE SPELLING and that is the thing being measured.
+;;
+;;   :bare   — bare `aget`/`*`/`+`, which is what every hand-written test form in this repo uses.
+;;   :walker — what the compiler ACTUALLY produces for the same computation: the qualified array op
+;;             (`raster.arrays/aget`) and `raster.numeric/*` for the float multiply, with index
+;;             arithmetic left in `clojure.core` per CLAUDE.md.
+;;
+;; These are the same contraction. If they measure differently, the difference is a compiler defect,
+;; not a property of the computation — which is exactly what this harness is for.
+(defn- matmul-form
+  ([m n k] (matmul-form :bare m n k))
+  ([spelling m n k]
+   (let [[ag mul add imul cast?] (case spelling
+                                   :bare   '[aget * + * false]
+                                   ;; VERBATIM what `ensure-walked-body!` yields for a deftm whose
+                                   ;; body reads `(ra/aget A (+ (* i k) l))`: the walker's :array-op
+                                   ;; handler qualifies into clojure.core, and extents arrive wrapped
+                                   ;; in `(long …)`. Both details were independently load-bearing —
+                                   ;; the spelling blinded the operand matchers, the cast blinded the
+                                   ;; affine layout check — so a faithful row must carry both.
+                                   :walker '[clojure.core/aget raster.numeric/*
+                                             clojure.core/+ clojure.core/* true])
+         ext (fn [e] (if cast? (list 'long e) e))]
+     (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
+           (list mul (list ag 'A (list add (list imul 'i (ext k)) 'l))
+                 (list ag 'B (list add (list imul 'l (ext n)) 'j)))))))
 
 ;; ── buffer plumbing: one A[m×k]·B[k×n]→C[m×n] triple at a given dtype ────────────────
 (def ^:private host-cache (atom {}))
@@ -204,6 +228,71 @@
                             {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}])]
        (bind! module kname [256 1] args
               (long (Math/ceil (/ (double n) 128.0))) (long (Math/ceil (/ (double m) 128.0))) 1)))})
+
+(defn- routed-spec
+  "THE PRODUCTION DOOR. Every other spec in this harness calls a generator directly and hand-computes
+   its launch grid from literals (`/128.0`, `*32`). That measures a kernel in ISOLATION, and it cannot
+   catch the two failure modes that actually shipped:
+
+     • a descriptor whose GEOMETRY disagrees with the kernel it describes — the kernel emitted with
+       one tile while the launch derived its grid from another, leaving the tail rows of C unwritten;
+     • a ROUTING decision that never selects the peak leaf for real compiler IR at all.
+
+   So this spec takes everything from `route-contraction`'s descriptor: its `:source`, its
+   `:array-params` ORDER, its `:scalar-args`, and its own `:wg`/`:grid`. Nothing here recomputes a
+   number the router already decided — if the descriptor is wrong, this row is wrong or slow, which is
+   the point. The argument order mirrors `ze-runtime/invoke-registered-contraction!` exactly
+   (operands in :array-params order, then out, then scalar-args), so this row launches the kernel the
+   way production launches it.
+
+   `spelling` is :bare or :walker (see `matmul-form`). Comparing the two rows at one dtype is the
+   measurement of whether the compiler's own output can reach the peak leaf.
+
+   NB the buffer triple is allocated at ONE dtype, so this row is valid only where the routed
+   `:out-dtype` equals the operand dtype — true for :double/:float/:half, NOT for the int8 leaves
+   (int8 in, f32 out). Those need a mixed triple; it throws rather than quietly mis-sizing C."
+  [dtype spelling]
+  {:label (str "routed-" (name spelling) "-" (name dtype)) :dtype dtype
+   :bind
+   (fn [m n k triple]
+     (let [form (matmul-form spelling m n k)
+           desc (try (chw/descriptor-for :ze:0) (catch Throwable _ nil))
+           r (croute/route-contraction form :dtype dtype :desc desc)
+           {:keys [kernel-name source array-params scalar-args grid wg out-dtype strategy]} r
+           _ (when (and out-dtype (not= out-dtype dtype))
+               (throw (ex-info (str "routed-spec: routed :out-dtype " out-dtype " differs from the "
+                                    "operand dtype " dtype " — this harness allocates one triple at "
+                                    "a single dtype, so C would be mis-sized")
+                               {:dtype dtype :out-dtype out-dtype :strategy strategy})))
+           {:keys [module kname]} (compile-src! [:routed dtype spelling m n k] kernel-name source)
+           ;; operands in the DESCRIPTOR's order — not sorted, not assumed to be [A B]
+           bufs (mapv (fn [s]
+                        (let [k (keyword (str/lower-case (name s)))]
+                          (or (:segment (get triple k))
+                              (throw (ex-info (str "routed-spec: descriptor names operand `" s
+                                                   "` which this shape has no buffer for")
+                                              {:array-params array-params})))))
+                      array-params)
+           args (into bufs (cons (:segment (:c triple)) scalar-args))
+           [gx gy] grid]
+       (assoc (bind! module kname wg args gx gy 1) :strategy strategy)))})
+
+(defn routed-strategies
+  "Which leaf each spelling routes to, per dtype — the device-free half of the measurement, and the
+   assertion a regression test wants. Prints a table and returns it."
+  [{:keys [m n k]} & {:keys [dtypes] :or {dtypes [:double :half :byte]}}]
+  (let [desc (try (chw/descriptor-for :ze:0) (catch Throwable _ nil))
+        rows (for [dt dtypes sp [:bare :walker]]
+               (let [r (try (croute/route-contraction (matmul-form sp m n k) :dtype dt :desc desc)
+                            (catch Throwable e {:strategy (str "THREW: " (.getMessage e))}))]
+                 {:dtype dt :spelling sp :strategy (:strategy r)}))]
+    (println (format "\n===== ROUTED STRATEGY BY OPERAND SPELLING (M%d K%d N%d) =====" m k n))
+    (doseq [[dt g] (group-by :dtype rows)]
+      (let [by (into {} (map (juxt :spelling :strategy)) g)]
+        (println (format "%-8s bare=%-16s walker=%-16s %s"
+                         (name dt) (str (:bare by)) (str (:walker by))
+                         (if (= (:bare by) (:walker by)) "" "<<< DIVERGES")))))
+    (vec rows)))
 
 ;; ── cadence graph over a spec (mirrors resident-gemm-cold-bench/record-seq-graph) ─────
 (defn- record-seq-graph

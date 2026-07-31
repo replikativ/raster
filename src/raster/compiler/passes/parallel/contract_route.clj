@@ -15,7 +15,8 @@
    (int8 widening). Keys: :kernel-name :source :array-params (binding order) :dtype :out-dtype
    :out-elems :wg [x y] :grid [gx gy] :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
-  (:require [clojure.string :as str]
+  (:require [raster.compiler.core.op-descriptor :as od]
+            [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
@@ -41,9 +42,7 @@
    those are declared on the stages and surfaced separately as :lift-operands, so the two groups
    cannot be confused at bind time."
   [body]
-  (distinct (keep (fn [f] (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
-                            (second f)))
-                  (tree-seq coll? seq body))))
+  (distinct (map :sym (od/aget-reads body))))
 
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
@@ -391,28 +390,37 @@
   [contract-form required-col-axes dtype]
   (let [[_ out free-axes contract-axes body] contract-form]
     (when (and (= 2 (count free-axes)) (= 1 (count contract-axes))
-               (seq? body) (#{'* 'clojure.core/* 'raster.numeric/*} (first body)) (= 3 (count body)))
+               (seq? body) (od/multiplication-op? (od/semantic-op body))
+               ;; TWO arguments, not three: `call-args` excludes the head (and the `.invk` receiver),
+               ;; whereas the literal check this replaced counted the whole form. Getting this wrong
+               ;; made `retarget-to-layout` bail unconditionally, so :nn int8 + :prefer-peak? stopped
+               ;; producing its transpose pre-step and silently fell back to :quant-naive.
+               (= 2 (count (od/call-args body))))
       (let [[i-sym M] (first free-axes) [j-sym N] (second free-axes) [l-sym K] (first contract-axes)
             ext {i-sym M j-sym N l-sym K}
-            agets (mapv ce/normalize-array-prims (rest body))
-            agets (filterv #(and (seq? %) (= 'aget (first %))) agets)]
+            agets (mapv ce/normalize-array-prims (od/call-args body))
+            agets (filterv od/aget-call? agets)]
         (when (= 2 (count agets))
-          (let [syms-of (fn [g] (set (filter symbol? (tree-seq coll? seq (nth g 2)))))
+          (let [syms-of (fn [g] (set (filter symbol? (tree-seq coll? seq (od/aget-index g)))))
                 col (first (filter #(and (contains? (syms-of %) j-sym)
                                          (not (contains? (syms-of %) i-sym))) agets))
                 row (first (filter #(and (contains? (syms-of %) i-sym)
                                          (not (contains? (syms-of %) j-sym))) agets))]
             (when (and col row (not= col row))
-              (let [col-arr (nth col 1)
+              (let [col-arr (od/aget-array-sym col)
                     actual-axes [l-sym j-sym]          ; the :nn storage we can retarget from
-                    cmap (operand-map contract-form col-arr (nth col 2) actual-axes
+                    cmap (operand-map contract-form col-arr (od/aget-index col) actual-axes
                                       (mapv ext actual-axes))
                     want (am/of-axes (mapv (fn [a] [a (ext a)]) required-col-axes))]
                 ;; only proceed when the ACTUAL layout is verified and the difference is a
                 ;; genuine 2-D group transposition
                 (when (and cmap (am/transposed-2d? cmap want))
                   (let [col-t (gensym (str (name col-arr) "__t"))
-                        new-body (list '* row (list 'aget col-t (am/index-expr want)))
+                        ;; QUALIFIED: this form RE-ENTERS route-contraction, so emitting bare ops
+                        ;; here would hand the router the one spelling its matchers used to be the
+                        ;; only ones that worked — and violates CLAUDE.md's emit-qualified rule.
+                        new-body (list 'raster.numeric/*
+                                       row (list 'raster.arrays/aget col-t (am/index-expr want)))
                         ;; PRESERVE THE FORM'S OPTS. Rebuilding with only :maps silently dropped
                         ;; :epilogue, :decode, :init, :combine and :out-dtype — so a retargeted
                         ;; contraction lost its scale (wrong by a constant factor), and a
@@ -477,9 +485,17 @@
                   :epilogue (:epilogue f)
                   :tensorize-inner? tz?}))
         dp4a-ok? (fn [form]
+                   ;; The router must consult the SAME gate the emitter will apply. It previously
+                   ;; checked only k%4 and the operand layout, so a `:decode` (or a body the leaf
+                   ;; would discard) passed here and then THREW inside
+                   ;; generate-staged-contraction-kernel — turning a correct :quant-naive kernel
+                   ;; into a hard compile error. Keep the emitter's throw: it is the right contract
+                   ;; for an EXPLICIT :tensorize-inner? true. The router just has to stop asking
+                   ;; when the answer is no. Same pattern the :staged-segred branch already uses.
                    (and (number? k-extent) (zero? (mod (long k-extent) 4))
                         (:ok (cf/check-layout (cf/contraction-facts form :dtype :byte)
-                                              (:dp4a cf/leaf-layouts)))))
+                                              (:dp4a cf/leaf-layouts)))
+                        (:ok (sco/staged-inner-dp4a-legal? (spec form true)))))
         emit (fn [form tz? pre-steps]
                (let [k (sco/generate-staged-contraction-kernel (spec form tz?) out-sym)]
                  (cond-> {:strategy (if tz? :dp4a :quant-naive)

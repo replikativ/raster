@@ -43,15 +43,15 @@
     (apply hash-map tail)))
 
 (defn- aget-terms
-  "Every `(aget arr idx)` the expression reads, as {:sym :idx}, in encounter order. Uses the
-   op-descriptor's aget classification rather than a local literal set, so a devirtualized
-   `.invk` read is recognized the same way a bare `aget` is."
+  "Every array read the expression makes, as {:sym :idx}, in encounter order.
+
+   Delegates to `od/aget-reads`, which classifies via the registry — so bare `aget`,
+   `clojure.core/aget` (WHAT THE WALKER ACTUALLY EMITS), `raster.arrays/aget`, and a devirtualized
+   `.invk` are all recognized. This docstring previously CLAIMED that while the code matched
+   `(= 'aget (first f))`; the result was `:operands []` for every compiled deftm, so no tensorize
+   gate could ever see an operand and a canonical f16 matmul routed to `:naive-segred`."
   [expr]
-  (->> (tree-seq coll? seq expr)
-       (keep (fn [f]
-               (when (and (seq? f) (= 'aget (first f)) (symbol? (second f)))
-                 {:sym (second f) :idx (nth f 2)})))
-       vec))
+  (mapv #(select-keys % [:sym :idx]) (od/aget-reads expr)))
 
 (defn- verify-declared-map
   "A declared map is admitted only if it provably generates the operand's ACTUAL index."
@@ -127,9 +127,9 @@
     (when (and (seq? body) (od/multiplication-op? (od/semantic-op body)))
       (let [args (vec (od/call-args body))]
         (when (= (count syms) (count args))
-          (let [terms (keep (fn [t] (when (and (seq? t) (= 'aget (first t))
-                                               (contains? syms (second t)))
-                                      {:sym (second t) :idx (nth t 2)}))
+          (let [terms (keep (fn [t] (let [arr (od/aget-array-sym t)]
+                                      (when (contains? syms arr)
+                                        {:sym arr :idx (od/aget-index t)})))
                             args)]
             (when (and (= (count terms) (count args))
                        (= syms (set (map :sym terms))))

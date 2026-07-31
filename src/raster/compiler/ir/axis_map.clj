@@ -19,7 +19,8 @@
 
    Extents may be numbers or symbols; index expressions fold to constants when everything is
    literal and stay symbolic otherwise."
-  (:refer-clojure :exclude [shape]))
+  (:refer-clojure :exclude [shape])
+  (:require [raster.compiler.core.op-descriptor :as od]))
 
 ;; ── construction ────────────────────────────────────────────────────────────────────
 (defn of-axes
@@ -161,6 +162,14 @@
               (cond
                 (number? e) {::one {[] e}}
                 (symbol? e) (if (axes e) {e p-one} {::one {[e] 1}})
+                ;; The walked dialect wraps axes AND extents in integer casts —
+                ;; `(clojure.core/* i (long k))`. Without unwrapping, `(long k)` is an OPAQUE atom,
+                ;; the index is not the row-major layout, and the DPAS orientation gate declines
+                ;; with :non-canonical-orientation — so a compiled deftm cannot reach the tensorized
+                ;; leaf even once its operands are recognized. `od/unwrap-int-cast` is the same
+                ;; unwrapping `affine-step` and `idx-matches?` already apply; using it here makes
+                ;; the affine normal form agree with them instead of being stricter by accident.
+                (and (seq? e) (not= e (od/unwrap-int-cast e))) (aff (od/unwrap-int-cast e))
                 (seq? e)
                 (let [h (op-head (first e)) args (rest e)]
                   (cond
