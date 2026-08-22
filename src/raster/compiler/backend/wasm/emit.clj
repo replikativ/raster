@@ -220,6 +220,15 @@
                     (contains? (:fn-index ctx) (first A)))))
         (-> (vec (mapcat #(emit-val ctx %) (drop 1 A)))   ; args (drop the impl sym)
             (into (e/call (get (:fn-index ctx) (first A)))))
+        ;; A devirtualized INTRINSIC with its own expansion (dp4a → the :scalar-lanes lanes
+        ;; branch below) re-dispatches on its semantic head. This clause used to win first and
+        ;; hand dp4a to emit-intrinsic, which has no :scalar-lanes case → "intrinsic not
+        ;; emittable". It only ever worked because par/dp4a was a plain defn that got INLINED
+        ;; before reaching here; once it became a ^:no-inline deftm (so the GPU census could see
+        ;; its type and the GPU body stopped leaking), the .invk form arrived and fell through.
+        ;; Same .invk-blindness as the #93 aget matchers, third instance in one day.
+        (and (= h '.invk) (= :dp4a (ix/canonical (:raster.op/original (meta node)))))
+        (emit-val ctx (with-meta (cons (:raster.op/original (meta node)) (drop 1 A)) (meta node)))
         ;; devirtualized typed call: op + element vt from carried metadata
         (= h '.invk)
         (let [tag (:raster.type/tag (meta node))

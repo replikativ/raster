@@ -1,5 +1,12 @@
 # Raster Compiler
 
+> **Status (2026-08-22): partially superseded.** This document describes the JVM/bytecode path and
+> is accurate for it. For the **GPU vertical** — `par/contract`, contraction routing, hardware
+> descriptors, schedules, autotuning, SegOps — it predates the work (March 2026) and says nothing;
+> the current spec is [compiler-north-star.md](compiler-north-star.md). The pass sequence listed
+> below (9 stages) is also stale: the executed `forward-passes` vector has 14. Use
+> `explain-pipeline` for the truth, not this list.
+
 Raster includes a nanopass compiler that transforms high-level typed function
 definitions (`deftm`) into optimized JVM bytecode with zero-allocation inner
 loops, BLAS dispatch, and optional SIMD vectorization. This document explains

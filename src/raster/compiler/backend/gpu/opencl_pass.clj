@@ -235,8 +235,13 @@
                   ;; full reduction with :combine max or :combine * spanning more than one
                   ;; workgroup silently SUMMED the per-group partials. Reachable today: a
                   ;; 0-free-axis contraction at :float/:double is exactly what this pass routes.
+                  ;; :strategy/:fallback-reason/:declines/:tile are the ROUTING DECISION. They
+                  ;; were dropped here, so no diagnostic could say which leaf a kernel came from
+                  ;; or why a faster one was refused. (:scalar-params is kept for the existing
+                  ;; consumers; route-contraction actually returns :scalar-args — ledger.)
                   k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
-                                                             :scalar-params :out-dtype])
+                                                             :scalar-params :out-dtype
+                                                             :strategy :fallback-reason :declines :tile])
                                              {:kernel-name (:kernel-name r) :source (:source r)
                                               :dtype (:dtype r)})
                                       :ze-contracts)]

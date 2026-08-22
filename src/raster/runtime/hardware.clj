@@ -246,20 +246,26 @@
           (mapv (fn [idx dev-info]
                   (let [dev-name (:name dev-info)
                         catalogue-spec (catalogue/find-gpu-spec dev-name)
-                        caps (merge
-                              (when catalogue-spec catalogue-spec)
-                              (select-keys dev-info
-                                           [:total-eus :threads-per-eu :simd-width
-                                            :subgroup-sizes :max-workgroup-size
-                                            :shared-local-memory :global-memory-bytes
-                                            :memory-bandwidth-gb-s :core-clock-mhz
-                                            :device-id-hex :integrated?]))]
+                        probed (select-keys dev-info
+                                            [:total-eus :threads-per-eu :simd-width
+                                             :subgroup-sizes :max-workgroup-size
+                                             :shared-local-memory :global-memory-bytes
+                                             :memory-bandwidth-gb-s :core-clock-mhz
+                                             :device-id-hex :integrated?])
+                        caps (merge (when catalogue-spec catalogue-spec) probed)
+                        ;; PER-FIELD provenance. This used to stamp {:all :detected} over the
+                        ;; whole map, which was false for every catalogued field (bandwidth,
+                        ;; peak-flops, :matrix). A reader deciding whether to trust a number
+                        ;; must be able to see whether the hardware said it or a table did.
+                        ;; Probed wins on overlap, so the stamp follows the merge order. Ledger #8.
+                        source (merge (into {} (map (fn [k] [k :catalogued])) (keys catalogue-spec))
+                                      (into {} (map (fn [k] [k :detected])) (keys probed)))]
                     {:id (keyword (str "ze:" idx))
                      :type :ze
                      :index idx
                      :name dev-name
                      :capabilities caps
-                     :source {:all :detected}}))
+                     :source source}))
                 (range) devices))))
     (catch Exception e
       (when (System/getenv "ROMEO_DEBUG")

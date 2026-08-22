@@ -125,6 +125,8 @@
                        {:n-bound "_n_bound" :store-name "out"}))
         ;; pragmas cover the output dtype AND every input array's dtype
         source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
+                    ;; registry intrinsics this body calls (e.g. rstr_dp4a) must be DEFINED
+                    (ce/intrinsic-helper-sources scalar-body-str)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    "
@@ -1114,7 +1116,9 @@
                  ;; this; the staged one did not, so a :double staged contraction — reachable from
                  ;; opencl_pass, whose default dtype IS :double — emitted `double` with no pragma.
                  (codegen/extension-pragmas out-dtype dtype)
-                 (when tz (:c-helper-src (intrinsics/descriptor 'dp4a)))
+                 ;; registry-driven, not `(intrinsics/descriptor 'dp4a)`: define every intrinsic
+                 ;; helper this body actually calls — the same scan every other emitter uses
+                 (ce/intrinsic-helper-sources nest)
                  (when ep (:epilogue-helpers ep))
                  "__kernel void " kernel-name "(" params ") {\n"
                  "    int seg = get_global_id(0);\n"

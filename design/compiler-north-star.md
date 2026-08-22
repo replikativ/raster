@@ -1,0 +1,516 @@
+# Raster compiler north star
+
+Status: architectural direction, grounded in the implementation on 2026-07-30.
+
+Raster should become a compiler in which a typed Clojure program, its parallel
+algorithm, its schedule, its device placement, and its executable artifact are
+all inspectable values. The compiler may search and learn schedules, but it must
+never learn around the type system, effect system, legality checks, or numerical
+oracle.
+
+The shortest description of the destination is:
+
+```text
+typed Clojure
+    → semantic program IR
+    → functional parallel IR (SOAC)
+    → scheduled kernel graph
+    → verified kernel IR
+    → target module
+    → composable Compiled artifact
+```
+
+This is an evolution of Raster's existing architecture, not a replacement with
+Futhark, Triton, JAX, or MLIR. Raster keeps its typed multiple-dispatch frontend,
+functional Clojure programming model, explicit AD rules, portable hardware
+model, and vendor-JIT backends. The reference systems supply specific missing
+ideas at specific layers.
+
+## 1. What is already strong
+
+Raster is not starting from a toy compiler:
+
+- `deftm`/`ftm`, typed dispatch, monomorphization, AD expansion, and qualified
+  semantic operator identities form a capable language frontend.
+- The nanopass pipeline has explicit pass ordering, diagnostics, and declared
+  dialect arrows.
+- SOAC fusion already handles useful vertical and horizontal fusion, aliases,
+  multiple consumers, and profitability vetoes.
+- Contractions carry explicit free and contracted axes, checked index maps,
+  contraction facts, layouts, staged accumulators, and routes for scalar,
+  register-tiled, DPAS, DP4A, and block-quant execution.
+- Hardware descriptors centralize launch geometry, matrix-instruction shape,
+  register budgets, cache and bandwidth data, and measured calibration
+  provenance.
+- Schedules are data, have a compile-time resource feasibility gate, and can be
+  searched and cached by hardware signature.
+- `Compiled` and `DeviceArray` establish device-resident values, ownership,
+  donation, multi-output projection, and functional invocation.
+- The backend surface already includes JVM, C/SIMD, OpenCL, Level Zero, CUDA,
+  HIP, Vulkan, WGSL, and WASM compile gates.
+- The quantized path already covers Q4_0, Q8_0, Q4_K, and Q6_K, including
+  staged contraction and DP4A-related work.
+
+These pieces are the foundation. The principal problem is that some of them are
+connected by metadata, duplicated lowering, string-template seams, or
+conventions that the dialect validator cannot actually prove.
+
+## 2. The load-bearing gaps
+
+### 2.1 The middle end is not yet a sequence of real dialects
+
+`segop-lower-pass` currently leaves the original S-expression in place and
+attaches SegOps to binding-symbol metadata. Failed conversion is caught, printed
+as a warning, and treated as absence. The OpenCL backend can then reconstruct a
+SegOp on demand. Meanwhile, the `:segop-lowered` and `:gpu-planned` dialect
+validators prove only that the outer `let*` is ordered.
+
+This means the pass arrows are nominal at the most important boundary. A kernel
+can bypass the intended IR, and a failed lowering can quietly select a different
+path.
+
+The first architectural correction is therefore:
+
+> SOAC, scheduled kernel graph, and kernel IR must be first-class program values,
+> and every conversion must have a legality target that fails loudly.
+
+### 2.2 Algorithm, schedule, and emitted kernel are still entangled
+
+Raster has schedule data and hardware-aware contraction routes, but there is no
+single stage that applies a schedule to an algorithm and produces the kernel IR
+consumed by every emitter. Several scheduling axes are costed or gated more
+broadly than they are emitted, and GEMM-like leaves still sit partly outside the
+general SegOp route.
+
+The required separation is:
+
+- **algorithm** says what values are computed;
+- **schedule** says where, in what order, with what tiling/layout/staging;
+- **kernel IR** records the selected execution without losing the algorithm's
+  semantic identity;
+- **emission** is a target spelling of the verified kernel IR.
+
+No schedule key is complete until it is declared, checked, costed, emitted, and
+measured. A key that intentionally models feasibility before emission must be
+labelled as such in the schema and excluded from claims of executable coverage.
+
+### 2.3 Values do not yet compose across artifacts without copying
+
+`Compiled` is a sound whole-program MVP, but its session is internal, shape
+information is flat, a foreign `DeviceArray` cannot be rebound, and an ordinary
+device input is currently downloaded and uploaded. These limitations prevent
+independently compiled transformer layers, prefill/decode artifacts, and
+forward/backward/update artifacts from forming one zero-copy device graph.
+
+Artifact linking and value rebinding are not runtime conveniences. They are
+compiler primitives required for competitive model execution.
+
+### 2.4 Shape, layout, effects, ownership, and sharding are separate facts
+
+The current metadata and descriptor registries contain much of this information,
+but there is no one JAX-like abstract value threaded through transformations.
+Consequently, shape polymorphism, layout propagation, aliasing, device
+placement, and future distributed sharding do not share a single checked
+contract.
+
+### 2.5 Workload coverage is broad at the backend edge, not yet through one door
+
+Triton's practical strength is not merely its set of operations. Masks, block
+pointers, layouts, reductions, scans, atomics, gathers/scatters, tensor-core
+forms, and software pipelines travel through one staged compilation path.
+Raster has many of the leaves, but production reachability through the same
+verified IR is the important coverage metric.
+
+## 3. The settled architecture
+
+### 3.1 Semantic program IR
+
+The output of tracing/lowering should be an immutable, SSA-like program with
+unique value identities, nested regions, source locations, and explicit
+constants. S-expression syntax may remain the readable frontend form, but
+passes that need semantic facts should operate on program values rather than
+recovering them from spelling or symbol metadata.
+
+Every value has an `AbstractValue`:
+
+```clojure
+{:dtype        :f16
+ :shape        [batch seq hidden] ; dimensions may be symbolic
+ :logical-layout {:order [0 1 2]}
+ :memory-space :device
+ :placement    {:device :ze:0}
+ :sharding     nil
+ :ownership    :owned
+ :effects      #{}}
+```
+
+The exact representation may be records or validated maps. The invariant
+matters more than the container: all facets describe the same value identity,
+and a pass cannot update one without revalidation.
+
+Operations use one descriptor/interface system. In addition to the existing
+buffer, device, shape, placement, algebra, comparison, and result facets, an
+operation can define:
+
+- abstract evaluation;
+- effect and alias behavior;
+- JVP, VJP/transpose, and batching rules;
+- layout and sharding constraints;
+- canonicalization and fusion traits;
+- legal lowerings for each next dialect;
+- cost features and measurement identity.
+
+This borrows JAX's useful core—abstract values, primitives, explicit equations,
+transformation rules, effects, and pytrees—without borrowing Python tracing
+semantics or making retracing the programming model.
+
+### 3.2 Functional parallel IR
+
+The portable algorithm dialect should contain nested, typed parallel
+operations. Its minimum useful family is:
+
+- map;
+- reduce and scan, including multiple results;
+- screma;
+- histogram;
+- stream/chunked fold;
+- gather and scatter;
+- stencil;
+- contraction;
+- structured `if`, `while`, and call regions;
+- explicit effect/token operations where functional dataflow is insufficient.
+
+Futhark is the semantic reference here. In particular, Raster should adopt its
+discipline of typed SOAC inputs/results, nested parallel distribution,
+regularity and balance legality, and typed kernel results. Raster need not copy
+Futhark's Haskell representation or uniqueness type system wholesale.
+
+This dialect is hardware-independent. Hardware facts may be supplied to a
+costing or scheduling pass, but must not change the meaning of an operation.
+
+### 3.3 Schedule and transform IR
+
+A schedule is an immutable transformation program over the functional parallel
+IR. It is more than a bag of kernel kwargs. It can express:
+
+- split, tile, reorder, fuse, compute placement, and materialization;
+- thread/block/subgroup mapping;
+- vectorization and matrix-instruction selection;
+- operand layout and explicit layout conversion;
+- staging space, copies, pipeline depth, and barriers;
+- reduction decomposition and split-K;
+- buffer donation, residency, and graph capture;
+- device/mesh placement and resharding policy.
+
+Halide supplies the algorithm/schedule separation and structural search model.
+MLIR's Transform dialect supplies a useful safety model: typed handles,
+preconditions, declared effects, and recoverable versus irrecoverable transform
+failure. Raster can implement those properties in EDN and Clojure records.
+
+Applying a schedule produces a candidate scheduled kernel graph. Candidate
+generation, legality, feasibility, profitability, and measurement remain
+separate:
+
+```text
+rewrite legality → hardware feasibility → analytic rank → measured rank
+```
+
+A cost model may abstain. A failed legality or resource check is never converted
+to a different semantic program.
+
+### 3.4 Scheduled kernel graph and kernel IR
+
+The scheduled graph contains calls between kernels and explicit resident
+buffers. Each kernel contains typed operations and regions sufficient to
+represent:
+
+- N-dimensional program and thread indices;
+- named register, shared/local, cache-resident, and global layouts;
+- masked loads/stores and boundary values;
+- block views/pointers, strides, offsets, gathers, and scatters;
+- scalar, subgroup, block, and grid reductions/scans;
+- matrix/dot operands and accumulator fragments;
+- shared-memory allocation and swizzles;
+- asynchronous copy, commit, wait, and barrier;
+- atomics;
+- structured control flow;
+- ordered kernel inputs, outputs, scalars, aliases, and temporary buffers.
+
+SegMap, SegRed, and SegScan should migrate into this real dialect. Histograms and
+the missing result forms should be added by workload demand.
+
+Layouts should initially be a finite, named family with stride, permutation,
+tile, vector, and swizzle parameters, plus explicit legal conversions. This is
+enough for DPAS, WMMA/WGMMA, and MFMA families while Raster delegates register
+allocation and final instruction scheduling to vendor compilers. A general
+Triton GF(2) linear-layout algebra is not a prerequisite.
+
+The kernel ABI is one ordered, typed slot vector:
+
+```clojure
+[{:name 'x   :kind :input  :dtype :f16 :shape [m k] :layout x-layout}
+ {:name 'w   :kind :input  :dtype :q4-k :shape [n k] :layout w-layout}
+ {:name 'out :kind :output :dtype :f32 :shape [m n] :layout out-layout}]
+```
+
+The signature renderer, binder, verifier, cache key, profiler, and debugger all
+consume this same vector. Unordered input/output symbol sets and independently
+maintained argument counts must disappear.
+
+### 3.5 Dialect conversion and verification
+
+Raster should adopt MLIR's conversion discipline without requiring MLIR as a
+runtime dependency:
+
+- a conversion target declares legal, dynamically legal, and illegal
+  operations;
+- full conversion succeeds only when no illegal operation remains;
+- partial conversion is named explicitly and cannot masquerade as a completed
+  dialect;
+- type/layout conversions insert explicit adapters;
+- each operation supplies interfaces/traits, avoiding repeated exact-op
+  conditionals;
+- every pass declares preserved analyses and invalidates the rest;
+- pass diagnostics retain source and semantic value identities.
+
+The immediate implication is that SegOp lowering may no longer warn and return
+`nil`. Unsupported forms produce a structured diagnostic naming the operation,
+source, missing rule, target dialect, and possible legal fallback. A fallback
+is an explicit conversion rule, not exception handling.
+
+Native MLIR remains an optional future interchange or target boundary. Raster
+should not take a mandatory LLVM/MLIR/Triton build dependency merely to gain
+dialect concepts it can express in its existing nanopass system.
+
+### 3.6 Target lowering
+
+Target backends select instruction families and render source/binaries from the
+same verified kernel IR. Vendor differences that change the structure of a
+kernel—DPAS versus WMMA/WGMMA versus MFMA—fork in target lowering. Dtype
+spellings and instruction variants within a family are data tables.
+
+The vendor compiler continues to own register allocation, low-level instruction
+scheduling, and binary generation until measurements demonstrate that this
+boundary is the limiting factor.
+
+### 3.7 Executable artifact and runtime
+
+`Compiled` evolves from a whole-program wrapper into a composable executable
+graph:
+
+- target module and kernel cache;
+- typed input/output tree specifications;
+- device values with shape, dtype, layout, placement, and ownership;
+- ordered kernel ABI bindings;
+- explicit aliases and donation;
+- captured constants and parameters;
+- events and asynchronous dependencies;
+- schedule, hardware signature, compiler version, and measurement provenance;
+- graph instantiation/linking without recompiling shared kernels;
+- serialization of all non-live-resource state.
+
+Device-to-device binding is the normal path. Host transfer is an explicit graph
+edge with a reason and byte count. The compiler's memory plan owns temporary
+liveness, reuse, alignment, and peak-memory accounting.
+
+JAX pytrees are the model for separating user structure from flat leaves, but
+Raster trees should retain stable keyed paths and type/shape information. JAX
+donation and sharding contracts are also useful references; Raster's existing
+ownership checks should remain fail-loud.
+
+## 4. Quantized computation
+
+Quantization should be represented as contraction semantics plus an operand
+storage layout, not as one opaque hand-written kernel per format. A format
+descriptor must define:
+
+- block shape and byte layout;
+- scale, offset, and auxiliary metadata encoding;
+- logical element-to-byte index map;
+- decode computation and signedness;
+- permitted activation and accumulator dtypes;
+- reference pack/unpack implementation;
+- legal instruction families;
+- numerical tolerance and golden vectors.
+
+Q4_0, Q8_0, Q4_K, and Q6_K establish the pattern. The next formats should be
+selected from actual pretrained and finetuning model requirements and measured
+quality/performance—not from a goal of mirroring every `llama.cpp` enum. Likely
+candidates include high-use IQ variants and current low-bit floating formats
+such as MXFP4/NVFP4, subject to model evidence and hardware support.
+
+`llama.cpp-new` is the interoperability and CPU-reference oracle. Every added
+format needs pack/unpack parity, randomized boundary cases, odd-tail coverage,
+and end-to-end logits or loss comparisons. A format is not complete when only
+its isolated emitter test passes.
+
+## 5. Hardware-aware compilation and autotuning
+
+Raster's existing hardware descriptor and schedule cache form the right base.
+The closed loop is:
+
+```text
+program + abstract values + hardware descriptor
+    → legal schedules
+    → resource-feasible schedules
+    → analytic shortlist
+    → compile and device-time benchmark
+    → stationary winner
+    → versioned cache and Compiled artifact
+```
+
+The search state should include both kernel and graph choices. Per-kernel axes
+include tile, vector width, instruction family, workgroup geometry, layout,
+staging, pipeline depth, and reduction strategy. Graph axes include fusion,
+materialization, parameter/activation residency, recomputation, capture, and
+placement.
+
+The benchmark protocol must record:
+
+- warmup and cache-state policy;
+- device-event time, not host submission time;
+- minimum and distribution summary;
+- stationarity/variance result;
+- compilation time and binary size;
+- peak memory and temporary bytes;
+- transfers and bytes moved;
+- hardware, driver, compiler, program, schedule, and numerical-mode hashes.
+
+Analytic models seed and prune; measurement decides among survivors. Learned
+cost models may later replace parts of ranking, but the raw observations remain
+the source of truth.
+
+## 6. Distributed and resource-aware programming model
+
+Distribution belongs in the abstract value and scheduled graph, not in a
+separate orchestration wrapper. The program model needs:
+
+- a device mesh and topology descriptor;
+- sharding annotations on logical dimensions;
+- sharding propagation rules per operation;
+- explicit reshard, all-reduce, all-gather, reduce-scatter, broadcast, and
+  point-to-point operations;
+- compute/communication dependency events;
+- memory capacity and bandwidth constraints per device/link;
+- heterogeneous placement and legal dtype/layout capabilities.
+
+Compilation minimizes a cost vector rather than a single kernel time:
+
+```text
+latency, throughput, peak memory, transferred bytes,
+compile/tune budget, energy when measurable, and numerical error
+```
+
+The first distributed target should be data-parallel training with explicit
+gradient all-reduce, followed by tensor/sequence sharding for a transformer
+block. Pipeline and expert parallelism should wait until the value, sharding,
+and communication IR can state them without runtime side protocols.
+
+## 7. Reflection, structural self-modification, and learning
+
+Raster can make reflection unusually powerful because Clojure data is a natural
+representation for programs and schedules. The safe version has four rules:
+
+1. Source operations, semantic values, SOAC nodes, kernel nodes, and measurements
+   retain stable identities across lowering.
+2. IRs, transforms, schedules, hardware descriptions, and measurements are
+   immutable, content-addressed, inspectable data.
+3. Every structural change is a declared transform with preconditions,
+   provenance, and a verifier; rejected changes leave the payload unchanged.
+4. Learned proposals compete in shadow mode before they may be cached or shipped,
+   and no proposal bypasses legality, resource, or numerical gates.
+
+This permits learning across representations: a model can associate source
+structure, SOAC structure, chosen schedules, emitted kernel features, hardware,
+and measurements. It does not require unrestricted mutation of compiler code or
+live executables. Rewrite policies and cost models are replaceable artifacts;
+the trusted verifier stays small.
+
+## 8. Landing order
+
+Each increment should be a thin vertical slice with a production-path test.
+
+| Increment | Work | Completion gate |
+|---|---|---|
+| 1. Real SegOp boundary | Introduce a first-class program container for SOAC/SegOps; make lowering a full, fail-loud conversion; remove metadata-only and backend re-lowering for the migrated forms; validate operations and types, not only outer `let*`. | Map, reduction, scan, and one contraction travel through the same recorded dialect path on CPU and GPU; unsupported forms cannot silently bypass it. |
+| 2. Kernel ABI | Replace unordered symbol sets and hand-maintained signatures/binders with one ordered typed ABI; derive emission, binding, cache identity, and diagnostics from it. | Every production GPU invocation compares the emitted and bound ABI structurally; syntax/compile checks cover every emitted kernel. |
+| 3. Abstract values and operation interfaces | Add canonical shape/dtype/layout/placement/ownership/effect facts and operation rules; flatten/unflatten structured arguments with stable paths. | Passes no longer infer these facts from spellings or independent maps; differential type/effect tests cover nested and polymorphic shapes. |
+| 4. Scheduled contraction slice | Apply an explicit schedule to contraction/Screma; bring one GEMM family through kernel IR with masks, named operand layouts, and fusible epilogue. | The same algorithm selects scalar, tiled, DPAS/DP4A, and quant leaves by legal schedule; emitted results match the flat semantic oracle. |
+| 5. Composable artifacts | Lift executable/session ownership, add foreign `DeviceArray` rebinding, graph linking/instantiation, parameter capture, events, and N-D trees. | Two compiled transformer subgraphs compose with zero host transfers; a full forward/VJP/update step is one resident artifact. |
+| 6. Closed tuning loop | Connect real device timing to schedule candidates and graph choices; make cache/provenance complete; wire or explicitly classify every schedule axis. | A cold compile tunes once, a warm compile reproduces the winner, numerical validation precedes timing, and the artifact explains why it won. |
+| 7. Workload-driven coverage | Add stream/hist/gather/scatter, masking/block views, atomics, layouts/staging, and quant formats as demanded by model/scientific kernels. | Coverage is measured through production lowering on a published workload corpus, with differential and device compile/run gates. |
+| 8. Distributed IR | Add mesh/sharding abstract values, collective nodes, communication cost, and placement scheduling. | A transformer training step runs data-parallel on multiple devices without hidden host copies and reports compute, communication, and memory costs. |
+
+The first two increments are correctness infrastructure and should precede
+additional backend breadth. Increment 5 is the first major model-execution
+unlock. Increment 6 makes the hardware-aware work a closed system instead of a
+collection of useful components.
+
+## 9. Scientific and model acceptance ladder
+
+Every tier compares semantics first and performance second:
+
+1. generated small map/reduce/scan/stencil programs across interpreter, JVM,
+   C/SIMD, and available GPU backends;
+2. reductions with nontrivial identities, ragged sizes, aliases, multiple
+   outputs, and exceptional values;
+3. contractions over permutations, batching, split-K, transposes, layouts,
+   epilogues, and supported quant formats;
+4. FFT/PDE/sparse or irregular scientific kernels that force the non-GEMM
+   coverage;
+5. one transformer layer forward, VJP, optimizer update, and mixed precision;
+6. `pretrained-rstr` prefill and decode with KV residency and logits parity;
+7. `finetune-rstr` batched SFT/LoRA/QLoRA with a wholly resident train step;
+8. full model execution and training, then multi-device versions.
+
+For each tier record numerical error, kernel count, allocations, peak memory,
+host/device and device/device bytes, compile time, tuning time, steady-state
+time, and achieved bandwidth/compute. Comparisons with JAX/XLA, Triton,
+`llama.cpp-new`, and vendor libraries must use matched dtypes, shapes, warmup,
+transfer boundaries, and numerical modes.
+
+## 10. Non-goals and anti-drift rules
+
+- Do not port an entire reference compiler.
+- Do not adopt native MLIR merely to obtain terminology or pass structure.
+- Do not add an optimization knob without its schema, legality, resource,
+  emission, measurement, and explanation path.
+- Do not count isolated emitter tests as feature coverage.
+- Do not infer semantics from mangled names, source spelling, or exception
+  fallbacks.
+- Do not create a second operation-property registry.
+- Do not let tuning change numerical mode without making that mode part of the
+  schedule, cache key, validation oracle, and returned artifact.
+- Do not add distributed side protocols that are invisible to the value and
+  effect model.
+- Do not let self-modifying or learned components bypass the trusted verifier.
+
+## 11. Reference mapping and study snapshot
+
+| Reference | Borrow | Do not borrow |
+|---|---|---|
+| Futhark | typed SOAC semantics, nested distribution, balance/regularity legality, first-class SegOps and results | Haskell representation or full uniqueness system |
+| Halide | algorithm/schedule separation, explicit schedule transformations, structural search states and hard resource filters | a separate DSL or every scheduling primitive before a workload needs it |
+| Triton | staged high/kernel/target IR, explicit layouts and masks, broad kernel primitives, autotune protocol and failure handling | Python block-program frontend or a mandatory Triton backend dependency |
+| `llama.cpp-new` | quant layout oracle, golden formats, model-driven kernel cases | one bespoke compiler architecture per quant format |
+| JAX/XLA | abstract values, primitive transformation rules, effects, pytrees, donation, sharding contracts, layout constraints | Python retracing behavior or outsourcing Raster's programming model to XLA |
+| MLIR | conversion legality, operation interfaces/traits, pass invalidation, Transform and DataLayout discipline | compulsory native MLIR integration before a concrete backend requires it |
+
+Local source revisions studied for this direction:
+
+```text
+futhark          f05e40c0f
+Halide           2fad88f4c
+triton           434aecbe9
+llama.cpp-new    5c7c22c
+jax              d36f6b3b7
+xla              2aa87bb
+mlir-reference   edff73e1
+pretrained-rstr  3caf8a1
+finetune-rstr    9e9ba5d
+```
+
+The durable decision is not any one revision's class hierarchy. It is the
+separation of semantic program, transform/schedule, verified kernel, target
+lowering, and composable artifact—with stable identities and measurements
+connecting them.
