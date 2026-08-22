@@ -60,29 +60,63 @@
 
 (def ^:private segop-id-counter (atom 0))
 
+(def ^:private fatal-reasons
+  "A violated invariant is not \"the SegOp path does not cover this form\". Letting one fall through
+   to the legacy generator would run the pipeline on with the bug intact."
+  #{:raster/fatal :raster/bug})
+
+(defn- segop-attempt
+  "Run a SegOp lowering `thunk`, returning the SegOp or nil — and RECORDING why on `stats` when it
+   declines, so the choice between the modern SegOp path and `legacy/generate-par-*` stops being
+   invisible.
+
+   Both outcomes increment the same `:ze-maps`/`:ze-reduces` counter, so nothing downstream — not
+   the kernel record, not explain-pipeline — could say which of the two code generators produced a
+   kernel, or why the modern one declined. That is the same warn-and-vanish shape north-star §3.5
+   rejects at the SegOp boundary, one door along."
+  [stats kind form dtype thunk]
+  (let [r (try {:ok (thunk)} (catch Exception e {:err e}))]
+    (cond
+      (:err r)
+      (let [e (:err r)]
+        (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
+        (swap! stats update :segop-declined (fnil conj [])
+               {:kind kind :op (when (seq? form) (first form))
+                :dtype (or dtype :double)
+                :reason (or (:reason (ex-data e)) :no-lowering-rule)
+                :message (.getMessage e)
+                :fallback :legacy-codegen})
+        nil)
+
+      (nil? (:ok r))
+      (do (swap! stats update :segop-declined (fnil conj [])
+                 {:kind kind :op (when (seq? form) (first form))
+                  :dtype (or dtype :double)
+                  :reason :lowering-produced-nothing
+                  :fallback :legacy-codegen})
+          nil)
+
+      :else (:ok r))))
+
 (defn- par->segmap
-  "Compute SegMap on-the-fly from a par/map! form."
-  [form dtype]
-  (try
-    (let [par-info (par/extract-par-map-info form)
-          soac (raster.compiler.ir.soac/par-form->soac
-                (:out par-info) form (swap! segop-id-counter inc))
-          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                  soac :ze:0 :dtype (or dtype :double))]
-      (first segops))
-    (catch Exception _ nil)))
+  "Compute SegMap on-the-fly from a par/map! form. nil (with a recorded decline) ⇒ legacy codegen."
+  [stats form dtype]
+  (segop-attempt stats :segmap form dtype
+                 #(let [par-info (par/extract-par-map-info form)
+                        soac (raster.compiler.ir.soac/par-form->soac
+                              (:out par-info) form (swap! segop-id-counter inc))]
+                    (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                            soac :ze:0 :dtype (or dtype :double))))))
 
 (defn- par->segred
-  "Compute SegRed on-the-fly from a par/reduce form."
-  [form dtype]
-  (try
-    (let [sym (gensym "red_")
-          soac (raster.compiler.ir.soac/par-form->soac
-                sym form (swap! segop-id-counter inc))
-          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                  soac :ze:0 :dtype (or dtype :double))]
-      (first segops))
-    (catch Exception _ nil)))
+  "Compute SegRed on-the-fly from a par/reduce form. nil (with a recorded decline) ⇒ legacy codegen."
+  [stats form dtype]
+  (segop-attempt stats :segred form dtype
+                 #(let [sym (gensym "red_")
+                        soac (raster.compiler.ir.soac/par-form->soac
+                              sym form (swap! segop-id-counter inc))]
+                    (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                            soac :ze:0 :dtype (or dtype :double))))))
 
 (defn- maybe-compile-spirv
   "Optionally compile OpenCL C to SPIR-V."
@@ -148,7 +182,7 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
-                (if-let [segmap (par->segmap form dtype)]
+                (if-let [segmap (par->segmap stats form dtype)]
                   (let [kernel (segop-cl/generate-segmap-kernel segmap out
                                                                 :dtype dtype :scalar-types top-scalar-types
                                                                 :array-types (merge top-array-types (:array-types (meta form))))]
@@ -233,7 +267,7 @@
             ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
             (par/par-reduce-into-form? form)
             (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
-              (if-let [segred (par->segred reduce-form dtype)]
+              (if-let [segred (par->segred stats reduce-form dtype)]
                 (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
                   (if kernel
                     (let [k (register-kernel! kernel :ze-reduces)]
@@ -258,7 +292,7 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce form))
-                (if-let [segred (par->segred form dtype)]
+                (if-let [segred (par->segred stats form dtype)]
                   (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
                     (if kernel
                       (let [k (register-kernel! kernel :ze-reduces)]
