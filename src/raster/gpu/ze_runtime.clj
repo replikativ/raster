@@ -828,6 +828,64 @@
     (MemorySegment/copy src 0 seg 0 n-bytes)
     buf))
 
+(defn- as-segment
+  "A JVM primitive array or a MemorySegment, as a MemorySegment. The one conversion point, so a
+   Boring mmap segment and a float[] take the same code path."
+  ^MemorySegment [x]
+  (if (instance? MemorySegment x) x (MemorySegment/ofArray x)))
+
+(defn- check-range!
+  "Element-range bounds for a ranged transfer. Throws rather than clamping: `array->buffer!`
+   silently copies `(min buf src)` bytes, which is fine for a whole-buffer transfer but is exactly
+   the wrong behaviour for a range — a clamped KV-cache export looks identical to a correct one
+   until the restored continuation diverges at the missing tokens."
+  ;; no primitive hints: >4 primitive params is a Clojure limit (CLAUDE.md); the body casts
+  [what have-elements offset elements elem-size other-bytes]
+  (let [have-elements (long have-elements) offset (long offset) elements (long elements)
+        elem-size (long elem-size) other-bytes (long other-bytes)]
+  (when (or (neg? offset) (neg? elements))
+    (throw (ex-info (str what ": negative offset or length") {:offset offset :elements elements})))
+  (when (> (+ offset elements) have-elements)
+    (throw (ex-info (str what ": range exceeds the buffer")
+                    {:offset offset :elements elements :buffer-elements have-elements})))
+  (when (> (* elements elem-size) other-bytes)
+    (throw (ex-info (str what ": range exceeds the host-side array/segment")
+                    {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
+
+(defn upload-range!
+  "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element
+   `src-element`) into `buf` starting at element `dst-element`. Elements, not bytes: the byte
+   size comes from the buffer's own dtype, so a caller cannot mis-size a copy.
+
+   Session buffers are SHARED (host-coherent) allocations, so this is a plain Panama copy — no
+   command list, and a MemorySegment source (e.g. an mmap'd file) is copied directly without
+   materializing a JVM array. Returns the buffer."
+  [^DeviceBuffer buf src {:keys [src-element dst-element elements]
+                          :or {src-element 0 dst-element 0}}]
+  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
+        src-seg (as-segment src)
+        src-off (* (long src-element) es)
+        n-bytes (* (long elements) es)]
+    (check-range! "upload-range!" (:n-elements buf) dst-element elements es
+                  (- (.byteSize src-seg) src-off))
+    (MemorySegment/copy src-seg src-off (:segment buf) (* (long dst-element) es) n-bytes)
+    buf))
+
+(defn download-range!
+  "Copy `elements` elements from `buf` (starting at element `src-element`) into `dst` (JVM array
+   or MemorySegment, starting at element `dst-element`). The mirror of `upload-range!`; same
+   element semantics and bounds checks. Returns `dst`."
+  [^DeviceBuffer buf dst {:keys [src-element dst-element elements]
+                          :or {src-element 0 dst-element 0}}]
+  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
+        dst-seg (as-segment dst)
+        dst-off (* (long dst-element) es)
+        n-bytes (* (long elements) es)]
+    (check-range! "download-range!" (:n-elements buf) src-element elements es
+                  (- (.byteSize dst-seg) dst-off))
+    (MemorySegment/copy (:segment buf) (* (long src-element) es) dst-seg dst-off n-bytes)
+    dst))
+
 (defn buffer->array
   "Copy a DeviceBuffer's contents to a new JVM array.
   For :float16/:half, returns a short array of encoded FP16 values.

@@ -601,6 +601,33 @@
                                 {:available (keys buffers)})))]
     ((rt-resolve device-id "buffer->array") buf)))
 
+(defn- session-buffer
+  [sess key]
+  (let [{:keys [buffers]} @sess]
+    (or (get buffers key)
+        (throw (ex-info (str "No buffer for key: " key) {:available (keys buffers)})))))
+
+(defn upload-range!
+  "Copy a SUB-RANGE of a host array or MemorySegment into a session buffer.
+
+     (upload-range! sess :kc0 src {:src-element 0 :dst-element 0 :elements (* tokens kvrow)})
+
+   `src` may be a JVM primitive array or a MemorySegment — an mmap'd file is copied directly, no
+   JVM array in between. Offsets and length are in ELEMENTS of the buffer's dtype; byte size is
+   never the caller's to get wrong. Out-of-range is an error, not a clamp.
+
+   Why this exists: `upload!`/`download` move the WHOLE buffer. A KV cache is allocated at
+   `maxpos` positions and position-major, so a continuation of `t` tokens is one contiguous
+   prefix — exporting it should move `t` rows, not `maxpos`."
+  [sess key src spec]
+  ((rt-resolve (:device-id @sess) "upload-range!") (session-buffer sess key) src spec))
+
+(defn download-range!
+  "Copy a SUB-RANGE of a session buffer into a host array or MemorySegment; mirror of
+   `upload-range!`. Returns `dst`."
+  [sess key dst spec]
+  ((rt-resolve (:device-id @sess) "download-range!") (session-buffer sess key) dst spec))
+
 (defn buffer
   "Get a DeviceBuffer from the session by key."
   [sess key]
