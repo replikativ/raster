@@ -852,39 +852,50 @@
     (throw (ex-info (str what ": range exceeds the host-side array/segment")
                     {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
 
+(defn plan-range
+  "Validate one ranged transfer and return its byte-level PLAN, without copying anything:
+   `{:buf-off :host-off :n-bytes :host-seg}`. Throws on any out-of-range.
+
+   Split from the copy so a BATCH can validate every entry before executing any. Without that, a
+   bad spec in the 30th layer of a 36-layer KV restore would leave the first 29 written and the
+   cache half-restored — a partial state that is worse than either all or nothing, and that a
+   single-range API could never produce."
+  [^DeviceBuffer buf host {:keys [src-element dst-element elements]
+                           :or {src-element 0 dst-element 0}} direction]
+  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
+        host-seg (as-segment host)
+        ;; for :upload the host side is src and the buffer side is dst; :download is the mirror
+        [buf-el host-el] (case direction :upload [dst-element src-element] :download [src-element dst-element])
+        host-off (* (long host-el) es)]
+    (check-range! (name direction) (:n-elements buf) buf-el elements es
+                  (- (.byteSize host-seg) host-off))
+    {:buf-off (* (long buf-el) es) :host-off host-off :n-bytes (* (long elements) es)
+     :host-seg host-seg}))
+
+(defn execute-range!
+  "Perform a transfer previously validated by `plan-range`. Session buffers are SHARED
+   (host-coherent) allocations, so this is a plain Panama copy — no command list, and a
+   MemorySegment host side (e.g. an mmap'd file) is copied directly without materializing a JVM
+   array."
+  [^DeviceBuffer buf {:keys [buf-off host-off n-bytes host-seg]} direction]
+  (case direction
+    :upload   (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
+    :download (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes))))
+
 (defn upload-range!
   "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element
    `src-element`) into `buf` starting at element `dst-element`. Elements, not bytes: the byte
-   size comes from the buffer's own dtype, so a caller cannot mis-size a copy.
-
-   Session buffers are SHARED (host-coherent) allocations, so this is a plain Panama copy — no
-   command list, and a MemorySegment source (e.g. an mmap'd file) is copied directly without
-   materializing a JVM array. Returns the buffer."
-  [^DeviceBuffer buf src {:keys [src-element dst-element elements]
-                          :or {src-element 0 dst-element 0}}]
-  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
-        src-seg (as-segment src)
-        src-off (* (long src-element) es)
-        n-bytes (* (long elements) es)]
-    (check-range! "upload-range!" (:n-elements buf) dst-element elements es
-                  (- (.byteSize src-seg) src-off))
-    (MemorySegment/copy src-seg src-off (:segment buf) (* (long dst-element) es) n-bytes)
-    buf))
+   size comes from the buffer's own dtype, so a caller cannot mis-size a copy. Returns the buffer."
+  [^DeviceBuffer buf src spec]
+  (execute-range! buf (plan-range buf src spec :upload) :upload)
+  buf)
 
 (defn download-range!
   "Copy `elements` elements from `buf` (starting at element `src-element`) into `dst` (JVM array
-   or MemorySegment, starting at element `dst-element`). The mirror of `upload-range!`; same
-   element semantics and bounds checks. Returns `dst`."
-  [^DeviceBuffer buf dst {:keys [src-element dst-element elements]
-                          :or {src-element 0 dst-element 0}}]
-  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
-        dst-seg (as-segment dst)
-        dst-off (* (long dst-element) es)
-        n-bytes (* (long elements) es)]
-    (check-range! "download-range!" (:n-elements buf) src-element elements es
-                  (- (.byteSize dst-seg) dst-off))
-    (MemorySegment/copy (:segment buf) (* (long src-element) es) dst-seg dst-off n-bytes)
-    dst))
+   or MemorySegment, starting at element `dst-element`). Mirror of `upload-range!`. Returns `dst`."
+  [^DeviceBuffer buf dst spec]
+  (execute-range! buf (plan-range buf dst spec :download) :download)
+  dst)
 
 (defn buffer->array
   "Copy a DeviceBuffer's contents to a new JVM array.

@@ -119,3 +119,71 @@
               (is (< per-call (quot payload 10))
                   (str "per-call heap " per-call " B vs payload " payload " B")))
             (finally (.close arena))))))))
+
+;; ── batched: the whole KV cache in one call ─────────────────────────────────────────
+(defn- with-kv-session
+  "A session with `layers` kc/vc pairs, each holding value = (layer-tag + index) so a write to the
+   wrong layer is as visible as a write to the wrong position."
+  [layers f]
+  (let [s (g/make-session :ze:0)
+        make (ns-resolve (find-ns 'raster.gpu.ze-runtime) 'make-buffer)]
+    (try
+      (doseq [l (range layers) kind ["kc" "vc"]]
+        (let [k (keyword (str kind l)) tag (float (* 1e6 (+ 1 (* 2 l) (if (= kind "vc") 1 0))))
+              a (float-array N)]
+          (dotimes [i N] (aset a i (+ tag (float i))))
+          (swap! s assoc-in [:buffers k] (make N :float))
+          (g/upload! s k a)))
+      (f s)
+      (finally (g/close-session! s)))))
+
+(deftest a-batch-moves-every-layer-in-one-call
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "batched ranged transfers: whole-cache export/import")
+    (with-kv-session 3
+      (fn [s]
+        (let [tokens 64 n (* tokens kvrow)
+              keys* (for [l (range 3) kind ["kc" "vc"]] (keyword (str kind l)))
+              outs (zipmap keys* (repeatedly #(float-array n)))
+              res (g/download-ranges! s (for [k keys*] [k (get outs k) {:elements n}]))]
+          (is (= 6 (count res)) "one result per entry")
+          (is (= (map #(get outs %) keys*) (seq res))
+              "…and IN ENTRY ORDER — the i-th result is the i-th entry's destination, which is
+               what lets a caller zip results back to layers without re-deriving the mapping")
+          (doseq [[l kind] (for [l (range 3) kind ["kc" "vc"]] [l kind])]
+            (let [k (keyword (str kind l)) tag (* 1e6 (+ 1 (* 2 l) (if (= kind "vc") 1 0)))]
+              (is (every? (fn [i] (== (aget ^floats (get outs k) i) (float (+ tag i)))) (range n))
+                  (str k " carries ITS OWN layer's prefix, not a neighbour's")))))))))
+
+(deftest a-bad-entry-anywhere-leaves-the-whole-cache-untouched
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "batched ranged transfers: all-or-nothing")
+    (with-kv-session 3
+      (fn [s]
+        ;; The failure a batched API newly makes possible: entries 1-5 valid, entry 6 out of range.
+        ;; Without validate-all-first, five layers get overwritten before the throw and the cache
+        ;; is half-restored — indistinguishable from correct until decode diverges.
+        (let [n (* 64 kvrow)
+              zeros (float-array n)
+              entries (concat (for [l (range 3) kind ["kc"]] [(keyword (str kind l)) zeros {:elements n}])
+                              (for [l (range 2)] [(keyword (str "vc" l)) zeros {:elements n}])
+                              [[:vc2 zeros {:dst-element (- N 10) :elements n}]])]   ; the bad one, LAST
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds the buffer"
+                                (g/upload-ranges! s entries)))
+          (testing "NOT ONE of the five valid earlier entries was written"
+            (doseq [[l kind] (for [l (range 3) kind ["kc" "vc"]] [l kind])]
+              (let [k (keyword (str kind l)) tag (* 1e6 (+ 1 (* 2 l) (if (= kind "vc") 1 0)))
+                    back (g/download s k)]
+                (is (every? (fn [i] (== (aget ^floats back i) (float (+ tag i)))) (range n))
+                    (str k " must be untouched"))))))))))
+
+(deftest an-unknown-key-is-refused-before-anything-moves
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "batched ranged transfers: unknown key")
+    (with-kv-session 1
+      (fn [s]
+        (let [n (* 8 kvrow) zeros (float-array n)]
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"No buffer for key"
+                                (g/upload-ranges! s [[:kc0 zeros {:elements n}]
+                                                     [:kc99 zeros {:elements n}]])))
+          (is (== (aget ^floats (g/download s :kc0) 0) (float 1e6)) ":kc0 untouched"))))))

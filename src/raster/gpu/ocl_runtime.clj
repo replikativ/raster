@@ -482,47 +482,51 @@
     (throw (ex-info (str what ": range exceeds the host-side array/segment")
                     {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
 
-(defn upload-range!
-  "Ranged host → device copy. Same element semantics as the ze runtime's `upload-range!`, but
-   OpenCL buffers are not host-coherent: the range goes through the host staging segment and a
-   clEnqueueWriteBuffer at the byte offset, so only the RANGE crosses the bus."
-  [^OclBuffer buf src {:keys [src-element dst-element elements]
-                       :or {src-element 0 dst-element 0}}]
+(defn plan-range
+  "Validate one ranged transfer and return its byte-level plan without copying. Same contract as
+   the ze runtime's `plan-range`; split from execution so a batch validates everything first."
+  [^OclBuffer buf host {:keys [src-element dst-element elements]
+                        :or {src-element 0 dst-element 0}} direction]
+  (let [es (long (get dtype-byte-sizes (:dtype buf) 4))
+        host-seg (as-segment host)
+        [buf-el host-el] (case direction :upload [dst-element src-element] :download [src-element dst-element])
+        host-off (* (long host-el) es)]
+    (check-range! (name direction) (:n-elements buf) buf-el elements es
+                  (- (.byteSize host-seg) host-off))
+    {:buf-off (* (long buf-el) es) :host-off host-off :n-bytes (* (long elements) es)
+     :host-seg host-seg}))
+
+(defn execute-range!
+  "Perform a validated transfer. OpenCL buffers are not host-coherent, so the range goes through
+   the host staging segment and a clEnqueueWrite/ReadBuffer at the byte offset — only the RANGE
+   crosses the bus."
+  [^OclBuffer buf {:keys [buf-off host-off n-bytes host-seg]} direction]
   (ensure-init!)
   (let [{:keys [queue]} @state
-        es (long (get dtype-byte-sizes (:dtype buf) 4))
-        src-seg (as-segment src)
-        src-off (* (long src-element) es)
-        dst-off (* (long dst-element) es)
-        n-bytes (* (long elements) es)]
-    (check-range! "upload-range!" (:n-elements buf) dst-element elements es
-                  (- (.byteSize src-seg) src-off))
-    (MemorySegment/copy src-seg src-off (:segment buf) dst-off n-bytes)
-    (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
-              [queue (:cl-mem buf) (int CL_TRUE) (long dst-off) (long n-bytes)
-               (.asSlice ^MemorySegment (:segment buf) dst-off)
-               (int 0) MemorySegment/NULL MemorySegment/NULL])
-    buf))
+        staging (.asSlice ^MemorySegment (:segment buf) (long buf-off))]
+    (case direction
+      :upload
+      (do (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
+          (cl-call! "clEnqueueWriteBuffer" @h-clEnqueueWriteBuffer
+                    [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
+                     staging (int 0) MemorySegment/NULL MemorySegment/NULL]))
+      :download
+      (do (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
+                    [queue (:cl-mem buf) (int CL_TRUE) (long buf-off) (long n-bytes)
+                     staging (int 0) MemorySegment/NULL MemorySegment/NULL])
+          (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes))))))
+
+(defn upload-range!
+  "Ranged host → device copy; returns the buffer."
+  [^OclBuffer buf src spec]
+  (execute-range! buf (plan-range buf src spec :upload) :upload)
+  buf)
 
 (defn download-range!
-  "Ranged device → host copy; mirror of `upload-range!`. Returns `dst`."
-  [^OclBuffer buf dst {:keys [src-element dst-element elements]
-                       :or {src-element 0 dst-element 0}}]
-  (ensure-init!)
-  (let [{:keys [queue]} @state
-        es (long (get dtype-byte-sizes (:dtype buf) 4))
-        dst-seg (as-segment dst)
-        src-off (* (long src-element) es)
-        dst-off (* (long dst-element) es)
-        n-bytes (* (long elements) es)]
-    (check-range! "download-range!" (:n-elements buf) src-element elements es
-                  (- (.byteSize dst-seg) dst-off))
-    (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
-              [queue (:cl-mem buf) (int CL_TRUE) (long src-off) (long n-bytes)
-               (.asSlice ^MemorySegment (:segment buf) src-off)
-               (int 0) MemorySegment/NULL MemorySegment/NULL])
-    (MemorySegment/copy (:segment buf) src-off dst-seg dst-off n-bytes)
-    dst))
+  "Ranged device → host copy; returns `dst`."
+  [^OclBuffer buf dst spec]
+  (execute-range! buf (plan-range buf dst spec :download) :download)
+  dst)
 
 (defn buffer->array
   "Copy an OclBuffer's contents to a new JVM array (device → host)."

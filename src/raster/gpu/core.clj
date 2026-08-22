@@ -628,6 +628,45 @@
   [sess key dst spec]
   ((rt-resolve (:device-id @sess) "download-range!") (session-buffer sess key) dst spec))
 
+(defn- transfer-ranges!
+  "The batched core. VALIDATES EVERY entry (`plan-range`) before EXECUTING ANY. A batch is how a
+   whole KV cache moves — 36 per-layer buffers for gemma-270m — and a batched API newly makes a
+   partial state possible: a bad spec in the 30th entry leaving 29 layers written. All-or-nothing
+   on validation removes that class; nothing is copied until every range has been proved in
+   bounds. (A failure DURING execution — a device fault — is still partial; that is a different
+   class and is not promised here.)"
+  [sess entries direction]
+  (let [device-id (:device-id @sess)
+        plan (rt-resolve device-id "plan-range")
+        exec (rt-resolve device-id "execute-range!")
+        ;; phase 1: resolve + validate everything, collecting plans in order
+        plans (mapv (fn [[key host spec]]
+                      (let [buf (session-buffer sess key)]
+                        [buf (plan buf host spec direction) host]))
+                    entries)]
+    ;; phase 2: execute in order
+    (mapv (fn [[buf p host]] (exec buf p direction) (if (= :upload direction) buf host)) plans)))
+
+(defn upload-ranges!
+  "BATCHED `upload-range!`: many `[key src spec]` entries in one call, e.g. every layer of a KV
+   continuation:
+
+     (upload-ranges! sess (for [l (range 18)]
+                            [(keyword (str \"kc\" l)) (kc-segment l) {:elements (* tokens kvrow)}]))
+
+   Every entry is bounds-validated BEFORE any is copied, so a bad spec cannot leave the cache
+   half-restored. Returns the buffers, in entry order. This is the shape LMCache's
+   `batched_to_gpu` has; ours is a loop over validated plans rather than a fused kernel because a
+   position-major cache needs no gather."
+  [sess entries]
+  (transfer-ranges! sess entries :upload))
+
+(defn download-ranges!
+  "BATCHED `download-range!`: many `[key dst spec]` entries, validated all-or-nothing, executed
+   in order. Returns the destinations, in entry order."
+  [sess entries]
+  (transfer-ranges! sess entries :download))
+
 (defn buffer
   "Get a DeviceBuffer from the session by key."
   [sess key]
