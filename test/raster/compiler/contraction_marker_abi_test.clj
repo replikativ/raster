@@ -1,12 +1,10 @@
 (ns raster.compiler.contraction-marker-abi-test
-  "The contraction route can describe capabilities the current invocation marker cannot bind.
-
-   Until contraction descriptors and runtime launches share one ordered typed ABI, the compiler
-   must reject those descriptors rather than emit a valid kernel with an under-bound invocation."
+  "The contraction emitter, route, marker, registry and runtime share one ordered typed ABI."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.passes.parallel.contract-route :as route]
-            [raster.compiler.passes.parallel.par-fusion :as fusion]))
+            [raster.compiler.passes.parallel.par-fusion :as fusion]
+            [raster.gpu.ze-runtime :as ze]))
 
 (defn- mm [m n k]
   (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
@@ -33,18 +31,19 @@
     (catch clojure.lang.ExceptionInfo e
       (ex-data e))))
 
-(deftest fused-epilogue-operands-are-refused-before-an-under-bound-marker-is-emitted
+(deftest fused-epilogue-operands-are-carried-in-the-ordered-marker
   (let [contract (fuse-epilogue
                   (list 'raster.numeric/+ (list 'aget 'C 't)
                         (list 'aget 'bias (list 'mod 't 256))))
-        data (thrown-data #(compile-form contract))]
-    (testing "this is a real routed DPAS descriptor, not a synthetic malformed map"
-      (is (= :dpas (:strategy data))))
-    (testing "the marker would bind [A B] while the kernel signature also requires bias"
-      (is (= :raster/fatal (:reason data)))
-      (is (= :ordered-contraction-kernel-abi (:missing-rule data)))
-      (is (= [:epilogue-operands] (:unsupported-fields data)))
-      (is (= {:epilogue-operands '[bias]} (:unsupported-values data))))))
+        compiled (compile-form contract)
+        kernel (first (:kernels compiled))
+        marker (-> compiled :form second second)]
+    (is (= :dpas (:strategy kernel)))
+    (is (= '[A B out M N K bias] (mapv :name (:abi kernel))))
+    (is (= [:input :input :output :scalar :scalar :scalar :input]
+           (mapv :kind (:abi kernel))))
+    (testing "values appear in exactly the same order as ABI slots"
+      (is (= '[A B out 128 256 64 bias] (nth marker 2))))))
 
 (deftest codegen-only-routing-facts-remain-legal-and-observable
   (let [dp4a '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
@@ -55,12 +54,25 @@
     (testing "tensorization and packing are already baked into source and need no extra launch slot"
       (is (= :dp4a (:strategy kernel)))
       (is (true? (:tensorized kernel)))
-      (is (= :int8x4 (:packed kernel))))
+      (is (= :int8x4 (:packed kernel)))
+      (is (= [:byte :byte] (mapv :dtype (take 2 (:abi kernel)))))
+      (is (= [:int :int] (mapv :kernel-dtype (take 2 (:abi kernel))))))
     (testing "the ordinary two-input descriptor still emits the production marker"
       (is (= 'raster.gpu.ze-runtime/invoke-registered-contraction!
              (-> compiled :form second second first))))))
 
-(deftest every-unexpressed-marker-field-is-fail-loud
+(deftest epilogue-scalars-occupy-their-real-signature-position
+  (let [contract (concat (mm 128 256 64)
+                         [:epilogue {:acc 'acc
+                                     :expr '(raster.numeric/* acc alpha)
+                                     :scalars [{:sym 'alpha :dtype :float}]}])
+        compiled (compile-form contract)
+        kernel (first (:kernels compiled))
+        marker (-> compiled :form second second)]
+    (is (= '[A B C M N K alpha] (mapv :name (:abi kernel))))
+    (is (= '[A B C 128 256 64 alpha] (nth marker 2)))))
+
+(deftest non-argument-pre-steps-remain-fail-loud
   (let [base {:strategy :probe
               :kernel-name "probe_contract"
               :source "__kernel void probe_contract(__global double* A, __global double* C) {}"
@@ -68,14 +80,20 @@
               :dtype :double :out-dtype :double :out-elems 1
               :wg [1 1] :grid [1 1] :scalar-args []}
         contract (mm 1 1 1)]
-    (doseq [[field value] [[:pre-steps [{:op :transpose}]]
-                           [:lift-operands '[scale]]
-                           [:epilogue-operands '[bias]]
-                           [:epilogue-scalars '[alpha]]]]
-      (testing (name field)
-        (let [data (with-redefs [route/route-contraction
-                                 (fn [& _] (assoc base field value))]
-                     (thrown-data #(compile-form contract)))]
-          (is (= :raster/fatal (:reason data)))
-          (is (= [field] (:unsupported-fields data)))
-          (is (= {field value} (:unsupported-values data))))))))
+    (let [value [{:op :transpose}]
+          data (with-redefs [route/route-contraction
+                             (fn [& _] (assoc base :pre-steps value))]
+                 (thrown-data #(compile-form contract)))]
+      (is (= :raster/fatal (:reason data)))
+      (is (= [:pre-steps] (:unsupported-fields data)))
+      (is (= {:pre-steps value} (:unsupported-values data))))))
+
+(deftest runtime-rejects-an-abi-value-count-mismatch-before-touching-the-driver
+  (let [kernel-name (str "abi_count_probe_" (gensym))
+        abi [{:name 'A :c-name "A" :kind :input :dtype :float :kernel-dtype :float}
+             {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float}]
+        _ (ze/register-kernel! kernel-name {:abi abi})
+        data (thrown-data #(ze/invoke-registered-contraction!
+                            kernel-name [(float-array 1)] 1 [1 1] [1 1]))]
+    (is (= 2 (:expected data)))
+    (is (= 1 (:actual data)))))

@@ -154,19 +154,13 @@
     kernel))
 
 (def ^:private contraction-marker-unexpressed-fields
-  "Descriptor capabilities that `invoke-registered-contraction!` cannot execute or bind yet.
-
-   `:tensorized` and `:packed` are deliberately absent: they describe code already baked into the
-   emitted kernel and require no additional launch arguments. These fields do. Silently dropping
-   any non-empty one produces either a wrong layout (`:pre-steps`) or a launch-arity mismatch."
-  [:pre-steps :lift-operands :epilogue-operands :epilogue-scalars])
+  "Descriptor work that is outside a single kernel launch.  Kernel arguments, including lift and
+   epilogue values, are carried by the ABI; pre-steps require a scheduler to emit another launch."
+  [:pre-steps])
 
 (defn- ensure-contraction-marker-expressible!
-  "Refuse a routed descriptor whose required work/arguments the current invoke marker cannot carry.
-
-   This is the fail-loud bridge to the ordered kernel ABI: until the marker and runtime consume one
-   typed slot vector, accepting these fields would register a valid kernel and emit an invocation
-   that binds fewer arguments than its signature."
+  "Refuse routed work that is not a kernel argument.  Lift and epilogue arguments are represented
+   by the ordered ABI; a pre-step is a separate operation and still needs explicit scheduling."
   [descriptor]
   (let [unsupported (filterv #(seq (get descriptor %))
                              contraction-marker-unexpressed-fields)]
@@ -174,7 +168,7 @@
       (throw (ex-info (str "contraction: invoke marker cannot express descriptor fields "
                            (pr-str unsupported))
                       {:reason :raster/fatal
-                       :missing-rule :ordered-contraction-kernel-abi
+                       :missing-rule :contraction-pre-step-scheduling
                        :target 'raster.gpu.ze-runtime/invoke-registered-contraction!
                        :strategy (:strategy descriptor)
                        :unsupported-fields unsupported
@@ -298,7 +292,7 @@
                   k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
                                                              :out-dtype :strategy :fallback-reason
                                                              :declines :tile :tensorized :packed
-                                                             :fused-epilogue])
+                                                             :fused-epilogue :abi])
                                              {:kernel-name (:kernel-name r) :source (:source r)
                                               :dtype (:dtype r)})
                                       :ze-contracts)]
@@ -309,19 +303,14 @@
                       (:kernel-name k)
                       (vec (:array-params r))
                       (:reduce-bound r))
-              ;; Pass the descriptor through INTACT — scalar-args as data (the exact shape
-              ;; launch-2d! wants), explicit out-dtype/out-elems. Any :strategy works; the
-              ;; old (count scalar-args) + [m n k] reconstruction only covered :dpas/:regtiled.
+              ;; The marker carries only VALUES in ABI order.  Slot kind, storage dtype and kernel
+              ;; view dtype live once in the registered ABI and drive runtime binding.
                 (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
                       (:kernel-name k)
-                      (vec (:array-params r))       ; operand symbols (vector literal evaluates them)
-                      out-sym
-                      (:dtype r)
-                      (:out-dtype r)
+                      (vec (:arguments r))
                       (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
                       (vec (:wg r))
-                      (vec (:grid r))
-                      (vec (:scalar-args r)))))
+                      (vec (:grid r)))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the

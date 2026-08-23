@@ -31,7 +31,8 @@
             AddressLayout]
            [java.lang.invoke MethodHandle]
            [java.nio.file Files Path])
-  (:require [raster.compiler.core.types :as types]))
+  (:require [raster.compiler.core.types :as types]
+            [raster.compiler.ir.kernel-abi :as kabi]))
 
 ;; ================================================================
 ;; Library loading
@@ -1413,7 +1414,16 @@
             :long   (let [s (.allocate ^Arena arena I64)]
                       (.set s I64 0 (long value))
                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))))))
+                                [kernel (int idx) (long 8) s]))
+            :half   (let [s (.allocate ^Arena arena ValueLayout/JAVA_SHORT)]
+                      (.set s ValueLayout/JAVA_SHORT 0
+                            (short (Float/floatToFloat16 (float value))))
+                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                [kernel (int idx) (long 2) s]))
+            :byte   (let [s (.allocate ^Arena arena ValueLayout/JAVA_BYTE)]
+                      (.set s ValueLayout/JAVA_BYTE 0 (byte value))
+                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                [kernel (int idx) (long 1) s]))))))
 
     ;; 2D group count
     (let [gc (.allocate arena 12)]
@@ -3231,43 +3241,59 @@
   out))
 
 (defn invoke-registered-contraction!
-  "Pipeline-friendly tensor contraction: launch a routed contraction kernel (the descriptor
-  from contract-route/route-contraction) over host arrays or DeviceBuffers with a 2D grid.
-  This is the resident/host-staging analog of invoke-registered-kernel for the 2-operand
-  contraction shape C[m×n] = Σ_k A[m×k]·B[k×n]. The routing brain already chose DPAS-vs-
-  regtiled and the dtype; this just stages + launches.
+  "Launch a routed contraction by its registered ordered ABI.
 
-  Takes the routed descriptor's values INTACT — no reconstruction from dims (which only worked
-  for the two 2-operand strategies and crashed on the rest). Input sizes come from the arrays
-  themselves (alength), so any operand arity/shape works.
-
-  inputs      : host arrays (double[]/float[]/byte[]) or DeviceBuffers, in :array-params order
-  out         : host array or DeviceBuffer for the result
-  dtype       : OPERAND element type (:half converts operands to f16 for the DPAS/XMX leaf)
-  out-dtype   : RESULT element type (differs from dtype for quant: int8 in, f32 out)
-  out-elems   : number of result elements
-  wg          : [x y] workgroup   grid : [gx gy] group counts
-  scalar-args : the descriptor's :scalar-args, passed straight through to launch-2d!"
-  [^String kernel-name inputs out dtype out-dtype out-elems wg grid scalar-args]
-  (let [{:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
+   `arguments` contains evaluated values in exact ABI order.  The ABI decides which values are
+   buffers or scalars, how host buffers are staged, and the scalar type passed to Level Zero.
+  Packed kernels therefore retain byte storage while declaring a distinct int32 kernel view."
+  [^String kernel-name arguments out-elems wg grid]
+  (let [registered (get @kernel-registry kernel-name)
+        _ (when-not registered
+            (throw (ex-info (str "Kernel not registered: " kernel-name)
+                            {:kernel-name kernel-name :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        _ (when-not (= (count abi) (count arguments))
+            (throw (ex-info "contraction invocation value count does not match registered ABI"
+                            {:kernel-name kernel-name :expected (count abi)
+                             :actual (count arguments) :abi abi})))
+        {:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         out-elems (long out-elems)
-        half? (boolean (#{:half :float16} dtype))
-        esize (long (get dtype-byte-sizes dtype 8))
-        out-half? (boolean (#{:half :float16} out-dtype))
-        out-esize (long (get dtype-byte-sizes out-dtype 8))
-        dev-inputs (mapv (fn [arr idx]
-                           (if (device-buffer? arr)
-                             (:segment ^DeviceBuffer arr)
-                             (stage-operand! kernel-name (keyword (str "c-in-" idx))
-                                             arr (java.lang.reflect.Array/getLength arr) half? esize)))
-                         inputs (range))
-        out-buffer? (device-buffer? out)
-        out-seg (if out-buffer? (:segment ^DeviceBuffer out)
-                    (ensure-seg kernel-name :c-out (* out-elems out-esize)))
-        all-args (vec (concat dev-inputs [out-seg] scalar-args))
+        input-index (volatile! -1)
+        output (volatile! nil)
+        output-seg (volatile! nil)
+        all-args
+        (mapv (fn [{:keys [kind dtype kernel-dtype] :as slot} value]
+                (case kind
+                  :input
+                  (let [idx (vswap! input-index inc)
+                        half? (boolean (#{:half :float16} dtype))
+                        esize (long (get dtype-byte-sizes dtype 8))]
+                    (if (device-buffer? value)
+                      (:segment ^DeviceBuffer value)
+                      (stage-operand! kernel-name (keyword (str "c-in-" idx))
+                                      value (java.lang.reflect.Array/getLength value) half? esize)))
+
+                  :output
+                  (let [half? (boolean (#{:half :float16} dtype))
+                        esize (long (get dtype-byte-sizes dtype 8))
+                        seg (if (device-buffer? value)
+                              (:segment ^DeviceBuffer value)
+                              (ensure-seg kernel-name :c-out (* out-elems esize)))]
+                    (vreset! output value)
+                    (vreset! output-seg [seg half? esize])
+                    seg)
+
+                  :scalar
+                  {:type kernel-dtype :value value}
+
+                  (throw (ex-info "unsupported contraction ABI slot kind"
+                                  {:kernel-name kernel-name :slot slot}))))
+              abi arguments)
+        out @output
+        [out-seg out-half? out-esize] @output-seg
         [gx gy] grid]
     (launch-2d! kernel-handle wg [gx gy] all-args)
-    (when-not out-buffer?
+    (when-not (device-buffer? out)
       (readback-operand! out-seg out out-elems out-half? out-esize))
     out))
 
@@ -3422,4 +3448,3 @@
   (shutdown!)
   (init!)
   nil)
-
