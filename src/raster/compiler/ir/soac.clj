@@ -90,6 +90,17 @@
 ;; soac-outputs (a GEMM writing C with no edge → reorderable consumer). `epilogue` is the
 ;; fused same-position elementwise consumer lambda (bias/act/residual), or nil; when set,
 ;; the emitter splices it into the validated store slot (emit-gemm-tiled :epilogue).
+(defrecord SoacContract
+           [id           ;; int
+            sym          ;; symbol (binding) — the contraction's output
+            facts])      ;; contraction-facts — THE sole semantic payload (ir/contraction_facts)
+;; A contraction as a first-class SOAC node. `facts` is the whole payload: free/contract axes,
+;; operands with VERIFIED axis-maps, :decode, :combine/:init, dtype pair, :stages, :epilogue,
+;; :roles, :dims. Nothing is copied out of it onto the record (north-star §10: one registry);
+;; graph/scheduling projections are DERIVED (`soac-inputs`/`soac-outputs` below). `Dot` is the
+;; representation this replaces — it had one constructor (a unit test), was excluded from lowering,
+;; reconstruction and fusion, and could not carry most of the facts.
+
 (defrecord Dot
            [id           ;; int
             sym          ;; symbol (binding)
@@ -214,8 +225,15 @@
 (defn par-form->soac
   "Convert a raster.par/* S-expression to a SOAC record.
   Returns a SoacMap, SoacReduce, SoacScan, SoacStencil, or nil."
-  [sym expr id]
+  [sym expr id & {:keys [dtype]}]
   (cond
+    ;; par/contract → SoacContract. Was DECLINED here (:no-lowering-rule) — the one par form that
+    ;; was not a SOAC node, so it bypassed the segop boundary through a backend side branch. The
+    ;; facts are derived ONCE, here; every consumer downstream reads them instead of re-parsing.
+    (and (seq? expr) (= 'raster.par/contract (first expr)))
+    (->SoacContract id sym ((requiring-resolve 'raster.compiler.ir.contraction-facts/contraction-facts)
+                            expr :dtype (or dtype :double)))
+
     ;; Pure par/map (no output buffer) — must check before par-map-form?
     (par/par-map-pure-form? expr)
     (let [info (par/extract-par-map-pure-info expr)
@@ -315,6 +333,12 @@
   [soac]
   (stamp-elem-type
    (condp instance? soac
+     ;; a contraction reconstructs to its ORIGINAL surface form — the facts keep it for exactly
+     ;; this dialect boundary (the CPU path round-trips SOAC nodes back to par forms after
+     ;; fusion; before contract was a node it was never round-tripped, so no arm existed)
+     SoacContract
+     (:form (:facts soac))
+
      SoacMap
      (cond
        ;; In-place single-aset void map: reconstruct the imperative write so codegen
@@ -459,24 +483,33 @@
    A Dot is a contraction with its own emit path, so the map/reduce lowering must skip it."
   [node]
   (and (not (instance? ScalarBinding node))
-       (not (instance? Dot node))))
+       (not (instance? Dot node))
+       ;; a contraction has its own lowering (SegContract) and must NOT enter the generic
+       ;; map/reduce/scan lowering or lambda fusion, whose consumers assume idx/lambda/1-D bound
+       (not (instance? SoacContract node))))
+
+(defn contract? [node] (instance? SoacContract node))
 
 (defn soac-inputs
   "Get the set of input array symbols for a SOAC node (or a Dot)."
   [node]
-  (when (or (soac? node) (dot? node)) (:inputs node)))
+  (if (instance? SoacContract node)
+    (set (map :sym (:operands (:facts node))))
+  (when (or (soac? node) (dot? node)) (:inputs node))))
 
 (defn soac-outputs
   "Get the set of output symbols for a SOAC node (or a Dot — its written C, so the dependency graph
    gets a producer edge for the contraction by construction, closing the documented leak)."
   [node]
+  (if (instance? SoacContract node)
+    #{(:out (:facts node))}
   (cond
     (instance? SoacMap node)     (:outputs node)
     (instance? SoacReduce node)  #{(:output node)}
     (instance? SoacScan node)    (:outputs node)
     (instance? SoacStencil node) (:outputs node)
     (instance? Dot node)         (:outputs node)
-    :else nil))
+    :else nil)))
 
 (defn soac-bound
   "Get the iteration bound expression for a SOAC node."

@@ -242,6 +242,10 @@
         (throw (ex-info "Complex Screma not yet supported for lowering" {:soac soac})))
 
       ;; Direct SOAC dispatch
+      ;; a contraction: record the facts for this target; the backend routes from them
+      (instance? raster.compiler.ir.soac.SoacContract soac)
+      [(segop/->SegContract (:id soac) (:facts soac) dtype device-id)]
+
       (instance? raster.compiler.ir.soac.SoacMap soac)
       (lower-map soac device-id :dtype dtype)
 
@@ -260,7 +264,7 @@
   [nodes-map device-id & {:keys [dtype] :or {dtype :double}}]
   (reduce-kv
    (fn [acc id node]
-     (if (soac/soac? node)
+     (if (or (soac/soac? node) (soac/contract? node))
        (assoc acc id (lower-soac node device-id :dtype dtype))
        acc))
    {} nodes-map))

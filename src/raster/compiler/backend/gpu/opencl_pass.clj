@@ -98,25 +98,50 @@
 
       :else (:ok r))))
 
+(def ^:dynamic *bound-segops*
+  "The SegOp records `segop-lower` attached to the binding CURRENTLY being transformed (its
+   `::segops` metadata), or nil in body position / when the pass did not run.
+
+   This is the seam that makes the SegOp boundary REAL instead of nominal. `segop-lower` lowered
+   every par form with the real target device and stored the result on the binder symbol — and
+   nothing read it: this pass re-lowered each form from scratch with `:ze:0` hardcoded, ignoring
+   both the stored result and its own `device-id` (north-star §2.1, ledger #6/#11). Now the
+   stored SegOp is consumed; re-lowering is the fallback and is COUNTED, so a form that bypasses
+   the pass's output shows up in the stats instead of silently taking a second path."
+  nil)
+
+(defn- take-bound-segop
+  "The precomputed SegOp of `kind` for the current binding, if segop-lower produced one."
+  [stats kind pred]
+  (when-let [so (first (filter pred *bound-segops*))]
+    (swap! stats update :segop-reused (fnil inc 0))
+    so))
+
 (defn- par->segmap
-  "Compute SegMap on-the-fly from a par/map! form. nil (with a recorded decline) ⇒ legacy codegen."
-  [stats form dtype]
-  (segop-attempt stats :segmap form dtype
-                 #(let [par-info (par/extract-par-map-info form)
-                        soac (raster.compiler.ir.soac/par-form->soac
-                              (:out par-info) form (swap! segop-id-counter inc))]
-                    (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                            soac :ze:0 :dtype (or dtype :double))))))
+  "The SegMap for a par/map! form: the one `segop-lower` already computed for this binding when
+   available; otherwise re-lowered here with the REAL `device-id` (it was `:ze:0` hardcoded) and
+   counted as `:segop-relowered`. nil (with a recorded decline) ⇒ legacy codegen."
+  [stats form dtype device-id]
+  (or (take-bound-segop stats :segmap #(instance? raster.compiler.ir.segop.SegMap %))
+      (do (swap! stats update :segop-relowered (fnil inc 0))
+          (segop-attempt stats :segmap form dtype
+                         #(let [par-info (par/extract-par-map-info form)
+                                soac (raster.compiler.ir.soac/par-form->soac
+                                      (:out par-info) form (swap! segop-id-counter inc))]
+                            (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                    soac (or device-id :ze:0) :dtype (or dtype :double))))))))
 
 (defn- par->segred
-  "Compute SegRed on-the-fly from a par/reduce form. nil (with a recorded decline) ⇒ legacy codegen."
-  [stats form dtype]
-  (segop-attempt stats :segred form dtype
-                 #(let [sym (gensym "red_")
-                        soac (raster.compiler.ir.soac/par-form->soac
-                              sym form (swap! segop-id-counter inc))]
-                    (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                            soac :ze:0 :dtype (or dtype :double))))))
+  "The SegRed for a par/reduce form; same consume-then-relower contract as `par->segmap`."
+  [stats form dtype device-id]
+  (or (take-bound-segop stats :segred #(instance? raster.compiler.ir.segop.SegRed %))
+      (do (swap! stats update :segop-relowered (fnil inc 0))
+          (segop-attempt stats :segred form dtype
+                         #(let [sym (gensym "red_")
+                                soac (raster.compiler.ir.soac/par-form->soac
+                                      sym form (swap! segop-id-counter inc))]
+                            (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                    soac (or device-id :ze:0) :dtype (or dtype :double))))))))
 
 (defn- maybe-compile-spirv
   "Optionally compile OpenCL C to SPIR-V."
@@ -182,7 +207,7 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
-                (if-let [segmap (par->segmap stats form dtype)]
+                (if-let [segmap (par->segmap stats form dtype device-id)]
                   (let [kernel (segop-cl/generate-segmap-kernel segmap out
                                                                 :dtype dtype :scalar-types top-scalar-types
                                                                 :array-types (merge top-array-types (:array-types (meta form))))]
@@ -215,8 +240,15 @@
                   ;; pass the REAL descriptor: route-contraction fed `(or desc {})` into
                   ;; derive-gemm-tile, so the "hardware-derived" tile was derived from an empty map
                   ;; — Arc constants on every device. device-id is already in scope here.
+                  ;; CONSUME the SegContract segop-lower recorded (its facts were derived and
+                  ;; verified once, at the boundary) — the same take-bound-segop seam map/reduce
+                  ;; use. Without one (door C, no pass run) route from the form and count it.
+                  bound-sc (take-bound-segop stats :segcontract
+                                             #(instance? raster.compiler.ir.segop.SegContract %))
+                  _ (when-not bound-sc (swap! stats update :segop-relowered (fnil inc 0)))
                   r (croute/route-contraction
                      form :dtype dtype
+                     :facts (:facts bound-sc)
                      :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                  device-id)
                                 (catch Throwable _ nil)))
@@ -272,7 +304,7 @@
             ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
             (par/par-reduce-into-form? form)
             (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
-              (if-let [segred (par->segred stats reduce-form dtype)]
+              (if-let [segred (par->segred stats reduce-form dtype device-id)]
                 (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
                   (if kernel
                     (let [k (register-kernel! kernel :ze-reduces)]
@@ -297,7 +329,7 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce form))
-                (if-let [segred (par->segred stats form dtype)]
+                (if-let [segred (par->segred stats form dtype device-id)]
                   (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
                     (if kernel
                       (let [k (register-kernel! kernel :ze-reduces)]
@@ -465,9 +497,22 @@
             (and (seq? form) (contains? #{'let 'let*} (first form)))
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
-                  new-bindings (vec (mapcat (fn [[sym expr]] [sym (transform expr)]) pairs))
+                  ;; the binder symbol carries what segop-lower computed for this init — make it
+                  ;; visible to the par branches so they consume it instead of re-lowering
+                  new-bindings (vec (mapcat (fn [[sym expr]]
+                                              [sym (binding [*bound-segops*
+                                                             (:raster.compiler.passes.parallel.segop-lower-pass/segops (meta sym))]
+                                                     (transform expr))])
+                                            pairs))
                   new-body (mapv transform body-exprs)]
               (with-meta (apply list let-sym new-bindings new-body) (meta form)))
+
+            ;; a body-position par form: segop-lower wraps it in (do …) carrying ::body-segops
+            ;; — consume that exactly as a binding's ::segops, so body forms stop re-lowering
+            (and (seq? form) (= 'do (first form))
+                 (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form)))
+            (binding [*bound-segops* (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form))]
+              (with-meta (apply list 'do (mapv transform (rest form))) (meta form)))
 
             (and (seq? form) (= 'do (first form)))
             (with-meta (apply list 'do (mapv transform (rest form))) (meta form))
