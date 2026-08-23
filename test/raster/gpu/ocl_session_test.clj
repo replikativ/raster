@@ -8,6 +8,7 @@
   buffers (uninitialized device memory — Intel's driver zeroes allocations,
   POCL's malloc does not)."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.pipeline :as pl]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]))
@@ -36,6 +37,24 @@
             (clojure.core/+ acc (clojure.core/* scale (ra/aget x i))))]
     (raster.par/map-void! j n
       (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
+
+(deftest ocl-map-void-mixed-storage-abi-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl mixed-storage map-void (no OpenCL device)")
+    (let [n 64
+          q (byte-array (map #(byte (- (mod % 31) 15)) (range n)))
+          out (int-array n)
+          kernel (par-opencl/generate-par-map-void-kernel
+                  '(raster.par/map-void! i n
+                     (aset out i (+ (int (aget q i)) limit)))
+                  :dtype :float
+                  :array-types {'out :int 'q :byte}
+                  :scalar-types {'limit :int})
+          register! (resolve 'raster.gpu.ocl-runtime/register-kernel!)
+          invoke! (resolve 'raster.gpu.ocl-runtime/invoke-registered-map-void-kernel)]
+      (register! (:kernel-name kernel) kernel)
+      (invoke! (:kernel-name kernel) [out q] [{:type :int :value 7}] n)
+      (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out))))))
 
 (deftest ocl-resident-session-roundtrip
   (if-not @ocl-available?

@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing use-fixtures]]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]
@@ -77,6 +78,27 @@
       (is (= :float (:dtype kernel))))))
 
 ;; ================================================================
+;; Kernel generation: par/map-void!
+;; ================================================================
+
+(deftest generate-par-map-void-ordered-abi-test
+  (testing "multi-write/inout map-void ABI follows the emitted signature and preserves dtypes"
+    (let [form '(raster.par/map-void! i n
+                  (do (aset y i (* scale (aget x i)))
+                      (aset state i (+ (aget state i) limit))))
+          k (par-opencl/generate-par-map-void-kernel
+             form :dtype :float
+             :array-types {'state :int 'x :float 'y :float}
+             :scalar-types {'limit :int 'scale :float})]
+      (is (= '[state x y limit scale _n_bound] (mapv :name (:abi k))))
+      (is (= [:output :input :output :scalar :scalar :scalar] (mapv :kind (:abi k))))
+      (is (= [:int :float :float :int :float :int] (mapv :dtype (:abi k))))
+      (is (= [:inout :operand :effect :parameter :parameter :bound]
+             (mapv :role (:abi k))))
+      (is (= '[state x y] (:array-params k)))
+      (is (= '[state x y limit scale n] (:arguments k))))))
+
+;; ================================================================
 ;; Kernel generation: par/reduce
 ;; ================================================================
 
@@ -116,6 +138,22 @@
             body (nth transformed 2)] ;; body of let*
         (is (and (seq? body)
                  (= 'raster.gpu.ze-runtime/invoke-registered-kernel (first body))))))))
+
+(deftest opencl-pass-map-void-marker-follows-abi-test
+  (testing "the compatibility marker is projected from the ordered ABI"
+    (let [form '(raster.par/map-void! i n
+                  (do (aset y i (* scale (aget x i)))
+                      (aset state i (+ (aget state i) limit))))
+          result (opencl-pass/opencl-pass
+                  form :device-id :ze:0 :dtype :float
+                  :array-types {'state :int 'x :float 'y :float}
+                  :scalar-types {'limit :int 'scale :float})
+          marker (:form result)
+          abi (:abi (first (:kernels result)))]
+      (is (= 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel (first marker)))
+      (is (= (kabi/pointer-binding-names abi) (nth marker 2)))
+      (is (= '[limit scale] (nth marker 3)))
+      (is (= 'n (nth marker 4))))))
 
 (deftest opencl-pass-fallback-test
   (testing "Small arrays fall back to scalar expansion"

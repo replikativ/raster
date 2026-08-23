@@ -9,6 +9,7 @@
             [raster.core :refer [defvalue deftm]]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.runtime.display :as display])
   (:import [java.lang.foreign MemorySegment ValueLayout]))
 
@@ -157,7 +158,19 @@
       (is (str/includes? source "__global float* particles_vx"))
       (is (str/includes? source "__global float* particles_vy"))
       ;; Should NOT have a single particles param
-      (is (not (re-find #"__global float\* particles[^_]" source))))))
+      (is (not (re-find #"__global float\* particles[^_]" source))))
+    (testing "physical field slots retain one logical GpuSoA binding"
+      (let [body (tag-body
+                  (list 'raster.par/map-void! 'i 'n
+                        '(let* [p (aget particles i)]
+                               (aset particles i p)))
+                  {'particles 'TestParticleSoA})
+            kernel (first (:kernels (opencl-pass/opencl-pass body :dtype :float)))
+            abi (:abi kernel)]
+        (is (= '[particles_x particles_y particles_vx particles_vy _n_bound]
+               (mapv :name abi)))
+        (is (= '[particles] (kabi/pointer-binding-names abi)))
+        (is (= '[particles] (:array-params kernel)))))))
 
 (deftest soa-kernel-aget-field-projects-test
   (testing "SoA aget + field projection scalar-replaces to the per-field array read"

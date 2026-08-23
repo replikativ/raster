@@ -129,8 +129,9 @@
   array-types: {sym -> :float|:int|:long|:double} for mixed-type params.
   Written arrays get __global TYPE* (not const restrict).
 
-  Returns {:kernel-name str :source str :array-params [syms]
-           :scalar-params [syms] :written-arrays #{syms} :dtype kw}."
+  Returns {:kernel-name str :source str :abi [ordered typed physical slots]
+           :array-params [logical binding syms] :scalar-params [syms]
+           :written-arrays #{syms} :dtype kw}."
   [form & {:keys [dtype kernel-name-prefix array-types scalar-types]
            :or {dtype :float kernel-name-prefix "par_map_void"
                 array-types {} scalar-types {}}}]
@@ -149,6 +150,7 @@
         soa-expansions (sl/collect-soa-env body)
         array-syms (ce/collect-arrays-in-body body)
         written-syms (ce/collect-written-arrays body)
+        read-syms (ce/collect-read-arrays body)
         scalar-syms (ce/collect-scalars-in-body body idx array-syms)
         all-arr-params (vec (sort-by name array-syms))
         ;; Partition: SoA arrays vs plain arrays
@@ -161,6 +163,13 @@
                      (get codegen/opencl-type-map t default-ctype)))
         written? (fn [s] (or (contains? written-syms s)
                              (contains? written-syms (symbol (name s)))))
+        read? (fn [s] (or (contains? read-syms s)
+                          (contains? read-syms (symbol (name s)))))
+        pointer-role (fn [s]
+                       (cond
+                         (and (written? s) (read? s)) :inout
+                         (written? s) :effect
+                         :else :operand))
         ;; Plain array params
         plain-arr-param-str (str/join ", "
                                       (map (fn [s]
@@ -185,12 +194,53 @@
                                             soa-arr-params))
         ;; Infer scalar types: check explicit scalar-types map, name heuristic, or metadata
         scl-type (fn [s] (ce/scalar-native-type s scalar-types default-ctype))
+        scalar-dtype (fn [s]
+                       (case (scl-type s)
+                         "int" :int
+                         "long" :long
+                         "double" :double
+                         "float" :float))
+        element-dtype (fn [tag]
+                        (case tag
+                          double :double
+                          float :float
+                          long :long
+                          int :int
+                          byte :byte))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
         all-params (str/join ", "
                              (remove empty?
                                      [plain-arr-param-str soa-arr-param-str scl-param-str "int _n_bound"]))
+        ;; The ABI describes the PHYSICAL C signature. An SoA contributes one pointer per field,
+        ;; each linked back to the single logical caller binding via :binding. This lets source
+        ;; validation and driver binding share one record without making the marker flatten a
+        ;; GpuSoA itself.
+        abi (kabi/validate!
+             (vec
+              (concat
+               (map (fn [s]
+                      (kabi/slot s (if (written? s) :output :input)
+                                 (get array-types s (get array-types (symbol (name s)) dtype))
+                                 :c-name (ce/c-symbol s)
+                                 :role (pointer-role s)))
+                    plain-arr-params)
+               (mapcat (fn [s]
+                         (map (fn [{field-name :name element-tag :element-tag}]
+                                (let [field-sym (sl/field-arr-sym (symbol (name s)) field-name)]
+                                  (kabi/slot field-sym (if (written? s) :output :input)
+                                             (element-dtype element-tag)
+                                             :c-name (ce/c-symbol field-sym)
+                                             :binding s
+                                             :role (pointer-role s))))
+                              (:fields (get soa-expansions (symbol (name s))))))
+                       soa-arr-params)
+               (map (fn [s]
+                      (kabi/slot s :scalar (scalar-dtype s)
+                                 :c-name (ce/c-symbol s) :role :parameter))
+                    scl-params)
+               [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         ;; SROA: scalar-replace value-type access so the body has only per-field
         ;; plain array ops (no struct typedef / SoA aget-aset left for the C emitter).
         lowered-body (sl/lower-body soa-expansions body)
@@ -256,10 +306,14 @@
                         (str "for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
                              "        " body-str "\n"
                              "    }"))
-                    "\n}\n")]
+                    "\n}\n")
+        _ (kabi/validate-source-signature! kernel-name source abi)
+        binding-params (kabi/pointer-binding-names abi)]
     {:kernel-name    kernel-name
      :source         source
-     :array-params   all-arr-params
+     :abi            abi
+     :arguments      (vec (concat binding-params scl-params [(:bound info)]))
+     :array-params   binding-params
      :soa-expansions soa-expansions
      :scalar-params  scl-params
      :written-arrays written-syms

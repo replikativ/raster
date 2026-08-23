@@ -1705,6 +1705,27 @@
      body)
     @written))
 
+(defn collect-read-arrays
+  "Collect array symbols whose existing contents are read. Atomic updates and collect! counters
+   are read-modify-write operations and therefore count as reads as well as writes."
+  [body]
+  (let [read (atom #{})]
+    (walk/postwalk
+     (fn [form]
+       (when (seq? form)
+         (let [head (first form)]
+           (when (and (descriptor/aget-op? head) (>= (count form) 3))
+             (swap! read conj (second form)))
+           (when (and (contains? #{'raster.par/atomic-add! 'par/atomic-add!} head)
+                      (>= (count form) 4))
+             (swap! read conj (second form)))
+           (when (and (contains? #{'raster.par/collect! 'par/collect!} head)
+                      (>= (count form) 2))
+             (swap! read conj (second form)))))
+       form)
+     body)
+    @read))
+
 ;; ================================================================
 ;; GPU function helpers — auto-inlining of deftm scalar helpers
 ;; ================================================================

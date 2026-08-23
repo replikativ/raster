@@ -410,14 +410,15 @@
                                                                   :array-types top-array-types
                                                                   :scalar-types top-scalar-types)
                       k (register-kernel! kernel :ze-maps)
-                      soa-exp (or (:soa-expansions k) {})
-                      all-params (:array-params k)
-                      plain-params (filterv #(not (contains? soa-exp (symbol (name %)))) all-params)
-                      soa-params (filterv #(contains? soa-exp (symbol (name %))) all-params)]
+                      abi (:abi k)
+                      pointer-args (kabi/pointer-binding-names abi)
+                      scalar-args (mapv :name
+                                        (remove #(= :bound (:role %))
+                                                (kabi/scalar-slots abi)))]
                   (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
                         (:kernel-name k)
-                        (vec (concat plain-params soa-params))
-                        (vec (:scalar-params k))
+                        pointer-args
+                        scalar-args
                         bound))))
 
             ;; par/scan-exclusive
