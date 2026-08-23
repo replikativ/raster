@@ -554,7 +554,11 @@
    for the SLM-staged fork it is load-bearing (a deeper pipeline than SLM holds fails to compile)."
   [desc tile]
   (let [{:keys [block-m block-n block-k]} tile
-        slm (long (:shared-local-memory desc (:slm-bytes desc 65536)))
+        ;; The descriptor carries SLM at [:cache :slm] (see build-descriptor :114). This used to read
+        ;; two keys the descriptor never has and fall through to 65536 — so on the 128 KB Arc it
+        ;; computed 4 stages where the truth is 8, silently pruning every deepest-pipeline
+        ;; candidate from every autotune search. Ledger #3.
+        slm (long (or (get-in desc [:cache :slm]) (:shared-local-memory desc) 65536))
         ;; one pipeline stage stages an A K-panel (block-m×block-k) + a B K-panel (block-k×block-n),
         ;; f16 = 2 bytes each.
         panel-bytes (* 2 (+ (* (long block-m) (long block-k))

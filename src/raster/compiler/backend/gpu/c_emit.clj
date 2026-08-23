@@ -1732,20 +1732,36 @@
 
 (defn- try-add-gpu-helper
   "Check if a var is a GPU-inlinable deftm and add it to result if not seen.
-  Always stores the resolved base var's qualified name as :sym for consistent c-name generation."
+  Always stores the resolved base var's qualified name as :sym for consistent c-name generation.
+
+  A HARDWARE INTRINSIC'S BODY IS THE JVM REFERENCE, NOT A HELPER TO DEFINE IN C. If the intrinsics
+  registry owns this op's C lowering (`op->c-lowering` non-nil), the call site lowers to the
+  registry's function (e.g. `rstr_dp4a`) and the registry emits its own `c-helper-src`. Generating a
+  `gpufn_` definition from the deftm BODY as well emitted `par/dp4a`'s sign-extension reference —
+  `unchecked_int`, an inner `fn` — as C, and the OpenCL compile failed with `use of undeclared
+  identifier 'unchecked_int'`; gemma-270m `bind-decode!` died there. The discriminator is REGISTRY
+  OWNERSHIP, not `^:no-inline`: the CPU-C int8-MAC seam is `^:no-inline` and DOES want a generated
+  helper (cpu/aot.clj helper-c-defs)."
   [sym seen result]
   (when-not (contains? @seen sym)
     (when-let [v (resolve-gpu-inlinable-var sym)]
       (let [m (meta v)
-            ;; Use the resolved var's qualified name, not the original sym
-            ;; This ensures -impl vars map to the same c-name as direct calls
+            ;; the resolved var's qualified name, so -impl vars map to the same c-name as direct calls
             base-sym (symbol (str (.-ns ^clojure.lang.Var v)) (str (:name m)))]
-        (swap! seen conj sym)
-        (swap! result conj
-               {:sym base-sym :var v
-                :source-body (:raster.core/deftm-source-body m)
-                :params (:raster.core/deftm-params m)
-                :tags (:raster.core/deftm-tags m)})))))
+        ;; The collector records the MANGLED dispatch name (`raster.par/dp4a_m_long_long_long`),
+        ;; which the registry does not know. Ask about the `_m_` parent — the same walk
+        ;; `dispatch/no-inline?` does — so a devirtualized intrinsic call is recognised.
+        (when-not (let [n (name base-sym)
+                        parent (if-let [i (clojure.string/index-of n "_m_")]
+                                 (symbol (namespace base-sym) (subs n 0 i))
+                                 base-sym)]
+                    (intrinsics/op->c-lowering parent false))
+          (swap! seen conj sym)
+          (swap! result conj
+                 {:sym base-sym :var v
+                  :source-body (:raster.core/deftm-source-body m)
+                  :params (:raster.core/deftm-params m)
+                  :tags (:raster.core/deftm-tags m)}))))))
 
 (defn collect-gpu-fn-calls
   "Scan body for calls to GPU-inlinable deftm functions.
@@ -1767,6 +1783,25 @@
        form)
      body)
     @result))
+
+(defn intrinsic-helper-sources
+  "The C helper DEFINITIONS for every registry intrinsic whose C function is CALLED in
+   `body-str`, each once, in table order. Registry-driven: an intrinsic that carries a
+   `:c-helper-src` (today `:dp4a` → `inline int rstr_dp4a(...)`) is defined iff its `:c :fn`
+   name appears in the emitted body.
+
+   Why this exists: the call site lowered `(par/dp4a …)` to `rstr_dp4a(...)` correctly, but only
+   the staged-contraction emitter prepended the helper — hardcoded as `(intrinsics/descriptor
+   'dp4a)`. Every other kernel that used the intrinsic compiled to `use of undeclared identifier
+   'rstr_dp4a'`. One registry scan replaces the per-emitter, per-intrinsic special case."
+  [body-str]
+  (->> intrinsics/table
+       (keep (fn [[_ {:keys [c c-helper-src]}]]
+               (when (and c-helper-src (:fn c)
+                          (re-find (re-pattern (str "\\b" (java.util.regex.Pattern/quote (:fn c)) "\\(")) body-str))
+                 c-helper-src)))
+       distinct
+       (str/join "\n")))
 
 (defn generate-c-helper
   "Generate a static C helper function from a GPU-inlinable deftm."

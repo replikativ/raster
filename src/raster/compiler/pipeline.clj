@@ -2008,17 +2008,30 @@
       (str (clojure.string/join "\n" (take max-lines lines))
            "\n  [... " (- (count lines) max-lines) " more lines]\n"))))
 
+(defn- decline-stats?
+  "Do these pass stats record a conversion that DECLINED? (`:segops-declined`, `:segop-declined`,
+   `:declines` — the #95 family.) A decline leaves the form byte-identical, so without this the
+   diagnostic was hidden precisely when it existed."
+  [stats]
+  ;; stats mix counters (:ze-maps 0 — a Long) with records; only a COLLECTION can be a decline list
+  (boolean (some (fn [[k v]] (and (coll? v) (seq v) (re-find #"declin" (name k)))) stats)))
+
 (defn- print-stage
-  "Print a single pipeline stage. Returns true if printed (not unchanged)."
+  "Print a single pipeline stage. Returns true if the form was printed.
+
+   Stats are printed whenever present — a pass that changes only metadata (segop-lower attaching
+   SegOps, or recording a decline) leaves the form `=` to the previous stage, and the old
+   `[unchanged]` short-circuit dropped its stats on the floor. That is how a declined contraction
+   was invisible in this tool while `show-pipeline` carried the record all along."
   [n label form prev-form & {:keys [stats always?]}]
   (println (str "\n--- Stage " n ": " label " ---"))
+  (when stats
+    (println (str "  Stats: " (pr-str stats)))
+    (when (decline-stats? stats)
+      (println "  ^^ this pass DECLINED a conversion; see the record above")))
   (if (and (not always?) prev-form (= form prev-form))
-    (do (println "  [unchanged]") false)
-    (do
-      (when stats
-        (println (str "  Stats: " (pr-str stats))))
-      (print (pprint-form form 30))
-      true)))
+    (do (println "  [form unchanged]") false)
+    (do (print (pprint-form form 30)) true)))
 
 (defn explain-pipeline
   "Print human-readable stage-by-stage compilation explanation.
@@ -2043,15 +2056,25 @@
                     :scalar  ", scalar"
                     "")
                   ") ==="))
-    ;; Hardware info
+    ;; Hardware info — the TARGET device. This printed `hardware/default-device` (the host CPU)
+    ;; for a :ze:0 compile, so the line lied about what the kernels were compiled for.
     (hardware/init!)
-    (let [dev (hardware/default-device)]
+    (let [target-device (:target-device opts)
+          dev (if target-device (hardware/device target-device) (hardware/default-device))]
       (when dev
-        (println (str "Hardware: " (:name dev)
+        (println (str "Hardware: " (:name dev) " [" (or (:id dev) target-device) "]"
                       (when-let [lanes (hardware/simd-lanes (:id dev) :double)]
                         (str ", " lanes " double lanes"))
                       (when-let [flanes (hardware/simd-lanes (:id dev) :float)]
-                        (str ", " flanes " float lanes"))))))
+                        (str ", " flanes " float lanes"))))
+        ;; which numbers the hardware SAID vs which came from a table — so a reader deciding
+        ;; whether to trust a roofline can see where it came from
+        (when-let [src (:source dev)]
+          (when (map? src)
+            (let [by (group-by val src)]
+              (println (str "  provenance: " (count (get by :detected)) " detected, "
+                            (count (get by :catalogued)) " catalogued"
+                            (when-let [m (seq (get by :measured))] (str ", " (count m) " measured")))))))))
 
     ;; Source (if available)
     (when source-body
@@ -2063,18 +2086,12 @@
 
     ;; Unified stage printing — walks the pass vector
     (let [passes forward-passes
-          stage-labels {:lower "Lower" :fixpoint "Fixpoint"
-                        :dce "DCE" :buffer-fuse "Buffer Fusion"
-                        :soac-fuse "SOAC Fusion"
-                        :materialize "Materialize"
-                        :segop-lower "SegOp Lower"
-                        :compound-detect "Compound Detect"
-                        :backend "Backend"
-                        :resolve-alength "Resolve Alength"
-                        :mem-merge "Memory Merge"
-                        ;; Building blocks (for custom pipelines)
-                        :expand "Expand" :mode-select "Mode Select"
-                        :gpu-plan "GPU Plan"}
+          ;; ONE source for the sequence: the vector that RAN. Labels come from pass-specs (a
+          ;; pass without :label prints its keyword — loud, never dropped). The old parallel
+          ;; `stage-labels` table lacked three live passes (late-cleanup, loop-lift,
+          ;; write-read-fuse) and carried three dead ones (expand, mode-select, gpu-plan): a
+          ;; fourth disagreeing description of the pipeline, in the tool meant to be the truth.
+          stage-labels (into {} (map (fn [[k spec]] [k (or (:label spec) (name k))])) pass-specs)
           walked (:walked result)
           prev (atom walked)]
       (print-stage 0 "Walker" walked nil :always? true)
@@ -2087,14 +2104,24 @@
           (when form
             (print-stage (inc n) label form @prev :stats stats)
             (reset! prev form))))
-      ;; Kernel info
+      ;; Kernel info: WHICH leaf, WHY not a faster one, WHAT tile — the routing decision. These
+      ;; keys were dropped by opencl-pass's select-keys, so the record could not say any of it.
       (when-let [kernels (:kernels result)]
+        (println "\n--- Kernels ---")
         (doseq [k kernels]
-          (when-let [occ (:occupancy-estimate k)]
-            (println (str "  Kernel " (:kernel-name k)
-                          ": occupancy=" (format "%.0f%%" (* 100.0 (:occupancy occ)))
-                          " blocks/SM=" (:blocks-per-sm occ)
-                          " limited-by=" (name (:limiting-factor occ))))))))
+          (println (str "  " (:kernel-name k)
+                        (when-let [s (:strategy k)] (str "  strategy=" s))
+                        (when-let [r (:fallback-reason k)] (str "  fallback-reason=" r))
+                        (when-let [t (:tile k)]
+                          (str "  tile=" (:block-m t) "x" (:block-n t) "/" (:sg-m t) "x" (:sg-n t)
+                               " k" (:block-k t) " stages=" (:num-stages t 3)))
+                        (when-let [occ (:occupancy-estimate k)]
+                          (str "  occupancy=" (format "%.0f%%" (* 100.0 (:occupancy occ)))
+                               " limited-by=" (name (:limiting-factor occ))))))
+          (when-let [ds (seq (:declines k))]
+            (doseq [d ds]
+              (println (str "      declined " (:leaf d) ": " (:reason d)
+                            (when-let [m (:message d)] (str " — " m)))))))))
 
     (println)
     result))

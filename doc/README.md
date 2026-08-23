@@ -37,5 +37,5 @@ ongoing and planned work:
 | [Type System](../design/type-system.md) | Typed multiple dispatch design |
 | [Autodiff](../design/autodiff.md) | AD design and implementation |
 | [SOAC Fusion](../design/soac-fusion.md) | Loop fusion design |
-| [Loop Vectorization](../design/loop-vectorization.md) | Auto-vectorization design |
 | [Functional Combinators](../design/functional-combinators.md) | Pure parallel form design |
+| [Compiler North Star](../design/compiler-north-star.md) | Verified GPU IR, scheduling, artifacts, autotuning, and distributed execution |

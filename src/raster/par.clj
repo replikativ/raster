@@ -418,7 +418,7 @@
          (clojure.core/aset a# i# (unchecked-add-int old# (int ~val)))
          old#))))
 
-(defn dp4a
+(deftm ^:no-inline dp4a
   "4-way int8 dot-accumulate. `a` and `b` each pack four signed int8 lanes into an int32,
   little-endian (lane 0 = low byte), exactly as `as_char4` reinterprets memory on a
   little-endian device. Returns `acc + Σ_i lane_i(a)·lane_i(b)`.
@@ -427,8 +427,18 @@
   GPU and CPU-C backends lower a `(par/dp4a a b acc)` call to `rstr_dp4a(a, b, acc)` (a
   portable scalar helper the OpenCL/C compiler pattern-matches to a hardware dp4a:
   Intel/CUDA `__dp4a`, AMD `sdot4`). The masked extraction below is sign-correct
-  regardless of how the int sign-extends into the JVM long."
-  ^long [a b acc]
+  regardless of how the int sign-extends into the JVM long.
+
+  A `deftm`, not a `defn`, so the walker STAMPS its Long result type. As a plain defn it had no
+  declared return type, every let-bound `(par/dp4a …)` intermediate reached the GPU fixpoint
+  edge untagged, and the typedness census (correctly) refused the program — `bind-decode!` on
+  gemma-3-270m failed with `14 non-exempt untagged binding(s) {raster.par/dp4a 14}` from the
+  d1/d2 pairs in `quant/kernels-k`'s Q4_K kernel. A loop-accumulator use slipped past only
+  because loop BINDERS are census-exempt. The backends match this op by its symbol through the
+  intrinsics registry (`:dp4a` → `rstr_dp4a`), which the `:raster.op/original` stamp preserves,
+  so emission is unchanged. Do not exempt dp4a from the census instead: the census exists to
+  catch exactly the narrowing class an untyped integer accumulate can hide."
+  [a :- Long, b :- Long, acc :- Long] :- Long
   (let [a (long (unchecked-int a)) b (long (unchecked-int b))
         sx (fn ^long [^long x ^long sh]
              (let [v (bit-and (unsigned-bit-shift-right x sh) 0xFF)]

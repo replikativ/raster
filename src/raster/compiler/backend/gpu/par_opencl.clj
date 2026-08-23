@@ -10,7 +10,8 @@
   Usage:
     (opencl-pass form :device-id :ze:0)
     ;; Returns {:form new-form :stats {...} :kernels [...]}"
-  (:require [raster.compiler.backend.intrinsics :as intrinsics]
+  (:require [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.ir.par :as par]
             [raster.runtime.hardware :as hw]
             [raster.compiler.core.hardware :as chw]
@@ -44,21 +45,15 @@
   (:c-helper-src (intrinsics/descriptor 'dp4a)))
 
 (defn- body-uses-dp4a?
-  "True if the kernel body calls the dp4a int8-dot primitive (any spelling)."
+  "True if the kernel body calls the dp4a int8-dot primitive — ANY spelling, including the
+   walker's devirtualized `(.invk dp4a_m_…-impl …)`. Registry-classified via `semantic-op`,
+   NOT a literal `#{'dp4a 'par/dp4a 'raster.par/dp4a}` head set: that set was blind to the
+   `.invk` form, so once `par/dp4a` became a deftm (so the census could see its type) the
+   helper was no longer prepended and every kernel using it failed OpenCL compile with
+   `use of undeclared identifier 'rstr_dp4a'`. Same defect class as the #93 aget matchers."
   [body]
-  (let [found (atom false)]
-    (walk/postwalk
-     (fn [form]
-       (when (and (seq? form)
-                  (contains? #{'dp4a 'par/dp4a 'raster.par/dp4a} (first form)))
-         (reset! found true))
-       form)
-     body)
-    @found))
-
-;; Kernel generators
-;; ================================================================
-
+  (boolean (some (fn [f] (and (seq? f) (= 'raster.par/dp4a (descriptor/semantic-op f))))
+                 (tree-seq coll? seq body))))
 (defn generate-par-map-kernel
   "Generate an OpenCL C kernel from a raster.par/map! form.
 
@@ -233,7 +228,8 @@
                     "#pragma OPENCL EXTENSION cl_khr_global_int32_base_atomics : enable\n"
                     helper-sources
                     (when needs-float-atomic? atomic-add-float-helper)
-                    (when (body-uses-dp4a? body) rstr-dp4a-helper)
+                    ;; registry-owned intrinsic definitions (rstr_dp4a …), defined iff called
+                    (ce/intrinsic-helper-sources body-str)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    "
