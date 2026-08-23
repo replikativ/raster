@@ -20,7 +20,8 @@
             [raster.arrays :as ra]
             [raster.par :as par]
             [raster.compiler.pipeline :as pl]
-            [raster.compiler.core.dispatch :as dispatch]))
+            [raster.compiler.core.dispatch :as dispatch]
+            [raster.dl.gpu-grad-parity :as gp]))
 
 ;; a deftm that uses dp4a in exactly the shape that failed: a let-bound intermediate chain
 (deftm dp4a-chain! [wp :- (Array int), xp :- (Array int), out :- (Array int), n :- Long] :- Void
@@ -58,12 +59,16 @@
           "no fragment of the JVM reference body leaked into the C"))))
 
 (deftest the-kernel-actually-compiles-for-the-device
+  ;; needs `ocloc` (the Intel OpenCL offline compiler) and a device — CI has neither; the three
+  ;; emit-level tests above run everywhere and pin the same defects at the source level
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "intrinsic opacity: real OpenCL compile of the emitted kernel")
   (testing "the only assertion that catches BOTH a leaked body and a missing helper definition:
             hand the emitted source to the OpenCL compiler"
     (let [src (str (:source (first (:kernels (pl/show-pipeline #'dp4a-chain!
                                                                :target-device :ze:0 :dtype :float)))))
           hex (get-in ((requiring-resolve 'raster.runtime.hardware/device) :ze:0) [:capabilities :device-id-hex])]
-      (is (some? ((requiring-resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv) src :device hex))))))
+      (is (some? ((requiring-resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv) src :device hex)))))))
 
 (deftest the-jvm-reference-is-unchanged
   (testing "deftm + ^:no-inline changed NOTHING about the reference semantics (sign-heavy lanes)"
