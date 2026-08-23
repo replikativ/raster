@@ -128,6 +128,16 @@
         ;; this unique test entry cannot retain native resources (none were created here).
         (ze/register-kernel! kernel-name {:test-tombstone? true})))))
 
+(deftest staging-refuses-to-invent-a-map-abi
+  (let [kernel-name (str "missing_abi_" (gensym))]
+    (ze/register-kernel! kernel-name {:dtype :float})
+    (try
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no ordered ABI"
+                            (ze/invoke-registered-kernel
+                             kernel-name [] (float-array 1) [] 1)))
+      (finally
+        (ze/register-kernel! kernel-name {:test-tombstone? true})))))
+
 (deftest staging-rejects-pointer-dtype-mismatch-before-driver-loading
   (let [kernel-name (str "abi_dtype_mismatch_" (gensym))]
     (ze/register-kernel! kernel-name {:abi map-abi :dtype :float})

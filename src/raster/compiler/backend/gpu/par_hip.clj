@@ -58,8 +58,8 @@
                   idx (set (map #(symbol (name %)) arr-params)))))
 
 (defn generate-par-map-kernel
-  "CUDA/HIP kernel from a raster.par/map! form. Mirrors par_opencl/generate-par-map-kernel with
-   the CUDA-C wrapper. Returns {:kernel-name :source :array-params :scalar-params :dtype :target}."
+  "CUDA/HIP kernel from a raster.par/map! form. Returns the legacy HIP kernel info map until that
+   backend joins the KernelArtifact boundary."
   [form & {:keys [dtype kernel-name-prefix scalar-types target]
            :or {dtype :double kernel-name-prefix "par_map" scalar-types {} target :cuda}}]
   (let [info        (par/extract-par-map-info form)

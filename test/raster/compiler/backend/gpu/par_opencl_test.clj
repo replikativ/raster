@@ -28,11 +28,16 @@
 ;; Kernel generation: par/map!
 ;; ================================================================
 
-(deftest generate-par-map-kernel-simple-test
+(defn- emitted-map
+  [form & opts]
+  (first (:kernels (apply opencl-pass/opencl-pass form
+                          (concat [:min-elements 0] opts)))))
+
+(deftest generate-segmap-kernel-artifact-simple-test
   (testing "Simple element-wise add with OpenCL syntax"
     (let [form '(raster.par/map! out i n double (+ (aget a i) (aget b i)))
-          kernel (par-opencl/generate-par-map-kernel form)]
-      (is (some? kernel))
+          kernel (emitted-map form)]
+      (is (kart/kernel-artifact? kernel))
       (is (string? (:kernel-name kernel)))
       (is (string? (:source kernel)))
       ;; OpenCL-specific syntax
@@ -46,37 +51,39 @@
       (is (not (str/includes? (:source kernel) "__global__")))
       (is (not (str/includes? (:source kernel) "extern \"C\"")))
       ;; Check parameter lists
-      (is (= 2 (count (:array-params kernel))))
+      (is (= 2 (count (kart/attribute kernel :array-params))))
       (is (= '[a b out _n_bound] (mapv :name (:abi kernel))))
       (is (= [:input :input :output :scalar] (mapv :kind (:abi kernel))))
       (is (= '[a b out n] (:arguments kernel)))
-      (is (= :double (:dtype kernel))))))
+      (is (= :double (kart/attribute kernel :dtype)))
+      (is (= :segmap (get-in kernel [:provenance :dialect])))
+      (is (= [256] (get-in kernel [:launch :workgroup-size]))))))
 
-(deftest generate-par-map-kernel-scalar-test
+(deftest generate-segmap-kernel-scalar-test
   (testing "Map with scalar parameter"
     (let [form '(raster.par/map! out i n double (* alpha (aget a i)))
-          kernel (par-opencl/generate-par-map-kernel form)]
-      (is (some? kernel))
+          kernel (emitted-map form)]
+      (is (kart/kernel-artifact? kernel))
       (is (str/includes? (:source kernel) "alpha"))
-      (is (= 1 (count (:array-params kernel))))
+      (is (= 1 (count (kart/attribute kernel :array-params))))
       (is (= '[a out alpha _n_bound] (mapv :name (:abi kernel))))
       (is (= [:double :double :double :int] (mapv :dtype (:abi kernel)))))))
 
-(deftest generate-par-map-kernel-math-test
+(deftest generate-segmap-kernel-math-test
   (testing "Map with math operations"
     (let [form '(raster.par/map! out i n double (Math/sin (aget a i)))
-          kernel (par-opencl/generate-par-map-kernel form)]
+          kernel (emitted-map form)]
       (is (some? kernel))
       (is (str/includes? (:source kernel) "sin(")))))
 
-(deftest generate-par-map-kernel-float-test
+(deftest generate-segmap-kernel-float-test
   (testing "Float dtype kernel — no fp64 pragma"
     (let [form '(raster.par/map! out i n float (+ (aget a i) (aget b i)))
-          kernel (par-opencl/generate-par-map-kernel form :dtype :float)]
+          kernel (emitted-map form :dtype :float)]
       (is (some? kernel))
       (is (str/includes? (:source kernel) "float"))
       (is (not (str/includes? (:source kernel) "cl_khr_fp64")))
-      (is (= :float (:dtype kernel))))))
+      (is (= :float (kart/attribute kernel :dtype))))))
 
 ;; ================================================================
 ;; Kernel generation: par/map-void!
@@ -119,7 +126,7 @@
       ;; Must NOT have CUDA
       (is (not (str/includes? (:source kernel) "__syncthreads()")))
       (is (= :segred (get-in kernel [:provenance :dialect])))
-      (is (= 256 (get-in kernel [:launch :workgroup-size]))))))
+      (is (= [256] (get-in kernel [:launch :workgroup-size]))))))
 
 ;; ================================================================
 ;; Pipeline pass: opencl-pass
@@ -136,6 +143,7 @@
       (is (map? (:stats result)))
       (is (= 1 (:ze-maps (:stats result))))
       (is (= 1 (count (:kernels result))))
+      (is (kart/kernel-artifact? (first (:kernels result))))
       ;; Check the marker form
       (let [transformed (:form result)
             body (nth transformed 2)] ;; body of let*

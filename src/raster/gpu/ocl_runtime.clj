@@ -21,7 +21,8 @@
            [java.lang.invoke MethodHandle])
   (:require [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
-            [raster.compiler.ir.kernel-artifact :as kart]))
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
 ;; Library loading
@@ -1089,6 +1090,18 @@
   [kernel-name]
   (get @kernel-registry kernel-name))
 
+(defn- registered-1d-workgroup-size
+  "Read the canonical artifact workgroup or the remaining plain registry entry. A 1-D binder must
+   reject rather than flatten multidimensional launch geometry."
+  [kernel-info]
+  (if-let [launch (:launch kernel-info)]
+    (let [workgroup (klaunch/static-workgroup-size launch)]
+      (when-not (= 1 (count workgroup))
+        (throw (ex-info "1-D kernel path received a multidimensional launch contract"
+                        {:kernel-name (:kernel-name kernel-info) :launch launch})))
+      (first workgroup))
+    (long (or (:workgroup-size kernel-info) 256))))
+
 (defn- create-kernel-fresh
   "A DEDICATED cl_kernel per binding — kernel args are mutable state on the
   kernel object (same clobbering hazard as Level Zero shared handles)."
@@ -1122,10 +1135,10 @@
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [program workgroup-size dtype]
-          :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+         {:keys [program dtype] :or {dtype :float} :as loaded}
+         (ensure-kernel-loaded! kernel-name)
          kh (create-kernel-fresh program kernel-name)
-         wg (long (get opts :workgroup-size workgroup-size))
+         wg (long (get opts :workgroup-size (registered-1d-workgroup-size loaded)))
          n (long n)
          scalar-type (if (= dtype :float) :float :double)
          idx (atom -1)

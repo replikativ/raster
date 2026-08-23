@@ -1,7 +1,8 @@
 (ns raster.compiler.ir.kernel-artifact-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
-            [raster.compiler.ir.kernel-artifact :as kart]))
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 (def ^:private abi
   [(kabi/slot 'x :input :float :role :operand)
@@ -14,7 +15,8 @@
                 "__global float* out, int _n_bound) {}")
    :abi abi
    :arguments '[x out n]
-   :launch {:dimensions 1 :workgroup-size 256 :grid {:kind :ceil-div-bound}}
+   :launch (klaunch/spec {:workgroup-size [256]
+                          :group-count [(klaunch/ceil-div 'n 256)]})
    :temporaries []
    :effects {:kind :pure-reduction}
    :provenance {:dialect :segred :segop-id 7}
@@ -24,7 +26,7 @@
   (let [a (kart/make base)]
     (is (kart/kernel-artifact? a))
     (is (= :opencl-c (:target a)))
-    (is (= 256 (kart/launch-value a :workgroup-size)))
+    (is (= [256] (kart/launch-value a :workgroup-size)))
     (is (= "+" (kart/attribute a :c-op)))
     (is (identical? a (kart/validate! a)))))
 
@@ -40,5 +42,5 @@
          (kart/make (assoc base :arguments '[x out])))))
   (testing "an entry without executable launch geometry is not a kernel artifact"
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"positive integer workgroup size"
+         clojure.lang.ExceptionInfo #"invalid launch contract"
          (kart/make (assoc base :launch {:dimensions 1}))))))

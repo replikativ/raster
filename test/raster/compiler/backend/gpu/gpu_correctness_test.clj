@@ -48,7 +48,7 @@
 
 ;; Helper: generate kernel and extract source
 (defn- map-kernel-src [form]
-  (:source (par-opencl/generate-par-map-kernel form)))
+  (:source (first (:kernels (opencl-pass/opencl-pass form :min-elements 0)))))
 
 (defn- map-void-kernel-src [form]
   (:source (par-opencl/generate-par-map-void-kernel form)))
@@ -148,8 +148,10 @@
       (is (or (str/includes? src "cl_khr_fp64")
               (str/includes? src "double")))))
   (testing "Float precision: uses float type"
-    (let [src (:source (par-opencl/generate-par-map-kernel
-                        '(raster.par/map! out i n float (aget a i))))]
+    (let [src (:source (first (:kernels
+                               (opencl-pass/opencl-pass
+                                '(raster.par/map! out i n float (aget a i))
+                                :min-elements 0 :dtype :float))))]
       (is (str/includes? src "float"))))
   (testing "__kernel void signature"
     (let [src (map-kernel-src

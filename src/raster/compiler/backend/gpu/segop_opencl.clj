@@ -19,6 +19,7 @@
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -51,8 +52,8 @@
    dtype (:dtype segmap), which may differ from the inputs (e.g. a float input
    promoted to double by a double literal).
 
-   Returns {:kernel-name str :source str :abi [ordered typed slots]
-            :array-params [syms] :scalar-params [syms] :dtype kw}."
+   Returns a verified KernelArtifact whose ABI, compiler arguments and launch contract have one
+   authoritative order."
   [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types]
                      :or {dtype :double kernel-name-prefix "par_map"
                           scalar-types {} array-types {}}}]
@@ -67,6 +68,7 @@
         meta-types (ce/collect-array-types-from-meta body)
         array-types (merge meta-types array-types)
         kernel-name (str kernel-name-prefix "_" (gensym ""))
+        workgroup-size 256
         ;; Use pre-computed inputs/outputs/scalars from SegOp.
         ;; :outputs may carry SECONDARY outputs beyond `out-sym` — the side-effect
         ;; aset targets of a horizontally-fused multi-output map. Those are array
@@ -160,19 +162,27 @@
                              "        " scalar-body-str "\n"
                              "    }"))
                     "\n}\n")
-        _ (kabi/validate-source-signature! kernel-name source abi)]
-    {:kernel-name kernel-name
-     :source source
-     :array-params arr-params
-     :scalar-params scl-params
-     :abi abi
-     :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segmap)]))
-     ;; array params (by sig name) the kernel WRITES — secondary fused outputs and
-     ;; read+write inputs. The staging invoke copies these back to their JVM arrays
-     ;; after launch; the resident role-derivation marks written PARAMS :output.
-     :written-arrays written-params
-     :out-param out-param
-     :dtype out-dtype}))
+        bound (seg-bound segmap)]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments (vec (concat arr-params [out-sym] scl-params [bound]))
+      :launch (klaunch/spec
+               {:workgroup-size [workgroup-size]
+                :group-count [(klaunch/ceil-div bound workgroup-size)]})
+      :temporaries []
+      :effects {:kind :elementwise-map}
+      :provenance {:dialect :segmap :segop-id (:id segmap)}
+      :attributes
+      {:array-params arr-params
+       :scalar-params scl-params
+       ;; Array params (by signature name) the kernel WRITES — secondary fused outputs and
+       ;; read+write inputs. The staging invoke copies these back to their JVM arrays after
+       ;; launch; the resident role derivation marks written parameters :output.
+       :written-arrays written-params
+       :out-param out-param
+       :dtype out-dtype}})))
 
 ;; ================================================================
 ;; SegRed → OpenCL kernel (two-phase reduction)
@@ -358,9 +368,10 @@
       :source source
       :abi abi
       :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
-      :launch {:dimensions 1
-               :workgroup-size workgroup-size
-               :grid {:kind :ceil-div-bound}}
+      :launch (klaunch/spec
+               {:workgroup-size [workgroup-size]
+                :group-count [(klaunch/ceil-div (seg-bound segred) workgroup-size)]
+                :shared-memory-bytes (* workgroup-size (dt/bytes-of dtype))})
       :temporaries []
       :effects {:kind :pure-reduction}
       :provenance {:dialect :segred :segop-id (:id segred)}
