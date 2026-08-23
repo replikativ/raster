@@ -20,7 +20,9 @@
    data, per §3.5's requirement that an unsupported form 'produce a structured diagnostic naming
    the operation, source, missing rule, target dialect, and possible legal fallback'."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.passes.parallel.segop-lower-pass :as slp]))
+            [raster.compiler.passes.parallel.segop-lower-pass :as slp]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
+            [raster.compiler.ir.soac :as soac]))
 
 (defn- stats-of [form] (:stats (slp/segop-lower-pass form {})))
 
@@ -61,6 +63,21 @@
       (is (contains? fatal :raster/fatal))
       (is (contains? fatal :raster/bug)))))
 
+(deftest implementation-exceptions-are-not-conversion-declines
+  (testing "an implementation bug in par→SOAC escapes instead of silently selecting a fallback"
+    (with-redefs [soac/par-form->soac
+                  (fn [& _] (throw (NullPointerException. "simulated compiler bug")))]
+      (is (thrown-with-msg? NullPointerException #"simulated compiler bug"
+                            (stats-of '(let* [o (raster.par/map! O i 256 nil i)] o))))))
+  (testing "nil and an unsupported SOAC type have distinct diagnostics"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"produced no SOAC node"
+                          (soac-lower/lower-soac nil :cpu:0)))
+    (try
+      (soac-lower/lower-soac nil :cpu:0)
+      (is false "nil SOAC must throw")
+      (catch clojure.lang.ExceptionInfo e
+        (is (= :no-soac-node (:reason (ex-data e))))))))
+
 (deftest the-gpu-door-records-which-generator-it-used
   (testing "opencl_pass's SegMap/SegRed door recorded nothing when it fell back to legacy codegen,
             and both paths incremented the same counter. The decline is now structured data on the
@@ -87,4 +104,9 @@
         (testing "…while an invariant violation escapes to the caller"
           (is (thrown? clojure.lang.ExceptionInfo
                        (attempt stats :segmap '(raster.par/map! O i 4 nil x) :double
-                                (fn [] (throw (ex-info "bug" {:reason :raster/bug})))))))))))
+                                (fn [] (throw (ex-info "bug" {:reason :raster/bug})))))))
+        (testing "…and an unstructured implementation exception is never a decline"
+          (is (thrown-with-msg? NullPointerException #"implementation bug"
+                                (attempt stats :segmap '(raster.par/map! O i 4 nil x) :double
+                                         (fn [] (throw (NullPointerException.
+                                                        "implementation bug")))))))))))

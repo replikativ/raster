@@ -34,18 +34,18 @@
 
 (defn- screma-map-lambda
   [soac]
-  (when (instance? raster.compiler.ir.soac.Screma soac)
+  (when (soac/screma? soac)
     (:map-lambda soac)))
 
 (defn- reduce-op-info
   [soac]
-  (if (instance? raster.compiler.ir.soac.SoacReduce soac)
+  (if (soac/soac-reduce? soac)
     {:acc (:acc soac) :init (:init soac) :lambda (:lambda soac)}
     (first (:reduces soac))))
 
 (defn- scan-op-info
   [soac]
-  (if (instance? raster.compiler.ir.soac.SoacScan soac)
+  (if (soac/soac-scan? soac)
     {:acc (:acc soac) :init (:init soac)
      :lambda (:lambda soac) :out (:out soac)}
     (first (:scans soac))))
@@ -226,8 +226,12 @@
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)]
     (cond
+      (nil? soac)
+      (throw (ex-info "Cannot lower nil: the preceding conversion produced no SOAC node"
+                      {:reason :no-soac-node :target-dialect :segop}))
+
       ;; Screma dispatch based on contents
-      (instance? raster.compiler.ir.soac.Screma soac)
+      (soac/screma? soac)
       (cond
         (and (empty? (:scans soac)) (empty? (:reduces soac)) (:map-lambda soac))
         (lower-map soac device-id :dtype dtype)
@@ -243,16 +247,16 @@
 
       ;; Direct SOAC dispatch
       ;; a contraction: record the facts for this target; the backend routes from them
-      (instance? raster.compiler.ir.soac.SoacContract soac)
+      (soac/contract? soac)
       [(segop/->SegContract (:id soac) (:facts soac) dtype device-id)]
 
-      (instance? raster.compiler.ir.soac.SoacMap soac)
+      (soac/soac-map? soac)
       (lower-map soac device-id :dtype dtype)
 
-      (instance? raster.compiler.ir.soac.SoacReduce soac)
+      (soac/soac-reduce? soac)
       (lower-reduce soac device-id :dtype dtype)
 
-      (instance? raster.compiler.ir.soac.SoacScan soac)
+      (soac/soac-scan? soac)
       (lower-scan soac device-id :dtype dtype)
 
       :else

@@ -1,5 +1,6 @@
 (ns raster.compiler.segop-consumption-test
-  "THE SEGOP BOUNDARY IS REAL: opencl-pass CONSUMES what segop-lower computed. Device-free.
+  "THE SEGOP BOUNDARY IS REAL: GPU and JVM SIMD backends CONSUME what segop-lower computed.
+   Device-free.
 
    `segop-lower` lowered every par form with the real target device and attached the SegOp to
    the binder symbol as `::segops`. Nothing read it (north-star §2.1: 'the pass arrows are nominal
@@ -13,7 +14,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
-            [raster.compiler.backend.gpu.opencl-pass :as op]))
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.backend.gpu.opencl-pass :as op]
+            [raster.compiler.backend.jvm.par-simd :as par-simd]))
 
 (def ^:private map-form
   '(let* [o (raster.par/map! O i 8192 nil (clojure.core/* (clojure.core/aget X i) 2.0))] o))
@@ -22,6 +25,9 @@
 
 (defn- lowered [form] (:form (slp/segop-lower-pass form {:target-device :ze:0 :dtype :double})))
 (defn- run [form] (op/opencl-pass form :device-id :ze:0 :dtype :double :min-elements 0))
+(defn- lowered-cpu [form dtype]
+  (:form (slp/segop-lower-pass form {:target-device :cpu:0 :dtype dtype})))
+(defn- run-simd [form] (par-simd/simd-pass form :min-elements 0))
 (defn- norm [src] (str/replace (str src) #"_\d{3,}" "_N"))
 
 (deftest a-lowered-binding-is-consumed-not-relowered
@@ -66,3 +72,42 @@
       (is (= 1 (:ze-maps st)))
       (is (= 1 (:segop-reused st)) "consumed from ::body-segops")
       (is (nil? (:segop-relowered st))))))
+
+(deftest jvm-simd-consumes-the-boundary-too
+  (testing "matching map/reduce SegOps are reused rather than independently re-derived"
+    (doseq [[label form stat-key]
+            [["par/map!" map-form :simd-maps]
+             ["par/reduce" reduce-form :simd-reduces]]]
+      (testing label
+        (let [st (:stats (run-simd (lowered-cpu form :double)))]
+          (is (= 1 (get st stat-key)))
+          (is (= 1 (:segop-reused st)))
+          (is (nil? (:segop-relowered st))))))))
+
+(deftest jvm-simd-refuses-a-bound-segop-with-the-wrong-dtype
+  (testing "the backend re-lowers when its locally derived dtype disagrees with the boundary;
+            consuming the float SegOp as a double SIMD operation would silently change semantics"
+    (let [st (:stats (run-simd (lowered-cpu map-form :float)))]
+      (is (= 1 (:simd-maps st)))
+      (is (= 1 (:segop-relowered st)))
+      (is (nil? (:segop-reused st))))))
+
+(deftest jvm-simd-invalidates-segops-when-it-fuses-after-lowering
+  (testing "a fused expression cannot consume the second input map's now-stale SegOp"
+    (let [form '(let* [tmp-step (raster.par/map! TMP i 8192 nil
+                                                 (clojure.core/* (clojure.core/aget X i) 2.0))
+                       out-step (raster.par/map! O j 8192 nil
+                                                 (clojure.core/+ (clojure.core/aget TMP j) 1.0))]
+                      out-step)
+          st (:stats (run-simd (lowered-cpu form :double)))]
+      (is (= 1 (:fused st)))
+      (is (= 1 (:simd-maps st)))
+      (is (= 1 (:segop-relowered st)) "the fused lambda gets a fresh SegOp")
+      (is (nil? (:segop-reused st)) "neither pre-fusion SegOp certifies the fused lambda"))))
+
+(deftest jvm-simd-does-not-turn-an-implementation-bug-into-scalar-fallback
+  (testing "an unstructured re-lowering exception is a compiler bug, not an unsupported SIMD form"
+    (with-redefs [soac/par-form->soac
+                  (fn [& _] (throw (NullPointerException. "simulated SIMD lowering bug")))]
+      (is (thrown-with-msg? NullPointerException #"simulated SIMD lowering bug"
+                            (run-simd map-form))))))
