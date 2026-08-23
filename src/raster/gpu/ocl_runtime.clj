@@ -1109,6 +1109,42 @@
       :kernel-name kernel-name
       :async? (boolean (get opts :async?))})))
 
+(defn bind-registered-reduction!
+  "OpenCL resident SegRed binder. Consumes complete values in emitter-authored ABI order and
+   derives its pointer/scalar/bound projections exclusively from slot kinds and roles."
+  [^String kernel-name arguments]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        {:keys [pointer-pairs scalar-pairs result-pair bound-pair]}
+        (kabi/validate-reduction-arguments! abi arguments)
+        _ (doseq [[slot value] pointer-pairs]
+            (when-not (or (device-buffer? value) (instance? MemorySegment value))
+              (throw (ex-info "resident reduction requires OclBuffer/MemorySegment pointer arguments"
+                              {:kernel-name kernel-name :slot slot :value-type (type value)})))
+            (when (and (device-buffer? value)
+                       (not= (:dtype slot) (dt/canon (:dtype ^OclBuffer value))))
+              (throw (ex-info "reduction ABI storage dtype does not match resident buffer"
+                              {:kernel-name kernel-name :slot slot :expected (:dtype slot)
+                               :actual (dt/canon (:dtype ^OclBuffer value))}))))
+        result-value (second result-pair)
+        _ (when (and (device-buffer? result-value)
+                     (< (:n-elements ^OclBuffer result-value) 1))
+            (throw (ex-info "resident reduction result buffer must hold at least one element"
+                            {:kernel-name kernel-name :buffer-elements 0})))
+        _ (doseq [[slot value] (conj scalar-pairs bound-pair)]
+            (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
+              (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
+                              {:kernel-name kernel-name :slot slot
+                               :expected (:kernel-dtype slot)
+                               :actual (when (map? value) (:type value))}))))
+        pointers (mapv second pointer-pairs)
+        scalars (mapv second scalar-pairs)
+        n (long (:value (second bound-pair)))]
+    (bind-registered-map-void-kernel kernel-name pointers scalars n {:group-count 1})))
+
 (defn bind-registered-contraction!
   "Pre-bind a routed contraction over resident OclBuffers in exact ordered ABI position.
   The returned prepared launch carries vector workgroup/group-count geometry; the OpenCL graph

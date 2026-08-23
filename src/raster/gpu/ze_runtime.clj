@@ -1926,6 +1926,110 @@
     (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
         output-array)))
 
+(defn invoke-registered-reduction-kernel
+  "Run a SegRed host-scalar reduction from one complete ordered ABI value vector. The single
+   :result value must be nil: staging owns and inserts the workgroup-partial buffer at exactly
+   that slot. Captured scalars retain their declared kernel dtypes, and every structural/storage
+   check runs before kernel loading touches the driver. Returns a scalar double after combining
+   workgroup partials on the host."
+  [^String kernel-name arguments]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        {:keys [pairs pointer-pairs scalar-pairs result-pair bound-pair]}
+        (kabi/validate-reduction-arguments! abi arguments)
+        _ (when-not (nil? (second result-pair))
+            (throw (ex-info "staging reduction ABI :result value must be nil (runtime-owned partial buffer)"
+                            {:kernel-name kernel-name :result-pair result-pair})))
+        non-result-pointers (filterv #(not= :result (:role (first %))) pointer-pairs)
+        _ (doseq [[slot value] non-result-pointers]
+            (when-not (= :input (:kind slot))
+              (throw (ex-info "staging reduction supports only input pointers besides its :result"
+                              {:kernel-name kernel-name :slot slot})))
+            (let [actual (if (device-buffer? value)
+                           (dt/canon (:dtype ^DeviceBuffer value))
+                           (jvm-array-dtype value))]
+              (when-not actual
+                (throw (ex-info "reduction ABI pointer value is not a supported buffer/array"
+                                {:kernel-name kernel-name :slot slot :value-type (type value)})))
+              (when-not (= (:dtype slot) actual)
+                (throw (ex-info "reduction ABI storage dtype mismatch"
+                                {:kernel-name kernel-name :slot slot
+                                 :expected (:dtype slot) :actual actual})))))
+        _ (doseq [[slot value] scalar-pairs]
+            (when (map? value)
+              (when-not (= (:kernel-dtype slot) (:type value))
+                (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
+                                {:kernel-name kernel-name :slot slot
+                                 :expected (:kernel-dtype slot) :actual (:type value)})))))
+        [bound-slot bound-value] bound-pair
+        _ (when (and (map? bound-value)
+                     (not= (:kernel-dtype bound-slot) (:type bound-value)))
+            (throw (ex-info "reduction ABI bound binding has the wrong kernel dtype"
+                            {:kernel-name kernel-name :slot bound-slot
+                             :expected (:kernel-dtype bound-slot) :actual (:type bound-value)})))
+        n (long (if (map? bound-value) (:value bound-value) bound-value))
+        result-dtype (:dtype (first result-pair))
+        _ (when-not (#{:float :double} result-dtype)
+            (throw (ex-info "host partial combine currently supports only float/double SegRed results"
+                            {:kernel-name kernel-name :dtype result-dtype})))
+        ;; Native driver/loading begins only after every ABI/value check above.
+        {:keys [kernel-handle workgroup-size identity-val c-op]
+         :or {workgroup-size 256 identity-val 0.0 c-op "+"}}
+        (ensure-kernel-loaded! kernel-name)
+        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
+                      "fmin" (fn ^double [^double a ^double b] (Math/min a b))
+                      "*"    (fn ^double [^double a ^double b] (* a b))
+                      (fn ^double [^double a ^double b] (+ a b)))
+        wg (long (or workgroup-size 256))
+        group-count (max 1 (long (Math/ceil (/ (double n) wg))))
+        dtype-size (long (get dtype-byte-sizes result-dtype))
+        value-layout (if (= result-dtype :float) ValueLayout/JAVA_FLOAT ValueLayout/JAVA_DOUBLE)
+        staged-inputs
+        (into {}
+              (map-indexed
+               (fn [idx [slot value]]
+                 [slot
+                  (if (device-buffer? value)
+                    (:segment ^DeviceBuffer value)
+                    (let [host (MemorySegment/ofArray value)
+                          n-bytes (.byteSize host)
+                          seg (ensure-seg kernel-name (keyword (str "red-abi-input-" idx)) n-bytes)]
+                      (MemorySegment/copy host 0 seg 0 n-bytes)
+                      seg))])
+               non-result-pointers))
+        partial-bytes (* group-count dtype-size)
+        dev-partial (ensure-seg kernel-name :partial-seg partial-bytes)
+        scalar-arg (fn [slot value]
+                     (if (map? value)
+                       value
+                       (let [t (:kernel-dtype slot)]
+                         {:type t
+                          :value (case t
+                                   :int (int value)
+                                   :long (long value)
+                                   :float (float value)
+                                   :double (double value)
+                                   value)})))
+        all-args
+        (mapv (fn [[slot value]]
+                (cond
+                  (= :result (:role slot)) dev-partial
+                  (= :scalar (:kind slot)) (scalar-arg slot value)
+                  :else (get staged-inputs slot)))
+              pairs)]
+    (launch! kernel-handle group-count wg all-args)
+    (if (= group-count 1)
+      (double (.get dev-partial value-layout 0))
+      (loop [i 0 acc (double identity-val)]
+        (if (< i group-count)
+          (recur (inc i)
+                 (double (combine acc (double (.get dev-partial value-layout
+                                                    (* i dtype-size))))))
+          acc)))))
+
 (defn invoke-reduction-kernel
   "Pipeline-friendly reduction kernel invocation. Returns scalar double.
   input-arrays: vector of JVM arrays (double[] or float[]) or DeviceBuffers
@@ -2577,6 +2681,44 @@
       :group-count group-count
       :kernel-name kernel-name
       :async? async?})))
+
+(defn bind-registered-reduction!
+  "Pre-bind a SegRed kernel from its complete ordered ABI values. The ABI roles—not registry
+   :array-params or a caller-side concatenation convention—select pointers, captured scalars,
+   the result buffer and the bound. A single workgroup lets the grid-stride kernel write the
+   resident one-element result without a host combine."
+  [^String kernel-name arguments]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        {:keys [pointer-pairs scalar-pairs result-pair bound-pair]}
+        (kabi/validate-reduction-arguments! abi arguments)
+        _ (doseq [[slot value] pointer-pairs]
+            (when-not (or (device-buffer? value) (instance? MemorySegment value))
+              (throw (ex-info "resident reduction requires DeviceBuffer/MemorySegment pointer arguments"
+                              {:kernel-name kernel-name :slot slot :value-type (type value)})))
+            (when (and (device-buffer? value)
+                       (not= (:dtype slot) (dt/canon (:dtype ^DeviceBuffer value))))
+              (throw (ex-info "reduction ABI storage dtype does not match resident buffer"
+                              {:kernel-name kernel-name :slot slot :expected (:dtype slot)
+                               :actual (dt/canon (:dtype ^DeviceBuffer value))}))))
+        result-value (second result-pair)
+        _ (when (and (device-buffer? result-value)
+                     (< (:n-elements ^DeviceBuffer result-value) 1))
+            (throw (ex-info "resident reduction result buffer must hold at least one element"
+                            {:kernel-name kernel-name :buffer-elements 0})))
+        _ (doseq [[slot value] (conj scalar-pairs bound-pair)]
+            (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
+              (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
+                              {:kernel-name kernel-name :slot slot
+                               :expected (:kernel-dtype slot)
+                               :actual (when (map? value) (:type value))}))))
+        pointers (mapv second pointer-pairs)
+        scalars (mapv second scalar-pairs)
+        n (long (:value (second bound-pair)))]
+    (bind-registered-map-void-kernel kernel-name pointers scalars n {:group-count 1})))
 
 (defn bind-registered-contraction!
   "Pre-bind a routed contraction over resident buffers using its ordered typed ABI.

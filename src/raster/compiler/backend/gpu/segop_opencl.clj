@@ -184,10 +184,15 @@
    Phase 1: block-local shared-memory tree reduction
    Phase 2: single-block reduction of partial results
 
-   Returns {:kernel-name str :source str :array-params [syms]
-            :scalar-params [syms] :dtype kw :n-phases int}."
-  [segred out-sym & {:keys [dtype kernel-name-prefix]
-                     :or {dtype :double kernel-name-prefix "par_reduce"}}]
+   Returns {:kernel-name str :source str :abi [ordered typed slots]
+            :arguments [ordered compiler values] :array-params [syms]
+            :scalar-params [syms] :dtype kw :n-phases int}.
+
+   `out-sym` is nil for the host-scalar staging protocol: the ordered :arguments vector then
+   carries nil at the single :result slot, which the runtime replaces with its partial-results
+   buffer.  Resident reduce-into supplies the real output buffer symbol at that same ABI position."
+  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types]
+                     :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}}}]
   (let [idx (seg-idx segred)
         bound (seg-bound segred)
         {:keys [acc init lambda]} (:reduce-op segred)
@@ -202,6 +207,15 @@
         ctype (dt/ctype :opencl dtype)
         arr-params (vec (sort-by name (:inputs segred)))
         scl-params (vec (sort-by name (:scalars segred)))
+        int-scalar-syms (set (keep (fn [[k v]] (when (= v :int) (symbol (name k))))
+                                   scalar-types))
+        scl-type (fn [s] (ce/scalar-native-type s scalar-types ctype))
+        scalar-dtype (fn [s]
+                       (case (scl-type s)
+                         "int" :int
+                         "long" :long
+                         "double" :double
+                         "float" :float))
         ;; Detect reduction op from lambda — unwrap let to find op, keep let for elem
         [let-bindings inner-body]
         (if (and (seq? lambda) (contains? #{'let* 'let} (first lambda)))
@@ -251,8 +265,16 @@
                                  " operands — only a binary (op acc elem) combine is modeled;"
                                  " extra operands would be dropped")
                             {:op op-sym :op-args op-args :lambda lambda})))
+        ;; Typed float pipelines cast the accumulator to `(float acc)` while double pipelines
+        ;; use `(double acc)`. Treat both as the accumulator position; recognizing only double
+        ;; made an otherwise-valid float SegRed return nil and fall through to a legacy kernel
+        ;; whose body referenced captured scalars absent from its signature.
         acc-at? (fn [a] (or (= a acc)
-                            (and (seq? a) (= 'double (first a)) (= acc (second a)))))
+                            (and (seq? a)
+                                 (contains? #{'float 'double 'clojure.core/float
+                                              'clojure.core/double}
+                                            (first a))
+                                 (= acc (second a)))))
         [_acc-pos elem-expr-raw]
         (when (>= (count op-args) 2)
           (let [a0 (nth op-args 0) a1 (nth op-args 1)]
@@ -271,7 +293,8 @@
         idx-c-name (ce/c-symbol idx)
         elem-str (when adapted-elem
                    (binding [ce/*emit-config* ce/opencl-config
-                             ce/*scalar-type* ctype]
+                             ce/*scalar-type* ctype
+                             ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                      (ce/emit-expr adapted-elem idx (set (map #(symbol (name %)) arr-params)) idx-c-name)))
         ;; Build kernel source
         arr-param-str (str/join ", "
@@ -279,7 +302,7 @@
                                                   (ce/c-symbol s)))
                                      arr-params))
         scl-param-str (str/join ", "
-                                (map (fn [s] (str ctype " " (ce/c-symbol s))) scl-params))
+                                (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
         ;; Use output param name matching invoke-reduction-kernel expectations
         all-params (str/join ", "
                              (remove empty?
@@ -287,6 +310,16 @@
                                       (str "__global " ctype "* restrict output")
                                       scl-param-str
                                       "int _n_bound"]))
+        result-name (or out-sym 'output)
+        abi (kabi/validate!
+             (vec (concat
+                   (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand)
+                        arr-params)
+                   [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
+                   (map #(kabi/slot % :scalar (scalar-dtype %)
+                                   :c-name (ce/c-symbol %) :role :parameter)
+                        scl-params)
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         ;; Static shared memory — matches invoke-reduction-kernel (no __local arg)
         source (when elem-str
                  (str (codegen/extension-pragmas dtype)
@@ -310,12 +343,15 @@
                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                       "    }\n"
                       "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
-                      "}\n"))]
+                      "}\n"))
+        _ (when source (kabi/validate-source-signature! kernel-name source abi))]
     (when source
       {:kernel-name kernel-name
        :source source
        :array-params arr-params
        :scalar-params scl-params
+       :abi abi
+       :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
        :dtype dtype
        :n-phases 2
        :identity-val identity-val

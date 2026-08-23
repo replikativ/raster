@@ -214,30 +214,38 @@
   ;; :scatter step kinds; a program containing a par/reduce whose result stays resident
   ;; (the #42 resident-reduce work: fuse-reduce-results gives it a device 1-elem out-buf)
   ;; threw at bind time even though bind-step! already handled :reduce. This pins the
-  ;; wiring: sum(a) feeding an elementwise scale compiles to [:reduce :map] steps, binds,
+  ;; wiring: scale*sum(a) (a captured reduction scalar) feeding an elementwise scale compiles to
+  ;; [:reduce :map] steps, binds its full ordered ABI,
   ;; and replays with the correct output. (An ESCAPING tail reduce — a loss returned as
   ;; the scalar result — still doesn't bind: that is the remaining #42 leftover, same as
   ;; bind-step!.)
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gpu-reduce-step")
     (let [probe (eval '(raster.core/deftm gpu-reduce-consumer-probe
-                         [a :- (Array float) out :- (Array float) n :- Long] :- Void
+                         [a :- (Array float) out :- (Array float) n :- Long scale :- Double] :- Void
                          (let [s (raster.par/reduce
                                   acc 0.0 i n
-                                  (raster.numeric/+ acc (raster.arrays/aget a i)))]
+                                  (raster.numeric/+ acc
+                                                    (raster.numeric/* scale
+                                                                      (raster.arrays/aget a i))))]
                            (raster.par/map-void!
                             j n
                             (raster.arrays/aset out j
                                                 (raster.numeric/* (raster.arrays/aget a j) s))))))
           n 64
+          scale 0.75
           a (rnd n 51)
           out (float-array n)
-          s (double (reduce + 0.0 (map double (seq a))))
+          s (double (reduce + 0.0 (map #(* scale (double %)) (seq a))))
           cpu (float-array (map #(float (* (double %) s)) (seq a)))
-          {:keys [descriptor] :as r} (run-resident probe [a out n])
+          {:keys [descriptor] :as r} (run-resident probe [a out n scale])
           gpu (:out r)]
-      (is (some #(= :reduce (:convention %)) (:steps descriptor))
-          "resident-consumed par/reduce compiles to a :reduce step")
+      (let [red-step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))]
+        (is (some? red-step) "resident-consumed par/reduce compiles to a :reduce step")
+        (is (= [:input :output :scalar :scalar]
+               (mapv :kind (:argument-specs red-step))))
+        (is (= [:float :float :float :int]
+               (mapv (comp :kernel-dtype :slot) (:argument-specs red-step)))))
       (is (< (rel-err gpu cpu) 1e-4)
           (str "reduce→map-void replay relerr " (rel-err gpu cpu))))))
 

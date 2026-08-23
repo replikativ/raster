@@ -80,9 +80,9 @@
 
      default (:invoke nil)  invoke-registered-contraction! binds :scalar-args positionally and
                             launches with :wg/:grid — so all three must be present and match.
-     :invoke :reduction     invoke-reduction-kernel supplies the kernel's single trailing count
-                            param from :reduce-bound and computes its own two-phase launch geometry
-                            — so :scalar-args must be EMPTY and :wg/:grid ABSENT.
+     :invoke :reduction     invoke-registered-reduction-kernel consumes the emitter's complete
+                            ordered ABI (the staging marker replaces only the :result value with
+                            nil) and computes its own two-phase launch geometry; :wg/:grid are absent.
 
    Returns the descriptor with `:arguments`, the compiler values in exact ABI order."
   [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands abi
@@ -111,14 +111,13 @@
         ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
         ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
         expect-scalar (if (= :reduction invoke)
-                        1
+                        (count (when abi (kabi/scalar-slots abi)))
                         (+ (count scalar-args) (count epilogue-scalars)))]
     (cond
-      (and (not= :reduction invoke) (nil? abi))
+      (nil? abi)
       (throw (ex-info "contract descriptor: the ordered :abi is required"
                       {:strategy strategy :kernel-name kernel-name}))
-      (and (not= :reduction invoke)
-           (not= param-shape (kabi/signature-shape abi)))
+      (not= param-shape (kabi/signature-shape abi))
       (throw (ex-info "contract descriptor: ordered ABI does not match the emitted kernel signature"
                       {:strategy strategy :kernel-name kernel-name
                        :signature param-shape :abi (kabi/signature-shape abi)}))
@@ -135,13 +134,10 @@
       (not= n-scalar expect-scalar)
       (throw (ex-info (str "contract descriptor: kernel takes " n-scalar " scalar params but the "
                            (if (= :reduction invoke)
-                             "reduction invoke supplies 1 (the count, from :reduce-bound)"
+                             (str "ordered reduction ABI supplies " expect-scalar)
                              (str "descriptor supplies " expect-scalar " scalar-args")))
                       {:strategy strategy :kernel-name kernel-name :params params
                        :invoke invoke :scalar-args scalar-args}))
-      (and (= :reduction invoke) (seq scalar-args))
-      (throw (ex-info "contract descriptor: :invoke :reduction must leave :scalar-args empty (the count comes from :reduce-bound)"
-                      {:strategy strategy :scalar-args scalar-args}))
       (nil? out-elems)
       (throw (ex-info "contract descriptor: :out-elems is required (the invoke sizes the output with it)"
                       {:strategy strategy}))
@@ -160,7 +156,7 @@
                       {:strategy strategy}))
       :else
       (if (= :reduction invoke)
-        d
+        (do (kabi/validate-reduction-arguments! abi (:arguments d)) d)
         (let [remaining-scalars (volatile! (seq scalar-args))
               arguments
               (mapv (fn [{:keys [name kind role] :as slot}]
@@ -306,6 +302,7 @@
          :invoke :reduction
          :kernel-name (:kernel-name k) :source (:source k)
          :array-params (:array-params k)
+         :abi (:abi k) :arguments (:arguments k)
          :dtype dtype :out-dtype dtype :out-elems 1
          :n-phases (:n-phases k)
          ;; CARRY THE COMBINE. invoke-reduction-kernel reads :c-op/:identity-val from the kernel

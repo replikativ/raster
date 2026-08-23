@@ -205,6 +205,19 @@
       (list 'raster.gpu.ze-runtime/invoke-registered-kernel
             kernel-name inputs out scalars bound))))
 
+(defn- emit-reduction-invocation
+  "Render a SegRed marker as one complete ordered ABI value vector. `result` is the caller-owned
+   resident buffer for reduce-into, or nil for a host-scalar reduction whose staging runtime owns
+   the temporary partial-results buffer. No input/scalar/bound positions are reconstructed here."
+  [{:keys [kernel-name abi arguments]} result]
+  (let [arguments (kabi/validate-arguments! abi arguments)
+        arguments (mapv (fn [slot value]
+                          (if (= :result (:role slot)) result value))
+                        abi arguments)]
+    (kabi/validate-reduction-arguments! abi arguments)
+    (list 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+          kernel-name arguments)))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -311,17 +324,14 @@
                   k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
                                                              :out-dtype :strategy :fallback-reason
                                                              :declines :tile :tensorized :packed
-                                                             :fused-epilogue :abi])
+                                                             :fused-epilogue :abi :arguments])
                                              {:kernel-name (:kernel-name r) :source (:source r)
                                               :dtype (:dtype r)})
                                       :ze-contracts)]
               ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
               ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
               (if (= :reduction (:invoke r))
-                (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                      (:kernel-name k)
-                      (vec (:array-params r))
-                      (:reduce-bound r))
+                (emit-reduction-invocation k nil)
               ;; The marker carries only VALUES in ABI order.  Slot kind, storage dtype and kernel
               ;; view dtype live once in the registered ABI and drive runtime binding.
                 (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
@@ -338,11 +348,11 @@
             (par/par-reduce-into-form? form)
             (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
               (if-let [segred (par->segred stats reduce-form dtype device-id)]
-                (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
+                (let [kernel (segop-cl/generate-segred-kernel
+                              segred out-buf :dtype dtype :scalar-types top-scalar-types)]
                   (if kernel
                     (let [k (register-kernel! kernel :ze-reduces)]
-                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                            (:kernel-name k) (vec (:array-params k)) out-buf bound))
+                      (emit-reduction-invocation k out-buf))
                     (let [k (register-kernel!
                              (legacy/generate-par-reduce-kernel reduce-form
                                                                 :dtype dtype :device-id device-id)
@@ -363,13 +373,11 @@
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce form))
                 (if-let [segred (par->segred stats form dtype device-id)]
-                  (let [kernel (segop-cl/generate-segred-kernel segred nil :dtype dtype)]
+                  (let [kernel (segop-cl/generate-segred-kernel
+                                segred nil :dtype dtype :scalar-types top-scalar-types)]
                     (if kernel
                       (let [k (register-kernel! kernel :ze-reduces)]
-                        (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                              (:kernel-name k)
-                              (vec (:array-params k))
-                              bound))
+                        (emit-reduction-invocation k nil))
                       ;; SegOp codegen failed — use legacy
                       (let [k (register-kernel!
                                (legacy/generate-par-reduce-kernel form
