@@ -32,6 +32,7 @@
            [java.lang.invoke MethodHandle]
            [java.nio.file Files Path])
   (:require [raster.compiler.core.types :as types]
+            [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]))
 
 ;; ================================================================
@@ -772,6 +773,18 @@
 
 (def ^:private dtype-byte-sizes
   {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
+
+(defn- jvm-array-dtype
+  "Canonical storage dtype of a supported JVM primitive array, or nil."
+  [x]
+  (cond
+    (instance? (Class/forName "[D") x) :double
+    (instance? (Class/forName "[F") x) :float
+    (instance? (Class/forName "[I") x) :int
+    (instance? (Class/forName "[J") x) :long
+    (instance? (Class/forName "[S") x) :half
+    (instance? (Class/forName "[B") x) :byte
+    :else nil))
 
 (defn make-buffer
   "Allocate a persistent shared-memory GPU buffer.
@@ -1804,69 +1817,105 @@
         arr))))
 
 (defn invoke-registered-kernel
-  "Pipeline-friendly kernel invocation. Looks up kernel from registry.
-  input-arrays: vector of JVM arrays (double[] or float[]) or DeviceBuffers
+  "Pipeline-friendly map invocation. Looks up the emitter-authored ordered ABI from the registry
+  and stages/binds every pointer and scalar in that order.
+  input-arrays: vector of JVM primitive arrays or DeviceBuffers
   output-array: JVM array or DeviceBuffer to receive results
   scalar-args: vector of scalar values
   n: element count
-  Dtype is read from kernel registry entry (:dtype, default :double)."
+  The split call shape is retained for compiled-code compatibility; it is structurally checked
+  against :abi before the driver is touched."
   [^String kernel-name input-arrays output-array scalar-args n]
-  (let [{:keys [kernel-handle workgroup-size dtype]
-         :or {workgroup-size 256 dtype :double}
-         :as info} (ensure-kernel-loaded! kernel-name)
-        n (long n)
-        dtype-size (long (get dtype-byte-sizes dtype 8))
-        scalar-type (if (= dtype :float) :float :double)
-        n-bytes (* n dtype-size)
-        ;; Copy input arrays to cached shared memory
-        dev-inputs (mapv (fn [arr idx]
-                           (if (device-buffer? arr)
-                             (:segment ^DeviceBuffer arr)
-                             (let [arr-bytes (if (= dtype :float)
-                                               (* (alength ^floats arr) 4)
-                                               (* (alength ^doubles arr) 8))
-                                   seg (ensure-seg kernel-name (keyword (str "input-seg-" idx)) arr-bytes)
-                                   src (MemorySegment/ofArray arr)]
-                               (MemorySegment/copy src 0 seg 0 arr-bytes)
-                               seg)))
-                         input-arrays (range))
-        ;; Output buffer
-        output-is-buffer? (device-buffer? output-array)
-        dev-output (if output-is-buffer?
-                     (:segment ^DeviceBuffer output-array)
-                     (ensure-seg kernel-name :output-seg n-bytes))
-        ;; Build args: inputs, output, scalars, n
-        scalar-kernel-args (mapv (fn [v] {:type scalar-type
-                                          :value (if (= scalar-type :float)
-                                                   (float v) (double v))})
-                                 scalar-args)
-        all-args (vec (concat dev-inputs
-                              [dev-output]
-                              scalar-kernel-args
-                              [{:type :int :value (int n)}]))
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        {:keys [dtype abi array-params scalar-params written-arrays]
+         :or {dtype :double}} registered
+        ;; Old registered/manual map kernels get an equivalent synthetic ABI. New compiler
+        ;; artifacts always carry :abi, so mixed pointer/scalar types are no longer guessed from
+        ;; the output dtype.
+        abi (or abi
+                (let [written (set (map name written-arrays))]
+                  (kabi/validate!
+                   (vec (concat
+                         (map-indexed
+                          (fn [i _]
+                            (let [nm (or (nth array-params i nil) (symbol (str "input" i)))]
+                              (kabi/slot nm :input dtype
+                                         :role (if (contains? written (name nm)) :inout :operand))))
+                          input-arrays)
+                         [(kabi/slot 'out :output dtype :role :result)]
+                         (map-indexed
+                          (fn [i _]
+                            (kabi/slot (or (nth scalar-params i nil) (symbol (str "scalar" i)))
+                                       :scalar dtype :role :parameter))
+                          scalar-args)
+                         [(kabi/slot '_n_bound :scalar :int :role :bound)])))))
+        arguments (vec (concat input-arrays [output-array] scalar-args [n]))
+        _ (kabi/validate-arguments! abi arguments)
+        pairs (mapv vector abi arguments)
+        pointer-count (count (kabi/pointer-slots abi))
+        scalar-user-count (count (remove #(= :bound (:role %)) (kabi/scalar-slots abi)))
+        _ (when-not (= pointer-count (inc (count input-arrays)))
+            (throw (ex-info "map kernel ABI pointer count does not match marker"
+                            {:kernel-name kernel-name :expected pointer-count
+                             :actual (inc (count input-arrays)) :abi abi})))
+        _ (when-not (= scalar-user-count (count scalar-args))
+            (throw (ex-info "map kernel ABI scalar count does not match marker"
+                            {:kernel-name kernel-name :expected scalar-user-count
+                             :actual (count scalar-args) :abi abi})))
+        _ (doseq [[slot value] pairs :when (not= :scalar (:kind slot))]
+            (let [actual (if (device-buffer? value)
+                           (dt/canon (:dtype ^DeviceBuffer value))
+                           (jvm-array-dtype value))]
+              (when-not actual
+                (throw (ex-info "map kernel ABI pointer value is not a supported buffer/array"
+                                {:kernel-name kernel-name :slot slot :value-type (type value)})))
+              (when-not (= (:dtype slot) actual)
+                (throw (ex-info "map kernel ABI storage dtype mismatch"
+                                {:kernel-name kernel-name :slot slot
+                                 :expected (:dtype slot) :actual actual})))))
+        ;; Loading/compilation may touch the native driver. Every ABI check above deliberately
+        ;; runs first, so a malformed marker fails deterministically even on a machine without
+        ;; the target device.
+        {:keys [kernel-handle workgroup-size]
+         :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
+        staged (mapv
+                (fn [idx [slot value]]
+                  (if (= :scalar (:kind slot))
+                    (let [t (:kernel-dtype slot)]
+                      {:arg {:type t
+                             :value (case t
+                                      :int (int value)
+                                      :long (long value)
+                                      :float (float value)
+                                      :double (double value)
+                                      value)}})
+                    (if (device-buffer? value)
+                      {:arg (:segment ^DeviceBuffer value) :value value :slot slot}
+                      (let [host (MemorySegment/ofArray value)
+                            n-bytes (.byteSize host)
+                            seg (ensure-seg kernel-name (keyword (str "abi-arg-" idx)) n-bytes)]
+                        (when (or (= :input (:kind slot)) (= :inout (:role slot)))
+                          (MemorySegment/copy host 0 seg 0 n-bytes))
+                        {:arg seg :value value :host host :n-bytes n-bytes :slot slot}))))
+                (range) pairs)
+        all-args (mapv :arg staged)
+        bound-pair (first (filter #(= :bound (:role (first %))) pairs))
+        _ (when-not bound-pair
+            (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
+        n (long (second bound-pair))
         wg (long (or workgroup-size 256))
         group-count (long (Math/ceil (/ (double n) wg)))]
     (launch! kernel-handle group-count wg all-args)
-    ;; Copy results back
-    (when-not output-is-buffer?
-      (let [dst-seg (MemorySegment/ofArray output-array)]
-        (MemorySegment/copy dev-output 0 dst-seg 0 n-bytes)))
-    ;; Copy back WRITTEN input-position arrays (a horizontally-fused kernel's
-    ;; secondary outputs / read+write buffers, named by the registry's
-    ;; :written-arrays). Only JVM arrays need the copy — device buffers were
-    ;; written in place.
-    (when-let [wa (seq (:written-arrays info))]
-      (let [wnames (set (map name wa))
-            aps (mapv name (:array-params info))]
-        (doseq [[arr seg ^long idx] (map vector input-arrays dev-inputs (range))]
-          (when (and (not (device-buffer? arr))
-                     (< idx (count aps))
-                     (contains? wnames (nth aps idx)))
-            (let [arr-bytes (if (= dtype :float)
-                              (* (alength ^floats arr) 4)
-                              (* (alength ^doubles arr) 8))]
-              (MemorySegment/copy ^MemorySegment seg 0 (MemorySegment/ofArray arr) 0 arr-bytes))))))
-    output-array))
+    ;; ABI output and inout roles are the single source of copy-back truth. DeviceBuffers are
+    ;; already resident and therefore need no host copy.
+    (doseq [{:keys [arg host n-bytes slot]} staged
+            :when (and host (or (= :output (:kind slot)) (= :inout (:role slot))))]
+      (MemorySegment/copy ^MemorySegment arg 0 ^MemorySegment host 0 (long n-bytes)))
+    (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
+        output-array)))
 
 (defn invoke-reduction-kernel
   "Pipeline-friendly reduction kernel invocation. Returns scalar double.
@@ -2400,7 +2449,9 @@
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [{:keys [kernel-handle workgroup-size dtype written-arrays array-types]
+   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
+             (kabi/validate-split-binding! abi arrays scalar-args))
+         {:keys [kernel-handle workgroup-size dtype written-arrays array-types]
           :or {workgroup-size 256 dtype :float}
           :as info} (ensure-kernel-loaded! kernel-name)
          workgroup-size (long (get opts :workgroup-size workgroup-size))
@@ -2477,7 +2528,9 @@
   ([^String kernel-name arrays scalar-args n]
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [{:keys [module workgroup-size dtype]
+   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
+             (kabi/validate-split-binding! abi arrays scalar-args))
+         {:keys [module workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
          ;; mutable state ON the kernel handle, so reusing the registry's shared handle would

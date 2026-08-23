@@ -9,6 +9,7 @@
    par form vocabulary but produce different target code."
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -176,6 +177,34 @@
                        :fallback :none})))
     descriptor))
 
+(defn- emit-map-invocation
+  "Render the compatibility map marker from the emitter-authored ABI and ordered values."
+  [{:keys [kernel-name abi arguments]}]
+  (let [arguments (kabi/validate-arguments! abi arguments)
+        pairs (mapv vector abi arguments)
+        result-pairs (filterv #(= :result (:role (first %))) pairs)
+        bound-pairs (filterv #(= :bound (:role (first %))) pairs)]
+    (when-not (= 1 (count result-pairs))
+      (throw (ex-info "map kernel ABI must identify exactly one :result slot"
+                      {:kernel-name kernel-name :abi abi})))
+    (when-not (= 1 (count bound-pairs))
+      (throw (ex-info "map kernel ABI must identify exactly one :bound slot"
+                      {:kernel-name kernel-name :abi abi})))
+    (let [[_ out] (first result-pairs)
+          [_ bound] (first bound-pairs)
+          inputs (mapv second
+                       (filter (fn [[slot _]]
+                                 (and (not= :scalar (:kind slot))
+                                      (not= :result (:role slot))))
+                               pairs))
+          scalars (mapv second
+                        (filter (fn [[slot _]]
+                                  (and (= :scalar (:kind slot))
+                                       (not= :bound (:role slot))))
+                                pairs))]
+      (list 'raster.gpu.ze-runtime/invoke-registered-kernel
+            kernel-name inputs out scalars bound))))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -237,23 +266,13 @@
                                                                 :dtype dtype :scalar-types top-scalar-types
                                                                 :array-types (merge top-array-types (:array-types (meta form))))]
                     (let [k (register-kernel! kernel :ze-maps)]
-                      (list 'raster.gpu.ze-runtime/invoke-registered-kernel
-                            (:kernel-name k)
-                            (vec (:array-params k))
-                            out
-                            (vec (:scalar-params k))
-                            bound)))
+                      (emit-map-invocation k)))
                   ;; SegOp failed — use legacy
                   (let [kernel (legacy/generate-par-map-kernel form
                                                                :dtype dtype :device-id device-id
                                                                :scalar-types top-scalar-types)
                         k (register-kernel! kernel :ze-maps)]
-                    (list 'raster.gpu.ze-runtime/invoke-registered-kernel
-                          (:kernel-name k)
-                          (vec (:array-params k))
-                          out
-                          (vec (:scalar-params k))
-                          bound)))))
+                    (emit-map-invocation k)))))
 
             ;; === par/contract — tensor contraction, routed through the DPAS legality gate ===
             ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX

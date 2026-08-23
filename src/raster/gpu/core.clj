@@ -29,6 +29,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
 
@@ -400,7 +401,8 @@
 
 (defn- resolve-kernel-bufs
   "Resolve buffer arguments for a kernel from session buffers.
-   sym->buf-key maps kernel param names to session buffer keys."
+   sym->buf-key maps kernel param names to session buffer keys.  When present,
+   the ordered ABI is authoritative and includes a functional map's output."
   [kernel-info bufs sym->buf-key]
   (mapv (fn [sym]
           (let [sym-name (name sym)
@@ -414,7 +416,9 @@
             (or (get bufs k)
                 (throw (ex-info (str "No buffer for kernel param: " sym-name)
                                 {:sym sym :available (keys bufs)})))))
-        (:array-params kernel-info)))
+        (if-let [abi (:abi kernel-info)]
+          (mapv :name (kabi/pointer-slots abi))
+          (:array-params kernel-info))))
 
 ;; ================================================================
 ;; Kernel invocation

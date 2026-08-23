@@ -45,6 +45,9 @@
       (is (not (str/includes? (:source kernel) "extern \"C\"")))
       ;; Check parameter lists
       (is (= 2 (count (:array-params kernel))))
+      (is (= '[a b out _n_bound] (mapv :name (:abi kernel))))
+      (is (= [:input :input :output :scalar] (mapv :kind (:abi kernel))))
+      (is (= '[a b out n] (:arguments kernel)))
       (is (= :double (:dtype kernel))))))
 
 (deftest generate-par-map-kernel-scalar-test
@@ -53,7 +56,9 @@
           kernel (par-opencl/generate-par-map-kernel form)]
       (is (some? kernel))
       (is (str/includes? (:source kernel) "alpha"))
-      (is (= 1 (count (:array-params kernel)))))))
+      (is (= 1 (count (:array-params kernel))))
+      (is (= '[a out alpha _n_bound] (mapv :name (:abi kernel))))
+      (is (= [:double :double :double :int] (mapv :dtype (:abi kernel)))))))
 
 (deftest generate-par-map-kernel-math-test
   (testing "Map with math operations"

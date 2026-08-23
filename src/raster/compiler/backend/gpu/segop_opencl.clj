@@ -50,8 +50,8 @@
    dtype (:dtype segmap), which may differ from the inputs (e.g. a float input
    promoted to double by a double literal).
 
-   Returns {:kernel-name str :source str :array-params [syms]
-            :scalar-params [syms] :dtype kw}."
+   Returns {:kernel-name str :source str :abi [ordered typed slots]
+            :array-params [syms] :scalar-params [syms] :dtype kw}."
   [segmap out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types]
                      :or {dtype :double kernel-name-prefix "par_map"
                           scalar-types {} array-types {}}}]
@@ -125,6 +125,29 @@
                        idx (conj arr-sym-set 'out) "idx" scalar-body-str
                        {:n-bound "_n_bound" :store-name "out"}))
         ;; pragmas cover the output dtype AND every input array's dtype
+        scalar-dtype (fn [s]
+                       (case (scl-type s)
+                         "int" :int
+                         "long" :long
+                         "double" :double
+                         "float" :float))
+        abi (kabi/validate!
+             (vec (concat
+                   (map (fn [s]
+                          (let [written? (contains? written (symbol (name s)))
+                                extra-output? (and written? (not (contains? input-name-set
+                                                                           (symbol (name s)))))]
+                            (kabi/slot s (if extra-output? :output :input) (arr-dtype s)
+                                       :c-name (ce/c-symbol s)
+                                       :role (cond extra-output? :secondary-result
+                                                   written? :inout
+                                                   :else :operand))))
+                        arr-params)
+                   [(kabi/slot out-sym :output out-dtype :c-name "out" :role :result)]
+                   (map #(kabi/slot % :scalar (scalar-dtype %)
+                                   :c-name (ce/c-symbol %) :role :parameter)
+                        scl-params)
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
                     ;; registry intrinsics this body calls (e.g. rstr_dp4a) must be DEFINED
                     (ce/intrinsic-helper-sources scalar-body-str)
@@ -135,11 +158,14 @@
                         (str "for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
                              "        " scalar-body-str "\n"
                              "    }"))
-                    "\n}\n")]
+                    "\n}\n")
+        _ (kabi/validate-source-signature! kernel-name source abi)]
     {:kernel-name kernel-name
      :source source
      :array-params arr-params
      :scalar-params scl-params
+     :abi abi
+     :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segmap)]))
      ;; array params (by sig name) the kernel WRITES — secondary fused outputs and
      ;; read+write inputs. The staging invoke copies these back to their JVM arrays
      ;; after launch; the resident role-derivation marks written PARAMS :output.
