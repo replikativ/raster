@@ -64,7 +64,10 @@
                     (when par? {:declined (diagnostic sym form stage e device-id dtype)}))
           ;; capture value-or-exception in one call: the alternative (catch a sentinel, then call
           ;; again to get the exception) re-runs a side-effecting conversion
-          attempt (fn [f] (try {:ok (f)} (catch Exception e {:err e})))
+          ;; Only an intentional, structured conversion refusal may become a decline. A raw
+          ;; NullPointerException/ClassCastException/etc. is an implementation bug and must escape;
+          ;; treating it as "no lowering rule" would silently select a different backend path.
+          attempt (fn [f] (try {:ok (f)} (catch clojure.lang.ExceptionInfo e {:err e})))
           soac (attempt #(soac/par-form->soac sym form (swap! id-counter inc) :dtype (or dtype :double)))]
       (cond
         (:err soac) (decline :soac (:err soac))

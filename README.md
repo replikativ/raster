@@ -337,6 +337,7 @@ passes that you can inspect individually.
 | Document | Description |
 |----------|-------------|
 | [Compiler Pipeline](doc/compiler.md) | Nanopass architecture, passes, `compile-aot`, diagnostics |
+| [Compiler North Star](design/compiler-north-star.md) | GPU IR, scheduling, artifacts, autotuning, and distributed execution |
 | [Automatic Differentiation](doc/autodiff.md) | Forward/reverse AD, rrules, sensitivity analysis |
 | [GPU Computing](doc/gpu.md) | Parallel primitives, session API, backends, SoA layout |
 | [Deep Learning](doc/deep-learning.md) | Layers, loss, optimizers, compiled training |

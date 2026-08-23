@@ -75,7 +75,9 @@
    kernel, or why the modern one declined. That is the same warn-and-vanish shape north-star §3.5
    rejects at the SegOp boundary, one door along."
   [stats kind form dtype thunk]
-  (let [r (try {:ok (thunk)} (catch Exception e {:err e}))]
+  ;; Only structured conversion refusals are legal fallbacks. An implementation exception is not
+  ;; evidence that legacy codegen is legal, and must escape instead of becoming :no-lowering-rule.
+  (let [r (try {:ok (thunk)} (catch clojure.lang.ExceptionInfo e {:err e}))]
     (cond
       (:err r)
       (let [e (:err r)]

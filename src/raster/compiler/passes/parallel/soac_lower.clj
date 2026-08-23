@@ -226,6 +226,10 @@
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)]
     (cond
+      (nil? soac)
+      (throw (ex-info "Cannot lower nil: the preceding conversion produced no SOAC node"
+                      {:reason :no-soac-node :target-dialect :segop}))
+
       ;; Screma dispatch based on contents
       (instance? raster.compiler.ir.soac.Screma soac)
       (cond

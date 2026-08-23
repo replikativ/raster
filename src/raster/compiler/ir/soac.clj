@@ -79,17 +79,6 @@
             expr])      ;; the RHS expression
 
 ;; ================================================================
-;; Dot — a first-class GEMM/contraction node (feature 4 keystone)
-;; ================================================================
-;; A contraction C[m,n] = Σ_k A[m,k]·B[k,n], modelled as an IR NODE (not an opaque
-;; BLAS .invk) so it participates in the dependency graph + fusion. It is NOT a generic
-;; SOAC (its K-reduction is a real contraction, not a fold over the SOAC iteration — the
-;; eval agent's finding), so `soac?` EXCLUDES it and the map/reduce lowering skips it; a
-;; dedicated GEMM emit path handles it. But the DEPENDENCY accessors DO handle it, so its
-;; output C carries a producer edge BY CONSTRUCTION — closing the documented leak at
-;; soac-outputs (a GEMM writing C with no edge → reorderable consumer). `epilogue` is the
-;; fused same-position elementwise consumer lambda (bias/act/residual), or nil; when set,
-;; the emitter splices it into the validated store slot (emit-gemm-tiled :epilogue).
 (defrecord SoacContract
            [id           ;; int
             sym          ;; symbol (binding) — the contraction's output
@@ -101,20 +90,6 @@
 ;; representation this replaces — it had one constructor (a unit test), was excluded from lowering,
 ;; reconstruction and fusion, and could not carry most of the facts.
 
-(defrecord Dot
-           [id           ;; int
-            sym          ;; symbol (binding)
-            inputs       ;; #{A B + epilogue operands} — read arrays (dep graph)
-            outputs      ;; #{C} — written array (dep graph producer edge)
-            bound        ;; expr — output element count m*n (for scheduling)
-            A B C        ;; operand symbols
-            m n k        ;; dim exprs
-            variant      ;; :nn | :tn | :nt
-            alpha beta   ;; scalars
-            epilogue     ;; {:lambda expr :element sym :operands #{sym}} or nil (fused consumer)
-            layout-a layout-b])  ;; :layout facets on the operands (transpose-elim), or nil
-
-(defn dot? [node] (instance? Dot node))
 
 ;; ================================================================
 ;; Input/output extraction helpers
@@ -479,11 +454,10 @@
 ;; ================================================================
 
 (defn soac?
-  "Check if a node is a generic SOAC (map/reduce/scan/stencil) — NOT a ScalarBinding and NOT a Dot.
-   A Dot is a contraction with its own emit path, so the map/reduce lowering must skip it."
+  "Check if a node is a generic SOAC (map/reduce/scan/stencil) — NOT a ScalarBinding, and NOT a
+   SoacContract (a contraction has its own lowering; generic map/reduce lowering must skip it)."
   [node]
   (and (not (instance? ScalarBinding node))
-       (not (instance? Dot node))
        ;; a contraction has its own lowering (SegContract) and must NOT enter the generic
        ;; map/reduce/scan lowering or lambda fusion, whose consumers assume idx/lambda/1-D bound
        (not (instance? SoacContract node))))
@@ -491,15 +465,14 @@
 (defn contract? [node] (instance? SoacContract node))
 
 (defn soac-inputs
-  "Get the set of input array symbols for a SOAC node (or a Dot)."
+  "Get the set of input array symbols for a SOAC node."
   [node]
   (if (instance? SoacContract node)
     (set (map :sym (:operands (:facts node))))
-  (when (or (soac? node) (dot? node)) (:inputs node))))
+    (when (soac? node) (:inputs node))))
 
 (defn soac-outputs
-  "Get the set of output symbols for a SOAC node (or a Dot — its written C, so the dependency graph
-   gets a producer edge for the contraction by construction, closing the documented leak)."
+  "Get the set of output symbols for a SOAC node."
   [node]
   (if (instance? SoacContract node)
     #{(:out (:facts node))}
@@ -508,7 +481,6 @@
     (instance? SoacReduce node)  #{(:output node)}
     (instance? SoacScan node)    (:outputs node)
     (instance? SoacStencil node) (:outputs node)
-    (instance? Dot node)         (:outputs node)
     :else nil)))
 
 (defn soac-bound

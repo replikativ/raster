@@ -383,6 +383,12 @@
 
 (def ^:private segop-id-counter (atom 0))
 
+(def ^:dynamic *bound-segops*
+  "SegOps segop-lower attached to the binding currently being transformed (its ::segops metadata),
+   or nil. The JVM SIMD backend used to re-lower every par form on the fly, same as opencl-pass
+   did before PR #98 — the third copy of that seam. Consumption is dtype-guarded."
+  nil)
+
 (defn simd-pass
   "Pipeline pass: walk an S-expression, replace raster.par/* forms with SIMD code.
 
@@ -397,6 +403,13 @@
     (let [min-elements (or min-elements (effective-min-elements))
           stats (atom {:simd-maps 0 :simd-reduces 0 :fallback 0 :fused 0 :skipped-small 0})
           ;; On-the-fly SegOp computation for any par form
+          ;; the SegOps segop-lower attached to the binding being transformed — same seam as
+          ;; opencl-pass (*bound-segops* there). Consumed only when the dtype matches what this
+          ;; backend would derive, so consumption cannot silently change the SIMD element type.
+          take-bound (fn [pred dtype]
+                       (when-let [so (first (filter #(and (pred %) (= dtype (:dtype %))) *bound-segops*))]
+                         (swap! stats update :segop-reused (fnil inc 0))
+                         so))
           par->segmap (fn [form]
                         (try
                           (let [par-info (par/extract-par-map-info form)
@@ -412,24 +425,31 @@
                                          " from-meta=" (:elem-type par-info)
                                          " out-tag=" (or (:raster.type/tag (meta (:out par-info)))
                                                          (:tag (meta (:out par-info)))))))
-                            (let [soac (raster.compiler.ir.soac/par-form->soac
-                                        (:out par-info) form (swap! segop-id-counter inc))
-                                  segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                          soac :cpu:0 :dtype dtype)]
-                              (first segops)))
-                          (catch Exception _ nil)))
+                            (or (take-bound #(instance? raster.compiler.ir.segop.SegMap %) dtype)
+                                (do (swap! stats update :segop-relowered (fnil inc 0))
+                                    (let [soac (raster.compiler.ir.soac/par-form->soac
+                                                (:out par-info) form (swap! segop-id-counter inc))
+                                          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                                  soac :cpu:0 :dtype dtype)]
+                                      (first segops)))))
+                          ;; A structured unsupported-form refusal may fall back to scalar code.
+                          ;; Raw implementation exceptions must escape, as on the GPU boundary.
+                          (catch clojure.lang.ExceptionInfo _ nil)))
           par->segred (fn [form]
                         (try
                           (let [par-info (par/extract-par-reduce-info form)
                                 dtype (or (:elem-type par-info)
                                           :double)
                                 sym (gensym "red_")
-                                soac (raster.compiler.ir.soac/par-form->soac
-                                      sym form (swap! segop-id-counter inc))
-                                segops (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                        soac :cpu:0 :dtype dtype)]
-                            (first segops))
-                          (catch Exception _ nil)))
+                                bound (take-bound #(instance? raster.compiler.ir.segop.SegRed %) dtype)]
+                            (or bound
+                                (do (swap! stats update :segop-relowered (fnil inc 0))
+                                    (let [soac (raster.compiler.ir.soac/par-form->soac
+                                                sym form (swap! segop-id-counter inc))
+                                          segops (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                                  soac :cpu:0 :dtype dtype)]
+                                      (first segops)))))
+                          (catch clojure.lang.ExceptionInfo _ nil)))
           transform
           (fn transform [form]
             (cond
@@ -501,7 +521,11 @@
                   ;; No fusion — recurse into bindings and body
                   ;; transform handles par forms via SegOp uniformly
                   (let [pairs (partition 2 bindings)
-                        new-bindings (vec (mapcat (fn [[s e]] [s (transform e)]) pairs))
+                        new-bindings (vec (mapcat (fn [[s e]]
+                                                    [s (binding [*bound-segops*
+                                                                 (:raster.compiler.passes.parallel.segop-lower-pass/segops (meta s))]
+                                                         (transform e))])
+                                                  pairs))
                         new-body (doall (map transform body))]
                     (list* let-sym new-bindings new-body))))
 
