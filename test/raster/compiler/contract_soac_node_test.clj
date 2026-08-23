@@ -17,6 +17,7 @@
    `compile-aot` of every contraction with 'Cannot convert non-SOAC to par form'."
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.backend.gpu.opencl-pass :as op]
@@ -63,7 +64,7 @@
       (let [r (run (:form (slp/segop-lower-pass bound {:target-device :ze:0 :dtype :double})))]
         (is (= 1 (:segop-reused (:stats r))))
         (is (nil? (:segop-relowered (:stats r))))
-        (is (= :regtiled (:strategy (first (:kernels r)))))))
+        (is (= :regtiled (kart/attribute (first (:kernels r)) :strategy)))))
     (testing "without segop-lower (door C): re-lowered and COUNTED"
       (is (= 1 (:segop-relowered (:stats (run bound))))))
     (testing "it is a refactor: identical kernel source both ways"

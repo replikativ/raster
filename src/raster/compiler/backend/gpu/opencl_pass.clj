@@ -322,7 +322,7 @@
             ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX
             ;; tensorize when legal (canonical f16 matmul, pitch-aligned) → peak (byte-identical
             ;; to the hand GEMM front door); otherwise the portable register-tiled kernel (any
-            ;; dtype, arbitrary dims). Emits a 2D invoke-registered-contraction! marker.
+            ;; dtype, arbitrary dims). Emits one artifact-backed marker containing only ABI values.
             (croute/par-contract-form? form)
             (let [out-sym (second form)
                   ;; pass the REAL descriptor: route-contraction fed `(or desc {})` into
@@ -341,36 +341,21 @@
                       :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                   device-id)
                                  (catch Throwable _ nil))))
-                  ;; Full reductions already arrive as a verified KernelArtifact; keep that value
-                  ;; intact. Other contraction leaves have not migrated yet and retain their
-                  ;; routed kernel map during this bounded vertical.
-                  ;; :strategy/:fallback-reason/:declines/:tile are the ROUTING DECISION. They
-                  ;; were dropped here, so no diagnostic could say which leaf a kernel came from
-                  ;; or why a faster one was refused. Tensorization/packing are codegen facts that
-                  ;; need no extra launch slot, so preserve them for inspection instead of treating
-                  ;; them like the unbound argument fields refused above.
-                  kernel (if (= :reduction (:invoke r))
-                           (:artifact r)
-                           (merge (select-keys r [:c-op :identity-val :array-params
-                                                  :out-dtype :strategy :fallback-reason
-                                                  :declines :tile :tensorized :packed
-                                                  :fused-epilogue :abi :arguments])
-                                  {:kernel-name (:kernel-name r) :source (:source r)
-                                   :dtype (:dtype r)}))
+                  ;; Every routed single-entry leaf is now a complete executable artifact. Routing
+                  ;; diagnostics and tensorization facts live in its attributes/provenance rather
+                  ;; than being flattened into the runtime registry namespace.
+                  kernel (:artifact r)
                   k (register-kernel! kernel
                                       :ze-contracts)]
               ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
               ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
               (if (= :reduction (:invoke r))
                 (emit-reduction-invocation k nil)
-              ;; The marker carries only VALUES in ABI order.  Slot kind, storage dtype and kernel
-              ;; view dtype live once in the registered ABI and drive runtime binding.
+                ;; The staging marker carries only ordered values. Output extent and complete 2-D
+                ;; launch live in the artifact; resident extraction never reconstructs geometry.
                 (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
                       (:kernel-name k)
-                      (vec (:arguments r))
-                      (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
-                      (vec (:wg r))
-                      (vec (:grid r)))))
+                      (vec (:arguments r)))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the

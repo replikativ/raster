@@ -1172,6 +1172,23 @@
               (when (and (device-buffer? value) (< (:n-elements ^OclBuffer value) 1))
                 (throw (ex-info "resident reduction result buffer must hold at least one element"
                                 {:kernel-name kernel-name :slot slot :buffer-elements 0})))))
+        _ (when (= :tensor-contraction (get-in registered [:effects :kind]))
+            (let [extent-expr (kart/attribute registered :out-elems)
+                  out-elems (long (if (number? extent-expr)
+                                    extent-expr
+                                    (kcall/resolve-value call extent-expr)))]
+              (when (neg? out-elems)
+                (throw (ex-info "resident contraction output extent must be non-negative"
+                                {:kernel-name kernel-name :out-elems out-elems})))
+              (doseq [[slot value] pointer-pairs :when (= :result (:role slot))]
+                (let [capacity (cond
+                                 (device-buffer? value) (:n-elements ^OclBuffer value)
+                                 (instance? MemorySegment value)
+                                 (quot (.byteSize ^MemorySegment value) (dt/bytes-of (:dtype slot))))]
+                  (when (< (long capacity) out-elems)
+                    (throw (ex-info "contraction output buffer is smaller than its artifact extent"
+                                    {:kernel-name kernel-name :slot slot :out-elems out-elems
+                                     :buffer-elements capacity})))))))
         ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
         {:keys [program]} (ensure-kernel-loaded! kernel-name)
         kh (create-kernel-fresh program kernel-name)]
@@ -1215,60 +1232,6 @@
       :group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
       :kernel-name kernel-name
       :async? (boolean (get opts :async?))})))
-
-(defn bind-registered-contraction!
-  "Pre-bind a routed contraction over resident OclBuffers in exact ordered ABI position.
-  The returned prepared launch carries vector workgroup/group-count geometry; the OpenCL graph
-  replay path accepts both these 2-D values and the scalar 1-D values used by map kernels."
-  [^String kernel-name arguments out-elems wg grid]
-  (let [registered (or (get @kernel-registry kernel-name)
-                       (throw (ex-info (str "Kernel not registered: " kernel-name)
-                                       {:kernel-name kernel-name
-                                        :registered (keys @kernel-registry)})))
-        abi (kabi/validate! (:abi registered))
-        arguments (kabi/validate-arguments! abi arguments)
-        _ (when-not (and (vector? wg) (= 2 (count wg))
-                         (every? pos? wg)
-                         (vector? grid) (= 2 (count grid))
-                         (every? pos? grid))
-            (throw (ex-info "resident contraction requires positive 2-D :wg and :grid vectors"
-                            {:kernel-name kernel-name :wg wg :grid grid})))
-        out-elems (long out-elems)
-        _ (when (neg? out-elems)
-            (throw (ex-info "resident contraction :out-elems must be non-negative"
-                            {:kernel-name kernel-name :out-elems out-elems})))
-        _ (doseq [[slot value] (map vector abi arguments)]
-            (if (= :scalar (:kind slot))
-              (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
-                (throw (ex-info "contraction ABI scalar binding has the wrong kernel dtype"
-                                {:kernel-name kernel-name :slot slot
-                                 :expected (:kernel-dtype slot)
-                                 :actual (when (map? value) (:type value))})))
-              (do
-                (when-not (or (device-buffer? value) (instance? MemorySegment value))
-                  (throw (ex-info "resident contraction requires OclBuffer/MemorySegment pointer arguments"
-                                  {:kernel-name kernel-name :slot slot :value-type (type value)})))
-                (when (and (device-buffer? value)
-                           (not= (:dtype slot) (dt/canon (:dtype ^OclBuffer value))))
-                  (throw (ex-info "contraction ABI storage dtype does not match resident buffer"
-                                  {:kernel-name kernel-name :slot slot
-                                   :expected (:dtype slot)
-                                   :actual (dt/canon (:dtype ^OclBuffer value))})))
-                (when (and (= :output (:kind slot)) (device-buffer? value)
-                           (< (:n-elements ^OclBuffer value) out-elems))
-                  (throw (ex-info "contraction output buffer is smaller than :out-elems"
-                                  {:kernel-name kernel-name :slot slot :out-elems out-elems
-                                   :buffer-elements (:n-elements ^OclBuffer value)}))))))
-        ;; Driver touch starts only after ABI/value/geometry validation.
-        {:keys [program]} (ensure-kernel-loaded! kernel-name)
-        kh (create-kernel-fresh program kernel-name)]
-    (doseq [[idx [slot value]] (map-indexed vector (map vector abi arguments))]
-      (if (= :scalar (:kind slot))
-        (set-kernel-arg-scalar! kh idx value)
-        (set-kernel-arg-buffer! kh idx (device-mem-of value))))
-    {:bound {:kernel kh :wg (mapv long wg)}
-     :group-count (mapv long grid)
-     :kernel-name kernel-name}))
 
 (defn- enqueue-bound!
   "Enqueue one pre-bound kernel (no finish)."
