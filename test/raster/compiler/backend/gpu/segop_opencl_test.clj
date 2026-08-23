@@ -86,4 +86,21 @@
       (is (re-find #"__global float\* restrict hout2" (:source k)))
       (is (not (re-find #"const float\* restrict hout2" (:source k)))))
     (testing "written via subscript in the body"
-      (is (re-find #"hout2\[" (:source k))))))
+      (is (re-find #"hout2\[" (:source k))))
+    (testing "the ABI preserves secondary-output, primary-output, scalar and bound order"
+      (is (= '[a b d hout2 hout1 _n_bound] (mapv :name (:abi k))))
+      (is (= [:input :input :input :output :output :scalar]
+             (mapv :kind (:abi k))))
+      (is (= '[a b d hout2 hout1 n] (:arguments k))))))
+
+(deftest segmap-abi-preserves-integer-scalar-type
+  (let [form '(raster.par/map! out i n float
+                               (clojure.core/aget a (clojure.core/+ i offset)))
+        s (soac/par-form->soac 'out form 1)
+        segmap (first (lower/lower-map s nil :dtype :float))
+        k (sg/generate-segmap-kernel segmap 'out :dtype :float
+                                     :scalar-types {'offset :int})]
+    (is (= '[a out offset _n_bound] (mapv :name (:abi k))))
+    (is (= [:float :float :int :int] (mapv :dtype (:abi k))))
+    (is (re-find #"int offset" (:source k)))
+    (is (= '[a out offset n] (:arguments k)))))

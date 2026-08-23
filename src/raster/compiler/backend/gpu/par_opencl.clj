@@ -17,6 +17,7 @@
             [raster.compiler.core.hardware :as chw]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.passes.scalar.soa-lower :as sl]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [clojure.string :as str]
@@ -57,8 +58,8 @@
 (defn generate-par-map-kernel
   "Generate an OpenCL C kernel from a raster.par/map! form.
 
-  Returns {:kernel-name str :source str :array-params [syms]
-           :scalar-params [syms] :dtype kw}."
+  Returns {:kernel-name str :source str :abi [ordered typed slots]
+           :array-params [syms] :scalar-params [syms] :dtype kw}."
   [form & {:keys [dtype kernel-name-prefix scalar-types]
            :or {dtype :double kernel-name-prefix "par_map"
                 scalar-types {}}}]
@@ -87,17 +88,35 @@
                            ce/*scalar-type* ctype]
                    (ce/emit-expr adapted-body idx (set (map #(symbol (name %)) arr-params))))
         cast-str (if cast (str "(" (name cast) ")(" body-str ")") body-str)
+        scalar-dtype (fn [s]
+                       (case (scl-type s)
+                         "int" :int
+                         "long" :long
+                         "double" :double
+                         "float" :float))
+        abi (kabi/validate!
+             (vec (concat
+                   (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand)
+                        arr-params)
+                   [(kabi/slot out :output dtype :c-name "out" :role :result)]
+                   (map #(kabi/slot % :scalar (scalar-dtype %)
+                                   :c-name (ce/c-symbol %) :role :parameter)
+                        scl-params)
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (codegen/extension-pragmas dtype)
                     "__kernel void " kernel-name
                     "(" all-params ") {\n"
                     "    for (int idx = get_global_id(0); idx < _n_bound; idx += get_global_size(0)) {\n"
                     "        out[idx] = " cast-str ";\n"
                     "    }\n"
-                    "}\n")]
+                    "}\n")
+        _ (kabi/validate-source-signature! kernel-name source abi)]
     {:kernel-name kernel-name
      :source source
      :array-params arr-params
      :scalar-params scl-params
+     :abi abi
+     :arguments (vec (concat arr-params [out] scl-params [(:bound info)]))
      :out-param out
      :dtype dtype}))
 

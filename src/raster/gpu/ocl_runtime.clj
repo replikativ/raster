@@ -18,7 +18,8 @@
             Arena FunctionDescriptor Linker Linker$Option
             MemoryLayout MemorySegment SymbolLookup ValueLayout
             AddressLayout]
-           [java.lang.invoke MethodHandle]))
+           [java.lang.invoke MethodHandle])
+  (:require [raster.compiler.ir.kernel-abi :as kabi]))
 
 ;; ================================================================
 ;; Library loading
@@ -1071,7 +1072,9 @@
   ([^String kernel-name arrays scalar-args n]
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [{:keys [program workgroup-size dtype]
+   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
+             (kabi/validate-split-binding! abi arrays scalar-args))
+         {:keys [program workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
          kh (create-kernel-fresh program kernel-name)
          wg (long (get opts :workgroup-size workgroup-size))
