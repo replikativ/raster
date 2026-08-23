@@ -22,6 +22,10 @@
 (deftm ocl-session-ax! (All [T] [x :- (Array T) y :- (Array T) a :- T n :- Long] :- Void
   (raster.par/map-void! i n (ra/aset y i (* a (ra/aget x i))))))
 
+(deftm ocl-session-map
+  [x :- (Array float) y :- (Array float) a :- Float n :- Long] :- (Array float)
+  (raster.par/map! y i n float (* a (ra/aget x i))))
+
 (deftm ocl-session-contract
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
@@ -80,6 +84,28 @@
           (let [r2 (run-program! s p [x y (float 2.0) n])
                 ^floats yg (get r2 'y)]
             (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3))))
+        (finally (close-session! s))))))
+
+(deftest ocl-resident-segmap-artifact-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl resident SegMap artifact (no OpenCL device)")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          make-session (ns-resolve gpu 'make-session)
+          bind-program! (ns-resolve gpu 'bind-program!)
+          run-program! (ns-resolve gpu 'run-program!)
+          close-session! (ns-resolve gpu 'close-session!)
+          descriptor (pl/compile-gpu-program #'ocl-session-map :ocl:0 :dtype :float)
+          n 4096
+          x (float-array (map float (range n)))
+          y (float-array n)
+          s (make-session :ocl:0)]
+      (try
+        (let [handle (bind-program! s descriptor [x y (float 2.0) n])
+              result (get (run-program! s handle [x y (float 2.0) n]) 'y)]
+          (is (= [:map] (mapv :convention (:steps descriptor))))
+          (is (every? (fn [i] (< (Math/abs (- (aget ^floats result (int i)) (* 2.0 i)))
+                                  1e-3))
+                      (range n))))
         (finally (close-session! s))))))
 
 (deftest ocl-resident-contraction-roundtrip

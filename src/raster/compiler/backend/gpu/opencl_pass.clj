@@ -68,41 +68,34 @@
   #{:raster/fatal :raster/bug})
 
 (defn- segop-attempt
-  "Run a SegOp lowering `thunk`, returning the SegOp or nil — and RECORDING why on `stats` when it
-   declines, so the choice between the modern SegOp path and `legacy/generate-par-*` stops being
-   invisible.
+  "Run a SegOp lowering `thunk`, returning the SegOp or nil and recording a structured decline.
+   The caller decides whether that decline is an allowed scheduling fallback or an illegal
+   operation."
+  [stats kind form dtype fallback thunk]
+  ;; Only structured conversion refusals are legal fallbacks. An implementation exception is not
+  ;; evidence that alternate codegen is legal, and must escape instead of becoming a decline.
+  (let [r (try {:ok (thunk)} (catch clojure.lang.ExceptionInfo e {:err e}))]
+    (cond
+      (:err r)
+      (let [e (:err r)]
+        (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
+        (swap! stats update :segop-declined (fnil conj [])
+               {:kind kind :op (when (seq? form) (first form))
+                :dtype (or dtype :double)
+                :reason (or (:reason (ex-data e)) :no-lowering-rule)
+                :message (.getMessage e)
+                :fallback fallback})
+        nil)
 
-   Both outcomes increment the same `:ze-maps`/`:ze-reduces` counter, so nothing downstream — not
-   the kernel record, not explain-pipeline — could say which of the two code generators produced a
-   kernel, or why the modern one declined. That is the same warn-and-vanish shape north-star §3.5
-   rejects at the SegOp boundary, one door along."
-  ([stats kind form dtype thunk]
-   (segop-attempt stats kind form dtype :legacy-codegen thunk))
-  ([stats kind form dtype fallback thunk]
-   ;; Only structured conversion refusals are legal fallbacks. An implementation exception is not
-   ;; evidence that alternate codegen is legal, and must escape instead of becoming a decline.
-   (let [r (try {:ok (thunk)} (catch clojure.lang.ExceptionInfo e {:err e}))]
-     (cond
-       (:err r)
-       (let [e (:err r)]
-         (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
-         (swap! stats update :segop-declined (fnil conj [])
-                {:kind kind :op (when (seq? form) (first form))
-                 :dtype (or dtype :double)
-                 :reason (or (:reason (ex-data e)) :no-lowering-rule)
-                 :message (.getMessage e)
-                 :fallback fallback})
-         nil)
+      (nil? (:ok r))
+      (do (swap! stats update :segop-declined (fnil conj [])
+                 {:kind kind :op (when (seq? form) (first form))
+                  :dtype (or dtype :double)
+                  :reason :lowering-produced-nothing
+                  :fallback fallback})
+          nil)
 
-       (nil? (:ok r))
-       (do (swap! stats update :segop-declined (fnil conj [])
-                  {:kind kind :op (when (seq? form) (first form))
-                   :dtype (or dtype :double)
-                   :reason :lowering-produced-nothing
-                   :fallback fallback})
-           nil)
-
-       :else (:ok r)))))
+      :else (:ok r))))
 
 (def ^:dynamic *bound-segops*
   "The SegOp records `segop-lower` attached to the binding CURRENTLY being transformed (its
@@ -126,16 +119,26 @@
 (defn- par->segmap
   "The SegMap for a par/map! form: the one `segop-lower` already computed for this binding when
    available; otherwise re-lowered here with the REAL `device-id` (it was `:ze:0` hardcoded) and
-   counted as `:segop-relowered`. nil (with a recorded decline) ⇒ legacy codegen."
+   counted as `:segop-relowered`. SegMap is a full conversion: a missing rule is an illegal
+   operation, never permission to select a second emitter."
   [stats form dtype device-id]
   (or (take-bound-segop stats :segmap #(instance? raster.compiler.ir.segop.SegMap %))
       (do (swap! stats update :segop-relowered (fnil inc 0))
-          (segop-attempt stats :segmap form dtype
-                         #(let [par-info (par/extract-par-map-info form)
-                                soac (raster.compiler.ir.soac/par-form->soac
-                                      (:out par-info) form (swap! segop-id-counter inc))]
-                            (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                    soac (or device-id :ze:0) :dtype (or dtype :double))))))))
+          (or (segop-attempt stats :segmap form dtype :none
+                             #(let [par-info (par/extract-par-map-info form)
+                                    soac (raster.compiler.ir.soac/par-form->soac
+                                          (:out par-info) form (swap! segop-id-counter inc))]
+                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+              (let [decline (last (:segop-declined @stats))]
+                (throw (ex-info "par/map! remains illegal after full SegOp conversion"
+                                {:reason :illegal-op-remains
+                                 :op (first form)
+                                 :source form
+                                 :missing-rule (:reason decline)
+                                 :target-dialect :segop
+                                 :decline decline
+                                 :fallback :none})))))))
 
 (defn- par->segred
   "The SegRed for a par/reduce form. Reduction is a FULL conversion: absence is an illegal
@@ -234,8 +237,8 @@
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
-   Uses SegOp-based codegen for par/map! and par/reduce.
-   Delegates to legacy generators for specialized forms (stencil, scatter,
+   Uses full SegOp conversion for par/map! and par/reduce.
+   Delegates to specialized generators for stencil, scatter,
    scan, rng-fill, active-ids, reduce-by-key, compound-kernel, map-void).
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
@@ -288,18 +291,13 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map! form))
-                (if-let [segmap (par->segmap stats form dtype device-id)]
-                  (let [kernel (segop-cl/generate-segmap-kernel segmap out
-                                                                :dtype dtype :scalar-types top-scalar-types
-                                                                :array-types (merge top-array-types (:array-types (meta form))))]
-                    (let [k (register-kernel! kernel :ze-maps)]
-                      (emit-map-invocation k)))
-                  ;; SegOp failed — use legacy
-                  (let [kernel (legacy/generate-par-map-kernel form
-                                                               :dtype dtype :device-id device-id
-                                                               :scalar-types top-scalar-types)
-                        k (register-kernel! kernel :ze-maps)]
-                    (emit-map-invocation k)))))
+                (let [segmap (par->segmap stats form dtype device-id)
+                      kernel (segop-cl/generate-segmap-kernel
+                              segmap out
+                              :dtype dtype :scalar-types top-scalar-types
+                              :array-types (merge top-array-types (:array-types (meta form))))
+                      k (register-kernel! kernel :ze-maps)]
+                  (emit-map-invocation k))))
 
             ;; === par/contract — tensor contraction, routed through the DPAS legality gate ===
             ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX

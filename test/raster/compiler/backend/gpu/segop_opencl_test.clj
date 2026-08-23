@@ -10,6 +10,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
@@ -79,8 +80,9 @@
       (is (= '[a result-buffer scale n] (:arguments k)))
       (is (re-find #"\(.*a,.*output, float scale, int _n_bound\)" (:source k))))
     (testing "launch and semantic origin are part of the value"
-      (is (= {:dimensions 1 :workgroup-size 256 :grid {:kind :ceil-div-bound}}
-             (:launch k)))
+      (is (klaunch/launch-spec? (:launch k)))
+      (is (= [256] (get-in k [:launch :workgroup-size])))
+      (is (= 1024 (get-in k [:launch :shared-memory-bytes])))
       (is (= {:dialect :segred :segop-id (:id segred)} (:provenance k)))
       (is (= :float (get-in k [:attributes :dtype])))))
   (testing "host-scalar staging retains the result position as an explicit nil placeholder"
@@ -108,9 +110,10 @@
         segmap (first (lower/lower-map s nil :dtype :float))
         k (sg/generate-segmap-kernel segmap 'hout1 :dtype :float)]
     (testing "secondary output is an array param, not a scalar param"
-      (is (some #{'hout2} (:array-params k)))
-      (is (not (some #{'hout2} (:scalar-params k))))
-      (is (some #{'hout2} (:written-arrays k))))
+      (is (kart/kernel-artifact? k))
+      (is (some #{'hout2} (kart/attribute k :array-params)))
+      (is (not (some #{'hout2} (kart/attribute k :scalar-params))))
+      (is (some #{'hout2} (kart/attribute k :written-arrays))))
     (testing "declared __global and NON-const in the C signature"
       (is (re-find #"__global float\* restrict hout2" (:source k)))
       (is (not (re-find #"const float\* restrict hout2" (:source k)))))

@@ -34,7 +34,8 @@
   (:require [raster.compiler.core.types :as types]
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
-            [raster.compiler.ir.kernel-artifact :as kart]))
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
 ;; Library loading
@@ -1779,6 +1780,18 @@
   [kernel-name]
   (get @kernel-registry kernel-name))
 
+(defn- registered-1d-workgroup-size
+  "Read a 1-D workgroup from the canonical artifact launch contract, or from the remaining plain
+   registry entry while specialized emitters migrate. Never silently flatten a 2-D/3-D launch."
+  [kernel-info]
+  (if-let [launch (:launch kernel-info)]
+    (let [workgroup (klaunch/static-workgroup-size launch)]
+      (when-not (= 1 (count workgroup))
+        (throw (ex-info "1-D kernel path received a multidimensional launch contract"
+                        {:kernel-name (:kernel-name kernel-info) :launch launch})))
+      (first workgroup))
+    (long (or (:workgroup-size kernel-info) 256))))
+
 (defn- ensure-kernel-loaded!
   "Lazily compile SPIR-V and load module for a registered kernel.
   Returns updated kernel-info with :module and :kernel-handle."
@@ -1852,28 +1865,11 @@
                        (throw (ex-info (str "Kernel not registered: " kernel-name)
                                        {:kernel-name kernel-name
                                         :registered (keys @kernel-registry)})))
-        {:keys [dtype abi array-params scalar-params written-arrays]
-         :or {dtype :double}} registered
-        ;; Old registered/manual map kernels get an equivalent synthetic ABI. New compiler
-        ;; artifacts always carry :abi, so mixed pointer/scalar types are no longer guessed from
-        ;; the output dtype.
-        abi (or abi
-                (let [written (set (map name written-arrays))]
-                  (kabi/validate!
-                   (vec (concat
-                         (map-indexed
-                          (fn [i _]
-                            (let [nm (or (nth array-params i nil) (symbol (str "input" i)))]
-                              (kabi/slot nm :input dtype
-                                         :role (if (contains? written (name nm)) :inout :operand))))
-                          input-arrays)
-                         [(kabi/slot 'out :output dtype :role :result)]
-                         (map-indexed
-                          (fn [i _]
-                            (kabi/slot (or (nth scalar-params i nil) (symbol (str "scalar" i)))
-                                       :scalar dtype :role :parameter))
-                          scalar-args)
-                         [(kabi/slot '_n_bound :scalar :int :role :bound)])))))
+        abi (or (:abi registered)
+                (throw (ex-info "registered map kernel has no ordered ABI"
+                                {:kernel-name kernel-name :registry-entry registered
+                                 :fallback :none})))
+        abi (kabi/validate! abi)
         arguments (vec (concat input-arrays [output-array] scalar-args [n]))
         _ (kabi/validate-arguments! abi arguments)
         pairs (mapv vector abi arguments)
@@ -1901,8 +1897,7 @@
         ;; Loading/compilation may touch the native driver. Every ABI check above deliberately
         ;; runs first, so a malformed marker fails deterministically even on a machine without
         ;; the target device.
-        {:keys [kernel-handle workgroup-size]
-         :or {workgroup-size 256}} (ensure-kernel-loaded! kernel-name)
+        {:keys [kernel-handle] :as loaded} (ensure-kernel-loaded! kernel-name)
         staged (mapv
                 (fn [idx [slot value]]
                   (if (= :scalar (:kind slot))
@@ -1928,7 +1923,7 @@
         _ (when-not bound-pair
             (throw (ex-info "map kernel ABI has no :bound scalar" {:kernel-name kernel-name :abi abi})))
         n (long (second bound-pair))
-        wg (long (or workgroup-size 256))
+        wg (registered-1d-workgroup-size loaded)
         group-count (long (Math/ceil (/ (double n) wg)))]
     (launch! kernel-handle group-count wg all-args)
     ;; ABI output and inout roles are the single source of copy-back truth. DeviceBuffers are
@@ -1991,8 +1986,7 @@
         ;; Native driver/loading begins only after every ABI/value check above.
         loaded (ensure-kernel-loaded! kernel-name)
         kernel-handle (:kernel-handle loaded)
-        workgroup-size (or (get-in loaded [:launch :workgroup-size])
-                           (:workgroup-size loaded) 256)
+        workgroup-size (registered-1d-workgroup-size loaded)
         identity-val (or (get-in loaded [:attributes :identity-val])
                          (:identity-val loaded) 0.0)
         c-op (or (get-in loaded [:attributes :c-op]) (:c-op loaded) "+")
@@ -2625,15 +2619,16 @@
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [module workgroup-size dtype]
-          :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
+         {:keys [module dtype] :or {dtype :float} :as loaded}
+         (ensure-kernel-loaded! kernel-name)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
          ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
          ;; make every binding of the same kernel clobber the others (the last prepare! wins).
          ;; A fresh handle per binding gives each its own arg state — required for the decode
          ;; pattern (N matmuls share one kernel SOURCE but need N independent arg sets).
          kernel-handle (create-kernel-fresh module kernel-name)
-         workgroup-size (long (get opts :workgroup-size workgroup-size))
+         workgroup-size (long (get opts :workgroup-size
+                                   (registered-1d-workgroup-size loaded)))
          n (long n)
          dev-segs (reduce
                    (fn [acc arr]

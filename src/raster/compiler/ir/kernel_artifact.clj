@@ -8,7 +8,8 @@
    This is intentionally the single-kernel value.  Multi-kernel algorithms (scan, staged
    contraction, etc.) belong in the scheduled kernel graph and contain KernelArtifacts as nodes."
   (:require [clojure.string :as str]
-            [raster.compiler.ir.kernel-abi :as kabi]))
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 (defrecord KernelArtifact
            [kernel-name   ;; emitted entry-point string
@@ -47,13 +48,12 @@
       :opencl-c (kabi/validate-source-signature! kernel-name source abi)
       (throw (ex-info "kernel artifact target has no module verifier"
                       {:kernel-name kernel-name :target target})))
-    (when-not (map? launch)
-      (throw (ex-info "kernel artifact launch contract must be a map"
-                      {:kernel-name kernel-name :launch launch})))
-    (let [wg (:workgroup-size launch)]
-      (when-not (and (integer? wg) (pos? wg))
-        (throw (ex-info "kernel artifact launch requires a positive integer workgroup size"
-                        {:kernel-name kernel-name :workgroup-size wg :launch launch}))))
+    (try
+      (klaunch/validate-spec! launch)
+      (catch clojure.lang.ExceptionInfo e
+        (throw (ex-info "kernel artifact has an invalid launch contract"
+                        {:kernel-name kernel-name :launch launch}
+                        e))))
     (when-not (vector? temporaries)
       (throw (ex-info "kernel artifact temporaries must be an ordered vector"
                       {:kernel-name kernel-name :temporaries temporaries})))
