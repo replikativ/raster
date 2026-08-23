@@ -72,6 +72,55 @@
                            call (assoc artifact :source
                                        "__kernel void kernel_call_contract_test(__global const float* x, __global float* out, float scale, int n) { out[0] = 0; }"))))))
 
+(deftest logical-soa-plan-expands-once-before-physical-call
+  (let [soa-artifact
+        (kart/make
+         {:kernel-name "logical_soa_contract_test"
+          :source (str "__kernel void logical_soa_contract_test("
+                       "__global const float* particles_x, "
+                       "__global const int* particles_id, __global float* out, int n) {}")
+          :abi [(kabi/slot 'particles_x :input :float :binding 'particles :role :operand)
+                (kabi/slot 'particles_id :input :int :binding 'particles :role :operand)
+                (kabi/slot 'out :output :float :role :effect)
+                (kabi/slot 'n :scalar :int :role :bound)]
+          :arguments '[particles_x particles_id out n]
+          :launch (klaunch/spec {:workgroup-size [64]
+                                 :group-count [(klaunch/ceil-div 'n 64)]})})
+        plan (kcall/logical-argument-plan soa-artifact)
+        physical (kcall/expand-logical-arguments
+                  soa-artifact
+                  [:resident-particles :resident-out {:type :int :value 65}]
+                  (fn [{:keys [binding]} value]
+                    (if (= binding 'particles)
+                      [(keyword (str (name value) "-x"))
+                       (keyword (str (name value) "-id"))]
+                      [value])))
+        call (kcall/make soa-artifact physical)]
+    (is (= '[particles out n] (kcall/logical-arguments soa-artifact)))
+    (is (= [2 1 1] (mapv (comp count :slots) plan)))
+    (is (= [:resident-particles-x :resident-particles-id :resident-out
+            {:type :int :value 65}]
+           physical))
+    (is (= [2] (get-in call [:geometry :group-count])))
+    (is (= [:seg-x :seg-id]
+           (ze/expand-pointer-binding
+            (first plan)
+            (ze/->GpuSoA 'Particle 'ParticleSoA 65
+                         [{:name "x" :dtype :float :seg :seg-x}
+                          {:name "id" :dtype :int :seg :seg-id}]))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"field order/name"
+         (ze/expand-pointer-binding
+          (first plan)
+          (ze/->GpuSoA 'Particle 'ParticleSoA 65
+                       [{:name "id" :dtype :float :seg :seg-id}
+                        {:name "x" :dtype :int :seg :seg-x}]))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"differs from physical ABI"
+         (kcall/expand-logical-arguments soa-artifact
+                                         [:particles :out {:type :int :value 1}]
+                                         (fn [_ value] [value]))))))
+
 (deftest both-resident-backends-consume-the-same-call-contract
   (let [call (kcall/make artifact args)]
     (doseq [[register! bind!] [[ze/register-kernel! ze/bind-kernel-call]

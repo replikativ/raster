@@ -433,6 +433,26 @@
            :else (jvm-array-dtype %))
         arrays))
 
+(defn expand-pointer-binding
+  "Expand one logical artifact pointer binding into OpenCL physical resident values. OpenCL's
+   current resident representation is one OclBuffer per logical value; multi-slot SoA bindings
+   fail here explicitly until an OpenCL SoA view is introduced. Driver state is not touched."
+  [{:keys [binding slots]} value]
+  (when-not (= 1 (count slots))
+    (throw (ex-info "OpenCL has no resident representation for a multi-slot logical pointer"
+                    {:binding binding :slots slots :value-type (type value)})))
+  (when-not (or (device-buffer? value) (instance? MemorySegment value))
+    (throw (ex-info "OpenCL logical pointer requires OclBuffer/MemorySegment"
+                    {:binding binding :slot (first slots) :value-type (type value)})))
+  [value])
+
+(defn- kernel-info-value
+  "Read a compiler-owned emitter attribute from an artifact or a remaining specialized entry."
+  [kernel-info k default]
+  (if (kart/kernel-artifact? kernel-info)
+    (get (:attributes kernel-info) k default)
+    (get kernel-info k default)))
+
 (defn make-buffer
   "Allocate a persistent GPU buffer via clCreateBuffer."
   ([n] (make-buffer n :float))
@@ -817,11 +837,13 @@
          _ (when abi
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [kernel-handle workgroup-size dtype]
-          :or {workgroup-size 256 dtype :float}
-          :as info} (ensure-kernel-loaded! kernel-name)
+         {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
-         workgroup-size (long (get opts :workgroup-size workgroup-size))
+         dtype (kernel-info-value info :dtype :float)
+         workgroup-size (long (get opts :workgroup-size
+                                   (if (:launch info)
+                                     (first (klaunch/static-workgroup-size (:launch info)))
+                                     (long (or (:workgroup-size info) 256)))))
          n (long n)
          default-elem-size (long (get dtype-byte-sizes dtype 4))
 
@@ -1173,8 +1195,8 @@
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [program dtype] :or {dtype :float} :as loaded}
-         (ensure-kernel-loaded! kernel-name)
+         {:keys [program] :as loaded} (ensure-kernel-loaded! kernel-name)
+         dtype (kernel-info-value loaded :dtype :float)
          kh (create-kernel-fresh program kernel-name)
          wg (long (get opts :workgroup-size (registered-1d-workgroup-size loaded)))
          n (long n)

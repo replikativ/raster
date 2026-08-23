@@ -690,45 +690,42 @@
    weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
    caller collects :phase keys and records once.
 
-     :map/:reduce
+     :map/:reduce/:map-void
                 Artifact ABI values and realized geometry bind through one KernelCall contract.
-                SegRed explicitly schedules one resident workgroup; SegMap realizes its grid.
-     :map-void  output is an in-place array among :array-params; bind by name via prepare!."
+                SegRed explicitly schedules one resident workgroup; maps realize their grid.
+                Logical SoA arguments expand through the backend representation adapter before
+                the physical KernelCall is constructed."
   [sess step args sym->key]
   (let [device-id (:device-id @sess)
-        {:keys [kernel-name arrays n-fn scalar-specs phase convention artifact argument-specs]} step
-        info-fn (rt-resolve device-id "kernel-registry-entry")]
+        {:keys [kernel-name phase convention artifact argument-specs]} step]
     (when-not (#{:map-void :map :reduce} convention)
       (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
                            ") — only :map-void / :map / :reduce are supported on the resident path")
                       {:convention convention :kernel kernel-name})))
-    (let [ki (or (info-fn kernel-name)
-                 (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                 {:kernel kernel-name})))
-          bufs (:buffers @sess)
+    (let [bufs (:buffers @sess)
           resolve-buf (fn [a] (or (get bufs (sym->key a))
                                   (throw (ex-info (str "No buffer for kernel arg: " a " → " (sym->key a))
                                                   {:kernel kernel-name :available (keys bufs)}))))
-          scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
-                        scalar-specs)
-          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
           bind-call-fn (rt-resolve device-id "bind-kernel-call")]
       (case convention
-        (:map :reduce)
-        (let [ordered-args
+        (:map :reduce :map-void)
+        (let [logical-or-physical-args
               (mapv (fn [{:keys [kind sym type value-fn]}]
                       (if (= :scalar kind)
                         {:type type :value (value-fn args)}
                         (resolve-buf sym)))
                     argument-specs)
+              ordered-args
+              (if (:logical-bindings? step)
+                (kcall/expand-logical-arguments
+                 artifact logical-or-physical-args
+                 (rt-resolve device-id "expand-pointer-binding"))
+                logical-or-physical-args)
               call (kcall/make artifact ordered-args
                                (if (= :reduce convention) {:group-count [1]} {}))
               prepared (bind-call-fn call)]
           (swap! sess assoc-in [:prepared phase] prepared))
-
-        (let [sym->buf (into {} (map (fn [p] [(name p) (sym->key p)]) (:array-params ki)))]
-          (swap! sess assoc-in [:kernels phase] [ki])
-          (prepare! sess phase sym->buf scalars (long (n-fn args)) {:kernel-phase phase}))))
+        nil))
     sess))
 
 ;; ----------------------------------------------------------------
@@ -747,6 +744,7 @@
    compile-gpu-program's scalar typing (same derive-param-types) — not a special case."
   [op ki scalars dtype]
   (let [v (or (resolve-deftm-var op) op)
+        scalar-params (or (:scalar-params ki) (get-in ki [:attributes :scalar-params]))
         types (:scalar-types (opencl-pass/derive-param-types
                               (:raster.core/deftm-params (meta v))
                               (:raster.core/deftm-tags (meta v)) dtype))]
@@ -756,9 +754,9 @@
                           (if (contains? scalars sp) (get scalars sp)
                               (throw (ex-info (str "chain step for " (:name (meta v))
                                                    " missing scalar: " sp)
-                                              {:need (:scalar-params ki) :have (keys scalars)}))))]
+                                              {:need scalar-params :have (keys scalars)}))))]
               {:type t :value (case t :int (int raw) :long (long raw) :double (double raw) (float raw))}))
-          (:scalar-params ki))))
+          scalar-params)))
 
 (def ^:private valid-chain-roles
   "Residency roles a chain buffer may carry. run-chain!/run-chain-ctx! move :input up and
@@ -1100,7 +1098,7 @@
                                                        (str "scratch " sym)))))
                            allocs)
          info-fn   (rt-resolve device-id "kernel-registry-entry")
-         bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
+         specialized-bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
          bind-call-fn (rt-resolve device-id "bind-kernel-call")
          contract-fn (rt-resolve device-id "bind-registered-contraction!")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
@@ -1229,29 +1227,22 @@
                ;; Generic map and reduction now share the complete executable value: emitted
                ;; artifact, ordered ABI values and realized launch. Reduction's single-group
                ;; resident schedule is explicit here rather than hidden in a special binder.
-               (:map :reduce)
-               (let [ordered-args
+               (:map :reduce :map-void)
+               (let [logical-or-physical-args
                      (mapv (fn [{:keys [kind sym type value-fn]}]
                              (if (= :scalar kind)
                                {:type type :value (value-fn args)}
                                (buf-of sym kernel-name)))
                            argument-specs)
+                     ordered-args
+                     (if (:logical-bindings? step)
+                       (kcall/expand-logical-arguments
+                        artifact logical-or-physical-args
+                        (rt-resolve device-id "expand-pointer-binding"))
+                       logical-or-physical-args)
                      call (kcall/make artifact ordered-args
                                       (if (= :reduce convention) {:group-count [1]} {}))]
                  [(assoc (bind-call-fn call) :phase (:phase step))])
-
-               ;; Map-void has not migrated to KernelArtifact yet; retain its compatibility
-               ;; binder until its emitter carries a complete artifact and ordered call values.
-               :map-void
-               (do (or (info-fn kernel-name)
-                       (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                       {:kernel kernel-name})))
-                   (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
-                         scalars (mapv (fn [{:keys [type value-fn]}]
-                                         {:type type :value (value-fn args)})
-                                       scalar-specs)]
-                     [(assoc (bind-fn kernel-name buf-vec scalars (long (n-fn args)))
-                             :phase (:phase step))]))
                ;; Routed contraction: preserve the emitter-authored ABI order all the way into
                ;; the backend binder. Pointer slots resolve to resident buffers; scalar slots
                ;; retain their declared kernel view dtype (not the program/output dtype). The
@@ -1308,7 +1299,8 @@
                          zerofill-fn (rt-resolve device-id "ensure-zero-fill-kernel!")
                          scatter-fn (rt-resolve device-id "bind-registered-scatter-kernel!")
                          zk (zerofill-fn (if (= dtype :double) :double :float))]
-                     [(assoc (bind-fn zk [out-buf] [] (long out-size)) :phase (:phase step))
+                     [(assoc (specialized-bind-fn zk [out-buf] [] (long out-size))
+                             :phase (:phase step))
                       (assoc (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)
                              :phase (:phase step))]))
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "

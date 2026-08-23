@@ -30,6 +30,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
@@ -1750,7 +1751,7 @@
                                        (into acc
                                              (map (comp symbol name)
                                                   (if-let [abi (:abi ki)]
-                                                    (map :name
+                                                    (map #(or (:binding %) (:name %))
                                                          (filter #(or (= :output (:kind %))
                                                                       (= :inout (:role %)))
                                                                  (kabi/pointer-slots abi)))
@@ -1827,6 +1828,38 @@
                            :out-elems-fn (expr->arg-fn all-params scalar-lets out-elems-expr)
                            :wg-fns (mapv #(expr->arg-fn all-params scalar-lets %) wg-exprs)
                            :grid-fns (mapv #(expr->arg-fn all-params scalar-lets %) grid-exprs)
+                           :phase (keyword (str "gpu-step-" i))})
+
+                        (= :map-void (:convention step))
+                        (let [{:keys [kernel-name arrays scalars n-expr convention]} step
+                              artifact (reg-entry kernel-name)
+                              _ (when-not (kart/kernel-artifact? artifact)
+                                  (throw (ex-info "resident map-void kernel is not a registered KernelArtifact"
+                                                  {:kernel-name kernel-name :entry artifact})))
+                              artifact (kart/validate! artifact)
+                              plan (kcall/logical-argument-plan artifact)
+                              marker-values (vec (concat arrays scalars [n-expr]))
+                              expected-values (kcall/logical-arguments artifact)
+                              _ (when-not (= expected-values marker-values)
+                                  (throw (ex-info "map-void marker differs from its artifact logical argument plan"
+                                                  {:kernel-name kernel-name
+                                                   :expected expected-values
+                                                   :actual marker-values
+                                                   :plan plan})))]
+                          {:convention convention
+                           :kernel-name kernel-name
+                           :artifact artifact
+                           :abi (:abi artifact)
+                           :logical-bindings? true
+                           :argument-specs
+                           (mapv (fn [entry value]
+                                   (let [slot (first (:slots entry))]
+                                     (if (:pointer? entry)
+                                       {:slots (:slots entry) :kind :pointer
+                                        :binding (:binding entry) :sym value}
+                                       {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                        :value-fn (expr->arg-fn all-params scalar-lets value)})))
+                                 plan marker-values)
                            :phase (keyword (str "gpu-step-" i))})
 
                         (and (#{:map :reduce} (:convention step)) (:arguments step))

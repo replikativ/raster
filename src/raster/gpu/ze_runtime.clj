@@ -1129,6 +1129,41 @@
               :else (conj dtypes (jvm-array-dtype arr))))
           [] arrays))
 
+(defn expand-pointer-binding
+  "Expand one logical artifact pointer binding into Level Zero's physical resident values.
+   A GpuSoA supplies one checked field segment per ABI slot; ordinary resident buffers supply one
+   slot. This function is driver-free and is called before KernelCall construction."
+  [{:keys [binding slots]} value]
+  (cond
+    (gpu-soa? value)
+    (let [fields (:field-segs ^GpuSoA value)]
+      (when-not (= (count slots) (count fields))
+        (throw (ex-info "GpuSoA field count differs from its artifact binding"
+                        {:binding binding :expected (count slots) :actual (count fields)
+                         :slots slots :fields (mapv :name fields)})))
+      (doseq [[slot field] (map vector slots fields)]
+        (let [expected-name (symbol (str (name binding) "_" (name (:name field))))]
+          (when-not (= expected-name (:name slot))
+            (throw (ex-info "GpuSoA field order/name differs from its physical ABI slot"
+                            {:binding binding :slot slot :field (:name field)
+                             :expected expected-name :actual (:name slot)}))))
+        (when-not (= (:dtype slot) (dt/canon (:dtype field)))
+          (throw (ex-info "GpuSoA field dtype differs from its physical ABI slot"
+                          {:binding binding :slot slot :field (:name field)
+                           :expected (:dtype slot) :actual (dt/canon (:dtype field))}))))
+      (mapv :seg fields))
+
+    (not= 1 (count slots))
+    (throw (ex-info "multi-slot logical pointer requires a GpuSoA resident value"
+                    {:binding binding :slots slots :value-type (type value)}))
+
+    (or (device-buffer? value) (instance? MemorySegment value))
+    [value]
+
+    :else
+    (throw (ex-info "Level Zero logical pointer requires DeviceBuffer/GpuSoA/MemorySegment"
+                    {:binding binding :slot (first slots) :value-type (type value)}))))
+
 (defn gpu-array
   "Allocate GPU-resident (shared) storage for n elements of scalar-type.
    scalar-type: the defvalue type symbol (e.g. 'Particle) or Class.
@@ -1749,6 +1784,13 @@
                         {:kernel-name (:kernel-name kernel-info) :launch launch})))
       (first workgroup))
     (long (or (:workgroup-size kernel-info) 256))))
+
+(defn- kernel-info-value
+  "Read a compiler-owned emitter attribute from an artifact or a remaining specialized entry."
+  [kernel-info k default]
+  (if (kart/kernel-artifact? kernel-info)
+    (get (:attributes kernel-info) k default)
+    (get kernel-info k default)))
 
 (defn- ensure-kernel-loaded!
   "Lazily compile SPIR-V and load module for a registered kernel.
@@ -2452,10 +2494,10 @@
          _ (when abi
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [kernel-handle workgroup-size dtype written-arrays array-types]
-          :or {workgroup-size 256 dtype :float}
-          :as info} (ensure-kernel-loaded! kernel-name)
-         workgroup-size (long (get opts :workgroup-size workgroup-size))
+         {:keys [kernel-handle] :as info} (ensure-kernel-loaded! kernel-name)
+         dtype (kernel-info-value info :dtype :float)
+         workgroup-size (long (get opts :workgroup-size
+                                   (registered-1d-workgroup-size info)))
          n (long n)
          default-dtype-size (long (get dtype-byte-sizes dtype 4))
         ;; Determine per-array byte size from actual array type
@@ -2588,8 +2630,8 @@
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
              (kabi/validate-split-binding! abi arrays scalar-args)
              (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
-         {:keys [module dtype] :or {dtype :float} :as loaded}
-         (ensure-kernel-loaded! kernel-name)
+         {:keys [module] :as loaded} (ensure-kernel-loaded! kernel-name)
+         dtype (kernel-info-value loaded :dtype :float)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
          ;; mutable state ON the kernel handle, so reusing the registry's shared handle would
          ;; make every binding of the same kernel clobber the others (the last prepare! wins).

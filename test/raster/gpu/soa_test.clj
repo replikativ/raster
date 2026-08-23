@@ -10,6 +10,7 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.runtime.display :as display])
   (:import [java.lang.foreign MemorySegment ValueLayout]))
 
@@ -170,7 +171,7 @@
         (is (= '[particles_x particles_y particles_vx particles_vy _n_bound]
                (mapv :name abi)))
         (is (= '[particles] (kabi/pointer-binding-names abi)))
-        (is (= '[particles] (:array-params kernel)))))))
+        (is (= '[particles] (kart/attribute kernel :array-params)))))))
 
 (deftest soa-kernel-aget-field-projects-test
   (testing "SoA aget + field projection scalar-replaces to the per-field array read"
@@ -231,8 +232,8 @@
                 {'particles 'TestParticleSoA})
           result (opencl-pass/opencl-pass body :dtype :float)
           kernel (first (:kernels result))]
-      (is (some? (:soa-expansions kernel)))
-      (is (contains? (:soa-expansions kernel) 'particles)))))
+      (is (some? (kart/attribute kernel :soa-expansions)))
+      (is (contains? (kart/attribute kernel :soa-expansions) 'particles)))))
 
 ;; ================================================================
 ;; Phase 3: deftm inlining in OpenCL kernels
