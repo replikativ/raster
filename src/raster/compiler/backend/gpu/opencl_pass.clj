@@ -10,6 +10,7 @@
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -75,31 +76,33 @@
    the kernel record, not explain-pipeline — could say which of the two code generators produced a
    kernel, or why the modern one declined. That is the same warn-and-vanish shape north-star §3.5
    rejects at the SegOp boundary, one door along."
-  [stats kind form dtype thunk]
-  ;; Only structured conversion refusals are legal fallbacks. An implementation exception is not
-  ;; evidence that legacy codegen is legal, and must escape instead of becoming :no-lowering-rule.
-  (let [r (try {:ok (thunk)} (catch clojure.lang.ExceptionInfo e {:err e}))]
-    (cond
-      (:err r)
-      (let [e (:err r)]
-        (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
-        (swap! stats update :segop-declined (fnil conj [])
-               {:kind kind :op (when (seq? form) (first form))
-                :dtype (or dtype :double)
-                :reason (or (:reason (ex-data e)) :no-lowering-rule)
-                :message (.getMessage e)
-                :fallback :legacy-codegen})
-        nil)
+  ([stats kind form dtype thunk]
+   (segop-attempt stats kind form dtype :legacy-codegen thunk))
+  ([stats kind form dtype fallback thunk]
+   ;; Only structured conversion refusals are legal fallbacks. An implementation exception is not
+   ;; evidence that alternate codegen is legal, and must escape instead of becoming a decline.
+   (let [r (try {:ok (thunk)} (catch clojure.lang.ExceptionInfo e {:err e}))]
+     (cond
+       (:err r)
+       (let [e (:err r)]
+         (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
+         (swap! stats update :segop-declined (fnil conj [])
+                {:kind kind :op (when (seq? form) (first form))
+                 :dtype (or dtype :double)
+                 :reason (or (:reason (ex-data e)) :no-lowering-rule)
+                 :message (.getMessage e)
+                 :fallback fallback})
+         nil)
 
-      (nil? (:ok r))
-      (do (swap! stats update :segop-declined (fnil conj [])
-                 {:kind kind :op (when (seq? form) (first form))
-                  :dtype (or dtype :double)
-                  :reason :lowering-produced-nothing
-                  :fallback :legacy-codegen})
-          nil)
+       (nil? (:ok r))
+       (do (swap! stats update :segop-declined (fnil conj [])
+                  {:kind kind :op (when (seq? form) (first form))
+                   :dtype (or dtype :double)
+                   :reason :lowering-produced-nothing
+                   :fallback fallback})
+           nil)
 
-      :else (:ok r))))
+       :else (:ok r)))))
 
 (def ^:dynamic *bound-segops*
   "The SegOp records `segop-lower` attached to the binding CURRENTLY being transformed (its
@@ -135,16 +138,26 @@
                                     soac (or device-id :ze:0) :dtype (or dtype :double))))))))
 
 (defn- par->segred
-  "The SegRed for a par/reduce form; same consume-then-relower contract as `par->segmap`."
+  "The SegRed for a par/reduce form. Reduction is a FULL conversion: absence is an illegal
+   operation at the SegOp boundary, never permission to select a second emitter."
   [stats form dtype device-id]
   (or (take-bound-segop stats :segred #(instance? raster.compiler.ir.segop.SegRed %))
       (do (swap! stats update :segop-relowered (fnil inc 0))
-          (segop-attempt stats :segred form dtype
-                         #(let [sym (gensym "red_")
-                                soac (raster.compiler.ir.soac/par-form->soac
-                                      sym form (swap! segop-id-counter inc))]
-                            (first (raster.compiler.passes.parallel.soac-lower/lower-soac
-                                    soac (or device-id :ze:0) :dtype (or dtype :double))))))))
+          (or (segop-attempt stats :segred form dtype :none
+                             #(let [sym (gensym "red_")
+                                    soac (raster.compiler.ir.soac/par-form->soac
+                                          sym form (swap! segop-id-counter inc))]
+                                (first (raster.compiler.passes.parallel.soac-lower/lower-soac
+                                        soac (or device-id :ze:0) :dtype (or dtype :double)))))
+              (let [decline (last (:segop-declined @stats))]
+                (throw (ex-info "par/reduce remains illegal after full SegOp conversion"
+                                {:reason :illegal-op-remains
+                                 :op (first form)
+                                 :source form
+                                 :missing-rule (:reason decline)
+                                 :target-dialect :segop
+                                 :decline decline
+                                 :fallback :none})))))))
 
 (defn- maybe-compile-spirv
   "Optionally compile OpenCL C to SPIR-V."
@@ -246,7 +259,8 @@
 
         register-kernel!
         (fn [kernel stat-key]
-          (let [k (maybe-compile-spirv kernel compile-spirv? device-id)]
+          (let [_ (when (kart/kernel-artifact? kernel) (kart/validate! kernel))
+                k (maybe-compile-spirv kernel compile-spirv? device-id)]
             (swap! stats update stat-key inc)
             (swap! kernels conj k)
             k))
@@ -310,23 +324,23 @@
                       :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                   device-id)
                                  (catch Throwable _ nil))))
-                  ;; Register the ROUTED KERNEL MAP, not three hand-picked keys. Dropping
-                  ;; :c-op/:identity-val made invoke-reduction-kernel fall back to its
-                  ;; `:or {c-op "+" identity-val 0.0}` for the HOST-SIDE FINAL COMBINE — so a
-                  ;; full reduction with :combine max or :combine * spanning more than one
-                  ;; workgroup silently SUMMED the per-group partials. Reachable today: a
-                  ;; 0-free-axis contraction at :float/:double is exactly what this pass routes.
+                  ;; Full reductions already arrive as a verified KernelArtifact; keep that value
+                  ;; intact. Other contraction leaves have not migrated yet and retain their
+                  ;; routed kernel map during this bounded vertical.
                   ;; :strategy/:fallback-reason/:declines/:tile are the ROUTING DECISION. They
                   ;; were dropped here, so no diagnostic could say which leaf a kernel came from
                   ;; or why a faster one was refused. Tensorization/packing are codegen facts that
                   ;; need no extra launch slot, so preserve them for inspection instead of treating
                   ;; them like the unbound argument fields refused above.
-                  k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
-                                                             :out-dtype :strategy :fallback-reason
-                                                             :declines :tile :tensorized :packed
-                                                             :fused-epilogue :abi :arguments])
-                                             {:kernel-name (:kernel-name r) :source (:source r)
-                                              :dtype (:dtype r)})
+                  kernel (if (= :reduction (:invoke r))
+                           (:artifact r)
+                           (merge (select-keys r [:c-op :identity-val :array-params
+                                                  :out-dtype :strategy :fallback-reason
+                                                  :declines :tile :tensorized :packed
+                                                  :fused-epilogue :abi :arguments])
+                                  {:kernel-name (:kernel-name r) :source (:source r)
+                                   :dtype (:dtype r)}))
+                  k (register-kernel! kernel
                                       :ze-contracts)]
               ;; A full reduction (0 free axes) has its own two-phase launch protocol + a
               ;; host-side final combine — emit the reduction invoke, not the 2-D contraction one.
@@ -346,25 +360,12 @@
             ;; resident invoke carries the output buffer (4-arg) so it stays device-resident
             ;; instead of round-tripping a host scalar. Emitted by the reduce-fusion pass.
             (par/par-reduce-into-form? form)
-            (let [{:keys [out-buf reduce-form bound]} (par/extract-par-reduce-into-info form)]
-              (if-let [segred (par->segred stats reduce-form dtype device-id)]
-                (let [kernel (segop-cl/generate-segred-kernel
-                              segred out-buf :dtype dtype :scalar-types top-scalar-types)]
-                  (if kernel
-                    (let [k (register-kernel! kernel :ze-reduces)]
-                      (emit-reduction-invocation k out-buf))
-                    (let [k (register-kernel!
-                             (legacy/generate-par-reduce-kernel reduce-form
-                                                                :dtype dtype :device-id device-id)
-                             :ze-reduces)]
-                      (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                            (:kernel-name k) (vec (:array-params k)) out-buf bound))))
-                (let [k (register-kernel!
-                         (legacy/generate-par-reduce-kernel reduce-form
-                                                            :dtype dtype :device-id device-id)
-                         :ze-reduces)]
-                  (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                        (:kernel-name k) (vec (:array-params k)) out-buf bound))))
+            (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info form)
+                  segred (par->segred stats reduce-form dtype device-id)
+                  kernel (segop-cl/generate-segred-kernel
+                          segred out-buf :dtype dtype :scalar-types top-scalar-types)
+                  k (register-kernel! kernel :ze-reduces)]
+              (emit-reduction-invocation k out-buf))
 
             ;; === par/reduce — SegOp path ===
             (par/par-reduce-form? form)
@@ -372,30 +373,11 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-reduce form))
-                (if-let [segred (par->segred stats form dtype device-id)]
-                  (let [kernel (segop-cl/generate-segred-kernel
-                                segred nil :dtype dtype :scalar-types top-scalar-types)]
-                    (if kernel
-                      (let [k (register-kernel! kernel :ze-reduces)]
-                        (emit-reduction-invocation k nil))
-                      ;; SegOp codegen failed — use legacy
-                      (let [k (register-kernel!
-                               (legacy/generate-par-reduce-kernel form
-                                                                  :dtype dtype :device-id device-id)
-                               :ze-reduces)]
-                        (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                              (:kernel-name k)
-                              (vec (:array-params k))
-                              bound))))
-                  ;; SegOp lowering failed — use legacy
-                  (let [k (register-kernel!
-                           (legacy/generate-par-reduce-kernel form
-                                                              :dtype dtype :device-id device-id)
-                           :ze-reduces)]
-                    (list 'raster.gpu.ze-runtime/invoke-reduction-kernel
-                          (:kernel-name k)
-                          (vec (:array-params k))
-                          bound)))))
+                (let [segred (par->segred stats form dtype device-id)
+                      kernel (segop-cl/generate-segred-kernel
+                              segred nil :dtype dtype :scalar-types top-scalar-types)
+                      k (register-kernel! kernel :ze-reduces)]
+                  (emit-reduction-invocation k nil))))
 
             ;; === Specialized forms — delegate to legacy generators ===
 

@@ -18,6 +18,7 @@
             [raster.compiler.ir.contract-stages :as cstage]
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -297,13 +298,14 @@
                              ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                      (ce/emit-expr adapted-elem idx (set (map #(symbol (name %)) arr-params)) idx-c-name)))
         ;; Build kernel source
+        workgroup-size 256
         arr-param-str (str/join ", "
                                 (map (fn [s] (str "__global const " ctype "* restrict "
                                                   (ce/c-symbol s)))
                                      arr-params))
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s))) scl-params))
-        ;; Use output param name matching invoke-reduction-kernel expectations
+        ;; The emitted name is pinned by the ordered ABI.
         all-params (str/join ", "
                              (remove empty?
                                      [arr-param-str
@@ -320,42 +322,54 @@
                                    :c-name (ce/c-symbol %) :role :parameter)
                         scl-params)
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
-        ;; Static shared memory — matches invoke-reduction-kernel (no __local arg)
-        source (when elem-str
-                 (str (codegen/extension-pragmas dtype)
-                      "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
-                      "__kernel void " kernel-name
-                      "(" all-params ") {\n"
-                      "    __local " ctype " sdata[256];\n"
-                      "    int tid = get_local_id(0);\n"
-                      "    " ctype " val = " c-identity-val ";\n"
-                      "    int stride = get_global_size(0);\n"
-                      "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
-                      "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
-                      "        val = " (c-combine "val" elem-str) ";\n"
-                      "    }\n"
-                      "    sdata[tid] = val;\n"
-                      "    barrier(CLK_LOCAL_MEM_FENCE);\n"
-                      "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
-                      "        if (tid < s) {\n"
-                      "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
-                      "        }\n"
-                      "        barrier(CLK_LOCAL_MEM_FENCE);\n"
-                      "    }\n"
-                      "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
-                      "}\n"))
-        _ (when source (kabi/validate-source-signature! kernel-name source abi))]
-    (when source
-      {:kernel-name kernel-name
-       :source source
-       :array-params arr-params
-       :scalar-params scl-params
-       :abi abi
-       :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
-       :dtype dtype
-       :n-phases 2
-       :identity-val identity-val
-       :c-op c-op})))
+        ;; Static shared memory is part of the artifact launch contract (no dynamic-local ABI slot).
+        _ (when-not elem-str
+            (throw (ex-info "SegRed emission produced no element expression"
+                            {:reason :illegal-op-remains
+                             :missing-rule :segred-element-expression
+                             :target-dialect :kernel-artifact
+                             :segred-id (:id segred)
+                             :lambda lambda
+                             :fallback :none})))
+        source (str (codegen/extension-pragmas dtype)
+                    "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n"
+                    "__kernel void " kernel-name
+                    "(" all-params ") {\n"
+                    "    __local " ctype " sdata[" workgroup-size "];\n"
+                    "    int tid = get_local_id(0);\n"
+                    "    " ctype " val = " c-identity-val ";\n"
+                    "    int stride = get_global_size(0);\n"
+                    "    int " (ce/c-symbol idx) " = get_global_id(0);\n"
+                    "    for (; " (ce/c-symbol idx) " < _n_bound; " (ce/c-symbol idx) " += stride) {\n"
+                    "        val = " (c-combine "val" elem-str) ";\n"
+                    "    }\n"
+                    "    sdata[tid] = val;\n"
+                    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+                    "    for (int s = get_local_size(0) / 2; s > 0; s >>= 1) {\n"
+                    "        if (tid < s) {\n"
+                    "            sdata[tid] = " (c-combine "sdata[tid]" "sdata[tid + s]") ";\n"
+                    "        }\n"
+                    "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                    "    }\n"
+                    "    if (tid == 0) output[get_group_id(0)] = sdata[0];\n"
+                    "}\n")]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments (vec (concat arr-params [out-sym] scl-params [(seg-bound segred)]))
+      :launch {:dimensions 1
+               :workgroup-size workgroup-size
+               :grid {:kind :ceil-div-bound}}
+      :temporaries []
+      :effects {:kind :pure-reduction}
+      :provenance {:dialect :segred :segop-id (:id segred)}
+      :attributes {:array-params arr-params
+                   :scalar-params scl-params
+                   :dtype dtype
+                   :n-phases 2
+                   :identity-val identity-val
+                   :c-op c-op}})))
 
 ;; ================================================================
 ;; Segmented reduction (contraction) → OpenCL — the multi-axis SegSpace path

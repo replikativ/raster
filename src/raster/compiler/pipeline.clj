@@ -1177,7 +1177,6 @@
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
-     raster.gpu.ze-runtime/invoke-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
@@ -1314,7 +1313,7 @@
   ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
   ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
   ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=6,
-  ;; scatter=6|7, ordered-reduce=3, legacy-reduce=4|5.
+  ;; scatter=6|7, ordered-reduce=3.
   (let [head (first expr)
         argc (count expr)]
     (cond
@@ -1367,20 +1366,6 @@
             {:kernel-name kname :arguments arguments
              :convention :reduce :returns sym})))
 
-      (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
-      ;; 3-arg legacy (host-scalar return, argc 4) vs resident (writes out-buf, stays on
-      ;; device, argc 5). Any OTHER count is an unmodeled shape — reject by name instead of
-      ;; silently treating it as the legacy 3-arg form (which would drop a real out-buf).
-      (cond
-        (= 5 argc)
-        (let [[_ kname inputs out-buf n] expr]
-          {:kernel-name kname :arrays (vec inputs) :output out-buf :scalars [] :n-expr n
-           :convention :reduce :returns sym})
-        (= 4 argc)
-        (let [[_ kname inputs n] expr]
-          {:kernel-name kname :arrays (vec inputs) :scalars [] :n-expr n
-           :convention :reduce :returns sym})
-        :else nil)
       ;; devirtualized BLAS GEMM: (.invk dgemm*-impl A B C m k n alpha beta). BLAS arg order is
       ;; (A B C m k n) — note m,k,n (NOT m,n,k). C (out) is written in place. This is how a
       ;; forward matmul (linear-nb → dgemm-nt!) AND its backward (linear-dx → dgemm!, linear-dW →
