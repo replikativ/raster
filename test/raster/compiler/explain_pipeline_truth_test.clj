@@ -48,10 +48,11 @@
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "explain-pipeline: declines")
     (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)]
-      (testing "segop-lower declines par/contract (it is not a SOAC yet); the stage prints its
-                stats instead of collapsing to [unchanged]"
-        (is (re-find #"DECLINED a conversion" s))
-        (is (re-find #":segops-declined" s)))
+      (testing "segop-lower RECORDS the contraction as a SegContract (Phase 1c made it a SOAC
+                node; this stage used to print a decline). A metadata-only pass leaves the form
+                unchanged, and the stage must still print its stats instead of collapsing"
+        (is (re-find #":segops-lowered 1" s))
+        (is (not (re-find #"DECLINED a conversion" s)) "nothing declines any more"))
       (testing "the kernel section names the leaf, the headline reason, and every leaf that refused"
         (is (re-find #"--- Kernels ---" s))
         (is (re-find #"strategy=:naive-segred" s))
