@@ -500,6 +500,13 @@
                   new-body (mapv transform body-exprs)]
               (with-meta (apply list let-sym new-bindings new-body) (meta form)))
 
+            ;; a body-position par form: segop-lower wraps it in (do …) carrying ::body-segops
+            ;; — consume that exactly as a binding's ::segops, so body forms stop re-lowering
+            (and (seq? form) (= 'do (first form))
+                 (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form)))
+            (binding [*bound-segops* (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form))]
+              (with-meta (apply list 'do (mapv transform (rest form))) (meta form)))
+
             (and (seq? form) (= 'do (first form)))
             (with-meta (apply list 'do (mapv transform (rest form))) (meta form))
 

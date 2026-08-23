@@ -57,3 +57,12 @@
                     (fn [soac device-id & opts] (swap! calls conj device-id) (apply orig soac :ze:0 opts))]
         (op/opencl-pass map-form :device-id :ze:1 :dtype :double :min-elements 0))
       (is (= [:ze:1] @calls) (str "lower-soac was called with " @calls ", not the pass's device-id")))))
+
+(deftest a-body-position-form-is-consumed-too
+  (testing "segop-lower wraps a body-position par form in (do …) carrying ::body-segops; that
+            must be consumed exactly like a binding's ::segops"
+    (let [form '(let* [n 8192] (raster.par/map! O i n nil (clojure.core/* (clojure.core/aget X i) 2.0)))
+          st (:stats (run (lowered form)))]
+      (is (= 1 (:ze-maps st)))
+      (is (= 1 (:segop-reused st)) "consumed from ::body-segops")
+      (is (nil? (:segop-relowered st))))))
