@@ -35,6 +35,7 @@
             [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
@@ -1464,7 +1465,7 @@
 ;; ================================================================
 
 (defn bind-kernel!
-  "Pre-bind kernel arguments for fast repeated launches.
+  "Pre-bind kernel arguments for fast repeated 1-3D launches.
   Returns a map that can be passed to launch-bound!.
 
   kernel-args: same format as launch! args
@@ -1472,14 +1473,22 @@
   Optional cmd-list selects which immediate command list launch-bound! appends to —
   default is the synchronous list (each dispatch blocks); pass (async-cmd-list) for batched
   dispatch (appends return immediately; sync once via synchronize-async!)."
-  ([^MemorySegment kernel ^long workgroup-size-x kernel-args]
-   (bind-kernel! kernel workgroup-size-x kernel-args (:cmd-list @state)))
-  ([^MemorySegment kernel ^long workgroup-size-x kernel-args ^MemorySegment cmd-list]
+  ([^MemorySegment kernel workgroup-size kernel-args]
+   (bind-kernel! kernel workgroup-size kernel-args (:cmd-list @state)))
+  ([^MemorySegment kernel workgroup-size kernel-args ^MemorySegment cmd-list]
    (ensure-init!)
-   (let [arena (:arena @state)]
+   (let [arena (:arena @state)
+         workgroup-size (if (vector? workgroup-size)
+                          workgroup-size
+                          [(long workgroup-size)])
+         _ (when-not (and (<= 1 (count workgroup-size) 3)
+                          (every? #(and (integer? %) (pos? %)) workgroup-size))
+             (throw (ex-info "Level Zero binding requires a positive 1-3D workgroup vector"
+                             {:workgroup-size workgroup-size})))
+         [wg-x wg-y wg-z] (take 3 (concat workgroup-size [1 1]))]
     ;; Set group size once
      (ze-call! "zeKernelSetGroupSize" @h-zeKernelSetGroupSize
-               [kernel (int workgroup-size-x) (int 1) (int 1)])
+               [kernel (int wg-x) (int wg-y) (int wg-z)])
     ;; Set all arguments once
      (doseq [[idx arg] (map-indexed vector kernel-args)]
        (if (instance? MemorySegment arg)
@@ -1504,10 +1513,20 @@
              :long   (let [s (.allocate ^Arena arena I64)]
                        (.set s I64 0 (long value))
                        (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                 [kernel (int idx) (long 8) s]))))))
+                                 [kernel (int idx) (long 8) s]))
+             :half   (let [s (.allocate ^Arena arena ValueLayout/JAVA_SHORT)]
+                       (.set s ValueLayout/JAVA_SHORT 0
+                             (short (Float/floatToFloat16 (float value))))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 2) s]))
+             :byte   (let [s (.allocate ^Arena arena ValueLayout/JAVA_BYTE)]
+                       (.set s ValueLayout/JAVA_BYTE 0 (byte value))
+                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                 [kernel (int idx) (long 1) s]))))))
      (let [gc-seg (.allocate arena 12)
            cmd cmd-list]
-      ;; Pre-fill Y=1, Z=1 (only X changes per launch)
+      ;; Pre-fill a legal 1-D launch; KernelCall binding overwrites every active dimension.
+       (.set gc-seg I32 0 (int 1))
        (.set gc-seg I32 4 (int 1))
        (.set gc-seg I32 8 (int 1))
       ;; Pre-allocate launch args array (reused every call)
@@ -1518,84 +1537,23 @@
           :h-launch @h-zeCommandListAppendLaunchKernel})))))
 
 (defn launch-bound!
-  "Launch a pre-bound kernel. Only dispatches (no arg setup, no barrier).
+  "Launch a pre-bound 1-3D kernel. Only dispatches (no arg setup, no barrier).
   Uses synchronous command list — completes before returning.
   Much faster than launch! for repeated calls on the same buffers.
 
   bound: map from bind-kernel!
-  group-count-x: number of workgroups"
-  [bound ^long group-count-x]
-  (let [^MemorySegment gc (:gc-seg bound)]
-    (.set gc I32 0 (int group-count-x))
+  `group-count` is a positive one-to-three-dimensional vector or a legacy 1-D scalar."
+  [bound group-count]
+  (let [^MemorySegment gc (:gc-seg bound)
+        group-count (if (vector? group-count) group-count [(long group-count)])]
+    (when-not (and (<= 1 (count group-count) 3)
+                   (every? #(and (integer? %) (pos? %)) group-count))
+      (throw (ex-info "Level Zero launch requires a positive 1-3D group-count vector"
+                      {:group-count group-count})))
+    (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
+      (.set gc I32 (long (* axis 4)) (int count)))
     ;; Synchronous cmd list: launch completes before return, no barrier needed
     ;; Reuse pre-allocated args array
-    (.invokeWithArguments ^MethodHandle (:h-launch bound)
-                          ^"[Ljava.lang.Object;" (:launch-args bound))))
-
-(defn bind-kernel-2d!
-  "Pre-bind kernel arguments for fast repeated 2D launches.
-  Returns a map that can be passed to launch-bound-2d!.
-
-  workgroup-size: [x y] threads per workgroup
-  kernel-args: same format as launch! args"
-  [^MemorySegment kernel workgroup-size kernel-args]
-  (ensure-init!)
-  (let [arena (:arena @state)
-        [wg-x wg-y] workgroup-size]
-    ;; Set group size once
-    (ze-call! "zeKernelSetGroupSize" @h-zeKernelSetGroupSize
-              [kernel (int wg-x) (int wg-y) (int 1)])
-    ;; Set all arguments once
-    (doseq [[idx arg] (map-indexed vector kernel-args)]
-      (if (instance? MemorySegment arg)
-        (let [arg-ptr (ptr-seg arena)]
-          (.set arg-ptr PTR 0 ^MemorySegment arg)
-          (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                    [kernel (int idx) (long (.byteSize PTR)) arg-ptr]))
-        (let [{:keys [type value]} arg]
-          (case type
-            :int    (let [s (.allocate ^Arena arena I32)]
-                      (.set s I32 0 (int value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 4) s]))
-            :float  (let [s (.allocate ^Arena arena ValueLayout/JAVA_FLOAT)]
-                      (.set s ValueLayout/JAVA_FLOAT 0 (float value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 4) s]))
-            :double (let [s (.allocate ^Arena arena F64)]
-                      (.set s F64 0 (double value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))
-            :long   (let [s (.allocate ^Arena arena I64)]
-                      (.set s I64 0 (long value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))
-            :half   (let [s (.allocate ^Arena arena ValueLayout/JAVA_SHORT)]
-                      (.set s ValueLayout/JAVA_SHORT 0
-                            (short (Float/floatToFloat16 (float value))))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 2) s]))
-            :byte   (let [s (.allocate ^Arena arena ValueLayout/JAVA_BYTE)]
-                      (.set s ValueLayout/JAVA_BYTE 0 (byte value))
-                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 1) s]))))))
-    (let [gc-seg (.allocate arena 12)
-          cmd (:cmd-list @state)]
-      (.set gc-seg I32 8 (int 1))  ;; Z=1
-      (let [launch-args (object-array [cmd kernel gc-seg
-                                       MemorySegment/NULL (int 0) MemorySegment/NULL])]
-        {:kernel kernel :cmd cmd :gc-seg gc-seg
-         :launch-args launch-args
-         :h-launch @h-zeCommandListAppendLaunchKernel}))))
-
-(defn launch-bound-2d!
-  "Launch a pre-bound 2D kernel. Only sets group counts and dispatches.
-  bound: map from bind-kernel-2d!
-  group-count-x, group-count-y: number of workgroups in each dimension"
-  [bound ^long group-count-x ^long group-count-y]
-  (let [^MemorySegment gc (:gc-seg bound)]
-    (.set gc I32 0 (int group-count-x))
-    (.set gc I32 4 (int group-count-y))
     (.invokeWithArguments ^MethodHandle (:h-launch bound)
                           ^"[Ljava.lang.Object;" (:launch-args bound))))
 
@@ -1625,7 +1583,7 @@
 
 (defn record-graph!
   "Record an ordered seq of bound kernels into a regular (replayable) command list.
-  Each `bound` (from bind-kernel!/bind-kernel-2d!, each carrying its own dedicated
+  Each `bound` (from the uniform bind-kernel!, carrying its own dedicated
   kernel handle with args + group counts already set into its :gc-seg) is appended
   once, with NO per-op barrier — ordering is implicit in the list. Returns a graph
   {:queue :list :lists-arr} for replay-graph!. Re-record only if the kernel
@@ -2050,40 +2008,6 @@
   [kernel-name]
   (get @kernel-registry kernel-name))
 
-(defn bind-registered-map-void-kernel
-  "Bind a registered void-map kernel over GPU-RESIDENT args, for recording into a
-  command graph (whole-offload). `arrays` must be resident (DeviceBuffer /
-  MemorySegment) — NO per-call JVM-array staging (residency is the whole point).
-  `scalar-args` are scalar values; `n` is the element count. Returns a bound map
-  {:kernel :gc-seg …} (from bind-kernel!, with :gc-seg X pre-set to the group
-  count) — pass directly to record-graph!. A FRESH kernel handle per binding is
-  used (LZ kernel args are mutable handle state → shared handles clobber)."
-  [kernel-name arrays scalar-args n]
-  (let [{:keys [module workgroup-size dtype]
-         :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
-        kernel-handle (create-kernel-fresh module kernel-name)
-        wg (long workgroup-size)
-        n (long n)
-        dev-segs (reduce
-                  (fn [acc arr]
-                    (cond
-                      (device-buffer? arr)          (conj acc (:segment ^DeviceBuffer arr))
-                      (instance? MemorySegment arr)  (conj acc arr)
-                      :else (throw (ex-info "bind-registered-map-void-kernel requires GPU-resident args (DeviceBuffer/MemorySegment); JVM-array staging is not supported on the bound path"
-                                            {:arr-type (type arr)}))))
-                  [] arrays)
-        scalar-type (if (= dtype :float) :float :double)
-        scalar-kernel-args (mapv (fn [v]
-                                   (if (map? v) v
-                                       {:type scalar-type
-                                        :value (if (= scalar-type :float) (float v) (double v))}))
-                                 scalar-args)
-        all-args (vec (concat dev-segs scalar-kernel-args [{:type :int :value (int n)}]))
-        group-count (long (Math/ceil (/ (double n) (double wg))))
-        bnd (bind-kernel! kernel-handle wg all-args)]
-    (.set ^MemorySegment (:gc-seg bnd) I32 0 (int group-count))
-    bnd))
-
 (defn bind-registered-gemm!
   "Bind the XMX GEMM kernel (C = A×B) over RESIDENT fp16 DeviceBuffers for recording into a
   command graph — the resident analog of invoke-registered-gemm! (which stages JVM arrays every
@@ -2106,7 +2030,7 @@
          m (long m) n (long n) k (long k)
          args [(:segment a) (:segment b) (:segment c)
                {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-         bnd (bind-kernel-2d! kh [256 1] args)
+         bnd (bind-kernel! kh [256 1] args)
          gc ^MemorySegment (:gc-seg bnd)]
      (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n (gemm-tile)))))))   ;; X = gc-n
      (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m (gemm-tile)))))))   ;; Y = gc-m
@@ -2164,7 +2088,7 @@
         kh   (create-kernel-fresh module kernel-name)
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd  (bind-kernel-2d! kh [wg 1] args)
+        bnd  (bind-kernel! kh [wg 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))   ;; Y = gc-m
@@ -2214,7 +2138,7 @@
         args (vec (concat [(:segment a) (:segment b) (:segment c)
                            {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
                           (map :segment (:operands epilogue))))
-        bnd  (bind-kernel-2d! kh [wg 1] args)
+        bnd  (bind-kernel! kh [wg 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
     (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))
@@ -2283,7 +2207,7 @@
         args [(:segment a) (:segment b) (:segment partials)
               {:type :int :value (int m)} {:type :int :value (int n)}
               {:type :int :value (int k)} {:type :int :value (int kc)}]
-        bnd (bind-kernel-2d! kh [256 1] args)
+        bnd (bind-kernel! kh [256 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
@@ -2348,7 +2272,7 @@
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)}
               {:type :int :value (int k)}]
-        bnd (bind-kernel-2d! kh [256 1] args)
+        bnd (bind-kernel! kh [256 1] args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
@@ -2604,6 +2528,51 @@
          (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab))))
      nil)))
 
+(defn bind-kernel-call
+  "Bind a backend-neutral KernelCall over Level Zero resident buffers. ABI order and complete
+   1-3D geometry come exclusively from the call; no map/reduction convention is interpreted."
+  [call]
+  (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
+        (kcall/binding-plan call)
+        registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        _ (kcall/validate-registered! call registered)
+        pointer-values (mapv second pointer-pairs)
+        _ (doseq [[slot value] pointer-pairs]
+            (when-not (or (device-buffer? value) (instance? MemorySegment value))
+              (throw (ex-info "Level Zero KernelCall requires DeviceBuffer/MemorySegment pointers"
+                              {:kernel-name kernel-name :slot slot :value-type (type value)}))))
+        _ (kabi/validate-physical-pointer-dtypes!
+           abi (physical-pointer-dtypes pointer-values))
+        _ (when (= :pure-reduction (get-in registered [:effects :kind]))
+            (doseq [[slot value] pointer-pairs
+                    :when (= :result (:role slot))]
+              (when (and (device-buffer? value) (< (:n-elements ^DeviceBuffer value) 1))
+                (throw (ex-info "resident reduction result buffer must hold at least one element"
+                                {:kernel-name kernel-name :slot slot :buffer-elements 0})))))
+        ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
+        {:keys [module]} (ensure-kernel-loaded! kernel-name)
+        kernel-handle (create-kernel-fresh module kernel-name)
+        native-args (mapv (fn [[slot value]]
+                            (if (= :scalar (:kind slot))
+                              value
+                              (if (device-buffer? value)
+                                (:segment ^DeviceBuffer value)
+                                value)))
+                          pairs)
+        bound (bind-kernel! kernel-handle workgroup-size native-args)
+        ^MemorySegment gc (:gc-seg bound)]
+    (doseq [[axis count] (map-indexed vector (take 3 (concat group-count [1 1])))]
+      (.set gc I32 (long (* axis 4)) (int count)))
+    {:bound bound
+     ;; Geometry is already baked into gc-seg. record-graph! must not reinterpret X specially.
+     :group-count nil
+     :kernel-name kernel-name
+     :kernel-call call
+     :binding-plan plan}))
+
 (defn bind-registered-map-void-kernel
   "Pre-bind a registered void-map kernel's arguments ONCE for fast repeated dispatch.
   All array args must be GPU-resident (DeviceBuffer / GpuSoA / MemorySegment) — no per-call
@@ -2658,44 +2627,6 @@
       :group-count group-count
       :kernel-name kernel-name
       :async? async?})))
-
-(defn bind-registered-reduction!
-  "Pre-bind a SegRed kernel from its complete ordered ABI values. The ABI roles—not registry
-   :array-params or a caller-side concatenation convention—select pointers, captured scalars,
-   the result buffer and the bound. A single workgroup lets the grid-stride kernel write the
-   resident one-element result without a host combine."
-  [^String kernel-name arguments]
-  (let [registered (or (get @kernel-registry kernel-name)
-                       (throw (ex-info (str "Kernel not registered: " kernel-name)
-                                       {:kernel-name kernel-name
-                                        :registered (keys @kernel-registry)})))
-        abi (kabi/validate! (:abi registered))
-        {:keys [pointer-pairs scalar-pairs result-pair bound-pair]}
-        (kabi/validate-reduction-arguments! abi arguments)
-        _ (doseq [[slot value] pointer-pairs]
-            (when-not (or (device-buffer? value) (instance? MemorySegment value))
-              (throw (ex-info "resident reduction requires DeviceBuffer/MemorySegment pointer arguments"
-                              {:kernel-name kernel-name :slot slot :value-type (type value)})))
-            (when (and (device-buffer? value)
-                       (not= (:dtype slot) (dt/canon (:dtype ^DeviceBuffer value))))
-              (throw (ex-info "reduction ABI storage dtype does not match resident buffer"
-                              {:kernel-name kernel-name :slot slot :expected (:dtype slot)
-                               :actual (dt/canon (:dtype ^DeviceBuffer value))}))))
-        result-value (second result-pair)
-        _ (when (and (device-buffer? result-value)
-                     (< (:n-elements ^DeviceBuffer result-value) 1))
-            (throw (ex-info "resident reduction result buffer must hold at least one element"
-                            {:kernel-name kernel-name :buffer-elements 0})))
-        _ (doseq [[slot value] (conj scalar-pairs bound-pair)]
-            (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
-              (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
-                              {:kernel-name kernel-name :slot slot
-                               :expected (:kernel-dtype slot)
-                               :actual (when (map? value) (:type value))}))))
-        pointers (mapv second pointer-pairs)
-        scalars (mapv second scalar-pairs)
-        n (long (:value (second bound-pair)))]
-    (bind-registered-map-void-kernel kernel-name pointers scalars n {:group-count 1})))
 
 (defn bind-registered-contraction!
   "Pre-bind a routed contraction over resident buffers using its ordered typed ABI.
@@ -2752,16 +2683,21 @@
                              (:segment ^DeviceBuffer value)
                              value)))
                        abi arguments)
-        bound (bind-kernel-2d! kernel-handle (mapv long wg) all-args)
+        bound (bind-kernel! kernel-handle (mapv long wg) all-args)
         ^MemorySegment gc (:gc-seg bound)]
     (.set gc I32 0 (int (first grid)))
     (.set gc I32 4 (int (second grid)))
     {:bound bound :group-count nil :kernel-name kernel-name}))
 
 (defn launch-registered-bound!
-  "Dispatch a kernel pre-bound by bind-registered-map-void-kernel. Synchronous."
+  "Dispatch a pre-bound kernel. A KernelCall has its complete geometry baked into :gc-seg;
+   compatibility bindings may still supply a scalar :group-count."
   [prepared]
-  (launch-bound! (:bound prepared) (long (:group-count prepared))))
+  (if-some [group-count (:group-count prepared)]
+    (launch-bound! (:bound prepared) group-count)
+    (let [bound (:bound prepared)]
+      (.invokeWithArguments ^MethodHandle (:h-launch bound)
+                            ^"[Ljava.lang.Object;" (:launch-args bound)))))
 
 (defn ensure-zero-fill-kernel!
   "Register (idempotently) a zero-fill kernel `out[i]=0` for the given dtype and
@@ -2824,8 +2760,8 @@
   record time; buffer CONTENTS may change freely between replays (the decode pattern — each
   token rewrites the activation buffers, the recorded matmuls read whatever is there).
 
-  prepareds: ordered seq of maps from bind-registered-map-void-kernel (each carries its own
-  dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
+  prepareds: ordered seq from bind-kernel-call or a specialized compatibility binder (each
+  carries its own dedicated kernel handle with args already set). Returns a graph handle for replay-graph!.
   Re-record only if the kernel sequence or any buffer is reallocated.
 
   Profiling (:profile? true): one kernel-timestamp device event per launch is created from a

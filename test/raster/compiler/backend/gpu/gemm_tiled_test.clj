@@ -46,7 +46,7 @@
           I32  @(r 'I32)
           dev  (:device-id-hex @@(r 'state))
           f16  @(r 'buffer-of-floats-as-half)  MB @(r 'make-buffer)
-          LM   @(r 'load-module!)  CK @(r 'create-kernel-fresh)  BK2 @(r 'bind-kernel-2d!)
+          LM   @(r 'load-module!)  CK @(r 'create-kernel-fresh)  BK2 @(r 'bind-kernel!)
           RG   @(r 'record-graph!) RP @(r 'replay-graph!) DG @(r 'destroy-graph!)
           BA   @(r 'buffer->array) FB @(r 'free-buffer!)  breg @(r 'bind-registered-gemm!)
           seti (fn [seg off v] (.set ^java.lang.foreign.MemorySegment seg I32 (int off) (int v)))

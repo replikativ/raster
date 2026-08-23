@@ -29,6 +29,7 @@
             [raster.compiler.passes.scalar.rewalk :as rewalk]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
@@ -1303,9 +1304,9 @@
               (recur (next ps) subst realized rbufs (conj out [sym init'])))))))))
 
 (defn- parse-gpu-step
-  "One invoke-registered-* binding → a step record. :arrays is the full resident-buffer arg
-   list in the kernel's signature order (for map! the separate output is appended, so on the
-   resident path it is just another buffer). nil for an unrecognized head."
+  "One invoke-registered-* binding → a step record. Artifact-backed map/reduction steps retain a
+   complete `:arguments` vector; specialized compatibility markers retain their explicit fields.
+   Returns nil for an unrecognized head."
   [sym expr]
   ;; Every arm below destructures a FIXED-length invoke prefix. The invoke forms are
   ;; compiler-generated (opencl_pass) with a known arity per convention. A wrong count means
@@ -1325,7 +1326,8 @@
       (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
       (when (= 6 argc)
         (let [[_ kname inputs out scalars n] expr]
-          {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
+          {:kernel-name kname
+           :arguments (vec (concat inputs [out] scalars [n]))
            :convention :map :returns sym}))
       (= head 'raster.gpu.ze-runtime/invoke-registered-contraction!)
       ;; The marker carries VALUES in exact emitter-authored ABI order.  Do not split or reorder
@@ -1478,11 +1480,8 @@
                   ;; that reads the binding sym (e.g. the primary of a horizontally-fused
                   ;; multi-output map, whose out is a fusion-materialized buffer) must
                   ;; resolve to the REAL resident buffer at bind time.
-                  (when (or (#{:map :contract} (:convention s))
-                            (and (= :reduce (:convention s)) (:arguments s)))
-                    (let [out (if (= :map (:convention s))
-                                (last (:arrays s))
-                                (:value ordered-result))]
+                  (when (and (#{:map :contract :reduce} (:convention s)) ordered-result)
+                    (let [out (:value ordered-result)]
                       (when (and (symbol? out) (not= sym out))
                         (vswap! aliases assoc sym out)))))))
               (reject! :unparseable-kernel-invoke sym expr))
@@ -1584,8 +1583,8 @@
       :scalar-params [n]
       :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
       :steps  [{:kernel-name str :convention :map|:contract|:reduce|... :phase kw
-                ;; maps carry split :arrays/:scalar-specs/:n-fn; contractions carry
-                ;; ordered :argument-specs plus :wg-fns/:grid-fns geometry
+                ;; artifact maps/reductions carry :artifact plus ordered :argument-specs;
+                ;; contractions carry ordered :argument-specs plus :wg-fns/:grid-fns geometry
                 ...}]
       :result-sym sym}
 
@@ -1830,20 +1829,30 @@
                            :grid-fns (mapv #(expr->arg-fn all-params scalar-lets %) grid-exprs)
                            :phase (keyword (str "gpu-step-" i))})
 
-                        (and (= :reduce (:convention step)) (:arguments step))
-                        (let [{:keys [kernel-name arguments]} step
-                              abi (some-> (reg-entry kernel-name) :abi kabi/validate!)
-                              _ (when-not abi
-                                  (throw (ex-info "resident reduction kernel has no registered ordered ABI"
-                                                  {:kernel-name kernel-name})))
-                              {:keys [result-pair]} (kabi/validate-reduction-arguments! abi arguments)
-                              output (second result-pair)
+                        (and (#{:map :reduce} (:convention step)) (:arguments step))
+                        (let [{:keys [kernel-name arguments convention]} step
+                              artifact (reg-entry kernel-name)
+                              _ (when-not (kart/kernel-artifact? artifact)
+                                  (throw (ex-info "resident map/reduction kernel is not a registered KernelArtifact"
+                                                  {:kernel-name kernel-name
+                                                   :convention convention :entry artifact})))
+                              artifact (kart/validate! artifact)
+                              abi (:abi artifact)
+                              _ (kabi/validate-arguments! abi arguments)
+                              result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
+                                                    (map vector abi arguments))
+                              _ (when-not (= 1 (count result-pairs))
+                                  (throw (ex-info "resident kernel ABI must identify exactly one :result slot"
+                                                  {:kernel-name kernel-name :abi abi
+                                                   :result-slots (mapv first result-pairs)})))
+                              output (second (first result-pairs))
                               _ (when-not (symbol? output)
-                                  (throw (ex-info "resident reduction requires a concrete output buffer at the ABI :result slot"
+                                  (throw (ex-info "resident kernel requires a concrete output buffer at the ABI :result slot"
                                                   {:kernel-name kernel-name :output output
                                                    :abi abi :arguments arguments})))]
-                          {:convention :reduce
+                          {:convention convention
                            :kernel-name kernel-name
+                           :artifact artifact
                            :abi abi
                            :argument-specs
                            (mapv (fn [slot value]
