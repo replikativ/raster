@@ -11,14 +11,19 @@
 (def ^:private kinds #{:input :output :scalar})
 
 (defn slot
-  "Construct one ABI slot.  Options: :c-name, :kernel-dtype and :role."
-  [nm kind dtype & {:keys [c-name kernel-dtype role]}]
+  "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, and :binding.
+
+   `:binding` names the logical caller value that supplies a physical pointer slot. It is
+   normally absent (and therefore identical to `:name`), but an SoA argument has one physical
+   slot per field and all of those slots share the same logical binding."
+  [nm kind dtype & {:keys [c-name kernel-dtype role binding]}]
   (cond-> {:name nm
            :c-name (or c-name (name nm))
            :kind kind
            :dtype (dt/canon dtype)
            :kernel-dtype (dt/canon (or kernel-dtype dtype))}
-    role (assoc :role role)))
+    role (assoc :role role)
+    binding (assoc :binding binding)))
 
 (defn validate!
   "Validate an ordered ABI and return it unchanged.  A kernel has at least one output;
@@ -38,9 +43,18 @@
     (doseq [k [:dtype :kernel-dtype]]
       (when-not (dt/known? (get s k))
         (throw (ex-info (str "kernel ABI slot has an unknown " k)
-                        {:index i :slot s :dtype (get s k)})))))
+                        {:index i :slot s :dtype (get s k)}))))
+    (when (and (= :scalar (:kind s)) (:binding s))
+      (throw (ex-info "kernel ABI scalar slot cannot have a logical pointer :binding"
+                      {:index i :slot s :abi abi}))))
   (when-not (= (count abi) (count (distinct (map :c-name abi))))
     (throw (ex-info "kernel ABI parameter names must be unique" {:abi abi})))
+  (let [pointers (vec (remove #(= :scalar (:kind %)) abi))]
+    (doseq [binding (distinct (keep :binding pointers))]
+      (let [indexes (keep-indexed (fn [i slot] (when (= binding (:binding slot)) i)) pointers)]
+        (when-not (= (count indexes) (inc (- (apply max indexes) (apply min indexes))))
+          (throw (ex-info "kernel ABI physical slots for one logical binding must be contiguous"
+                          {:binding binding :indexes (vec indexes) :abi abi}))))))
   (when-not (some #(= :output (:kind %)) abi)
     (throw (ex-info "kernel ABI must contain at least one output" {:abi abi})))
   abi)
@@ -54,6 +68,22 @@
   "Scalar ABI slots, in kernel signature order."
   [abi]
   (filterv #(= :scalar (:kind %)) (validate! abi)))
+
+(defn pointer-binding-names
+  "Logical caller pointer values, in first physical-signature occurrence order.
+
+   Usually this is simply `(mapv :name (pointer-slots abi))`. An SoA occupies several physical
+   C pointer slots but is supplied by one logical GpuSoA value; those slots carry a shared
+   `:binding` and collapse to one name here."
+  [abi]
+  (:names
+   (reduce (fn [{:keys [seen] :as acc} slot]
+             (if-let [binding (:binding slot)]
+               (if (contains? seen binding)
+                 acc
+                 (-> acc (update :names conj binding) (update :seen conj binding)))
+               (update acc :names conj (:name slot))))
+           {:names [] :seen #{}} (pointer-slots abi))))
 
 (defn validate-arguments!
   "Check that `arguments` supplies exactly one value per ordered ABI slot."
@@ -72,15 +102,16 @@
    ordered ABI. Pre-typed scalar maps must also agree with the ABI's kernel view dtype."
   [abi pointers scalars]
   (let [pointer-slots (pointer-slots abi)
+        pointer-bindings (pointer-binding-names abi)
         all-scalars (scalar-slots abi)
         bound-slots (filterv #(= :bound (:role %)) all-scalars)
         user-slots (filterv #(not= :bound (:role %)) all-scalars)]
     (when-not (= 1 (count bound-slots))
       (throw (ex-info "split map binding requires exactly one implicit :bound ABI slot"
                       {:abi abi :bound-slots bound-slots})))
-    (when-not (= (count pointer-slots) (count pointers))
+    (when-not (= (count pointer-bindings) (count pointers))
       (throw (ex-info "kernel ABI pointer count does not match binding"
-                      {:expected (count pointer-slots) :actual (count pointers) :abi abi})))
+                      {:expected (count pointer-bindings) :actual (count pointers) :abi abi})))
     (when-not (= (count user-slots) (count scalars))
       (throw (ex-info "kernel ABI scalar count does not match binding"
                       {:expected (count user-slots) :actual (count scalars) :abi abi})))
@@ -89,7 +120,27 @@
       (when-not (= (:kernel-dtype slot) (:type value))
         (throw (ex-info "kernel ABI scalar dtype does not match binding"
                         {:slot slot :expected (:kernel-dtype slot) :actual (:type value)}))))
-    {:pointer-slots pointer-slots :scalar-slots user-slots :bound-slot (first bound-slots)}))
+    {:pointer-slots pointer-slots :pointer-bindings pointer-bindings
+     :scalar-slots user-slots :bound-slot (first bound-slots)}))
+
+(defn validate-physical-pointer-dtypes!
+  "Check the storage dtype of every PHYSICAL pointer value after logical values (notably SoAs)
+   have been expanded. `actual-dtypes` must follow the emitted C signature order. This is kept
+   separate from `validate-split-binding!` because expansion is a runtime representation concern,
+   while the ABI remains a backend-neutral physical signature."
+  [abi actual-dtypes]
+  (let [slots (pointer-slots abi)]
+    (when-not (= (count slots) (count actual-dtypes))
+      (throw (ex-info "kernel ABI physical pointer count does not match expanded binding"
+                      {:expected (count slots) :actual (count actual-dtypes) :abi abi})))
+    (doseq [[slot actual] (map vector slots actual-dtypes)]
+      (when-not (or (= :opaque actual) (and actual (dt/known? actual)))
+        (throw (ex-info "kernel ABI pointer value has no supported storage dtype"
+                        {:slot slot :actual actual :abi abi})))
+      (when (and (not= :opaque actual) (not= (:dtype slot) (dt/canon actual)))
+        (throw (ex-info "kernel ABI storage dtype does not match binding"
+                        {:slot slot :expected (:dtype slot) :actual (dt/canon actual)}))))
+    actual-dtypes))
 
 (defn validate-reduction-arguments!
   "Validate a complete ordered reduction binding and expose its semantic projections without

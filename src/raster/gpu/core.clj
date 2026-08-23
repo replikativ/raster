@@ -417,7 +417,7 @@
                 (throw (ex-info (str "No buffer for kernel param: " sym-name)
                                 {:sym sym :available (keys bufs)})))))
         (if-let [abi (:abi kernel-info)]
-          (mapv :name (kabi/pointer-slots abi))
+          (kabi/pointer-binding-names abi)
           (:array-params kernel-info))))
 
 ;; ================================================================

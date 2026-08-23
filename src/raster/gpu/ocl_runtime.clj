@@ -413,6 +413,23 @@
 (defn device-buffer? [x]
   (instance? OclBuffer x))
 
+(defn- jvm-array-dtype [x]
+  (cond
+    (instance? (Class/forName "[D") x) :double
+    (instance? (Class/forName "[F") x) :float
+    (instance? (Class/forName "[I") x) :int
+    (instance? (Class/forName "[J") x) :long
+    (instance? (Class/forName "[S") x) :half
+    (instance? (Class/forName "[B") x) :byte
+    :else nil))
+
+(defn- physical-pointer-dtypes [arrays]
+  (mapv #(cond
+           (device-buffer? %) (:dtype ^OclBuffer %)
+           (instance? MemorySegment %) :opaque
+           :else (jvm-array-dtype %))
+        arrays))
+
 (defn make-buffer
   "Allocate a persistent GPU buffer via clCreateBuffer."
   ([n] (make-buffer n :float))
@@ -792,7 +809,11 @@
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [{:keys [kernel-handle workgroup-size dtype]
+   (let [abi (:abi (get @kernel-registry kernel-name))
+         _ (when abi
+             (kabi/validate-split-binding! abi arrays scalar-args)
+             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
+         {:keys [kernel-handle workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}
           :as info} (ensure-kernel-loaded! kernel-name)
          {:keys [queue]} @state
@@ -815,6 +836,8 @@
                                          (instance? (Class/forName "[I") arr) 4
                                          (instance? (Class/forName "[D") arr) 8
                                          (instance? (Class/forName "[J") arr) 8
+                                         (instance? (Class/forName "[S") arr) 2
+                                         (instance? (Class/forName "[B") arr) 1
                                          :else default-elem-size)))
                      ;; Create temp cl_mem and upload
                     {:keys [context arena]} @state
@@ -830,6 +853,14 @@
                            :host-seg host-seg :temp? true}))))
           []
           (map-indexed vector arrays))
+
+         expanded-entries
+         (if abi
+           (mapv (fn [entry slot]
+                   (assoc entry :write? (or (= :output (:kind slot))
+                                            (= :inout (:role slot)))))
+                 expanded-entries (kabi/pointer-slots abi))
+           expanded-entries)
 
          ;; Set kernel args: buffers first, then scalars, then n
          arg-idx (atom 0)]
@@ -864,8 +895,8 @@
          (finally (.close gs-arena))))
 
      ;; Copy back JVM arrays and free temp cl_mems
-     (doseq [{:keys [cl-mem source byte-size host-seg temp?]} expanded-entries]
-       (when source
+     (doseq [{:keys [cl-mem source byte-size host-seg temp? write?]} expanded-entries]
+       (when (and source (or (nil? abi) write?))
          ;; Read back from device
          (cl-call! "clEnqueueReadBuffer" @h-clEnqueueReadBuffer
                    [queue cl-mem (int CL_TRUE) (long 0) (long byte-size)
@@ -1087,7 +1118,8 @@
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
-             (kabi/validate-split-binding! abi arrays scalar-args))
+             (kabi/validate-split-binding! abi arrays scalar-args)
+             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
          {:keys [program workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
          kh (create-kernel-fresh program kernel-name)

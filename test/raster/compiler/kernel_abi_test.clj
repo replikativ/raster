@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.gpu.core]
+            [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
 
 (def map-abi
@@ -45,6 +46,38 @@
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar dtype"
                         (kabi/validate-split-binding! map-abi [:x :out]
                                                       [{:type :int :value 2}]))))
+
+(deftest soa-physical-slots-collapse-to-one-logical-binding
+  (let [abi [(kabi/slot 'particles_x :output :float :binding 'particles :role :inout)
+             (kabi/slot 'particles_id :output :int :binding 'particles :role :inout)
+             (kabi/slot '_n_bound :scalar :int :role :bound)]]
+    (is (= '[particles] (kabi/pointer-binding-names abi)))
+    (is (= '[particles]
+           (:pointer-bindings (kabi/validate-split-binding! abi [:gpu-soa] []))))
+    (is (= [:float :int]
+           (kabi/validate-physical-pointer-dtypes! abi [:float :int])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"physical pointer count"
+                          (kabi/validate-physical-pointer-dtypes! abi [:float])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage dtype"
+                          (kabi/validate-physical-pointer-dtypes! abi [:float :float]))))
+  (testing "a logical SoA cannot be split around another physical binding"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be contiguous"
+          (kabi/validate!
+           [(kabi/slot 'particles_x :output :float :binding 'particles)
+            (kabi/slot 'other :input :float)
+            (kabi/slot 'particles_id :output :int :binding 'particles)])))))
+
+(deftest repeated-unbound-name-remains-positional
+  (testing "an in-place generic map may bind the same value as an input and the result"
+    (let [abi [(kabi/slot 'x :input :float :role :inout)
+               (kabi/slot 'other :input :float :role :operand)
+               (kabi/slot 'x :output :float :c-name "out" :role :result)
+               (kabi/slot '_n_bound :scalar :int :role :bound)]]
+      (is (= abi (kabi/validate! abi)))
+      (is (= '[x other x] (kabi/pointer-binding-names abi)))
+      (is (= '[x other x]
+             (:pointer-bindings
+              (kabi/validate-split-binding! abi [:x-in :other :x-out] [])))))))
 
 (deftest ordered-reduction-binding-is-derived-from-roles
   (let [abi [(kabi/slot 'x :input :float :role :operand)
@@ -109,6 +142,42 @@
         (is (= :double (:actual (ex-data e)))))
       (finally
         (ze/register-kernel! kernel-name {:test-tombstone? true})))))
+
+(deftest map-void-staging-rejects-abi-errors-before-driver-loading
+  (let [kernel-name (str "map_void_abi_mismatch_" (gensym))
+        abi [(kabi/slot 'x :input :float :role :operand)
+             (kabi/slot 'out :output :int :role :effect)
+             (kabi/slot 'limit :scalar :int :role :parameter)
+             (kabi/slot '_n_bound :scalar :int :role :bound)]]
+    (ze/register-kernel! kernel-name {:abi abi :dtype :float})
+    (try
+      (testing "typed scalar mismatch is rejected before source-less kernel loading"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar dtype"
+              (ze/invoke-registered-map-void-kernel
+               kernel-name [(float-array 1) (int-array 1)]
+               [{:type :float :value 1.0}] 1))))
+      (testing "mixed pointer storage mismatch is rejected before source-less kernel loading"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage dtype"
+              (ze/invoke-registered-map-void-kernel
+               kernel-name [(float-array 1) (float-array 1)]
+               [{:type :int :value 1}] 1))))
+      (finally
+        (ze/register-kernel! kernel-name {:test-tombstone? true})))))
+
+(deftest opencl-map-void-staging-rejects-abi-errors-before-driver-loading
+  (let [kernel-name (str "ocl_map_void_abi_mismatch_" (gensym))
+        abi [(kabi/slot 'x :input :float :role :operand)
+             (kabi/slot 'out :output :int :role :effect)
+             (kabi/slot 'limit :scalar :int :role :parameter)
+             (kabi/slot '_n_bound :scalar :int :role :bound)]]
+    (ocl/register-kernel! kernel-name {:abi abi :dtype :float})
+    (try
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"storage dtype"
+            (ocl/invoke-registered-map-void-kernel
+             kernel-name [(float-array 1) (float-array 1)]
+             [{:type :int :value 1}] 1)))
+      (finally
+        (ocl/register-kernel! kernel-name {:test-tombstone? true})))))
 
 (deftest reduction-staging-rejects-abi-errors-before-driver-loading
   (let [kernel-name (str "reduction_abi_mismatch_" (gensym))

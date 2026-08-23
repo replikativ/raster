@@ -236,6 +236,26 @@
        (is (seq devices) "Should find at least one GPU device")
        (is (string? (:name (first devices))) "Device should have a name")))))
 
+(deftest gpu-map-void-mixed-storage-abi-test
+  (when-ze
+   (testing "map-void stages byte input, int output and an int scalar through the ABI"
+     (require 'raster.gpu.ze-runtime)
+     ((resolve 'raster.gpu.ze-runtime/init!))
+     (let [n 64
+           q (byte-array (map #(byte (- (mod % 31) 15)) (range n)))
+           out (int-array n)
+           kernel (par-opencl/generate-par-map-void-kernel
+                   '(raster.par/map-void! i n
+                      (aset out i (+ (int (aget q i)) limit)))
+                   :dtype :float
+                   :array-types {'out :int 'q :byte}
+                   :scalar-types {'limit :int})
+           register! (resolve 'raster.gpu.ze-runtime/register-kernel!)
+           invoke! (resolve 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)]
+       (register! (:kernel-name kernel) kernel)
+       (invoke! (:kernel-name kernel) [out q] [{:type :int :value 7}] n)
+       (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out)))))))
+
 (deftest gpu-segred-staging-captured-scalar-test
   (when-ze
    (testing "ordered SegRed staging inserts its partial output and binds captured scalars"

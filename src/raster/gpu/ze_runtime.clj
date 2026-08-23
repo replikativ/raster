@@ -1115,6 +1115,17 @@
   [x]
   (instance? GpuSoA x))
 
+(defn- physical-pointer-dtypes
+  "Storage dtypes after expanding each logical map/map-void pointer binding."
+  [arrays]
+  (reduce (fn [dtypes arr]
+            (cond
+              (gpu-soa? arr) (into dtypes (mapv :dtype (:field-segs ^GpuSoA arr)))
+              (device-buffer? arr) (conj dtypes (:dtype ^DeviceBuffer arr))
+              (instance? MemorySegment arr) (conj dtypes :opaque)
+              :else (conj dtypes (jvm-array-dtype arr))))
+          [] arrays))
+
 (defn gpu-array
   "Allocate GPU-resident (shared) storage for n elements of scalar-type.
    scalar-type: the defvalue type symbol (e.g. 'Particle) or Class.
@@ -2562,8 +2573,10 @@
   ([^String kernel-name arrays scalar-args n]
    (invoke-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
-   (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
-             (kabi/validate-split-binding! abi arrays scalar-args))
+   (let [abi (:abi (get @kernel-registry kernel-name))
+         _ (when abi
+             (kabi/validate-split-binding! abi arrays scalar-args)
+             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
          {:keys [kernel-handle workgroup-size dtype written-arrays array-types]
           :or {workgroup-size 256 dtype :float}
           :as info} (ensure-kernel-loaded! kernel-name)
@@ -2581,6 +2594,10 @@
                            (* (alength ^doubles arr) 8)
                            (instance? (Class/forName "[J") arr)
                            (* (alength ^longs arr) 8)
+                           (instance? (Class/forName "[S") arr)
+                           (* (alength ^shorts arr) 2)
+                           (instance? (Class/forName "[B") arr)
+                           (alength ^bytes arr)
                            :else
                            (* n default-dtype-size)))
         ;; Build expanded entries: GpuSoA expands to N field segments,
@@ -2607,6 +2624,13 @@
                 (conj acc {:seg seg :source arr :ab ab}))))
           []
           (map-indexed vector arrays))
+         expanded-entries
+         (if abi
+           (mapv (fn [entry slot]
+                   (assoc entry :write? (or (= :output (:kind slot))
+                                            (= :inout (:role slot)))))
+                 expanded-entries (kabi/pointer-slots abi))
+           expanded-entries)
          dev-segs (mapv :seg expanded-entries)
         ;; Scalar args
          scalar-type (if (= dtype :float) :float :double)
@@ -2624,8 +2648,8 @@
          group-count (long (Math/ceil (/ (double n) wg)))]
      (launch! kernel-handle group-count wg all-args)
     ;; Copy back only JVM arrays (GpuSoA/DeviceBuffer have :source nil)
-     (doseq [{:keys [seg source ab]} expanded-entries]
-       (when source
+     (doseq [{:keys [seg source ab write?]} expanded-entries]
+       (when (and source (or (nil? abi) write?))
          (MemorySegment/copy seg 0 (MemorySegment/ofArray source) 0 (long ab))))
      nil)))
 
@@ -2642,7 +2666,8 @@
    (bind-registered-map-void-kernel kernel-name arrays scalar-args n {}))
   ([^String kernel-name arrays scalar-args n opts]
    (let [_ (when-let [abi (:abi (get @kernel-registry kernel-name))]
-             (kabi/validate-split-binding! abi arrays scalar-args))
+             (kabi/validate-split-binding! abi arrays scalar-args)
+             (kabi/validate-physical-pointer-dtypes! abi (physical-pointer-dtypes arrays)))
          {:keys [module workgroup-size dtype]
           :or {workgroup-size 256 dtype :float}} (ensure-kernel-loaded! kernel-name)
          ;; CRITICAL: create a DEDICATED kernel handle per binding. Level Zero kernel args are
