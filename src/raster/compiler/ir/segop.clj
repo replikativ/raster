@@ -62,6 +62,17 @@
             phase       ;; :single | :block-local | :cross-block
             dtype])      ;; :double | :float — element type
 
+(defrecord SegContract
+           [id          ;; int
+            facts       ;; contraction-facts — the recorded semantic plan (ir/contraction_facts)
+            dtype       ;; element dtype the contraction was lowered for
+            device-id]) ;; the target it was lowered for — routing reads its descriptor
+;; The SegOp for a contraction. Deliberately carries the facts and NOTHING derived from them:
+;; which leaf (dpas/regtiled/naive), its tile and launch geometry are TARGET decisions made by
+;; contract-route from these facts + the device descriptor at emission time — putting them here
+;; would mix target-specific emission into semantic lowering. What this node guarantees is that
+;; the backend receives the SAME facts segop-lower verified, instead of re-parsing the form.
+
 (defrecord SegScan
            [id          ;; int
             space       ;; SegSpace

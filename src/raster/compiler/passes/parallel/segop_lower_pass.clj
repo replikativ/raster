@@ -65,7 +65,7 @@
           ;; capture value-or-exception in one call: the alternative (catch a sentinel, then call
           ;; again to get the exception) re-runs a side-effecting conversion
           attempt (fn [f] (try {:ok (f)} (catch Exception e {:err e})))
-          soac (attempt #(soac/par-form->soac sym form (swap! id-counter inc)))]
+          soac (attempt #(soac/par-form->soac sym form (swap! id-counter inc) :dtype (or dtype :double)))]
       (cond
         (:err soac) (decline :soac (:err soac))
 

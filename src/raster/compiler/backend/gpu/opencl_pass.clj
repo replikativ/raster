@@ -240,8 +240,15 @@
                   ;; pass the REAL descriptor: route-contraction fed `(or desc {})` into
                   ;; derive-gemm-tile, so the "hardware-derived" tile was derived from an empty map
                   ;; — Arc constants on every device. device-id is already in scope here.
+                  ;; CONSUME the SegContract segop-lower recorded (its facts were derived and
+                  ;; verified once, at the boundary) — the same take-bound-segop seam map/reduce
+                  ;; use. Without one (door C, no pass run) route from the form and count it.
+                  bound-sc (take-bound-segop stats :segcontract
+                                             #(instance? raster.compiler.ir.segop.SegContract %))
+                  _ (when-not bound-sc (swap! stats update :segop-relowered (fnil inc 0)))
                   r (croute/route-contraction
                      form :dtype dtype
+                     :facts (:facts bound-sc)
                      :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                  device-id)
                                 (catch Throwable _ nil)))

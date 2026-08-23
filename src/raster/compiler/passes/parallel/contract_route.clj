@@ -179,7 +179,7 @@
    anything else, or a gate rejection, falls back to the register-tiled portable kernel).
    int8 needs no decode descriptor: a scale is an ordinary :epilogue and a zero-point an ordinary
    per-operand :decode, both carried on the form like any other contraction data."
-  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands]
+  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts]
                     :or {dtype :half prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
@@ -219,7 +219,7 @@
       (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
-            _ (let [cmb (:combine (cf/contraction-facts contract-form :dtype dtype))]
+            _ (let [cmb (:combine (or facts (cf/contraction-facts contract-form :dtype dtype)))]
                 (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
                   (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
                                        cmb ") — every accumulator level uses += and a lift's "
@@ -233,7 +233,7 @@
                   ;; the axes the FORM declared, read off FACTS — a single derivation whose only
                   ;; input is the form, so there is no separately-computed value to pass
                   ;; inconsistently (which is what made the span rule unfireable)
-                  :contract-axes (:contract-axes (cf/contraction-facts contract-form :dtype dtype))
+                  :contract-axes (:contract-axes (or facts (cf/contraction-facts contract-form :dtype dtype)))
                   :body (nth contract-form 4)
                   :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
                   :operands operands
