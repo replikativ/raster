@@ -44,6 +44,11 @@
       (is (= (* M N) (:out-elems r)))
       (is (= [256 1] (:wg r)))
       (is (= [{:type :int :value (* M N)}] (:scalar-args r))))
+    (testing "lift buffers are real ABI slots between operands and output"
+      (is (= '[a b da db out _nseg] (mapv :name (:abi r))))
+      (is (= [:input :input :input :input :output :scalar]
+             (mapv :kind (:abi r))))
+      (is (= '[a b da db out 24] (:arguments r))))
     (testing "the emitted kernel really nests one loop per stage"
       (is (= 2 (count (re-seq #"for \(int" (:source r)))))
       (is (re-find #"int acc_1 = 0;" (:source r)) "inner accumulator is int32")

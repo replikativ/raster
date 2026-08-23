@@ -35,7 +35,7 @@
    driver path used here is the runtime path production takes for these kernels."
   [dt m k n]
   (let [{:keys [form kernels]} (ocl/opencl-pass (matmul-form m n k) :dtype dt :compile-spirv? false)
-        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype])))
+        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype :abi])))
         f (eval (list 'fn '[A B C] form))
         A (double-array (map #(* 0.1 (- (double (mod % 7)) 3.0)) (range (* m k))))
         B (double-array (map #(* 0.1 (- (double (mod % 5)) 2.0)) (range (* k n))))
@@ -70,7 +70,7 @@
 ;; staged at int8 size (4× undersized).
 (defn- run-form [form dt args-map out-len]
   (let [{:keys [form kernels]} (ocl/opencl-pass form :dtype dt :compile-spirv? false)
-        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype])))
+        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype :abi])))
         syms (vec (keys args-map))
         f (eval (list 'fn (conj syms 'C) form))]
     (apply f (conj (mapv args-map syms) (double-array out-len)))))

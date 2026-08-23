@@ -17,6 +17,7 @@
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as cstage]
             [raster.compiler.ir.contraction-facts :as cf]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -394,6 +395,12 @@
      :source source
      :array-params arr-params
      :scalar-params scl-params
+     :abi (kabi/validate!
+           (vec (concat
+                 (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand) arr-params)
+                 [(kabi/slot out-sym :output dtype :c-name "out" :role :result)]
+                 (map #(kabi/slot % :scalar :int :c-name (ce/c-symbol %) :role :parameter) scl-params)
+                 [(kabi/slot '_nseg :scalar :int :role :bound)])))
      :dtype dtype
      :c-op c-op}))
 
@@ -446,7 +453,14 @@
                  "    out[seg] = " body-str ";\n"
                  "}\n")]
     {:kernel-name kernel-name :source src :array-params arr-params
-     :scalar-params scl-params :dtype dtype}))
+     :scalar-params scl-params
+     :abi (kabi/validate!
+           (vec (concat
+                 (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand) arr-params)
+                 [(kabi/slot out-sym :output dtype :c-name "out" :role :result)]
+                 (map #(kabi/slot % :scalar :int :c-name (ce/c-symbol %) :role :parameter) scl-params)
+                 [(kabi/slot '_nseg :scalar :int :role :bound)])))
+     :dtype dtype}))
 
 ;; ================================================================
 ;; Block-tiled + __local-staged contraction (BlkRegTiling, block-tile level)
@@ -587,6 +601,13 @@
     {:kernel-name kernel-name
      :source src
      :array-params arr-params
+     :abi (kabi/validate!
+           (vec (concat
+                 (map #(kabi/slot % :input (or (:dtype segred) dtype)
+                                  :c-name (ce/c-symbol %) :role :operand)
+                      arr-params)
+                 [(kabi/slot out-sym :output (or (:dtype segred) dtype)
+                             :c-name "out" :role :result)])))
      :dtype (or (:dtype segred) dtype)
      :block [bm bn bk]
      :micro [tm tn]
@@ -835,6 +856,18 @@
         {:kernel-name kernel-name
          :source source
          :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
+         :abi (kabi/validate!
+               (vec (concat
+                     [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
+                      (kabi/slot col-arr :input :half :c-name "B" :role :operand)
+                      (kabi/slot out-sym :output :half :c-name "C" :role :result)
+                      (kabi/slot 'M :scalar :int :role :dimension)
+                      (kabi/slot 'N :scalar :int :role :dimension)
+                      (kabi/slot 'K :scalar :int :role :dimension)]
+                     (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
+                       (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
+                     (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+                       (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
          :dims [M N L]
          :dtype :half
          :tile tile
@@ -1136,6 +1169,20 @@
                  "}\n")]
     {:kernel-name kernel-name :source src
      :array-params (vec inputs)
+     :abi (kabi/validate!
+           (vec (concat
+                 (for [a inputs]
+                   (kabi/slot a :input dtype :c-name (ce/c-symbol a)
+                              :kernel-dtype (if tz :int dtype)
+                              :role :operand))
+                 (for [{:keys [sym dtype] :or {dtype :float}} lift-ops]
+                   (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :lift))
+                 [(kabi/slot out-sym :output out-dtype :c-name "out" :role :result)]
+                 (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
+                   (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
+                 (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+                   (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue))
+                 [(kabi/slot '_nseg :scalar :int :role :bound)])))
      :lift-operands (mapv :sym lift-ops)
      :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
      :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))

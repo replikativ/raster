@@ -21,7 +21,8 @@
             [raster.compiler.backend.gpu.segop-opencl :as sco]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.ir.axis-map :as am]
-            [raster.compiler.ir.contraction-facts :as cf]))
+            [raster.compiler.ir.contraction-facts :as cf]
+            [raster.compiler.ir.kernel-abi :as kabi]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -83,14 +84,18 @@
                             param from :reduce-bound and computes its own two-phase launch geometry
                             — so :scalar-args must be EMPTY and :wg/:grid ABSENT.
 
-   Returns the descriptor unchanged when consistent."
-  [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands
+   Returns the descriptor with `:arguments`, the compiler values in exact ABI order."
+  [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands abi
            epilogue-scalars out-elems wg grid invoke reduce-bound] :as d}]
   (let [params (kernel-signature-params source)
         _ (when (nil? params)
             (throw (ex-info "contract descriptor: no __kernel signature found in source"
                             {:strategy strategy :kernel-name kernel-name})))
         ptr? (fn [p] (str/includes? p "*"))
+        param-shape (mapv (fn [p]
+                            {:c-name (second (re-find #"([A-Za-z_][A-Za-z0-9_]*)\s*$" p))
+                             :pointer? (ptr? p)})
+                          params)
         n-ptr (count (filter ptr? params))
         n-scalar (count (remove ptr? params))
         ;; EXTRA operand arrays are pointer params too, whichever seam declared them: an
@@ -109,6 +114,14 @@
                         1
                         (+ (count scalar-args) (count epilogue-scalars)))]
     (cond
+      (and (not= :reduction invoke) (nil? abi))
+      (throw (ex-info "contract descriptor: the ordered :abi is required"
+                      {:strategy strategy :kernel-name kernel-name}))
+      (and (not= :reduction invoke)
+           (not= param-shape (kabi/signature-shape abi)))
+      (throw (ex-info "contract descriptor: ordered ABI does not match the emitted kernel signature"
+                      {:strategy strategy :kernel-name kernel-name
+                       :signature param-shape :abi (kabi/signature-shape abi)}))
       (not= n-ptr expect-ptr)
       (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
                            "descriptor binds " expect-ptr " (" (count array-params) " operands + out"
@@ -145,7 +158,24 @@
       (and (= :reduction invoke) (nil? reduce-bound))
       (throw (ex-info "contract descriptor: :invoke :reduction requires :reduce-bound"
                       {:strategy strategy}))
-      :else d)))
+      :else
+      (if (= :reduction invoke)
+        d
+        (let [remaining-scalars (volatile! (seq scalar-args))
+              arguments
+              (mapv (fn [{:keys [name kind role] :as slot}]
+                      (case kind
+                        (:input :output) name
+                        :scalar
+                        (if (= :epilogue role)
+                          name
+                          (if-let [arg (first @remaining-scalars)]
+                            (do (vswap! remaining-scalars next) (:value arg))
+                            (throw (ex-info "contract descriptor: no value for ABI scalar"
+                                            {:strategy strategy :slot slot
+                                             :scalar-args scalar-args}))))))
+                    abi)]
+          (assoc d :arguments arguments))))))
 
 (declare route-2free-1contract route-quant)
 
@@ -246,6 +276,7 @@
         {:strategy :staged-segred
          :kernel-name (:kernel-name k) :source (:source k)
          :array-params (:array-params k)
+         :abi (:abi k)
          ;; the per-stage scale arrays are EXTRA pointer params — surfaced so a caller binds them
          :lift-operands (:lift-operands k)
          :dtype (:dtype k) :out-dtype (:out-dtype k)
@@ -289,10 +320,10 @@
 
       (zero? n-contract)
       (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
-            {:keys [kernel-name source array-params scalar-params]}
+            {:keys [kernel-name source array-params scalar-params abi]}
             (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
         {:strategy :segmap
-         :kernel-name kernel-name :source source :array-params array-params
+         :kernel-name kernel-name :source source :array-params array-params :abi abi
          :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
          :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
                             {:type :int :value nseg})
@@ -310,7 +341,7 @@
       ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
       :else
       (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-            {:keys [kernel-name source array-params scalar-params]}
+            {:keys [kernel-name source array-params scalar-params abi]}
             (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
@@ -321,7 +352,7 @@
         (cond->
         {:strategy :naive-segred
          :declines (vec declines)
-         :kernel-name kernel-name :source source :array-params array-params
+         :kernel-name kernel-name :source source :array-params array-params :abi abi
          :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
          ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
@@ -411,11 +442,13 @@
          :kernel-name (:kernel-name dpas)
          :source (:source dpas)
          :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
+         :abi (:abi dpas)
          :dtype :half :out-dtype :half :out-elems (* M N)
          :tile (:tile dpas)                          ; the DERIVED tile actually emitted
          :fused-epilogue (boolean epilogue)
          ;; extra kernel args the epilogue needs, in signature order (after out + the dims)
          :epilogue-operands (:epilogue-operands dpas)
+         :epilogue-scalars (:epilogue-scalars dpas)
          :epilogue-params (:epilogue-params dpas)
          :wg (:workgroup dpas)                       ; derived from that tile
          :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
@@ -431,6 +464,7 @@
          :kernel-name (:kernel-name rt)
          :source (:source rt)
          :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
+         :abi (:abi rt)
          :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
          :wg (:workgroup rt)
          :grid [(ceil-div N bn) (ceil-div M bm)]
@@ -580,6 +614,7 @@
                  (cond-> {:strategy (if tz? :dp4a :quant-naive)
                           :kernel-name (:kernel-name k) :source (:source k)
                           :array-params (:array-params k)
+                          :abi (:abi k)
                           :lift-operands (:lift-operands k)
                           :epilogue-operands (:epilogue-operands k)
                           :epilogue-scalars (:epilogue-scalars k)

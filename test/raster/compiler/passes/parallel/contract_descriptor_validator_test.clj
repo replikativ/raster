@@ -70,6 +70,9 @@
             (route/validate-descriptor (update good :scalar-args conj {:type :int :value 1}))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"scalar params"
             (route/validate-descriptor (assoc good :scalar-args [])))))
+    (testing "the same counts in the wrong order are still an ABI mismatch"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered ABI"
+            (route/validate-descriptor (update good :abi #(vec (reverse %)))))))
     (testing "a missing :out-elems (the invoke sizes the output with it)"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out-elems"
             (route/validate-descriptor (dissoc good :out-elems)))))
@@ -99,4 +102,10 @@
     (let [d (route/route-contraction (mm 256 512 128) :dtype :half)
           ps (route/kernel-signature-params (:source d))]
       (is (= 3 (count (filter #(clojure.string/includes? % "*") ps))) "A, B, C")
-      (is (= 3 (count (remove #(clojure.string/includes? % "*") ps))) "M, N, K"))))
+      (is (= 3 (count (remove #(clojure.string/includes? % "*") ps))) "M, N, K")))
+  (testing "ABI C names use the emitter's symbol mangling"
+    (let [d (route/route-contraction
+             '(raster.par/contract out-buffer [[row-index 4]] []
+                (aget input-buffer row-index))
+             :dtype :double)]
+      (is (= ["input_buffer" "out" "_nseg"] (mapv :c-name (:abi d)))))))
