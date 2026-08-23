@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]
@@ -102,11 +103,11 @@
 ;; Kernel generation: par/reduce
 ;; ================================================================
 
-(deftest generate-par-reduce-kernel-test
-  (testing "Sum reduction with OpenCL syntax"
+(deftest generate-segred-kernel-artifact-test
+  (testing "Sum reduction reaches one verified SegRed kernel artifact"
     (let [form '(raster.par/reduce acc 0.0 i n (+ acc (aget a i)))
-          kernel (par-opencl/generate-par-reduce-kernel form)]
-      (is (some? kernel))
+          kernel (first (:kernels (opencl-pass/opencl-pass form :min-elements 0)))]
+      (is (kart/kernel-artifact? kernel))
       (is (string? (:source kernel)))
       ;; OpenCL-specific syntax
       (is (str/includes? (:source kernel) "__kernel void"))
@@ -116,7 +117,9 @@
       ;; Subgroup extension
       (is (str/includes? (:source kernel) "cl_intel_subgroups"))
       ;; Must NOT have CUDA
-      (is (not (str/includes? (:source kernel) "__syncthreads()"))))))
+      (is (not (str/includes? (:source kernel) "__syncthreads()")))
+      (is (= :segred (get-in kernel [:provenance :dialect])))
+      (is (= 256 (get-in kernel [:launch :workgroup-size]))))))
 
 ;; ================================================================
 ;; Pipeline pass: opencl-pass
@@ -163,7 +166,7 @@
       (is (= 0 (:ze-maps (:stats result)))))))
 
 (deftest opencl-pass-reduce-test
-  (testing "par/reduce gets replaced with ze invoke-reduction-kernel"
+  (testing "par/reduce gets replaced with the ordered registered reduction marker"
     (let [form '(raster.par/reduce acc 0.0 i n (+ acc (* scale (aget a i))))
           result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
                                           :scalar-types {'scale :float 'n :int})]

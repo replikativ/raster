@@ -9,6 +9,7 @@
    emitted x[i] (decoder-gpu)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
@@ -69,13 +70,19 @@
         segred (first (lower/lower-reduce s nil))
         k (sg/generate-segred-kernel segred 'result-buffer :dtype :float
                                      :scalar-types {'scale :float 'n :int})]
+    (is (kart/kernel-artifact? k))
     (testing "signature, ABI and compiler values have one identical order"
       (is (= '[a result-buffer scale _n_bound] (mapv :name (:abi k))))
       (is (= [:input :output :scalar :scalar] (mapv :kind (:abi k))))
       (is (= [:float :float :float :int] (mapv :kernel-dtype (:abi k))))
       (is (= [:operand :result :parameter :bound] (mapv :role (:abi k))))
       (is (= '[a result-buffer scale n] (:arguments k)))
-      (is (re-find #"\(.*a,.*output, float scale, int _n_bound\)" (:source k)))))
+      (is (re-find #"\(.*a,.*output, float scale, int _n_bound\)" (:source k))))
+    (testing "launch and semantic origin are part of the value"
+      (is (= {:dimensions 1 :workgroup-size 256 :grid {:kind :ceil-div-bound}}
+             (:launch k)))
+      (is (= {:dialect :segred :segop-id (:id segred)} (:provenance k)))
+      (is (= :float (get-in k [:attributes :dtype])))))
   (testing "host-scalar staging retains the result position as an explicit nil placeholder"
     (let [form '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
           s (soac/par-form->soac 'result form 0)

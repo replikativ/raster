@@ -15,10 +15,8 @@
    downstream could say which of two code generators produced a kernel, or why the modern one
    declined.
 
-   The fallbacks themselves are legitimate and are deliberately preserved — a form the SegOp path
-   cannot represent SHOULD reach the legacy generator. What changes is that the choice becomes
-   data, per §3.5's requirement that an unsupported form 'produce a structured diagnostic naming
-   the operation, source, missing rule, target dialect, and possible legal fallback'."
+   Map fallback is still represented as data during its migration. Reduction is now a full
+   conversion: an unrepresentable reduction is an illegal remaining operation with no fallback."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
@@ -110,3 +108,17 @@
                                 (attempt stats :segmap '(raster.par/map! O i 4 nil x) :double
                                          (fn [] (throw (NullPointerException.
                                                         "implementation bug")))))))))))
+
+(deftest reduction-is-a-full-conversion-with-no-legacy-emitter
+  (testing "a missing SegRed rule leaves an illegal op and cannot silently change code generators"
+    (with-redefs [soac-lower/lower-soac (fn [& _] nil)]
+      (try
+        ((requiring-resolve 'raster.compiler.backend.gpu.opencl-pass/opencl-pass)
+         '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
+         :dtype :float :min-elements 0)
+        (is false "an unlowered reduction must fail full conversion")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :illegal-op-remains (:reason (ex-data e))))
+          (is (= :segop (:target-dialect (ex-data e))))
+          (is (= :none (:fallback (ex-data e))))
+          (is (= :none (get-in (ex-data e) [:decline :fallback]))))))))

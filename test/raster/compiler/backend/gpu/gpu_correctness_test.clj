@@ -54,7 +54,7 @@
   (:source (par-opencl/generate-par-map-void-kernel form)))
 
 (defn- reduce-kernel-src [form]
-  (:source (par-opencl/generate-par-reduce-kernel form)))
+  (:source (first (:kernels (opencl-pass/opencl-pass form :min-elements 0)))))
 
 ;; Helper: emit a single C expression
 (defn- emit [expr & {:keys [idx-sym arrays dtype]

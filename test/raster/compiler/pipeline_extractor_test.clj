@@ -77,21 +77,11 @@
                                       out))))]
       (is (= :reduce (:convention step)))
       (is (= '[a obuf scale n] (:arguments step)))))
-  (testing "the 5-wide resident compatibility reduction and 4-wide legacy reduction still extract"
-    (is (= :reduce (:convention (first (:steps (pipeline/extract-gpu-program
-                                                '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel
-                                                             "k" [a] obuf 10)]
-                                                       out)))))))
-    (is (= :reduce (:convention (first (:steps (pipeline/extract-gpu-program
-                                                '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel
-                                                             "k" [a] 10)]
-                                                       out))))))))
-  (testing "a 6-wide reduction (unmodeled) is REJECTED, not silently read as legacy 3-arg"
-    ;; Before the fix this fell to the else-branch and destructured [_ kname inputs n],
-    ;; binding n = the out-buf symbol — a silent miscompile.
-    (is (= :unparseable-kernel-invoke
-           (why '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel
-                             "k" [a] obuf 10 extra)]
+  (testing "the compatibility reduction marker is no longer a production kernel convention"
+    (let [heads (var-get (requiring-resolve 'raster.compiler.pipeline/gpu-invoke-heads))]
+      (is (not (contains? heads 'raster.gpu.ze-runtime/invoke-reduction-kernel))))
+    (is (= :no-kernel-steps
+           (why '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel "k" [a] 10)]
                        out)))))
   (testing "ordered reduction requires exactly one vector operand"
     (is (= :unparseable-kernel-invoke

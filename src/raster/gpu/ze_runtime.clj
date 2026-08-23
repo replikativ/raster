@@ -33,7 +33,8 @@
            [java.nio.file Files Path])
   (:require [raster.compiler.core.types :as types]
             [raster.compiler.core.dtype :as dt]
-            [raster.compiler.ir.kernel-abi :as kabi]))
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]))
 
 ;; ================================================================
 ;; Library loading
@@ -1684,7 +1685,7 @@
 
 (def kernel-registry
   "Global registry mapping kernel-name → kernel info.
-  Populated by pipeline before eval, consumed by invoke-kernel/invoke-reduction-kernel."
+  Populated by the pipeline before eval and consumed by the registered ABI binders."
   (atom {}))
 
 ;; ----------------------------------------------------------------
@@ -1767,7 +1768,8 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
-   (let [info (cond-> kernel-info
+   (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
+         info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))
 
@@ -1987,9 +1989,13 @@
             (throw (ex-info "host partial combine currently supports only float/double SegRed results"
                             {:kernel-name kernel-name :dtype result-dtype})))
         ;; Native driver/loading begins only after every ABI/value check above.
-        {:keys [kernel-handle workgroup-size identity-val c-op]
-         :or {workgroup-size 256 identity-val 0.0 c-op "+"}}
-        (ensure-kernel-loaded! kernel-name)
+        loaded (ensure-kernel-loaded! kernel-name)
+        kernel-handle (:kernel-handle loaded)
+        workgroup-size (or (get-in loaded [:launch :workgroup-size])
+                           (:workgroup-size loaded) 256)
+        identity-val (or (get-in loaded [:attributes :identity-val])
+                         (:identity-val loaded) 0.0)
+        c-op (or (get-in loaded [:attributes :c-op]) (:c-op loaded) "+")
         combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
                       "fmin" (fn ^double [^double a ^double b] (Math/min a b))
                       "*"    (fn ^double [^double a ^double b] (* a b))
@@ -2032,55 +2038,6 @@
                   :else (get staged-inputs slot)))
               pairs)]
     (launch! kernel-handle group-count wg all-args)
-    (if (= group-count 1)
-      (double (.get dev-partial value-layout 0))
-      (loop [i 0 acc (double identity-val)]
-        (if (< i group-count)
-          (recur (inc i)
-                 (double (combine acc (double (.get dev-partial value-layout
-                                                    (* i dtype-size))))))
-          acc)))))
-
-(defn invoke-reduction-kernel
-  "Pipeline-friendly reduction kernel invocation. Returns scalar double.
-  input-arrays: vector of JVM arrays (double[] or float[]) or DeviceBuffers
-  n: element count
-  Dtype is read from kernel registry entry (:dtype, default :double)."
-  [^String kernel-name input-arrays n]
-  (let [{:keys [kernel-handle workgroup-size identity-val c-op dtype]
-         :or {workgroup-size 256 identity-val 0.0 c-op "+" dtype :double}
-         :as info} (ensure-kernel-loaded! kernel-name)
-        combine (case c-op "fmax" (fn ^double [^double a ^double b] (Math/max a b))
-                      "fmin" (fn ^double [^double a ^double b] (Math/min a b))
-                      "*"    (fn ^double [^double a ^double b] (* a b))
-                      (fn ^double [^double a ^double b] (+ a b)))
-        n (long n)
-        wg (long (or workgroup-size 256))
-        group-count (long (Math/ceil (/ (double n) wg)))
-        dtype-size (long (get dtype-byte-sizes dtype 8))
-        float-dtype? (= dtype :float)
-        value-layout (if float-dtype? ValueLayout/JAVA_FLOAT ValueLayout/JAVA_DOUBLE)
-        ;; Copy input arrays to cached shared memory
-        dev-inputs (mapv (fn [arr idx]
-                           (if (device-buffer? arr)
-                             (:segment ^DeviceBuffer arr)
-                             (let [arr-bytes (if float-dtype?
-                                               (* (alength ^floats arr) 4)
-                                               (* (alength ^doubles arr) 8))
-                                   seg (ensure-seg kernel-name (keyword (str "red-input-seg-" idx)) arr-bytes)
-                                   src (MemorySegment/ofArray arr)]
-                               (MemorySegment/copy src 0 seg 0 arr-bytes)
-                               seg)))
-                         input-arrays (range))
-        ;; Partial sums output (one per workgroup)
-        partial-bytes (* group-count dtype-size)
-        dev-partial (ensure-seg kernel-name :partial-seg partial-bytes)
-        ;; Build args: inputs, output, n
-        all-args (vec (concat dev-inputs
-                              [dev-partial]
-                              [{:type :int :value (int n)}]))]
-    (launch! kernel-handle group-count wg all-args)
-    ;; Read partial sums and reduce on CPU
     (if (= group-count 1)
       (double (.get dev-partial value-layout 0))
       (loop [i 0 acc (double identity-val)]

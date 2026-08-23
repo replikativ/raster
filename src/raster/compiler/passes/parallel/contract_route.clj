@@ -105,8 +105,8 @@
         ;; TWO invoke protocols, made explicit here because the validator forced the question:
         ;;   :invoke nil (default) — invoke-registered-contraction! binds :scalar-args positionally,
         ;;                           so they must match the kernel's scalar params exactly.
-        ;;   :invoke :reduction    — invoke-reduction-kernel supplies the kernel's single trailing
-        ;;                           count param itself, from :reduce-bound; :scalar-args stays empty.
+        ;;   :invoke :reduction    — the ordered reduction ABI includes the count slot; the routed
+        ;;                           descriptor carries no separate positional scalar convention.
         ;; an epilogue's SCALARS are kernel scalar params too — they are emitted into the
         ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
         ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
@@ -297,21 +297,19 @@
       (zero? n-free)
       (let [sr (cl/contract-form->segred contract-form :dtype dtype)
             k (sco/generate-segred-kernel sr out-sym :dtype dtype)
+            attrs (:attributes k)
             red-bound (second (first contract-axes))]
         {:strategy :full-reduce
          :invoke :reduction
+         :artifact k
          :kernel-name (:kernel-name k) :source (:source k)
-         :array-params (:array-params k)
+         :array-params (:array-params attrs)
          :abi (:abi k) :arguments (:arguments k)
          :dtype dtype :out-dtype dtype :out-elems 1
-         :n-phases (:n-phases k)
-         ;; CARRY THE COMBINE. invoke-reduction-kernel reads :c-op/:identity-val from the kernel
-         ;; REGISTRY for its host-side final combine, defaulting to `+`/0.0. Widening the
-         ;; registration to pass the whole descriptor through (as a previous commit did) is a no-op
-         ;; unless the descriptor actually contains them — generate-segred-kernel returns them into
-         ;; a local that was discarded here. Without this, a multi-workgroup `:combine max` or `*`
-         ;; silently SUMS its per-group partials.
-         :c-op (:c-op k) :identity-val (:identity-val k)
+         :n-phases (:n-phases attrs)
+         ;; CARRY THE COMBINE for descriptor inspection as well as in the artifact attributes.
+         ;; The staging runtime reads the artifact attributes for its host-side final combine.
+         :c-op (:c-op attrs) :identity-val (:identity-val attrs)
          :reduce-bound red-bound          ; element count the reduction spans
          :scalar-args [] :dims [1]})
 

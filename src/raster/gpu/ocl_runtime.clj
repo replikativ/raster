@@ -20,7 +20,8 @@
             AddressLayout]
            [java.lang.invoke MethodHandle])
   (:require [raster.compiler.core.dtype :as dt]
-            [raster.compiler.ir.kernel-abi :as kabi]))
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]))
 
 ;; ================================================================
 ;; Library loading
@@ -658,7 +659,8 @@
   ([kernel-name kernel-info]
    (register-kernel! kernel-name kernel-info *current-arena*))
   ([kernel-name kernel-info arena-id]
-   (let [info (cond-> kernel-info
+   (let [_ (when (kart/kernel-artifact? kernel-info) (kart/validate! kernel-info))
+         info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))
 
