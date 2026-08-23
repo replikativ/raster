@@ -1046,7 +1046,7 @@
          arr-dtype (fn [arr]
                      (condp instance? arr
                        (Class/forName "[B") :byte
-                       (Class/forName "[S") :short
+                       (Class/forName "[S") :half
                        (Class/forName "[I") :int
                        (Class/forName "[J") :long
                        (Class/forName "[F") :float
@@ -1089,13 +1089,16 @@
                                                        [adt (nel arr) arr]
                                                        (str "param " p)))))
                            array-params)
-         alloc-specs (into {} (keep (fn [{:keys [sym size-fn]}]
-                                      (let [n (long (size-fn args))]
-                                        (reuse-or-spec (alloc->key sym) dt n [dt n nil]
+         alloc-specs (into {} (keep (fn [{:keys [sym size-fn dtype]}]
+                                      (let [n (long (size-fn args))
+                                            alloc-dtype (or dtype dt)]
+                                        (reuse-or-spec (alloc->key sym) alloc-dtype n
+                                                       [alloc-dtype n nil]
                                                        (str "scratch " sym)))))
                            allocs)
          info-fn   (rt-resolve device-id "kernel-registry-entry")
          bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
+         contract-fn (rt-resolve device-id "bind-registered-contraction!")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
          conv-fn   (rt-resolve device-id "bind-registered-convert!")
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
@@ -1229,6 +1232,26 @@
                                        scalar-specs)]
                      [(assoc (bind-fn kernel-name buf-vec scalars (long (n-fn args)))
                              :phase (:phase step))]))
+               ;; Routed contraction: preserve the emitter-authored ABI order all the way into
+               ;; the backend binder. Pointer slots resolve to resident buffers; scalar slots
+               ;; retain their declared kernel view dtype (not the program/output dtype). The
+               ;; 2-D workgroup and grid expressions are evaluated once at bind and baked into
+               ;; the replay graph.
+               :contract
+               (do (or (info-fn kernel-name)
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                       {:kernel kernel-name})))
+                   (let [ordered-args
+                         (mapv (fn [{:keys [kind sym type value-fn]}]
+                                 (if (= :scalar kind)
+                                   {:type type :value (value-fn args)}
+                                   (buf-of sym kernel-name)))
+                               (:argument-specs step))
+                         out-elems (long ((:out-elems-fn step) args))
+                         wg (mapv (fn [f] (long (f args))) (:wg-fns step))
+                         grid (mapv (fn [f] (long (f args))) (:grid-fns step))]
+                     [(assoc (contract-fn kernel-name ordered-args out-elems wg grid)
+                             :phase (:phase step))]))
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
                ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
                ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
@@ -1283,7 +1306,8 @@
                  [(assoc (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})
                          :phase (:phase step))])
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
-                                    ":map / :map-void / :reduce / :gemm / :scatter are wired on the resident path")
+                                    ":map / :map-void / :contract / :reduce / :gemm / :scatter "
+                                    "are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
            ;; CONSTANT PROLOGUE: the f16 conversions/transposes of :constant GEMM operands run

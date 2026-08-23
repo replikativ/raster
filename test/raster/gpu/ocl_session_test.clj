@@ -21,6 +21,15 @@
 (deftm ocl-session-ax! (All [T] [x :- (Array T) y :- (Array T) a :- T n :- Long] :- Void
   (raster.par/map-void! i n (ra/aset y i (* a (ra/aget x i))))))
 
+(deftm ocl-session-contract
+  [A :- (Array float) B :- (Array float)] :- (Array float)
+  (let [C (ra/alloc-like A 64)]
+    (raster.par/contract C [[i 8] [j 8]] [[l 8]]
+      (clojure.core/*
+       (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
+       (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+    C))
+
 (deftest ocl-resident-session-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl-session test (no OpenCL device)")
@@ -45,4 +54,26 @@
           (let [r2 (run-program! s p [x y (float 2.0) n])
                 ^floats yg (get r2 'y)]
             (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3))))
+        (finally (close-session! s))))))
+
+(deftest ocl-resident-contraction-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl resident contraction (no OpenCL device)")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          make-session (ns-resolve gpu 'make-session)
+          bind-program! (ns-resolve gpu 'bind-program!)
+          run-program! (ns-resolve gpu 'run-program!)
+          close-session! (ns-resolve gpu 'close-session!)
+          descriptor (pl/compile-gpu-program #'ocl-session-contract :ocl:0 :dtype :float)
+          A (float-array (map float (range 64)))
+          B (float-array (repeat 64 (float 1.0)))
+          s (make-session :ocl:0)]
+      (try
+        (let [handle (bind-program! s descriptor [A B])
+              result (get (run-program! s handle [A B]) 'C)]
+          (is (= [:contract] (mapv :convention (:steps descriptor))))
+          (is (= (vec (mapcat #(repeat 8 (float %))
+                              (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
+                                   (range 8))))
+                 (vec result))))
         (finally (close-session! s))))))

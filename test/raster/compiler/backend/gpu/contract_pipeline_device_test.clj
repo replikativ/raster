@@ -5,7 +5,11 @@
    that the SOAC contraction path compiles automatically (not just as a standalone emitter).
    Gated on a real GPU."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.arrays :as ra]
             [raster.compiler.backend.gpu.opencl-pass :as ocl]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.core :refer [deftm]]
+            [raster.gpu.core :as gpu]
             [raster.gpu.ze-runtime :as ze]))
 
 (def ^:private gpu?
@@ -24,6 +28,34 @@
   (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
         (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
               (list 'aget 'B (list '+ (list '* 'l n) 'j)))))
+
+(deftm resident-contract-probe
+  [A :- (Array float) B :- (Array float)] :- (Array float)
+  (let [C (ra/alloc-like A 64)]
+    (raster.par/contract C [[i 8] [j 8]] [[l 8]]
+      (clojure.core/*
+       (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
+       (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+    C))
+
+(deftest par-contract-runs-as-a-resident-compiled-step
+  (if-not @gpu?
+    (println "[skip] resident contract pipeline: no GPU device available")
+    (let [descriptor (pipeline/compile-gpu-program #'resident-contract-probe
+                                                   :ze:0 :dtype :float)
+          A (float-array (map float (range 64)))
+          B (float-array (repeat 64 (float 1.0)))
+          session (gpu/make-session :ze:0)]
+      (try
+        (let [handle (gpu/bind-program! session descriptor [A B])
+              result (get (gpu/run-program! session handle [A B]) 'C)]
+          (is (= [:contract] (mapv :convention (:steps descriptor))))
+          (is (= (vec (mapcat #(repeat 8 (float %))
+                              (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
+                                   (range 8))))
+                 (vec result))))
+        (finally
+          (gpu/close-session! session))))))
 
 (defn- compile+run
   "Run a matmul par/contract form through opencl-pass at `dt`, register the emitted kernel,

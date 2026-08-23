@@ -45,6 +45,29 @@
                              "k" [a b] out0 10)]
                        out))))))
 
+(deftest contraction-arity-and-geometry
+  (testing "a correct ordered-ABI contraction marker extracts without flattening its arguments"
+    (let [r (pipeline/extract-gpu-program
+             '(let* [result (raster.gpu.ze-runtime/invoke-registered-contraction!
+                             "contract_k" [A scale C M N K] (* M N)
+                             [16 16] [(quot (+ N 15) 16) (quot (+ M 15) 16)])]
+                    result))
+          step (first (:steps r))]
+      (is (nil? (nr-key r)))
+      (is (= :contract (:convention step)))
+      (is (= '[A scale C M N K] (:arguments step)))
+      (is (= '[16 16] (:wg-exprs step)))
+      (is (= '[(quot (+ N 15) 16) (quot (+ M 15) 16)] (:grid-exprs step)))))
+  (testing "extra operands and malformed 2-D geometry are rejected by marker name"
+    (is (= :unparseable-kernel-invoke
+           (why '(let* [result (raster.gpu.ze-runtime/invoke-registered-contraction!
+                                "contract_k" [A C] 16 [8 8] [1 1] extra)]
+                       result))))
+    (is (= :unparseable-kernel-invoke
+           (why '(let* [result (raster.gpu.ze-runtime/invoke-registered-contraction!
+                                "contract_k" [A C] 16 [64] [1 1])]
+                       result))))))
+
 (deftest reduce-arity
   (testing "a 5-wide resident reduction and a 4-wide legacy reduction both extract"
     (is (= :reduce (:convention (first (:steps (pipeline/extract-gpu-program

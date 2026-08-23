@@ -19,7 +19,8 @@
             MemoryLayout MemorySegment SymbolLookup ValueLayout
             AddressLayout]
            [java.lang.invoke MethodHandle])
-  (:require [raster.compiler.ir.kernel-abi :as kabi]))
+  (:require [raster.compiler.core.dtype :as dt]
+            [raster.compiler.ir.kernel-abi :as kabi]))
 
 ;; ================================================================
 ;; Library loading
@@ -558,6 +559,10 @@
                 (MemorySegment/copy (:segment buf) ValueLayout/JAVA_DOUBLE 0
                                     arr 0 (int n))
                 arr)
+      (:float16 :half) (let [arr (short-array n)]
+                         (MemorySegment/copy (:segment buf) ValueLayout/JAVA_SHORT 0
+                                             arr 0 (int n))
+                         arr)
       (:byte :int8) (let [arr (byte-array n)]
                       (MemorySegment/copy (:segment buf) ValueLayout/JAVA_BYTE 0
                                           arr 0 (int n))
@@ -746,6 +751,15 @@
                   (.set seg F64 0 (double value))
                   (cl-call! "clSetKernelArg" @h-clSetKernelArg
                             [kernel (int arg-idx) (long 8) seg]))
+        :half   (let [seg (.allocate arena ValueLayout/JAVA_SHORT)]
+                  (.set seg ValueLayout/JAVA_SHORT 0
+                        (short (Float/floatToFloat16 (float value))))
+                  (cl-call! "clSetKernelArg" @h-clSetKernelArg
+                            [kernel (int arg-idx) (long 2) seg]))
+        :byte   (let [seg (.allocate arena ValueLayout/JAVA_BYTE)]
+                  (.set seg ValueLayout/JAVA_BYTE 0 (byte value))
+                  (cl-call! "clSetKernelArg" @h-clSetKernelArg
+                            [kernel (int arg-idx) (long 1) seg]))
         (throw (ex-info (str "Unknown scalar type: " type) {:type type})))
       (finally (.close arena)))))
 
@@ -1095,17 +1109,79 @@
       :kernel-name kernel-name
       :async? (boolean (get opts :async?))})))
 
+(defn bind-registered-contraction!
+  "Pre-bind a routed contraction over resident OclBuffers in exact ordered ABI position.
+  The returned prepared launch carries vector workgroup/group-count geometry; the OpenCL graph
+  replay path accepts both these 2-D values and the scalar 1-D values used by map kernels."
+  [^String kernel-name arguments out-elems wg grid]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        arguments (kabi/validate-arguments! abi arguments)
+        _ (when-not (and (vector? wg) (= 2 (count wg))
+                         (every? pos? wg)
+                         (vector? grid) (= 2 (count grid))
+                         (every? pos? grid))
+            (throw (ex-info "resident contraction requires positive 2-D :wg and :grid vectors"
+                            {:kernel-name kernel-name :wg wg :grid grid})))
+        out-elems (long out-elems)
+        _ (when (neg? out-elems)
+            (throw (ex-info "resident contraction :out-elems must be non-negative"
+                            {:kernel-name kernel-name :out-elems out-elems})))
+        _ (doseq [[slot value] (map vector abi arguments)]
+            (if (= :scalar (:kind slot))
+              (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
+                (throw (ex-info "contraction ABI scalar binding has the wrong kernel dtype"
+                                {:kernel-name kernel-name :slot slot
+                                 :expected (:kernel-dtype slot)
+                                 :actual (when (map? value) (:type value))})))
+              (do
+                (when-not (or (device-buffer? value) (instance? MemorySegment value))
+                  (throw (ex-info "resident contraction requires OclBuffer/MemorySegment pointer arguments"
+                                  {:kernel-name kernel-name :slot slot :value-type (type value)})))
+                (when (and (device-buffer? value)
+                           (not= (:dtype slot) (dt/canon (:dtype ^OclBuffer value))))
+                  (throw (ex-info "contraction ABI storage dtype does not match resident buffer"
+                                  {:kernel-name kernel-name :slot slot
+                                   :expected (:dtype slot)
+                                   :actual (dt/canon (:dtype ^OclBuffer value))})))
+                (when (and (= :output (:kind slot)) (device-buffer? value)
+                           (< (:n-elements ^OclBuffer value) out-elems))
+                  (throw (ex-info "contraction output buffer is smaller than :out-elems"
+                                  {:kernel-name kernel-name :slot slot :out-elems out-elems
+                                   :buffer-elements (:n-elements ^OclBuffer value)}))))))
+        ;; Driver touch starts only after ABI/value/geometry validation.
+        {:keys [program]} (ensure-kernel-loaded! kernel-name)
+        kh (create-kernel-fresh program kernel-name)]
+    (doseq [[idx [slot value]] (map-indexed vector (map vector abi arguments))]
+      (if (= :scalar (:kind slot))
+        (set-kernel-arg-scalar! kh idx value)
+        (set-kernel-arg-buffer! kh idx (device-mem-of value))))
+    {:bound {:kernel kh :wg (mapv long wg)}
+     :group-count (mapv long grid)
+     :kernel-name kernel-name}))
+
 (defn- enqueue-bound!
   "Enqueue one pre-bound kernel (no finish)."
-  [{:keys [^MemorySegment kernel ^long wg]} ^long group-count]
+  [{:keys [^MemorySegment kernel wg]} group-count]
   (let [{:keys [queue]} @state
-        arena (Arena/ofConfined)]
+        arena (Arena/ofConfined)
+        wg (if (vector? wg) wg [(long wg)])
+        group-count (if (vector? group-count) group-count [(long group-count)])
+        work-dim (count wg)]
+    (when-not (= work-dim (count group-count))
+      (throw (ex-info "bound OpenCL workgroup and grid dimensionality differ"
+                      {:workgroup wg :grid group-count})))
     (try
-      (let [g (.allocate ^Arena arena I64) l (.allocate ^Arena arena I64)]
-        (.set g I64 0 (* group-count wg))
-        (.set l I64 0 wg)
+      (let [g (.allocate ^Arena arena (* 8 work-dim))
+            l (.allocate ^Arena arena (* 8 work-dim))]
+        (doseq [i (range work-dim)]
+          (.set g I64 (long (* 8 i)) (* (long (nth group-count i)) (long (nth wg i))))
+          (.set l I64 (long (* 8 i)) (long (nth wg i))))
         (cl-call! "clEnqueueNDRangeKernel" @h-clEnqueueNDRangeKernel
-                  [queue kernel (int 1) MemorySegment/NULL g l
+                  [queue kernel (int work-dim) MemorySegment/NULL g l
                    (int 0) MemorySegment/NULL MemorySegment/NULL]))
       (finally (.close arena)))))
 
@@ -1121,7 +1197,7 @@
   ([prepareds] (record-graph! prepareds {}))
   ([prepareds _opts]
    {:launches (mapv (fn [{:keys [bound group-count]}]
-                      {:bound bound :group-count (long group-count)})
+                      {:bound bound :group-count group-count})
                     prepareds)}))
 
 (defn replay-graph!
