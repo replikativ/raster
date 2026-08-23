@@ -10,7 +10,11 @@
 
 (defrecord KernelCall [artifact arguments geometry])
 
-(defn kernel-call? [x] (instance? KernelCall x))
+(defn kernel-call?
+  "Recognize executable calls across Typed Clojure's child DynamicClassLoaders."
+  [x]
+  (and x (= "raster.compiler.ir.kernel_call.KernelCall"
+            (.getName (class x)))))
 
 (defn logical-argument-plan
   "Project an artifact's physical ABI into ordered logical caller arguments.
@@ -159,6 +163,14 @@
                             {:kernel-name (:kernel-name artifact)
                              :value compiler-value :indexes (vec indexes) :values values})))
           (first values))))))
+
+(defn resolve-value
+  "Resolve one compiler value through a checked call's artifact/runtime argument relation. This
+   is used for artifact attributes such as a contraction's logical output extent; backends still
+   receive no convention-specific positional metadata."
+  [call compiler-value]
+  (let [{:keys [artifact arguments]} (validate! call)]
+    ((argument-resolver artifact arguments) compiler-value)))
 
 (defn make
   "Construct a checked call from an artifact and complete ABI-ordered runtime values.

@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.arrays :as ra]
             [raster.compiler.backend.gpu.opencl-pass :as ocl]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.gpu.core :as gpu]
@@ -67,7 +68,7 @@
    driver path used here is the runtime path production takes for these kernels."
   [dt m k n]
   (let [{:keys [form kernels]} (ocl/opencl-pass (matmul-form m n k) :dtype dt :compile-spirv? false)
-        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype :abi])))
+        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) kr))
         f (eval (list 'fn '[A B C] form))
         A (double-array (map #(* 0.1 (- (double (mod % 7)) 3.0)) (range (* m k))))
         B (double-array (map #(* 0.1 (- (double (mod % 5)) 2.0)) (range (* k n))))
@@ -102,7 +103,7 @@
 ;; staged at int8 size (4× undersized).
 (defn- run-form [form dt args-map out-len]
   (let [{:keys [form kernels]} (ocl/opencl-pass form :dtype dt :compile-spirv? false)
-        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) (select-keys kr [:source :dtype :abi])))
+        _ (doseq [kr kernels] (ze/register-kernel! (:kernel-name kr) kr))
         syms (vec (keys args-map))
         f (eval (list 'fn (conj syms 'C) form))]
     (apply f (conj (mapv args-map syms) (double-array out-len)))))
@@ -138,7 +139,17 @@
     (let [r ((requiring-resolve 'raster.compiler.passes.parallel.contract-route/route-contraction)
              '(raster.par/contract C [[i m] [j n]] [[l k]]
                 (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
-             :dtype :double)]
+             :dtype :double)
+          artifact (:artifact r)
+          scalar-values {"k" 7 "m" 20 "n" 20 "_nseg" 400}
+          runtime-arguments
+          (mapv (fn [slot]
+                  (if (= :scalar (:kind slot))
+                    {:type (:kernel-dtype slot)
+                     :value (get scalar-values (:c-name slot))}
+                    (Object.)))
+                (:abi artifact))
+          call (kcall/make artifact runtime-arguments)]
       (is (some? (:out-elems r)))
       (is (not (number? (:out-elems r))))            ; carried symbolically
       (is (contains? #{:regtiled :naive-segred} (:strategy r)))
@@ -150,4 +161,7 @@
           "the symbolic axis bounds must be bound as int params, before the trailing count")
       (is (= '[k m n] (mapv :value (butlast (:scalar-args r))))
           "…in the kernel's declared (name-sorted) order")
-      (is (= (:out-elems r) (:value (last (:scalar-args r))))))))
+      (is (= (:out-elems r) (:value (last (:scalar-args r)))))
+      (is (= [256 1] (get-in call [:geometry :workgroup-size])))
+      (is (= [2 1] (get-in call [:geometry :group-count]))
+          "the artifact resolves its symbolic ceil-div grid from ordered ABI values"))))

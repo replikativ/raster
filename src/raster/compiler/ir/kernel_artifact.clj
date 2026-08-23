@@ -23,7 +23,11 @@
             provenance    ;; semantic/scheduled origin for explain/profile
             attributes])  ;; emitter properties (dtype, combine, phases, ...)
 
-(defn kernel-artifact? [x] (instance? KernelArtifact x))
+(defn kernel-artifact?
+  "Recognize emitted artifacts across Typed Clojure's child DynamicClassLoaders."
+  [x]
+  (and x (= "raster.compiler.ir.kernel_artifact.KernelArtifact"
+            (.getName (class x)))))
 
 (defn validate!
   "Validate `artifact` and return it unchanged.  Validation includes the emitted OpenCL

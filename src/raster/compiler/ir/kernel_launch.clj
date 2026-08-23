@@ -10,6 +10,11 @@
 (defrecord LaunchSpec [workgroup-size group-count shared-memory-bytes])
 (defrecord LaunchGeometry [workgroup-size group-count shared-memory-bytes])
 
+(defn- record-kind?
+  "Recognize compiler IR records across Typed Clojure's child DynamicClassLoaders."
+  [record-class value]
+  (and value (= record-class (.getName (class value)))))
+
 (defn runtime-value
   "A launch dimension whose value is resolved when a call is bound."
   [value]
@@ -27,8 +32,17 @@
                     {:value value :divisor divisor})))
   (->CeilDiv value divisor))
 
-(defn launch-spec? [x] (instance? LaunchSpec x))
-(defn launch-geometry? [x] (instance? LaunchGeometry x))
+(defn launch-spec? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.LaunchSpec" x))
+
+(defn launch-geometry? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.LaunchGeometry" x))
+
+(defn- runtime-value? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.RuntimeValue" x))
+
+(defn- ceil-div? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.CeilDiv" x))
 
 (defn- dimension-vector!
   [owner field dimensions pred expected]
@@ -47,8 +61,8 @@
 (defn- launch-expression?
   [x]
   (or (and (integer? x) (pos? x))
-      (instance? RuntimeValue x)
-      (instance? CeilDiv x)))
+      (runtime-value? x)
+      (ceil-div? x)))
 
 (defn validate-spec!
   "Validate and return a symbolic launch specification."
@@ -136,9 +150,9 @@
   (long
    (cond
      (integer? dimension) dimension
-     (instance? RuntimeValue dimension)
+     (runtime-value? dimension)
      (resolve-integer! resolve-value dimension (:value dimension))
-     (instance? CeilDiv dimension)
+     (ceil-div? dimension)
      (let [value (resolve-integer! resolve-value dimension (:value dimension))
            divisor (:divisor dimension)]
        ;; This form avoids overflowing `value + divisor - 1` for a large positive value.

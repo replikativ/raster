@@ -1314,7 +1314,7 @@
   ;; the emitter changed shape — extra operands would be SILENTLY DROPPED (the store-drop /
   ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
   ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
-  ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=6,
+  ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=3,
   ;; scatter=6|7, ordered-reduce=3.
   (let [head (first expr)
         argc (count expr)]
@@ -1331,14 +1331,13 @@
            :arguments (vec (concat inputs [out] scalars [n]))
            :convention :map :returns sym}))
       (= head 'raster.gpu.ze-runtime/invoke-registered-contraction!)
-      ;; The marker carries VALUES in exact emitter-authored ABI order.  Do not split or reorder
-      ;; them here: packed inputs and epilogue operands/scalars can interleave by signature.
-      (when (= 6 argc)
-        (let [[_ kname arguments out-elems wg grid] expr]
-          (when (and (vector? arguments) (vector? wg) (= 2 (count wg))
-                     (vector? grid) (= 2 (count grid)))
-            {:kernel-name kname :arguments arguments :out-elems-expr out-elems
-             :wg-exprs wg :grid-exprs grid :convention :contract :returns sym})))
+      ;; The marker carries VALUES in exact emitter-authored ABI order. Output extent and launch
+      ;; are artifact-owned and therefore cannot drift as extra marker positions.
+      (when (= 3 argc)
+        (let [[_ kname arguments] expr]
+          (when (vector? arguments)
+            {:kernel-name kname :arguments arguments
+             :convention :contract :returns sym})))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
       ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
@@ -1585,7 +1584,7 @@
       :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
       :steps  [{:kernel-name str :convention :map|:contract|:reduce|... :phase kw
                 ;; artifact maps/reductions carry :artifact plus ordered :argument-specs;
-                ;; contractions carry ordered :argument-specs plus :wg-fns/:grid-fns geometry
+                ;; contractions carry ordered :argument-specs plus their executable artifact
                 ...}]
       :result-sym sym}
 
@@ -1803,11 +1802,13 @@
                          :phase (keyword (str "gpu-step-" i))}
 
                         (= :contract (:convention step))
-                        (let [{:keys [kernel-name arguments out-elems-expr wg-exprs grid-exprs]} step
-                              abi (some-> (reg-entry kernel-name) :abi kabi/validate!)
-                              _ (when-not abi
-                                  (throw (ex-info "resident contraction kernel has no registered ordered ABI"
-                                                  {:kernel-name kernel-name})))
+                        (let [{:keys [kernel-name arguments]} step
+                              artifact (reg-entry kernel-name)
+                              _ (when-not (kart/kernel-artifact? artifact)
+                                  (throw (ex-info "resident contraction kernel is not a registered KernelArtifact"
+                                                  {:kernel-name kernel-name :entry artifact})))
+                              artifact (kart/validate! artifact)
+                              abi (:abi artifact)
                               _ (kabi/validate-arguments! abi arguments)
                               result-slots (filterv #(= :result (:role %)) abi)
                               _ (when-not (= 1 (count result-slots))
@@ -1816,6 +1817,7 @@
                                                    :result-slots result-slots})))]
                           {:convention :contract
                            :kernel-name kernel-name
+                           :artifact artifact
                            :abi abi
                            :argument-specs
                            (mapv (fn [slot value]
@@ -1825,9 +1827,6 @@
                                      {:slot slot :kind (:kind slot) :role (:role slot)
                                       :dtype (:dtype slot) :sym value}))
                                  abi arguments)
-                           :out-elems-fn (expr->arg-fn all-params scalar-lets out-elems-expr)
-                           :wg-fns (mapv #(expr->arg-fn all-params scalar-lets %) wg-exprs)
-                           :grid-fns (mapv #(expr->arg-fn all-params scalar-lets %) grid-exprs)
                            :phase (keyword (str "gpu-step-" i))})
 
                         (= :map-void (:convention step))

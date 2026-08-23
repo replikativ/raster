@@ -4,6 +4,9 @@
             [raster.arrays :as ra]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.gpu.opencl-pass :as op]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.par-fusion :as fusion]
             [raster.core :refer [deftm]]
@@ -44,6 +47,16 @@
     (catch clojure.lang.ExceptionInfo e
       (ex-data e))))
 
+(defn- probe-artifact
+  [kernel-name source abi arguments]
+  (kart/make {:kernel-name kernel-name
+              :source source
+              :abi abi
+              :arguments arguments
+              :launch (klaunch/spec {:workgroup-size [1 1] :group-count [1 1]})
+              :effects {:kind :tensor-contraction}
+              :attributes {:out-elems 1 :dtype :float :out-dtype :float}}))
+
 (deftest fused-epilogue-operands-are-carried-in-the-ordered-marker
   (let [contract (fuse-epilogue
                   (list 'raster.numeric/+ (list 'aget 'C 't)
@@ -51,7 +64,7 @@
         compiled (compile-form contract)
         kernel (first (:kernels compiled))
         marker (-> compiled :form second second)]
-    (is (= :dpas (:strategy kernel)))
+    (is (= :dpas (kart/attribute kernel :strategy)))
     (is (= '[A B out M N K bias] (mapv :name (:abi kernel))))
     (is (= [:input :input :output :scalar :scalar :scalar :input]
            (mapv :kind (:abi kernel))))
@@ -65,9 +78,9 @@
         compiled (compile-form dp4a :byte)
         kernel (first (:kernels compiled))]
     (testing "tensorization and packing are already baked into source and need no extra launch slot"
-      (is (= :dp4a (:strategy kernel)))
-      (is (true? (:tensorized kernel)))
-      (is (= :int8x4 (:packed kernel)))
+      (is (= :dp4a (kart/attribute kernel :strategy)))
+      (is (true? (kart/attribute kernel :tensorized)))
+      (is (= :int8x4 (kart/attribute kernel :packed)))
       (is (= [:byte :byte] (mapv :dtype (take 2 (:abi kernel)))))
       (is (= [:int :int] (mapv :kernel-dtype (take 2 (:abi kernel))))))
     (testing "the ordinary two-input descriptor still emits the production marker"
@@ -104,10 +117,16 @@
 (deftest runtime-rejects-an-abi-value-count-mismatch-before-touching-the-driver
   (let [kernel-name (str "abi_count_probe_" (gensym))
         abi [{:name 'A :c-name "A" :kind :input :dtype :float :kernel-dtype :float}
-             {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float}]
-        _ (ze/register-kernel! kernel-name {:abi abi})
+             {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float
+              :role :result}]
+        artifact (probe-artifact
+                  kernel-name
+                  (str "__kernel void " kernel-name
+                       "(__global float* A, __global float* C) {}")
+                  abi '[A C])
+        _ (ze/register-kernel! kernel-name artifact)
         data (thrown-data #(ze/invoke-registered-contraction!
-                            kernel-name [(float-array 1)] 1 [1 1] [1 1]))]
+                            kernel-name [(float-array 1)]))]
     (is (= 2 (:expected data)))
     (is (= 1 (:actual data)))))
 
@@ -117,16 +136,21 @@
              {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float :role :result}]
         raw-seg (java.lang.foreign.MemorySegment/ofArray (float-array 1))]
     (doseq [[backend register! bind!]
-            [[:ze ze/register-kernel! ze/bind-registered-contraction!]
-             [:ocl ocl/register-kernel! ocl/bind-registered-contraction!]]]
+            [[:ze ze/register-kernel! ze/bind-kernel-call]
+             [:ocl ocl/register-kernel! ocl/bind-kernel-call]]]
       (let [kernel-name (str "resident_abi_probe_" (name backend) "_" (gensym))
-            _ (register! kernel-name {:abi abi})
-            pointer-data (thrown-data #(bind! kernel-name
-                                              [(Object.) {:type :float :value 1.0} (Object.)]
-                                              1 [1 1] [1 1]))
-            scalar-data (thrown-data #(bind! kernel-name
-                                             [raw-seg {:type :int :value 1} raw-seg]
-                                             1 [1 1] [1 1]))]
+            artifact (probe-artifact
+                      kernel-name
+                      (str "__kernel void " kernel-name
+                           "(__global float* A, float alpha, __global float* C) {}")
+                      abi '[A alpha C])
+            _ (register! kernel-name artifact)
+            pointer-call (kcall/make artifact
+                                     [(Object.) {:type :float :value 1.0} (Object.)])
+            pointer-data (thrown-data #(bind! pointer-call))
+            scalar-data (thrown-data #(kcall/make
+                                       artifact
+                                       [raw-seg {:type :int :value 1} raw-seg]))]
         (is (= kernel-name (:kernel-name pointer-data)))
         (is (= :input (get-in pointer-data [:slot :kind])))
         (is (= Object (:value-type pointer-data)))
@@ -138,7 +162,13 @@
   (let [descriptor (pipeline/compile-gpu-program #'resident-contract-descriptor-probe
                                                   :ze:0 :dtype :float)
         step (first (:steps descriptor))
-        args [(float-array 64) (float-array 64)]]
+        args [(float-array 64) (float-array 64)]
+        call-arguments (mapv (fn [{:keys [kind type value-fn]}]
+                               (if (= :scalar kind)
+                                 {:type type :value (value-fn args)}
+                                 (Object.)))
+                             (:argument-specs step))
+        call (kcall/make (:artifact step) call-arguments)]
     (is (= :contract (:convention step)))
     (is (= '[A B C] (mapv (comp :name :slot) (:argument-specs step))))
     (is (= [:input :input :output] (mapv :kind (:argument-specs step))))
@@ -146,6 +176,8 @@
     (is (= {'A :input 'B :input} (:array-roles descriptor)))
     (is (= :float (:dtype (first (:allocs descriptor))))
         "scratch allocation dtype comes from the contraction output ABI")
-    (is (= 64 (long ((:out-elems-fn step) args))))
-    (is (every? pos? (map #(% args) (:wg-fns step))))
-    (is (every? pos? (map #(% args) (:grid-fns step))))))
+    (is (= 64 (kart/attribute (:artifact step) :out-elems)))
+    (is (= 2 (count (get-in call [:geometry :workgroup-size]))))
+    (is (= 2 (count (get-in call [:geometry :group-count]))))
+    (is (every? pos? (get-in call [:geometry :workgroup-size])))
+    (is (every? pos? (get-in call [:geometry :group-count])))))

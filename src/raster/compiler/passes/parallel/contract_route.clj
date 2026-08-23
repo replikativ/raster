@@ -22,7 +22,9 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contraction-facts :as cf]
-            [raster.compiler.ir.kernel-abi :as kabi]))
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -44,6 +46,54 @@
    cannot be confused at bind time."
   [body]
   (distinct (map :sym (od/aget-reads body))))
+
+(defn- launch-dimension
+  "Translate the router's legacy arithmetic dimension into canonical launch IR. The router emits
+  symbolic ceil-div as `(quot (+ value (dec divisor)) divisor)`; preserve that operation as a
+  CeilDiv so KernelCall resolves the underlying compiler value directly from the ABI arguments."
+  [dimension]
+  (cond
+    (integer? dimension)
+    (if (pos? dimension)
+      dimension
+      (throw (ex-info "contract launch dimension must be positive"
+                      {:dimension dimension})))
+
+    :else
+    (let [[q numerator divisor] (when (seq? dimension) dimension)
+          [plus value offset] (when (seq? numerator) numerator)]
+      (if (and (contains? '#{quot clojure.core/quot} q)
+               (contains? '#{+ clojure.core/+} plus)
+               (integer? divisor) (pos? divisor)
+               (= (dec divisor) offset))
+        (klaunch/ceil-div value divisor)
+        (klaunch/runtime-value dimension)))))
+
+(defn- descriptor-artifact
+  "Close a validated single-launch contraction descriptor into one executable compiler value."
+  [{:keys [strategy kernel-name source abi arguments wg grid out-elems dtype out-dtype]
+    :as descriptor}]
+  (when (and (not (number? out-elems)) (not (some #(= out-elems %) arguments)))
+    (throw (ex-info "contract descriptor: symbolic :out-elems is absent from artifact arguments"
+                    {:strategy strategy :out-elems out-elems :arguments arguments})))
+  (kart/make
+   {:kernel-name kernel-name
+    :source source
+    :abi abi
+    :arguments arguments
+    :launch (klaunch/spec
+             {:workgroup-size (mapv launch-dimension wg)
+              :group-count (mapv launch-dimension grid)})
+    :temporaries []
+    :effects {:kind :tensor-contraction}
+    :provenance {:dialect :segcontract :strategy strategy}
+    :attributes
+    (merge {:strategy strategy
+            :out-elems out-elems
+            :dtype dtype
+            :out-dtype out-dtype}
+           (select-keys descriptor [:fallback-reason :declines :tile :tensorized :packed
+                                    :fused-epilogue :dims :stages]))}))
 
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
@@ -74,17 +124,13 @@
    7-arg kernel. Both are mechanically detectable by comparing the emitted signature with what the
    descriptor says to bind, which is what this does.
 
-   Pointer params must equal (array-params + 1 output + epilogue-operands). The rest depends on the
-   INVOKE PROTOCOL, of which there are two — writing this validator is what forced them to be stated
-   explicitly instead of living implicitly in two call sites:
+   Pointer params must equal (array-params + 1 output + epilogue-operands). Default single-launch
+   leaves must also supply positive 2-D workgroup/grid data; validation closes those fields and the
+   ordered compiler values into a KernelArtifact. Full reductions already arrive as a verified
+   artifact and retain their distinct two-phase invoke protocol, whose scheduler owns geometry.
 
-     default (:invoke nil)  invoke-registered-contraction! binds :scalar-args positionally and
-                            launches with :wg/:grid — so all three must be present and match.
-     :invoke :reduction     invoke-registered-reduction-kernel consumes the emitter's complete
-                            ordered ABI (the staging marker replaces only the :result value with
-                            nil) and computes its own two-phase launch geometry; :wg/:grid are absent.
-
-   Returns the descriptor with `:arguments`, the compiler values in exact ABI order."
+   Returns the descriptor with `:arguments`, the compiler values in exact ABI order, and an
+   executable `:artifact` for every route."
   [{:keys [strategy kernel-name source array-params scalar-args epilogue-operands lift-operands abi
            epilogue-scalars out-elems wg grid invoke reduce-bound] :as d}]
   (let [params (kernel-signature-params source)
@@ -102,11 +148,9 @@
         ;; epilogue's (bias/residual/scale, appended after the dims) or a staged contraction's
         ;; lift operands (the per-block scales, bound between the operands and the output).
         expect-ptr (+ (count array-params) 1 (count epilogue-operands) (count lift-operands))
-        ;; TWO invoke protocols, made explicit here because the validator forced the question:
-        ;;   :invoke nil (default) — invoke-registered-contraction! binds :scalar-args positionally,
-        ;;                           so they must match the kernel's scalar params exactly.
-        ;;   :invoke :reduction    — the ordered reduction ABI includes the count slot; the routed
-        ;;                           descriptor carries no separate positional scalar convention.
+        ;; Full reduction carries a complete ordered ABI. Other leaves still construct their
+        ;; compiler argument values from descriptor scalars here, exactly once, before artifact
+        ;; validation eliminates the positional convention from all runtime paths.
         ;; an epilogue's SCALARS are kernel scalar params too — they are emitted into the
         ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
         ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
@@ -139,7 +183,7 @@
                       {:strategy strategy :kernel-name kernel-name :params params
                        :invoke invoke :scalar-args scalar-args}))
       (nil? out-elems)
-      (throw (ex-info "contract descriptor: :out-elems is required (the invoke sizes the output with it)"
+      (throw (ex-info "contract descriptor: :out-elems is required (the artifact sizes the output with it)"
                       {:strategy strategy}))
       ;; wg/grid belong to the 2-D launch contract only. The reduction invoke computes its own
       ;; two-phase geometry, so a :reduction descriptor legitimately carries neither — a third
@@ -170,8 +214,9 @@
                             (throw (ex-info "contract descriptor: no value for ABI scalar"
                                             {:strategy strategy :slot slot
                                              :scalar-args scalar-args}))))))
-                    abi)]
-          (assoc d :arguments arguments))))))
+                    abi)
+              descriptor (assoc d :arguments arguments)]
+          (assoc descriptor :artifact (descriptor-artifact descriptor)))))))
 
 (declare route-2free-1contract route-quant)
 

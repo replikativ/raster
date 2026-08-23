@@ -690,7 +690,7 @@
    weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
    caller collects :phase keys and records once.
 
-     :map/:reduce/:map-void
+     :map/:reduce/:map-void/:contract
                 Artifact ABI values and realized geometry bind through one KernelCall contract.
                 SegRed explicitly schedules one resident workgroup; maps realize their grid.
                 Logical SoA arguments expand through the backend representation adapter before
@@ -698,9 +698,9 @@
   [sess step args sym->key]
   (let [device-id (:device-id @sess)
         {:keys [kernel-name phase convention artifact argument-specs]} step]
-    (when-not (#{:map-void :map :reduce} convention)
+    (when-not (#{:map-void :map :reduce :contract} convention)
       (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
-                           ") — only :map-void / :map / :reduce are supported on the resident path")
+                           ") — only artifact-backed kernel steps are supported on the resident path")
                       {:convention convention :kernel kernel-name})))
     (let [bufs (:buffers @sess)
           resolve-buf (fn [a] (or (get bufs (sym->key a))
@@ -708,7 +708,7 @@
                                                   {:kernel kernel-name :available (keys bufs)}))))
           bind-call-fn (rt-resolve device-id "bind-kernel-call")]
       (case convention
-        (:map :reduce :map-void)
+        (:map :reduce :map-void :contract)
         (let [logical-or-physical-args
               (mapv (fn [{:keys [kind sym type value-fn]}]
                       (if (= :scalar kind)
@@ -1100,7 +1100,6 @@
          info-fn   (rt-resolve device-id "kernel-registry-entry")
          specialized-bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
          bind-call-fn (rt-resolve device-id "bind-kernel-call")
-         contract-fn (rt-resolve device-id "bind-registered-contraction!")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
          conv-fn   (rt-resolve device-id "bind-registered-convert!")
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
@@ -1224,10 +1223,10 @@
                      (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)
                                            :const-prologue? (boolean c)})
                            raw))))
-               ;; Generic map and reduction now share the complete executable value: emitted
-               ;; artifact, ordered ABI values and realized launch. Reduction's single-group
-               ;; resident schedule is explicit here rather than hidden in a special binder.
-               (:map :reduce :map-void)
+               ;; Artifact-backed kernels share the complete executable value: emitted artifact,
+               ;; ordered ABI values and realized launch. Reduction's single-group resident
+               ;; schedule is explicit here rather than hidden in a special binder.
+               (:map :reduce :map-void :contract)
                (let [logical-or-physical-args
                      (mapv (fn [{:keys [kind sym type value-fn]}]
                              (if (= :scalar kind)
@@ -1243,26 +1242,6 @@
                      call (kcall/make artifact ordered-args
                                       (if (= :reduce convention) {:group-count [1]} {}))]
                  [(assoc (bind-call-fn call) :phase (:phase step))])
-               ;; Routed contraction: preserve the emitter-authored ABI order all the way into
-               ;; the backend binder. Pointer slots resolve to resident buffers; scalar slots
-               ;; retain their declared kernel view dtype (not the program/output dtype). The
-               ;; 2-D workgroup and grid expressions are evaluated once at bind and baked into
-               ;; the replay graph.
-               :contract
-               (do (or (info-fn kernel-name)
-                       (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                       {:kernel kernel-name})))
-                   (let [ordered-args
-                         (mapv (fn [{:keys [kind sym type value-fn]}]
-                                 (if (= :scalar kind)
-                                   {:type type :value (value-fn args)}
-                                   (buf-of sym kernel-name)))
-                               (:argument-specs step))
-                         out-elems (long ((:out-elems-fn step) args))
-                         wg (mapv (fn [f] (long (f args))) (:wg-fns step))
-                         grid (mapv (fn [f] (long (f args))) (:grid-fns step))]
-                     [(assoc (contract-fn kernel-name ordered-args out-elems wg grid)
-                             :phase (:phase step))]))
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
                ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
                ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
