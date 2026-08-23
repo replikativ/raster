@@ -1,10 +1,23 @@
 (ns raster.compiler.contraction-marker-abi-test
   "The contraction emitter, route, marker, registry and runtime share one ordered typed ABI."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.arrays :as ra]
+            [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.par-fusion :as fusion]
+            [raster.core :refer [deftm]]
+            [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
+
+(deftm resident-contract-descriptor-probe
+  [A :- (Array float) B :- (Array float)] :- (Array float)
+  (let [C (ra/alloc-like A 64)]
+    (raster.par/contract C [[i 8] [j 8]] [[l 8]]
+      (clojure.core/*
+       (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
+       (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+    C))
 
 (defn- mm [m n k]
   (list 'raster.par/contract 'C [['i m] ['j n]] [['l k]]
@@ -97,3 +110,42 @@
                             kernel-name [(float-array 1)] 1 [1 1] [1 1]))]
     (is (= 2 (:expected data)))
     (is (= 1 (:actual data)))))
+
+(deftest resident-binders-validate-ordered-values-before-touching-a-driver
+  (let [abi [{:name 'A :c-name "A" :kind :input :dtype :float :kernel-dtype :float}
+             {:name 'alpha :c-name "alpha" :kind :scalar :dtype :float :kernel-dtype :float}
+             {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float :role :result}]
+        raw-seg (java.lang.foreign.MemorySegment/ofArray (float-array 1))]
+    (doseq [[backend register! bind!]
+            [[:ze ze/register-kernel! ze/bind-registered-contraction!]
+             [:ocl ocl/register-kernel! ocl/bind-registered-contraction!]]]
+      (let [kernel-name (str "resident_abi_probe_" (name backend) "_" (gensym))
+            _ (register! kernel-name {:abi abi})
+            pointer-data (thrown-data #(bind! kernel-name
+                                              [(Object.) {:type :float :value 1.0} (Object.)]
+                                              1 [1 1] [1 1]))
+            scalar-data (thrown-data #(bind! kernel-name
+                                             [raw-seg {:type :int :value 1} raw-seg]
+                                             1 [1 1] [1 1]))]
+        (is (= kernel-name (:kernel-name pointer-data)))
+        (is (= :input (get-in pointer-data [:slot :kind])))
+        (is (= Object (:value-type pointer-data)))
+        (is (= 'alpha (get-in scalar-data [:slot :name])))
+        (is (= :float (:expected scalar-data)))
+        (is (= :int (:actual scalar-data)))))))
+
+(deftest compile-gpu-program-extracts-a-real-contraction-as-an-ordered-resident-step
+  (let [descriptor (pipeline/compile-gpu-program #'resident-contract-descriptor-probe
+                                                  :ze:0 :dtype :float)
+        step (first (:steps descriptor))
+        args [(float-array 64) (float-array 64)]]
+    (is (= :contract (:convention step)))
+    (is (= '[A B C] (mapv (comp :name :slot) (:argument-specs step))))
+    (is (= [:input :input :output] (mapv :kind (:argument-specs step))))
+    (is (= 'C (:result-sym descriptor)) "the invoke result aliases its ABI :result buffer")
+    (is (= {'A :input 'B :input} (:array-roles descriptor)))
+    (is (= :float (:dtype (first (:allocs descriptor))))
+        "scratch allocation dtype comes from the contraction output ABI")
+    (is (= 64 (long ((:out-elems-fn step) args))))
+    (is (every? pos? (map #(% args) (:wg-fns step))))
+    (is (every? pos? (map #(% args) (:grid-fns step))))))

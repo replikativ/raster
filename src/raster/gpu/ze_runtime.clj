@@ -1556,7 +1556,16 @@
             :long   (let [s (.allocate ^Arena arena I64)]
                       (.set s I64 0 (long value))
                       (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
-                                [kernel (int idx) (long 8) s]))))))
+                                [kernel (int idx) (long 8) s]))
+            :half   (let [s (.allocate ^Arena arena ValueLayout/JAVA_SHORT)]
+                      (.set s ValueLayout/JAVA_SHORT 0
+                            (short (Float/floatToFloat16 (float value))))
+                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                [kernel (int idx) (long 2) s]))
+            :byte   (let [s (.allocate ^Arena arena ValueLayout/JAVA_BYTE)]
+                      (.set s ValueLayout/JAVA_BYTE 0 (byte value))
+                      (ze-call! (str "zeKernelSetArgumentValue[" idx "]") @h-zeKernelSetArgumentValue
+                                [kernel (int idx) (long 1) s]))))))
     (let [gc-seg (.allocate arena 12)
           cmd (:cmd-list @state)]
       (.set gc-seg I32 8 (int 1))  ;; Z=1
@@ -2568,6 +2577,67 @@
       :group-count group-count
       :kernel-name kernel-name
       :async? async?})))
+
+(defn bind-registered-contraction!
+  "Pre-bind a routed contraction over resident buffers using its ordered typed ABI.
+  `arguments` is in exact kernel-signature order and may interleave pointer and scalar slots.
+  The complete 2-D launch geometry is baked into the returned prepared binding, so command-graph
+  recording must leave :gc-seg untouched (:group-count is nil). All structural/type checks run
+  before kernel loading touches the native driver."
+  [^String kernel-name arguments out-elems wg grid]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (kabi/validate! (:abi registered))
+        arguments (kabi/validate-arguments! abi arguments)
+        _ (when-not (and (vector? wg) (= 2 (count wg))
+                         (every? pos? wg)
+                         (vector? grid) (= 2 (count grid))
+                         (every? pos? grid))
+            (throw (ex-info "resident contraction requires positive 2-D :wg and :grid vectors"
+                            {:kernel-name kernel-name :wg wg :grid grid})))
+        out-elems (long out-elems)
+        _ (when (neg? out-elems)
+            (throw (ex-info "resident contraction :out-elems must be non-negative"
+                            {:kernel-name kernel-name :out-elems out-elems})))
+        _ (doseq [[slot value] (map vector abi arguments)]
+            (if (= :scalar (:kind slot))
+              (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
+                (throw (ex-info "contraction ABI scalar binding has the wrong kernel dtype"
+                                {:kernel-name kernel-name :slot slot
+                                 :expected (:kernel-dtype slot)
+                                 :actual (when (map? value) (:type value))})))
+              (do
+                (when-not (or (device-buffer? value) (instance? MemorySegment value))
+                  (throw (ex-info "resident contraction requires DeviceBuffer/MemorySegment pointer arguments"
+                                  {:kernel-name kernel-name :slot slot :value-type (type value)})))
+                (when (and (device-buffer? value)
+                           (not= (:dtype slot) (dt/canon (:dtype ^DeviceBuffer value))))
+                  (throw (ex-info "contraction ABI storage dtype does not match resident buffer"
+                                  {:kernel-name kernel-name :slot slot
+                                   :expected (:dtype slot)
+                                   :actual (dt/canon (:dtype ^DeviceBuffer value))})))
+                (when (and (= :output (:kind slot)) (device-buffer? value)
+                           (< (:n-elements ^DeviceBuffer value) out-elems))
+                  (throw (ex-info "contraction output buffer is smaller than :out-elems"
+                                  {:kernel-name kernel-name :slot slot :out-elems out-elems
+                                   :buffer-elements (:n-elements ^DeviceBuffer value)}))))))
+        ;; Driver touch starts only after the ordered ABI and resident values are proven valid.
+        {:keys [module]} (ensure-kernel-loaded! kernel-name)
+        kernel-handle (create-kernel-fresh module kernel-name)
+        all-args (mapv (fn [slot value]
+                         (if (= :scalar (:kind slot))
+                           value
+                           (if (device-buffer? value)
+                             (:segment ^DeviceBuffer value)
+                             value)))
+                       abi arguments)
+        bound (bind-kernel-2d! kernel-handle (mapv long wg) all-args)
+        ^MemorySegment gc (:gc-seg bound)]
+    (.set gc I32 0 (int (first grid)))
+    (.set gc I32 4 (int (second grid)))
+    {:bound bound :group-count nil :kernel-name kernel-name}))
 
 (defn launch-registered-bound!
   "Dispatch a kernel pre-bound by bind-registered-map-void-kernel. Synchronous."

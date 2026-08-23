@@ -28,6 +28,7 @@
             [raster.compiler.passes.scalar.normalize :as normalize]
             [raster.compiler.passes.scalar.rewalk :as rewalk]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
@@ -1176,6 +1177,7 @@
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
      raster.gpu.ze-runtime/invoke-reduction-kernel
+     raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
@@ -1310,7 +1312,8 @@
   ;; the emitter changed shape — extra operands would be SILENTLY DROPPED (the store-drop /
   ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
   ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
-  ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, scatter=6|7, reduce=4|5.
+  ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=6,
+  ;; scatter=6|7, reduce=4|5.
   (let [head (first expr)
         argc (count expr)]
     (cond
@@ -1324,6 +1327,15 @@
         (let [[_ kname inputs out scalars n] expr]
           {:kernel-name kname :arrays (conj (vec inputs) out) :scalars (vec scalars) :n-expr n
            :convention :map :returns sym}))
+      (= head 'raster.gpu.ze-runtime/invoke-registered-contraction!)
+      ;; The marker carries VALUES in exact emitter-authored ABI order.  Do not split or reorder
+      ;; them here: packed inputs and epilogue operands/scalars can interleave by signature.
+      (when (= 6 argc)
+        (let [[_ kname arguments out-elems wg grid] expr]
+          (when (and (vector? arguments) (vector? wg) (= 2 (count wg))
+                     (vector? grid) (= 2 (count grid)))
+            {:kernel-name kname :arguments arguments :out-elems-expr out-elems
+             :wg-exprs wg :grid-exprs grid :convention :contract :returns sym})))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
       ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
@@ -1400,7 +1412,8 @@
    `{::non-resident {:why <kw> :sym <sym> :form <expr>}}` naming the FIRST binding that defeated
    straight-line extraction — so the caller can fail loud with an actionable message instead of a
    bare nil (the silent-empty-graph footgun)."
-  [form]
+  ([form] (extract-gpu-program form nil))
+  ([form kernel-info-fn]
   (if-not (and (seq? form) (#{'let* 'let} (first form)))
     {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
     (let [bindings (partition 2 (second form))
@@ -1454,8 +1467,17 @@
                   ;; that reads the binding sym (e.g. the primary of a horizontally-fused
                   ;; multi-output map, whose out is a fusion-materialized buffer) must
                   ;; resolve to the REAL resident buffer at bind time.
-                  (when (= :map (:convention s))
-                    (let [out (last (:arrays s))]
+                  (when (#{:map :contract} (:convention s))
+                    (let [out (if (= :map (:convention s))
+                                (last (:arrays s))
+                                (when kernel-info-fn
+                                  (let [abi (:abi (kernel-info-fn (:kernel-name s)))
+                                        result-indexes (keep-indexed
+                                                        (fn [i slot]
+                                                          (when (= :result (:role slot)) i))
+                                                        abi)]
+                                    (when (= 1 (count result-indexes))
+                                      (nth (:arguments s) (first result-indexes))))))]
                       (when (and (symbol? out) (not= sym out))
                         (vswap! aliases assoc sym out)))))
               (reject! :unparseable-kernel-invoke sym expr))
@@ -1500,7 +1522,7 @@
         (cond
           (not @ok)      {::non-resident @reason}
           (empty? @steps) {::non-resident {:why :no-kernel-steps}}
-          :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body})))))
+          :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))))
 
 (defn- strip-meta
   "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
@@ -1556,8 +1578,10 @@
       :array-params [a out]         ; array params (resident buffers, up/downloaded)
       :scalar-params [n]
       :allocs [{:sym b :size-fn (fn [args] int)}]   ; intermediate scratch buffers
-      :steps  [{:kernel-name str :arrays [syms] :n-fn (fn [args] int)
-                :scalar-fns [(fn [args] v) ...] :convention :map-void|:map :phase kw}]
+      :steps  [{:kernel-name str :convention :map|:contract|:reduce|... :phase kw
+                ;; maps carry split :arrays/:scalar-specs/:n-fn; contractions carry
+                ;; ordered :argument-specs plus :wg-fns/:grid-fns geometry
+                ...}]
       :result-sym sym}
 
    :on-non-resident controls what happens when the fused IR is NOT a straight-line resident
@@ -1686,7 +1710,11 @@
                          "Bind `((value+grad #'f) args…)` directly to a let symbol at the deftm's "
                          "top level and read `(nth vg k)` from there.")
                     {:fn f-var :vg-form vg})))
-        extracted (extract-gpu-program form)
+        runtime-ns (if (and device-id (.startsWith (name device-id) "ocl"))
+                     'raster.gpu.ocl-runtime
+                     'raster.gpu.ze-runtime)
+        reg-entry (requiring-resolve (symbol (str runtime-ns) "kernel-registry-entry"))
+        extracted (extract-gpu-program form reg-entry)
         prog (if-let [nr (::non-resident extracted)]
                (if (= on-non-resident :throw)
                  (throw (ex-info
@@ -1709,15 +1737,37 @@
         ;; calls to :constant (weights — uploaded once at bind) and persistent written state to
         ;; :state (KV cache — never downloaded): that cross-call axis isn't a single-program
         ;; property (escape analysis can't see it), so it's declared, not derived.
-        reg-entry (when prog (requiring-resolve 'raster.gpu.ze-runtime/kernel-registry-entry))
         written-params (when prog
                          (reduce (fn [acc s]
                                    (if (= :gemm (:convention s))
                                      ;; a GEMM writes its C (out-buf) in place
                                      (conj acc (symbol (name (:out-buf s))))
                                      (let [ki (reg-entry (:kernel-name s))]
-                                       (into acc (map (comp symbol name) (:written-arrays ki))))))
+                                       (into acc
+                                             (map (comp symbol name)
+                                                  (if-let [abi (:abi ki)]
+                                                    (map :name
+                                                         (filter #(or (= :output (:kind %))
+                                                                      (= :inout (:role %)))
+                                                                 (kabi/pointer-slots abi)))
+                                                    (:written-arrays ki)))))))
                                  #{} (:steps prog)))
+        ;; Scratch allocations are not necessarily the program-wide FP dtype. Ordered ABIs can
+        ;; produce half, byte or int buffers (tensorized/quant contractions and mixed pipelines),
+        ;; so carry the producing output slot's STORAGE dtype into the residency allocator.
+        buffer-dtypes (when prog
+                        (reduce (fn [m s]
+                                  (if (= :gemm (:convention s))
+                                    (assoc m (:C s) effective-dtype)
+                                    (if-let [abi (:abi (reg-entry (:kernel-name s)))]
+                                      (reduce (fn [m slot]
+                                                (if (or (= :output (:kind slot))
+                                                        (= :inout (:role slot)))
+                                                  (assoc m (:name slot) (:dtype slot))
+                                                  m))
+                                              m (kabi/pointer-slots abi))
+                                      m)))
+                                {} (:steps prog)))
         array-roles (when prog
                       (into {} (map (fn [p] [p (if (contains? written-params p) :output :input)])
                                     array-params)))]
@@ -1730,10 +1780,12 @@
        :array-roles array-roles
        :scalar-params scalar-params
        :allocs (mapv (fn [{:keys [sym size-expr]}]
-                       {:sym sym :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
+                       {:sym sym :dtype (get buffer-dtypes sym effective-dtype)
+                        :size-fn (expr->arg-fn all-params scalar-lets size-expr)})
                      (:allocs prog))
        :steps (mapv (fn [i step]
-                      (if (= :gemm (:convention step))
+                      (cond
+                        (= :gemm (:convention step))
                         ;; GEMM: carries the A/B/C buffer syms + m/n/k size closures (BLAS arg
                         ;; order is A B C m k n → keep m/n/k separate). bind-program! expands this
                         ;; into [convert A→f16][convert B→f16][(transpose)][fp16 XMX gemm → f32 C].
@@ -1744,6 +1796,36 @@
                          :n-fn (expr->arg-fn all-params scalar-lets (:n-expr step))
                          :k-fn (expr->arg-fn all-params scalar-lets (:k-expr step))
                          :phase (keyword (str "gpu-step-" i))}
+
+                        (= :contract (:convention step))
+                        (let [{:keys [kernel-name arguments out-elems-expr wg-exprs grid-exprs]} step
+                              abi (some-> (reg-entry kernel-name) :abi kabi/validate!)
+                              _ (when-not abi
+                                  (throw (ex-info "resident contraction kernel has no registered ordered ABI"
+                                                  {:kernel-name kernel-name})))
+                              _ (kabi/validate-arguments! abi arguments)
+                              result-slots (filterv #(= :result (:role %)) abi)
+                              _ (when-not (= 1 (count result-slots))
+                                  (throw (ex-info "resident contraction ABI must identify exactly one :result slot"
+                                                  {:kernel-name kernel-name :abi abi
+                                                   :result-slots result-slots})))]
+                          {:convention :contract
+                           :kernel-name kernel-name
+                           :abi abi
+                           :argument-specs
+                           (mapv (fn [slot value]
+                                   (if (= :scalar (:kind slot))
+                                     {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                      :value-fn (expr->arg-fn all-params scalar-lets value)}
+                                     {:slot slot :kind (:kind slot) :role (:role slot)
+                                      :dtype (:dtype slot) :sym value}))
+                                 abi arguments)
+                           :out-elems-fn (expr->arg-fn all-params scalar-lets out-elems-expr)
+                           :wg-fns (mapv #(expr->arg-fn all-params scalar-lets %) wg-exprs)
+                           :grid-fns (mapv #(expr->arg-fn all-params scalar-lets %) grid-exprs)
+                           :phase (keyword (str "gpu-step-" i))})
+
+                        :else
                         (let [{:keys [kernel-name arrays scalars n-expr convention output accumulator]} step]
                           {:kernel-name kernel-name
                            :arrays arrays
