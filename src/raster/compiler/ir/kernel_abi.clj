@@ -112,7 +112,10 @@
       []
       (mapv (fn [param]
               (let [param (str/trim param)
-                    c-name (second (re-find #"([A-Za-z_][A-Za-z0-9_]*)\s*$" param))]
+                    ;; Clojure gensyms in emitted kernels may retain Unicode letters (for example
+                    ;; the AD pipeline uses α). Capture the complete final non-whitespace token;
+                    ;; an ASCII-only C-identifier regex silently reduced `y_α_42` to `_42`.
+                    c-name (second (re-find #"([^\s*]+)\s*$" param))]
                 (when-not c-name
                   (throw (ex-info "kernel ABI could not parse emitted OpenCL parameter"
                                   {:kernel-name kernel-name :parameter param})))

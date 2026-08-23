@@ -27,8 +27,14 @@
   (is (thrown-with-msg?
        clojure.lang.ExceptionInfo #"does not match"
        (kabi/validate-source-signature!
-        "map_k" "__kernel void map_k(__global float* out, __global const float* x, float scale, int _n_bound) {}"
-        map-abi))))
+       "map_k" "__kernel void map_k(__global float* out, __global const float* x, float scale, int _n_bound) {}"
+        map-abi)))
+  (let [unicode-abi [(kabi/slot 'y_α_42 :input :float)
+                     (kabi/slot 'out :output :float :role :result)]]
+    (is (= unicode-abi
+           (kabi/validate-source-signature!
+            "unicode_k" "__kernel void unicode_k(__global const float* y_α_42, __global float* out) {}"
+            unicode-abi)))))
 
 (deftest split-resident-binding-is-checked-against-abi
   (is (= '[x out]
