@@ -1176,6 +1176,7 @@
 (def ^:private gpu-invoke-heads
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
+     raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
@@ -1313,7 +1314,7 @@
   ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
   ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
   ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=6,
-  ;; scatter=6|7, reduce=4|5.
+  ;; scatter=6|7, ordered-reduce=3, legacy-reduce=4|5.
   (let [head (first expr)
         argc (count expr)]
     (cond
@@ -1355,6 +1356,16 @@
           {:kernel-name kname :arrays [out src index]
            :scalars (if stride [(strip-cast stride)] [])
            :n-expr n :convention :scatter :accumulator out :returns sym}))
+
+      (= head 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel)
+      ;; SegRed carries VALUES in exact emitter-authored ABI order, including its result and
+      ;; bound slots. A nil result is the host-scalar staging protocol and cannot enter a
+      ;; resident graph; descriptor construction rejects it with the registered ABI in hand.
+      (when (= 3 argc)
+        (let [[_ kname arguments] expr]
+          (when (vector? arguments)
+            {:kernel-name kname :arguments arguments
+             :convention :reduce :returns sym})))
 
       (= head 'raster.gpu.ze-runtime/invoke-reduction-kernel)
       ;; 3-arg legacy (host-scalar return, argc 4) vs resident (writes out-buf, stays on
@@ -1460,26 +1471,35 @@
                 (vswap! device-buffers conj sym))
             (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
             (if-let [s (parse-gpu-step sym expr)]
-              (do (vswap! steps conj s) (vswap! device-buffers conj sym)
+              (let [ordered-result
+                    (when (and (:arguments s) kernel-info-fn)
+                      (let [abi (:abi (kernel-info-fn (:kernel-name s)))
+                            result-indexes (keep-indexed
+                                            (fn [i slot]
+                                              (when (= :result (:role slot)) i))
+                                            abi)]
+                        (when (= 1 (count result-indexes))
+                          {:value (nth (:arguments s) (first result-indexes))})))]
+                (if (and (= :reduce (:convention s)) ordered-result
+                         (nil? (:value ordered-result)))
+                  ;; The explicit nil :result is the host-scalar staging protocol. It cannot be
+                  ;; recorded into a resident graph, but must remain a clean non-resident fallback
+                  ;; (rather than reaching descriptor construction and throwing there).
+                  (reject! :host-scalar-reduction sym expr)
+                  (do (vswap! steps conj s) (vswap! device-buffers conj sym)
                   ;; A :map step's runtime VALUE is its out buffer (invoke-registered-kernel
                   ;; returns output-array), so the binding sym is a pure alias of the out
                   ;; array. Copy-propagate it like any other array alias — a later step
                   ;; that reads the binding sym (e.g. the primary of a horizontally-fused
                   ;; multi-output map, whose out is a fusion-materialized buffer) must
                   ;; resolve to the REAL resident buffer at bind time.
-                  (when (#{:map :contract} (:convention s))
+                  (when (or (#{:map :contract} (:convention s))
+                            (and (= :reduce (:convention s)) (:arguments s)))
                     (let [out (if (= :map (:convention s))
                                 (last (:arrays s))
-                                (when kernel-info-fn
-                                  (let [abi (:abi (kernel-info-fn (:kernel-name s)))
-                                        result-indexes (keep-indexed
-                                                        (fn [i slot]
-                                                          (when (= :result (:role slot)) i))
-                                                        abi)]
-                                    (when (= 1 (count result-indexes))
-                                      (nth (:arguments s) (first result-indexes))))))]
+                                (:value ordered-result))]
                       (when (and (symbol? out) (not= sym out))
-                        (vswap! aliases assoc sym out)))))
+                        (vswap! aliases assoc sym out)))))))
               (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step. A non-default
           ;; alpha/beta is NOT representable by the resident GEMM kernels (they compute
@@ -1823,6 +1843,32 @@
                            :out-elems-fn (expr->arg-fn all-params scalar-lets out-elems-expr)
                            :wg-fns (mapv #(expr->arg-fn all-params scalar-lets %) wg-exprs)
                            :grid-fns (mapv #(expr->arg-fn all-params scalar-lets %) grid-exprs)
+                           :phase (keyword (str "gpu-step-" i))})
+
+                        (and (= :reduce (:convention step)) (:arguments step))
+                        (let [{:keys [kernel-name arguments]} step
+                              abi (some-> (reg-entry kernel-name) :abi kabi/validate!)
+                              _ (when-not abi
+                                  (throw (ex-info "resident reduction kernel has no registered ordered ABI"
+                                                  {:kernel-name kernel-name})))
+                              {:keys [result-pair]} (kabi/validate-reduction-arguments! abi arguments)
+                              output (second result-pair)
+                              _ (when-not (symbol? output)
+                                  (throw (ex-info "resident reduction requires a concrete output buffer at the ABI :result slot"
+                                                  {:kernel-name kernel-name :output output
+                                                   :abi abi :arguments arguments})))]
+                          {:convention :reduce
+                           :kernel-name kernel-name
+                           :abi abi
+                           :argument-specs
+                           (mapv (fn [slot value]
+                                   (if (= :scalar (:kind slot))
+                                     {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                      :value-fn (expr->arg-fn all-params scalar-lets value)}
+                                     {:slot slot :kind (:kind slot) :role (:role slot)
+                                      :dtype (:dtype slot) :sym value}))
+                                 abi arguments)
+                           :output (keyword (name output))
                            :phase (keyword (str "gpu-step-" i))})
 
                         :else

@@ -10,7 +10,8 @@
    emitting a miscompiled kernel step. These pin the reject; before the fix each malformed
    form extracted to a (wrong) step with no ::non-resident."
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.compiler.pipeline :as pipeline]))
+            [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.ir.kernel-abi :as kabi]))
 
 (def ^:private nr-key :raster.compiler.pipeline/non-resident)
 
@@ -69,7 +70,14 @@
                        result))))))
 
 (deftest reduce-arity
-  (testing "a 5-wide resident reduction and a 4-wide legacy reduction both extract"
+  (testing "an ordered resident reduction preserves the complete argument vector"
+    (let [step (first (:steps (pipeline/extract-gpu-program
+                               '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+                                            "k" [a obuf scale n])]
+                                      out))))]
+      (is (= :reduce (:convention step)))
+      (is (= '[a obuf scale n] (:arguments step)))))
+  (testing "the 5-wide resident compatibility reduction and 4-wide legacy reduction still extract"
     (is (= :reduce (:convention (first (:steps (pipeline/extract-gpu-program
                                                 '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel
                                                              "k" [a] obuf 10)]
@@ -84,4 +92,35 @@
     (is (= :unparseable-kernel-invoke
            (why '(let* [out (raster.gpu.ze-runtime/invoke-reduction-kernel
                              "k" [a] obuf 10 extra)]
+                       out)))))
+  (testing "ordered reduction requires exactly one vector operand"
+    (is (= :unparseable-kernel-invoke
+           (why '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+                             "k" [a obuf n] extra)]
+                       out))))
+    (is (= :unparseable-kernel-invoke
+           (why '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+                             "k" (list a obuf n))]
                        out))))))
+
+(deftest ordered-reduction-residency-is-decided-by-result-role
+  (let [abi [(kabi/slot 'a :input :float :role :operand)
+             (kabi/slot 'out :output :float :role :result)
+             (kabi/slot 'scale :scalar :float :role :parameter)
+             (kabi/slot '_n_bound :scalar :int :role :bound)]
+        info (constantly {:abi abi})]
+    (testing "nil at the ABI result role is an explicit host-scalar staging fallback"
+      (let [r (pipeline/extract-gpu-program
+               '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+                             "k" [a nil scale n])]
+                      out)
+               info)]
+        (is (= :host-scalar-reduction (get-in r [nr-key :why])))))
+    (testing "a concrete result buffer remains resident and aliases the marker binding"
+      (let [r (pipeline/extract-gpu-program
+               '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+                             "k" [a obuf scale n])]
+                      out)
+               info)]
+        (is (nil? (nr-key r)))
+        (is (= 'obuf (:result r)))))))

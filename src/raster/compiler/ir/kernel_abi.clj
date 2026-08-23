@@ -91,6 +91,35 @@
                         {:slot slot :expected (:kernel-dtype slot) :actual (:type value)}))))
     {:pointer-slots pointer-slots :scalar-slots user-slots :bound-slot (first bound-slots)}))
 
+(defn validate-reduction-arguments!
+  "Validate a complete ordered reduction binding and expose its semantic projections without
+   reconstructing positional conventions.  A reduction owns exactly one pointer-valued :result
+   and exactly one scalar :bound; captured scalars and operands may otherwise be arbitrary ABI
+   slots.  Returns the ordered slot/value pairs plus role-derived projections."
+  [abi arguments]
+  (let [arguments (validate-arguments! abi arguments)
+        pairs (mapv vector abi arguments)
+        result-pairs (filterv (fn [[slot _]] (= :result (:role slot))) pairs)
+        bound-pairs (filterv (fn [[slot _]] (= :bound (:role slot))) pairs)]
+    (when-not (= 1 (count result-pairs))
+      (throw (ex-info "reduction ABI must identify exactly one :result slot"
+                      {:abi abi :result-slots (mapv first result-pairs)})))
+    (when-not (= :output (:kind (ffirst result-pairs)))
+      (throw (ex-info "reduction ABI :result slot must be an output pointer"
+                      {:abi abi :result-slot (ffirst result-pairs)})))
+    (when-not (= 1 (count bound-pairs))
+      (throw (ex-info "reduction ABI must identify exactly one :bound slot"
+                      {:abi abi :bound-slots (mapv first bound-pairs)})))
+    (when-not (= :scalar (:kind (ffirst bound-pairs)))
+      (throw (ex-info "reduction ABI :bound slot must be scalar"
+                      {:abi abi :bound-slot (ffirst bound-pairs)})))
+    {:pairs pairs
+     :pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot))) pairs)
+     :scalar-pairs (filterv (fn [[slot _]] (and (= :scalar (:kind slot))
+                                                 (not= :bound (:role slot)))) pairs)
+     :result-pair (first result-pairs)
+     :bound-pair (first bound-pairs)}))
+
 (defn signature-shape
   "The structural portion checked against emitted C."
   [abi]

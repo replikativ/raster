@@ -30,6 +30,13 @@
        (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
     C))
 
+(deftm ocl-session-reduce
+  [x :- (Array float) out :- (Array float) scale :- Double n :- Long] :- Void
+  (let [s (raster.par/reduce acc 0.0 i n
+            (clojure.core/+ acc (clojure.core/* scale (ra/aget x i))))]
+    (raster.par/map-void! j n
+      (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
+
 (deftest ocl-resident-session-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl-session test (no OpenCL device)")
@@ -76,4 +83,30 @@
                               (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
                                    (range 8))))
                  (vec result))))
+        (finally (close-session! s))))))
+
+(deftest ocl-resident-reduction-ordered-abi-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl resident reduction (no OpenCL device)")
+    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
+          make-session (ns-resolve gpu 'make-session)
+          bind-program! (ns-resolve gpu 'bind-program!)
+          run-program! (ns-resolve gpu 'run-program!)
+          close-session! (ns-resolve gpu 'close-session!)
+          descriptor (pl/compile-gpu-program #'ocl-session-reduce :ocl:0 :dtype :float)
+          n 1024
+          scale 0.75
+          x (float-array (map #(float (/ (inc %) 1024.0)) (range n)))
+          out (float-array n)
+          expected-sum (reduce + 0.0 (map #(* scale (double %)) (seq x)))
+          s (make-session :ocl:0)]
+      (try
+        (let [handle (bind-program! s descriptor [x out scale n])
+              result (get (run-program! s handle [x out scale n]) 'out)
+              red-step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))]
+          (is (= [:input :output :scalar :scalar]
+                 (mapv :kind (:argument-specs red-step))))
+          (is (< (Math/abs (- (double (aget ^floats result 511))
+                              (* (double (aget x 511)) expected-sum)))
+                 1e-3)))
         (finally (close-session! s))))))

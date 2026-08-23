@@ -126,10 +126,35 @@
 
 (deftest opencl-pass-reduce-test
   (testing "par/reduce gets replaced with ze invoke-reduction-kernel"
-    (let [form '(raster.par/reduce acc 0.0 i n (+ acc (aget a i)))
-          result (opencl-pass/opencl-pass form :device-id :ze:0)]
+    (let [form '(raster.par/reduce acc 0.0 i n (+ acc (* scale (aget a i))))
+          result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
+                                          :scalar-types {'scale :float 'n :int})]
       (is (= 1 (:ze-reduces (:stats result))))
-      (is (= 1 (count (:kernels result)))))))
+      (is (= 1 (count (:kernels result))))
+      (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+             (first (:form result))))
+      (is (= '[a nil scale n] (nth (:form result) 2)))
+      (is (= '[a output scale _n_bound]
+             (mapv :name (:abi (first (:kernels result))))))))
+  (testing "reduce-into supplies its resident result at the same ordered ABI slot"
+    (let [form '(raster.par/reduce-into obuf acc 0.0 i n (+ acc (* scale (aget a i))))
+          result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float
+                                          :scalar-types {'scale :float 'n :int})]
+      (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+             (first (:form result))))
+      (is (= '[a obuf scale n] (nth (:form result) 2)))
+      (is (= '[a obuf scale _n_bound]
+             (mapv :name (:abi (first (:kernels result)))))))))
+
+(deftest opencl-pass-full-contraction-reduction-uses-ordered-marker
+  (let [form '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i)))
+        result (opencl-pass/opencl-pass form :device-id :ze:0 :dtype :float)
+        kernel (first (:kernels result))]
+    (is (= 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
+           (first (:form result))))
+    (is (= '[A B nil 8] (nth (:form result) 2)))
+    (is (= '[A B O _n_bound] (mapv :name (:abi kernel))))
+    (is (= [:operand :operand :result :bound] (mapv :role (:abi kernel))))))
 
 (deftest opencl-pass-nested-let-test
   (testing "Nested let* forms are traversed"

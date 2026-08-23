@@ -61,6 +61,28 @@
       (is (not (re-find #"gpufn_aget" src)))
       (is (re-find #"a\[" src)))))
 
+(deftest segred-emits-complete-ordered-typed-abi
+  (let [form (with-meta '(raster.par/reduce acc 0.0 i n
+                                           (+ (float acc) (* scale (clojure.core/aget a i))))
+               {:raster.type/elem-type :float})
+        s (soac/par-form->soac 'result form 0)
+        segred (first (lower/lower-reduce s nil))
+        k (sg/generate-segred-kernel segred 'result-buffer :dtype :float
+                                     :scalar-types {'scale :float 'n :int})]
+    (testing "signature, ABI and compiler values have one identical order"
+      (is (= '[a result-buffer scale _n_bound] (mapv :name (:abi k))))
+      (is (= [:input :output :scalar :scalar] (mapv :kind (:abi k))))
+      (is (= [:float :float :float :int] (mapv :kernel-dtype (:abi k))))
+      (is (= [:operand :result :parameter :bound] (mapv :role (:abi k))))
+      (is (= '[a result-buffer scale n] (:arguments k)))
+      (is (re-find #"\(.*a,.*output, float scale, int _n_bound\)" (:source k)))))
+  (testing "host-scalar staging retains the result position as an explicit nil placeholder"
+    (let [form '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
+          s (soac/par-form->soac 'result form 0)
+          k (sg/generate-segred-kernel (first (lower/lower-reduce s nil)) nil :dtype :float)]
+      (is (= '[a output _n_bound] (mapv :name (:abi k))))
+      (is (= '[a nil n] (:arguments k))))))
+
 ;; ================================================================
 ;; Horizontally-fused multi-output SegMap: the SECONDARY output (written
 ;; only via a side-effect aset in the fused lambda) must be a NON-const

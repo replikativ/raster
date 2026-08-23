@@ -83,17 +83,19 @@
 (deftest validator-models-both-invoke-protocols
   (let [red (route/route-contraction '(raster.par/contract O [] [[i 8]] (* (aget A i) (aget B i)))
                                      :dtype :double)]
-    (testing ":invoke :reduction owns its launch — no :wg/:grid, empty :scalar-args, needs :reduce-bound"
+    (testing ":invoke :reduction owns its launch and carries an ordered ABI"
       (is (= :reduction (:invoke red)))
       (is (nil? (:wg red)))
       (is (nil? (:grid red)))
       (is (empty? (:scalar-args red)))
-      (is (some? (:reduce-bound red))))
+      (is (some? (:reduce-bound red)))
+      (is (= '[A B O _n_bound] (mapv :name (:abi red))))
+      (is (= '[A B O 8] (:arguments red))))
     (testing "…and the validator enforces each of those, so the protocol cannot drift"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must not carry"
             (route/validate-descriptor (assoc red :wg [256 1]))))
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must leave :scalar-args empty"
-            (route/validate-descriptor (assoc red :scalar-args [{:type :int :value 8}]))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered :abi is required"
+            (route/validate-descriptor (dissoc red :abi))))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires :reduce-bound"
             (route/validate-descriptor (dissoc red :reduce-bound)))))))
 

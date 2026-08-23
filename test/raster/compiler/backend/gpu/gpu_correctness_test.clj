@@ -236,6 +236,28 @@
        (is (seq devices) "Should find at least one GPU device")
        (is (string? (:name (first devices))) "Device should have a name")))))
 
+(deftest gpu-segred-staging-captured-scalar-test
+  (when-ze
+   (testing "ordered SegRed staging inserts its partial output and binds captured scalars"
+     (require 'raster.gpu.ze-runtime)
+     ((resolve 'raster.gpu.ze-runtime/init!))
+     (let [n 1024
+           scale 0.75
+           input (float-array (map #(float (/ (inc %) 1024.0)) (range n)))
+           form '(raster.par/reduce acc 0.0 i n
+                                    (+ acc (* scale (aget input i))))
+           compiled (opencl-pass/opencl-pass
+                     form :device-id :ze:0 :dtype :float
+                     :scalar-types {'scale :float 'n :int})
+           kernel (first (:kernels compiled))
+           invoke (resolve 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel)
+           register! (resolve 'raster.gpu.ze-runtime/register-kernel!)
+           _ (register! (:kernel-name kernel) kernel)
+           actual (invoke (:kernel-name kernel) [input nil scale n])
+           expected (reduce + 0.0 (map #(* scale (double %)) (seq input)))]
+       (is (< (Math/abs (- (double actual) expected)) 1e-3)
+           (str "captured-scalar SegRed expected " expected ", got " actual))))))
+
 (deftest gpu-scan-correctness-test
   (when-ze
    (testing "GPU exclusive scan matches CPU reference"
