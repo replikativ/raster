@@ -154,9 +154,15 @@
                                            f))
                                        (:body info2))
                           fused-expr (list 'raster.par/map! (:out info2) (:idx info2) (:bound info2)
-                                           (:cast info2) inline-body)]
+                                           (:cast info2) inline-body)
+                          ;; sym2's SegOp describes expr2 before body1 was inlined. Keeping that
+                          ;; metadata makes boundary consumption silently emit expr2 alone. The
+                          ;; fused expression did not pass through segop-lower, so invalidate its
+                          ;; stale certificate and let the counted backend re-lowering handle it.
+                          fused-sym (vary-meta sym2 dissoc
+                                               :raster.compiler.passes.parallel.segop-lower-pass/segops)]
                       ;; Skip sym1 binding (tmp is eliminated), replace sym2 with fused
-                      (recur (+ i 2) (conj result [sym2 fused-expr]) true))
+                      (recur (+ i 2) (conj result [fused-sym fused-expr]) true))
                     ;; Not fusable — keep both
                     (recur (inc i) (conj result (nth pairs i)) fused?)))
                 ;; Not both par maps

@@ -90,6 +90,23 @@
 ;; representation this replaces — it had one constructor (a unit test), was excluded from lowering,
 ;; reconstruction and fusion, and could not carry most of the facts.
 
+(defn- record-kind?
+  "Recognize a SOAC record without pinning the caller to one DynamicClassLoader instance.
+
+   Typed Clojure may analyze and re-evaluate this namespace in a child DynamicClassLoader. A
+   record produced after that re-evaluation has the same public record type but is not `instance?`
+   the class literal captured earlier by a compiler pass. Dispatching through this namespace's Var
+   and comparing the stable generated class name keeps the IR boundary valid across that reload."
+  [record-class node]
+  (and node (= record-class (.getName (class node)))))
+
+(defn soac-map? [node] (record-kind? "raster.compiler.ir.soac.SoacMap" node))
+(defn soac-reduce? [node] (record-kind? "raster.compiler.ir.soac.SoacReduce" node))
+(defn soac-scan? [node] (record-kind? "raster.compiler.ir.soac.SoacScan" node))
+(defn soac-stencil? [node] (record-kind? "raster.compiler.ir.soac.SoacStencil" node))
+(defn scalar-binding? [node] (record-kind? "raster.compiler.ir.soac.ScalarBinding" node))
+(defn screma? [node] (record-kind? "raster.compiler.ir.soac.Screma" node))
+(defn contract? [node] (record-kind? "raster.compiler.ir.soac.SoacContract" node))
 
 ;; ================================================================
 ;; Input/output extraction helpers
@@ -457,31 +474,29 @@
   "Check if a node is a generic SOAC (map/reduce/scan/stencil) — NOT a ScalarBinding, and NOT a
    SoacContract (a contraction has its own lowering; generic map/reduce lowering must skip it)."
   [node]
-  (and (not (instance? ScalarBinding node))
+  (and (not (scalar-binding? node))
        ;; a contraction has its own lowering (SegContract) and must NOT enter the generic
        ;; map/reduce/scan lowering or lambda fusion, whose consumers assume idx/lambda/1-D bound
-       (not (instance? SoacContract node))))
-
-(defn contract? [node] (instance? SoacContract node))
+       (not (contract? node))))
 
 (defn soac-inputs
   "Get the set of input array symbols for a SOAC node."
   [node]
-  (if (instance? SoacContract node)
+  (if (contract? node)
     (set (map :sym (:operands (:facts node))))
     (when (soac? node) (:inputs node))))
 
 (defn soac-outputs
   "Get the set of output symbols for a SOAC node."
   [node]
-  (if (instance? SoacContract node)
+  (if (contract? node)
     #{(:out (:facts node))}
-  (cond
-    (instance? SoacMap node)     (:outputs node)
-    (instance? SoacReduce node)  #{(:output node)}
-    (instance? SoacScan node)    (:outputs node)
-    (instance? SoacStencil node) (:outputs node)
-    :else nil)))
+    (cond
+      (soac-map? node)     (:outputs node)
+      (soac-reduce? node)  #{(:output node)}
+      (soac-scan? node)    (:outputs node)
+      (soac-stencil? node) (:outputs node)
+      :else nil)))
 
 (defn soac-bound
   "Get the iteration bound expression for a SOAC node."
