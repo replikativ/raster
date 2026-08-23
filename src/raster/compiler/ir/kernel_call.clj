@@ -12,6 +12,83 @@
 
 (defn kernel-call? [x] (instance? KernelCall x))
 
+(defn logical-argument-plan
+  "Project an artifact's physical ABI into ordered logical caller arguments.
+
+   Ordinary pointers and every scalar remain one entry. Contiguous physical pointer slots that
+   share `:binding` become one logical pointer entry (an SoA, for example). The physical slots and
+   compiler arguments are retained on every entry, so this is a checked view of the one ABI rather
+   than a second signature."
+  [artifact]
+  (let [artifact (kart/validate! artifact)
+        pairs (mapv vector (:abi artifact) (:arguments artifact))]
+    (reduce (fn [plan [index [slot argument]]]
+              (let [pointer? (not= :scalar (:kind slot))
+                    binding (when pointer? (or (:binding slot) (:name slot)))
+                    previous (peek plan)]
+                (if (and pointer?
+                         (:pointer? previous)
+                         (= binding (:binding previous))
+                         (:binding slot))
+                  (-> plan
+                      pop
+                      (conj (-> previous
+                                (update :slots conj slot)
+                                (update :physical-arguments conj argument)
+                                (update :physical-indexes conj index))))
+                  (conj plan
+                        {:pointer? pointer?
+                         :kind (if pointer? :pointer :scalar)
+                         :binding (when pointer? binding)
+                         :value (if pointer? binding argument)
+                         :slots [slot]
+                         :physical-arguments [argument]
+                         :physical-indexes [index]}))))
+            []
+            (map-indexed vector pairs))))
+
+(defn logical-arguments
+  "Compiler values in logical caller order. SoA field slots collapse to their shared binding."
+  [artifact]
+  (mapv :value (logical-argument-plan artifact)))
+
+(defn expand-logical-arguments
+  "Expand logical runtime values into the artifact's complete physical ABI order.
+
+   `expand-pointer` receives `[plan-entry logical-value]` and must return a vector containing one
+   resident value per physical pointer slot. Scalar values are already physical and pass through.
+   Representation-specific expansion therefore happens explicitly before `make`, while the
+   resulting KernelCall and all backend binders remain physical and backend-neutral."
+  [artifact logical-values expand-pointer]
+  (let [artifact (kart/validate! artifact)
+        plan (logical-argument-plan artifact)]
+    (when-not (vector? logical-values)
+      (throw (ex-info "logical kernel arguments must be an ordered vector"
+                      {:kernel-name (:kernel-name artifact) :arguments logical-values})))
+    (when-not (= (count plan) (count logical-values))
+      (throw (ex-info "logical kernel argument count mismatch"
+                      {:kernel-name (:kernel-name artifact)
+                       :expected (count plan) :actual (count logical-values)
+                       :plan plan})))
+    (vec
+     (mapcat (fn [entry value]
+               (if (:pointer? entry)
+                 (let [expanded (expand-pointer entry value)]
+                   (when-not (vector? expanded)
+                     (throw (ex-info "logical pointer expansion must return an ordered vector"
+                                     {:kernel-name (:kernel-name artifact)
+                                      :binding (:binding entry) :expanded expanded})))
+                   (when-not (= (count (:slots entry)) (count expanded))
+                     (throw (ex-info "logical pointer expansion count differs from physical ABI"
+                                     {:kernel-name (:kernel-name artifact)
+                                      :binding (:binding entry)
+                                      :expected (count (:slots entry))
+                                      :actual (count expanded)
+                                      :slots (:slots entry)})))
+                   expanded)
+                 [value]))
+             plan logical-values))))
+
 (defn- scalar-value!
   [slot value]
   (when-not (and (map? value) (contains? value :value) (contains? value :type))

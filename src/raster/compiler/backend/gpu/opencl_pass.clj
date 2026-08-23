@@ -11,6 +11,7 @@
             [raster.compiler.ir.soac]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -234,6 +235,24 @@
     (list 'raster.gpu.ze-runtime/invoke-registered-reduction-kernel
           kernel-name arguments)))
 
+(defn- emit-map-void-invocation
+  "Render the staging marker from the artifact's logical argument projection. The marker remains
+   useful to the host evaluator, but it no longer owns or reconstructs an argument convention."
+  [artifact]
+  (let [plan (kcall/logical-argument-plan artifact)
+        pointer-values (mapv :value (filterv :pointer? plan))
+        scalar-entries (filterv (complement :pointer?) plan)
+        bound-entries (filterv #(= :bound (:role (first (:slots %)))) scalar-entries)
+        user-scalars (filterv #(not= :bound (:role (first (:slots %)))) scalar-entries)]
+    (when-not (= 1 (count bound-entries))
+      (throw (ex-info "map-void artifact must identify exactly one :bound scalar"
+                      {:kernel-name (:kernel-name artifact) :plan plan})))
+    (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+          (:kernel-name artifact)
+          pointer-values
+          (mapv :value user-scalars)
+          (:value (first bound-entries)))))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -389,17 +408,8 @@
                                                                   :dtype dtype :device-id device-id
                                                                   :array-types top-array-types
                                                                   :scalar-types top-scalar-types)
-                      k (register-kernel! kernel :ze-maps)
-                      abi (:abi k)
-                      pointer-args (kabi/pointer-binding-names abi)
-                      scalar-args (mapv :name
-                                        (remove #(= :bound (:role %))
-                                                (kabi/scalar-slots abi)))]
-                  (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
-                        (:kernel-name k)
-                        pointer-args
-                        scalar-args
-                        bound))))
+                      k (register-kernel! kernel :ze-maps)]
+                  (emit-map-void-invocation k))))
 
             ;; par/scan-exclusive
             (par/par-scan-exclusive-form? form)
@@ -471,21 +481,15 @@
             ;; output element once (no atomics/accumulation), so it lowers to a map-void
             ;; kernel and binds through the existing resident map path.
             (par/par-gather-form? form)
-            (let [{:keys [n stride]} (par/extract-par-gather-info form)]
+            (let [{:keys [n]} (par/extract-par-gather-info form)]
               (if (and (number? n) (< n min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-gather! form))
                 (let [k (register-kernel!
                          (legacy/generate-par-gather-kernel form
                                                             :dtype dtype :device-id device-id)
-                         :ze-maps)
-                      {:keys [out src index]} (par/extract-par-gather-info form)
-                      strip-cast (fn [x] (if (and (seq? x)
-                                                  (#{'long 'int 'clojure.core/long 'clojure.core/int} (first x)))
-                                           (second x) x))]
-                  (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
-                        (:kernel-name k) (vec [out src index])
-                        (if stride [(strip-cast stride)] []) n))))
+                         :ze-maps)]
+                  (emit-map-void-invocation k))))
 
             ;; par/reduce-by-key
             (par/par-reduce-by-key-form? form)

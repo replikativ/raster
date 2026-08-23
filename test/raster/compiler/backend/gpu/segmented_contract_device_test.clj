@@ -41,10 +41,13 @@
                      (list '* (list 'aget 'A (list '+ (list '* 'i k) 'l))
                            (list 'aget 'B (list '+ (list '* 'l n) 'j))))
           sr  (cl/contract-form->segred form)
-          {:keys [kernel-name source scalar-params]} (sco/generate-segmented-reduce-kernel sr 'C)]
+          {:keys [kernel-name scalar-params] :as kernel}
+          (sco/generate-segmented-reduce-kernel sr 'C)]
       (testing "literal-dim contraction has no scalar params (dims inlined)"
         (is (empty? scalar-params)))
-      (register! kernel-name {:source source :dtype :double :workgroup-size 256})
+      ;; Register the emitter-owned ABI as well as its source. The runtime deliberately refuses
+      ;; a hand-reconstructed map signature because dropping one slot here is a silent miscompile.
+      (register! kernel-name (assoc kernel :workgroup-size 256))
       (invoke! kernel-name [A B] C [] (* m n))     ; args: A, B, out, int _nseg=(m*n)
       (testing "GPU segmented-contraction result == CPU reference"
         (let [ref (ref-matmul A B m k n)]

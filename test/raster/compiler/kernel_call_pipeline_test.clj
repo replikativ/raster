@@ -17,6 +17,11 @@
     (raster.par/map-void! j n
                           (ra/aset out j (* (ra/aget x j) sum)))))
 
+(deftm resident-kernel-call-map-void
+  [x :- (Array float) out :- (Array float) scale :- Float n :- Long] :- Void
+  (raster.par/map-void! i n
+                        (ra/aset out i (* scale (ra/aget x i)))))
+
 (deftest resident-segmap-step-carries-one-executable-call-template
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map
                                                  :ze:0 :dtype :float)
@@ -56,3 +61,24 @@
            (mapv :kind (:argument-specs step))))
     (is (= [3] (get-in default-call [:geometry :group-count])))
     (is (= [1] (get-in resident-call [:geometry :group-count])))))
+
+(deftest resident-map-void-step-carries-a-logical-plan-for-one-physical-call
+  (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map-void
+                                                 :ze:0 :dtype :float)
+        step (first (:steps descriptor))
+        runtime-params [(float-array 513) (float-array 513) (float 2.0) 513]
+        logical-values
+        (mapv (fn [{:keys [kind sym type value-fn]}]
+                (if (= :scalar kind)
+                  {:type type :value (value-fn runtime-params)}
+                  (keyword (name sym))))
+              (:argument-specs step))
+        physical-values (kcall/expand-logical-arguments
+                         (:artifact step) logical-values (fn [_ value] [value]))
+        call (kcall/make (:artifact step) physical-values)]
+    (is (= :map-void (:convention step)))
+    (is (:logical-bindings? step))
+    (is (kart/kernel-artifact? (:artifact step)))
+    (is (= '[out x scale]
+           (subvec (kcall/logical-arguments (:artifact step)) 0 3)))
+    (is (= [3] (get-in call [:geometry :group-count])))))

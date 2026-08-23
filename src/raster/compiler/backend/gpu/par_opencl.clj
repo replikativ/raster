@@ -18,6 +18,8 @@
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.scalar.soa-lower :as sl]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [clojure.string :as str]
@@ -64,9 +66,8 @@
   array-types: {sym -> :float|:int|:long|:double} for mixed-type params.
   Written arrays get __global TYPE* (not const restrict).
 
-  Returns {:kernel-name str :source str :abi [ordered typed physical slots]
-           :array-params [logical binding syms] :scalar-params [syms]
-           :written-arrays #{syms} :dtype kw}."
+  Returns one verified KernelArtifact. Its ABI and :arguments are physical; logical SoA bindings
+  are a projection of the ABI's contiguous `:binding` groups."
   [form & {:keys [dtype kernel-name-prefix array-types scalar-types]
            :or {dtype :float kernel-name-prefix "par_map_void"
                 array-types {} scalar-types {}}}]
@@ -243,17 +244,29 @@
                              "    }"))
                     "\n}\n")
         _ (kabi/validate-source-signature! kernel-name source abi)
-        binding-params (kabi/pointer-binding-names abi)]
-    {:kernel-name    kernel-name
-     :source         source
-     :abi            abi
-     :arguments      (vec (concat binding-params scl-params [(:bound info)]))
-     :array-params   binding-params
-     :soa-expansions soa-expansions
-     :scalar-params  scl-params
-     :written-arrays written-syms
-     :array-types    array-types
-     :dtype          dtype}))
+        binding-params (kabi/pointer-binding-names abi)
+        bound (:bound info)
+        physical-arguments
+        (mapv (fn [slot]
+                (if (= :bound (:role slot)) bound (:name slot)))
+              abi)]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments physical-arguments
+      :launch (klaunch/spec
+               {:workgroup-size [256]
+                :group-count [(klaunch/ceil-div bound 256)]})
+      :temporaries []
+      :effects {:kind :side-effect-map}
+      :provenance {:dialect :map-void}
+      :attributes {:array-params binding-params
+                   :soa-expansions soa-expansions
+                   :scalar-params scl-params
+                   :written-arrays written-syms
+                   :array-types array-types
+                   :dtype dtype}})))
 
 (defn generate-par-scan-exclusive-kernel
   "Generate OpenCL Blelloch exclusive scan kernels from a par/scan-exclusive form.
@@ -717,15 +730,14 @@
   Gather: out[e*stride+d] = src[index[e]*stride+d] — one work-item per gathered pair
   e (inner loop over stride). A gather writes every output element exactly once (no
   atomics, no accumulation), so it uses the map-void calling convention
-  (out, src, index, [stride,] int _n_bound) and binds through
-  bind-registered-map-void-kernel — `out` is just another resident buffer.
+  (out, src, index, [stride,] int _n_bound); resident execution binds its artifact through
+  KernelCall — `out` is just another effect pointer.
 
-  Returns {:kernel-name str :source str :array-params [out src index]
-           :scalar-params [...] :written-arrays [out] :dtype kw :strided? bool}."
+  Returns one verified KernelArtifact using the same side-effect map contract."
   [form & {:keys [dtype kernel-name-prefix]
            :or {dtype :float kernel-name-prefix "par_gather"}}]
   (let [info (par/extract-par-gather-info form)
-        {:keys [out src index stride]} info
+        {:keys [out src index stride n]} info
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         ctype (get codegen/opencl-type-map dtype "float")
         strided? (some? stride)
@@ -747,14 +759,32 @@
                            "        }\n")
                       (str "        " out-c "[e] = " src-c "[src_idx];\n"))
                     "    }\n"
-                    "}\n")]
-    {:kernel-name kernel-name
-     :source source
-     :array-params [out src index]
-     :scalar-params (if strided? [{:name 'stride :type :int}] [])
-     :written-arrays [out]
-     :strided? strided?
-     :dtype dtype}))
+                    "}\n")
+        scalar-params (if strided? ['stride] [])
+        abi (kabi/validate!
+             (vec (concat
+                   [(kabi/slot out :output dtype :c-name (ce/c-symbol out) :role :effect)
+                    (kabi/slot src :input dtype :c-name (ce/c-symbol src) :role :operand)
+                    (kabi/slot index :input :int :c-name (ce/c-symbol index) :role :operand)]
+                   (when strided?
+                     [(kabi/slot 'stride :scalar :int :role :parameter)])
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))]
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments (vec (concat [out src index] (when strided? [stride]) [n]))
+      :launch (klaunch/spec
+               {:workgroup-size [256]
+                :group-count [(klaunch/ceil-div n 256)]})
+      :temporaries []
+      :effects {:kind :side-effect-map}
+      :provenance {:dialect :gather}
+      :attributes {:array-params [out src index]
+                   :scalar-params scalar-params
+                   :written-arrays [out]
+                   :strided? strided?
+                   :dtype dtype}})))
 
 ;; ================================================================
 ;; Reduce-by-key kernel generator

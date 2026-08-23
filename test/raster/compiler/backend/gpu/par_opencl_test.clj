@@ -4,6 +4,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.passes.parallel.device :as device]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]
@@ -98,13 +99,24 @@
              form :dtype :float
              :array-types {'state :int 'x :float 'y :float}
              :scalar-types {'limit :int 'scale :float})]
+      (is (kart/kernel-artifact? k))
       (is (= '[state x y limit scale _n_bound] (mapv :name (:abi k))))
       (is (= [:output :input :output :scalar :scalar :scalar] (mapv :kind (:abi k))))
       (is (= [:int :float :float :int :float :int] (mapv :dtype (:abi k))))
       (is (= [:inout :operand :effect :parameter :parameter :bound]
              (mapv :role (:abi k))))
-      (is (= '[state x y] (:array-params k)))
+      (is (= '[state x y] (kart/attribute k :array-params)))
       (is (= '[state x y limit scale n] (:arguments k))))))
+
+(deftest generate-gather-kernel-is-a-side-effect-artifact
+  (let [k (par-opencl/generate-par-gather-kernel
+           '(raster.par/gather out src index n stride) :dtype :float)]
+    (is (kart/kernel-artifact? k))
+    (is (= '[out src index stride _n_bound] (mapv :name (:abi k))))
+    (is (= '[out src index stride n] (:arguments k)))
+    (is (= '[out src index stride n] (kcall/logical-arguments k)))
+    (is (= :side-effect-map (get-in k [:effects :kind])))
+    (is (= [256] (get-in k [:launch :workgroup-size])))))
 
 ;; ================================================================
 ;; Kernel generation: par/reduce
