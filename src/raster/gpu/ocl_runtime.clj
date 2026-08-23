@@ -22,6 +22,7 @@
   (:require [raster.compiler.core.dtype :as dt]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
@@ -1125,6 +1126,43 @@
     :else (throw (ex-info "bound path requires GPU-resident args (OclBuffer); JVM-array staging is not supported here"
                           {:arr-type (type arr)}))))
 
+(defn bind-kernel-call
+  "Bind a backend-neutral KernelCall over OpenCL resident buffers. ABI order and complete 1-3D
+   geometry come exclusively from the call; no map/reduction convention is interpreted."
+  [call]
+  (let [{:keys [kernel-name abi pairs pointer-pairs workgroup-size group-count] :as plan}
+        (kcall/binding-plan call)
+        registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        _ (kcall/validate-registered! call registered)
+        pointer-values (mapv second pointer-pairs)
+        _ (doseq [[slot value] pointer-pairs]
+            (when-not (or (device-buffer? value) (instance? MemorySegment value))
+              (throw (ex-info "OpenCL KernelCall requires OclBuffer/MemorySegment pointers"
+                              {:kernel-name kernel-name :slot slot :value-type (type value)}))))
+        _ (kabi/validate-physical-pointer-dtypes!
+           abi (physical-pointer-dtypes pointer-values))
+        _ (when (= :pure-reduction (get-in registered [:effects :kind]))
+            (doseq [[slot value] pointer-pairs
+                    :when (= :result (:role slot))]
+              (when (and (device-buffer? value) (< (:n-elements ^OclBuffer value) 1))
+                (throw (ex-info "resident reduction result buffer must hold at least one element"
+                                {:kernel-name kernel-name :slot slot :buffer-elements 0})))))
+        ;; Driver contact begins only after call/artifact/ABI/value/geometry validation.
+        {:keys [program]} (ensure-kernel-loaded! kernel-name)
+        kh (create-kernel-fresh program kernel-name)]
+    (doseq [[idx [slot value]] (map-indexed vector pairs)]
+      (if (= :scalar (:kind slot))
+        (set-kernel-arg-scalar! kh idx value)
+        (set-kernel-arg-buffer! kh idx (device-mem-of value))))
+    {:bound {:kernel kh :wg workgroup-size}
+     :group-count group-count
+     :kernel-name kernel-name
+     :kernel-call call
+     :binding-plan plan}))
+
 (defn bind-registered-map-void-kernel
   "Pre-bind a registered void-map kernel's args ONCE over RESIDENT OclBuffers.
   Same contract as ze-runtime/bind-registered-map-void-kernel: buffer CONTENTS
@@ -1155,42 +1193,6 @@
       :group-count (long (or (get opts :group-count) (Math/ceil (/ (double n) wg))))
       :kernel-name kernel-name
       :async? (boolean (get opts :async?))})))
-
-(defn bind-registered-reduction!
-  "OpenCL resident SegRed binder. Consumes complete values in emitter-authored ABI order and
-   derives its pointer/scalar/bound projections exclusively from slot kinds and roles."
-  [^String kernel-name arguments]
-  (let [registered (or (get @kernel-registry kernel-name)
-                       (throw (ex-info (str "Kernel not registered: " kernel-name)
-                                       {:kernel-name kernel-name
-                                        :registered (keys @kernel-registry)})))
-        abi (kabi/validate! (:abi registered))
-        {:keys [pointer-pairs scalar-pairs result-pair bound-pair]}
-        (kabi/validate-reduction-arguments! abi arguments)
-        _ (doseq [[slot value] pointer-pairs]
-            (when-not (or (device-buffer? value) (instance? MemorySegment value))
-              (throw (ex-info "resident reduction requires OclBuffer/MemorySegment pointer arguments"
-                              {:kernel-name kernel-name :slot slot :value-type (type value)})))
-            (when (and (device-buffer? value)
-                       (not= (:dtype slot) (dt/canon (:dtype ^OclBuffer value))))
-              (throw (ex-info "reduction ABI storage dtype does not match resident buffer"
-                              {:kernel-name kernel-name :slot slot :expected (:dtype slot)
-                               :actual (dt/canon (:dtype ^OclBuffer value))}))))
-        result-value (second result-pair)
-        _ (when (and (device-buffer? result-value)
-                     (< (:n-elements ^OclBuffer result-value) 1))
-            (throw (ex-info "resident reduction result buffer must hold at least one element"
-                            {:kernel-name kernel-name :buffer-elements 0})))
-        _ (doseq [[slot value] (conj scalar-pairs bound-pair)]
-            (when-not (and (map? value) (= (:kernel-dtype slot) (:type value)))
-              (throw (ex-info "reduction ABI scalar binding has the wrong kernel dtype"
-                              {:kernel-name kernel-name :slot slot
-                               :expected (:kernel-dtype slot)
-                               :actual (when (map? value) (:type value))}))))
-        pointers (mapv second pointer-pairs)
-        scalars (mapv second scalar-pairs)
-        n (long (:value (second bound-pair)))]
-    (bind-registered-map-void-kernel kernel-name pointers scalars n {:group-count 1})))
 
 (defn bind-registered-contraction!
   "Pre-bind a routed contraction over resident OclBuffers in exact ordered ABI position.
@@ -1271,7 +1273,7 @@
 (defn launch-registered-bound!
   "Dispatch a pre-bound kernel. Synchronous."
   [prepared]
-  (enqueue-bound! (:bound prepared) (long (:group-count prepared)))
+  (enqueue-bound! (:bound prepared) (:group-count prepared))
   (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
 
 (defn record-graph!

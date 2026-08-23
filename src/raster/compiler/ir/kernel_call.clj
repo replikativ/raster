@@ -1,0 +1,136 @@
+(ns raster.compiler.ir.kernel-call
+  "A verified executable call of one emitted kernel.
+
+   KernelArtifact owns target code, ABI and symbolic launch. KernelCall adds runtime values in the
+   identical ABI order and a concrete 1-3D LaunchGeometry. Backends consume this value instead of
+   reconstructing arguments or launch dimensions from a convention-specific marker."
+  (:require [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
+
+(defrecord KernelCall [artifact arguments geometry])
+
+(defn kernel-call? [x] (instance? KernelCall x))
+
+(defn- scalar-value!
+  [slot value]
+  (when-not (and (map? value) (contains? value :value) (contains? value :type))
+    (throw (ex-info "kernel scalar argument must be a typed value"
+                    {:slot slot :value value})))
+  (when-not (= (:kernel-dtype slot) (:type value))
+    (throw (ex-info "kernel scalar argument has the wrong kernel dtype"
+                    {:slot slot :expected (:kernel-dtype slot) :actual (:type value)
+                     :value value})))
+  value)
+
+(defn validate!
+  "Validate and return a KernelCall. This is driver-independent: a backend subsequently checks
+   that pointer values are its resident buffer representation and match ABI storage dtypes."
+  [call]
+  (when-not (kernel-call? call)
+    (throw (ex-info "kernel call must be a KernelCall value"
+                    {:call call :actual (type call)})))
+  (let [{:keys [artifact arguments geometry]} call
+        artifact (kart/validate! artifact)
+        abi (:abi artifact)
+        arguments (kabi/validate-arguments! abi arguments)
+        geometry (klaunch/validate-geometry! geometry)
+        spec (:launch artifact)]
+    (when-not (= (klaunch/dimensions spec) (klaunch/dimensions geometry))
+      (throw (ex-info "kernel call launch dimensionality differs from its artifact"
+                      {:kernel-name (:kernel-name artifact)
+                       :spec (:launch artifact) :geometry geometry})))
+    ;; Emitted kernels may bake workgroup-sized local arrays or subgroup assumptions into source.
+    ;; A scheduler may choose the number of groups per call, but changing this workgroup requires
+    ;; re-emission and therefore a different artifact.
+    (when-let [static-wg (when (every? integer? (:workgroup-size spec))
+                           (klaunch/static-workgroup-size spec))]
+      (when-not (= static-wg (:workgroup-size geometry))
+        (throw (ex-info "kernel call workgroup differs from its emitted artifact"
+                        {:kernel-name (:kernel-name artifact)
+                         :expected static-wg :actual (:workgroup-size geometry)}))))
+    (when-not (= (:shared-memory-bytes spec) (:shared-memory-bytes geometry))
+      (throw (ex-info "kernel call shared memory differs from its emitted artifact"
+                      {:kernel-name (:kernel-name artifact)
+                       :expected (:shared-memory-bytes spec)
+                       :actual (:shared-memory-bytes geometry)})))
+    (doseq [[slot value] (map vector abi arguments)]
+      (if (= :scalar (:kind slot))
+        (scalar-value! slot value)
+        (when (nil? value)
+          (throw (ex-info "kernel pointer argument cannot be nil"
+                          {:kernel-name (:kernel-name artifact) :slot slot})))))
+    call))
+
+(defn- runtime-number
+  [value]
+  (if (and (map? value) (contains? value :value)) (:value value) value))
+
+(defn- argument-resolver
+  [artifact arguments]
+  (let [compiler-arguments (:arguments artifact)]
+    (fn [compiler-value]
+      (let [indexes (keep-indexed (fn [i value] (when (= compiler-value value) i))
+                                  compiler-arguments)]
+        (when-not (seq indexes)
+          (throw (ex-info "launch value is not present in the artifact argument order"
+                          {:kernel-name (:kernel-name artifact)
+                           :value compiler-value :arguments compiler-arguments})))
+        (let [values (mapv #(runtime-number (nth arguments %)) indexes)]
+          (when-not (apply = values)
+            (throw (ex-info "repeated launch value resolved to conflicting runtime arguments"
+                            {:kernel-name (:kernel-name artifact)
+                             :value compiler-value :indexes (vec indexes) :values values})))
+          (first values))))))
+
+(defn make
+  "Construct a checked call from an artifact and complete ABI-ordered runtime values.
+
+   The default geometry realizes the artifact launch by resolving compiler values against the
+   artifact/runtime argument vectors. `:group-count` is the scheduling seam: it may override the
+   realized group vector without changing the emitted workgroup (resident SegRed uses `[1]` to
+   keep its partial result entirely on device)."
+  ([artifact arguments] (make artifact arguments {}))
+  ([artifact arguments {:keys [group-count resolve-value]}]
+   (let [artifact (kart/validate! artifact)
+         arguments (kabi/validate-arguments! (:abi artifact) arguments)
+         resolver (or resolve-value (argument-resolver artifact arguments))
+         realized (klaunch/realize (:launch artifact) resolver)
+         geometry (if group-count
+                    (klaunch/geometry
+                     {:workgroup-size (:workgroup-size realized)
+                      :group-count group-count
+                      :shared-memory-bytes (:shared-memory-bytes realized)})
+                    realized)]
+     (validate! (->KernelCall artifact arguments geometry)))))
+
+(defn binding-plan
+  "Backend-neutral ordered binding plan for a checked call."
+  [call]
+  (let [{:keys [artifact arguments geometry]} (validate! call)
+        pairs (mapv vector (:abi artifact) arguments)]
+    {:kernel-name (:kernel-name artifact)
+     :target (:target artifact)
+     :artifact artifact
+     :abi (:abi artifact)
+     :arguments arguments
+     :pairs pairs
+     :pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot))) pairs)
+     :scalar-pairs (filterv (fn [[slot _]] (= :scalar (:kind slot))) pairs)
+     :workgroup-size (:workgroup-size geometry)
+     :group-count (:group-count geometry)
+     :shared-memory-bytes (:shared-memory-bytes geometry)}))
+
+(defn validate-registered!
+  "Prove that a runtime registry entry is the artifact named by this call. Runtime-only cached
+   handles may extend the record, so compare compiler-owned fields rather than record equality."
+  [call registered]
+  (let [artifact (:artifact (validate! call))
+        registered (kart/validate! registered)
+        compiler-fields [:kernel-name :target :source :abi :arguments :launch :temporaries
+                         :effects :provenance :attributes]]
+    (when-not (= (select-keys artifact compiler-fields)
+                 (select-keys registered compiler-fields))
+      (throw (ex-info "kernel call artifact differs from the registered artifact"
+                      {:kernel-name (:kernel-name artifact)})))
+    registered))

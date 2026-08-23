@@ -30,6 +30,7 @@
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
 
@@ -689,14 +690,13 @@
    weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
    caller collects :phase keys and records once.
 
-     :reduce    Ordered SegRed ABI values bind through bind-registered-reduction!; legacy/manual
-                descriptors retain the split inputs/output/scalars/bound compatibility path.
-     :map       SegMap sig (inputs…, out, scl…, _n_bound); the output is a SEPARATE param not in the
-                registry :array-params, so bind the step's full :arrays (inputs ++ [out]).
+     :map/:reduce
+                Artifact ABI values and realized geometry bind through one KernelCall contract.
+                SegRed explicitly schedules one resident workgroup; SegMap realizes its grid.
      :map-void  output is an in-place array among :array-params; bind by name via prepare!."
   [sess step args sym->key]
   (let [device-id (:device-id @sess)
-        {:keys [kernel-name arrays n-fn scalar-specs phase convention output]} step
+        {:keys [kernel-name arrays n-fn scalar-specs phase convention artifact argument-specs]} step
         info-fn (rt-resolve device-id "kernel-registry-entry")]
     (when-not (#{:map-void :map :reduce} convention)
       (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
@@ -711,25 +711,19 @@
                                                   {:kernel kernel-name :available (keys bufs)}))))
           scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
                         scalar-specs)
-          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")]
+          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
+          bind-call-fn (rt-resolve device-id "bind-kernel-call")]
       (case convention
-        :reduce
-        (let [prepared
-              (if-let [specs (:argument-specs step)]
-                (let [ordered-args
-                      (mapv (fn [{:keys [kind sym type value-fn]}]
-                              (if (= :scalar kind)
-                                {:type type :value (value-fn args)}
-                                (resolve-buf sym)))
-                            specs)]
-                  ((rt-resolve device-id "bind-registered-reduction!") kernel-name ordered-args))
-                (let [array-bufs (conj (mapv resolve-buf (:array-params ki)) (resolve-buf output))]
-                  (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {:group-count 1})))]
-          (swap! sess assoc-in [:prepared phase] prepared))
-
-        :map
-        (let [array-bufs (mapv resolve-buf arrays)
-              prepared (bind-fn kernel-name array-bufs scalars (long (n-fn args)) {})]
+        (:map :reduce)
+        (let [ordered-args
+              (mapv (fn [{:keys [kind sym type value-fn]}]
+                      (if (= :scalar kind)
+                        {:type type :value (value-fn args)}
+                        (resolve-buf sym)))
+                    argument-specs)
+              call (kcall/make artifact ordered-args
+                               (if (= :reduce convention) {:group-count [1]} {}))
+              prepared (bind-call-fn call)]
           (swap! sess assoc-in [:prepared phase] prepared))
 
         (let [sym->buf (into {} (map (fn [p] [(name p) (sym->key p)]) (:array-params ki)))]
@@ -1107,8 +1101,8 @@
                            allocs)
          info-fn   (rt-resolve device-id "kernel-registry-entry")
          bind-fn   (rt-resolve device-id "bind-registered-map-void-kernel")
+         bind-call-fn (rt-resolve device-id "bind-kernel-call")
          contract-fn (rt-resolve device-id "bind-registered-contraction!")
-         reduction-fn (rt-resolve device-id "bind-registered-reduction!")
          gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
          conv-fn   (rt-resolve device-id "bind-registered-convert!")
          trans-fn  (rt-resolve device-id "bind-registered-transpose!")
@@ -1149,7 +1143,8 @@
            ;; 7.2 → 0.6 ms, transpose_half 3.2 → 0.2 ms per replay.
            const-operand? (fn [sym] (= :constant (get effective-roles sym)))
            step->bounds
-           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator output] :as step}]
+           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator
+                        artifact argument-specs] :as step}]
              (case convention
                ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
                ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); the
@@ -1231,14 +1226,29 @@
                      (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)
                                            :const-prologue? (boolean c)})
                            raw))))
-               ;; map / map-void bind through bind-registered-map-void-kernel (output is just
-               ;; another resident buffer). Resolve buffers from the STEP's :arrays (full C-sig
-               ;; order incl. output).
-               (:map :map-void)
+               ;; Generic map and reduction now share the complete executable value: emitted
+               ;; artifact, ordered ABI values and realized launch. Reduction's single-group
+               ;; resident schedule is explicit here rather than hidden in a special binder.
+               (:map :reduce)
+               (let [ordered-args
+                     (mapv (fn [{:keys [kind sym type value-fn]}]
+                             (if (= :scalar kind)
+                               {:type type :value (value-fn args)}
+                               (buf-of sym kernel-name)))
+                           argument-specs)
+                     call (kcall/make artifact ordered-args
+                                      (if (= :reduce convention) {:group-count [1]} {}))]
+                 [(assoc (bind-call-fn call) :phase (:phase step))])
+
+               ;; Map-void has not migrated to KernelArtifact yet; retain its compatibility
+               ;; binder until its emitter carries a complete artifact and ordered call values.
+               :map-void
                (do (or (info-fn kernel-name)
-                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
+                       (throw (ex-info (str "Program kernel not registered: " kernel-name)
+                                       {:kernel kernel-name})))
                    (let [buf-vec (mapv #(buf-of % kernel-name) arrays)
-                         scalars (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                         scalars (mapv (fn [{:keys [type value-fn]}]
+                                         {:type type :value (value-fn args)})
                                        scalar-specs)]
                      [(assoc (bind-fn kernel-name buf-vec scalars (long (n-fn args)))
                              :phase (:phase step))]))
@@ -1301,32 +1311,6 @@
                      [(assoc (bind-fn zk [out-buf] [] (long out-size)) :phase (:phase step))
                       (assoc (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)
                              :phase (:phase step))]))
-               ;; reduce: SegRed sig (inputs…, output, scl…, _n_bound) — bind the registry's
-               ;; :array-params ++ [output] and launch a SINGLE workgroup (:group-count 1) so
-               ;; the kernel's grid-stride loop covers all n and writes output[0] into its
-               ;; resident 1-elem buffer (mirrors bind-step!'s :reduce; the #42 leftover).
-               :reduce
-               (do (or (info-fn kernel-name)
-                       (throw (ex-info (str "Program kernel not registered: " kernel-name)
-                                       {:kernel kernel-name})))
-                   (let [prepared
-                         (if-let [specs (:argument-specs step)]
-                           (let [ordered-args
-                                 (mapv (fn [{:keys [kind sym type value-fn]}]
-                                         (if (= :scalar kind)
-                                           {:type type :value (value-fn args)}
-                                           (buf-of sym kernel-name)))
-                                       specs)]
-                             (reduction-fn kernel-name ordered-args))
-                           (let [ki (info-fn kernel-name)
-                                 array-bufs (conj (mapv #(buf-of % kernel-name) (:array-params ki))
-                                                  (buf-of output kernel-name))
-                                 scalars (mapv (fn [{:keys [type value-fn]}]
-                                                 {:type type :value (value-fn args)})
-                                               scalar-specs)]
-                             (bind-fn kernel-name array-bufs scalars (long (n-fn args))
-                                      {:group-count 1})))]
-                     [(assoc prepared :phase (:phase step))]))
                (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
                                     ":map / :map-void / :contract / :reduce / :gemm / :scatter "
                                     "are wired on the resident path")
