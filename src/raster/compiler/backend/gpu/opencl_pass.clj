@@ -153,6 +153,35 @@
            (legacy/compile-kernel-to-spirv (:source kernel) :device-id device-id))
     kernel))
 
+(def ^:private contraction-marker-unexpressed-fields
+  "Descriptor capabilities that `invoke-registered-contraction!` cannot execute or bind yet.
+
+   `:tensorized` and `:packed` are deliberately absent: they describe code already baked into the
+   emitted kernel and require no additional launch arguments. These fields do. Silently dropping
+   any non-empty one produces either a wrong layout (`:pre-steps`) or a launch-arity mismatch."
+  [:pre-steps :lift-operands :epilogue-operands :epilogue-scalars])
+
+(defn- ensure-contraction-marker-expressible!
+  "Refuse a routed descriptor whose required work/arguments the current invoke marker cannot carry.
+
+   This is the fail-loud bridge to the ordered kernel ABI: until the marker and runtime consume one
+   typed slot vector, accepting these fields would register a valid kernel and emit an invocation
+   that binds fewer arguments than its signature."
+  [descriptor]
+  (let [unsupported (filterv #(seq (get descriptor %))
+                             contraction-marker-unexpressed-fields)]
+    (when (seq unsupported)
+      (throw (ex-info (str "contraction: invoke marker cannot express descriptor fields "
+                           (pr-str unsupported))
+                      {:reason :raster/fatal
+                       :missing-rule :ordered-contraction-kernel-abi
+                       :target 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                       :strategy (:strategy descriptor)
+                       :unsupported-fields unsupported
+                       :unsupported-values (select-keys descriptor unsupported)
+                       :fallback :none})))
+    descriptor))
+
 (defn opencl-pass
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
@@ -248,21 +277,13 @@
                   bound-sc (take-bound-segop stats :segcontract
                                              #(instance? raster.compiler.ir.segop.SegContract %))
                   _ (when-not bound-sc (swap! stats update :segop-relowered (fnil inc 0)))
-                  r (croute/route-contraction
-                     form :dtype dtype
-                     :facts (:facts bound-sc)
-                     :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
-                                 device-id)
-                                (catch Throwable _ nil)))
-                  ;; :pre-steps (an inserted layout transpose) is PRODUCED by route-contraction
-                  ;; under :prefer-peak? but executed by NOTHING — the kernel would index a
-                  ;; transposed layout against an untransposed buffer, a wrong answer with no
-                  ;; diagnostic. Unreachable today (:prefer-peak? is never set here), so refusing
-                  ;; costs nothing now and converts a future silent miscompile into a loud one.
-                  _ (when (seq (:pre-steps r))
-                      (throw (ex-info (str "contraction: descriptor carries :pre-steps, which no "
-                                           "pass executes — the operand would be read untransposed")
-                                      {:reason :raster/fatal :pre-steps (:pre-steps r)})))
+                  r (ensure-contraction-marker-expressible!
+                     (croute/route-contraction
+                      form :dtype dtype
+                      :facts (:facts bound-sc)
+                      :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
+                                  device-id)
+                                 (catch Throwable _ nil))))
                   ;; Register the ROUTED KERNEL MAP, not three hand-picked keys. Dropping
                   ;; :c-op/:identity-val made invoke-reduction-kernel fall back to its
                   ;; `:or {c-op "+" identity-val 0.0}` for the HOST-SIDE FINAL COMBINE — so a
@@ -271,11 +292,13 @@
                   ;; 0-free-axis contraction at :float/:double is exactly what this pass routes.
                   ;; :strategy/:fallback-reason/:declines/:tile are the ROUTING DECISION. They
                   ;; were dropped here, so no diagnostic could say which leaf a kernel came from
-                  ;; or why a faster one was refused. (:scalar-params is kept for the existing
-                  ;; consumers; route-contraction actually returns :scalar-args — ledger.)
+                  ;; or why a faster one was refused. Tensorization/packing are codegen facts that
+                  ;; need no extra launch slot, so preserve them for inspection instead of treating
+                  ;; them like the unbound argument fields refused above.
                   k (register-kernel! (merge (select-keys r [:c-op :identity-val :array-params
-                                                             :scalar-params :out-dtype
-                                                             :strategy :fallback-reason :declines :tile])
+                                                             :out-dtype :strategy :fallback-reason
+                                                             :declines :tile :tensorized :packed
+                                                             :fused-epilogue])
                                              {:kernel-name (:kernel-name r) :source (:source r)
                                               :dtype (:dtype r)})
                                       :ze-contracts)]
@@ -289,16 +312,16 @@
               ;; Pass the descriptor through INTACT — scalar-args as data (the exact shape
               ;; launch-2d! wants), explicit out-dtype/out-elems. Any :strategy works; the
               ;; old (count scalar-args) + [m n k] reconstruction only covered :dpas/:regtiled.
-              (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
-                    (:kernel-name k)
-                    (vec (:array-params r))       ; operand symbols (vector literal evaluates them)
-                    out-sym
-                    (:dtype r)
-                    (:out-dtype r)
-                    (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
-                    (vec (:wg r))
-                    (vec (:grid r))
-                    (vec (:scalar-args r)))))
+                (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                      (:kernel-name k)
+                      (vec (:array-params r))       ; operand symbols (vector literal evaluates them)
+                      out-sym
+                      (:dtype r)
+                      (:out-dtype r)
+                      (:out-elems r)                ; may be a symbolic expr (symbolic axis bounds)
+                      (vec (:wg r))
+                      (vec (:grid r))
+                      (vec (:scalar-args r)))))
 
             ;; === par/reduce-into — resident SegRed writing a caller-supplied 1-elem buffer ===
             ;; Same SegRed kernel as par/reduce (it already has an `output` param), but the
