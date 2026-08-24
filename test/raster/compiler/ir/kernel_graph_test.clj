@@ -23,6 +23,8 @@
     (is (= ['out] (mapv :id (:outputs scheduled))))
     (is (= 1 (count (:temporaries scheduled))))
     (is (= :temporary (:role temporary)))
+    (is (not (re-find #"min" (pr-str (get-in operations [0 :grid :num-blocks]))))
+        "scan coverage is an uncapped ceil-div grid, never map/reduce grid-stride virtualization")
     (is (= (:id temporary)
            (first (disj (:outputs (:operation intra)) 'out)))
         "stage 1 produces the same stable block-totals buffer consumed by stages 2 and 3")
@@ -79,3 +81,16 @@
     (is (= :inout (get-in scheduled [:inputs 0 :role])))
     (is (identical? (first (:inputs scheduled)) (first (:outputs scheduled))))
     (is (= :read-write (get-in scheduled [:nodes 0 :uses 0 :access])))))
+
+(deftest scan-graph-preserves-per-buffer-storage-dtypes
+  (let [node (soac/par-form->soac
+              'scan-result
+              '(raster.par/scan out acc 0.0 i n double
+                                (+ acc (double (aget integer-values i))))
+              12)
+        operations (lower/lower-scan node nil)
+        scheduled (lower/scan-kernel-graph
+                   node operations {:array-types {'integer-values :int 'out :double}})]
+    (is (= :int (get-in scheduled [:inputs 0 :dtype])))
+    (is (= :double (get-in scheduled [:outputs 0 :dtype])))
+    (is (= :double (get-in scheduled [:temporaries 0 :dtype])))))

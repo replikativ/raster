@@ -55,6 +55,19 @@
     (is (= [:intra-block :block-scan nil]
            (mapv #(get-in % [:operation :phase]) (:nodes scheduled))))))
 
+(deftest a-general-scan-recurrence-declines-parallel-scheduling
+  (let [r (slp/segop-lower-pass
+           '(let* [result (raster.par/scan out h 0.0 i n double
+                                           (Math/tanh (+ (* w h) (aget values i))))]
+                  result)
+           {})
+        d (first (get-in r [:stats :segops-declined]))]
+    (is (zero? (get-in r [:stats :segops-lowered])))
+    (is (zero? (get-in r [:stats :kernel-graphs-lowered])))
+    (is (= :segop (:stage d)))
+    (is (= :scan-not-associative (:reason d)))
+    (is (= :no-segop-metadata-backend-lowers-or-uses-legacy-codegen (:fallback d)))))
+
 (deftest an-unrepresentable-par-form-becomes-a-diagnostic
   (testing "a par form with no lowering rule is the case that used to vanish onto stderr"
     (let [st (stats-of '(let* [o (raster.par/scatter! O IDX V 256)] o))
