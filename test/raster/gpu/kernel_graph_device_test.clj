@@ -88,3 +88,47 @@
   (if-not @ocl-available?
     (is true "OpenCL device unavailable")
     (assert-prefix! :ocl:0)))
+
+(deftest opencl-kernel-graph-binds-aligned-disjoint-views-of-one-allocation
+  (if-not @ocl-available?
+    (is true "OpenCL device unavailable")
+    (let [n 1025
+          n-bytes (* 4 n)
+          alignment ((resolve 'raster.gpu.ocl-runtime/buffer-offset-alignment))
+          output-offset (* alignment (quot (+ n-bytes (dec alignment)) alignment))
+          graph (emitted-graph)
+          storage (float-array (quot (+ output-offset n-bytes 4) 4))]
+      (is (zero? (mod output-offset alignment)))
+      (dotimes [i n] (aset storage i 1.0))
+      (gpu/with-gpu-session [sess :ocl:0]
+        (gpu/alloc! sess {:storage [:float (alength storage) storage]})
+        (is (= alignment (get-in @sess [:allocations :storage :alignment]))
+            "the canonical allocation exposes the queried OpenCL alignment")
+        (let [input (gpu/buffer-view sess :storage {:shape [n]})
+              output (gpu/buffer-view sess :storage
+                                      {:byte-offset output-offset :shape [n]})
+              handle (gpu/bind-kernel-graph!
+                      sess :opencl-view-scan graph {'values input 'out output}
+                      {'n {:type :int :value n}})]
+          (try
+            (gpu/run-kernel-graph! sess handle)
+            (let [result (float-array n)]
+              (gpu/download-range! sess output result {:elements n})
+              (is (= 1025.0 (double (aget result 1024))))
+              (is (every? true?
+                          (map-indexed (fn [i value] (= (double (inc i)) (double value)))
+                                       result))))
+            (finally
+              (gpu/release-kernel-graph! sess handle)))
+          (when (> alignment 4)
+            (let [misaligned-output (gpu/buffer-view
+                                     sess :storage
+                                     {:byte-offset (+ output-offset 4) :shape [n]})]
+              (is (thrown-with-msg?
+                   clojure.lang.ExceptionInfo #"alignment requirement"
+                   (gpu/bind-kernel-graph!
+                    sess :misaligned-view-scan graph
+                    {'values input 'out misaligned-output}
+                    {'n {:type :int :value n}})))
+              (is (empty? (:kernel-graphs @sess))
+                  "misaligned binding leaves no graph-owned resources"))))))))

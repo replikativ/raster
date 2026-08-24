@@ -112,6 +112,7 @@
                      :byte-size byte-size
                      :memory-space (if ze? :shared :device)
                      :device device-id
+                     :alignment (or (:alignment buffer) 1)
                      :coherence (if ze? :host-coherent :explicit-transfer)
                      :ownership (allocation-ownership owner)})]
     (bview/view allocation {:dtype dtype :shape (vec shape)})))

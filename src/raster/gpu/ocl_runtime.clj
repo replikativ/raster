@@ -109,6 +109,7 @@
 (def ^:private CL_DEVICE_MAX_CLOCK_FREQUENCY 0x100C)
 (def ^:private CL_DEVICE_GLOBAL_MEM_SIZE 0x101F)
 (def ^:private CL_DEVICE_HOST_UNIFIED_MEMORY 0x1035)
+(def ^:private CL_DEVICE_MEM_BASE_ADDR_ALIGN 0x1019)
 (def ^:private CL_DEVICE_NAME 0x102B)
 (def ^:private CL_DEVICE_VENDOR 0x102C)
 (def ^:private CL_DEVICE_EXTENSIONS 0x1030)
@@ -116,6 +117,9 @@
 
 ;; clGetProgramBuildInfo param_name
 (def ^:private CL_PROGRAM_BUILD_LOG 0x1183)
+
+;; cl_buffer_create_type
+(def ^:private CL_BUFFER_CREATE_TYPE_REGION 0x1220)
 
 ;; ================================================================
 ;; Layout helpers
@@ -167,6 +171,8 @@
 ;; Memory
 (def ^:private h-clCreateBuffer
   (delay (make-handle "clCreateBuffer" (fd PTR PTR I64 I64 PTR PTR))))
+(def ^:private h-clCreateSubBuffer
+  (delay (make-handle "clCreateSubBuffer" (fd PTR PTR I64 I32 PTR PTR))))
 (def ^:private h-clEnqueueWriteBuffer
   (delay (make-handle "clEnqueueWriteBuffer" (fd I32 PTR PTR I32 I64 I64 PTR I32 PTR PTR))))
 (def ^:private h-clEnqueueReadBuffer
@@ -226,6 +232,7 @@
          :arena nil          ;; Arena for long-lived allocations
          :device-name nil
          :unified-memory? false
+         :buffer-offset-alignment nil ;; bytes; CL_DEVICE_MEM_BASE_ADDR_ALIGN is reported in bits
          :programs {}        ;; source-hash -> cl_program handle
          :kernels {}}))      ;; [program kernel-name] -> cl_kernel handle
 
@@ -286,6 +293,18 @@
   ^long [^MemorySegment device ^long param-name]
   ;; size_t is 8 bytes on 64-bit
   (query-device-info-ulong device param-name))
+
+(defn- device-buffer-offset-alignment
+  "Return the device's legal clCreateSubBuffer origin alignment in bytes. OpenCL reports this
+   capability in bits and requires it to be a power of two."
+  [device]
+  (let [bits (query-device-info-uint device CL_DEVICE_MEM_BASE_ADDR_ALIGN)]
+    (when-not (and (pos? bits)
+                   (zero? (bit-and bits (dec bits)))
+                   (zero? (mod bits 8)))
+      (throw (ex-info "OpenCL reported an invalid buffer base-address alignment"
+                      {:alignment-bits bits})))
+    (quot bits 8)))
 
 ;; ================================================================
 ;; Initialization
@@ -352,7 +371,8 @@
 
           dev-name (query-device-info-string device CL_DEVICE_NAME)
           unified? (try (== 1 (query-device-info-uint device CL_DEVICE_HOST_UNIFIED_MEMORY))
-                        (catch Exception _ false))]
+                        (catch Exception _ false))
+          buffer-offset-alignment (device-buffer-offset-alignment device)]
 
       (swap! state assoc
              :initialized? true
@@ -362,7 +382,8 @@
              :queue queue
              :arena arena
              :device-name dev-name
-             :unified-memory? unified?)
+             :unified-memory? unified?
+             :buffer-offset-alignment buffer-offset-alignment)
       (println (str "[ocl-runtime] Initialized: " dev-name
                     (when unified? " (unified memory)"))))))
 
@@ -404,6 +425,7 @@
                           :max-work-group-size (query-device-info-size-t dev CL_DEVICE_MAX_WORK_GROUP_SIZE)
                           :max-clock-mhz (query-device-info-uint dev CL_DEVICE_MAX_CLOCK_FREQUENCY)
                           :global-mem-bytes (query-device-info-ulong dev CL_DEVICE_GLOBAL_MEM_SIZE)
+                          :buffer-offset-alignment (device-buffer-offset-alignment dev)
                           :extensions (query-device-info-string dev CL_DEVICE_EXTENSIONS)
                           :integrated? (try (== 1 (query-device-info-uint dev CL_DEVICE_HOST_UNIFIED_MEMORY))
                                             (catch Exception _ false))}))
@@ -421,7 +443,8 @@
                       ^MemorySegment cl-mem      ;; cl_mem handle
                       ^long n-elements
                       ^long byte-size
-                      dtype])
+                      dtype
+                      ^long alignment])          ;; legal kernel-view origin alignment in bytes
 
 (defn device-buffer? [x]
   (instance? OclBuffer x))
@@ -463,6 +486,8 @@
     (get (:attributes kernel-info) k default)
     (get kernel-info k default)))
 
+(declare buffer-offset-alignment)
+
 (defn make-buffer
   "Allocate a persistent GPU buffer via clCreateBuffer."
   ([n] (make-buffer n :float))
@@ -479,7 +504,61 @@
              (throw (ex-info "clCreateBuffer failed" {:error (read-int err-seg) :size byte-size})))
          ;; Host staging buffer for data transfer
          host-seg (.allocate ^Arena arena byte-size)]
-     (->OclBuffer host-seg cl-mem (long n) byte-size dtype))))
+     (->OclBuffer host-seg cl-mem (long n) byte-size dtype
+                  (long (buffer-offset-alignment))))))
+
+(defn buffer-offset-alignment
+  "Minimum byte alignment for a clCreateSubBuffer origin on the selected OpenCL device."
+  []
+  (ensure-init!)
+  (:buffer-offset-alignment @state))
+
+(defn slice-buffer
+  "Create an independently reference-counted cl_mem sub-buffer over an exact byte range.
+
+   Unlike Level Zero's non-owning sliced pointer, the returned OclBuffer owns one native
+   cl_mem reference and MUST be passed to free-buffer!. `byte-offset` is relative to the root
+   buffer and must satisfy CL_DEVICE_MEM_BASE_ADDR_ALIGN; dtype reinterpretation is forbidden."
+  [^OclBuffer buf byte-offset byte-length dtype]
+  (ensure-init!)
+  (let [byte-offset (long byte-offset)
+        byte-length (long byte-length)
+        dtype (dt/canon dtype)
+        raw-dtype (dt/canon (:dtype buf))
+        element-bytes (long (dt/bytes-of dtype))
+        alignment (long (buffer-offset-alignment))]
+    (when-not (= raw-dtype dtype)
+      (throw (ex-info "OpenCL sub-buffer cannot reinterpret its parent dtype"
+                      {:buffer-dtype raw-dtype :dtype dtype})))
+    (when (or (neg? byte-offset) (not (pos? byte-length))
+              (> (+ byte-offset byte-length) (:byte-size buf))
+              (not (zero? (mod byte-offset element-bytes)))
+              (not (zero? (mod byte-length element-bytes))))
+      (throw (ex-info "OpenCL sub-buffer range is invalid"
+                      {:byte-offset byte-offset :byte-length byte-length
+                       :buffer-bytes (:byte-size buf) :dtype dtype})))
+    (when-not (zero? (mod byte-offset alignment))
+      (throw (ex-info "OpenCL sub-buffer origin violates the device alignment requirement"
+                      {:byte-offset byte-offset :required-alignment alignment})))
+    (let [arena (Arena/ofConfined)]
+      (try
+        (let [region (.allocate arena (long 16) (long 8))
+              err-seg (.allocate arena I32)
+              _ (.set region I64 0 byte-offset)
+              _ (.set region I64 8 byte-length)
+              cl-mem (.invokeWithArguments
+                      ^MethodHandle @h-clCreateSubBuffer
+                      (into-array Object [(:cl-mem buf) (long CL_MEM_READ_WRITE)
+                                          (int CL_BUFFER_CREATE_TYPE_REGION) region err-seg]))
+              error (read-int err-seg)]
+          (when-not (= CL_SUCCESS error)
+            (throw (ex-info "clCreateSubBuffer failed"
+                            {:error error :byte-offset byte-offset :byte-length byte-length
+                             :required-alignment alignment})))
+          (->OclBuffer (.asSlice ^MemorySegment (:segment buf) byte-offset byte-length)
+                       cl-mem (quot byte-length element-bytes) byte-length dtype alignment))
+        (finally
+          (.close arena))))))
 
 (defn free-buffer!
   "Free an OclBuffer's cl_mem."
@@ -525,14 +604,14 @@
   [what have-elements offset elements elem-size other-bytes]
   (let [have-elements (long have-elements) offset (long offset) elements (long elements)
         elem-size (long elem-size) other-bytes (long other-bytes)]
-  (when (or (neg? offset) (neg? elements))
-    (throw (ex-info (str what ": negative offset or length") {:offset offset :elements elements})))
-  (when (> (+ offset elements) have-elements)
-    (throw (ex-info (str what ": range exceeds the buffer")
-                    {:offset offset :elements elements :buffer-elements have-elements})))
-  (when (> (* elements elem-size) other-bytes)
-    (throw (ex-info (str what ": range exceeds the host-side array/segment")
-                    {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
+    (when (or (neg? offset) (neg? elements))
+      (throw (ex-info (str what ": negative offset or length") {:offset offset :elements elements})))
+    (when (> (+ offset elements) have-elements)
+      (throw (ex-info (str what ": range exceeds the buffer")
+                      {:offset offset :elements elements :buffer-elements have-elements})))
+    (when (> (* elements elem-size) other-bytes)
+      (throw (ex-info (str what ": range exceeds the host-side array/segment")
+                      {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
 
 (defn plan-range
   "Validate one ranged transfer and return its byte-level plan without copying. Same contract as
@@ -1107,7 +1186,6 @@
 ;; Lifecycle
 ;; ================================================================
 
-
 ;; ================================================================
 ;; Resident session layer (ports of the ze_runtime bound/graph API)
 ;; OpenCL has no command graphs in core: record-graph! stores the ordered
@@ -1396,6 +1474,7 @@
       (clojure.core/reset! state
                            {:initialized? false :platform nil :device nil :context nil
                             :queue nil :arena nil :device-name nil :unified-memory? false
+                            :buffer-offset-alignment nil
                             :programs {} :kernels {}}))))
 
 (defn reset!
@@ -1407,5 +1486,6 @@
   (clojure.core/reset! state
                        {:initialized? false :platform nil :device nil :context nil
                         :queue nil :arena nil :device-name nil :unified-memory? false
+                        :buffer-offset-alignment nil
                         :programs {} :kernels {}})
   (clojure.core/reset! kernel-registry {}))
