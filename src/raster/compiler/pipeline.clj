@@ -6,7 +6,7 @@
   runner validates arrow compatibility at composition time.
 
   Single unified pipeline (GPU/SIMD):
-    [:lower :fixpoint :dce :buffer-fuse :resolve-alength :soac-fuse :compound-detect :backend :mem-merge]
+    [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :resolve-alength :soac-fuse :compound-detect :backend :mem-merge]
 
   AD is handled by inlining value+grad calls during the fixpoint pass.
   Training, gradients, and higher-order derivatives all go through the
@@ -48,6 +48,7 @@
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
             [raster.compiler.passes.parallel.write-read-fuse :as write-read-fuse]
             [raster.compiler.passes.parallel.materialize :as materialize]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
             [raster.compiler.passes.parallel.gpu-plan :as gpu-plan]
             [raster.compiler.passes.scalar.mem-merge :as mem-merge]
             [raster.compiler.passes.scalar.resolve-alength :as resolve-alength]
@@ -344,6 +345,13 @@
                    (list 'let* [] result))]
     ;; Tag binding symbols with inferred types
     (tag-binding-types let-form (:param-env opts))))
+
+(defn- pass-structured-reduction-fuse
+  "Protect proven structured reductions as schedule-neutral internal markers on GPU targets."
+  [form opts]
+  (if (device/gpu-target? (:target-device opts))
+    (swr-fuse/fuse form (:dtype opts))
+    {:form form :stats {:segmented-weighted-reductions-fused 0}}))
 
 (defn- pass-expand
   "Expand template-backed ops for backend optimization.
@@ -918,7 +926,9 @@
   flat let* form). The :from tag is set to the most common input."
   {;; Core pipeline passes (used in forward-passes)
    :lower            {:from :walked            :to :lowered           :fn pass-lower}
-   :fixpoint         {:from :lowered           :to :fixpointed        :fn pass-fixpoint}
+   :structured-reduction-fuse
+   {:from :lowered :to :structured-reductions :fn pass-structured-reduction-fuse}
+   :fixpoint         {:from :structured-reductions :to :fixpointed    :fn pass-fixpoint}
    :dce              {:from :*                 :to :dce-cleaned       :fn pass-dce}
    :buffer-fuse      {:from :dce-cleaned       :to :buffer-fused      :fn pass-buffer-fuse}
    :loop-lift        {:from :late-cleaned      :to :loop-lifted       :fn pass-loop-lift}
@@ -981,14 +991,14 @@
    loop-lift recovers par structure from dotimes/loop forms (e.g. SGD inlined to dotimes).
    write-read-fuse eliminates intermediate buffers by fusing 2D producers into 1D consumers (dW+SGD).
    segop-lower converts par forms to SegOp IR for unified backend consumption."
-  [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :segop-lower :compound-detect :backend :resolve-alength :mem-merge])
+  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :segop-lower :compound-detect :backend :resolve-alength :mem-merge])
 
 (def gpu-resident-pre-soa-passes
   "forward-passes up to (and including) :materialize. The resident GPU path splits here so
    soa-lower can explode value-type (Params container) params into per-field arrays at the
    :materialized boundary — BEFORE the :backend pass emits kernels (the JVM bytecode backend
    keeps Valhalla value-classes native, so soa-lower is per-backend, not a shared pass)."
-  [:lower :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
+  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
 
 (def gpu-resident-post-soa-passes
   "forward-passes from :segop-lower onward — resumed (from :materialized) after soa-lower."

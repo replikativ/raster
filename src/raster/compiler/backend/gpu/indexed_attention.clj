@@ -5,7 +5,8 @@
    intentionally simple, but it is genuinely fused: scores, clamped exponential weights,
    denominator and weighted values remain private scalars and no edge-sized intermediates are
    materialized."
-  (:require [raster.compiler.ir.kernel-abi :as kabi]
+  (:require [clojure.string :as str]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
@@ -26,9 +27,7 @@
         [scale lower upper] score-arguments
         bound (:value upper)]
     (when-not
-     (and (= :indexed-graph-attention (:semantic-op provenance))
-          (= :recognized-indexed-attention-chain (:lowering provenance))
-          (= [:destination :head] (mapv :name segment-axes))
+     (and (= [:destination :head] (mapv :name segment-axes))
           (= :edge-list-by-destination (:kind membership))
           (= :multiset (:duplicate-policy membership))
           (= [(:id destination-indices) (:id source-indices)] (:buffers membership))
@@ -82,8 +81,8 @@
           (= [(:extent destination-axis) (:total-dim storage)] (:shape q))
           (= (:shape q) (:shape k) (:shape v) (:shape output))
           (= (:dtype q) (:dtype k) (:dtype v) (:dtype output) accumulator-dtype))
-      (fail "indexed-attention leaf cannot preserve this reduction plan exactly"
-            :indexed-attention-reference-plan-unsupported
+      (fail "indexed edge-list leaf cannot preserve this reduction plan exactly"
+            :indexed-segmented-reduction-plan-unsupported
             {:plan-id (:id plan) :provenance provenance}))
     plan))
 
@@ -135,20 +134,33 @@
          (Double/toString (double value)))
        (when (= :float dtype) "f")))
 
+(defn- long-expression
+  [value]
+  (if (number? value) (str value "L") (str "(" value ")")))
+
+(defn- fp-expression
+  [dtype value]
+  (if (number? value) (fp-literal dtype value) (str value)))
+
 (defn- kernel-name
   [plan shape]
   (let [identity {:schedule (swr/schedule-key plan) :shape shape}]
     (format "raster_indexed_attention_ref_%08x"
             (bit-and 0xffffffff (long (hash identity))))))
 
-(defn- source
-  [plan shape name]
-  (let [{:keys [entities heads edges components total-dim]} shape
+(defn- source*
+  [plan {:keys [entities edges components total-dim active-width scale bound epsilon
+                scalar-signature invalid-shape]} name]
+  (let [entities (long-expression entities)
+        edges (long-expression edges)
+        components (long-expression components)
+        total-dim (long-expression total-dim)
+        active-width (long-expression active-width)
         dtype (:accumulator-dtype plan)
         ctype (c-type dtype)
-        bound (double (get-in plan [:score :arguments 2 :value]))
-        epsilon (double (get-in plan [:normalization :epsilon]))
-        scale (/ 1.0 (Math/sqrt (double components)))
+        bound (fp-expression dtype bound)
+        epsilon (fp-expression dtype epsilon)
+        scale (fp-expression dtype scale)
         zero (fp-literal dtype 0.0)]
     (str (when (= :double dtype)
            "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
@@ -158,46 +170,63 @@
          "    __global const " ctype "* v,\n"
          "    __global const long* destination_indices,\n"
          "    __global const long* source_indices,\n"
-         "    __global " ctype "* output) {\n"
+         "    __global " ctype "* output"
+         (when (seq scalar-signature) (str ",\n" scalar-signature))
+         ") {\n"
          "  const long feature = (long)get_global_id(0);\n"
          "  const long destination = (long)get_global_id(1);\n"
-         "  if (feature >= " total-dim "L || destination >= " entities "L) return;\n"
-         "  const long output_index = destination * " total-dim "L + feature;\n"
-         "  if (feature >= " (* heads components) "L) {\n"
+         "  if (feature >= " total-dim " || destination >= " entities ") return;\n"
+         "  const long output_index = destination * " total-dim " + feature;\n"
+         (when invalid-shape
+           (str "  if (" invalid-shape ") {\n"
+                "    output[output_index] = (" ctype ")NAN;\n"
+                "    return;\n"
+                "  }\n"))
+         "  if (feature >= " active-width ") {\n"
          "    output[output_index] = " zero ";\n"
          "    return;\n"
          "  }\n"
-         "  const long head = feature / " components "L;\n"
-         "  const long component = feature - head * " components "L;\n"
+         "  const long head = feature / " components ";\n"
+         "  const long component = feature - head * " components ";\n"
          "  " ctype " numerator = " zero ";\n"
          "  " ctype " denominator = " zero ";\n"
-         "  for (long edge = 0; edge < " edges "L; ++edge) {\n"
+         "  for (long edge = 0; edge < " edges "; ++edge) {\n"
          "    const long edge_destination = destination_indices[edge];\n"
          "    const long source = source_indices[edge];\n"
          "    if (edge_destination < 0L || edge_destination >= " entities
-         "L || source < 0L || source >= " entities "L) {\n"
+         " || source < 0L || source >= " entities ") {\n"
          "      output[output_index] = (" ctype ")NAN;\n"
          "      return;\n"
          "    }\n"
          "    if (edge_destination != destination) continue;\n"
-         "    const long q_base = destination * " total-dim "L + head * " components "L;\n"
-         "    const long kv_base = source * " total-dim "L + head * " components "L;\n"
+         "    const long q_base = destination * " total-dim " + head * " components ";\n"
+         "    const long kv_base = source * " total-dim " + head * " components ";\n"
          "    " ctype " dot = " zero ";\n"
-         "    for (long x = 0; x < " components "L; ++x)\n"
+         "    for (long x = 0; x < " components "; ++x)\n"
          "      dot += q[q_base + x] * k[kv_base + x];\n"
-         "    const " ctype " scaled = dot * (" ctype ")" (fp-literal dtype scale) ";\n"
+         "    const " ctype " scaled = dot * (" ctype ")" scale ";\n"
          ;; Java Math/min and Math/max propagate NaN; OpenCL fmin/fmax select the numeric operand.
          ;; Preserve the recognized source semantics explicitly instead of inheriting that drift.
          "    const " ctype " score = isnan(scaled) ? scaled\n"
-         "        : fmin((" ctype ")" (fp-literal dtype bound)
-         ", fmax((" ctype ")" (fp-literal dtype (- bound)) ", scaled));\n"
+         "        : fmin((" ctype ")" bound
+         ", fmax(-(" ctype ")" bound ", scaled));\n"
          "    const " ctype " weight = exp(score);\n"
          "    numerator += weight * v[kv_base + component];\n"
          "    denominator += weight;\n"
          "  }\n"
          "  output[output_index] = denominator == " zero " ? " zero
-         " : numerator / (denominator + (" ctype ")" (fp-literal dtype epsilon) ");\n"
+         " : numerator / (denominator + (" ctype ")" epsilon ");\n"
          "}\n")))
+
+(defn- source
+  [plan {:keys [heads components] :as shape} name]
+  (source* plan
+           (assoc shape
+                  :active-width (* heads components)
+                  :scale (/ 1.0 (Math/sqrt (double components)))
+                  :bound (double (get-in plan [:score :arguments 2 :value]))
+                  :epsilon (double (get-in plan [:normalization :epsilon])))
+           name))
 
 (defn- ordered-abi
   [plan]
@@ -213,6 +242,108 @@
       (kabi/slot (:id source-indices) :input :long
                  :c-name "source_indices" :role :source-indices)
       (kabi/slot (:id output) :output fp :c-name "output" :role :result)])))
+
+(defn- dynamic-fields
+  [plan]
+  (let [[destination-axis head-axis] (:segment-axes plan)
+        membership (:membership plan)
+        storage (:storage plan)
+        value (:value plan)
+        output-elements (:elements (:output plan))]
+    [{:name 'n_entities :c-name "n_entities" :value (:extent destination-axis)}
+     {:name 'n_edges :c-name "n_edges" :value (:edges membership)}
+     {:name 'total_dim :c-name "total_dim" :value (:total-dim storage)}
+     {:name 'n_heads :c-name "n_heads" :value (:extent head-axis)}
+     {:name 'n_components :c-name "n_components" :value (:components value)}
+     {:name 'output_elements :c-name "output_elements" :value output-elements}]))
+
+(defn- dynamic-workgroup-x
+  [desc]
+  (long (max 1 (min (long (or (:subgroup-size desc) 16))
+                    (long (or (:max-workgroup-size desc) 256))))))
+
+(defn- dynamic-abi
+  [plan fields]
+  (let [[q k v destination-indices source-indices] (:operands plan)
+        output (:output plan)
+        fp (:accumulator-dtype plan)]
+    (kabi/validate!
+     (into
+      [(kabi/slot (:id q) :input fp :c-name "q" :role :query)
+       (kabi/slot (:id k) :input fp :c-name "k" :role :key)
+       (kabi/slot (:id v) :input fp :c-name "v" :role :value)
+       (kabi/slot (:id destination-indices) :input :long
+                  :c-name "destination_indices" :role :destination-indices)
+       (kabi/slot (:id source-indices) :input :long
+                  :c-name "source_indices" :role :source-indices)
+       (kabi/slot (:id output) :output fp :c-name "output" :role :result)]
+      (map (fn [{:keys [name c-name]}]
+             (kabi/slot name :scalar :long :c-name c-name :role :shape))
+           fields)))))
+
+(defn emit-dynamic-reference
+  "Emit one shape-polymorphic indexed-attention artifact.
+
+   Extents remain ordered int64 ABI values and drive the symbolic 2-D launch. Clamp and epsilon
+   are proven model semantics and stay embedded constants. `:out-elems` names an explicit scalar
+   argument so the staging path can allocate/read back without interpreting product forms."
+  [plan desc]
+  (let [plan (indexed-attention-plan! plan)
+        fields (dynamic-fields plan)
+        values (mapv :value fields)
+        field-code (into {} (map (juxt :name :c-name)) fields)
+        [entities _ total-dim _ _ output-elements] values
+        workgroup-x (dynamic-workgroup-x desc)
+        name (kernel-name plan :dynamic)
+        inputs (swr/ordered-input-ids plan)
+        output (get-in plan [:output :id])
+        dtype (:accumulator-dtype plan)
+        ctype (c-type dtype)
+        scalar-signature
+        (->> fields
+             (map (fn [{:keys [c-name]}] (str "    long " c-name)))
+             (str/join ",\n"))
+        code {:entities (get field-code 'n_entities)
+              :edges (get field-code 'n_edges)
+              :total-dim (get field-code 'total_dim)
+              :heads (get field-code 'n_heads)
+              :components (get field-code 'n_components)
+              :active-width (str (get field-code 'n_heads) " * "
+                                 (get field-code 'n_components))
+              :scale (str "((" ctype ")" (fp-literal dtype 1.0)
+                          " / sqrt((" ctype ")" (get field-code 'n_components) "))")
+              :bound (double (get-in plan [:score :arguments 2 :value]))
+              :epsilon (double (get-in plan [:normalization :epsilon]))
+              :scalar-signature scalar-signature
+              :invalid-shape
+              "n_edges < 0L || n_heads <= 0L || n_components <= 0L || n_heads > total_dim / n_components"}
+        abi (dynamic-abi plan fields)
+        arguments (into (conj inputs output) values)]
+    (kart/make
+     {:kernel-name name
+      :source (source* plan code name)
+      :abi abi
+      :arguments arguments
+      :launch (klaunch/spec
+               {:workgroup-size [workgroup-x 1]
+                :group-count [(klaunch/ceil-div total-dim workgroup-x)
+                              (klaunch/runtime-value entities)]})
+      :effects {:kind :segmented-weighted-reduction :reads inputs :writes [output]}
+      :provenance {:operation-id (get-in plan [:provenance :operation-id])
+                   :semantic-op (get-in plan [:provenance :semantic-op])
+                   :algebra-plan-id (:id plan)
+                   :lowering :direct-dynamic-reference}
+      :attributes {:strategy :indexed-segmented-reduction-reference
+                   :optimization-tier :reference
+                   :algebra :segmented-weighted-reduction
+                   :algebra-key (swr/algebra-key plan)
+                   :storage-dtype dtype :accumulator-dtype dtype
+                   :membership :edge-list-by-destination
+                   :duplicate-policy :multiset
+                   :dynamic-shape? true
+                   :out-elems output-elements
+                   :materialized-intermediates []
+                   :complexity :quadratic-in-edges-and-head-components}})))
 
 (defn emit-reference
   "Emit the direct indexed-attention correctness schedule for a resolved shape environment."
@@ -233,12 +364,12 @@
                {:workgroup-size [workgroup-x 1]
                 :group-count [(long (quot (+ total-dim (dec workgroup-x)) workgroup-x))
                               entities]})
-      :effects {:kind :indexed-attention :reads inputs :writes [output]}
+      :effects {:kind :segmented-weighted-reduction :reads inputs :writes [output]}
       :provenance {:operation-id (get-in plan [:provenance :operation-id])
-                   :semantic-op :indexed-graph-attention
+                   :semantic-op (get-in plan [:provenance :semantic-op])
                    :algebra-plan-id (:id plan)
                    :lowering :direct-reference}
-      :attributes {:strategy :indexed-attention-reference
+      :attributes {:strategy :indexed-segmented-reduction-reference
                    :optimization-tier :reference
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)
@@ -274,8 +405,41 @@
      {:inputs (mapv #(graph-buffer % :input) inputs)
       :outputs [(graph-buffer output :output)]
       :nodes [(kgraph/->ScheduledKernel
-               [:indexed-attention (:id plan) :direct-reference] artifact uses [])]
-      :effects {:kind :indexed-attention :materialized-intermediates []}
+               [:segmented-weighted-reduction (:id plan) :indexed-reference] artifact uses [])]
+      :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
       :provenance {:operation-id (get-in plan [:provenance :operation-id])
-                   :semantic-op :indexed-graph-attention}
-      :attributes {:strategy :indexed-attention-reference :reference? true}})))
+                   :semantic-op (get-in plan [:provenance :semantic-op])}
+      :attributes {:strategy :indexed-segmented-reduction-reference :reference? true}})))
+
+(defn dynamic-kernel-graph
+  "Wrap a dynamic artifact while retaining runtime-resolvable external buffer ranges."
+  [plan artifact]
+  (let [plan (indexed-attention-plan! plan)
+        artifact (kart/validate! artifact)
+        inputs (swr/ordered-input-ids plan)
+        output (get-in plan [:output :id])
+        descriptors (into {} (map (juxt :id identity))
+                          (conj (:operands plan) (:output plan)))
+        edge-ids #{(get-in plan [:membership :destination-indices])
+                   (get-in plan [:membership :source-indices])}
+        edge-elements (:edges (:membership plan))
+        value-elements (:elements (:output plan))
+        graph-buffer (fn [id role]
+                       (kgraph/buffer
+                        id (:dtype (get descriptors id))
+                        (klaunch/runtime-value
+                         (if (contains? edge-ids id) edge-elements value-elements))
+                        :device role))
+        uses (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
+                          [(kgraph/->ValueUse output :write)]))]
+    (kgraph/make
+     {:inputs (mapv #(graph-buffer % :input) inputs)
+      :outputs [(graph-buffer output :output)]
+      :nodes [(kgraph/->ScheduledKernel
+               [:segmented-weighted-reduction (:id plan) :indexed-dynamic-reference]
+               artifact uses [])]
+      :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
+      :provenance {:operation-id (get-in plan [:provenance :operation-id])
+                   :semantic-op (get-in plan [:provenance :semantic-op])}
+      :attributes {:strategy :indexed-segmented-reduction-reference
+                   :reference? true :dynamic-shape? true}})))

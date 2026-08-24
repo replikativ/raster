@@ -1063,6 +1063,7 @@
    so false positives just trigger an extra (harmless) rewalk."
   [sym]
   (and (symbol? sym)
+       (not (get-in (get-op-descriptor sym) [:compiler-ir?]))
        (when-let [ns-str (namespace sym)]
          (and (not (.contains ^String (name sym) "_m_"))
               (not (.startsWith ^String ns-str "clojure."))

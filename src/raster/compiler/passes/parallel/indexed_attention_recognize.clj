@@ -223,6 +223,7 @@
                     :operands operands
                     :output (buffer output dtype value-shape)
                     :accumulator-dtype accumulator-dtype
+                    :runtime-parameters [n-nodes n-edges total-dim n-heads slice-dim]
                     :source-operation {:form form :output output
                                        :intermediates internal}
                     :provenance {:semantic-op :indexed-graph-attention

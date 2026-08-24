@@ -16,6 +16,8 @@
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]
             [raster.compiler.backend.gpu.par-opencl :as legacy]
             [raster.compiler.support.spirv-cache :as spirv-cache]
             [raster.runtime.hardware :as hw]))
@@ -276,7 +278,8 @@
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
   (let [top-scalar-types (merge (or (:scalar-types (meta form)) {}) scalar-types)
         top-array-types (merge (or (:array-types (meta form)) {}) array-types)
-        stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0 :fallback 0})
+        stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
+                     :ze-structured-reductions 0 :fallback 0})
         kernels (atom [])
 
         register-kernel!
@@ -290,6 +293,21 @@
         transform
         (fn transform [form]
           (cond
+            ;; === Proven structured segmented weighted reduction ===
+            (swr-fuse/marker? form)
+            (let [plan (swr-fuse/marker-plan form dtype)
+                  routed (swr-route/route-dynamic!
+                          plan
+                          (try ((requiring-resolve
+                                 'raster.compiler.core.hardware/descriptor-for)
+                                device-id)
+                               (catch Throwable _ {:device-type :gpu})))
+                  artifact (register-kernel! (:artifact routed) :ze-structured-reductions)]
+              ;; Reuse the generic artifact marker: it already transports an arbitrary ordered
+              ;; pointer/scalar ABI and symbolic 2-D launch through staging and Compiled.
+              (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                    (:kernel-name artifact) (vec (:arguments artifact))))
+
             ;; === Compound kernel ===
             (and (seq? form) (= 'raster.compiler/compound-kernel (first form)))
             (let [[_ metadata original-dotimes] form
