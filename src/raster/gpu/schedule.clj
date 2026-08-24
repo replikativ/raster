@@ -58,6 +58,11 @@
     ;; fusion / cross-layer-resident schedule flips operands to :resident. The graph-level extension
     ;; for stationary LLMs (operand resident across the recorded decode sequence) lives here.
     :residency {:a :dram :b :dram :c :dram}
+    ;; Dynamic structured reductions keep their extents in the ABI. :auto emits compatible
+    ;; schedules once and selects after those scalar values become concrete. The subgroup multiple
+    ;; is the analytic crossover seed; measurement/autotuning may override it per machine.
+    :segmented-weighted-reduction {:strategy :auto
+                                   :score-reuse-subgroup-multiple 16}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
             :derived-by :raster.gpu.schedule/derive-default
@@ -78,6 +83,8 @@
 (def ^:private valid-precisions #{:f16-xmx :f32-scalar})
 (def ^:private valid-stage-spaces #{:none :slm :l3 :register})
 (def ^:private valid-grf-modes #{:grf128 :grf256})
+(def ^:private valid-segmented-reduction-strategies
+  #{:auto :reference :subgroup-score-reuse})
 
 (defn resolve
   "Stage 2: deep-merge a user `override` schedule onto the derived default, recording the pinned
@@ -177,7 +184,10 @@
   ;; bind (the #{:f16-xmx :f32-scalar} kwarg check upstream only sees the sugar, not a :schedule).
   (let [prec  (:precision schedule)
         space (get-in schedule [:stage :space] :none)
-        grf   (get-in schedule [:grf :mode] :grf128)]
+        grf   (get-in schedule [:grf :mode] :grf128)
+        reduction-strategy (get-in schedule [:segmented-weighted-reduction :strategy] :auto)
+        score-reuse-multiple
+        (get-in schedule [:segmented-weighted-reduction :score-reuse-subgroup-multiple] 16)]
     (when-not (valid-precisions prec)
       (throw (ex-info (str "schedule: unknown :precision " (pr-str prec) " — expected " valid-precisions)
                       {:precision prec})))
@@ -186,7 +196,14 @@
                       {:space space})))
     (when-not (valid-grf-modes grf)
       (throw (ex-info (str "schedule: unknown :grf :mode " (pr-str grf) " — expected " valid-grf-modes)
-                      {:grf grf}))))
+                      {:grf grf})))
+    (when-not (valid-segmented-reduction-strategies reduction-strategy)
+      (throw (ex-info "schedule: unknown segmented weighted-reduction strategy"
+                      {:strategy reduction-strategy
+                       :expected valid-segmented-reduction-strategies})))
+    (when-not (and (integer? score-reuse-multiple) (pos? score-reuse-multiple))
+      (throw (ex-info "schedule: score-reuse subgroup multiple must be a positive integer"
+                      {:score-reuse-subgroup-multiple score-reuse-multiple}))))
   (let [budget (grf-budget-bytes-per-lane schedule desc)
         acc    (acc-bytes-per-lane schedule)
         staged (register-staged-bytes-per-lane schedule)

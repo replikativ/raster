@@ -31,6 +31,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
@@ -796,6 +797,20 @@
          (catch Exception e
            (println "Warning: could not register GPU kernels:" (.getMessage e))))))))
 
+(defn- register-gpu-dispatches!
+  "Register pure multi-artifact dispatch values beside their target backend's kernel registry."
+  [dispatches device-id]
+  (when (seq dispatches)
+    (let [ns-sym (if (and device-id (.startsWith (name device-id) "ocl"))
+                   'raster.gpu.ocl-runtime
+                   'raster.gpu.ze-runtime)]
+      (try
+        (require ns-sym)
+        (let [register! (resolve (symbol (str ns-sym) "register-kernel-dispatch!"))]
+          (doseq [dispatch dispatches] (register! dispatch)))
+        (catch Exception e
+          (println "Warning: could not register GPU kernel dispatches:" (.getMessage e)))))))
+
 (defn- pass-gpu-plan
   "GPU execution plan: rewrite BLAS calls to GPU GEMM kernels,
   plan DeviceBuffer allocations for persistent GPU execution.
@@ -882,9 +897,12 @@
                      (vary-meta assoc :scalar-types (:scalar-types opts) :array-types (:array-types opts)))
               result (opencl-pass/opencl-pass form
                                               :device-id target-device
-                                              :dtype (:dtype opts))]
+                                              :dtype (:dtype opts)
+                                              :schedule (:schedule opts))]
           (register-gpu-kernels! (:kernels result) target-device)
-          {:form (:form result) :stats (:stats result) :kernels (:kernels result) :backend :opencl})
+          (register-gpu-dispatches! (:dispatches result) target-device)
+          {:form (:form result) :stats (:stats result)
+           :kernels (:kernels result) :dispatches (:dispatches result) :backend :opencl})
 
         :simd
         (let [clean-form (strip-compound-markers form)
@@ -1190,6 +1208,7 @@
      raster.gpu.ze-runtime/invoke-registered-kernel
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
+     raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
@@ -1325,6 +1344,7 @@
   ;; alpha-beta bug family) and fewer would bind nil into a size/scalar slot. Each arm returns
   ;; nil on an unexpected arity so the caller rejects it BY NAME (:unparseable-kernel-invoke)
   ;; instead of miscompiling. Emit-site arities: map-void=5, map=6, contraction=3,
+  ;; contraction-dispatch=4,
   ;; scatter=6|7, ordered-reduce=3.
   (let [head (first expr)
         argc (count expr)]
@@ -1347,6 +1367,14 @@
         (let [[_ kname arguments] expr]
           (when (vector? arguments)
             {:kernel-name kname :arguments arguments
+             :convention :contract :returns sym})))
+      (= head 'raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!)
+      ;; Default kernel identity keeps generic extraction/alias analysis on the common ABI. The
+      ;; dispatch id is retained and checked against that default artifact during descriptor build.
+      (when (= 4 argc)
+        (let [[_ dispatch-id default-kernel-name arguments] expr]
+          (when (vector? arguments)
+            {:dispatch-id dispatch-id :kernel-name default-kernel-name :arguments arguments
              :convention :contract :returns sym})))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
@@ -1679,7 +1707,8 @@
         array-params (filterv #(contains? array-param-set %) all-params)
         scalar-params (filterv #(not (contains? array-param-set %)) all-params)
         post-opts (cond-> {:inline? true :simd? false :target-device device-id
-                           :active-params active-params :dtype effective-dtype}
+                           :active-params active-params :dtype effective-dtype
+                           :schedule resolved-schedule}
                     param-env (assoc :param-env param-env)
                     source-ns (assoc :source-ns source-ns)
                     gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
@@ -1728,6 +1757,8 @@
                      'raster.gpu.ocl-runtime
                      'raster.gpu.ze-runtime)
         reg-entry (requiring-resolve (symbol (str runtime-ns) "kernel-registry-entry"))
+        dispatch-entry (requiring-resolve
+                        (symbol (str runtime-ns) "kernel-dispatch-registry-entry"))
         extracted (extract-gpu-program form reg-entry)
         prog (if-let [nr (::non-resident extracted)]
                (if (= on-non-resident :throw)
@@ -1812,8 +1843,21 @@
                          :phase (keyword (str "gpu-step-" i))}
 
                         (= :contract (:convention step))
-                        (let [{:keys [kernel-name arguments]} step
-                              artifact (reg-entry kernel-name)
+                        (let [{:keys [kernel-name dispatch-id arguments]} step
+                              dispatch (when dispatch-id
+                                         (or (dispatch-entry dispatch-id)
+                                             (throw (ex-info "resident contraction dispatch is not registered"
+                                                             {:dispatch-id dispatch-id}))))
+                              dispatch (when dispatch (kdispatch/validate! dispatch))
+                              artifact (if dispatch
+                                         (kdispatch/default-artifact dispatch)
+                                         (reg-entry kernel-name))
+                              _ (when (and dispatch
+                                           (not= kernel-name (:kernel-name artifact)))
+                                  (throw (ex-info "contraction marker default differs from its dispatch"
+                                                  {:dispatch-id dispatch-id
+                                                   :marker-kernel kernel-name
+                                                   :dispatch-kernel (:kernel-name artifact)})))
                               _ (when-not (kart/kernel-artifact? artifact)
                                   (throw (ex-info "resident contraction kernel is not a registered KernelArtifact"
                                                   {:kernel-name kernel-name :entry artifact})))
@@ -1827,6 +1871,8 @@
                                                    :result-slots result-slots})))]
                           {:convention :contract
                            :kernel-name kernel-name
+                           :dispatch-id dispatch-id
+                           :dispatch dispatch
                            :artifact artifact
                            :abi abi
                            :argument-specs

@@ -150,6 +150,16 @@
     (is (= :indexed-edge-list-reference leaf))
     (is (= :indexed-segmented-reduction-reference strategy))))
 
+(deftest intel-subgroup-source-is-not-offered-to-a-known-different-vendor
+  (let [{:keys [candidates declines]}
+        (swr-route/route-dynamic-candidates
+         (plan) {:device-type :gpu :vendor "Advanced Micro Devices"
+                 :subgroup-size 64 :max-workgroup-size 1024})]
+    (is (= [:indexed-segmented-reduction-reference]
+           (mapv :strategy candidates)))
+    (is (= :score-reuse-requires-intel-subgroup-dialect
+           (:reason (first declines))))))
+
 (deftest generic-router-keeps-reference-default-without-a-measured-selection
   (let [{:keys [leaf strategy]}
         (swr-route/route-dynamic!

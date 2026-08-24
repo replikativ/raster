@@ -23,6 +23,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
@@ -239,6 +240,10 @@
 (def kernel-registry
   "Global registry mapping kernel-name → kernel info.
   Same structure as raster.gpu.ze-runtime/kernel-registry."
+  (atom {}))
+
+(def kernel-dispatch-registry
+  "Pure compiler dispatch values keyed independently of single-entry native kernels."
   (atom {}))
 
 (def ^:dynamic *current-arena*
@@ -758,7 +763,11 @@
           ;; Host segments are arena-allocated, no explicit free needed
           nil)))
     ;; Remove from registry
-    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels)))))
+    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels)))
+    (swap! kernel-dispatch-registry
+           (fn [dispatches]
+             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch))))
+                   dispatches)))))
 
 ;; ================================================================
 ;; Kernel registration and compilation
@@ -774,6 +783,18 @@
          info (cond-> kernel-info
                 arena-id (assoc :arena-id arena-id))]
      (swap! kernel-registry assoc kernel-name info))))
+
+(defn register-kernel-dispatch!
+  ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
+  ([dispatch arena-id]
+   (let [dispatch (cond-> (kdispatch/validate! dispatch)
+                    arena-id (assoc :arena-id arena-id))]
+     (swap! kernel-dispatch-registry assoc (:id dispatch) dispatch)
+     dispatch)))
+
+(defn kernel-dispatch-registry-entry
+  [dispatch-id]
+  (get @kernel-dispatch-registry dispatch-id))
 
 (defn- compile-program!
   "Compile OpenCL C source to a cl_program. Returns the program handle."
@@ -1488,4 +1509,5 @@
                         :queue nil :arena nil :device-name nil :unified-memory? false
                         :buffer-offset-alignment nil
                         :programs {} :kernels {}})
-  (clojure.core/reset! kernel-registry {}))
+  (clojure.core/reset! kernel-registry {})
+  (clojure.core/reset! kernel-dispatch-registry {}))

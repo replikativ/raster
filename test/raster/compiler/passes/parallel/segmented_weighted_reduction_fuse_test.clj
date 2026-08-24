@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
@@ -112,10 +113,18 @@
                   {:type type :value (value-fn args)}
                   (Object.)))
               (:argument-specs step))
+        wide-args (assoc args 7 512)
+        wide-call-arguments
+        (mapv (fn [{:keys [kind type value-fn]}]
+                (if (= :scalar kind)
+                  {:type type :value (value-fn wide-args)}
+                  (Object.)))
+              (:argument-specs step))
         call (kcall/make (:artifact step) call-arguments)]
     (is (= 1 (count (:steps descriptor))))
     (is (= 1 (count (:allocs descriptor))))
     (is (= :contract (:convention step)))
+    (is (kdispatch/kernel-dispatch? (:dispatch step)))
     (is (kart/kernel-artifact? (:artifact step)))
     (is (= :indexed-segmented-reduction-reference
            (get-in step [:artifact :attributes :strategy])))
@@ -124,7 +133,26 @@
             :scalar :scalar :scalar :scalar :scalar :scalar]
            (mapv (comp :kind :slot) (:argument-specs step))))
     (is (= [1 3] (get-in call [:geometry :group-count])))
+    (is (= :indexed-segmented-reduction-reference
+           (kdispatch/artifact-strategy
+            (kdispatch/select-artifact (:dispatch step) call-arguments))))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse
+           (kdispatch/artifact-strategy
+            (kdispatch/select-artifact (:dispatch step) wide-call-arguments))))
     (is (= (:sym (first (:allocs descriptor))) (:result-sym descriptor)))))
+
+(deftest compiler-schedule-can-pin-either-dispatch-alternative
+  (doseq [[requested emitted]
+          [[:reference :indexed-segmented-reduction-reference]
+           [:subgroup-score-reuse
+            :indexed-segmented-reduction-subgroup-score-reuse]]]
+    (let [descriptor
+          (pipeline/compile-gpu-program
+           #'resident-structured-reduction-probe :ze:0 :dtype :float
+           :schedule {:segmented-weighted-reduction {:strategy requested}})
+          step (first (:steps descriptor))]
+      (is (nil? (:dispatch step)))
+      (is (= emitted (get-in step [:artifact :attributes :strategy]))))))
 
 (deftest actual-gsdm-region-reaches-generic-structured-reduction-stage
   (let [diagnostic (pipeline/show-pipeline

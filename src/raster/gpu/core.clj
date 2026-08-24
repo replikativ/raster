@@ -34,6 +34,7 @@
             [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.pipeline :as pl]
@@ -1301,7 +1302,10 @@
                  artifact logical-or-physical-args
                  (rt-resolve device-id "expand-pointer-binding"))
                 logical-or-physical-args)
-              call (kcall/make artifact ordered-args
+              selected-artifact (if-let [dispatch (:dispatch step)]
+                                  (kdispatch/select-artifact dispatch ordered-args)
+                                  artifact)
+              call (kcall/make selected-artifact ordered-args
                                (if (= :reduce convention) {:group-count [1]} {}))
               prepared (bind-call-fn call)]
           (swap! sess assoc-in [:prepared phase] prepared))
@@ -1617,6 +1621,8 @@
          ;; back-compat sugar for a descriptor built before the schedule field, or one hand-assoc'd.
          gemm-precision (or (get-in descriptor [:schedule :precision])
                             (:gemm-precision descriptor) :f16-xmx)
+         reduction-strategy
+         (get-in descriptor [:schedule :segmented-weighted-reduction :strategy] :auto)
          effective-roles (merge (:array-roles descriptor) roles)
          argmap (zipmap all-params args)
          dt (if (= dtype :double) :double :float)
@@ -1819,7 +1825,11 @@
                         artifact logical-or-physical-args
                         (rt-resolve device-id "expand-pointer-binding"))
                        logical-or-physical-args)
-                     call (kcall/make artifact ordered-args
+                     selected-artifact (if-let [dispatch (:dispatch step)]
+                                         (kdispatch/select-artifact
+                                          dispatch ordered-args reduction-strategy)
+                                         artifact)
+                     call (kcall/make selected-artifact ordered-args
                                       (if (= :reduce convention) {:group-count [1]} {}))]
                  [(assoc (bind-call-fn call) :phase (:phase step))])
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound

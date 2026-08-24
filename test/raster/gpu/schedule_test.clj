@@ -52,6 +52,9 @@
           "sugar and explicit override produce byte-identical schedules"))
     (testing "the default policy is f16-xmx (training AMP)"
       (is (= :f16-xmx (:precision derived))))
+    (testing "dynamic segmented reductions default to runtime shape selection"
+      (is (= {:strategy :auto :score-reuse-subgroup-multiple 16}
+             (:segmented-weighted-reduction derived))))
     (testing "a pinned override is recorded in :meta :overrides"
       (is (contains? (get-in (sched/resolve derived {:precision :f32-scalar}) [:meta :overrides])
                      :precision)))))
@@ -117,6 +120,19 @@
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown :stage :space"
                           (sched/feasible? (sched/resolve (sched/derive-default nil arc-desc)
                                                           {:stage {:space :regsiter}}) arc-desc))))
+  (testing "structured-reduction strategy and crossover are validated as schedule data"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unknown segmented"
+                          (sched/feasible?
+                           (sched/resolve (sched/derive-default nil arc-desc)
+                                          {:segmented-weighted-reduction {:strategy :guess}})
+                           arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
+                          (sched/feasible?
+                           (sched/resolve
+                            (sched/derive-default nil arc-desc)
+                            {:segmented-weighted-reduction
+                             {:score-reuse-subgroup-multiple 0}})
+                           arc-desc))))
   (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
                           (sched/resolve (sched/derive-default nil arc-desc)
