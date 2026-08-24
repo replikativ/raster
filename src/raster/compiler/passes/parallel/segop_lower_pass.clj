@@ -57,7 +57,7 @@
    NB success/failure is carried in an explicit `{:ok …}`/`{:err …}` rather than a truthy value: a
    SOAC node is a RECORD, and records satisfy `map?` and are always truthy, so a compact
    `or`/`if-let` version silently misread every successful lowering as a decline marker."
-  [sym form device-id dtype]
+  [sym form device-id dtype array-types]
   (when (seq? form)
     (let [par? (par/par-form? form)
           decline (fn [stage e] (when (contains? fatal-reasons (:reason (ex-data e))) (throw e))
@@ -85,7 +85,8 @@
             (seq (:ok segops)) (cond-> {:segops (:ok segops)}
                                  (soac-lower/scan-soac? (:ok soac))
                                  (assoc :kernel-graph
-                                        (soac-lower/scan-kernel-graph (:ok soac) (:ok segops))))
+                                        (soac-lower/scan-kernel-graph
+                                         (:ok soac) (:ok segops) {:array-types array-types})))
             :else (when par? {:declined (diagnostic sym form :segop
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))
@@ -125,6 +126,7 @@
           pairs (partition 2 bindings-vec)
           device-id (:target-device opts)
           dtype (:dtype opts)
+          array-types (:array-types opts)
           lowered (atom 0)
           graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
@@ -132,7 +134,7 @@
           ;; anyone diagnosing why a kernel took the legacy path.
           declined (atom [])
           attempt (fn [sym init]
-                    (let [r (lower-attempt sym init device-id dtype)]
+                    (let [r (lower-attempt sym init device-id dtype array-types)]
                       (when-let [d (:declined r)] (swap! declined conj d))
                       (when (:segops r) r)))
           ;; Annotate bindings with SegOp metadata

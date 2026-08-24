@@ -177,6 +177,20 @@
       (is (= 2 (count segops)))
       (is (every? #(instance? raster.compiler.ir.segop.SegRed %) segops)))))
 
+(deftest fused-scan-map-declines-until-the-epilogue-is-scheduled
+  (testing "a post-scan map is not silently dropped by scan decomposition"
+    (let [scan-soac (soac/par-form->soac
+                     'prefix
+                     '(raster.par/scan prefix acc 0.0 i n double (+ acc (aget a i)))
+                     0)
+          fused (assoc (soac/soac->screma scan-soac)
+                       :map-lambda '(* 2.0 (aget prefix i)))]
+      (try
+        (lower/lower-scan fused nil)
+        (is false "the fused epilogue must not be discarded")
+        (catch clojure.lang.ExceptionInfo e
+          (is (= :scan-fused-map-unimplemented (:reason (ex-data e)))))))))
+
 (deftest lower-nodes-map-test
   (testing "lower-soac-nodes processes all SOAC nodes"
     (let [pairs [['out '(raster.par/map! out i n double (aget a i))]

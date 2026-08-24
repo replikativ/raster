@@ -10,6 +10,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
@@ -19,6 +20,71 @@
         s (soac/par-form->soac 'result form 0)
         segops (lower/lower-reduce s nil)]
     (:source (sg/generate-segred-kernel (first segops) 'out :dtype :float))))
+
+(defn- emitted-scan-graph
+  ([form] (emitted-scan-graph form {}))
+  ([form opts]
+   (let [node (soac/par-form->soac 'scan-result form 71)
+         operations (lower/lower-scan node nil)
+         graph (lower/scan-kernel-graph node operations opts)]
+     (sg/generate-scan-kernel-graph graph
+                                    :scalar-types (:scalar-types opts)))))
+
+(deftest segscan-graph-emits-one-verified-artifact-per-scheduled-node
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc 0.0 i n double
+                                   (+ acc (* scale (clojure.core/aget values i))))
+                 {:array-types {'values :double 'out :double}
+                  :scalar-types {'scale :double}})
+        [intra block carry] (mapv :operation (:nodes emitted))]
+    (is (kgraph/kernel-graph? emitted))
+    (is (every? kart/kernel-artifact? [intra block carry]))
+    (is (= [:intra-block :block-scan :carry-in]
+           (mapv #(get-in % [:attributes :phase]) [intra block carry])))
+    (testing "stage 1 owns both the result and graph temporary in one exact ABI"
+      (is (= [:temporary :result :operand :parameter :bound]
+             (mapv :role (:abi intra))))
+      (is (= '[scale n] (take-last 2 (:arguments intra))))
+      (is (re-find #"value = \(double\).*scale.*values\[idx\]" (:source intra))))
+    (testing "block totals are scanned in one chunked workgroup for unbounded symbolic sizes"
+      (is (= [1] (get-in block [:launch :group-count])))
+      (is (re-find #"for \(int base = 0; base < _n_bound; base \+= 256\)" (:source block))))
+    (testing "carry consumes the scanned total of the preceding block"
+      (is (re-find #"block_totals_.*\[block - 1\].*out_\[idx\]" (:source carry))))
+    (testing "entry-point names are valid C identifiers"
+      (is (every? #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" (:kernel-name %))
+                  [intra block carry])))
+    (let [[intra-node block-node carry-node] (:nodes emitted)]
+      (is (= [(:id intra-node)] (:dependencies block-node)))
+      (is (= (mapv :id [intra-node block-node]) (:dependencies carry-node))
+          "target lowering preserves the verified schedule"))))
+
+(deftest segscan-artifact-abi-preserves-mixed-input-storage
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc 0.0 i n double
+                                   (+ acc (double (clojure.core/aget values i))))
+                 {:array-types {'values :int 'out :double}})
+        intra (get-in emitted [:nodes 0 :operation])
+        values-slot (first (filter #(= 'values (:name %)) (:abi intra)))]
+    (is (= :int (:dtype values-slot)))
+    (is (= :int (:kernel-dtype values-slot)))
+    (is (re-find #"__global const int\* restrict values" (:source intra)))))
+
+(deftest small-segscan-emits-the-degenerate-one-artifact-graph
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc 0.0 i 64 double (+ acc (aget values i))))
+        artifact (get-in emitted [:nodes 0 :operation])]
+    (is (= 1 (count (:nodes emitted))))
+    (is (= :single (get-in artifact [:attributes :phase])))
+    (is (= [1] (get-in artifact [:launch :group-count])))
+    (is (not (re-find #"block_totals" (:source artifact))))))
+
+(deftest segscan-carry-emits-the-certified-combine
+  (let [emitted (emitted-scan-graph
+                 '(raster.par/scan out acc 1.0 i n double (* acc (aget values i))))
+        carry (get-in emitted [:nodes 2 :operation])]
+    (is (re-find #"block_totals_.*\[block - 1\] \* out_\[idx\]" (:source carry))
+        "carry propagation must use the certified monoid, not a hard-coded addition")))
 
 ;; ================================================================
 ;; Silently-ignored-information family: a SegRed combine that the
@@ -46,12 +112,12 @@
 (deftest segred-devirtualized-aget-lowers-to-subscript
   (testing "the parametric (.invk aget-impl …) shape — the qlinear-k side of #55"
     (let [aget-invk (with-meta (list '.invk 'raster.arrays/aget_m_floats_long-impl 'a 'j)
-                               {:raster.op/original 'raster.arrays/aget
-                                :raster.type/tag 'float})
+                      {:raster.op/original 'raster.arrays/aget
+                       :raster.type/tag 'float})
           plus-invk (with-meta (list '.invk 'raster.numeric/_plus__m_double_double-impl
                                      'acc (list 'double aget-invk))
-                               {:raster.op/original 'raster.numeric/+
-                                :raster.type/tag 'double})
+                      {:raster.op/original 'raster.numeric/+
+                       :raster.type/tag 'double})
           src (segred-source plus-invk)]
       (is (not (re-find #"gpufn_aget" src))
           "devirtualized aget must normalize to a subscript, not a helper call")
@@ -65,7 +131,7 @@
 
 (deftest segred-emits-complete-ordered-typed-abi
   (let [form (with-meta '(raster.par/reduce acc 0.0 i n
-                                           (+ (float acc) (* scale (clojure.core/aget a i))))
+                                            (+ (float acc) (* scale (clojure.core/aget a i))))
                {:raster.type/elem-type :float})
         s (soac/par-form->soac 'result form 0)
         segred (first (lower/lower-reduce s nil))

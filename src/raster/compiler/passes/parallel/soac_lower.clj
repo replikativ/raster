@@ -9,11 +9,12 @@
            Phase 1: block-local shared-memory tree reduction
            Phase 2: cross-block reduction of partial results
   Scan → single-phase (n ≤ block-size) or three-stage (large n):
-         Stage 1: intra-block Blelloch scan
+         Stage 1: intra-block workgroup scan
          Stage 2: scan of block totals
-         Stage 3: carry-in addition (SegMap)"
+         Stage 3: carry-in combination (SegMap)"
   (:require [clojure.set :as set]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
@@ -29,6 +30,18 @@
 (defn- phase-grid
   [segop-type device-id bound-expr dtype]
   (segop/compute-launch-params segop-type device-id bound-expr :dtype dtype))
+
+(defn- scan-grid
+  "A scan needs one workgroup per contiguous block. Unlike map/reduce it cannot cap the grid and
+   recover coverage with a grid-stride loop because block prefixes are ordered dataflow."
+  [device-id bound-expr dtype]
+  (let [planned (phase-grid :scan device-id bound-expr dtype)
+        block-size (:block-size planned)]
+    (segop/->KernelGrid
+     (list 'int (list 'Math/ceil
+                      (list '/ (list 'double bound-expr) (double block-size))))
+     block-size
+     (:shared-mem-bytes planned))))
 
 (defn- single-block-grid
   [grid]
@@ -142,22 +155,28 @@
   "Lower a SoacScan/Screma-scan to SegScan SegOps.
 
   Decision criteria:
-    - n ≤ block-size → single-phase intra-block Blelloch scan
+    - n ≤ block-size → single-phase intra-block workgroup scan
     - n > block-size → three-stage:
-        Stage 1 (:intra-block): Blelloch scan within each block,
+        Stage 1 (:intra-block): scan within each block,
                  last element = block total
-        Stage 2 (:block-scan): scan of block totals (recursive)
-        Stage 3 (:carry-in): add carry-in to each element (SegMap)
+        Stage 2 (:block-scan): ordered scan of block totals
+        Stage 3 (:carry-in): combine carry-in with each element (SegMap)
 
   Returns a vector of SegScan/SegMap records."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)
         bound (:bound soac)
         idx (:idx soac)
-        scan-op (scan-op-info soac)
+        raw-scan-op (scan-op-info soac)
         map-lambda (screma-map-lambda soac)
+        _ (when map-lambda
+            (throw (ex-info "fused scan/map needs an explicit scheduled scan epilogue"
+                            {:reason :scan-fused-map-unimplemented
+                             :scan-op raw-scan-op :map-lambda map-lambda})))
+        scan-facts (scan/certify raw-scan-op dtype)
+        scan-op (assoc raw-scan-op :algebra scan-facts)
         space (segop/make-seg-space idx bound)
-        grid-1 (phase-grid :scan device-id bound dtype)
+        grid-1 (scan-grid device-id bound dtype)
         execution (execution-plan/scan-execution bound grid-1)]
     (case (:strategy execution)
       :single
@@ -199,10 +218,12 @@
             level-3 (segop/->SegLevel :thread :virtual)
             out-sym (or (:out scan-op) (first (soac-outputs* soac)))
             block-idx-expr (list 'clojure.core/quot carry-idx (:block-size grid-1))
+            combine (:combine scan-facts)
             carry-lambda (list 'if (list '> block-idx-expr 0)
-                               (list '+ (list 'aget out-sym carry-idx)
+                               (list combine
                                      (list 'aget totals-sym
-                                           (list 'clojure.core/- block-idx-expr 1)))
+                                           (list 'clojure.core/- block-idx-expr 1))
+                                     (list 'aget out-sym carry-idx))
                                (list 'aget out-sym carry-idx))
             stage-3 (segop/->SegMap (+ (:id soac) 3000)
                                     carry-space level-3
@@ -218,31 +239,41 @@
 
    This consumes the exact SegOps returned by `lower-scan`; it must not lower a second time because
    the block-totals buffer identity is generated during decomposition."
-  [soac segops]
-  (let [external (set/union (or (:inputs soac) #{}) (or (soac-outputs* soac) #{}))
-        used (reduce set/union #{}
-                     (map #(set/union (or (segop/segop-inputs %) #{})
-                                      (or (segop/segop-outputs %) #{}))
-                          segops))
-        temporary-ids (set/difference used external)
-        block-stage (some #(when (= :block-scan (:phase %)) %) segops)
-        temporary-elements (when block-stage
-                             (:bound (segop/seg-space-reduced-dim (:space block-stage))))
-        dtype (or (:elem-type soac) (:dtype (first segops)) :double)
-        temporaries (into {}
-                          (map (fn [id]
-                                 [id {:dtype dtype :elements temporary-elements
-                                      :memory-space :device}]))
-                          temporary-ids)]
-    (kernel-graph/from-segops
-     segops
-     {:inputs (or (:inputs soac) #{})
-      :outputs (or (soac-outputs* soac) #{})
-      :temporaries temporaries
-      :dtype dtype
-      :effects {:memory-order :dependency-ordered}
-      :provenance {:dialect :segop :algorithm :scan :soac-id (:id soac)}
-      :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)}})))
+  ([soac segops]
+   (scan-kernel-graph soac segops {}))
+  ([soac segops {:keys [array-types] :or {array-types {}}}]
+   (let [external (set/union (or (:inputs soac) #{}) (or (soac-outputs* soac) #{}))
+         used (reduce set/union #{}
+                      (map #(set/union (or (segop/segop-inputs %) #{})
+                                       (or (segop/segop-outputs %) #{}))
+                           segops))
+         temporary-ids (set/difference used external)
+         block-stage (some #(when (= :block-scan (:phase %)) %) segops)
+         temporary-elements (when block-stage
+                              (:bound (segop/seg-space-reduced-dim (:space block-stage))))
+         dtype (or (:elem-type soac) (:dtype (first segops)) :double)
+         temporaries (into {}
+                           (map (fn [id]
+                                  [id {:dtype dtype :elements temporary-elements
+                                       :memory-space :device}]))
+                           temporary-ids)
+         buffer-specs (into {}
+                            (map (fn [id]
+                                   [id {:dtype (or (get array-types id)
+                                                   (get array-types (symbol (name id)))
+                                                   dtype)}]))
+                            external)]
+     (kernel-graph/from-segops
+      segops
+      {:inputs (or (:inputs soac) #{})
+       :outputs (or (soac-outputs* soac) #{})
+       :temporaries temporaries
+       :buffer-specs buffer-specs
+       :dtype dtype
+       :effects {:memory-order :dependency-ordered}
+       :provenance {:dialect :segop :algorithm :scan :soac-id (:id soac)}
+       :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)
+                    :scan-algebra (get-in (first segops) [:scan-op :algebra])}}))))
 
 (defn scan-soac?
   "True when a SOAC/Screma node selects scan decomposition."

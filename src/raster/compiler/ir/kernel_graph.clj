@@ -191,6 +191,14 @@
     :or {inputs [] outputs [] temporaries [] nodes [] effects {} provenance {} attributes {}}}]
   (validate! (->KernelGraph inputs outputs temporaries nodes effects provenance attributes)))
 
+(defn map-operations
+  "Replace each scheduled operation while preserving and revalidating graph dataflow. `f` receives
+   the complete ScheduledKernel, so target lowering can use phase-local uses and provenance."
+  [graph f]
+  (let [graph (validate! graph)]
+    (validate! (update graph :nodes
+                       #(mapv (fn [node] (assoc node :operation (f node))) %)))))
+
 (defn- ordered [xs]
   (vec (sort-by pr-str xs)))
 
@@ -206,8 +214,10 @@
    `temporaries` is a map from stable buffer identity to at least `{:elements expr}`. External
    inputs/outputs are explicit; therefore a newly introduced intermediate can never hide as an
    undeclared symbol in a later kernel."
-  [segops {:keys [inputs outputs temporaries dtype memory-space effects provenance attributes]
-           :or {temporaries {} memory-space :device effects {} provenance {} attributes {}}}]
+  [segops {:keys [inputs outputs temporaries buffer-specs dtype memory-space effects provenance
+                  attributes]
+           :or {temporaries {} buffer-specs {} memory-space :device effects {} provenance {}
+                attributes {}}}]
   (when-not (vector? segops)
     (throw (ex-info "scheduled SegOps must be an ordered vector" {:segops segops})))
   (doseq [operation segops]
@@ -228,13 +238,16 @@
                       {:expected expected-temporaries :declared temporary-ids})))
     (let [external-buffers (into {}
                                  (map (fn [id]
-                                        [id (buffer id dtype nil memory-space
-                                                    (cond
-                                                      (contains? (set/intersection input-ids
-                                                                                   output-ids) id)
-                                                      :inout
-                                                      (contains? input-ids id) :input
-                                                      :else :output))]))
+                                        (let [spec (get buffer-specs id)]
+                                          [id (buffer id (or (:dtype spec) dtype)
+                                                      (:elements spec)
+                                                      (or (:memory-space spec) memory-space)
+                                                      (cond
+                                                        (contains? (set/intersection input-ids
+                                                                                     output-ids) id)
+                                                        :inout
+                                                        (contains? input-ids id) :input
+                                                        :else :output))])))
                                  (ordered external-ids))
           inputs* (mapv external-buffers (ordered input-ids))
           outputs* (mapv external-buffers (ordered output-ids))

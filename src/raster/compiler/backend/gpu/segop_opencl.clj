@@ -19,7 +19,9 @@
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.scan :as scan]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -139,7 +141,7 @@
                    (map (fn [s]
                           (let [written? (contains? written (symbol (name s)))
                                 extra-output? (and written? (not (contains? input-name-set
-                                                                           (symbol (name s)))))]
+                                                                            (symbol (name s)))))]
                             (kabi/slot s (if extra-output? :output :input) (arr-dtype s)
                                        :c-name (ce/c-symbol s)
                                        :role (cond extra-output? :secondary-result
@@ -148,7 +150,7 @@
                         arr-params)
                    [(kabi/slot out-sym :output out-dtype :c-name "out" :role :result)]
                    (map #(kabi/slot % :scalar (scalar-dtype %)
-                                   :c-name (ce/c-symbol %) :role :parameter)
+                                    :c-name (ce/c-symbol %) :role :parameter)
                         scl-params)
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         source (str (apply codegen/extension-pragmas out-dtype (map arr-dtype arr-params))
@@ -329,7 +331,7 @@
                         arr-params)
                    [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
                    (map #(kabi/slot % :scalar (scalar-dtype %)
-                                   :c-name (ce/c-symbol %) :role :parameter)
+                                    :c-name (ce/c-symbol %) :role :parameter)
                         scl-params)
                    [(kabi/slot '_n_bound :scalar :int :role :bound)])))
         ;; Static shared memory is part of the artifact launch contract (no dynamic-local ABI slot).
@@ -381,6 +383,224 @@
                    :n-phases 2
                    :identity-val identity-val
                    :c-op c-op}})))
+
+;; ================================================================
+;; KernelGraph scan → OpenCL KernelArtifacts
+;; ================================================================
+
+(defn- scan-c-combine
+  [combine dtype]
+  (let [op (symbol (name combine))
+        floating? (contains? #{:float :double} dtype)
+        token (case op
+                + "+"
+                * "*"
+                bit-and "&"
+                bit-or "|"
+                bit-xor "^"
+                min (if floating? "fmin" "min")
+                max (if floating? "fmax" "max")
+                (throw (ex-info "certified scan combine has no OpenCL lowering"
+                                {:reason :scan-combine-not-emittable
+                                 :combine combine :dtype dtype})))]
+    (fn [left right]
+      (if (contains? #{"fmin" "fmax" "min" "max"} token)
+        (str token "(" left ", " right ")")
+        (str "(" left " " token " " right ")")))))
+
+(defn- scan-c-identity
+  [identity dtype]
+  (cond
+    (contains? #{'Double/POSITIVE_INFINITY 'Float/POSITIVE_INFINITY} identity) "INFINITY"
+    (contains? #{'Double/NEGATIVE_INFINITY 'Float/NEGATIVE_INFINITY} identity) "-INFINITY"
+    (number? identity) (if (= :float dtype) (str (float identity) "f") (str identity))
+    (and (seq? identity) (= 2 (count identity)) (number? (second identity)))
+    (scan-c-identity (second identity) dtype)
+    :else (throw (ex-info "certified scan identity has no OpenCL literal"
+                          {:reason :scan-identity-not-emittable
+                           :identity identity :dtype dtype}))))
+
+(defn generate-scan-kernel-graph
+  "Target-lower a certified scheduled scan graph into a graph of verified KernelArtifacts.
+
+   The graph remains the owner of buffers and dependencies. Each node artifact owns exactly one
+   OpenCL entry point, ordered ABI, arguments, and launch. No runtime marker convention is involved
+   in this conversion. The block-totals kernel deliberately scans arbitrarily many totals in
+   workgroup-sized chunks, so symbolic input sizes do not require an unrolled recursive graph."
+  [graph & {:keys [kernel-name-prefix scalar-types]
+            :or {kernel-name-prefix "segscan" scalar-types {}}}]
+  (let [graph (kgraph/validate! graph)
+        algebra (get-in graph [:attributes :scan-algebra])
+        _ (when-not (scan/associative-scan? algebra)
+            (throw (ex-info "scan KernelGraph lacks certified associative algebra"
+                            {:reason :uncertified-scan-graph :algebra algebra})))
+        _ (when-not (= 1 (count (:outputs graph)))
+            (throw (ex-info "scan artifact lowering requires exactly one graph output"
+                            {:reason :scan-multi-output-unimplemented
+                             :outputs (mapv :id (:outputs graph))})))
+        dtype (:dtype algebra)
+        ctype (dt/ctype :opencl dtype)
+        combine-c (scan-c-combine (:combine algebra) dtype)
+        identity-c (scan-c-identity (:identity algebra) dtype)
+        buffers (into {} (map (juxt :id identity))
+                      (concat (:inputs graph) (:outputs graph) (:temporaries graph)))
+        temporary-ids (set (map :id (:temporaries graph)))
+        output-ids (set (map :id (:outputs graph)))
+        first-scan (some #(when (segop/segop? (:operation %))
+                            (when (:scan-op (:operation %)) (:operation %)))
+                         (:nodes graph))
+        scan-workgroup (or (get-in first-scan [:grid :block-size]) 256)
+        scalar-dtype (fn [sym]
+                       (or (get scalar-types sym)
+                           (get scalar-types (symbol (name sym)))
+                           dtype))
+        emit-node
+        (fn [{:keys [id operation uses]}]
+          (let [phase (or (:phase operation) :carry-in)
+                bound (seg-bound operation)
+                workgroup (or (get-in operation [:grid :block-size]) scan-workgroup)
+                pointer-ids (mapv :buffer uses)
+                scalar-ids (vec (sort-by name (:scalars operation)))
+                pointer-slots
+                (mapv (fn [{:keys [buffer access]}]
+                        (let [spec (get buffers buffer)
+                              output? (contains? #{:write :read-write} access)]
+                          (kabi/slot buffer (if output? :output :input) (:dtype spec)
+                                     :c-name (ce/c-symbol buffer)
+                                     :role (cond
+                                             (contains? temporary-ids buffer) :temporary
+                                             (and output? (contains? output-ids buffer)) :result
+                                             (= :read-write access) :inout
+                                             :else :operand))))
+                      uses)
+                scalar-slots (mapv #(kabi/slot % :scalar (scalar-dtype %)
+                                               :c-name (ce/c-symbol %) :role :parameter)
+                                   scalar-ids)
+                bound-slot (kabi/slot '_n_bound :scalar :int :role :bound)
+                abi (kabi/validate! (vec (concat pointer-slots scalar-slots [bound-slot])))
+                pointer-param
+                (fn [slot]
+                  (str "__global " (when (= :input (:kind slot)) "const ")
+                       (dt/ctype :opencl (:kernel-dtype slot)) "* restrict " (:c-name slot)))
+                scalar-param
+                (fn [slot]
+                  (str (dt/ctype :opencl (:kernel-dtype slot)) " " (:c-name slot)))
+                params (str/join ", "
+                                 (concat (map pointer-param pointer-slots)
+                                         (map scalar-param scalar-slots)
+                                         ["int _n_bound"]))
+                kernel-name (str kernel-name-prefix "_" (str/replace (name phase) "-" "_")
+                                 "_" (gensym ""))
+                totals-id (first (filter temporary-ids pointer-ids))
+                out-id (first (filter output-ids pointer-ids))
+                totals-c (some-> totals-id ce/c-symbol)
+                out-c (some-> out-id ce/c-symbol)
+                idx (or (some-> operation :space segop/seg-space-reduced-dim :name) 'idx)
+                input-ids (vec (:inputs operation))
+                int-scalars (set (keep #(when (= :int (scalar-dtype %)) %) scalar-ids))
+                element (:element algebra)
+                element-c
+                (when (contains? #{:single :intra-block} phase)
+                  (binding [ce/*emit-config* ce/opencl-config
+                            ce/*scalar-type* ctype
+                            ce/*idx-sym* idx
+                            ce/*int-vars* (into ce/*int-vars* int-scalars)]
+                    (ce/emit-expr (ce/adapt-casts-for-dtype
+                                   (ce/normalize-array-prims element) dtype)
+                                  idx (set (map #(symbol (name %)) input-ids)) "idx")))
+                source-body
+                (case phase
+                  (:single :intra-block)
+                  (str "    __local " ctype " sdata[" workgroup "];\n"
+                       "    int tid = get_local_id(0);\n"
+                       "    int block = get_group_id(0);\n"
+                       "    int base = block * " workgroup ";\n"
+                       "    int idx = base + tid;\n"
+                       "    " ctype " value = " identity-c ";\n"
+                       "    if (idx < _n_bound) value = (" ctype ")(" element-c ");\n"
+                       "    sdata[tid] = value;\n"
+                       "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    for (int offset = 1; offset < " workgroup "; offset <<= 1) {\n"
+                       "        " ctype " self = sdata[tid];\n"
+                       "        " ctype " left = " identity-c ";\n"
+                       "        if (tid >= offset) left = sdata[tid - offset];\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "        if (tid >= offset) sdata[tid] = " (combine-c "left" "self") ";\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    }\n"
+                       "    if (idx < _n_bound) " out-c "[idx] = sdata[tid];\n"
+                       (when totals-c
+                         (str "    if (tid == 0) {\n"
+                              "        int valid = min(" workgroup ", _n_bound - base);\n"
+                              "        " totals-c "[block] = sdata[valid - 1];\n"
+                              "    }\n")))
+
+                  :block-scan
+                  (str "    __local " ctype " sdata[" workgroup "];\n"
+                       "    __local " ctype " carry;\n"
+                       "    int tid = get_local_id(0);\n"
+                       "    if (tid == 0) carry = " identity-c ";\n"
+                       "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    for (int base = 0; base < _n_bound; base += " workgroup ") {\n"
+                       "        int idx = base + tid;\n"
+                       "        sdata[tid] = (idx < _n_bound) ? " totals-c "[idx] : " identity-c ";\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "        for (int offset = 1; offset < " workgroup "; offset <<= 1) {\n"
+                       "            " ctype " self = sdata[tid];\n"
+                       "            " ctype " left = " identity-c ";\n"
+                       "            if (tid >= offset) left = sdata[tid - offset];\n"
+                       "            barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "            if (tid >= offset) sdata[tid] = " (combine-c "left" "self") ";\n"
+                       "            barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "        }\n"
+                       "        " ctype " prefix = carry;\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "        if (idx < _n_bound) " totals-c "[idx] = "
+                       (combine-c "prefix" "sdata[tid]") ";\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "        if (tid == 0) {\n"
+                       "            int valid = min(" workgroup ", _n_bound - base);\n"
+                       "            carry = " (combine-c "prefix" "sdata[valid - 1]") ";\n"
+                       "        }\n"
+                       "        barrier(CLK_LOCAL_MEM_FENCE);\n"
+                       "    }\n")
+
+                  :carry-in
+                  (str "    int stride = get_global_size(0);\n"
+                       "    for (int idx = get_global_id(0); idx < _n_bound; idx += stride) {\n"
+                       "        int block = idx / " scan-workgroup ";\n"
+                       "        if (block > 0) " out-c "[idx] = "
+                       (combine-c (str totals-c "[block - 1]") (str out-c "[idx]")) ";\n"
+                       "    }\n")
+
+                  (throw (ex-info "scheduled scan node has no target lowering"
+                                  {:reason :scan-phase-not-emittable :phase phase :node id})))
+                source (str (apply codegen/extension-pragmas
+                                   dtype (map :dtype (keep buffers pointer-ids)))
+                            "__kernel void " kernel-name "(" params ") {\n"
+                            source-body
+                            "}\n")
+                group-count (case phase
+                              (:single :block-scan) [1]
+                              :intra-block [(klaunch/ceil-div bound workgroup)]
+                              :carry-in [(klaunch/ceil-div bound workgroup)])
+                shared-bytes (if (= :carry-in phase) 0 (* workgroup (dt/bytes-of dtype)))]
+            (kart/make
+             {:kernel-name kernel-name
+              :source source
+              :abi abi
+              :arguments (vec (concat pointer-ids scalar-ids [bound]))
+              :launch (klaunch/spec {:workgroup-size [workgroup]
+                                     :group-count group-count
+                                     :shared-memory-bytes shared-bytes})
+              :temporaries []
+              :effects {:kind :scan-stage :phase phase}
+              :provenance {:dialect :segscan :segop-id (:id operation) :graph-node id}
+              :attributes {:phase phase :dtype dtype :scan-workgroup scan-workgroup}})))]
+    (-> (kgraph/map-operations graph emit-node)
+        (assoc-in [:provenance :target-dialect] :opencl-c)
+        (assoc-in [:attributes :emitted?] true)
+        kgraph/validate!)))
 
 ;; ================================================================
 ;; Segmented reduction (contraction) → OpenCL — the multi-axis SegSpace path
@@ -1235,25 +1455,25 @@
                  ;; fp64/fp16 need their OpenCL extension enabled. All three sibling emitters emit
                  ;; this; the staged one did not, so a :double staged contraction — reachable from
                  ;; opencl_pass, whose default dtype IS :double — emitted `double` with no pragma.
-                 (codegen/extension-pragmas out-dtype dtype)
+             (codegen/extension-pragmas out-dtype dtype)
                  ;; registry-driven, not `(intrinsics/descriptor 'dp4a)`: define every intrinsic
                  ;; helper this body actually calls — the same scan every other emitter uses
-                 (ce/intrinsic-helper-sources nest)
-                 (when ep (:epilogue-helpers ep))
-                 "__kernel void " kernel-name "(" params ") {\n"
-                 "    int seg = get_global_id(0);\n"
-                 "    if (seg >= _nseg) return;\n"
-                 (flat-decompose-c free-axes) "\n"
-                 nest
-                 "    out[seg] = "
-                 (let [acc (str "(" out-ctype ")" (acc-name 0))]
-                   (if ep
-                     ((:epilogue ep) acc
-                      (ce/c-symbol (first (first free-axes)))
-                      (ce/c-symbol (first (second free-axes))))
-                     acc))
-                 ";\n"
-                 "}\n")]
+             (ce/intrinsic-helper-sources nest)
+             (when ep (:epilogue-helpers ep))
+             "__kernel void " kernel-name "(" params ") {\n"
+             "    int seg = get_global_id(0);\n"
+             "    if (seg >= _nseg) return;\n"
+             (flat-decompose-c free-axes) "\n"
+             nest
+             "    out[seg] = "
+             (let [acc (str "(" out-ctype ")" (acc-name 0))]
+               (if ep
+                 ((:epilogue ep) acc
+                                 (ce/c-symbol (first (first free-axes)))
+                                 (ce/c-symbol (first (second free-axes))))
+                 acc))
+             ";\n"
+             "}\n")]
     {:kernel-name kernel-name :source src
      :array-params (vec inputs)
      :abi (kabi/validate!
