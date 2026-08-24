@@ -38,7 +38,8 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.pipeline :as pl]
-            [raster.core :as rcore]))
+            [raster.core :as rcore]
+            [raster.gpu.measurement :as measurement]))
 
 ;; ================================================================
 ;; Backend dispatch
@@ -1581,11 +1582,10 @@
                      differently-named params (rename both onto one key + :reuse-buffers), or
                      keep two same-named params separate (rename one away from the collision).
                      run-program!/upload!/download address the renamed buffer by the new key.
-     :profile?       record the graph in PROFILING mode: a kernel-timestamp device event per
-                     launch (Level-Zero only). profile-program! then returns per-kernel device
-                     times. Opt-in: without it the recorded graph is exactly the fast path
-                     (no events, no overhead); run-program! on a profiled program still works
-                     (it resets the events after each replay).
+     :profile?       record the graph in PROFILING mode: a device-timestamp event per launch.
+                     Level Zero and OpenCL expose the same profile-program! contract. Opt-in:
+                     without it the recorded graph is exactly the fast path (no profiling queue,
+                     events, or overhead); run-program! on a profiled program still works.
 
    :gemm steps bind per the resolved S6 schedule's precision — [:schedule :precision] (set at
    compile time by compile-gpu-program, default :f16-xmx). :gemm-precision on the descriptor is a
@@ -2017,9 +2017,9 @@
                                   ;; (includes inter-kernel gaps = dispatch/barrier overhead)
       :host-wall-ms    double}    ;; System/nanoTime around the replay call, for comparison
 
-   Device kernel times come from Level-Zero kernel-timestamp events (immune to host scheduling
-   and far more stable under platform power-state swings than host wall time). Throws if the
-   program was not bound with {:profile? true}."
+   Device kernel times come from backend timestamp events (Level Zero or OpenCL), immune to host
+   scheduling and far more stable under platform power-state swings than host wall time. Throws
+   if the program was not bound with {:profile? true}."
   [sess prog-or-handle args]
   (let [{:keys [descriptor roles graph param->key result-key profile?]}
         (resolve-program sess prog-or-handle)
@@ -2047,6 +2047,62 @@
        :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
        :device-wall-ms (:wall-ms prof)
        :host-wall-ms (/ (- t1 t0) 1.0e6)})))
+
+(defn measure-graph!
+  "Repeatedly measure a PROFILING runtime graph with backend device events.
+
+   This is the backend-neutral autotune ruler. It delegates sampling discipline and the stable
+   Measurement value to raster.gpu.measurement, while the selected runtime supplies replay and
+   timestamp conversion. It never falls back to host wall time.
+
+   `:before-sample!`, when supplied, runs before EVERY replay (including warmup/probe) and is the
+   explicit restore seam for stateful candidates. Other options are forwarded to
+   measurement/measure!, including :budget-ms, :warmup-iterations, :flush-fn, :cold-warm,
+   :compile-ms, and :hashes."
+  [sess graph & {:keys [before-sample!] :as opts}]
+  (let [device-id (:device-id @sess)
+        replay-fn (rt-resolve device-id "replay-graph!")
+        read-ts-fn (rt-resolve device-id "read-graph-timestamps!")
+        sample-fn (fn []
+                    (when before-sample! (before-sample!))
+                    (replay-fn graph)
+                    (let [wall-ms (:wall-ms (read-ts-fn graph))]
+                      (when-not (and (number? wall-ms)
+                                     (Double/isFinite (double wall-ms))
+                                     (not (neg? (double wall-ms))))
+                        (throw (ex-info "device graph profiler returned no finite wall duration"
+                                        {:device-id device-id :wall-ms wall-ms})))
+                      (* 1.0e6 (double wall-ms))))
+        measurement-opts (-> opts
+                             (dissoc :before-sample!)
+                             (assoc :timing-source :device-event))]
+    (apply measurement/measure! sample-fn (mapcat identity measurement-opts))))
+
+(defn measure-program!
+  "Explicit offline device-event measurement of a bound resident program.
+
+   The program must have been bound with {:profile? true}. Inputs upload once before sampling;
+   output downloads are intentionally absent because they are not part of device timing. The
+   autotuner must validate a candidate against its oracle before calling this function.
+
+   A program with a :state resident role requires :before-sample! so repeated timing cannot
+   silently benchmark successively mutated state. Pure/output-only programs need no restore hook.
+   Returns a raster.gpu.measurement/Measurement."
+  [sess prog-or-handle args & {:keys [before-sample!] :as opts}]
+  (let [{:keys [descriptor roles graph param->key profile?]}
+        (resolve-program sess prog-or-handle)
+        {:keys [all-params array-params]} descriptor
+        argmap (zipmap all-params args)]
+    (when-not profile?
+      (throw (ex-info "measure-program!: program was not bound with {:profile? true}"
+                      {:program (or (::program-key prog-or-handle) :program)})))
+    (when (and (some #(= :state %) (vals roles)) (nil? before-sample!))
+      (throw (ex-info "measure-program!: stateful programs require :before-sample! restoration"
+                      {:state-params (into #{} (keep (fn [[sym role]]
+                                                       (when (= :state role) sym))) roles)})))
+    (doseq [param array-params :when (= :input (get roles param :input))]
+      (upload! sess (get param->key param) (get argmap param)))
+    (apply measure-graph! sess graph (mapcat identity opts))))
 
 (defn sync-to-arrays!
   "Download GPU buffers back into JVM arrays.
