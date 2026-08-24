@@ -203,7 +203,7 @@
       :byte-size (:byte-size buffer)
       :memory-space (or (:memory-space opts) (case backend :ze :shared :ocl :device))
       :device device-id
-      :alignment (or (:alignment opts) 1)
+      :alignment (or (:alignment opts) (:alignment buffer) 1)
       :coherence (or (:coherence opts)
                      (case backend :ze :host-coherent :ocl :explicit-transfer))
       :ownership ownership})))
@@ -232,8 +232,8 @@
 
 (defn- destroy-kernel-graph-entry!
   "Destroy one bound graph's backend recording, dedicated kernel handles and graph-owned
-   temporaries. External buffers remain session-owned and are never freed here."
-  [device-id {:keys [runtime-graph prepareds temporary-buffers]}]
+   temporaries/view handles. External root buffers remain session-owned and are never freed here."
+  [device-id {:keys [runtime-graph prepareds owned-view-buffers temporary-buffers]}]
   (let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")
         destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
     (when (and destroy-graph! runtime-graph)
@@ -241,6 +241,12 @@
     (when destroy-prepared!
       (doseq [prepared prepareds]
         (try (destroy-prepared! prepared) (catch Exception _))))
+    ;; OpenCL cl_mem sub-buffers are independently reference-counted native objects. Kernel
+    ;; bindings must die first because their argument state still refers to these handles.
+    (when (seq owned-view-buffers)
+      (let [free! (rt-resolve device-id "free-buffer!")]
+        (doseq [buffer owned-view-buffers]
+          (try (free! buffer) (catch Exception _)))))
     (when (seq temporary-buffers)
       (free-buffers-internal! temporary-buffers device-id))))
 
@@ -1000,12 +1006,37 @@
       (throw (ex-info "kernel ABI cannot reinterpret a resident buffer dtype"
                       {:buffer-dtype raw-dtype :view-dtype view-dtype :view (:id view)})))
     (if (zero? (:byte-offset view))
-      buffer
+      {:buffer buffer :owned-view? false}
       (case (backend-type device-id)
-        :ze ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
-                                                   (:byte-length view) view-dtype)
-        :ocl (throw (ex-info "OpenCL non-zero-offset kernel views require a legal cl_mem sub-buffer"
-                             {:view (:id view) :byte-offset (:byte-offset view)}))))))
+        :ze {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
+                                                            (:byte-length view) view-dtype)
+             :owned-view? false}
+        :ocl {:buffer ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
+                                                             (:byte-length view) view-dtype)
+              :owned-view? true}))))
+
+(defn- materialize-external-buffers!
+  "Turn checked external BufferViews into backend ABI buffers. Level Zero slices are non-owning
+   pointers. OpenCL slices are owned cl_mem sub-buffers and are transactionally released if any
+   later view fails to materialize."
+  [device-id external-bindings]
+  (let [owned (volatile! [])]
+    (try
+      {:buffers
+       (into {}
+             (map (fn [[id {:keys [buffer view]}]]
+                    (let [{runtime-buffer :buffer owned-view? :owned-view?}
+                          (runtime-buffer-for-view device-id buffer view)]
+                      (when owned-view? (vswap! owned conj runtime-buffer))
+                      [id runtime-buffer])))
+             external-bindings)
+       :owned-view-buffers @owned}
+      (catch Exception e
+        (when (seq @owned)
+          (let [free! (rt-resolve device-id "free-buffer!")]
+            (doseq [buffer @owned]
+              (try (free! buffer) (catch Exception _)))))
+        (throw e)))))
 
 (defn- resolve-kernel-graph-entry
   [sess handle]
@@ -1115,21 +1146,21 @@
           _ (doseq [[id {:keys [view]}] external-bindings]
               (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
           _ (validate-physical-aliases! graph external-bindings)
-          external-buffers (into {}
-                                 (map (fn [[id {:keys [buffer view]}]]
-                                        [id (runtime-buffer-for-view device-id buffer view)]))
-                                 external-bindings)
           _ (release-graph-events! sess graph-key)
           temporary-specs (kgcall/temporary-specs graph scalar-values)
           temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
-          all-buffers (merge external-buffers temporary-buffers)
-          register! (rt-resolve device-id "register-kernel!")
-          bind-call! (rt-resolve device-id "bind-kernel-call")
-          record! (rt-resolve device-id "record-graph!")
+          owned-view-buffers (volatile! [])
           prepareds (volatile! [])
           runtime-graph (volatile! nil)]
       (try
-        (let [graph-call (kgcall/make graph all-buffers scalar-values)
+        (let [{:keys [buffers] :as materialized}
+              (materialize-external-buffers! device-id external-bindings)
+              _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
+              all-buffers (merge buffers temporary-buffers)
+              register! (rt-resolve device-id "register-kernel!")
+              bind-call! (rt-resolve device-id "bind-kernel-call")
+              record! (rt-resolve device-id "record-graph!")
+              graph-call (kgcall/make graph all-buffers scalar-values)
               execution-plan (execution/from-kernel-graph-call graph-call)]
           (doseq [node (:nodes graph)]
             (let [artifact (:operation node)]
@@ -1146,6 +1177,7 @@
                        :execution-plan execution-plan
                        :runtime-graph @runtime-graph
                        :prepareds @prepareds
+                       :owned-view-buffers @owned-view-buffers
                        :temporary-buffers temporary-buffers
                        :buffer-keys buffer-keys
                        :resident-views (into {} (map (fn [[id binding]]
@@ -1160,6 +1192,7 @@
           (destroy-kernel-graph-entry!
            device-id {:runtime-graph @runtime-graph
                       :prepareds @prepareds
+                      :owned-view-buffers @owned-view-buffers
                       :temporary-buffers temporary-buffers})
           (throw e))))))
 

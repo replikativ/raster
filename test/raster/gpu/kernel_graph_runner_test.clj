@@ -140,3 +140,83 @@
           (is (not-any? #(or (identical? values-buffer %)
                              (identical? output-buffer %))
                         @freed)))))))
+
+(deftest opencl-sub-buffer-handles-follow-the-graph-lifetime
+  (let [n 1025
+        n-bytes (* 4 n)
+        output-offset 4224
+        graph (emitted-graph)
+        root-buffer {:root true :dtype :float
+                     :n-elements (quot (+ output-offset n-bytes) 4)
+                     :byte-size (+ output-offset n-bytes)}
+        allocation (bview/allocation
+                    {:id :shared-allocation :byte-size (:byte-size root-buffer)
+                     :memory-space :device :device :ocl:0 :coherence :explicit-transfer
+                     :ownership :owned})
+        sess (atom {:device-id :ocl:0 :session-id :test-session
+                    :buffers {:storage root-buffer}
+                    :allocations {:storage allocation}
+                    :kernel-graphs {} :events {} :closed? false})
+        input (gpu/buffer-view sess :storage {:shape [n]})
+        output (gpu/buffer-view sess :storage {:byte-offset output-offset :shape [n]})
+        slices (atom [])
+        freed (atom [])
+        fail-bind? (atom false)
+        resolver
+        (fn [_device-id name]
+          (case name
+            "make-buffer" (fn [elements dtype]
+                            {:temporary true :n-elements elements
+                             :byte-size (* elements 4) :dtype dtype})
+            "array->buffer!" (fn [buffer _] buffer)
+            "buffer-as-float-buffer" identity
+            "buffer-as-int-buffer" identity
+            "slice-buffer" (fn [buffer byte-offset byte-length dtype]
+                             (let [slice {:sub-buffer true :parent buffer
+                                          :byte-offset byte-offset :byte-size byte-length
+                                          :n-elements (quot byte-length 4) :dtype dtype}]
+                               (swap! slices conj slice)
+                               slice))
+            "free-buffer!" #(swap! freed conj %)
+            "register-kernel!" (fn [& _])
+            "bind-kernel-call" (fn [call]
+                                 (when @fail-bind?
+                                   (throw (ex-info "mock bind failure" {})))
+                                 {:mock-call call})
+            "record-graph!" (fn [prepareds opts] {:prepareds prepareds :opts opts})
+            (throw (ex-info "unexpected mocked runtime function" {:name name}))))
+        soft-resolver (fn [_device-id name]
+                        (case name
+                          "destroy-graph!" (fn [_])
+                          "destroy-prepared!" (fn [_])
+                          nil))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft-resolver}
+      (fn []
+        (let [handle (gpu/bind-kernel-graph!
+                      sess :view-scan graph {'values input 'out output}
+                      {'n {:type :int :value n}})
+              sub-buffer (first @slices)
+              temporary (first (vals (get-in @sess [:kernel-graphs :view-scan
+                                                    :temporary-buffers])))]
+          (is (= 1 (count @slices)) "only the nonzero view needs a cl_mem sub-buffer")
+          (is (identical? sub-buffer (get-in @sess [:kernel-graphs :view-scan
+                                                    :outputs 'out])))
+          (gpu/release-kernel-graph! sess handle)
+          (is (= #{sub-buffer temporary} (set @freed)))
+          (is (not-any? #(identical? root-buffer %) @freed)
+              "the session-owned root allocation survives graph release"))
+        (reset! slices [])
+        (reset! freed [])
+        (reset! fail-bind? true)
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"mock bind failure"
+                              (gpu/bind-kernel-graph!
+                               sess :failed-view-scan graph {'values input 'out output}
+                               {'n {:type :int :value n}})))
+        (is (= 1 (count @slices)))
+        (is (= 2 (count @freed))
+            "failed binding releases both its created sub-buffer and temporary")
+        (is (some :sub-buffer @freed))
+        (is (some :temporary @freed))
+        (is (empty? (:kernel-graphs @sess)))))))
