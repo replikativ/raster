@@ -46,13 +46,17 @@
         registered (atom [])
         bound (atom [])
         recorded (atom [])
-        replayed (atom [])
+        submitted (atom [])
+        awaited (atom [])
+        released-events (atom [])
         destroyed-graphs (atom [])
         destroyed-prepareds (atom [])
         freed (atom [])
         sess (atom {:device-id :ze:0
+                    :session-id :test-session
                     :buffers {:values values-buffer :out output-buffer}
                     :kernel-graphs {}
+                    :events {}
                     :closed? false})
         resolver
         (fn [_device-id name]
@@ -72,7 +76,13 @@
                               (let [recording {:prepareds prepareds :opts opts}]
                                 (swap! recorded conj recording)
                                 recording))
-            "replay-graph!" #(swap! replayed conj %)
+            "submit-graph!" (fn [graph]
+                              (let [event {:submitted graph}]
+                                (swap! submitted conj event)
+                                event))
+            "await-event!" #(swap! awaited conj %)
+            "event-complete?" (constantly true)
+            "release-event!" #(swap! released-events conj %)
             (throw (ex-info "unexpected mocked runtime function" {:name name}))))
         soft-resolver
         (fn [_device-id name]
@@ -87,6 +97,16 @@
         (let [handle (gpu/bind-kernel-graph!
                       sess :prefix graph {'values :values 'out :out}
                       {'n {:type :int :value 1025}})
+              event (gpu/submit-kernel-graph! sess handle)
+              _ (is (gpu/gpu-event? event))
+              _ (is (gpu/event-complete? sess event))
+              _ (is (empty? @released-events)
+                    "a positive status query is not a host wait and must not consume the event")
+              _ (is (thrown-with-msg? clojure.lang.ExceptionInfo #"in-flight submission"
+                                      (gpu/submit-kernel-graph! sess handle)))
+              async-outputs (gpu/await-event! sess event)
+              _ (is (gpu/event-complete? sess event))
+              _ (gpu/release-event! sess event)
               outputs (gpu/run-kernel-graph! sess handle)
               temporary (first (vals (get-in @sess [:kernel-graphs :prefix
                                                     :temporary-buffers])))]
@@ -95,9 +115,17 @@
           (is (= 3 (count @bound)))
           (is (= 1 (count @recorded)))
           (is (= {:barriers? true} (get-in @recorded [0 :opts])))
-          (is (= 1 (count @replayed)))
+          (is (= 2 (count @submitted)))
+          (is (= @submitted @awaited @released-events))
+          (is (empty? (:events @sess)))
+          (is (identical? output-buffer (get async-outputs 'out)))
           (is (identical? output-buffer (get outputs 'out)))
+          (gpu/submit-kernel-graph! sess handle)
           (gpu/release-kernel-graph! sess handle)
+          (is (= 3 (count @submitted)))
+          (is (= @submitted @awaited @released-events)
+              "graph release waits and releases an in-flight submission")
+          (is (empty? (:events @sess)))
           (is (empty? (:kernel-graphs @sess)))
           (is (= 1 (count @destroyed-graphs)))
           (is (= 3 (count @destroyed-prepareds)))

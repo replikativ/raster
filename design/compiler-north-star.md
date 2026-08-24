@@ -309,6 +309,19 @@ graph:
 - graph instantiation/linking without recompiling shared kernels;
 - serialization of all non-live-resource state.
 
+Execution scheduling is a distinct backend-neutral lowering. An `ExecutionPlan`
+assigns operations to logical queue classes and connects them with logical
+wait/completion events. Compiler events are stable identities, never OpenCL,
+Level Zero, MPI, or vendor-library handles. A backend may initially realize the
+plan on one in-order compute queue, but it must retain the dependency DAG so
+later compute/transfer/collective overlap is a scheduling change rather than an
+ABI rewrite.
+
+The runtime event contract is submit, nonblocking status, host wait, and safe
+release. Completion owns the lifetime of every referenced graph, kernel,
+allocation, and view; destruction must first establish completion. Status
+observation alone is not assumed to establish host memory visibility.
+
 Device-to-device binding is the normal path. Host transfer is an explicit graph
 edge with a reason and byte count. The compiler's memory plan owns temporary
 liveness, reuse, alignment, and peak-memory accounting.
