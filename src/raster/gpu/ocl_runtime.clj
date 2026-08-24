@@ -100,6 +100,8 @@
 (def ^:private CL_MEM_READ_WRITE (long 1))
 (def ^:private CL_MEM_COPY_HOST_PTR (long 32))
 (def ^:private CL_TRUE (int 1))
+(def ^:private CL_COMPLETE 0)
+(def ^:private CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3)
 
 ;; clGetDeviceInfo param_name constants
 (def ^:private CL_DEVICE_MAX_COMPUTE_UNITS 0x1002)
@@ -179,6 +181,14 @@
   (delay (make-handle "clEnqueueNDRangeKernel" (fd I32 PTR PTR I32 PTR PTR PTR I32 PTR PTR))))
 (def ^:private h-clFinish
   (delay (make-handle "clFinish" (fd I32 PTR))))
+(def ^:private h-clFlush
+  (delay (make-handle "clFlush" (fd I32 PTR))))
+(def ^:private h-clWaitForEvents
+  (delay (make-handle "clWaitForEvents" (fd I32 I32 PTR))))
+(def ^:private h-clGetEventInfo
+  (delay (make-handle "clGetEventInfo" (fd I32 PTR I32 I64 PTR PTR))))
+(def ^:private h-clReleaseEvent
+  (delay (make-handle "clReleaseEvent" (fd I32 PTR))))
 
 ;; Cleanup
 (def ^:private h-clReleaseKernel
@@ -1235,25 +1245,27 @@
 
 (defn- enqueue-bound!
   "Enqueue one pre-bound kernel (no finish)."
-  [{:keys [^MemorySegment kernel wg]} group-count]
-  (let [{:keys [queue]} @state
-        arena (Arena/ofConfined)
-        wg (if (vector? wg) wg [(long wg)])
-        group-count (if (vector? group-count) group-count [(long group-count)])
-        work-dim (count wg)]
-    (when-not (= work-dim (count group-count))
-      (throw (ex-info "bound OpenCL workgroup and grid dimensionality differ"
-                      {:workgroup wg :grid group-count})))
-    (try
-      (let [g (.allocate ^Arena arena (* 8 work-dim))
-            l (.allocate ^Arena arena (* 8 work-dim))]
-        (doseq [i (range work-dim)]
-          (.set g I64 (long (* 8 i)) (* (long (nth group-count i)) (long (nth wg i))))
-          (.set l I64 (long (* 8 i)) (long (nth wg i))))
-        (cl-call! "clEnqueueNDRangeKernel" @h-clEnqueueNDRangeKernel
-                  [queue kernel (int work-dim) MemorySegment/NULL g l
-                   (int 0) MemorySegment/NULL MemorySegment/NULL]))
-      (finally (.close arena)))))
+  ([bound group-count]
+   (enqueue-bound! bound group-count MemorySegment/NULL))
+  ([{:keys [^MemorySegment kernel wg]} group-count event-out]
+   (let [{:keys [queue]} @state
+         arena (Arena/ofConfined)
+         wg (if (vector? wg) wg [(long wg)])
+         group-count (if (vector? group-count) group-count [(long group-count)])
+         work-dim (count wg)]
+     (when-not (= work-dim (count group-count))
+       (throw (ex-info "bound OpenCL workgroup and grid dimensionality differ"
+                       {:workgroup wg :grid group-count})))
+     (try
+       (let [g (.allocate ^Arena arena (* 8 work-dim))
+             l (.allocate ^Arena arena (* 8 work-dim))]
+         (doseq [i (range work-dim)]
+           (.set g I64 (long (* 8 i)) (* (long (nth group-count i)) (long (nth wg i))))
+           (.set l I64 (long (* 8 i)) (long (nth wg i))))
+         (cl-call! "clEnqueueNDRangeKernel" @h-clEnqueueNDRangeKernel
+                   [queue kernel (int work-dim) MemorySegment/NULL g l
+                    (int 0) MemorySegment/NULL event-out]))
+       (finally (.close arena))))))
 
 (defn launch-registered-bound!
   "Dispatch a pre-bound kernel. Synchronous."
@@ -1270,12 +1282,67 @@
                       {:bound bound :group-count group-count})
                     prepareds)}))
 
-(defn replay-graph!
-  "Enqueue every recorded launch in order, then clFinish. Synchronous."
+(defn submit-graph!
+  "Submit an OpenCL graph without waiting. The in-order queue preserves the recorded order and
+   the final launch signals a native event held only by this runtime-private token."
   [graph]
-  (doseq [{:keys [bound group-count]} (:launches graph)]
-    (enqueue-bound! bound group-count))
-  (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
+  (let [launches (:launches graph)]
+    (if (empty? launches)
+      {:complete? true}
+      (let [arena (Arena/ofShared)
+            event-out (.allocate arena PTR)
+            status-out (.allocate arena I32)]
+        (try
+          (doseq [[index {:keys [bound group-count]}] (map-indexed vector launches)]
+            (enqueue-bound! bound group-count
+                            (if (= index (dec (count launches)))
+                              event-out
+                              MemorySegment/NULL)))
+          (cl-call! "clFlush" @h-clFlush [(:queue @state)])
+          {:event (.get event-out PTR 0)
+           :event-array event-out
+           :status-out status-out
+           :arena arena}
+          (catch Exception e
+            (.close arena)
+            (throw e)))))))
+
+(defn await-event!
+  "Wait for a runtime-private OpenCL completion token."
+  [{:keys [complete? event-array]}]
+  (when-not complete?
+    (cl-call! "clWaitForEvents" @h-clWaitForEvents [(int 1) event-array]))
+  nil)
+
+(defn event-complete?
+  "Nonblocking query of a runtime-private OpenCL completion token."
+  [{:keys [complete? event status-out]}]
+  (if complete?
+    true
+    (do
+      (cl-call! "clGetEventInfo" @h-clGetEventInfo
+                [event (int CL_EVENT_COMMAND_EXECUTION_STATUS) (long 4)
+                 status-out MemorySegment/NULL])
+      (= CL_COMPLETE (.get ^MemorySegment status-out I32 0)))))
+
+(defn release-event!
+  "Release a runtime-private OpenCL completion token. The caller must establish completion."
+  [{:keys [complete? event ^Arena arena]}]
+  (when-not complete?
+    (try
+      (cl-call! "clReleaseEvent" @h-clReleaseEvent [event])
+      (finally
+        (.close arena))))
+  nil)
+
+(defn replay-graph!
+  "Enqueue every recorded launch and wait for completion."
+  [graph]
+  (let [event (submit-graph! graph)]
+    (try
+      (await-event! event)
+      (finally
+        (release-event! event)))))
 
 (defn synchronize-async!
   "Block until all enqueued work completes."

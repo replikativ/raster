@@ -29,6 +29,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -286,12 +287,16 @@
   (let [make-arena! (rt-resolve device-id "make-kernel-arena!")
         arena-id (make-arena!)]
     (atom {:device-id device-id
+           :session-id (random-uuid)
            :arena-id  arena-id
            :kernels   {}       ;; {phase-key → [kernel-info ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
            :programs  {}       ;; {program-key → bound resident program (see bind-program!)}
            :kernel-graphs {}    ;; {graph-key → bound emitted KernelGraph}
+           :events {}           ;; {event-id → session-owned asynchronous completion}
            :closed?   false})))
+
+(declare release-event!)
 
 (defn close-session!
   "Free all buffers and kernels in a session. Idempotent and thread-safe.
@@ -302,8 +307,12 @@
   this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (let [{:keys [device-id arena-id buffers prepared graphs programs kernel-graphs closed?]} @sess]
-      (when-not closed?
+    (when-not (:closed? @sess)
+      ;; Completion owns the right to keep graph recordings, bound kernels, and buffers alive.
+      ;; Drain and release every event before tearing any of those resources down.
+      (doseq [[_ {:keys [event]}] (:events @sess)]
+        (release-event! sess event))
+      (let [{:keys [device-id arena-id buffers prepared graphs programs kernel-graphs]} @sess]
         ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
         ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
         (let [ns-sym (case (backend-type device-id) :ze 'raster.gpu.ze-runtime :ocl 'raster.gpu.ocl-runtime)
@@ -330,7 +339,7 @@
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
         (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {}
-               :programs {} :kernel-graphs {})))))
+               :programs {} :kernel-graphs {} :events {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -708,9 +717,13 @@
 ;; ================================================================
 
 (defrecord KernelGraphHandle [key])
+(defrecord GPUEvent [session-id id queue])
 
 (defn kernel-graph-handle? [x]
   (and x (= "raster.gpu.core.KernelGraphHandle" (.getName (class x)))))
+
+(defn gpu-event? [x]
+  (and x (= "raster.gpu.core.GPUEvent" (.getName (class x)))))
 
 (defn- external-graph-buffer-ids
   [graph]
@@ -726,6 +739,74 @@
                       {:key (:key handle)
                        :bound (keys (:kernel-graphs @sess))}))))
 
+(defn- resolve-event-entry
+  [sess event]
+  (when-not (gpu-event? event)
+    (throw (ex-info "GPU event operation requires a GPUEvent"
+                    {:event event :actual (type event)})))
+  (when-not (= (:session-id @sess) (:session-id event))
+    (throw (ex-info "GPU event belongs to a different session"
+                    {:event event :session-id (:session-id @sess)})))
+  (or (get-in @sess [:events (:id event)])
+      (throw (ex-info "GPU event is no longer owned by this session"
+                      {:event event :events (keys (:events @sess))}))))
+
+(defn- await-event-under-lock!
+  [sess event]
+  (let [{:keys [device-id closed?]} @sess
+        {:keys [status backend-event] :as entry} (resolve-event-entry sess event)]
+    (when closed?
+      (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
+    (if (= :complete status)
+      entry
+      (do
+        ;; A successful status query is not necessarily a host memory-synchronization point
+        ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
+        ((rt-resolve device-id "await-event!") backend-event)
+        ((rt-resolve device-id "release-event!") backend-event)
+        (let [completed (assoc entry :status :complete :backend-event nil)]
+          (swap! sess assoc-in [:events (:id event)] completed)
+          completed)))))
+
+(defn event-complete?
+  "Return true when a GPUEvent has completed, without blocking. This is a status query, not a
+   substitute for await-event!: native handles remain live until a host wait establishes memory
+   visibility or release-event! safely consumes the event."
+  [sess event]
+  (locking sess
+    (let [{:keys [device-id closed?]} @sess
+          {:keys [status backend-event]} (resolve-event-entry sess event)]
+      (when closed?
+        (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
+      (or (= :complete status)
+          ((rt-resolve device-id "event-complete?") backend-event)))))
+
+(defn await-event!
+  "Block until a GPUEvent completes and return the submission's value. For a KernelGraph this is
+   its resident output-buffer map. Waiting is idempotent until release-event! consumes the event."
+  [sess event]
+  (locking sess
+    (:value (await-event-under-lock! sess event))))
+
+(defn release-event!
+  "Establish completion and remove a session-owned GPUEvent. This is deliberately safe rather
+   than cancellation-like: releasing an in-flight event waits before permitting its graph or
+   buffers to be destroyed."
+  [sess event]
+  (locking sess
+    (await-event-under-lock! sess event)
+    (swap! sess update :events dissoc (:id event)))
+  nil)
+
+(defn- release-graph-events!
+  [sess graph-key]
+  (doseq [event (->> (:events @sess)
+                     vals
+                     (filter #(= graph-key (:graph-key %)))
+                     (map :event)
+                     vec)]
+    (release-event! sess event)))
+
 (defn bind-kernel-graph!
   "Bind an emitted KernelGraph for repeated resident execution.
 
@@ -735,9 +816,9 @@
    `{'n {:type :int :value 4096}}`.
 
    The graph owns its temporary allocations and dedicated bound kernel handles. Binding validates
-   the complete graph call before recording a conservative dependency-safe sequence. Both current
-   backends execute that sequence synchronously; the later queue/event contract can replace the
-   serialization without changing KernelGraphCall or buffer ownership."
+   the complete graph call, lowers dependencies to logical queue/event edges, then records a
+   conservative dependency-safe sequence. Current backends map the logical plan to one in-order
+   compute queue; submit-kernel-graph! exposes asynchronous completion without native handles."
   [sess graph-key graph buffer-keys scalar-values]
   (let [{:keys [device-id buffers closed?]} @sess
         graph (kgraph/validate! graph)
@@ -750,6 +831,7 @@
     (when-not (= (count (vals buffer-keys)) (count (set (vals buffer-keys))))
       (throw (ex-info "distinct graph buffers cannot alias before BufferView range analysis"
                       {:buffer-keys buffer-keys})))
+    (release-graph-events! sess graph-key)
     (let [external-buffers
           (into {}
                 (map (fn [[id key]]
@@ -767,7 +849,8 @@
           prepareds (volatile! [])
           runtime-graph (volatile! nil)]
       (try
-        (let [graph-call (kgcall/make graph all-buffers scalar-values)]
+        (let [graph-call (kgcall/make graph all-buffers scalar-values)
+              execution-plan (execution/from-kernel-graph-call graph-call)]
           (doseq [node (:nodes graph)]
             (let [artifact (:operation node)]
               (register! (:kernel-name artifact) artifact)))
@@ -777,9 +860,10 @@
               (vswap! prepareds conj prepared)))
           ;; Graph verification proves every dependency names an earlier node and every hazard is
           ;; represented. Serial recording is therefore a safe implementation of that partial
-          ;; order on today's synchronous/in-order backends.
+          ;; order on today's single in-order compute queues; the logical plan retains the DAG.
           (vreset! runtime-graph (record! @prepareds {:barriers? true}))
           (let [entry {:graph-call graph-call
+                       :execution-plan execution-plan
                        :runtime-graph @runtime-graph
                        :prepareds @prepareds
                        :temporary-buffers temporary-buffers
@@ -796,23 +880,62 @@
                       :temporary-buffers temporary-buffers})
           (throw e))))))
 
-(defn run-kernel-graph!
-  "Replay a bound graph once and return its resident output buffers by graph identity."
+(defn kernel-graph-execution-plan
+  "Return the pure backend-neutral queue/event plan for a bound KernelGraph."
   [sess handle]
-  (let [{:keys [device-id closed?]} @sess]
-    (when closed?
-      (throw (ex-info "cannot run a kernel graph in a closed GPU session" {:handle handle})))
-    (let [{:keys [runtime-graph outputs]} (resolve-kernel-graph-entry sess handle)]
-      ((rt-resolve device-id "replay-graph!") runtime-graph)
-      outputs)))
+  (:execution-plan (resolve-kernel-graph-entry sess handle)))
+
+(defn submit-kernel-graph!
+  "Submit a bound graph without waiting and return a session-owned GPUEvent.
+
+   One submission per graph may be in flight. This common guarantee matches Level Zero's
+   replayable command-list ownership and remains correct on OpenCL's in-order queue. Await or
+   release the prior event before submitting the same graph again."
+  [sess handle]
+  (locking sess
+    (let [{:keys [device-id session-id closed? events]} @sess]
+      (when closed?
+        (throw (ex-info "cannot submit a kernel graph in a closed GPU session" {:handle handle})))
+      (let [{:keys [runtime-graph outputs execution-plan]}
+            (resolve-kernel-graph-entry sess handle)
+            pending (some (fn [[_ entry]]
+                            (when (and (= (:key handle) (:graph-key entry))
+                                       (= :pending (:status entry)))
+                              (:event entry)))
+                          events)]
+        (when pending
+          (throw (ex-info "kernel graph already has an in-flight submission"
+                          {:handle handle :event pending})))
+        (let [backend-event ((rt-resolve device-id "submit-graph!") runtime-graph)
+              event-id (random-uuid)
+              queue (first (:queues execution-plan))
+              event (->GPUEvent session-id event-id queue)]
+          (swap! sess assoc-in [:events event-id]
+                 {:event event
+                  :graph-key (:key handle)
+                  :status :pending
+                  :backend-event backend-event
+                  :value outputs})
+          event)))))
+
+(defn run-kernel-graph!
+  "Submit a bound graph, wait for completion, and return its resident output buffers."
+  [sess handle]
+  (let [event (submit-kernel-graph! sess handle)]
+    (try
+      (await-event! sess event)
+      (finally
+        (release-event! sess event)))))
 
 (defn release-kernel-graph!
-  "Release one bound graph and its graph-owned temporaries. External session buffers survive."
+  "Release one bound graph and its graph-owned temporaries. External session buffers survive.
+   Any in-flight submission is completed and released before its resources are destroyed."
   [sess handle]
   (when-not (kernel-graph-handle? handle)
     (throw (ex-info "release-kernel-graph! requires a KernelGraphHandle"
                     {:handle handle :actual (type handle)})))
   (locking sess
+    (release-graph-events! sess (:key handle))
     (when-let [entry (get-in @sess [:kernel-graphs (:key handle)])]
       (swap! sess update :kernel-graphs dissoc (:key handle))
       (destroy-kernel-graph-entry! (:device-id @sess) entry)))

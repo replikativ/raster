@@ -108,6 +108,9 @@
 (def ^:private ZE_MODULE_FORMAT_IL_SPIRV 0x00)
 (def ^:private ZE_MODULE_FORMAT_NATIVE 0x01)
 (def ^:private ZE_RESULT_SUCCESS 0)
+(def ^:private ZE_RESULT_NOT_READY 1)
+(def ^:private ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS 1)
+(def ^:private ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS 2)
 
 ;; Device-event kernel timing (profiling)
 (def ^:private ZE_STRUCTURE_TYPE_EVENT_POOL_DESC 0x10)
@@ -344,7 +347,7 @@
                   ;; zeCommandListCreateImmediate (synchronous mode)
                   cq-desc (.allocate arena 40)
                   _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-                  _ (.set cq-desc I32 28 (int 1)) ;; ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS
+                  _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS))
                   cmd-out (ptr-seg arena)
                   _ (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
                               [context device cq-desc cmd-out])
@@ -385,7 +388,7 @@
       (let [{:keys [arena context device]} @state
             cq-desc (.allocate ^Arena arena 40)
             _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-            _ (.set cq-desc I32 28 (int 0)) ;; ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS
+            _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
             cmd-out (ptr-seg arena)
             _ (ze-call! "zeCommandListCreateImmediate" @h-zeCommandListCreateImmediate
                         [context device cq-desc cmd-out])
@@ -1628,7 +1631,7 @@
   (let [{:keys [arena context device]} @state
         cq-desc (.allocate ^Arena arena 40)
         _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-        _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until list completes
+        _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_SYNCHRONOUS))
         q-out (ptr-seg arena)
         _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate [context device cq-desc q-out])
         queue (read-ptr q-out)
@@ -2775,7 +2778,9 @@
    (let [{:keys [arena context device]} @state
          cq-desc (.allocate ^Arena arena 40)
          _ (.set cq-desc I32 0 (int ZE_STRUCTURE_TYPE_COMMAND_QUEUE_DESC))
-         _ (.set cq-desc I32 28 (int 1)) ;; SYNCHRONOUS: execute blocks until the list completes
+         ;; The public replay path still waits, but submit-graph! can now return immediately and
+         ;; expose queue completion through the backend-neutral runtime event contract.
+         _ (.set cq-desc I32 28 (int ZE_COMMAND_QUEUE_MODE_ASYNCHRONOUS))
          q-out (ptr-seg arena)
          _ (ze-call! "zeCommandQueueCreate" @h-zeCommandQueueCreate
                      [context device cq-desc q-out])
@@ -2848,11 +2853,49 @@
                        :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
                        :phases (mapv :phase prepareds)))))))
 
-(defn replay-graph!
-  "Execute a recorded command graph once. Synchronous (the queue blocks until complete)."
+(defn submit-graph!
+  "Submit a recorded graph without waiting. Returns a runtime-private completion token.
+   The token contains a Level Zero queue handle, but it never enters compiler IR or the public
+   gpu.core event value. A graph permits one in-flight submission at a time at the core layer."
   [graph]
   (ze-call! "zeCommandQueueExecuteCommandLists" @h-zeCommandQueueExecuteCommandLists
-            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL]))
+            [(:queue graph) (int 1) (:lists-arr graph) MemorySegment/NULL])
+  {:queue (:queue graph)})
+
+(defn await-event!
+  "Wait for a runtime-private graph completion token."
+  [{:keys [queue]}]
+  (ze-call! "zeCommandQueueSynchronize" @h-zeCommandQueueSynchronize
+            [queue (long -1)])
+  nil)
+
+(defn event-complete?
+  "Nonblocking query of a runtime-private graph completion token."
+  [{:keys [queue]}]
+  (let [result (int (.invokeWithArguments
+                     ^MethodHandle @h-zeCommandQueueSynchronize
+                     ^java.util.List (java.util.List/of
+                                      (object-array [queue (long 0)]))))]
+    (cond
+      (= result ZE_RESULT_SUCCESS) true
+      (= result ZE_RESULT_NOT_READY) false
+      :else (throw (ex-info (str "Level Zero error querying graph event: 0x"
+                                 (Integer/toHexString result))
+                            {:result result :context "zeCommandQueueSynchronize"})))))
+
+(defn release-event!
+  "Release a runtime-private graph completion token. Queue ownership remains with the graph."
+  [_event]
+  nil)
+
+(defn replay-graph!
+  "Execute a recorded command graph once and wait for completion."
+  [graph]
+  (let [event (submit-graph! graph)]
+    (try
+      (await-event! event)
+      (finally
+        (release-event! event)))))
 
 (defn- destroy-handle!
   [^MethodHandle mh ^MemorySegment seg]

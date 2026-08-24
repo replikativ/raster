@@ -36,8 +36,14 @@
                     sess :inclusive-scan graph {'values :values 'out :out}
                     {'n {:type :int :value n}})]
         (try
-          (gpu/run-kernel-graph! sess handle)
-          (gpu/download sess :out)
+          (let [event (gpu/submit-kernel-graph! sess handle)]
+            (try
+              (is (boolean? (gpu/event-complete? sess event)))
+              (gpu/await-event! sess event)
+              (is (gpu/event-complete? sess event))
+              (gpu/download sess :out)
+              (finally
+                (gpu/release-event! sess event))))
           (finally
             (gpu/release-kernel-graph! sess handle)))))))
 
