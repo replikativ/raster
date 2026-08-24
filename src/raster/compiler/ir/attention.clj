@@ -153,7 +153,8 @@
                      :field field :storage-dtype storage-dtype :format format})))
   format)
 
-(defn- route-buffer-ids
+(defn route-buffer-ids
+  "Return the physical metadata buffer identities for a checked paged-route variant."
   [route]
   (cond
     (dense-paged-route? route)
