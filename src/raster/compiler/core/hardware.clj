@@ -140,6 +140,8 @@
                               (when gpu? (:global-memory-bytes caps))
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
+      (:vendor caps)  (assoc :vendor (:vendor caps))
+      (:arch caps)    (assoc :arch (:arch caps))
       bw-gb           (assoc :bandwidth-bytes-s (* (double bw-gb) 1e9))
       (seq peak-flops) (assoc :peak-flops peak-flops)
       (seq cache)     (assoc :cache cache)

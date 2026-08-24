@@ -6,6 +6,7 @@
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.passes.parallel.par-fusion :as fusion]
@@ -140,6 +141,46 @@
       (ze/launch-geometry! :kernel [64 1 1] [2 3 4] [:a :b]))
     (is (= [[:bind :kernel [64 1 1] [:a :b]]
             [:launch :bound [2 3 4]]]
+           @seen))))
+
+(deftest staged-dispatch-selects-after-abi-scalars-are-concrete
+  (let [abi [{:name 'A :c-name "A" :kind :input :dtype :float :kernel-dtype :float}
+             {:name 'C :c-name "C" :kind :output :dtype :float :kernel-dtype :float
+              :role :result}
+             {:name 'width :c-name "width" :kind :scalar :dtype :long :kernel-dtype :long}]
+        make-artifact
+        (fn [kernel-name strategy]
+          (kart/make
+           {:kernel-name kernel-name
+            :source (str "__kernel void " kernel-name
+                         "(__global float* A, __global float* C, long width) {}")
+            :abi abi
+            :arguments '[A C width]
+            :launch (klaunch/spec {:workgroup-size [1] :group-count [1]})
+            :effects {:kind :probe}
+            :attributes {:strategy strategy}}))
+        reference (make-artifact "staged_dispatch_reference" :reference)
+        subgroup (make-artifact "staged_dispatch_subgroup" :subgroup)
+        dispatch (kdispatch/make
+                  {:id "staged_dispatch_probe"
+                   :alternatives [reference subgroup]
+                   :default-strategy :reference
+                   :selector {:kind :runtime-scalar-threshold
+                              :argument 'width :threshold 256
+                              :at-least :subgroup :otherwise :reference}})
+        seen (atom [])]
+    (doseq [artifact [reference subgroup]]
+      (ze/register-kernel! (:kernel-name artifact) artifact))
+    (ze/register-kernel-dispatch! dispatch)
+    (with-redefs [ze/invoke-registered-contraction!
+                  (fn [kernel-name arguments]
+                    (swap! seen conj [kernel-name arguments]))]
+      (ze/invoke-registered-contraction-dispatch!
+       (:id dispatch) (:kernel-name reference) [:a :c 128])
+      (ze/invoke-registered-contraction-dispatch!
+       (:id dispatch) (:kernel-name reference) [:a :c 256]))
+    (is (= [["staged_dispatch_reference" [:a :c 128]]
+            ["staged_dispatch_subgroup" [:a :c 256]]]
            @seen))))
 
 (deftest resident-binders-validate-ordered-values-before-touching-a-driver

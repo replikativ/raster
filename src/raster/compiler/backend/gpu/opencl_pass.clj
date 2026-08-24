@@ -12,6 +12,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -270,7 +271,7 @@
      :dtype         — :double or :float (default :double)
      :min-elements  — minimum elements for GPU (default 4096)
      :compile-spirv? — compile to SPIR-V now (default false)"
-  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types]
+  [form & {:keys [device-id dtype min-elements compile-spirv? scalar-types array-types schedule]
            :or {device-id :ze:0 dtype :double min-elements 4096
                 compile-spirv? false}}]
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
@@ -281,6 +282,12 @@
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
                      :ze-structured-reductions 0 :fallback 0})
         kernels (atom [])
+        dispatches (atom [])
+        target-desc (delay
+                      (try ((requiring-resolve
+                             'raster.compiler.core.hardware/descriptor-for)
+                            device-id)
+                           (catch Throwable _ {:device-type :gpu})))
 
         register-kernel!
         (fn [kernel stat-key]
@@ -296,17 +303,42 @@
             ;; === Proven structured segmented weighted reduction ===
             (swr-fuse/marker? form)
             (let [plan (swr-fuse/marker-plan form dtype)
-                  routed (swr-route/route-dynamic!
-                          plan
-                          (try ((requiring-resolve
-                                 'raster.compiler.core.hardware/descriptor-for)
-                                device-id)
-                               (catch Throwable _ {:device-type :gpu})))
-                  artifact (register-kernel! (:artifact routed) :ze-structured-reductions)]
-              ;; Reuse the generic artifact marker: it already transports an arbitrary ordered
-              ;; pointer/scalar ABI and symbolic 2-D launch through staging and Compiled.
-              (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
-                    (:kernel-name artifact) (vec (:arguments artifact))))
+                  strategy (get-in schedule [:segmented-weighted-reduction :strategy] :reference)]
+              (if (= :auto strategy)
+                (if-let [dispatch0 (swr-route/dynamic-dispatch plan @target-desc schedule)]
+                  (let [artifacts (mapv #(maybe-compile-spirv % compile-spirv? device-id)
+                                        (:alternatives dispatch0))
+                        dispatch (kdispatch/validate! (assoc dispatch0 :alternatives artifacts))]
+                    (swap! stats update :ze-structured-reductions inc)
+                    (swap! kernels into artifacts)
+                    (swap! dispatches conj dispatch)
+                    (list 'raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
+                          (:id dispatch)
+                          (:kernel-name (kdispatch/default-artifact dispatch))
+                          (vec (:arguments (kdispatch/default-artifact dispatch)))))
+                  (let [routed (swr-route/route-dynamic! plan @target-desc)
+                        artifact (register-kernel! (:artifact routed)
+                                                   :ze-structured-reductions)]
+                    (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                          (:kernel-name artifact) (vec (:arguments artifact)))))
+                (let [wanted (case strategy
+                               :reference :indexed-segmented-reduction-reference
+                               :subgroup-score-reuse
+                               :indexed-segmented-reduction-subgroup-score-reuse)
+                      routed-set (swr-route/route-dynamic-candidates! plan @target-desc)
+                      routed (some #(when (= wanted (:strategy %)) %) (:candidates routed-set))
+                      _ (when-not routed
+                          (throw (ex-info "pinned segmented weighted-reduction schedule is unavailable"
+                                          {:reason :segmented-weighted-reduction-pinned-schedule-unavailable
+                                           :requested strategy
+                                           :available (mapv :strategy (:candidates routed-set))
+                                           :declines (:declines routed-set)})))
+                      artifact (register-kernel! (:artifact routed)
+                                                 :ze-structured-reductions)]
+                  ;; A pinned schedule remains a plain single-entry marker. Runtime dispatch is
+                  ;; introduced only by :auto and therefore never overrides an explicit policy.
+                  (list 'raster.gpu.ze-runtime/invoke-registered-contraction!
+                        (:kernel-name artifact) (vec (:arguments artifact))))))
 
             ;; === Compound kernel ===
             (and (seq? form) (= 'raster.compiler/compound-kernel (first form)))
@@ -558,4 +590,5 @@
             :else form))]
     {:form (transform form)
      :stats @stats
-     :kernels @kernels}))
+     :kernels @kernels
+     :dispatches @dispatches}))

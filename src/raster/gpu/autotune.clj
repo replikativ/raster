@@ -14,7 +14,7 @@
             [clojure.java.io :as io])
   (:import [java.io File]))
 
-(def autotune-version 1)
+(def autotune-version 2)
 
 ;; ================================================================
 ;; Coordinate descent (Inductor) — greedy, one neighbourhood step at a time

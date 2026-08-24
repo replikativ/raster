@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.indexed-attention-route
   "Structured routing for recognized indexed graph-attention plans."
-  (:require [raster.compiler.backend.gpu.indexed-attention :as emit]
+  (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.indexed-attention :as emit]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]))
 
 (defn- decline
@@ -115,17 +116,20 @@
        (let [{:keys [operands output accumulator-dtype] :as plan} (swr/validate! plan)
              storage-dtypes (mapv :dtype (conj operands output))
              subgroup-size (long (or (:subgroup-size desc) 16))
-             max-workgroup-size (long (or (:max-workgroup-size desc) 256))]
+             max-workgroup-size (long (or (:max-workgroup-size desc) 256))
+             vendor (some-> (:vendor desc) str str/lower-case)
+             matrix-family (get-in desc [:matrix :family])
+             known-non-intel? (and (or vendor matrix-family)
+                                   (not (or (= :dpas matrix-family)
+                                            (and vendor (str/includes? vendor "intel")))))]
          (cond
-           (not= :subgroup-score-reuse
-                 (:segmented-weighted-reduction-schedule desc))
-           (decline plan leaf :score-reuse-not-selected
-                    {:required :subgroup-score-reuse
-                     :selected (:segmented-weighted-reduction-schedule desc)})
-
            (and desc (not= :gpu (:device-type desc)))
            (decline plan leaf :score-reuse-requires-gpu
                     {:device-type (:device-type desc)})
+
+           known-non-intel?
+           (decline plan leaf :score-reuse-requires-intel-subgroup-dialect
+                    {:vendor (:vendor desc) :matrix-family matrix-family})
 
            (not (contains? #{:float :double} accumulator-dtype))
            (decline plan leaf :score-reuse-accumulator-unsupported

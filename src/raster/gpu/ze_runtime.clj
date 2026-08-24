@@ -36,6 +36,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as klaunch]))
 
 ;; ================================================================
@@ -1712,6 +1713,10 @@
   Populated by the pipeline before eval and consumed by the registered ABI binders."
   (atom {}))
 
+(def kernel-dispatch-registry
+  "Pure compiler dispatch values keyed independently of single-entry native kernels."
+  (atom {}))
+
 ;; ----------------------------------------------------------------
 ;; Arena-scoped kernel lifetime management
 ;; ----------------------------------------------------------------
@@ -1738,7 +1743,11 @@
       (doseq [[k v] info]
         (when (instance? MemorySegment v)
           (try (free! v) (catch Exception _)))))
-    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels))))
+    (swap! kernel-registry #(reduce dissoc % (map first arena-kernels)))
+    (swap! kernel-dispatch-registry
+           (fn [dispatches]
+             (into {} (remove (fn [[_ dispatch]] (= arena-id (:arena-id dispatch))))
+                   dispatches))))
   nil)
 
 (defmacro with-gpu-computation
@@ -1802,6 +1811,18 @@
    …). Used by the resident GPU-program binder to map kernel params → resident buffers."
   [kernel-name]
   (get @kernel-registry kernel-name))
+
+(defn register-kernel-dispatch!
+  ([dispatch] (register-kernel-dispatch! dispatch *current-arena*))
+  ([dispatch arena-id]
+   (let [dispatch (cond-> (kdispatch/validate! dispatch)
+                    arena-id (assoc :arena-id arena-id))]
+     (swap! kernel-dispatch-registry assoc (:id dispatch) dispatch)
+     dispatch)))
+
+(defn kernel-dispatch-registry-entry
+  [dispatch-id]
+  (get @kernel-dispatch-registry dispatch-id))
 
 (defn- registered-1d-workgroup-size
   "Read a 1-D workgroup from the canonical artifact launch contract, or from the remaining plain
@@ -3552,6 +3573,26 @@
       (readback-operand! out-seg out out-elems out-half? out-esize))
     out))
 
+(defn invoke-registered-contraction-dispatch!
+  "Select one ABI-compatible contraction artifact from concrete scalar values, then use the
+   ordinary artifact staging path. `default-kernel-name` is compiler-carried redundancy checked
+   against the registered dispatch; it lets resident extraction inspect the common ABI without
+   interpreting dispatch internals."
+  [^String dispatch-id ^String default-kernel-name arguments]
+  (let [dispatch (or (get @kernel-dispatch-registry dispatch-id)
+                     (throw (ex-info "Kernel dispatch not registered"
+                                     {:dispatch-id dispatch-id
+                                      :registered (keys @kernel-dispatch-registry)})))
+        dispatch (kdispatch/validate! dispatch)
+        expected-default (:kernel-name (kdispatch/default-artifact dispatch))
+        _ (when-not (= expected-default default-kernel-name)
+            (throw (ex-info "contraction dispatch marker default differs from its registry"
+                            {:dispatch-id dispatch-id
+                             :expected expected-default
+                             :actual default-kernel-name})))
+        selected (kdispatch/select-artifact dispatch arguments)]
+    (invoke-registered-contraction! (:kernel-name selected) arguments)))
+
 (defn invoke-gpu-transpose!
   "Transpose matrix on GPU via registered kernel. Zero CPU↔GPU copies.
   in-buf: DeviceBuffer [rows x cols] row-major
@@ -3680,6 +3721,7 @@
         (when (instance? MemorySegment v)
           (try (free! v) (catch Exception _)))))
     (clojure.core/reset! kernel-registry {})
+    (clojure.core/reset! kernel-dispatch-registry {})
     (doseq [[_ k] (:kernels @state)]
       (try (.invokeWithArguments ^MethodHandle @h-zeKernelDestroy
                                  ^java.util.List (java.util.List/of (object-array [k])))
