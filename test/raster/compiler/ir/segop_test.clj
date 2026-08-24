@@ -124,6 +124,9 @@
       ;; Stage 2: block-totals scan
       (is (instance? raster.compiler.ir.segop.SegScan (nth segops 1)))
       (is (= :block-scan (:phase (nth segops 1))))
+      (let [totals (first (:inputs (nth segops 1)))]
+        (is (contains? (:outputs (nth segops 0)) totals)
+            "stage 1 explicitly produces the block-totals storage consumed by stage 2"))
       ;; Stage 3: carry-in (SegMap)
       (is (instance? raster.compiler.ir.segop.SegMap (nth segops 2))))))
 
