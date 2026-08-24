@@ -31,6 +31,8 @@
             [raster.compiler.core.inference :as inf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]))
 
@@ -154,6 +156,11 @@
   (let [hw-topo  (try ((requiring-resolve 'raster.runtime.hardware/memory-topology) device-id)
                       (catch Exception _ {:model :discrete :integrated? false}))
         unified? (= :unified (:model hw-topo))
+        ;; Level Zero's integrated allocation is genuinely host-coherent. OpenCL's OclBuffer,
+        ;; however, always owns a cl_mem plus a separate host staging segment: writing that segment
+        ;; is not an upload even when the physical GPU shares system memory. Treating topology
+        ;; `:unified` as API-level coherence left newly allocated OpenCL inputs full of zeroes.
+        coherent-host-view? (and unified? (= :ze (backend-type device-id)))
         mk       (rt-resolve device-id "make-buffer")
         upload   (rt-resolve device-id "array->buffer!")
         as-fbuf  (rt-resolve device-id "buffer-as-float-buffer")
@@ -162,7 +169,7 @@
         buf-of (fn [arr dtype n]
                  (let [buf (mk n dtype)]
                    (if arr
-                     (if unified?
+                     (if coherent-host-view?
                        (case dtype
                          :float (let [fb (as-fbuf buf)]
                                   (.put fb ^floats arr 0 (int n))
@@ -184,6 +191,33 @@
   (let [free! (rt-resolve device-id "free-buffer!")]
     (doseq [[_ buf] bufs]
       (free! buf))))
+
+(defn- alloc-buffers-transactional
+  "Allocate buffer specs one at a time and free the successful prefix on failure."
+  [buffer-specs device-id]
+  (let [allocated (volatile! {})]
+    (try
+      (doseq [[key spec] buffer-specs]
+        (vswap! allocated merge (alloc-buffers-internal {key spec} device-id)))
+      @allocated
+      (catch Exception e
+        (when (seq @allocated)
+          (free-buffers-internal! @allocated device-id))
+        (throw e)))))
+
+(defn- destroy-kernel-graph-entry!
+  "Destroy one bound graph's backend recording, dedicated kernel handles and graph-owned
+   temporaries. External buffers remain session-owned and are never freed here."
+  [device-id {:keys [runtime-graph prepareds temporary-buffers]}]
+  (let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")
+        destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
+    (when (and destroy-graph! runtime-graph)
+      (try (destroy-graph! runtime-graph) (catch Exception _)))
+    (when destroy-prepared!
+      (doseq [prepared prepareds]
+        (try (destroy-prepared! prepared) (catch Exception _))))
+    (when (seq temporary-buffers)
+      (free-buffers-internal! temporary-buffers device-id))))
 
 (def ^:private array-tag->dtype
   {'doubles :double
@@ -256,6 +290,7 @@
            :kernels   {}       ;; {phase-key → [kernel-info ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
            :programs  {}       ;; {program-key → bound resident program (see bind-program!)}
+           :kernel-graphs {}    ;; {graph-key → bound emitted KernelGraph}
            :closed?   false})))
 
 (defn close-session!
@@ -267,7 +302,7 @@
   this every session leaks them and the driver eventually aborts (the source of the SIGABRTs)."
   [sess]
   (locking sess
-    (let [{:keys [device-id arena-id buffers prepared graphs programs closed?]} @sess]
+    (let [{:keys [device-id arena-id buffers prepared graphs programs kernel-graphs closed?]} @sess]
       (when-not closed?
         ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
         ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
@@ -289,10 +324,13 @@
             (when (seq (:scratch-buffers prog))
               (let [free! (rt-resolve device-id "free-buffer!")]
                 (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
+        (doseq [[_ graph-entry] kernel-graphs]
+          (destroy-kernel-graph-entry! device-id graph-entry))
         (free-buffers-internal! buffers device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {} :programs {})))))
+        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {}
+               :programs {} :kernel-graphs {})))))
 
 (defn with-gpu-session*
   "Functional implementation for with-gpu-session macro."
@@ -372,19 +410,7 @@
    If allocation fails partway through, already-allocated buffers are freed."
   [sess buffer-specs]
   (let [device-id (:device-id @sess)
-        ;; Allocate one-by-one so we can free on partial failure.
-        ;; alloc-buffers-internal uses `into` which is eager, so a failure
-        ;; partway through would leak already-allocated buffers.
-        allocated (volatile! {})
-        new-bufs (try
-                   (doseq [[k spec] buffer-specs]
-                     (let [single (alloc-buffers-internal {k spec} device-id)]
-                       (vswap! allocated merge single)))
-                   @allocated
-                   (catch Exception e
-                     (when (seq @allocated)
-                       (free-buffers-internal! @allocated device-id))
-                     (throw e)))]
+        new-bufs (alloc-buffers-transactional buffer-specs device-id)]
     (swap! sess update :buffers merge new-bufs)
     new-bufs))
 
@@ -676,6 +702,121 @@
   "Get a DeviceBuffer from the session by key."
   [sess key]
   (get-in @sess [:buffers key]))
+
+;; ================================================================
+;; Executable KernelGraphs
+;; ================================================================
+
+(defrecord KernelGraphHandle [key])
+
+(defn kernel-graph-handle? [x]
+  (and x (= "raster.gpu.core.KernelGraphHandle" (.getName (class x)))))
+
+(defn- external-graph-buffer-ids
+  [graph]
+  (set (map :id (concat (:inputs graph) (:outputs graph)))))
+
+(defn- resolve-kernel-graph-entry
+  [sess handle]
+  (when-not (kernel-graph-handle? handle)
+    (throw (ex-info "kernel graph runner requires a KernelGraphHandle"
+                    {:handle handle :actual (type handle)})))
+  (or (get-in @sess [:kernel-graphs (:key handle)])
+      (throw (ex-info "kernel graph is not bound in this session"
+                      {:key (:key handle)
+                       :bound (keys (:kernel-graphs @sess))}))))
+
+(defn bind-kernel-graph!
+  "Bind an emitted KernelGraph for repeated resident execution.
+
+   `buffer-keys` maps every external GraphBuffer identity to an existing session-buffer key.
+   Distinct graph identities may not alias one session key until stable BufferView/range analysis
+   exists. `scalar-values` maps symbolic compiler values to explicitly typed runtime scalars, e.g.
+   `{'n {:type :int :value 4096}}`.
+
+   The graph owns its temporary allocations and dedicated bound kernel handles. Binding validates
+   the complete graph call before recording a conservative dependency-safe sequence. Both current
+   backends execute that sequence synchronously; the later queue/event contract can replace the
+   serialization without changing KernelGraphCall or buffer ownership."
+  [sess graph-key graph buffer-keys scalar-values]
+  (let [{:keys [device-id buffers closed?]} @sess
+        graph (kgraph/validate! graph)
+        external-ids (external-graph-buffer-ids graph)]
+    (when closed?
+      (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
+    (when-not (= external-ids (set (keys buffer-keys)))
+      (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
+                      {:expected external-ids :bound (set (keys buffer-keys))})))
+    (when-not (= (count (vals buffer-keys)) (count (set (vals buffer-keys))))
+      (throw (ex-info "distinct graph buffers cannot alias before BufferView range analysis"
+                      {:buffer-keys buffer-keys})))
+    (let [external-buffers
+          (into {}
+                (map (fn [[id key]]
+                       [id (or (get buffers key)
+                               (throw (ex-info "kernel graph external session buffer is missing"
+                                               {:graph-buffer id :session-key key
+                                                :available (keys buffers)})))]))
+                buffer-keys)
+          temporary-specs (kgcall/temporary-specs graph scalar-values)
+          temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
+          all-buffers (merge external-buffers temporary-buffers)
+          register! (rt-resolve device-id "register-kernel!")
+          bind-call! (rt-resolve device-id "bind-kernel-call")
+          record! (rt-resolve device-id "record-graph!")
+          prepareds (volatile! [])
+          runtime-graph (volatile! nil)]
+      (try
+        (let [graph-call (kgcall/make graph all-buffers scalar-values)]
+          (doseq [node (:nodes graph)]
+            (let [artifact (:operation node)]
+              (register! (:kernel-name artifact) artifact)))
+          (doseq [node-call (:nodes graph-call)]
+            (let [prepared (assoc (bind-call! (:call node-call))
+                                  :phase (:id node-call))]
+              (vswap! prepareds conj prepared)))
+          ;; Graph verification proves every dependency names an earlier node and every hazard is
+          ;; represented. Serial recording is therefore a safe implementation of that partial
+          ;; order on today's synchronous/in-order backends.
+          (vreset! runtime-graph (record! @prepareds {:barriers? true}))
+          (let [entry {:graph-call graph-call
+                       :runtime-graph @runtime-graph
+                       :prepareds @prepareds
+                       :temporary-buffers temporary-buffers
+                       :buffer-keys buffer-keys
+                       :outputs (select-keys all-buffers (map :id (:outputs graph)))}
+                old (get-in @sess [:kernel-graphs graph-key])]
+            (swap! sess assoc-in [:kernel-graphs graph-key] entry)
+            (when old (destroy-kernel-graph-entry! device-id old))
+            (->KernelGraphHandle graph-key)))
+        (catch Exception e
+          (destroy-kernel-graph-entry!
+           device-id {:runtime-graph @runtime-graph
+                      :prepareds @prepareds
+                      :temporary-buffers temporary-buffers})
+          (throw e))))))
+
+(defn run-kernel-graph!
+  "Replay a bound graph once and return its resident output buffers by graph identity."
+  [sess handle]
+  (let [{:keys [device-id closed?]} @sess]
+    (when closed?
+      (throw (ex-info "cannot run a kernel graph in a closed GPU session" {:handle handle})))
+    (let [{:keys [runtime-graph outputs]} (resolve-kernel-graph-entry sess handle)]
+      ((rt-resolve device-id "replay-graph!") runtime-graph)
+      outputs)))
+
+(defn release-kernel-graph!
+  "Release one bound graph and its graph-owned temporaries. External session buffers survive."
+  [sess handle]
+  (when-not (kernel-graph-handle? handle)
+    (throw (ex-info "release-kernel-graph! requires a KernelGraphHandle"
+                    {:handle handle :actual (type handle)})))
+  (locking sess
+    (when-let [entry (get-in @sess [:kernel-graphs (:key handle)])]
+      (swap! sess update :kernel-graphs dissoc (:key handle))
+      (destroy-kernel-graph-entry! (:device-id @sess) entry)))
+  nil)
 
 ;; ================================================================
 ;; Resident GPU programs (Option A: pipeline → bound-dispatch path)

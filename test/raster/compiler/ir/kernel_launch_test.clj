@@ -41,6 +41,11 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be an integer"
                             (launch/realize spec {'groups 1.5}))))))
 
+(deftest symbolic-storage-expressions-use-the-same-checked-evaluator
+  (is (= 5 (launch/resolve-expression {'n 1025} (launch/ceil-div 'n 256))))
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be an integer"
+                        (launch/resolve-expression {} (launch/ceil-div 'n 256)))))
+
 (deftest concrete-geometry-rejects-invalid-backend-launches
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"positive integer"
                         (launch/geometry {:workgroup-size [0] :group-count [1]})))
