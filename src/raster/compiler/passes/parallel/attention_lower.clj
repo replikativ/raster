@@ -62,6 +62,7 @@
               :left {:kind :packed-query :buffer (:values query) :dtype q-dtype}
               :right {:kind :routed-key :buffer (:k-pages problem) :dtype k-dtype}
               :combine combine
+              :arguments []
               :finalize score-finalize}
       :weight weight
       :value {:kind :routed-value :buffer (:v-pages problem)
