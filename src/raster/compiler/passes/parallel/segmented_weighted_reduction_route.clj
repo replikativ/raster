@@ -7,7 +7,8 @@
             [raster.compiler.passes.parallel.indexed-attention-route :as indexed-leaf]))
 
 (def dynamic-leaves
-  [{:id :indexed-edge-list-reference :route indexed-leaf/route-dynamic}])
+  [{:id :indexed-edge-list-subgroup-score-reuse :route indexed-leaf/route-dynamic-score-reuse}
+   {:id :indexed-edge-list-reference :route indexed-leaf/route-dynamic}])
 
 (defn route-dynamic
   ([plan] (route-dynamic plan nil))

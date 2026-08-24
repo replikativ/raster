@@ -144,8 +144,11 @@
 
 (defn- kernel-name
   [plan shape]
-  (let [identity {:schedule (swr/schedule-key plan) :shape shape}]
-    (format "raster_indexed_attention_ref_%08x"
+  (let [identity {:schedule (swr/schedule-key plan) :shape shape}
+        schedule-name (case (:schedule shape)
+                        :destination-score-reuse "subgroup_score_reuse"
+                        "ref")]
+    (format "raster_indexed_attention_%s_%08x" schedule-name
             (bit-and 0xffffffff (long (hash identity))))))
 
 (defn- source*
@@ -345,6 +348,129 @@
                    :materialized-intermediates []
                    :complexity :quadratic-in-edges-and-head-components}})))
 
+(defn- score-reuse-subgroup-size
+  [desc]
+  (long (or (:subgroup-size desc) 16)))
+
+(defn- score-reuse-source
+  [plan fields subgroup-size name]
+  (let [dtype (:accumulator-dtype plan)
+        ctype (c-type dtype)
+        zero (fp-literal dtype 0.0)
+        one (fp-literal dtype 1.0)
+        bound (fp-literal dtype (double (get-in plan [:score :arguments 2 :value])))
+        epsilon (fp-literal dtype (double (get-in plan [:normalization :epsilon])))
+        scalar-signature (->> fields
+                              (map (fn [{:keys [c-name]}] (str "    long " c-name)))
+                              (str/join ",\n"))]
+    (str (when (= :double dtype)
+           "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
+         "__attribute__((intel_reqd_sub_group_size(" subgroup-size ")))\n"
+         "__kernel void " name "(\n"
+         "    __global const " ctype "* q,\n"
+         "    __global const " ctype "* k,\n"
+         "    __global const " ctype "* v,\n"
+         "    __global const long* destination_indices,\n"
+         "    __global const long* source_indices,\n"
+         "    __global " ctype "* output,\n"
+         scalar-signature ") {\n"
+         "  const long lane = (long)get_sub_group_local_id();\n"
+         "  const long component_tile = (long)get_group_id(0);\n"
+         "  const long head = (long)get_group_id(1);\n"
+         "  const long destination = (long)get_group_id(2);\n"
+         "  const long component = component_tile * " subgroup-size "L + lane;\n"
+         "  const long feature = head * n_components + component;\n"
+         "  const int active = component < n_components && feature < total_dim;\n"
+         "  " ctype " numerator = " zero ";\n"
+         "  " ctype " denominator = " zero ";\n"
+         "  int invalid = n_edges < 0L || n_heads <= 0L || n_components <= 0L\n"
+         "        || n_heads > total_dim / n_components;\n"
+         "  for (long edge = 0L; edge < n_edges; ++edge) {\n"
+         "    const long edge_destination = destination_indices[edge];\n"
+         "    const long source = source_indices[edge];\n"
+         "    if (edge_destination < 0L || edge_destination >= n_entities\n"
+         "        || source < 0L || source >= n_entities) invalid = 1;\n"
+         "    const int visible = !invalid && edge_destination == destination;\n"
+         "    " ctype " partial_dot = " zero ";\n"
+         "    if (visible) {\n"
+         "      const long q_base = destination * total_dim + head * n_components;\n"
+         "      const long k_base = source * total_dim + head * n_components;\n"
+         "      for (long x = lane; x < n_components; x += " subgroup-size "L)\n"
+         "        partial_dot += q[q_base + x] * k[k_base + x];\n"
+         "    }\n"
+         "    const " ctype " dot = sub_group_reduce_add(partial_dot);\n"
+         "    " ctype " weight = " zero ";\n"
+         "    if (lane == 0L && visible) {\n"
+         "        const " ctype " scaled = dot * ((" ctype ")" one
+         " / sqrt((" ctype ")n_components));\n"
+         "        const " ctype " score = isnan(scaled) ? scaled\n"
+         "            : fmin((" ctype ")" bound ", fmax(-(" ctype ")" bound ", scaled));\n"
+         "        weight = exp(score);\n"
+         "    }\n"
+         "    weight = sub_group_broadcast(weight, 0);\n"
+         "    denominator += weight;\n"
+         "    if (active && visible)\n"
+         "      numerator += weight * v[source * total_dim + feature];\n"
+         "  }\n"
+         "  if (active) {\n"
+         "    const long output_index = destination * total_dim + feature;\n"
+         "    output[output_index] = invalid ? (" ctype ")NAN\n"
+         "        : (denominator == " zero " ? " zero
+         " : numerator / (denominator + (" ctype ")" epsilon "));\n"
+         "  }\n"
+         "  if (head == 0L && component_tile == 0L) {\n"
+         "    const long active_width = n_heads * n_components;\n"
+         "    for (long tail = active_width + lane; tail < total_dim; tail += "
+         subgroup-size "L)\n"
+         "      output[destination * total_dim + tail] = invalid ? (" ctype ")NAN : " zero ";\n"
+         "  }\n"
+         "}\n")))
+
+(defn emit-dynamic-score-reuse
+  "Emit a 3-D destination/head/component-tile schedule. One hardware subgroup cooperatively
+   reduces each edge score and broadcasts its weight across component lanes. This retains the
+   edge-list ABI while removing the reference leaf's per-output score recomputation."
+  [plan desc]
+  (let [plan (indexed-attention-plan! plan)
+        fields (dynamic-fields plan)
+        values (mapv :value fields)
+        [entities _ _ heads components output-elements] values
+        subgroup-size (score-reuse-subgroup-size desc)
+        name (kernel-name plan {:schedule :destination-score-reuse
+                                :subgroup-size subgroup-size})
+        inputs (swr/ordered-input-ids plan)
+        output (get-in plan [:output :id])
+        dtype (:accumulator-dtype plan)
+        abi (dynamic-abi plan fields)
+        arguments (into (conj inputs output) values)]
+    (kart/make
+     {:kernel-name name
+      :source (score-reuse-source plan fields subgroup-size name)
+      :abi abi
+      :arguments arguments
+      :launch (klaunch/spec
+               {:workgroup-size [subgroup-size 1 1]
+                :group-count [(klaunch/ceil-div components subgroup-size)
+                              (klaunch/runtime-value heads)
+                              (klaunch/runtime-value entities)]})
+      :effects {:kind :segmented-weighted-reduction :reads inputs :writes [output]}
+      :provenance {:operation-id (get-in plan [:provenance :operation-id])
+                   :semantic-op (get-in plan [:provenance :semantic-op])
+                   :algebra-plan-id (:id plan)
+                   :lowering :destination-score-reuse}
+      :attributes {:strategy :indexed-segmented-reduction-subgroup-score-reuse
+                   :optimization-tier :subgroup
+                   :algebra :segmented-weighted-reduction
+                   :algebra-key (swr/algebra-key plan)
+                   :storage-dtype dtype :accumulator-dtype dtype
+                   :membership :edge-list-by-destination
+                   :duplicate-policy :multiset
+                   :dynamic-shape? true
+                   :out-elems output-elements
+                   :score-reuse-width subgroup-size
+                   :materialized-intermediates []
+                   :complexity :destination-head-edge-dot-plus-value}})))
+
 (defn emit-reference
   "Emit the direct indexed-attention correctness schedule for a resolved shape environment."
   [plan shape-env desc]
@@ -431,7 +557,9 @@
                          (if (contains? edge-ids id) edge-elements value-elements))
                         :device role))
         uses (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
-                          [(kgraph/->ValueUse output :write)]))]
+                          [(kgraph/->ValueUse output :write)]))
+        strategy (get-in artifact [:attributes :strategy])
+        reference? (= :reference (get-in artifact [:attributes :optimization-tier]))]
     (kgraph/make
      {:inputs (mapv #(graph-buffer % :input) inputs)
       :outputs [(graph-buffer output :output)]
@@ -441,5 +569,4 @@
       :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
       :provenance {:operation-id (get-in plan [:provenance :operation-id])
                    :semantic-op (get-in plan [:provenance :semantic-op])}
-      :attributes {:strategy :indexed-segmented-reduction-reference
-                   :reference? true :dynamic-shape? true}})))
+      :attributes {:strategy strategy :reference? reference? :dynamic-shape? true}})))

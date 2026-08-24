@@ -1615,6 +1615,13 @@
     (.invokeWithArguments ^MethodHandle (:h-launch bound)
                           ^"[Ljava.lang.Object;" (:launch-args bound))))
 
+(defn launch-geometry!
+  "Bind arguments and launch one checked 1-3D geometry. Artifact-backed staging uses this instead
+   of the legacy dimension-specific launchers so no valid KernelCall axis can be discarded."
+  [kernel workgroup-size group-count kernel-args]
+  (let [bound (bind-kernel! kernel workgroup-size kernel-args)]
+    (launch-bound! bound group-count)))
+
 ;; ================================================================
 ;; Command graph: enqueue-all → execute-once → sync-once (OpenVINO's model)
 ;; The per-op-barrier immediate list pays the ~35-75µs launch floor per kernel;
@@ -3485,7 +3492,7 @@
    `arguments` contains evaluated values in exact ABI order.  The ABI decides which values are
    buffers or scalars, how host buffers are staged, and the scalar type passed to Level Zero.
    Packed kernels therefore retain byte storage while declaring a distinct int32 kernel view.
-   Output extent and 2-D geometry are resolved from the artifact, never marker positions."
+   Output extent and 1-3D geometry are resolved from the artifact, never marker positions."
   [^String kernel-name arguments]
   (let [registered (get @kernel-registry kernel-name)
         _ (when-not registered
@@ -3540,7 +3547,7 @@
         {:keys [kernel-handle]} (ensure-kernel-loaded! kernel-name)
         out @output
         [out-seg out-half? out-esize] @output-seg]
-    (launch-2d! kernel-handle workgroup-size group-count all-args)
+    (launch-geometry! kernel-handle workgroup-size group-count all-args)
     (when-not (device-buffer? out)
       (readback-operand! out-seg out out-elems out-half? out-esize))
     out))
