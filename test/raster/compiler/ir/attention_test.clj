@@ -23,6 +23,17 @@
            :start-positions 'kv-start-positions :page-index-capacity 7}
           (apply hash-map overrides))))
 
+(defn- csr-visibility
+  [& overrides]
+  (attention/csr-visibility
+   (merge {:row-offsets 'attention-row-offsets
+           :key-indices 'attention-key-indices
+           :key-index-capacity 7
+           :duplicate-policy :set
+           :position-filter (attention/visibility
+                             {:causal? true :window-left 2 :window-right 0})}
+          (apply hash-map overrides))))
+
 (defn- problem
   [& overrides]
   (attention/make
@@ -101,6 +112,46 @@
                      :last-page-lengths [1 1 1]
                      :start-positions [0 0 8]})
                (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest logical-csr-visibility-is-independent-of-physical-page-routing
+  (let [sparse-problem (problem :visibility (csr-visibility))
+        query-offsets [0 2 2 4]
+        routing {:page-table [4 1 6, -1 -1 -1, 2 5 0]
+                 :lengths [5 0 5]
+                 :start-positions [0 0 8]}
+        visibility {:row-offsets [0 2 3 3 6]
+                    :key-indices [0 2, 4, 0 1 4, -1]}]
+    (is (= :csr (attention/visibility-kind (:visibility sparse-problem))))
+    (is (= :dense-paged (attention/route-kind (:route sparse-problem))))
+    (is (= [5] (:attention-row-offsets (attention/layouts sparse-problem))))
+    (is (= [7] (:attention-key-indices (attention/layouts sparse-problem))))
+    (is (= sparse-problem
+           (attention/validate-visibility-values!
+            sparse-problem query-offsets routing visibility)))
+    (testing "unused key-index capacity may contain a sentinel"
+      (is (= :attention-invalid-logical-key-index
+             (try
+               (attention/validate-visibility-values!
+                sparse-problem query-offsets routing
+                {:row-offsets [0 2 3 3 7]
+                 :key-indices [0 2, 4, 0 1 4 -1]})
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (testing "set adjacency rejects duplicates per query row"
+      (is (= :attention-duplicate-logical-key
+             (try
+               (attention/validate-visibility-values!
+                sparse-problem query-offsets routing
+                {:row-offsets [0 2 3 3 6]
+                 :key-indices [0 0, 4, 0 1 4, -1]})
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
+    (testing "graph multiset adjacency preserves parallel edges"
+      (let [multiset-problem (problem :visibility
+                                      (csr-visibility :duplicate-policy :multiset))]
+        (is (= multiset-problem
+               (attention/validate-visibility-values!
+                multiset-problem query-offsets routing
+                {:row-offsets [0 2 3 3 6]
+                 :key-indices [0 0, 4, 0 1 4, -1]})))))))
 
 (deftest invalid-static-semantics-fail-before-emission
   (testing "GQA mapping must be integral"

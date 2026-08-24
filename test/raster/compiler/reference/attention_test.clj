@@ -27,14 +27,25 @@
       :last-page-lengths 'lasts :start-positions 'starts :page-index-capacity 5})))
 
 (defn- problem
-  [kind]
-  (attention/make
-   (merge dims
-          {:id [:attention kind] :query (query) :k-pages 'k :v-pages 'v :output 'output
-           :route (route kind) :scale (/ 1.0 (Math/sqrt 2.0))
-           :k-layout :kv-head-major :v-layout :page-major
-           :visibility (attention/visibility
-                        {:causal? true :window-left 2 :window-right 0})})))
+  ([kind]
+   (problem kind (attention/visibility
+                  {:causal? true :window-left 2 :window-right 0})))
+  ([kind visibility]
+   (attention/make
+    (merge dims
+           {:id [:attention kind (attention/visibility-kind visibility)]
+            :query (query) :k-pages 'k :v-pages 'v :output 'output
+            :route (route kind) :scale (/ 1.0 (Math/sqrt 2.0))
+            :k-layout :kv-head-major :v-layout :page-major
+            :visibility visibility}))))
+
+(defn- sparse-visibility
+  [duplicate-policy capacity]
+  (attention/csr-visibility
+   {:row-offsets 'attention-row-offsets :key-indices 'attention-key-indices
+    :key-index-capacity capacity :duplicate-policy duplicate-policy
+    :position-filter (attention/visibility
+                      {:causal? true :window-left 2 :window-right 0})}))
 
 (defn- data
   [kind]
@@ -66,6 +77,13 @@
            :output-cotangent 'd-output
            :cotangents {:query 'd-q :key 'd-k :value 'd-v}}
           (apply hash-map overrides))))
+
+(defn- sparse-vjp
+  [kind visibility]
+  (attention-ad/make
+   {:id [:sparse-vjp kind] :primal (problem kind visibility)
+    :output-cotangent 'd-output
+    :cotangents {:query 'd-q :key 'd-k :value 'd-v}}))
 
 (defn- close?
   ([a b] (close? a b 1.0e-9))
@@ -146,3 +164,41 @@
         gradients (reference/reference-vjp query-vjp (data kind))]
     (is (= #{:query} (set (keys gradients))))
     (is (= 12 (count (:query gradients))))))
+
+(deftest per-example-logical-csr-masks-compose-with-either-physical-route
+  (let [visibility (sparse-visibility :set 5)
+        sparse-data {'attention-row-offsets [0 2 2 4]
+                     'attention-key-indices [0 1, 0 2, -1]}
+        dense-data (merge (data :dense-paged) sparse-data)
+        csr-data (merge (data :csr-paged) sparse-data)
+        dense-problem (problem :dense-paged visibility)
+        csr-problem (problem :csr-paged visibility)
+        dense-output (reference/reference-forward dense-problem dense-data)
+        csr-output (reference/reference-forward csr-problem csr-data)
+        dense-grads (reference/reference-vjp (sparse-vjp :dense-paged visibility) dense-data)
+        csr-grads (reference/reference-vjp (sparse-vjp :csr-paged visibility) csr-data)]
+    (is (arrays-close? dense-output csr-output 1.0e-12))
+    (doseq [role [:query :key :value]]
+      (is (arrays-close? (get dense-grads role) (get csr-grads role) 1.0e-12)))
+    (testing "the second packed query has its own empty mask row"
+      (is (every? zero? (subvec (vec dense-output) 4 8))))
+    (testing "logical visibility buffers are discrete VJP inputs"
+      (is (= '[attention-row-offsets attention-key-indices]
+             (get-in (attention-ad/differentiation-contract
+                      (sparse-vjp :dense-paged visibility))
+                     [:nondifferentiable :visibility]))))))
+
+(deftest sparse-multiset-vjp-preserves-parallel-edges-and-matches-finite-differences
+  (doseq [kind [:dense-paged :csr-paged]
+          :let [visibility (sparse-visibility :multiset 8)
+                values (merge (data kind)
+                              {'attention-row-offsets [0 3 5 7]
+                               'attention-key-indices [0 0 1, 0 2, 0 2, -1]})
+                problem (problem kind visibility)
+                analytical (reference/reference-vjp (sparse-vjp kind visibility) values)]]
+    (testing (name kind)
+      (doseq [[role buffer-id] [[:query 'q] [:key 'k] [:value 'v]]]
+        (is (arrays-close? (get analytical role)
+                           (numerical-gradient problem values buffer-id 1.0e-6)
+                           2.0e-8)
+            (str role " sparse multiset finite-difference agreement"))))))

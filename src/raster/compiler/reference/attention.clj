@@ -40,6 +40,13 @@
        :last-page-lengths (get values (:last-page-lengths route))
        :start-positions (get values (:start-positions route))})))
 
+(defn- visibility-values
+  [problem values]
+  (let [visibility (:visibility problem)]
+    (when (attention/csr-visibility? visibility)
+      {:row-offsets (get values (:row-offsets visibility))
+       :key-indices (get values (:key-indices visibility))})))
+
 (defn- prepare
   [problem values extra-specs]
   (let [{:keys [query] :as problem} (attention/validate! problem)
@@ -47,6 +54,9 @@
     (attention/validate-query-values!
      problem (get values (:row-offsets query)) (get values (:positions query)))
     (attention/validate-routing! problem (route-values problem values))
+    (attention/validate-visibility-values!
+     problem (get values (:row-offsets query)) (route-values problem values)
+     (visibility-values problem values))
     [problem values]))
 
 (defn- query-batches
@@ -108,11 +118,19 @@
         kv-head (quot query-head (quot q-heads kv-heads))
         q-base (* (+ (* query-token q-heads) query-head) qk-head-dim)
         {:keys [length start-position physical-page]} (route-row problem values batch)
+        logical-tokens
+        (if (attention/csr-visibility? visibility)
+          (let [row-offsets (get values (:row-offsets visibility))
+                key-indices (get values (:key-indices visibility))]
+            (subvec key-indices (nth row-offsets query-token)
+                    (nth row-offsets (inc query-token))))
+          (range length))
+        position-filter (attention/position-filter visibility)
         tokens
         (into []
               (keep (fn [token]
                       (let [kv-position (+ start-position token)]
-                        (when (visible? visibility query-position kv-position)
+                        (when (visible? position-filter query-position kv-position)
                           (let [page (physical-page (quot token page-size))
                                 page-token (rem token page-size)
                                 k-base (cache-index problem k-layout qk-head-dim
@@ -125,7 +143,7 @@
                                                      (double (nth k (+ k-base d)))))
                                                 (range qk-head-dim))))]
                             {:token token :page page :page-token page-token :logit logit})))))
-              (range length))]
+              logical-tokens)]
     (if (empty? tokens)
       {:kv-head kv-head :q-base q-base :tokens [] :lse Double/NEGATIVE_INFINITY}
       (let [maximum (reduce max (map :logit tokens))

@@ -3,7 +3,7 @@
 
    One work-item owns one output component and recomputes QK. This intentionally slow schedule is
    the executable semantic oracle for packed queries, GQA, independent K/V layouts and dimensions,
-   logical causal/window visibility, and physical page routing."
+   logical interval/CSR visibility, and physical page routing."
   (:require [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -23,12 +23,18 @@
   (let [identity (select-keys problem
                               [:batch-size :q-heads :kv-heads :qk-head-dim :value-head-dim
                                :page-size :physical-pages :scale :k-format :v-format
-                               :k-layout :v-layout :visibility])
+                               :k-layout :v-layout])
+        visibility (:visibility problem)
         identity (assoc identity
                         :route-kind (attention/route-kind (:route problem))
                         :route-shape (select-keys (:route problem)
                                                   [:pages-per-sequence
                                                    :page-index-capacity])
+                        :visibility-kind (attention/visibility-kind visibility)
+                        :visibility-shape
+                        (cond-> {:position-filter (into {} (attention/position-filter visibility))}
+                          (attention/csr-visibility? visibility)
+                          (assoc :key-index-capacity (:key-index-capacity visibility)))
                         :total-query-tokens (get-in problem [:query :total-tokens]))]
     (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity))))))
 
@@ -52,6 +58,12 @@
          "    __global const int* page_indices,\n"
          "    __global const int* last_page_lengths,\n"
          "    __global const int* kv_start_positions,\n")))
+
+(defn- visibility-signature
+  [visibility]
+  (when (attention/csr-visibility? visibility)
+    (str "    __global const int* attention_row_offsets,\n"
+         "    __global const int* attention_key_indices,\n")))
 
 (defn- route-initialization
   [{:keys [route page-size]}]
@@ -106,6 +118,29 @@
          (str "    visible = visible && (kv_position <= (long)q_position + "
               window-right "L);\n"))))
 
+(defn- visibility-initialization
+  [visibility]
+  (when (attention/csr-visibility? visibility)
+    (str "  const int attention_begin = attention_row_offsets[q_token];\n"
+         "  const int attention_end = attention_row_offsets[q_token + 1];\n"
+         "  if (attention_row_offsets[0] != 0 || attention_begin < 0\n"
+         "      || attention_end < attention_begin || attention_end > "
+         (:key-index-capacity visibility) ") {\n"
+         "    output[out_index] = convert_half_rte(NAN);\n"
+         "    return;\n"
+         "  }\n")))
+
+(defn- visibility-loop-start
+  [visibility]
+  (if (attention/csr-visibility? visibility)
+    (str "  for (int edge = attention_begin; edge < attention_end; ++edge) {\n"
+         "    const int token = attention_key_indices[edge];\n"
+         "    if (token < 0 || token >= length) {\n"
+         "      output[out_index] = convert_half_rte(NAN);\n"
+         "      return;\n"
+         "    }\n")
+    "  for (int token = 0; token < length; ++token) {\n"))
+
 (defn- source
   [problem name]
   (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
@@ -122,6 +157,7 @@
          "    __global const half* k_pages,\n"
          "    __global const half* v_pages,\n"
          (route-signature route)
+         (visibility-signature visibility)
          "    __global half* output) {\n"
          "  const int d = (int)get_global_id(0);\n"
          "  const int q_head = (int)get_global_id(1);\n"
@@ -146,16 +182,17 @@
          "    return;\n"
          "  }\n"
          (route-initialization problem)
+         (visibility-initialization visibility)
          "  const int kv_head = q_head / " gqa-ratio ";\n"
          "  const long q_base = ((long)q_token * " q-heads
          " + q_head) * " qk-head-dim ";\n"
          "  float maximum = -3.402823466e+38f;\n"
          "  float denominator = 0.0f;\n"
          "  float accumulator = 0.0f;\n"
-         "  for (int token = 0; token < length; ++token) {\n"
+         (visibility-loop-start visibility)
          "    const long kv_position = (long)kv_start_position + token;\n"
          "    int visible = 1;\n"
-         (visibility-statements visibility)
+         (visibility-statements (attention/position-filter visibility))
          "    if (!visible) continue;\n"
          "    const int logical_page = token / " page-size ";\n"
          "    const int physical_page = " (physical-page-expression route) ";\n"
@@ -185,17 +222,17 @@
 
 (defn- ordered-inputs
   [problem]
-  (let [{:keys [query k-pages v-pages route]} problem
-        common [(:values query) (:row-offsets query) (:positions query) k-pages v-pages]]
-    (into common
-          (if (attention/dense-paged-route? route)
-            [(:page-table route) (:lengths route) (:start-positions route)]
-            [(:page-offsets route) (:page-indices route) (:last-page-lengths route)
-             (:start-positions route)]))))
+  (let [{:keys [query k-pages v-pages route visibility]} problem
+        common [(:values query) (:row-offsets query) (:positions query) k-pages v-pages]
+        route-inputs (if (attention/dense-paged-route? route)
+                       [(:page-table route) (:lengths route) (:start-positions route)]
+                       [(:page-offsets route) (:page-indices route) (:last-page-lengths route)
+                        (:start-positions route)])]
+    (into (into common route-inputs) (attention/visibility-buffer-ids visibility))))
 
 (defn- ordered-abi
   [problem]
-  (let [{:keys [query k-pages v-pages route output]} problem
+  (let [{:keys [query k-pages v-pages route visibility output]} problem
         common [(kabi/slot (:values query) :input :half :c-name "q" :role :query)
                 (kabi/slot (:row-offsets query) :input :int
                            :c-name "q_row_offsets" :role :query-rows)
@@ -218,9 +255,15 @@
            (kabi/slot (:last-page-lengths route) :input :int
                       :c-name "last_page_lengths" :role :last-page-lengths)
            (kabi/slot (:start-positions route) :input :int
-                      :c-name "kv_start_positions" :role :kv-start-positions)])]
+                      :c-name "kv_start_positions" :role :kv-start-positions)])
+        visibility-slots
+        (when (attention/csr-visibility? visibility)
+          [(kabi/slot (:row-offsets visibility) :input :int
+                      :c-name "attention_row_offsets" :role :attention-row-offsets)
+           (kabi/slot (:key-indices visibility) :input :int
+                      :c-name "attention_key_indices" :role :attention-key-indices)])]
     (kabi/validate!
-     (conj (into common route-slots)
+     (conj (into (into common route-slots) visibility-slots)
            (kabi/slot output :output :half :c-name "output" :role :result)))))
 
 (defn emit-fp16-reference
@@ -248,6 +291,7 @@
       :attributes {:strategy :fp16-reference :optimization-tier :reference
                    :storage-dtype :half :accumulator-dtype :float
                    :route-kind (attention/route-kind route)
+                   :visibility-kind (attention/visibility-kind (:visibility problem))
                    :k-layout (:k-layout problem) :v-layout (:v-layout problem)
                    :visibility (:visibility problem)
                    :layout (attention/layouts problem)
