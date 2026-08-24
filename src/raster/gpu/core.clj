@@ -27,8 +27,10 @@
   (:refer-clojure :exclude [])
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -193,6 +195,28 @@
     (doseq [[_ buf] bufs]
       (free! buf))))
 
+(defn- allocation-contract
+  [device-id session-id key buffer ownership opts]
+  (let [backend (backend-type device-id)]
+    (bview/allocation
+     {:id (or (:allocation-id opts) [session-id key (random-uuid)])
+      :byte-size (:byte-size buffer)
+      :memory-space (or (:memory-space opts) (case backend :ze :shared :ocl :device))
+      :device device-id
+      :alignment (or (:alignment opts) 1)
+      :coherence (or (:coherence opts)
+                     (case backend :ze :host-coherent :ocl :explicit-transfer))
+      :ownership ownership})))
+
+(defn- free-session-buffers!
+  "Free only session-owned allocations. Borrowed/external registrations are detached, never
+   destroyed by Raster."
+  [buffers allocations device-id]
+  (let [free! (rt-resolve device-id "free-buffer!")]
+    (doseq [[key buffer] buffers
+            :when (= :owned (:ownership (get allocations key)))]
+      (free! buffer))))
+
 (defn- alloc-buffers-transactional
   "Allocate buffer specs one at a time and free the successful prefix on failure."
   [buffer-specs device-id]
@@ -291,6 +315,7 @@
            :arena-id  arena-id
            :kernels   {}       ;; {phase-key → [kernel-info ...]}
            :buffers   {}       ;; {buf-key → DeviceBuffer}
+           :allocations {}     ;; {buf-key → backend-neutral BufferAllocation}
            :programs  {}       ;; {program-key → bound resident program (see bind-program!)}
            :kernel-graphs {}    ;; {graph-key → bound emitted KernelGraph}
            :events {}           ;; {event-id → session-owned asynchronous completion}
@@ -312,7 +337,7 @@
       ;; Drain and release every event before tearing any of those resources down.
       (doseq [[_ {:keys [event]}] (:events @sess)]
         (release-event! sess event))
-      (let [{:keys [device-id arena-id buffers prepared graphs programs kernel-graphs]} @sess]
+      (let [{:keys [device-id arena-id buffers allocations prepared graphs programs kernel-graphs]} @sess]
         ;; backend-specific: the bound-dispatch + command-graph path is ze-only, so resolve the
         ;; destroyers nil-safely rather than via rt-resolve (which throws on backends lacking them).
         (let [ns-sym (case (backend-type device-id) :ze 'raster.gpu.ze-runtime :ocl 'raster.gpu.ocl-runtime)
@@ -335,10 +360,10 @@
                 (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
         (doseq [[_ graph-entry] kernel-graphs]
           (destroy-kernel-graph-entry! device-id graph-entry))
-        (free-buffers-internal! buffers device-id)
+        (free-session-buffers! buffers allocations device-id)
         (let [close-arena! (rt-resolve device-id "close-kernel-arena!")]
           (close-arena! arena-id))
-        (swap! sess assoc :closed? true :buffers {} :kernels {} :prepared {} :graphs {}
+        (swap! sess assoc :closed? true :buffers {} :allocations {} :kernels {} :prepared {} :graphs {}
                :programs {} :kernel-graphs {} :events {})))))
 
 (defn with-gpu-session*
@@ -418,18 +443,81 @@
    Buffers are merged into the session — call multiple times to add more.
    If allocation fails partway through, already-allocated buffers are freed."
   [sess buffer-specs]
-  (let [device-id (:device-id @sess)
-        new-bufs (alloc-buffers-transactional buffer-specs device-id)]
-    (swap! sess update :buffers merge new-bufs)
-    new-bufs))
+  (locking sess
+    (let [{:keys [device-id session-id buffers closed?]} @sess
+          duplicate-keys (set (filter #(contains? buffers %) (keys buffer-specs)))]
+      (when closed?
+        (throw (ex-info "cannot allocate in a closed GPU session" {})))
+      (when (seq duplicate-keys)
+        (throw (ex-info "session buffer keys must identify one stable allocation lifetime"
+                        {:duplicate-keys duplicate-keys})))
+      (let [new-bufs (alloc-buffers-transactional buffer-specs device-id)]
+        (let [new-allocations
+              (try
+                (into {}
+                      (map (fn [[key buffer]]
+                             [key (allocation-contract device-id session-id key buffer :owned {})]))
+                      new-bufs)
+                (catch Exception e
+                  (free-buffers-internal! new-bufs device-id)
+                  (throw e)))]
+          (swap! sess (fn [state]
+                        (-> state
+                            (update :buffers merge new-bufs)
+                            (update :allocations merge new-allocations))))
+          new-bufs)))))
+
+(defn register-buffer!
+  "Register an existing backend buffer without taking ownership by default.
+
+   This is the safe zero-copy/import seam: callers must first obtain a buffer that the selected
+   backend can legally address (an arbitrary Panama MemorySegment is not necessarily GPU-visible).
+   `opts` may specify :ownership (:external or :borrowed), :memory-space, :coherence, :alignment,
+   and a stable :allocation-id. Raster never frees external/borrowed registrations."
+  ([sess key buffer] (register-buffer! sess key buffer {}))
+  ([sess key buffer opts]
+   (locking sess
+     (let [{:keys [device-id session-id buffers closed?]} @sess
+           ownership (or (:ownership opts) :external)
+           device-buffer? (rt-resolve device-id "device-buffer?")]
+       (when closed?
+         (throw (ex-info "cannot register a buffer in a closed GPU session" {:key key})))
+       (when (contains? buffers key)
+         (throw (ex-info "session buffer key already names a live allocation" {:key key})))
+       (when-not (contains? #{:external :borrowed} ownership)
+         (throw (ex-info "registered buffers must remain caller-owned"
+                         {:key key :ownership ownership})))
+       (when-not (device-buffer? buffer)
+         (throw (ex-info "registered value is not a buffer for this session backend"
+                         {:key key :device-id device-id :actual (type buffer)})))
+       (let [allocation (allocation-contract device-id session-id key buffer ownership opts)]
+         (swap! sess (fn [state]
+                       (-> state
+                           (assoc-in [:buffers key] buffer)
+                           (assoc-in [:allocations key] allocation))))
+         buffer)))))
 
 (defn free-buffer!
-  "Free a specific buffer from the session by key."
+  "Release a specific buffer registration. Raster frees it only when the allocation is owned."
   [sess key]
-  (let [{:keys [device-id buffers]} @sess]
-    (when-let [buf (get buffers key)]
-      ((rt-resolve device-id "free-buffer!") buf)
-      (swap! sess update :buffers dissoc key))))
+  (locking sess
+    (let [{:keys [device-id buffers allocations kernel-graphs]} @sess
+          bound-graphs (->> kernel-graphs
+                            (keep (fn [[graph-key entry]]
+                                    (when (some #(= key (:key %))
+                                                (vals (:resident-views entry)))
+                                      graph-key)))
+                            vec)]
+      (when-let [buf (get buffers key)]
+        (when (seq bound-graphs)
+          (throw (ex-info "cannot release a buffer while a kernel graph holds one of its views"
+                          {:key key :kernel-graphs bound-graphs})))
+        (when (= :owned (:ownership (get allocations key)))
+          ((rt-resolve device-id "free-buffer!") buf))
+        (swap! sess (fn [state]
+                      (-> state
+                          (update :buffers dissoc key)
+                          (update :allocations dissoc key))))))))
 
 ;; ================================================================
 ;; Buffer argument resolution
@@ -641,11 +729,107 @@
                                 {:available (keys buffers)})))]
     ((rt-resolve device-id "buffer->array") buf)))
 
-(defn- session-buffer
-  [sess key]
-  (let [{:keys [buffers]} @sess]
-    (or (get buffers key)
-        (throw (ex-info (str "No buffer for key: " key) {:available (keys buffers)})))))
+(defrecord ResidentBufferView [session-id key view])
+
+(defn resident-buffer-view?
+  [x]
+  (and x (= "raster.gpu.core.ResidentBufferView" (.getName (class x)))))
+
+(defn- checked-resident-view
+  [sess resident]
+  (when-not (resident-buffer-view? resident)
+    (throw (ex-info "expected a ResidentBufferView" {:value resident :actual (type resident)})))
+  (let [{current-session :session-id buffers :buffers allocations :allocations closed? :closed?} @sess
+        key (:key resident)
+        current-allocation (get allocations key)]
+    (when closed?
+      (throw (ex-info "cannot use a buffer view from a closed GPU session" {:key key})))
+    (when-not (= current-session (:session-id resident))
+      (throw (ex-info "buffer view belongs to a different GPU session"
+                      {:key key :expected current-session :actual (:session-id resident)})))
+    (when-not (and (contains? buffers key)
+                   current-allocation
+                   (= (:id current-allocation) (get-in resident [:view :allocation :id])))
+      (throw (ex-info "buffer view no longer names its original live allocation"
+                      {:key key :allocation (get-in resident [:view :allocation :id])})))
+    (bview/validate-view! (:view resident))
+    resident))
+
+(defn buffer-view
+  "Return a stable checked view of a session allocation.
+
+   With no opts this is the whole flat buffer. Options describe a typed view and accept
+   :byte-offset, :shape, :strides, and :id. Shape defaults to the remaining one-dimensional
+   capacity. Byte offsets are relative to the allocation, and all bounds are checked now."
+  ([sess key] (buffer-view sess key {}))
+  ([sess key opts]
+   (let [{:keys [session-id buffers allocations closed?]} @sess
+         buffer (get buffers key)
+         allocation (get allocations key)]
+     (when closed?
+       (throw (ex-info "cannot create a buffer view in a closed GPU session" {:key key})))
+     (when-not (and buffer allocation)
+       (throw (ex-info (str "No buffer for key: " key " (or no live allocation contract)")
+                       {:key key :available (keys buffers)})))
+     (let [view-dtype (or (:dtype opts) (:dtype buffer))
+           byte-offset (long (or (:byte-offset opts) 0))
+           element-bytes (long (dtype/bytes-of view-dtype))
+           remaining (- (:byte-size allocation) byte-offset)
+           _ (when (or (neg? byte-offset) (neg? remaining)
+                       (not (zero? (mod remaining element-bytes))))
+               (throw (ex-info "buffer view offset leaves no integral typed capacity"
+                               {:key key :byte-offset byte-offset :dtype view-dtype
+                                :allocation-bytes (:byte-size allocation)})))
+           shape (or (:shape opts) [(quot remaining element-bytes)])
+           descriptor (bview/view allocation
+                                  (assoc opts :byte-offset byte-offset
+                                         :dtype view-dtype
+                                         :shape shape))]
+       (->ResidentBufferView session-id key descriptor)))))
+
+(defn sub-buffer-view
+  "Create a checked resident view contained by `base`; :byte-offset is relative to `base`."
+  [sess base opts]
+  (let [base (checked-resident-view sess base)]
+    (->ResidentBufferView (:session-id base) (:key base)
+                          (bview/subview (:view base) opts))))
+
+(defn- resolve-resident-binding
+  [sess key-or-view]
+  (let [resident (if (resident-buffer-view? key-or-view)
+                   (checked-resident-view sess key-or-view)
+                   (buffer-view sess key-or-view))]
+    {:buffer (get-in @sess [:buffers (:key resident)])
+     :resident resident
+     :view (:view resident)}))
+
+(defn- checked-view-range-spec
+  [buffer view spec direction]
+  (let [view (bview/validate-view! view)
+        raw-dtype (dtype/canon (:dtype buffer))
+        view-dtype (dtype/canon (:dtype view))
+        element-bytes (long (dtype/bytes-of raw-dtype))
+        buffer-field (case direction :upload :dst-element :download :src-element)
+        relative (long (get spec buffer-field 0))
+        elements (:elements spec)
+        capacity (quot (:byte-length view) element-bytes)]
+    (when-not (= raw-dtype view-dtype)
+      (throw (ex-info "ranged transfers cannot reinterpret a resident view's storage dtype"
+                      {:buffer-dtype raw-dtype :view-dtype view-dtype})))
+    (when-not (bview/contiguous? view)
+      (throw (ex-info "ranged transfers require a contiguous resident view"
+                      {:view (:id view) :shape (:shape view) :strides (:strides view)})))
+    (when-not (and (integer? elements) (not (neg? elements)))
+      (throw (ex-info "ranged transfer requires a non-negative integer element count"
+                      {:elements elements})))
+    (when (neg? relative)
+      (throw (ex-info "ranged transfer has a negative buffer-view offset"
+                      {:view (:id view) :offset relative :elements elements})))
+    (when (> (+ relative elements) capacity)
+      (throw (ex-info "ranged transfer exceeds the buffer view"
+                      {:view (:id view) :offset relative :elements elements
+                       :view-elements capacity})))
+    (assoc spec buffer-field (+ (quot (:byte-offset view) element-bytes) relative))))
 
 (defn upload-range!
   "Copy a SUB-RANGE of a host array or MemorySegment into a session buffer.
@@ -659,14 +843,18 @@
    Why this exists: `upload!`/`download` move the WHOLE buffer. A KV cache is allocated at
    `maxpos` positions and position-major, so a continuation of `t` tokens is one contiguous
    prefix — exporting it should move `t` rows, not `maxpos`."
-  [sess key src spec]
-  ((rt-resolve (:device-id @sess) "upload-range!") (session-buffer sess key) src spec))
+  [sess key-or-view src spec]
+  (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+        spec (checked-view-range-spec buffer view spec :upload)]
+    ((rt-resolve (:device-id @sess) "upload-range!") buffer src spec)))
 
 (defn download-range!
   "Copy a SUB-RANGE of a session buffer into a host array or MemorySegment; mirror of
    `upload-range!`. Returns `dst`."
-  [sess key dst spec]
-  ((rt-resolve (:device-id @sess) "download-range!") (session-buffer sess key) dst spec))
+  [sess key-or-view dst spec]
+  (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+        spec (checked-view-range-spec buffer view spec :download)]
+    ((rt-resolve (:device-id @sess) "download-range!") buffer dst spec)))
 
 (defn- transfer-ranges!
   "The batched core. VALIDATES EVERY entry (`plan-range`) before EXECUTING ANY. A batch is how a
@@ -680,9 +868,10 @@
         plan (rt-resolve device-id "plan-range")
         exec (rt-resolve device-id "execute-range!")
         ;; phase 1: resolve + validate everything, collecting plans in order
-        plans (mapv (fn [[key host spec]]
-                      (let [buf (session-buffer sess key)]
-                        [buf (plan buf host spec direction) host]))
+        plans (mapv (fn [[key-or-view host spec]]
+                      (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+                            spec (checked-view-range-spec buffer view spec direction)]
+                        [buffer (plan buffer host spec direction) host]))
                     entries)]
     ;; phase 2: execute in order
     (mapv (fn [[buf p host]] (exec buf p direction) (if (= :upload direction) buf host)) plans)))
@@ -728,6 +917,95 @@
 (defn- external-graph-buffer-ids
   [graph]
   (set (map :id (concat (:inputs graph) (:outputs graph)))))
+
+(defn- write-access?
+  [access]
+  (contains? #{:write :read-write} access))
+
+(defn- resolve-graph-elements
+  [scalar-values expression]
+  (let [bound (get scalar-values expression ::not-bound)
+        value (if (= ::not-bound bound)
+                (kgcall/resolve-integer scalar-values expression)
+                (if (and (map? bound) (contains? bound :value)) (:value bound) bound))]
+    (when-not (and (integer? value) (not (neg? value)))
+      (throw (ex-info "kernel graph buffer extent must resolve to a non-negative integer"
+                      {:expression expression :resolved value})))
+    (long value)))
+
+(defn- validate-external-view!
+  [graph-buffer view scalar-values]
+  (let [view (bview/validate-view! view)
+        expected-dtype (dtype/canon (:dtype graph-buffer))
+        actual-dtype (dtype/canon (:dtype view))
+        expected-elements (when (some? (:elements graph-buffer))
+                            (resolve-graph-elements scalar-values (:elements graph-buffer)))
+        capacity (quot (:byte-length view) (dtype/bytes-of actual-dtype))]
+    (when-not (= expected-dtype actual-dtype)
+      (throw (ex-info "kernel graph buffer dtype differs from its resident view"
+                      {:graph-buffer (:id graph-buffer) :expected expected-dtype
+                       :actual actual-dtype :view (:id view)})))
+    (when (and expected-elements (> expected-elements capacity))
+      (throw (ex-info "kernel graph buffer extent exceeds its resident view"
+                      {:graph-buffer (:id graph-buffer) :elements expected-elements
+                       :view-elements capacity :view (:id view)})))
+    (when-not (bview/contiguous? view)
+      (throw (ex-info "kernel ABI binding currently requires a contiguous resident view"
+                      {:graph-buffer (:id graph-buffer) :view (:id view)
+                       :shape (:shape view) :strides (:strides view)})))
+    view))
+
+(defn- node-physical-hazard?
+  [external-bindings earlier later]
+  (boolean
+   (some (fn [earlier-use]
+           (some (fn [later-use]
+                   (let [earlier-view (get-in external-bindings [(:buffer earlier-use) :view])
+                         later-view (get-in external-bindings [(:buffer later-use) :view])]
+                     (and earlier-view later-view
+                          (bview/overlaps? earlier-view later-view)
+                          (or (write-access? (:access earlier-use))
+                              (write-access? (:access later-use))))))
+                 (:uses later)))
+         (:uses earlier))))
+
+(defn- validate-physical-aliases!
+  "Prove hazards introduced when distinct graph identities are bound to overlapping views. The
+   symbolic graph validator cannot see these aliases, so binding must reject same-kernel writable
+   aliases and require the same explicit dependency rule across kernels."
+  [graph external-bindings]
+  (doseq [node (:nodes graph)
+          [index left] (map-indexed vector (:uses node))
+          right (drop (inc index) (:uses node))]
+    (let [left-view (get-in external-bindings [(:buffer left) :view])
+          right-view (get-in external-bindings [(:buffer right) :view])]
+      (when (and left-view right-view
+                 (bview/overlaps? left-view right-view)
+                 (or (write-access? (:access left)) (write-access? (:access right))))
+        (throw (ex-info "one kernel cannot bind overlapping writable graph buffer views"
+                        {:node (:id node) :left (:buffer left) :right (:buffer right)})))))
+  (doseq [[later-index later] (map-indexed vector (:nodes graph))
+          earlier (take later-index (:nodes graph))
+          :when (node-physical-hazard? external-bindings earlier later)
+          :when (not (contains? (set (:dependencies later)) (:id earlier)))]
+    (throw (ex-info "kernel graph omits a dependency introduced by overlapping resident views"
+                    {:node (:id later) :missing (:id earlier)})))
+  external-bindings)
+
+(defn- runtime-buffer-for-view
+  [device-id buffer view]
+  (let [raw-dtype (dtype/canon (:dtype buffer))
+        view-dtype (dtype/canon (:dtype view))]
+    (when-not (= raw-dtype view-dtype)
+      (throw (ex-info "kernel ABI cannot reinterpret a resident buffer dtype"
+                      {:buffer-dtype raw-dtype :view-dtype view-dtype :view (:id view)})))
+    (if (zero? (:byte-offset view))
+      buffer
+      (case (backend-type device-id)
+        :ze ((rt-resolve device-id "slice-buffer") buffer (:byte-offset view)
+                                                   (:byte-length view) view-dtype)
+        :ocl (throw (ex-info "OpenCL non-zero-offset kernel views require a legal cl_mem sub-buffer"
+                             {:view (:id view) :byte-offset (:byte-offset view)}))))))
 
 (defn- resolve-kernel-graph-entry
   [sess handle]
@@ -810,17 +1088,17 @@
 (defn bind-kernel-graph!
   "Bind an emitted KernelGraph for repeated resident execution.
 
-   `buffer-keys` maps every external GraphBuffer identity to an existing session-buffer key.
-   Distinct graph identities may not alias one session key until stable BufferView/range analysis
-   exists. `scalar-values` maps symbolic compiler values to explicitly typed runtime scalars, e.g.
-   `{'n {:type :int :value 4096}}`.
+   `buffer-keys` maps every external GraphBuffer identity to an existing session-buffer key or a
+   ResidentBufferView. Distinct graph identities may share an allocation when their physical
+   ranges and declared accesses are legal. `scalar-values` maps symbolic compiler values to
+   explicitly typed runtime scalars, e.g. `{'n {:type :int :value 4096}}`.
 
    The graph owns its temporary allocations and dedicated bound kernel handles. Binding validates
    the complete graph call, lowers dependencies to logical queue/event edges, then records a
    conservative dependency-safe sequence. Current backends map the logical plan to one in-order
    compute queue; submit-kernel-graph! exposes asynchronous completion without native handles."
   [sess graph-key graph buffer-keys scalar-values]
-  (let [{:keys [device-id buffers closed?]} @sess
+  (let [{:keys [device-id closed?]} @sess
         graph (kgraph/validate! graph)
         external-ids (external-graph-buffer-ids graph)]
     (when closed?
@@ -828,18 +1106,20 @@
     (when-not (= external-ids (set (keys buffer-keys)))
       (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
                       {:expected external-ids :bound (set (keys buffer-keys))})))
-    (when-not (= (count (vals buffer-keys)) (count (set (vals buffer-keys))))
-      (throw (ex-info "distinct graph buffers cannot alias before BufferView range analysis"
-                      {:buffer-keys buffer-keys})))
-    (release-graph-events! sess graph-key)
-    (let [external-buffers
-          (into {}
-                (map (fn [[id key]]
-                       [id (or (get buffers key)
-                               (throw (ex-info "kernel graph external session buffer is missing"
-                                               {:graph-buffer id :session-key key
-                                                :available (keys buffers)})))]))
-                buffer-keys)
+    (let [graph-buffer-by-id (into {} (map (juxt :id identity))
+                                   (concat (:inputs graph) (:outputs graph)))
+          external-bindings (into {}
+                                  (map (fn [[id key-or-view]]
+                                         [id (resolve-resident-binding sess key-or-view)]))
+                                  buffer-keys)
+          _ (doseq [[id {:keys [view]}] external-bindings]
+              (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
+          _ (validate-physical-aliases! graph external-bindings)
+          external-buffers (into {}
+                                 (map (fn [[id {:keys [buffer view]}]]
+                                        [id (runtime-buffer-for-view device-id buffer view)]))
+                                 external-bindings)
+          _ (release-graph-events! sess graph-key)
           temporary-specs (kgcall/temporary-specs graph scalar-values)
           temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
           all-buffers (merge external-buffers temporary-buffers)
@@ -868,6 +1148,9 @@
                        :prepareds @prepareds
                        :temporary-buffers temporary-buffers
                        :buffer-keys buffer-keys
+                       :resident-views (into {} (map (fn [[id binding]]
+                                                       [id (:resident binding)]))
+                                             external-bindings)
                        :outputs (select-keys all-buffers (map :id (:outputs graph)))}
                 old (get-in @sess [:kernel-graphs graph-key])]
             (swap! sess assoc-in [:kernel-graphs graph-key] entry)

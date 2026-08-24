@@ -59,6 +59,31 @@
     (gp/gpu-skip! "Level Zero KernelGraph inclusive scan")
     (assert-prefix! :ze:0)))
 
+(deftest level-zero-kernel-graph-binds-disjoint-views-of-one-allocation
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "Level Zero KernelGraph BufferView aliases")
+    (let [n 1025
+          graph (emitted-graph)
+          storage (float-array (* 2 n))]
+      (dotimes [i n] (aset storage i 1.0))
+      (gpu/with-gpu-session [sess :ze:0]
+        (gpu/alloc! sess {:storage [:float (* 2 n) storage]})
+        (let [input (gpu/buffer-view sess :storage {:shape [n]})
+              output (gpu/buffer-view sess :storage {:byte-offset (* 4 n) :shape [n]})
+              handle (gpu/bind-kernel-graph!
+                      sess :view-scan graph {'values input 'out output}
+                      {'n {:type :int :value n}})]
+          (try
+            (gpu/run-kernel-graph! sess handle)
+            (let [result (float-array n)]
+              (gpu/download-range! sess output result {:elements n})
+              (is (= 1025.0 (double (aget result 1024))))
+              (is (every? true?
+                          (map-indexed (fn [i value] (= (double (inc i)) (double value)))
+                                       result))))
+            (finally
+              (gpu/release-kernel-graph! sess handle))))))))
+
 (deftest opencl-kernel-graph-inclusive-scan
   (if-not @ocl-available?
     (is true "OpenCL device unavailable")

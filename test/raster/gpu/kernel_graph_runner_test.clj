@@ -1,6 +1,7 @@
 (ns raster.gpu.kernel-graph-runner-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
@@ -41,8 +42,12 @@
 
 (deftest session-runner-owns-only-graph-temporaries-and-bound-driver-objects
   (let [graph (emitted-graph)
-        values-buffer (Object.)
-        output-buffer (Object.)
+        values-buffer {:dtype :float :n-elements 1025 :byte-size 4100}
+        output-buffer {:dtype :float :n-elements 1025 :byte-size 4100}
+        allocation (fn [id]
+                     (bview/allocation {:id id :byte-size 4100 :memory-space :shared
+                                        :device :ze:0 :coherence :host-coherent
+                                        :ownership :owned}))
         registered (atom [])
         bound (atom [])
         recorded (atom [])
@@ -55,6 +60,8 @@
         sess (atom {:device-id :ze:0
                     :session-id :test-session
                     :buffers {:values values-buffer :out output-buffer}
+                    :allocations {:values (allocation :values-allocation)
+                                  :out (allocation :out-allocation)}
                     :kernel-graphs {}
                     :events {}
                     :closed? false})
