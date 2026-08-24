@@ -8,7 +8,9 @@
   (:require [raster.compiler.core.dtype :as dtype]))
 
 (defrecord PackedQueryBatch [values row-offsets positions total-tokens])
-(defrecord AttentionVisibility [causal? window-left window-right])
+(defrecord IntervalVisibility [causal? window-left window-right])
+(defrecord CSRVisibility
+           [row-offsets key-indices key-index-capacity duplicate-policy position-filter])
 (defrecord DensePagedRoute [page-table lengths start-positions pages-per-sequence])
 (defrecord CSRPagedRoute
            [page-offsets page-indices last-page-lengths start-positions page-index-capacity])
@@ -27,7 +29,15 @@
 
 (defn visibility?
   [x]
-  (instance? AttentionVisibility x))
+  (or (instance? IntervalVisibility x) (instance? CSRVisibility x)))
+
+(defn interval-visibility?
+  [x]
+  (instance? IntervalVisibility x))
+
+(defn csr-visibility?
+  [x]
+  (instance? CSRVisibility x))
 
 (defn dense-paged-route?
   [x]
@@ -50,6 +60,21 @@
   (cond
     (dense-paged-route? route) :dense-paged
     (csr-paged-route? route) :csr-paged
+    :else nil))
+
+(defn visibility-kind
+  [visibility]
+  (cond
+    (interval-visibility? visibility) :interval
+    (csr-visibility? visibility) :csr
+    :else nil))
+
+(defn position-filter
+  "Return the interval/position component of any supported visibility value."
+  [visibility]
+  (cond
+    (interval-visibility? visibility) visibility
+    (csr-visibility? visibility) (:position-filter visibility)
     :else nil))
 
 (defn- positive-integer!
@@ -108,7 +133,29 @@
    (doseq [[field value] [[:window-left window-left] [:window-right window-right]]]
      (when (some? value)
        (nonnegative-integer! "attention visibility" field value)))
-   (->AttentionVisibility causal? window-left window-right)))
+   (->IntervalVisibility causal? window-left window-right)))
+
+(defn csr-visibility
+  "Construct logical sparse visibility in CSR form. There is one adjacency row per packed query
+   token, and each selected key is a zero-based logical token offset within that query's example.
+   `:set` rejects duplicate keys per row; `:multiset` preserves parallel graph edges. An optional
+   interval position filter intersects adjacency with causal/window semantics."
+  [{:keys [row-offsets key-indices key-index-capacity duplicate-policy position-filter]
+    :or {duplicate-policy :set position-filter nil}}]
+  (when (some nil? [row-offsets key-indices])
+    (throw (ex-info "CSR visibility requires row offsets and logical key indices"
+                    {:reason :attention-csr-visibility-missing-buffer})))
+  (positive-integer! "CSR visibility" :key-index-capacity key-index-capacity)
+  (when-not (contains? #{:set :multiset} duplicate-policy)
+    (throw (ex-info "CSR visibility requires a set or multiset duplicate policy"
+                    {:reason :attention-invalid-duplicate-policy
+                     :duplicate-policy duplicate-policy})))
+  (when (and position-filter (not (interval-visibility? position-filter)))
+    (throw (ex-info "CSR visibility position filter must be interval visibility"
+                    {:reason :attention-invalid-position-filter
+                     :position-filter position-filter})))
+  (->CSRVisibility row-offsets key-indices key-index-capacity duplicate-policy
+                   (or position-filter (visibility))))
 
 (defn dense-paged-route
   "Construct a fixed-width dense page route. Row b lists physical pages in increasing logical KV
@@ -168,6 +215,16 @@
     (throw (ex-info "attention requires a supported KV route"
                     {:reason :attention-unsupported-route :route route :actual (type route)}))))
 
+(defn visibility-buffer-ids
+  "Return runtime logical-visibility buffer identities. Interval visibility is entirely static."
+  [visibility]
+  (cond
+    (interval-visibility? visibility) []
+    (csr-visibility? visibility) [(:row-offsets visibility) (:key-indices visibility)]
+    :else
+    (throw (ex-info "attention requires supported logical visibility"
+                    {:reason :attention-invalid-visibility :visibility visibility}))))
+
 (defn validate!
   "Validate an AttentionProblem's static semantics and storage extents. Runtime route/query values
    are validated separately before upload and guarded again by the reference kernel."
@@ -185,7 +242,7 @@
       (throw (ex-info "attention requires a PackedQueryBatch"
                       {:reason :attention-invalid-query-batch :query query})))
     (when-not (visibility? visibility)
-      (throw (ex-info "attention requires an AttentionVisibility"
+      (throw (ex-info "attention requires interval or CSR visibility"
                       {:reason :attention-invalid-visibility :visibility visibility})))
     (when-not (paged-route? route)
       (throw (ex-info "attention requires a dense or CSR paged route"
@@ -221,6 +278,7 @@
     (let [buffers (vec (concat [(:values query) (:row-offsets query) (:positions query)
                                 k-pages v-pages]
                                (route-buffer-ids route)
+                               (visibility-buffer-ids visibility)
                                [output]))]
       (when (some nil? buffers)
         (throw (ex-info "attention requires every logical buffer identity"
@@ -248,6 +306,9 @@
       (checked-product :page-table [batch-size (:pages-per-sequence route)])
       (positive-integer! "CSR page route" :page-index-capacity
                          (:page-index-capacity route)))
+    (when (csr-visibility? visibility)
+      (positive-integer! "CSR visibility" :key-index-capacity
+                         (:key-index-capacity visibility)))
     problem))
 
 (defn make
@@ -279,7 +340,7 @@
   "Named logical layouts. These are semantic/storage axes, not thread/register layouts."
   [problem]
   (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
-                page-size physical-pages k-layout v-layout]} (validate! problem)
+                page-size physical-pages k-layout v-layout visibility]} (validate! problem)
         cache-shape (fn [layout dim]
                       (case layout
                         :kv-head-major [kv-heads physical-pages page-size dim]
@@ -297,7 +358,10 @@
               :kv-lengths [batch-size]}
              {:page-offsets [(inc batch-size)]
               :page-indices [(:page-index-capacity route)]
-              :last-page-lengths [batch-size]}))))
+              :last-page-lengths [batch-size]})
+           (when (csr-visibility? visibility)
+             {:attention-row-offsets [(inc (:total-tokens query))]
+              :attention-key-indices [(:key-index-capacity visibility)]}))))
 
 (defn buffer-specs
   "Graph-buffer metadata keyed by compiler identities, including route-variant metadata."
@@ -321,7 +385,11 @@
               (:lengths route) (spec :input :int :kv-lengths)}
              {(:page-offsets route) (spec :input :int :page-offsets)
               (:page-indices route) (spec :input :int :page-indices)
-              (:last-page-lengths route) (spec :input :int :last-page-lengths)}))))
+              (:last-page-lengths route) (spec :input :int :last-page-lengths)})
+           (when (csr-visibility? (:visibility problem))
+             (let [visibility (:visibility problem)]
+               {(:row-offsets visibility) (spec :input :int :attention-row-offsets)
+                (:key-indices visibility) (spec :input :int :attention-key-indices)})))))
 
 (defn- int32-nonnegative?
   [x]
@@ -457,4 +525,74 @@
                         (if (zero? pages) 0 (+ (* (dec pages) page-size) last))))
                     (range batch-size))]
           (validate-start-positions! batch-size starts lengths))
+        problem))))
+
+(defn logical-route-lengths
+  "Return each example's logical KV length after validating host-visible route metadata."
+  [problem values]
+  (let [{:keys [route batch-size page-size] :as problem} (validate! problem)]
+    (validate-routing! problem values)
+    (if (dense-paged-route? route)
+      (vec (:lengths values))
+      (let [offsets (vec (:page-offsets values))
+            lasts (vec (:last-page-lengths values))]
+        (mapv (fn [batch]
+                (let [pages (- (nth offsets (inc batch)) (nth offsets batch))]
+                  (if (zero? pages) 0 (+ (* (dec pages) page-size) (nth lasts batch)))))
+              (range batch-size))))))
+
+(defn validate-visibility-values!
+  "Validate host-visible logical sparse visibility before upload. CSR rows correspond one-to-one
+   with packed query tokens. Key indices are example-local logical KV offsets and are checked
+   against that query's routed length. Unused key-index capacity is ignored."
+  [problem query-row-offset-values routing-values visibility-values]
+  (let [{:keys [query visibility batch-size] :as problem} (validate! problem)]
+    (if (interval-visibility? visibility)
+      problem
+      (let [query-offsets (vec query-row-offset-values)
+            total-tokens (:total-tokens query)
+            row-offsets (vec (:row-offsets visibility-values))
+            key-indices (vec (:key-indices visibility-values))
+            capacity (:key-index-capacity visibility)
+            lengths (logical-route-lengths problem routing-values)]
+        (when-not (and (= (inc batch-size) (count query-offsets))
+                       (= 0 (first query-offsets))
+                       (= total-tokens (peek query-offsets))
+                       (every? int32-nonnegative? query-offsets)
+                       (every? true? (map <= query-offsets (rest query-offsets))))
+          (throw (ex-info "packed query row offsets are invalid for sparse visibility"
+                          {:reason :attention-invalid-query-offsets
+                           :offsets query-offsets :total-tokens total-tokens})))
+        (when-not (= (inc total-tokens) (count row-offsets))
+          (throw (ex-info "attention CSR row offsets have the wrong element count"
+                          {:reason :attention-visibility-row-offset-shape
+                           :expected (inc total-tokens) :actual (count row-offsets)})))
+        (when-not (= capacity (count key-indices))
+          (throw (ex-info "attention CSR key-index buffer has the wrong element count"
+                          {:reason :attention-visibility-key-index-shape
+                           :expected capacity :actual (count key-indices)})))
+        (when-not (and (= 0 (first row-offsets))
+                       (every? int32-nonnegative? row-offsets)
+                       (every? true? (map <= row-offsets (rest row-offsets)))
+                       (<= (peek row-offsets) capacity))
+          (throw (ex-info "attention CSR row offsets must be monotone and capacity-bounded"
+                          {:reason :attention-invalid-visibility-row-offsets
+                           :offsets row-offsets :capacity capacity})))
+        (doseq [batch (range batch-size)
+                query-token (range (nth query-offsets batch) (nth query-offsets (inc batch)))
+                :let [begin (nth row-offsets query-token)
+                      end (nth row-offsets (inc query-token))
+                      row (subvec key-indices begin end)
+                      length (nth lengths batch)]]
+          (doseq [key-index row]
+            (when-not (and (int32-nonnegative? key-index) (< key-index length))
+              (throw (ex-info "attention CSR selects a key outside its example's logical route"
+                              {:reason :attention-invalid-logical-key-index
+                               :batch batch :query-token query-token
+                               :key-index key-index :kv-length length}))))
+          (when (and (= :set (:duplicate-policy visibility))
+                     (not= (count row) (count (distinct row))))
+            (throw (ex-info "set-valued attention CSR cannot contain duplicate keys per row"
+                            {:reason :attention-duplicate-logical-key
+                             :batch batch :query-token query-token :keys row}))))
         problem))))

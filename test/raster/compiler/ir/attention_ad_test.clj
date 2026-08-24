@@ -35,7 +35,8 @@
     (is (= {:query 'q :key 'k :value 'v} (:differentiable contract)))
     (is (= {:query-row-offsets 'q-offsets
             :query-positions 'q-positions
-            :route '[pages lengths starts]}
+            :route '[pages lengths starts]
+            :visibility []}
            (:nondifferentiable contract)))
     (is (= {:query :write :key :routed-sum :value :routed-sum}
            (:cotangent-accumulation contract)))

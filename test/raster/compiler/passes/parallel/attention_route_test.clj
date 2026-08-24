@@ -24,6 +24,14 @@
     :last-page-lengths 'last-page-lengths :start-positions 'kv-start-positions
     :page-index-capacity 6}))
 
+(defn- csr-visibility
+  []
+  (attention/csr-visibility
+   {:row-offsets 'attention-row-offsets :key-indices 'attention-key-indices
+    :key-index-capacity 8 :duplicate-policy :multiset
+    :position-filter (attention/visibility
+                      {:causal? true :window-left 2 :window-right 0})}))
+
 (defn- problem
   [& overrides]
   (attention/make
@@ -73,6 +81,24 @@
            (subvec (mapv :c-name (:abi artifact)) 5 8)))
     (is (str/includes? (:source artifact) "page_indices[page_begin + logical_page]"))
     (is (str/includes? (:source artifact) "routed_page_count == 0"))))
+
+(deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
+  (let [artifact (:artifact (route/route!
+                             (problem :visibility (csr-visibility))))]
+    (is (= :dense-paged (get-in artifact [:attributes :route-kind])))
+    (is (= :csr (get-in artifact [:attributes :visibility-kind])))
+    (is (= '[q q-row-offsets q-positions k-pages v-pages
+             page-table kv-lengths kv-start-positions
+             attention-row-offsets attention-key-indices output]
+           (:arguments artifact)))
+    (is (= ["attention_row_offsets" "attention_key_indices"]
+           (subvec (mapv :c-name (:abi artifact)) 8 10)))
+    (is (str/includes? (:source artifact)
+                       "for (int edge = attention_begin; edge < attention_end; ++edge)"))
+    (is (str/includes? (:source artifact)
+                       "const int token = attention_key_indices[edge]"))
+    (is (str/includes? (:source artifact) "token < 0 || token >= length"))
+    (is (str/includes? (:source artifact) "kv_position <= (long)q_position"))))
 
 (deftest independent-k-and-v-layouts-are-lowered-without-repacking
   (let [source (:source (:artifact (route/route! (problem))))]

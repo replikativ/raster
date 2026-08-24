@@ -25,7 +25,7 @@
   (double (Float/float16ToFloat (short value))))
 
 (defn- make-case
-  [route-kind]
+  [route-kind visibility-kind]
   (let [dims {:batch-size 3 :q-heads 4 :kv-heads 2 :qk-head-dim 8
               :value-head-dim 6 :page-size 2 :physical-pages 7}
         {:keys [q-heads kv-heads qk-head-dim value-head-dim page-size physical-pages]} dims
@@ -69,23 +69,39 @@
            {:page-offsets 'page-offsets :page-indices 'page-indices
             :last-page-lengths 'last-page-lengths
             :start-positions 'kv-start-positions :page-index-capacity 7}))
+        visibility-values
+        (when (= :csr visibility-kind)
+          {:row-offsets (int-array [0 2 3 5 8])
+           :key-indices (int-array [1 3, 2, 0 2, 2 3 4, -1])})
+        attention-visibility
+        (case visibility-kind
+          :interval
+          (attention/visibility {:causal? true :window-left 2 :window-right 0})
+
+          :csr
+          (attention/csr-visibility
+           {:row-offsets 'attention-row-offsets :key-indices 'attention-key-indices
+            :key-index-capacity 9 :duplicate-policy :set
+            :position-filter (attention/visibility
+                              {:causal? true :window-left 2 :window-right 0})}))
         [k-layout v-layout] (if (= :dense-paged route-kind)
                               [:kv-head-major :page-major]
                               [:page-major :kv-head-major])
         problem (attention/make
                  (merge dims
-                        {:id [:device-reference route-kind]
+                        {:id [:device-reference route-kind visibility-kind]
                          :query query :k-pages 'k-pages :v-pages 'v-pages
                          :route kv-route :output 'output
                          :k-layout k-layout :v-layout v-layout
-                         :visibility (attention/visibility
-                                      {:causal? true :window-left 2 :window-right 0})
+                         :visibility attention-visibility
                          :scale (/ 1.0 (Math/sqrt (double qk-head-dim)))}))]
     (attention/validate-query-values! problem q-offsets q-positions)
     (attention/validate-routing! problem route-values)
+    (attention/validate-visibility-values!
+     problem q-offsets route-values visibility-values)
     {:problem problem :q q :k k :v v
      :q-offsets q-offsets :q-positions q-positions
-     :route-values route-values}))
+     :route-values route-values :visibility-values visibility-values}))
 
 (defn- cache-index
   [{:keys [physical-pages page-size kv-heads]} layout dim kv-head page token d]
@@ -122,6 +138,15 @@
        (or (nil? window-left) (>= kv-position (- q-position window-left)))
        (or (nil? window-right) (<= kv-position (+ q-position window-right)))))
 
+(defn- logical-tokens
+  [{:keys [problem visibility-values]} q-token length]
+  (let [visibility (:visibility problem)]
+    (if (attention/csr-visibility? visibility)
+      (let [begin (aget ^ints (:row-offsets visibility-values) q-token)
+            end (aget ^ints (:row-offsets visibility-values) (inc q-token))]
+        (mapv #(aget ^ints (:key-indices visibility-values) %) (range begin end)))
+      (range length))))
+
 (defn- reference
   [{:keys [problem q k v q-offsets q-positions route-values] :as test-case}]
   (let [{:keys [query q-heads kv-heads qk-head-dim value-head-dim page-size scale
@@ -136,8 +161,9 @@
         (dotimes [q-head q-heads]
           (let [kv-head (quot q-head gqa-ratio)
                 q-base (* (+ (* q-token q-heads) q-head) qk-head-dim)
-                visible-tokens (filterv #(visible? visibility q-position (+ kv-start %))
-                                        (range length))
+                visible-tokens (filterv #(visible? (attention/position-filter visibility)
+                                                   q-position (+ kv-start %))
+                                        (logical-tokens test-case q-token length))
                 logits
                 (mapv
                  (fn [token]
@@ -193,6 +219,15 @@
        :kv-start-positions [:int (alength ^ints (:start-positions route-values))
                             (:start-positions route-values)]})))
 
+(defn- visibility-buffer-data
+  [{:keys [visibility-values]}]
+  (if visibility-values
+    {:attention-row-offsets [:int (alength ^ints (:row-offsets visibility-values))
+                             (:row-offsets visibility-values)]
+     :attention-key-indices [:int (alength ^ints (:key-indices visibility-values))
+                             (:key-indices visibility-values)]}
+    {}))
+
 (defn- graph-bindings
   [problem]
   (let [{:keys [query route]} problem
@@ -205,11 +240,15 @@
            (if (attention/dense-paged-route? route)
              {(:page-table route) :page-table (:lengths route) :kv-lengths}
              {(:page-offsets route) :page-offsets (:page-indices route) :page-indices
-              (:last-page-lengths route) :last-page-lengths}))))
+              (:last-page-lengths route) :last-page-lengths})
+           (when (attention/csr-visibility? (:visibility problem))
+             {(:row-offsets (:visibility problem)) :attention-row-offsets
+              (:key-indices (:visibility problem)) :attention-key-indices}))))
 
 (defn- run-case
-  [device-id route-kind]
-  (let [{:keys [problem q k v q-offsets q-positions] :as test-case} (make-case route-kind)
+  [device-id route-kind visibility-kind]
+  (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
+        (make-case route-kind visibility-kind)
         graph (:graph (route/route!
                        problem {:device-type :gpu :subgroup-size 16
                                 :max-workgroup-size 256}))
@@ -222,7 +261,8 @@
                 :k-pages [:half (get-in specs ['k-pages :elements]) k]
                 :v-pages [:half (get-in specs ['v-pages :elements]) v]
                 :output [:half (get-in specs ['output :elements]) nil]}
-               (route-buffer-data test-case))]
+               (route-buffer-data test-case)
+               (visibility-buffer-data test-case))]
     (gpu/with-gpu-session [session device-id]
       (gpu/alloc! session allocations)
       (let [handle (gpu/bind-kernel-graph!
@@ -242,9 +282,14 @@
 (deftest level-zero-packed-dense-attention-matches-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "packed dense-routed FP16 attention on Level Zero")
-    (run-case :ze:0 :dense-paged)))
+    (run-case :ze:0 :dense-paged :interval)))
 
 (deftest opencl-packed-csr-attention-matches-reference
   (if-not @ocl-fp16-available?
     (is true "OpenCL FP16 device unavailable")
-    (run-case :ocl:0 :csr-paged)))
+    (run-case :ocl:0 :csr-paged :interval)))
+
+(deftest opencl-logical-csr-visibility-over-dense-pages-matches-reference
+  (if-not @ocl-fp16-available?
+    (is true "OpenCL FP16 device unavailable")
+    (run-case :ocl:0 :dense-paged :csr)))

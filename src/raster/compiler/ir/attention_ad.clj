@@ -30,10 +30,11 @@
   "Discrete metadata that must never receive tangents. Visibility is static data and therefore
    has no buffer identity here; allocation/event state is intentionally absent from AttentionProblem."
   [problem]
-  (let [{:keys [query route]} (attention/validate! problem)]
+  (let [{:keys [query route visibility]} (attention/validate! problem)]
     {:query-row-offsets (:row-offsets query)
      :query-positions (:positions query)
-     :route (attention/route-buffer-ids route)}))
+     :route (attention/route-buffer-ids route)
+     :visibility (attention/visibility-buffer-ids visibility)}))
 
 (defn validate!
   "Validate an AttentionVJP independently of any target schedule. Activity is an explicit subset
