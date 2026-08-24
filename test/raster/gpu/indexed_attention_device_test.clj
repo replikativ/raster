@@ -1,7 +1,7 @@
 (ns raster.gpu.indexed-attention-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
-            [raster.compiler.passes.parallel.indexed-attention-route :as route]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as route]
             [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]))
@@ -48,7 +48,10 @@
   (let [{:keys [plan shape-env buffers expected]} (test-case)
         graph (:graph (route/route-dynamic!
                        plan
-                       {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}))
+                       {:device-type :gpu
+                        :subgroup-size 16
+                        :max-workgroup-size 256
+                        :segmented-weighted-reduction-schedule :subgroup-score-reuse}))
         output-elements (get-in plan [:output :elements])
         scalar-values
         (assoc (into {} (map (fn [[name value]]

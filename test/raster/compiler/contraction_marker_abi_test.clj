@@ -130,6 +130,18 @@
     (is (= 2 (:expected data)))
     (is (= 1 (:actual data)))))
 
+(deftest staged-artifact-launch-preserves-all-three-geometry-axes
+  (let [seen (atom [])]
+    (with-redefs [ze/bind-kernel! (fn [kernel workgroup arguments]
+                                    (swap! seen conj [:bind kernel workgroup arguments])
+                                    :bound)
+                  ze/launch-bound! (fn [bound groups]
+                                     (swap! seen conj [:launch bound groups]))]
+      (ze/launch-geometry! :kernel [64 1 1] [2 3 4] [:a :b]))
+    (is (= [[:bind :kernel [64 1 1] [:a :b]]
+            [:launch :bound [2 3 4]]]
+           @seen))))
+
 (deftest resident-binders-validate-ordered-values-before-touching-a-driver
   (let [abi [{:name 'A :c-name "A" :kind :input :dtype :float :kernel-dtype :float}
              {:name 'alpha :c-name "alpha" :kind :scalar :dtype :float :kernel-dtype :float}

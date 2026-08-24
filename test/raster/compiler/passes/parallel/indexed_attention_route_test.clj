@@ -1,10 +1,12 @@
 (ns raster.compiler.passes.parallel.indexed-attention-route-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.java.shell :as shell]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
-            [raster.compiler.passes.parallel.indexed-attention-route :as route]))
+            [raster.compiler.passes.parallel.indexed-attention-route :as route]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as swr-route]))
 
 (defn- chain
   []
@@ -102,6 +104,73 @@
     (is (= :indexed-segmented-reduction-reference strategy))
     (is (= :generic-segmented-weighted-reduction
            (get-in artifact [:provenance :semantic-op])))))
+
+(deftest generic-router-prefers-3d-subgroup-score-reuse
+  (let [generic-plan (assoc-in (plan) [:provenance :semantic-op]
+                               :generic-segmented-weighted-reduction)
+        {:keys [leaf strategy reference? artifact graph]}
+        (swr-route/route-dynamic!
+         generic-plan {:device-type :gpu
+                       :subgroup-size 16
+                       :max-workgroup-size 256
+                       :segmented-weighted-reduction-schedule :subgroup-score-reuse})
+        runtime-values (vec (concat (repeat 6 (Object.))
+                                    (map (fn [value] {:type :long :value value})
+                                         [3 4 5 2 2 15])))
+        call (kcall/make artifact runtime-values)
+        wide-values (vec (concat (repeat 6 (Object.))
+                                 (map (fn [value] {:type :long :value value})
+                                      [3 4 260 2 128 780])))
+        wide-call (kcall/make artifact wide-values)
+        source (:source artifact)]
+    (is (= :indexed-edge-list-subgroup-score-reuse leaf))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse strategy))
+    (is (false? reference?))
+    (is (= [16 1 1] (get-in call [:geometry :workgroup-size])))
+    (is (= [1 2 3] (get-in call [:geometry :group-count])))
+    (is (= [8 2 3] (get-in wide-call [:geometry :group-count]))
+        "components wider than one subgroup become tiles")
+    (is (= strategy (get-in graph [:attributes :strategy])))
+    (is (= :generic-segmented-weighted-reduction
+           (get-in artifact [:provenance :semantic-op])))
+    (is (str/includes? source "get_group_id(2)"))
+    (is (str/includes? source "sub_group_reduce_add"))
+    (is (str/includes? source "sub_group_broadcast"))
+    (is (str/includes? source "intel_reqd_sub_group_size(16)"))
+    (is (= 1 (count (re-seq #"for \(long x" source)))
+        "one score loop is shared across the component tile")))
+
+(deftest score-reuse-decline-falls-through-to-reference
+  (let [{:keys [leaf strategy]}
+        (swr-route/route-dynamic!
+         (plan) {:device-type :gpu
+                 :subgroup-size 16
+                 :max-workgroup-size 0
+                 :segmented-weighted-reduction-schedule :subgroup-score-reuse})]
+    (is (= :indexed-edge-list-reference leaf))
+    (is (= :indexed-segmented-reduction-reference strategy))))
+
+(deftest generic-router-keeps-reference-default-without-a-measured-selection
+  (let [{:keys [leaf strategy]}
+        (swr-route/route-dynamic!
+         (plan) {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256})]
+    (is (= :indexed-edge-list-reference leaf))
+    (is (= :indexed-segmented-reduction-reference strategy))))
+
+(deftest score-reuse-source-is-valid-opencl
+  (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
+    (if-not clang?
+      (is true "clang unavailable")
+      (let [source (get-in
+                    (swr-route/route-dynamic!
+                     (plan) {:device-type :gpu
+                             :subgroup-size 16
+                             :max-workgroup-size 256
+                             :segmented-weighted-reduction-schedule :subgroup-score-reuse})
+                    [:artifact :source])
+            result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                             "-fsyntax-only" "-" :in source)]
+        (is (zero? (:exit result)) (:err result))))))
 
 (deftest route-declines-unproved-semantics-and-unresolved-shapes
   (testing "a different scalar region cannot silently enter the specialized leaf"
