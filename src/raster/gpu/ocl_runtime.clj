@@ -102,7 +102,10 @@
 (def ^:private CL_MEM_COPY_HOST_PTR (long 32))
 (def ^:private CL_TRUE (int 1))
 (def ^:private CL_COMPLETE 0)
+(def ^:private CL_QUEUE_PROFILING_ENABLE (long 2))
 (def ^:private CL_EVENT_COMMAND_EXECUTION_STATUS 0x11D3)
+(def ^:private CL_PROFILING_COMMAND_START 0x1282)
+(def ^:private CL_PROFILING_COMMAND_END 0x1283)
 
 ;; clGetDeviceInfo param_name constants
 (def ^:private CL_DEVICE_MAX_COMPUTE_UNITS 0x1002)
@@ -194,6 +197,8 @@
   (delay (make-handle "clWaitForEvents" (fd I32 I32 PTR))))
 (def ^:private h-clGetEventInfo
   (delay (make-handle "clGetEventInfo" (fd I32 PTR I32 I64 PTR PTR))))
+(def ^:private h-clGetEventProfilingInfo
+  (delay (make-handle "clGetEventProfilingInfo" (fd I32 PTR I32 I64 PTR PTR))))
 (def ^:private h-clReleaseEvent
   (delay (make-handle "clReleaseEvent" (fd I32 PTR))))
 
@@ -1346,9 +1351,10 @@
   "Enqueue one pre-bound kernel (no finish)."
   ([bound group-count]
    (enqueue-bound! bound group-count MemorySegment/NULL))
-  ([{:keys [^MemorySegment kernel wg]} group-count event-out]
-   (let [{:keys [queue]} @state
-         arena (Arena/ofConfined)
+  ([bound group-count event-out]
+   (enqueue-bound! bound group-count event-out (:queue @state)))
+  ([{:keys [^MemorySegment kernel wg]} group-count event-out queue]
+   (let [arena (Arena/ofConfined)
          wg (if (vector? wg) wg [(long wg)])
          group-count (if (vector? group-count) group-count [(long group-count)])
          work-dim (count wg)]
@@ -1374,34 +1380,84 @@
 
 (defn record-graph!
   "OpenCL 'graph': capture the ordered pre-bound launches for replay. The
-  in-order queue serializes them (= ze per-kernel barriers)."
+  in-order queue serializes them (= ze per-kernel barriers). Profiling is opt-in: a dedicated
+  CL_QUEUE_PROFILING_ENABLE queue and per-replay events exist only on a profiled graph."
   ([prepareds] (record-graph! prepareds {}))
-  ([prepareds _opts]
-   {:launches (mapv (fn [{:keys [bound group-count]}]
-                      {:bound bound :group-count group-count})
-                    prepareds)}))
+  ([prepareds {:keys [profile?] :or {profile? false}}]
+   (ensure-init!)
+   (let [launches (mapv (fn [{:keys [bound group-count]}]
+                          {:bound bound :group-count group-count})
+                        prepareds)]
+     (if-not profile?
+       {:launches launches}
+       (let [{:keys [context device]} @state
+             arena (Arena/ofConfined)]
+         (try
+           (let [err-seg (.allocate arena I32)
+                 queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
+                                             (into-array Object
+                                                         [context device
+                                                          CL_QUEUE_PROFILING_ENABLE err-seg]))]
+             (when-not (= CL_SUCCESS (read-int err-seg))
+               (throw (ex-info "clCreateCommandQueue(profile) failed"
+                               {:error (read-int err-seg)})))
+             {:launches launches
+              :profile? true
+              :profile-queue queue
+              :profile-state (atom nil)
+              :kernel-names (mapv #(or (:kernel-name %) "unknown") prepareds)
+              :phases (mapv :phase prepareds)})
+           (finally (.close arena))))))))
+
+(defn- release-native-event!
+  [event]
+  (when (and event (not (.equals ^MemorySegment event MemorySegment/NULL)))
+    (cl-call! "clReleaseEvent" @h-clReleaseEvent [event])))
+
+(defn- clear-profile-state!
+  [graph]
+  (when-let [profile-state (:profile-state graph)]
+    (when-let [{:keys [events ^Arena arena]} @profile-state]
+      (try
+        (doseq [event events] (release-native-event! event))
+        (finally
+          (.close arena)
+          (clojure.core/reset! profile-state nil))))))
 
 (defn submit-graph!
   "Submit an OpenCL graph without waiting. The in-order queue preserves the recorded order and
    the final launch signals a native event held only by this runtime-private token."
   [graph]
-  (let [launches (:launches graph)]
+  (let [launches (:launches graph)
+        profile? (:profile? graph)
+        queue (or (:profile-queue graph) (:queue @state))]
     (if (empty? launches)
       {:complete? true}
       (let [arena (Arena/ofShared)
-            event-out (.allocate arena PTR)
+            event-outs (.allocate arena (* 8 (if profile? (count launches) 1)))
             status-out (.allocate arena I32)]
         (try
+          (when (and profile? @(:profile-state graph))
+            (throw (ex-info "profiled OpenCL graph events must be read or reset before replay"
+                            {})))
           (doseq [[index {:keys [bound group-count]}] (map-indexed vector launches)]
             (enqueue-bound! bound group-count
-                            (if (= index (dec (count launches)))
-                              event-out
-                              MemorySegment/NULL)))
-          (cl-call! "clFlush" @h-clFlush [(:queue @state)])
-          {:event (.get event-out PTR 0)
-           :event-array event-out
-           :status-out status-out
-           :arena arena}
+                            (if (or profile? (= index (dec (count launches))))
+                              (.asSlice event-outs (if profile? (* 8 index) 0) 8)
+                              MemorySegment/NULL)
+                            queue))
+          (cl-call! "clFlush" @h-clFlush [queue])
+          (let [events (when profile?
+                         (mapv #(.get event-outs PTR (* 8 %)) (range (count launches))))
+                final-offset (if profile? (* 8 (dec (count launches))) 0)
+                token {:event (.get event-outs PTR final-offset)
+                       :event-array (.asSlice event-outs final-offset 8)
+                       :status-out status-out
+                       :arena arena
+                       :profile? (boolean profile?)}]
+            (when profile?
+              (clojure.core/reset! (:profile-state graph) {:events events :arena arena}))
+            token)
           (catch Exception e
             (.close arena)
             (throw e)))))))
@@ -1426,12 +1482,16 @@
 
 (defn release-event!
   "Release a runtime-private OpenCL completion token. The caller must establish completion."
-  [{:keys [complete? event ^Arena arena]}]
+  [{:keys [complete? profile? event ^Arena arena]}]
   (when-not complete?
-    (try
-      (cl-call! "clReleaseEvent" @h-clReleaseEvent [event])
-      (finally
-        (.close arena))))
+    ;; A profiled graph retains every event until read-graph-timestamps! (or reset) consumes the
+    ;; sample. The graph owns the shared arena in that interval. Ordinary completion tokens keep
+    ;; the previous immediate-release behavior.
+    (when-not profile?
+      (try
+        (release-native-event! event)
+        (finally
+          (.close arena)))))
   nil)
 
 (defn replay-graph!
@@ -1448,6 +1508,53 @@
   []
   (cl-call! "clFinish" @h-clFinish [(:queue @state)]))
 
+(defn reset-graph-events!
+  "Discard the most recent OpenCL profiling sample and release its native events."
+  [graph]
+  (clear-profile-state! graph)
+  nil)
+
+(defn read-graph-timestamps!
+  "Read and consume one profiled OpenCL graph replay.
+
+   OpenCL event timestamps are nanoseconds in the device time domain. The return shape matches
+   Level Zero's `read-graph-timestamps!`, allowing gpu.core and autotuning to stay backend-neutral."
+  [graph]
+  (when-not (:profile? graph)
+    (throw (ex-info "read-graph-timestamps!: graph was not recorded with :profile? true" {})))
+  (let [profile-state (:profile-state graph)
+        {:keys [events]} @profile-state]
+    (when-not (seq events)
+      (throw (ex-info "read-graph-timestamps!: profiled graph has no completed replay" {})))
+    (let [arena (Arena/ofConfined)]
+      (try
+        (let [value (.allocate arena I64)
+              read-timestamp
+              (fn [event parameter]
+                (cl-call! "clGetEventProfilingInfo" @h-clGetEventProfilingInfo
+                          [event (int parameter) (long 8) value MemorySegment/NULL])
+                (.get value I64 0))
+              rows (mapv (fn [index event]
+                           (let [start (read-timestamp event CL_PROFILING_COMMAND_START)
+                                 end (read-timestamp event CL_PROFILING_COMMAND_END)
+                                 ms (/ (double (- end start)) 1.0e6)]
+                             {:kernel-name (nth (:kernel-names graph) index)
+                              :phase (nth (:phases graph) index)
+                              :ms ms
+                              :context-ms ms
+                              :start-ticks start
+                              :end-ticks end}))
+                         (range (count events)) events)
+              span (when (seq rows)
+                     (- (reduce max (map :end-ticks rows))
+                        (reduce min (map :start-ticks rows))))]
+          {:kernels rows
+           :wall-ms (when span (/ (double span) 1.0e6))
+           :ns-per-tick 1.0})
+        (finally
+          (.close arena)
+          (clear-profile-state! graph))))))
+
 (defn destroy-prepared!
   "Release the dedicated cl_kernel a binding owns."
   [prepared]
@@ -1457,9 +1564,11 @@
          (catch Exception _))))
 
 (defn destroy-graph!
-  "OpenCL graphs hold no driver objects (the launches reference kernels owned
-  by their bindings) — nothing to free."
-  [_graph]
+  "Release profiling-only OpenCL graph resources. Ordinary graphs own no driver objects."
+  [graph]
+  (clear-profile-state! graph)
+  (when-let [queue (:profile-queue graph)]
+    (cl-call! "clReleaseCommandQueue" @h-clReleaseCommandQueue [queue]))
   nil)
 
 (defn bind-registered-gemm!

@@ -286,6 +286,16 @@
   [^Compiled c]
   (gpu/profile-program! (:session c) (:handle c) (:args c)))
 
+(defn measure
+  "Explicit offline device-event measurement of a Compiled artifact.
+
+   The artifact must have been compiled with {:profile? true}. Returns a stable Measurement;
+   options are those of gpu/measure-program!, including the required :before-sample! restore hook
+   for stateful programs. This does not choose or cache a schedule by itself."
+  [^Compiled c & {:as opts}]
+  (apply gpu/measure-program! (:session c) (:handle c) (:args c)
+         (mapcat identity opts)))
+
 (defn cache-key
   "The serializable identity of the artifact minus closures (§2b C5): in/out trees, donation,
    schedule, target, and the descriptor's step kinds + concrete shapes. Excludes the non-
