@@ -13,11 +13,12 @@
      A3 — frozen weights are :constant (captured at bind), never per-call inputs.
      A4 — multi-output: the out-tree projects all 14 donated adapters as DeviceArrays."
   (:require [clojure.test :refer [deftest testing is]]
-            [raster.gpu.value :as v]
-            [raster.gpu.compiled :as r]
+            [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.pipeline :as pl]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.gemma-train-resident-test :as g]
-            [raster.compiler.pipeline :as pl]))
+            [raster.gpu.compiled :as r]
+            [raster.gpu.value :as v]))
 
 ;; ── access the gemma harness (privates) ──────────────────────────────────────────
 (defn- gv [sym] @(ns-resolve 'raster.dl.gemma-train-resident-test sym))
@@ -32,25 +33,69 @@
   (testing "an ::owned value is live and readable until consumed"
     (let [inp (v/wrap-owned (->FakeBuf 8 :float) :ze:0 :float [2 4])]
       (is (v/live? inp))
-      (let [buf (v/consume! inp)]
-        (is (instance? FakeBuf buf) "consume! returns the buffer for the output value")
+      (let [donation (v/consume! inp)]
+        (is (v/donated-buffer? donation) "consume! returns an opaque donation token")
+        (is (instance? FakeBuf (:buffer donation)) "the token retains the resident buffer")
         (is (not (v/live? inp)) "input is dead after donation")
         (is (thrown? clojure.lang.ExceptionInfo (v/->host inp))
             "reading a consumed value throws use-after-free")
         (is (thrown? clojure.lang.ExceptionInfo (v/consume! inp))
             "double-consume throws")
-        (let [out (v/donate-output buf :ze:0 :float [8])]
+        (let [out (v/donate-output donation :float [8])]
           (is (v/live? out) "output value is live")
-          (is (identical? buf (:buffer out)) "output reuses the donated buffer (no copy)")))))
+          (is (identical? (:buffer donation) (:buffer out)) "output reuses the buffer (no copy)")
+          (is (= (get-in donation [:view :allocation :id])
+                 (get-in out [:view :allocation :id]))
+              "donation preserves allocation identity")
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"already claimed"
+                                (v/donate-output donation :float [8]))
+              "one token cannot create two owners")))))
   (testing "::aliased free! never frees the base buffer"
     (let [base (v/wrap-owned (->FakeBuf 6 :float) :ze:0 :float [6])
-          al   (v/alias-of base [2 3] :float)]
+          al   (v/alias-of base {:shape [2 3] :dtype :float})]
       (is (identical? (:buffer base) (:buffer al)))
+      (is (bview/same-range? (:view base) (:view al)))
       (v/free! al)
       (is (not (v/live? al)))
       (is (v/live? base) "base survives an alias free!")))
+  (testing "an alias can name a checked byte range of its base"
+    (let [base (v/wrap-owned (->FakeBuf 8 :float) :ze:0 :float [6])
+          slice (v/alias-of base {:byte-offset 8 :shape [3]})]
+      (is (= 8 (get-in slice [:view :byte-offset])))
+      (is (= [3] (:shape slice)))
+      (is (= (get-in base [:view :allocation :id])
+             (get-in slice [:view :allocation :id])))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds its base"
+                            (v/alias-of base {:byte-offset 20 :shape [2]})))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"cannot transfer"
+                            (v/consume! slice)))))
+  (testing "a failed ->device shape contract releases the allocation it just made"
+    (let [buffer (->FakeBuf 2 :float)
+          freed (atom [])
+          resolver (fn [_ name]
+                     (case name
+                       "buffer-of-array" (fn [_] buffer)
+                       "free-buffer!" #(swap! freed conj %)
+                       (throw (ex-info "unexpected runtime call" {:name name}))))]
+      (with-redefs-fn
+        {(ns-resolve 'raster.gpu.value 'rt-fn) resolver}
+        (fn []
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds its allocation"
+                                (v/->device (float-array 2) :ze:0 {:shape [3]})))
+          (is (= [buffer] @freed))))))
   (testing "unknown backend fails loud"
     (is (thrown? clojure.lang.ExceptionInfo (v/->device (float-array 3) :cuda:0)))))
+
+(deftest a2-device-alias-downloads-only-its-view
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "DeviceArray ranged alias")
+    (let [base (v/->device (float-array [0.0 1.0 2.0 3.0 4.0 5.0]) :ze:0)
+          slice (v/alias-of base {:byte-offset 8 :shape [3]})]
+      (try
+        (is (= [2.0 3.0 4.0] (vec (v/->host slice))))
+        (finally
+          (v/free! slice)
+          (v/free! base))))))
 
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; A5 — inspection over a Compiled record (CPU, no device)
@@ -145,7 +190,15 @@
             (is (>= (count (keys last-out)) (count adapters))
                 "multi-output: at least one node per donated adapter")
             (is (every? v/device-array? (vals last-out))
-                "every output is a DeviceArray (device-resident, not a host array)"))
+                "every output is a DeviceArray (device-resident, not a host array)")
+            (doseq [{:keys [key sym]} (:out-tree step)
+                    :let [da (get last-out key)]
+                    :when da]
+              (let [resident-key ((ns-resolve gpu 'resident-key)
+                                  (:session step) (:handle step) sym)]
+                (is (= (get-in @(:session step) [:allocations resident-key :id])
+                       (get-in da [:view :allocation :id]))
+                    (str key " shares the session allocation identity")))))
           (testing "A1/A6: the value path is BIT-IDENTICAL to the raw run-program! path"
             (doseq [s adapters]
               (let [art (v/->host (get last-out (keyword (str (name s) "'"))))
@@ -166,6 +219,16 @@
                   lN (host-loss cfg final-st)]
               (println "  [S4 artifact] loss" (format "%.6f → %.6f" l0 lN))
               (is (< lN (* 0.7 l0)) (str "final " lN " vs initial " l0))))
+          (testing "a projected value threads through its exact donated view"
+            (let [in-key (keyword (name (first adapters)))
+                  out-key (keyword (str (name (first adapters)) "'"))
+                  prior (step {})
+                  input (get prior out-key)
+                  allocation-id (get-in input [:view :allocation :id])
+                  next (step {in-key input})]
+              (is (not (v/live? input)) "the donated input view is consumed")
+              (is (= allocation-id (get-in next [out-key :view :allocation :id]))
+                  "the fresh output preserves the session allocation identity")))
           (testing "S4 boundary contract (M4): a retained prior output is invalidated by the next call"
             (let [prev    (step {})
                   prev-da (get prev (keyword (str (name (first adapters)) "'")))]
@@ -180,7 +243,7 @@
                 "a non-param key throws instead of being dropped")
             (let [foreign (v/->device (float-array (java.lang.reflect.Array/getLength ^floats (st0 (first adapters))))
                                       :ze:0)]
-              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not this artifact's resident value"
+              (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not this artifact's resident view"
                                     (step {(keyword (name (first adapters))) foreign}))
                   "a foreign device value donated to a slot throws instead of being consumed-and-ignored")
               (v/free! foreign))))

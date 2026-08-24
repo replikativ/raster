@@ -21,9 +21,10 @@
    here hardcodes `:ze`."
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
+            [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.pipeline :as pl]
             [raster.gpu.core :as gpu]
-            [raster.gpu.value :as v]
-            [raster.compiler.pipeline :as pl]))
+            [raster.gpu.value :as v]))
 
 (declare invoke-compiled)
 
@@ -171,7 +172,10 @@
   (let [k   (gpu/resident-key session handle sym)
         buf (gpu/buffer session k)]
     (cond
-      buf (v/wrap-external buf target (or dtype (:dtype buf)) (or shape [(:n-elements buf)]))
+      buf (let [view (gpu/buffer-view session k
+                                      {:dtype (or dtype (:dtype buf))
+                                       :shape (or shape [(:n-elements buf)])})]
+            (v/wrap-external-view buf target (:view view)))
       (= from :result) nil   ;; documented Void/map-void result — no resident buffer to project
       :else (throw (ex-info (str "invoke: requested output node " key " (" from ") resolved to no "
                                  "resident buffer (key " k ") — the graph did not produce it")
@@ -208,13 +212,19 @@
             (when-let [val (get inputs k)]
               (when (v/device-array? val)
                 (let [s    (get key->sym k)
-                      rbuf (gpu/buffer session (gpu/resident-key session handle s))
-                      node (get in-nodes k)]
-                  (when-not (identical? (:buffer val) rbuf)
+                      resident-key (gpu/resident-key session handle s)
+                      rbuf (gpu/buffer session resident-key)
+                      node (get in-nodes k)
+                      resident-view (gpu/buffer-view
+                                     session resident-key
+                                     {:dtype (or (:dtype node) (:dtype rbuf))
+                                      :shape (or (:shape node) [(:n-elements rbuf)])})]
+                  (when-not (and (identical? (:buffer val) rbuf)
+                                 (bview/same-range? (:view val) (:view resident-view)))
                     (throw (ex-info (str "invoke: donated input " k " is not this artifact's resident "
-                                         "value — the MVP only supports threading the artifact's own "
-                                         "output back into its donated slot; uploading a foreign "
-                                         "device value needs a rebind that is not yet wired")
+                                         "view — the MVP only supports threading the artifact's exact "
+                                         "output view back into its donated slot; a foreign allocation "
+                                         "or subview needs an explicit rebind")
                                     {:key k})))
                   (when (and node (:shape node) (:shape val) (not= (:shape node) (:shape val)))
                     (throw (ex-info (str "invoke: donated input " k " shape " (:shape val)
