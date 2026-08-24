@@ -12,7 +12,9 @@
          Stage 1: intra-block Blelloch scan
          Stage 2: scan of block totals
          Stage 3: carry-in addition (SegMap)"
-  (:require [raster.compiler.ir.soac :as soac]
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
 
@@ -173,14 +175,14 @@
 
       :three-stage
       (let [level-1 (segop/->SegLevel :block :virtual)
+            totals-sym (gensym "block_totals_")
             stage-1 (segop/->SegScan (:id soac) space level-1
                                      scan-op map-lambda
                                      (:inputs soac)
-                                     (soac-outputs* soac)
+                                     (conj (soac-outputs* soac) totals-sym)
                                      (:scalars soac)
                                      grid-1 :intra-block
                                      dtype)
-            totals-sym (gensym "block_totals_")
             stage-2-idx (gensym "k_")
             stage-2-space (segop/make-seg-space stage-2-idx (:num-blocks grid-1))
             grid-2 (single-block-grid grid-1)
@@ -210,6 +212,43 @@
                                     #{} grid-3
                                     dtype out-sym nil)]
         [stage-1 stage-2 stage-3]))))
+
+(defn scan-kernel-graph
+  "Turn an already lowered scan into a verified scheduled graph.
+
+   This consumes the exact SegOps returned by `lower-scan`; it must not lower a second time because
+   the block-totals buffer identity is generated during decomposition."
+  [soac segops]
+  (let [external (set/union (or (:inputs soac) #{}) (or (soac-outputs* soac) #{}))
+        used (reduce set/union #{}
+                     (map #(set/union (or (segop/segop-inputs %) #{})
+                                      (or (segop/segop-outputs %) #{}))
+                          segops))
+        temporary-ids (set/difference used external)
+        block-stage (some #(when (= :block-scan (:phase %)) %) segops)
+        temporary-elements (when block-stage
+                             (:bound (segop/seg-space-reduced-dim (:space block-stage))))
+        dtype (or (:elem-type soac) (:dtype (first segops)) :double)
+        temporaries (into {}
+                          (map (fn [id]
+                                 [id {:dtype dtype :elements temporary-elements
+                                      :memory-space :device}]))
+                          temporary-ids)]
+    (kernel-graph/from-segops
+     segops
+     {:inputs (or (:inputs soac) #{})
+      :outputs (or (soac-outputs* soac) #{})
+      :temporaries temporaries
+      :dtype dtype
+      :effects {:memory-order :dependency-ordered}
+      :provenance {:dialect :segop :algorithm :scan :soac-id (:id soac)}
+      :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)}})))
+
+(defn scan-soac?
+  "True when a SOAC/Screma node selects scan decomposition."
+  [node]
+  (or (soac/soac-scan? node)
+      (and (soac/screma? node) (seq (:scans node)) (empty? (:reduces node)))))
 
 ;; ================================================================
 ;; Unified lowering dispatch

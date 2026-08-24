@@ -91,11 +91,13 @@
 ;; ================================================================
 
 (defn segop?
-  "Check if a value is a SegOp record."
+  "Check if a value is a generic SegOp record across Typed Clojure child classloaders."
   [x]
-  (or (instance? SegMap x)
-      (instance? SegRed x)
-      (instance? SegScan x)))
+  (and x
+       (contains? #{"raster.compiler.ir.segop.SegMap"
+                    "raster.compiler.ir.segop.SegRed"
+                    "raster.compiler.ir.segop.SegScan"}
+                  (.getName (class x)))))
 
 (defn segop-grid
   "Get the KernelGrid from a SegOp."

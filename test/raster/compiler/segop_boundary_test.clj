@@ -18,6 +18,7 @@
    Map and reduction are full conversions: an unrepresentable SegOp is an illegal remaining
    operation with no alternate emitter."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.ir.soac :as soac]))
@@ -38,6 +39,21 @@
     (let [st (stats-of '(let* [o (raster.par/map! O i 256 nil (clojure.core/* i 2.0))] o))]
       (is (= 1 (:segops-lowered st)))
       (is (empty? (:segops-declined st))))))
+
+(deftest scan-crosses-the-boundary-as-one-scheduled-kernel-graph
+  (let [r (slp/segop-lower-pass
+           '(let* [result (raster.par/scan out acc 0.0 i n double
+                                           (+ acc (aget values i)))]
+                  result)
+           {})
+        binding (first (second (:form r)))
+        scheduled (slp/get-kernel-graph binding)]
+    (is (= 1 (get-in r [:stats :segops-lowered])))
+    (is (= 1 (get-in r [:stats :kernel-graphs-lowered])))
+    (is (kernel-graph/kernel-graph? scheduled))
+    (is (= 3 (count (:nodes scheduled))))
+    (is (= [:intra-block :block-scan nil]
+           (mapv #(get-in % [:operation :phase]) (:nodes scheduled))))))
 
 (deftest an-unrepresentable-par-form-becomes-a-diagnostic
   (testing "a par form with no lowering rule is the case that used to vanish onto stderr"

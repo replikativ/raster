@@ -82,20 +82,29 @@
                                                       :dtype (or dtype :double)))]
           (cond
             (:err segops) (decline :segop (:err segops))
-            (seq (:ok segops)) {:segops (:ok segops)}
+            (seq (:ok segops)) (cond-> {:segops (:ok segops)}
+                                 (soac-lower/scan-soac? (:ok soac))
+                                 (assoc :kernel-graph
+                                        (soac-lower/scan-kernel-graph (:ok soac) (:ok segops))))
             :else (when par? {:declined (diagnostic sym form :segop
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))
 
 (defn- annotate-binding
-  "Attach SegOp metadata to a binding symbol."
-  [sym segops]
-  (vary-meta sym assoc ::segops segops))
+  "Attach scheduled compiler values to a binding symbol."
+  [sym {:keys [segops kernel-graph]}]
+  (cond-> (vary-meta sym assoc ::segops segops)
+    kernel-graph (vary-meta assoc ::kernel-graph kernel-graph)))
 
 (defn get-segops
   "Retrieve SegOp records from a binding symbol's metadata."
   [sym]
   (::segops (meta sym)))
+
+(defn get-kernel-graph
+  "Retrieve a scheduled KernelGraph from a binding symbol's metadata."
+  [sym]
+  (::kernel-graph (meta sym)))
 
 (defn segop-lower-pass
   "Pipeline pass: convert par forms in let* bindings to SegOp records.
@@ -103,19 +112,21 @@
    Walks the form's let* bindings. For each par/map!, par/reduce, par/scan!
    binding, converts to SegOp and attaches as metadata on the binding symbol.
 
-   Returns {:form annotated-form :stats {:segops-lowered N}}.
+   Scan decomposition additionally records one verified KernelGraph with its intermediate buffers
+   and dependencies. Returns both `:segops-lowered` and `:kernel-graphs-lowered` stats.
 
    Options from pipeline opts:
      :target-device — device for launch param computation
      :dtype — element type (:double or :float)"
   [form opts]
   (if-not (form/binding-form? form)
-    {:form form :stats {:segops-lowered 0}}
+    {:form form :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}
     (let [[let-sym bindings-vec & body-exprs] form
           pairs (partition 2 bindings-vec)
           device-id (:target-device opts)
           dtype (:dtype opts)
           lowered (atom 0)
+          graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
           ;; stderr as `WARNING: …` and vanished — invisible to stats, to explain-pipeline, and to
           ;; anyone diagnosing why a kernel took the legacy path.
@@ -123,26 +134,30 @@
           attempt (fn [sym init]
                     (let [r (lower-attempt sym init device-id dtype)]
                       (when-let [d (:declined r)] (swap! declined conj d))
-                      (:segops r)))
+                      (when (:segops r) r)))
           ;; Annotate bindings with SegOp metadata
           new-pairs
           (mapv (fn [[sym init]]
-                  (if-let [segops (attempt sym init)]
+                  (if-let [lowered-values (attempt sym init)]
                     (do (swap! lowered inc)
-                        [(annotate-binding sym segops) init])
+                        (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
+                        [(annotate-binding sym lowered-values) init])
                     [sym init]))
                 pairs)
           ;; Also check body expressions for par forms
           new-body
           (mapv (fn [expr]
                   (let [tmp-sym (gensym "body_par_")]
-                    (if-let [segops (attempt tmp-sym expr)]
+                    (if-let [{:keys [segops kernel-graph]} (attempt tmp-sym expr)]
                       (do (swap! lowered inc)
+                          (when kernel-graph (swap! graphs-lowered inc))
                           (with-meta (list 'do expr)
-                            {::body-segops segops}))
+                            (cond-> {::body-segops segops}
+                              kernel-graph (assoc ::body-kernel-graph kernel-graph))))
                       expr)))
                 body-exprs)
           new-bindings (vec (mapcat identity new-pairs))]
       {:form (list* let-sym new-bindings new-body)
-       :stats (cond-> {:segops-lowered @lowered}
+       :stats (cond-> {:segops-lowered @lowered
+                       :kernel-graphs-lowered @graphs-lowered}
                 (seq @declined) (assoc :segops-declined @declined))})))
