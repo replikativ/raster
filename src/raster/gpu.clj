@@ -41,8 +41,11 @@
 ;; ================================================================
 
 (import-vars raster.gpu.core
-             alloc! free-buffer!
+             alloc! register-buffer! free-buffer!
              upload! download
+             upload-range! download-range!
+             upload-ranges! download-ranges!
+             resident-buffer-view? buffer-view sub-buffer-view
              buffer sync-to-arrays!)
 
 ;; ================================================================

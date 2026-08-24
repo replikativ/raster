@@ -25,11 +25,10 @@
   "A session whose :kc0 buffer holds value=index at every element, so any disturbance is visible."
   [f]
   (let [s (g/make-session :ze:0)
-        ze (find-ns 'raster.gpu.ze-runtime)
-        buf ((ns-resolve ze 'make-buffer) N :float)]
+        a (float-array N)]
     (try
-      (swap! s assoc-in [:buffers :kc0] buf)
-      (let [a (float-array N)] (dotimes [i N] (aset a i (float i))) (g/upload! s :kc0 a))
+      (dotimes [i N] (aset a i (float i)))
+      (g/alloc! s {:kc0 [:float N a]})
       (f s)
       (finally (g/close-session! s)))))
 
@@ -65,6 +64,21 @@
                 (is (region-is-identity? back 0 at) "positions before the import")
                 (is (region-is-identity? back (+ at n) N) "positions after the import")))
             (finally (.close arena))))))))
+
+(deftest a-resident-view-makes-range-offsets-relative
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "ranged transfers: resident view")
+    (with-filled-session
+      (fn [s]
+        (let [at (* 64 kvrow)
+              n (* 8 kvrow)
+              view (g/buffer-view s :kc0 {:byte-offset (* 4 at) :shape [n]})
+              out (float-array n)]
+          (g/download-range! s view out {:elements n})
+          (is (every? (fn [i] (== (aget out i) (float (+ at i)))) (range n)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds the buffer view"
+                                (g/download-range! s view out
+                                                   {:src-element (dec n) :elements 2}))))))))
 
 (deftest a-jvm-array-and-a-memory-segment-take-the-same-path
   (if-not @gp/gpu-available?
@@ -125,15 +139,13 @@
   "A session with `layers` kc/vc pairs, each holding value = (layer-tag + index) so a write to the
    wrong layer is as visible as a write to the wrong position."
   [layers f]
-  (let [s (g/make-session :ze:0)
-        make (ns-resolve (find-ns 'raster.gpu.ze-runtime) 'make-buffer)]
+  (let [s (g/make-session :ze:0)]
     (try
       (doseq [l (range layers) kind ["kc" "vc"]]
         (let [k (keyword (str kind l)) tag (float (* 1e6 (+ 1 (* 2 l) (if (= kind "vc") 1 0))))
               a (float-array N)]
           (dotimes [i N] (aset a i (+ tag (float i))))
-          (swap! s assoc-in [:buffers k] (make N :float))
-          (g/upload! s k a)))
+          (g/alloc! s {k [:float N a]})))
       (f s)
       (finally (g/close-session! s)))))
 

@@ -811,6 +811,26 @@
   [^DeviceBuffer buf]
   (make-buffer (:n-elements buf) (:dtype buf)))
 
+(defn slice-buffer
+  "Create a non-owning typed pointer view into a DeviceBuffer. The returned record must never be
+   freed independently: its MemorySegment is a slice of the base allocation and exists only for
+   ABI binding. Bounds and dtype alignment are established by the backend-neutral BufferView."
+  [^DeviceBuffer buf byte-offset byte-length dtype]
+  (let [byte-offset (long byte-offset)
+        byte-length (long byte-length)
+        element-size (get dtype-byte-sizes dtype)]
+    (when-not element-size
+      (throw (ex-info "cannot slice a Level Zero buffer with an unknown dtype" {:dtype dtype})))
+    (let [element-bytes (long element-size)]
+      (when (or (neg? byte-offset) (neg? byte-length)
+                (> (+ byte-offset byte-length) (:byte-size buf))
+                (not (zero? (mod byte-length element-bytes))))
+        (throw (ex-info "Level Zero buffer slice is out of bounds or misaligned"
+                        {:byte-offset byte-offset :byte-length byte-length
+                         :buffer-bytes (:byte-size buf) :dtype dtype})))
+      (->DeviceBuffer (.asSlice ^MemorySegment (:segment buf) byte-offset byte-length)
+                      (quot byte-length element-bytes) byte-length dtype))))
+
 (defn free-buffer!
   "Free a DeviceBuffer's GPU memory."
   [^DeviceBuffer buf]
