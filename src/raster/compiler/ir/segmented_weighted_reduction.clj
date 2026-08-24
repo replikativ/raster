@@ -126,8 +126,10 @@
 (defn- positive-axis!
   [axis]
   (when-not (and (map? axis) (keyword? (:name axis))
-                 (integer? (:extent axis)) (pos? (:extent axis)))
-    (throw (ex-info "segment axes require keyword names and positive static extents"
+                 (let [extent (:extent axis)]
+                   (or (and (integer? extent) (pos? extent))
+                       (symbol? extent))))
+    (throw (ex-info "segment axes require keyword names and valid extent expressions"
                     {:reason :segmented-reduction-invalid-segment-axis :axis axis})))
   axis)
 
@@ -141,19 +143,48 @@
 
 (defn- buffer-descriptor!
   [field descriptor]
-  (when-not (and (map? descriptor)
-                 (some? (:id descriptor))
-                 (dtype/known? (:dtype descriptor))
-                 (vector? (:shape descriptor))
-                 (seq (:shape descriptor))
-                 (every? #(and (integer? %) (pos? %)) (:shape descriptor))
-                 (integer? (:elements descriptor))
-                 (pos? (:elements descriptor))
-                 (= (:elements descriptor) (reduce * 1 (:shape descriptor))))
-    (throw (ex-info "segmented reduction buffer descriptor is incomplete or inconsistent"
-                    {:reason :segmented-reduction-invalid-buffer-descriptor
-                     :field field :descriptor descriptor})))
-  descriptor)
+  (let [valid-extent? #(or (and (integer? %) (pos? %)) (symbol? %))
+        valid-elements? (fn valid-elements? [expression]
+                          (or (and (integer? expression) (pos? expression))
+                              (symbol? expression)
+                              (and (seq? expression)
+                                   (= 'clojure.core/* (first expression))
+                                   (seq (rest expression))
+                                   (every? valid-elements? (rest expression)))))
+        literal-shape? (every? integer? (:shape descriptor))]
+    (when-not (and (map? descriptor)
+                   (some? (:id descriptor))
+                   (dtype/known? (:dtype descriptor))
+                   (vector? (:shape descriptor))
+                   (seq (:shape descriptor))
+                   (every? valid-extent? (:shape descriptor))
+                   (valid-elements? (:elements descriptor))
+                   (or (not literal-shape?)
+                       (and (integer? (:elements descriptor))
+                            (pos? (:elements descriptor))
+                            (= (:elements descriptor) (reduce * 1 (:shape descriptor))))))
+      (throw (ex-info "segmented reduction buffer descriptor is incomplete or inconsistent"
+                      {:reason :segmented-reduction-invalid-buffer-descriptor
+                       :field field :descriptor descriptor})))
+    descriptor))
+
+(defn- validate-score-argument!
+  [argument]
+  (when-not
+   (and (map? argument)
+        (symbol? (:parameter argument))
+        (case (:kind argument)
+          :literal (and (number? (:value argument))
+                        (Double/isFinite (double (:value argument))))
+          :inverse-sqrt (let [extent (:extent argument)]
+                          (or (and (integer? extent) (pos? extent))
+                              (symbol? extent)))
+          false))
+    (throw (ex-info "score argument requires a supported loop-invariant scalar producer"
+                    {:reason :segmented-reduction-invalid-score-argument
+                     :argument argument
+                     :supported #{:literal :inverse-sqrt}})))
+  argument)
 
 (defn validate!
   "Validate a segmented weighted-reduction plan independently of target scheduling."
@@ -191,10 +222,18 @@
         (throw (ex-info "score combine region must accept left and right elements"
                         {:reason :segmented-reduction-score-combine-arity
                          :actual (:parameters (:combine score))})))
-      (when-not (= ['dot] (:parameters (:finalize score)))
-        (throw (ex-info "score finalize region must accept the reduced dot value"
-                        {:reason :segmented-reduction-score-finalize-arity
-                         :actual (:parameters (:finalize score))})))
+      (let [arguments (:arguments score)]
+        (when-not (vector? arguments)
+          (throw (ex-info "score arguments must be an ordered vector"
+                          {:reason :segmented-reduction-invalid-score-arguments
+                           :arguments arguments})))
+        (doseq [argument arguments] (validate-score-argument! argument))
+        (when-not (= (into ['dot] (map :parameter arguments))
+                     (:parameters (:finalize score)))
+          (throw (ex-info "score finalize parameters must align with its scalar arguments"
+                          {:reason :segmented-reduction-score-finalize-arity
+                           :arguments arguments
+                           :actual (:parameters (:finalize score))}))))
       (when-not (and (= accumulator-dtype (:result-dtype (:combine score)))
                      (= accumulator-dtype (:result-dtype (:finalize score))))
         (throw (ex-info "score regions must produce the accumulator dtype"
@@ -293,6 +332,8 @@
         score-finalize (:body (:finalize score))]
     (and (= :dot (:kind score))
          (= '(raster.numeric/* left right) (:body (:combine score)))
+         (empty? (:arguments score))
+         (= ['dot] (:parameters (:finalize score)))
          (seq? score-finalize)
          (= 'raster.numeric/* (first score-finalize))
          (= 'dot (second score-finalize))
