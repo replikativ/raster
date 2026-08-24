@@ -1,6 +1,8 @@
 (ns raster.compiler.passes.parallel.indexed-attention-route-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.indexed-attention-route :as route]))
 
@@ -31,7 +33,7 @@
   (let [{:keys [strategy reference? artifact graph schedule declines]}
         (route/route! (plan) shape-env
                       {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256})]
-    (is (= :indexed-attention-reference strategy))
+    (is (= :indexed-segmented-reduction-reference strategy))
     (is reference?)
     (is (empty? declines))
     (is (= '[Q K V dst src normalized] (:arguments artifact)))
@@ -64,12 +66,49 @@
     (is (str/starts-with? (:source artifact)
                           "#pragma OPENCL EXTENSION cl_khr_fp64 : enable"))))
 
+(deftest dynamic-reference-carries-shapes-through-the-ordered-abi
+  (let [{:keys [artifact graph]}
+        (route/route-dynamic! (plan)
+                              {:device-type :gpu :subgroup-size 16
+                               :max-workgroup-size 256})
+        runtime-values (vec (concat (repeat 6 (Object.))
+                                    (map (fn [value] {:type :long :value value})
+                                         [3 4 5 2 2 15])))
+        call (kcall/make artifact runtime-values)
+        output-elements (get-in (plan) [:output :elements])
+        graph-output (first (:outputs graph))]
+    (is (= '[Q K V dst src normalized
+             n_entities n_edges total_dim n_heads n_components output_elements]
+           (mapv :name (:abi artifact))))
+    (is (= '[Q K V dst src normalized
+             n-nodes n-edges emb-dim n-heads dk
+             (clojure.core/* n-nodes emb-dim)]
+           (:arguments artifact)))
+    (is (= [16 1] (get-in call [:geometry :workgroup-size])))
+    (is (= [1 3] (get-in call [:geometry :group-count])))
+    (is (= output-elements (get-in artifact [:attributes :out-elems])))
+    (is (= 15 (kgcall/resolve-integer
+               {output-elements {:type :long :value 15}}
+               (:elements graph-output))))
+    (is (str/includes? (:source artifact) "long n_entities"))
+    (is (str/includes? (:source artifact) "sqrt((float)n_components)"))))
+
+(deftest leaf-selection-depends-on-plan-descriptors-not-attention-provenance
+  (let [generic-plan (-> (plan)
+                         (assoc-in [:provenance :semantic-op]
+                                   :generic-segmented-weighted-reduction)
+                         (assoc-in [:provenance :lowering] :algebraic-diamond-recognition))
+        {:keys [strategy artifact]} (route/route-dynamic! generic-plan)]
+    (is (= :indexed-segmented-reduction-reference strategy))
+    (is (= :generic-segmented-weighted-reduction
+           (get-in artifact [:provenance :semantic-op])))))
+
 (deftest route-declines-unproved-semantics-and-unresolved-shapes
   (testing "a different scalar region cannot silently enter the specialized leaf"
     (let [result (route/route (assoc-in (plan) [:normalization :epsilon] 0.0)
                               shape-env)]
       (is (nil? (:strategy result)))
-      (is (= :indexed-attention-reference-plan-unsupported
+      (is (= :indexed-segmented-reduction-plan-unsupported
              (get-in result [:declines 0 :reason])))))
   (testing "symbolic extents have to be specialized deliberately"
     (let [result (route/route (plan) (dissoc shape-env 'n-edges))]

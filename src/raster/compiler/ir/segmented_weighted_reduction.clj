@@ -9,6 +9,7 @@
    Canonical attention and a future recognizer for indexed-dot/scatter programs can therefore
    converge here without making either source spelling opaque or changing its numerics."
   (:require [clojure.set :as set]
+            [clojure.walk :as walk]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]))
 
@@ -17,7 +18,7 @@
 (defrecord SegmentedWeightedReductionPlan
            [id segment-axes membership storage score weight value
             numerator denominator normalization operands output
-            accumulator-dtype source-operation provenance])
+            accumulator-dtype source-operation provenance runtime-parameters])
 
 (def ^:private scalar-operators
   "Closed scalar vocabulary accepted in plan regions. Keeping regions closed makes recognition
@@ -194,7 +195,8 @@
                     {:reason :segmented-reduction-invalid-plan
                      :plan plan :actual (type plan)})))
   (let [{:keys [id segment-axes membership storage score weight value numerator denominator
-                normalization operands output accumulator-dtype source-operation provenance]} plan]
+                normalization operands output accumulator-dtype source-operation provenance
+                runtime-parameters]} plan]
     (when (nil? id)
       (throw (ex-info "segmented weighted reduction requires a stable identity"
                       {:reason :segmented-reduction-missing-id})))
@@ -279,6 +281,11 @@
       (throw (ex-info "segmented reduction requires semantic provenance"
                       {:reason :segmented-reduction-invalid-provenance
                        :provenance provenance})))
+    (when-not (and (vector? runtime-parameters)
+                   (every? some? runtime-parameters))
+      (throw (ex-info "segmented reduction runtime parameters must be ordered expressions"
+                      {:reason :segmented-reduction-invalid-runtime-parameters
+                       :runtime-parameters runtime-parameters})))
     plan))
 
 (defn make
@@ -286,11 +293,61 @@
   [fields]
   (validate!
    (map->SegmentedWeightedReductionPlan
-    (update fields :accumulator-dtype dtype/canon))))
+    (-> fields
+        (update :accumulator-dtype dtype/canon)
+        (update :runtime-parameters #(vec (or % [])))))))
 
 (defn ordered-input-ids
   [plan]
   (mapv :id (:operands (validate! plan))))
+
+(defn runtime-parameter-values
+  "Ordered dynamic scalar values transported by a protected reduction marker. These are semantic
+   shape parameters, not a kernel ABI: a schedule may derive additional ABI scalars such as an
+   output element count from the rebound plan."
+  [plan]
+  (:runtime-parameters (validate! plan)))
+
+(def ^:private integral-casts
+  '#{long int clojure.core/long clojure.core/int})
+
+(defn- canonical-runtime-value
+  [value]
+  (if (and (seq? value) (= 2 (count value)) (contains? integral-casts (first value)))
+    (recur (second value))
+    value))
+
+(defn rebind
+  "Rebind a validated plan after ordinary compiler substitution rewrites its inputs and dynamic
+   scalar parameters. This is the generic bridge from a protected structured-reduction marker
+   back to schedule-neutral IR; no attention role or storage layout is assumed here."
+  [template output inputs runtime-values source-form]
+  (let [template (validate! template)
+        old-inputs (ordered-input-ids template)
+        old-runtime (runtime-parameter-values template)
+        runtime-values (mapv canonical-runtime-value runtime-values)]
+    (when-not (= (count old-runtime) (count (distinct old-runtime)))
+      (throw (ex-info "segmented reduction template has ambiguous runtime parameters"
+                      {:reason :segmented-reduction-duplicate-runtime-parameters
+                       :runtime-parameters old-runtime})))
+    (when-not (= (count old-inputs) (count inputs))
+      (throw (ex-info "segmented reduction marker has the wrong input arity"
+                      {:reason :segmented-reduction-marker-input-arity
+                       :expected (count old-inputs) :actual (count inputs)})))
+    (when-not (= (count old-runtime) (count runtime-values))
+      (throw (ex-info "segmented reduction marker has the wrong runtime-parameter arity"
+                      {:reason :segmented-reduction-marker-runtime-arity
+                       :expected (count old-runtime) :actual (count runtime-values)})))
+    (let [substitutions (into {(get-in template [:output :id]) output}
+                              (concat (map vector old-inputs inputs)
+                                      (map vector old-runtime runtime-values)))
+          rebound (walk/postwalk-replace substitutions template)]
+      (validate!
+       (-> rebound
+           (assoc :id [:segmented-weighted-reduction output]
+                  :runtime-parameters (vec runtime-values)
+                  :source-operation {:form source-form :output output :intermediates []})
+           (assoc-in [:provenance :operation-id] output))))))
 
 (defn algebra-key
   "Buffer- and storage-independent computation identity. Physical page routing and cache layout

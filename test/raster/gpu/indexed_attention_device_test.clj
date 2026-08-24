@@ -46,9 +46,15 @@
 (defn- run-case
   [device-id]
   (let [{:keys [plan shape-env buffers expected]} (test-case)
-        graph (:graph (route/route!
-                       plan shape-env
-                       {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}))]
+        graph (:graph (route/route-dynamic!
+                       plan
+                       {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256}))
+        output-elements (get-in plan [:output :elements])
+        scalar-values
+        (assoc (into {} (map (fn [[name value]]
+                               [name {:type :long :value value}])
+                             shape-env))
+               output-elements {:type :long :value 15})]
     (gpu/with-gpu-session [session device-id]
       (gpu/alloc! session
                   {:q [:float 15 (get buffers 'Q)]
@@ -60,7 +66,7 @@
       (let [handle (gpu/bind-kernel-graph!
                     session [:indexed-attention device-id] graph
                     {'Q :q 'K :k 'V :v 'dst :dst 'src :src 'normalized :output}
-                    {})]
+                    scalar-values)]
         (try
           (gpu/run-kernel-graph! session handle)
           (let [actual ^floats (gpu/download session :output)]

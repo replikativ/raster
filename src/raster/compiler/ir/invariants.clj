@@ -331,9 +331,10 @@
   I-T3 (dtype closure) THROWS — it guards against the f64-in-f32 silent
   miscompile class. It runs on the STAMPED dialects only (post-rewalk,
   pre-backend); it is skipped at:
-    :lowered — the :lower pass splices AD templates whose stamps
+    :lowered and :structured-reductions — the :lower pass splices AD templates whose stamps
       (:raster.type/tag, :raster.op/original) are only (re)established by the
-      :fixpoint rewalk; pre-rewalk IR is half-stamped by design (probed: an
+      :fixpoint rewalk; structured-reduction recognition also runs before that rewalk and preserves
+      all unmatched forms unchanged. Pre-rewalk IR is half-stamped by design (probed: an
       AD-spliced mse-loss .invk carries a bare {:tag double} at :lowered and
       the full stamps at :fixpointed);
     :backend-applied and later — the :backend pass CONSUMES the stamps and
@@ -343,7 +344,8 @@
   their corpora are clean."
   [dialect-key form pass-key {:keys [params dtype param-env]}]
   (when (and (= dtype :float)
-             (not (contains? #{:lowered :backend-applied :alength-resolved
+             (not (contains? #{:lowered :structured-reductions
+                               :backend-applied :alength-resolved
                                :mem-merged}
                              dialect-key)))
     (when-let [{:keys [sym tag init]} (dtype-closure-violation form (or param-env {}) dtype)]
