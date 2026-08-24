@@ -215,6 +215,8 @@
     (throw (ex-info "attention requires a supported KV route"
                     {:reason :attention-unsupported-route :route route :actual (type route)}))))
 
+(declare validate!)
+
 (defn visibility-buffer-ids
   "Return runtime logical-visibility buffer identities. Interval visibility is entirely static."
   [visibility]
@@ -224,6 +226,15 @@
     :else
     (throw (ex-info "attention requires supported logical visibility"
                     {:reason :attention-invalid-visibility :visibility visibility}))))
+
+(defn ordered-input-buffer-ids
+  "The single backend-neutral physical input order for an AttentionProblem. Route variants keep
+   distinct native layouts, while logical visibility always follows physical routing."
+  [problem]
+  (let [{:keys [query k-pages v-pages route visibility]} (validate! problem)]
+    (vec (concat [(:values query) (:row-offsets query) (:positions query) k-pages v-pages]
+                 (route-buffer-ids route)
+                 (visibility-buffer-ids visibility)))))
 
 (defn validate!
   "Validate an AttentionProblem's static semantics and storage extents. Runtime route/query values

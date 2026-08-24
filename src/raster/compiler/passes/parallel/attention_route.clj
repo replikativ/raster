@@ -1,7 +1,8 @@
 (ns raster.compiler.passes.parallel.attention-route
   "Structured routing for backend-neutral attention problems."
   (:require [raster.compiler.backend.gpu.attention :as emit]
-            [raster.compiler.ir.attention :as attention]))
+            [raster.compiler.ir.attention :as attention]
+            [raster.compiler.passes.parallel.attention-lower :as lower]))
 
 (defn- decline
   [problem reason data]
@@ -41,13 +42,15 @@
                 {:required :float :actual accumulator-dtype})
 
        :else
-       (let [artifact (emit/emit-fp16-reference problem desc)]
+       (let [plan (lower/lower problem)
+             artifact (emit/emit-fp16-reference plan desc)]
          {:operation problem
+          :plan plan
           :strategy :fp16-reference
           :reference? true
           :declines []
           :artifact artifact
-          :graph (emit/kernel-graph problem artifact)
+          :graph (emit/kernel-graph plan artifact)
           :schedule {:workgroup-size (:workgroup-size (:launch artifact))
                      :group-count (:group-count (:launch artifact))}})))))
 
