@@ -8,12 +8,69 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]))
+
+(defn- attention-problem
+  [plan]
+  (let [{:keys [source-operation provenance]} (swr/validate! plan)]
+    (when-not (and (= :attention (:semantic-op provenance))
+                   (= :canonical-segmented-weighted-reduction (:lowering provenance)))
+      (throw (ex-info "FP16 attention emission requires an attention-derived reduction plan"
+                      {:reason :attention-emitter-wrong-plan-provenance
+                       :provenance provenance})))
+    (attention/validate! source-operation)))
+
+(defn- reference-plan!
+  [plan]
+  (let [plan (swr/validate! plan)
+        {:keys [id query route output q-heads kv-heads qk-head-dim value-head-dim
+                q-dtype k-dtype v-dtype output-dtype accumulator-dtype scale visibility]
+         :as problem} (attention-problem plan)
+        expected-segments [{:name :query-token :extent (:total-tokens query)}
+                           {:name :query-head :extent q-heads}]
+        expected-score {:kind :dot
+                        :axis {:name :qk-component :extent qk-head-dim}
+                        :head-map {:kind :grouped-query
+                                   :query-heads q-heads :kv-heads kv-heads}
+                        :left {:kind :packed-query :buffer (:values query) :dtype q-dtype}
+                        :right {:kind :routed-key :buffer (:k-pages problem) :dtype k-dtype}}
+        expected-membership {:kind :logical-attention-visibility
+                             :visibility-kind (attention/visibility-kind visibility)
+                             :position-filter (into {} (attention/position-filter visibility))
+                             :duplicate-policy (when (attention/csr-visibility? visibility)
+                                                 (:duplicate-policy visibility))
+                             :buffers (attention/visibility-buffer-ids visibility)}]
+    (when-not (and (swr/online-softmax-algebra? plan)
+                   (= [:segmented-weighted-reduction id] (:id plan))
+                   (= expected-segments (:segment-axes plan))
+                   (= expected-membership (:membership plan))
+                   (= (attention/route-kind route) (get-in plan [:storage :route-kind]))
+                   (= route (get-in plan [:storage :route]))
+                   (= (attention/route-buffer-ids route) (get-in plan [:storage :buffers]))
+                   (= expected-score (select-keys (:score plan)
+                                                  [:kind :axis :head-map :left :right]))
+                   (= (list 'raster.numeric/* 'dot (double scale))
+                      (get-in plan [:score :finalize :body]))
+                   (= {:kind :routed-value :buffer (:v-pages problem)
+                       :dtype v-dtype :components value-head-dim}
+                      (:value plan))
+                   (= accumulator-dtype (:accumulator-dtype plan))
+                   (= (attention/ordered-input-buffer-ids problem)
+                      (swr/ordered-input-ids plan))
+                   (= {:id output :dtype output-dtype
+                       :shape [(:total-tokens query) q-heads value-head-dim]
+                       :elements (* (:total-tokens query) q-heads value-head-dim)}
+                      (:output plan)))
+      (throw (ex-info "FP16 reference leaf cannot preserve this reduction plan exactly"
+                      {:reason :attention-reference-plan-unsupported
+                       :operation-id id :plan-id (:id plan)})))
+    plan))
 
 (defn reference-workgroup-x
   "Choose the reference leaf's x workgroup from output width and hardware resources."
-  [problem desc]
-  (let [value-head-dim (:value-head-dim (attention/validate! problem))
+  [plan desc]
+  (let [value-head-dim (:value-head-dim (attention-problem plan))
         subgroup (long (or (:subgroup-size desc) 16))
         maximum (long (or (:max-workgroup-size desc) 256))]
     (long (max 1 (min value-head-dim subgroup maximum)))))
@@ -221,14 +278,8 @@
          "}\n")))
 
 (defn- ordered-inputs
-  [problem]
-  (let [{:keys [query k-pages v-pages route visibility]} problem
-        common [(:values query) (:row-offsets query) (:positions query) k-pages v-pages]
-        route-inputs (if (attention/dense-paged-route? route)
-                       [(:page-table route) (:lengths route) (:start-positions route)]
-                       [(:page-offsets route) (:page-indices route) (:last-page-lengths route)
-                        (:start-positions route)])]
-    (into (into common route-inputs) (attention/visibility-buffer-ids visibility))))
+  [plan]
+  (swr/ordered-input-ids plan))
 
 (defn- ordered-abi
   [problem]
@@ -268,12 +319,13 @@
 
 (defn emit-fp16-reference
   "Emit a route-specialized plain-FP16 attention reference as a verified KernelArtifact."
-  [problem desc]
-  (let [{:keys [query output q-heads value-head-dim route] :as problem}
-        (attention/validate! problem)
+  [plan desc]
+  (let [plan (reference-plan! plan)
+        {:keys [query output q-heads value-head-dim route] :as problem}
+        (attention-problem plan)
         name (kernel-name problem)
-        workgroup-x (reference-workgroup-x problem desc)
-        inputs (ordered-inputs problem)
+        workgroup-x (reference-workgroup-x plan desc)
+        inputs (ordered-inputs plan)
         arguments (conj inputs output)
         launch (klaunch/spec
                 {:workgroup-size [workgroup-x 1 1]
@@ -287,8 +339,10 @@
       :launch launch
       :effects {:kind :attention :reads inputs :writes [output]}
       :provenance {:operation-id (:id problem) :semantic-op :attention
-                   :lowering :fp16-reference}
+                   :algebra-plan-id (:id plan) :lowering :fp16-reference}
       :attributes {:strategy :fp16-reference :optimization-tier :reference
+                   :algebra :segmented-weighted-reduction
+                   :algebra-key (swr/algebra-key plan)
                    :storage-dtype :half :accumulator-dtype :float
                    :route-kind (attention/route-kind route)
                    :visibility-kind (attention/visibility-kind (:visibility problem))
@@ -299,11 +353,12 @@
 
 (defn kernel-graph
   "Wrap the reference artifact in an explicit one-node scheduled graph."
-  [problem artifact]
-  (let [{:keys [output id] :as problem} (attention/validate! problem)
+  [plan artifact]
+  (let [plan (reference-plan! plan)
+        {:keys [output id] :as problem} (attention-problem plan)
         artifact (kart/validate! artifact)
         specs (attention/buffer-specs problem)
-        inputs (ordered-inputs problem)
+        inputs (ordered-inputs plan)
         graph-buffer (fn [buffer-id]
                        (let [{:keys [dtype elements role]} (get specs buffer-id)]
                          (kgraph/buffer buffer-id dtype elements :device role)))

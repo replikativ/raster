@@ -4,6 +4,7 @@
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.attention-route :as route]))
 
 (defn- query
@@ -45,12 +46,13 @@
           (apply hash-map overrides))))
 
 (deftest dense-reference-is-a-complete-packed-attention-compiler-value
-  (let [{:keys [strategy reference? declines artifact graph schedule]}
+  (let [{:keys [strategy reference? declines plan artifact graph schedule]}
         (route/route! (problem)
                       {:device-type :gpu :subgroup-size 16 :max-workgroup-size 256})]
     (is (= :fp16-reference strategy))
     (is reference?)
     (is (empty? declines))
+    (is (swr/plan? plan))
     (is (kart/kernel-artifact? artifact))
     (is (kgraph/kernel-graph? graph))
     (is (= '[q q-row-offsets q-positions k-pages v-pages
