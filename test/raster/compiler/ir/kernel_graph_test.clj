@@ -93,4 +93,6 @@
                    node operations {:array-types {'integer-values :int 'out :double}})]
     (is (= :int (get-in scheduled [:inputs 0 :dtype])))
     (is (= :double (get-in scheduled [:outputs 0 :dtype])))
-    (is (= :double (get-in scheduled [:temporaries 0 :dtype])))))
+    (is (= :double (get-in scheduled [:temporaries 0 :dtype])))
+    (is (= 'n (get-in scheduled [:inputs 0 :elements])))
+    (is (= 'n (get-in scheduled [:outputs 0 :elements])))))

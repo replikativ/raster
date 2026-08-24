@@ -145,7 +145,13 @@
                       {:expression expression :value value :resolved resolved})))
     resolved))
 
-(defn- resolved-dimension
+(defn resolve-expression
+  "Resolve one integer launch/storage expression.
+
+   Besides literal integers this understands the explicit `RuntimeValue` and `CeilDiv` records
+   used by launch and graph-buffer contracts. `resolve-value` supplies an integer for an opaque
+   compiler value such as a bound symbol. Keeping this evaluator here prevents graph runners from
+   interpreting arbitrary compiler S-expressions."
   [resolve-value dimension]
   (long
    (cond
@@ -165,6 +171,6 @@
   [launch-spec resolve-value]
   (let [{:keys [workgroup-size group-count shared-memory-bytes]}
         (validate-spec! launch-spec)]
-    (geometry {:workgroup-size (mapv #(resolved-dimension resolve-value %) workgroup-size)
-               :group-count (mapv #(resolved-dimension resolve-value %) group-count)
+    (geometry {:workgroup-size (mapv #(resolve-expression resolve-value %) workgroup-size)
+               :group-count (mapv #(resolve-expression resolve-value %) group-count)
                :shared-memory-bytes shared-memory-bytes})))

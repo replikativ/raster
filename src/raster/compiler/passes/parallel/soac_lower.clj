@@ -14,6 +14,7 @@
          Stage 3: carry-in combination (SegMap)"
   (:require [clojure.set :as set]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.segop :as segop]
@@ -38,8 +39,7 @@
   (let [planned (phase-grid :scan device-id bound-expr dtype)
         block-size (:block-size planned)]
     (segop/->KernelGrid
-     (list 'int (list 'Math/ceil
-                      (list '/ (list 'double bound-expr) (double block-size))))
+     (kernel-launch/ceil-div bound-expr block-size)
      block-size
      (:shared-mem-bytes planned))))
 
@@ -261,7 +261,8 @@
                             (map (fn [id]
                                    [id {:dtype (or (get array-types id)
                                                    (get array-types (symbol (name id)))
-                                                   dtype)}]))
+                                                   dtype)
+                                        :elements (:bound soac)}]))
                             external)]
      (kernel-graph/from-segops
       segops
