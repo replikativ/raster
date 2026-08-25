@@ -530,6 +530,8 @@
     (kgraph/make
      {:inputs (mapv #(graph-buffer % :input) inputs)
       :outputs [(graph-buffer output :output)]
+      :abi (:abi artifact)
+      :arguments (:arguments artifact)
       :nodes [(kgraph/->ScheduledKernel
                [:segmented-weighted-reduction (:id plan) :indexed-reference] artifact uses [])]
       :effects {:kind :segmented-weighted-reduction :materialized-intermediates []}
@@ -563,6 +565,8 @@
     (kgraph/make
      {:inputs (mapv #(graph-buffer % :input) inputs)
       :outputs [(graph-buffer output :output)]
+      :abi (:abi artifact)
+      :arguments (:arguments artifact)
       :nodes [(kgraph/->ScheduledKernel
                [:segmented-weighted-reduction (:id plan) :indexed-dynamic-reference]
                artifact uses [])]

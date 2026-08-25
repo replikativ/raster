@@ -62,7 +62,7 @@
   {:measurement (stable-measurement cost)
    :validation {:passed? true
                 :oracle-hash "oracle-v1"
-                :candidate-hash (:source-hash (tuning/artifact-signature artifact))
+                :candidate-hash (:source-hash (tuning/executable-signature artifact))
                 :max-error 0.0}})
 
 (defn- temporary-cache-root
@@ -78,13 +78,13 @@
           benchmark (fn [artifact runtime-value]
                       (swap! calls inc)
                       (validated-result artifact
-                                        (get-in costs [(kdispatch/artifact-strategy artifact)
+                                        (get-in costs [(kdispatch/alternative-strategy artifact)
                                                        runtime-value])))
           result (tuning/tune! dispatch descriptor [768 128 256] benchmark
                                :numerical-mode numerical-mode :layout layout)
           tuned (tuning/apply-tuning dispatch result descriptor numerical-mode layout)
-          select #(kdispatch/artifact-strategy
-                   (kdispatch/select-artifact tuned [:x :out {:type :long :value %}]))]
+          select #(kdispatch/alternative-strategy
+                   (kdispatch/select-alternative tuned [:x :out {:type :long :value %}]))]
       (is (tuning/dispatch-tuning? result))
       (is (= {:kind :runtime-scalar-ranges
               :argument 'width
@@ -123,12 +123,12 @@
                   (fn [artifact _]
                     (validated-result artifact
                                       (if (= :reference
-                                             (kdispatch/artifact-strategy artifact))
+                                             (kdispatch/alternative-strategy artifact))
                                         100.0 99.95)))
                   :numerical-mode numerical-mode :layout layout :force? true)]
       (is (= [] (get-in result [:selector :ranges])))
-      (is (= :reference (kdispatch/artifact-strategy
-                         (kdispatch/select-artifact
+      (is (= :reference (kdispatch/alternative-strategy
+                         (kdispatch/select-alternative
                           (tuning/apply-tuning dispatch result descriptor numerical-mode layout)
                           [:x :out {:type :long :value 4096}])))))))
 
@@ -140,7 +140,7 @@
                      :validation {:passed? false
                                   :oracle-hash "oracle-v1"
                                   :candidate-hash (:source-hash
-                                                   (tuning/artifact-signature artifact))}))
+                                                   (tuning/executable-signature artifact))}))
             #"must pass an oracle"]
            [:noisy
             (fn [artifact _]
@@ -150,7 +150,7 @@
                :validation {:passed? true
                             :oracle-hash "oracle-v1"
                             :candidate-hash (:source-hash
-                                             (tuning/artifact-signature artifact))}})
+                                             (tuning/executable-signature artifact))}})
             #"non-stationary"]]]
     (testing (name label)
       (binding [cache/*cache-root* (temporary-cache-root)]

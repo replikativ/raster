@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
@@ -42,3 +43,13 @@
                                            {'n {:type :int :value 1025}})))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicitly typed"
                           (graph-call/make graph buffers {'n 1025})))))
+
+(deftest emitted-graph-projects-one-ordered-public-call-to-runtime-binding-maps
+  (let [graph (emitted-graph)
+        n {:type :int :value 1025}
+        bindings (executable/graph-bindings graph [:values-resident :out-resident n])]
+    (is (= '[values out n] (:arguments graph)))
+    (is (= {'values :values-resident 'out :out-resident} (:buffers bindings)))
+    (is (= {'n n} (:scalar-values bindings)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"explicitly typed"
+                          (executable/graph-bindings graph [:values :out 1025])))))

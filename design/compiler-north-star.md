@@ -218,6 +218,15 @@ rewrite legality → hardware feasibility → analytic rank → measured rank
 A cost model may abstain. A failed legality or resource check is never converted
 to a different semantic program.
 
+Runtime selection and offline tuning operate on an emitted executable
+alternative, not necessarily one kernel. An alternative is either a single
+`KernelArtifact` or an emitted `KernelGraph`. All alternatives in one
+`KernelDispatch` share one ordered external ABI, compiler argument order,
+target, and logical effects; graph topology, entry points, launch geometry,
+derived scalars, and private temporaries are schedule-owned and may differ.
+This is what permits a direct contraction and a split-K partial-plus-combine
+graph to compete without making split-K storage part of the user-visible call.
+
 ### 3.4 Scheduled kernel graph and kernel IR
 
 The scheduled graph contains calls between kernels and explicit resident

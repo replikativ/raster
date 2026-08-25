@@ -48,7 +48,7 @@
      :schedule-target (schedule-target dispatch)
      :numerical-mode (:numerical-mode contract)
      :layout (:layout contract)
-     :artifacts (mapv tuning/artifact-signature (:alternatives dispatch))}))
+     :alternatives (mapv tuning/executable-signature (:alternatives dispatch))}))
 
 (defn- tunable-step?
   [step]

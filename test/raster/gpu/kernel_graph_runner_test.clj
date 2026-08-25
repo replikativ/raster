@@ -107,6 +107,7 @@
             "await-event!" #(swap! awaited conj %)
             "event-complete?" (constantly true)
             "release-event!" #(swap! released-events conj %)
+            "reset-graph-events!" (fn [_])
             (throw (ex-info "unexpected mocked runtime function" {:name name}))))
         soft-resolver
         (fn [_device-id name]
@@ -120,7 +121,7 @@
       (fn []
         (let [handle (gpu/bind-kernel-graph!
                       sess :prefix graph {'values :values 'out :out}
-                      {'n {:type :int :value 1025}})
+                      {'n {:type :int :value 1025}} {:profile? true})
               event (gpu/submit-kernel-graph! sess handle)
               _ (is (gpu/gpu-event? event))
               _ (is (gpu/event-complete? sess event))
@@ -138,7 +139,7 @@
           (is (= 3 (count @registered)))
           (is (= 3 (count @bound)))
           (is (= 1 (count @recorded)))
-          (is (= {:barriers? true} (get-in @recorded [0 :opts])))
+          (is (= {:barriers? true :profile? true} (get-in @recorded [0 :opts])))
           (is (= 2 (count @submitted)))
           (is (= @submitted @awaited @released-events))
           (is (empty? (:events @sess)))

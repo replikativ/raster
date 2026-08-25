@@ -6,12 +6,13 @@
    replaces the operation with a KernelArtifact without reconstructing dataflow from marker
    conventions.  Stable GraphBuffer identities make intermediate storage part of the program."
   (:require [clojure.set :as set]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.segop :as segop]))
 
 (defrecord GraphBuffer [id dtype elements memory-space role])
 (defrecord ValueUse [buffer access])
 (defrecord ScheduledKernel [id operation uses dependencies])
-(defrecord KernelGraph [inputs outputs temporaries nodes effects provenance attributes])
+(defrecord KernelGraph [inputs outputs temporaries nodes abi arguments effects provenance attributes])
 
 (def ^:private buffer-roles #{:input :output :inout :temporary})
 (def ^:private access-modes #{:read :write :read-write})
@@ -67,6 +68,50 @@
         (seq (set/intersection ew lw))
         (seq (set/intersection er lw)))))
 
+(defn has-interface?
+  "Return true when a graph declares an ordered external call interface. Target-neutral graphs
+   may omit it temporarily; every emitted executable graph must provide it."
+  [graph]
+  (and (some? (:abi graph)) (some? (:arguments graph))))
+
+(defn- validate-interface!
+  [graph]
+  (let [{:keys [abi arguments]} graph]
+    (when-not (= (some? abi) (some? arguments))
+      (throw (ex-info "kernel graph ABI and arguments must be declared together"
+                      {:abi abi :arguments arguments})))
+    (when (some? abi)
+      (kabi/validate-arguments! abi arguments)
+      (let [external-by-id (into {} (map (juxt :id identity))
+                                 (concat (:inputs graph) (:outputs graph)))
+            pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot)))
+                                   (mapv vector abi arguments))
+            pointer-arguments (mapv second pointer-pairs)
+            scalar-arguments (mapv second
+                                   (filterv (fn [[slot _]] (= :scalar (:kind slot)))
+                                            (mapv vector abi arguments)))]
+        (when-not (= (set (keys external-by-id)) (set pointer-arguments))
+          (throw (ex-info "kernel graph pointer interface differs from its external buffers"
+                          {:external (set (keys external-by-id))
+                           :pointer-arguments pointer-arguments})))
+        (when-not (= (count pointer-arguments) (count (set pointer-arguments)))
+          (throw (ex-info "kernel graph pointer interface must name each external buffer once"
+                          {:pointer-arguments pointer-arguments})))
+        (when-not (= (count scalar-arguments) (count (set scalar-arguments)))
+          (throw (ex-info "kernel graph scalar interface arguments must be unique"
+                          {:scalar-arguments scalar-arguments})))
+        (doseq [[slot id] pointer-pairs]
+          (let [{:keys [dtype role]} (get external-by-id id)
+                expected-kind (if (= :input role) :input :output)]
+            (when-not (= dtype (:dtype slot))
+              (throw (ex-info "kernel graph ABI storage dtype differs from its buffer"
+                              {:buffer id :buffer-dtype dtype :slot slot})))
+            (when-not (= expected-kind (:kind slot))
+              (throw (ex-info "kernel graph ABI pointer direction differs from its buffer role"
+                              {:buffer id :role role :slot slot
+                               :expected-kind expected-kind})))))))
+    graph))
+
 (defn validate!
   "Validate a KernelGraph and return it unchanged.
 
@@ -113,6 +158,7 @@
       (when-not (map? value)
         (throw (ex-info "kernel graph descriptive sections must be maps"
                         {:field field :value value}))))
+    (validate-interface! graph)
     (let [declared (set buffer-ids)
           output-ids (set (map :id outputs))
           initially-written (set (map :id (filter #(contains? #{:input :inout} (:role %)) buffers)))]
@@ -187,9 +233,10 @@
 
 (defn make
   "Construct and verify a scheduled KernelGraph from explicit compiler values."
-  [{:keys [inputs outputs temporaries nodes effects provenance attributes]
+  [{:keys [inputs outputs temporaries nodes abi arguments effects provenance attributes]
     :or {inputs [] outputs [] temporaries [] nodes [] effects {} provenance {} attributes {}}}]
-  (validate! (->KernelGraph inputs outputs temporaries nodes effects provenance attributes)))
+  (validate! (->KernelGraph inputs outputs temporaries nodes abi arguments
+                            effects provenance attributes)))
 
 (defn map-operations
   "Replace each scheduled operation while preserving and revalidating graph dataflow. `f` receives

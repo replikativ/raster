@@ -1,9 +1,12 @@
 (ns raster.gpu.dispatch-benchmark-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.dispatch-tuning :as tuning]
@@ -50,6 +53,17 @@
   (.toFile (Files/createTempDirectory "raster-dispatch-benchmark-"
                                       (make-array java.nio.file.attribute.FileAttribute 0))))
 
+(defn- scan-graph
+  []
+  (let [node (soac/par-form->soac
+              'scan-result
+              '(raster.par/scan out acc 0.0 i n float (+ acc (aget values i)))
+              174)
+        operations (lower/lower-scan node nil :dtype :float)]
+    (emit/generate-scan-kernel-graph
+     (lower/scan-kernel-graph
+      node operations {:array-types {'values :float 'out :float}}))))
+
 (deftest resident-driver-validates-before-device-measurement
   (let [actions (atom [])
         result
@@ -80,11 +94,52 @@
                            {:passed? true :oracle-hash "host-reference-v1"})})))]
     (is (= :device-event (get-in result [:measurement :timing-source])))
     (is (= "host-reference-v1" (get-in result [:validation :oracle-hash])))
-    (is (= (:source-hash (tuning/artifact-signature reference))
+    (is (= (:source-hash (tuning/executable-signature reference))
            (get-in result [:validation :candidate-hash])))
     (is (= [:bind :restore :validate-run :measure :restore :release]
            (mapv first @actions)))
     (is (number? (get-in result [:measurement :compile-ms])))))
+
+(deftest resident-driver-binds-and-measures-a-multi-kernel-alternative
+  (let [graph (scan-graph)
+        strategy (get-in graph [:attributes :strategy])
+        graph-dispatch
+        (kdispatch/make
+         {:id "graph-benchmark-test"
+          :alternatives [graph]
+          :default-strategy strategy
+          :selector {:kind :runtime-scalar-threshold
+                     :argument 'n :threshold 2
+                     :at-least strategy :otherwise strategy}})
+        bound (atom nil)
+        n {:type :int :value 1025}
+        result
+        (with-redefs [gpu/bind-kernel-graph!
+                      (fn [session key candidate buffers scalars options]
+                        (reset! bound {:session session :key key :candidate candidate
+                                       :buffers buffers :scalars scalars :options options})
+                        {:candidate candidate})
+                      gpu/run-kernel-graph! (fn [& _] {'out :resident-output})
+                      gpu/measure-bound-kernel-graph!
+                      (fn [_ _ & {:keys [compile-ms hashes]}]
+                        (measurement/summarize [20 20 20]
+                                               :timing-source :device-event
+                                               :compile-ms compile-ms :hashes hashes))
+                      gpu/release-kernel-graph! (fn [& _])]
+          (benchmark/benchmark-candidate!
+           :session graph-dispatch graph 1025
+           (fn [_]
+             {:arguments [:values-resident :out-resident n]
+              :validate! (fn [{:keys [outputs executable]}]
+                           (is (identical? graph executable))
+                           (is (= {'out :resident-output} outputs))
+                           {:passed? true :oracle-hash "scan-reference-v1"})})))]
+    (is (= {'values :values-resident 'out :out-resident} (:buffers @bound)))
+    (is (= {'n n} (:scalars @bound)))
+    (is (= {:profile? true} (:options @bound)))
+    (is (= (:source-hash (tuning/executable-signature graph))
+           (get-in result [:validation :candidate-hash])))
+    (is (= :device-event (get-in result [:measurement :timing-source])))))
 
 (deftest failed-oracle-is-never-measured-and-always-releases
   (let [measured? (atom false)
@@ -132,7 +187,7 @@
                     (fn [_ {:keys [candidate runtime-value]}
                          & {:keys [compile-ms hashes before-sample!]}]
                       (when before-sample! (before-sample!))
-                      (let [cost (get-in costs [(kdispatch/artifact-strategy candidate)
+                      (let [cost (get-in costs [(kdispatch/alternative-strategy candidate)
                                                 runtime-value])]
                         (measurement/summarize [cost cost cost]
                                                :timing-source :device-event

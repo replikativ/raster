@@ -314,8 +314,8 @@
                     (swap! dispatches conj dispatch)
                     (list 'raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
                           (:id dispatch)
-                          (:kernel-name (kdispatch/default-artifact dispatch))
-                          (vec (:arguments (kdispatch/default-artifact dispatch)))))
+                          (:kernel-name (kdispatch/default-alternative dispatch))
+                          (vec (:arguments (kdispatch/default-alternative dispatch)))))
                   (let [routed (swr-route/route-dynamic! plan @target-desc)
                         artifact (register-kernel! (:artifact routed)
                                                    :ze-structured-reductions)]

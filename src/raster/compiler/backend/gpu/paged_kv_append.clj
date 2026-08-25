@@ -112,6 +112,8 @@
     (graph/make
      {:inputs (into input-buffers output-buffers)
       :outputs output-buffers
+      :abi (:abi emitted)
+      :arguments (:arguments emitted)
       :nodes [(graph/->ScheduledKernel
                [:paged-kv-append id :fp32-to-fp16-reference]
                emitted uses [])]

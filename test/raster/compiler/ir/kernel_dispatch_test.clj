@@ -1,8 +1,11 @@
 (ns raster.compiler.ir.kernel-dispatch-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.core :as gpu]
             [raster.gpu.ocl-runtime :as ocl]
@@ -43,15 +46,50 @@
                :at-least :subgroup-score-reuse
                :otherwise :reference}}))
 
+(defn- staged-graph
+  []
+  (let [temporary 'dispatch-temporary
+        stage (fn [kernel-name input output]
+                (kart/make
+                 {:kernel-name kernel-name
+                  :source (str "__kernel void " kernel-name
+                               "(__global const float* " input ", __global float* " output
+                               ", long width) {}")
+                  :abi [(kabi/slot input :input :float)
+                        (kabi/slot output :output :float)
+                        (kabi/slot 'width :scalar :long)]
+                  :arguments [input output 'width]
+                  :launch (klaunch/spec {:workgroup-size [64]
+                                         :group-count [(klaunch/ceil-div 'width 64)]})
+                  :effects {:kind :stage}}))
+        first-stage (stage "dispatch_stage_one" 'x temporary)
+        second-stage (stage "dispatch_stage_two" temporary 'out)]
+    (kgraph/make
+     {:inputs [(kgraph/buffer 'x :float 'width :device :input)]
+      :outputs [(kgraph/buffer 'out :float 'width :device :output)]
+      :temporaries [(kgraph/buffer temporary :float 'width :device :temporary)]
+      :abi abi
+      :arguments '[x out width]
+      :nodes [(kgraph/->ScheduledKernel
+               :stage-one first-stage
+               [(kgraph/->ValueUse 'x :read)
+                (kgraph/->ValueUse temporary :write)] [])
+              (kgraph/->ScheduledKernel
+               :stage-two second-stage
+               [(kgraph/->ValueUse temporary :read)
+                (kgraph/->ValueUse 'out :write)] [:stage-one])]
+      :effects (:effects reference)
+      :attributes {:strategy :two-stage}})))
+
 (deftest runtime-scalars-select-an-abi-compatible-artifact
   (is (kdispatch/kernel-dispatch? dispatch))
   (is (= "dispatch_reference"
-         (:kernel-name (kdispatch/select-artifact dispatch [:x :out {:type :long :value 128}]))))
+         (:kernel-name (kdispatch/select-alternative dispatch [:x :out {:type :long :value 128}]))))
   (is (= "dispatch_subgroup"
-         (:kernel-name (kdispatch/select-artifact dispatch [:x :out {:type :long :value 256}]))))
+         (:kernel-name (kdispatch/select-alternative dispatch [:x :out {:type :long :value 256}]))))
   (is (= "dispatch_subgroup"
-         (:kernel-name (kdispatch/select-artifact dispatch [:x :out {:type :long :value 2}]
-                                                  :subgroup-score-reuse)))
+         (:kernel-name (kdispatch/select-alternative dispatch [:x :out {:type :long :value 2}]
+                                                     :subgroup-score-reuse)))
       "an explicit schedule override is authoritative"))
 
 (deftest measured-runtime-ranges-select-without-runtime-tuning
@@ -62,17 +100,35 @@
                     :below :reference
                     :ranges [{:at-least 192 :strategy :subgroup-score-reuse}
                              {:at-least 768 :strategy :reference}]})
-        select #(kdispatch/artifact-strategy
-                 (kdispatch/select-artifact measured [:x :out {:type :long :value %}]))]
+        select #(kdispatch/alternative-strategy
+                 (kdispatch/select-alternative measured [:x :out {:type :long :value %}]))]
     (is (= :reference (select 128)))
     (is (= :subgroup-score-reuse (select 192)))
     (is (= :subgroup-score-reuse (select 512)))
     (is (= :reference (select 768)))
     (is (= :subgroup-score-reuse
-           (kdispatch/artifact-strategy
-            (kdispatch/select-artifact measured [:x :out {:type :long :value 1}]
-                                       :subgroup-score-reuse)))
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative measured [:x :out {:type :long :value 1}]
+                                          :subgroup-score-reuse)))
         "an explicit override remains authoritative over measured selector data")))
+
+(deftest dispatch-preserves-one-interface-across-single-and-multi-kernel-schedules
+  (let [graph (staged-graph)
+        mixed (kdispatch/make
+               {:id "mixed-executable-dispatch"
+                :alternatives [reference graph]
+                :default-strategy :reference
+                :selector {:kind :runtime-scalar-threshold
+                           :argument 'width :threshold 256
+                           :at-least :two-stage :otherwise :reference}})]
+    (is (= :kernel-artifact
+           (kexec/kind (kdispatch/select-alternative
+                        mixed [:x :out {:type :long :value 128}]))))
+    (is (= :kernel-graph
+           (kexec/kind (kdispatch/select-alternative
+                        mixed [:x :out {:type :long :value 256}]))))
+    (is (= '[x out width] (kexec/arguments graph)))
+    (is (= ['dispatch-temporary] (mapv :id (:temporaries graph))))))
 
 (deftest dispatch-rejects-incompatible-or-ambiguous-alternatives
   (testing "an alternative cannot silently change the ordered ABI"
@@ -112,14 +168,27 @@
            :default-strategy :reference
            :selector {:kind :runtime-scalar-threshold :argument 'x :threshold 1
                       :at-least :subgroup-score-reuse :otherwise :reference}}))))
-  (testing "alternatives need distinct runtime registry entry points"
-    (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"unique emitted entry points"
+  (testing "shared entry points are legal when they name the same module"
+    (is (kdispatch/kernel-dispatch?
          (kdispatch/make
-          {:id "duplicate-entry-point"
+          {:id "shared-entry-point"
            :alternatives [reference
                           (assoc subgroup :kernel-name (:kernel-name reference)
                                  :source (:source reference))]
+           :default-strategy :reference
+           :selector (:selector dispatch)}))))
+  (testing "one entry point cannot name conflicting emitted modules"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"conflicting modules"
+         (kdispatch/make
+          {:id "duplicate-entry-point"
+           :alternatives
+           [reference
+            (assoc subgroup
+                   :kernel-name (:kernel-name reference)
+                   :source (-> (:source subgroup)
+                               (str/replace "dispatch_subgroup" "dispatch_reference")
+                               (str/replace "{}" "{ long gid = get_global_id(0); }")))]
            :default-strategy :reference
            :selector (:selector dispatch)})))))
 
