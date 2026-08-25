@@ -21,6 +21,13 @@
 (def ^:private kvrow 256)
 (def ^:private N (* maxpos kvrow))
 
+(def ^:private opencl-available?
+  (delay
+    (try
+      ((requiring-resolve 'raster.gpu.ocl-runtime/init!))
+      true
+      (catch Throwable _ false))))
+
 (defn- with-filled-session
   "A session whose :kc0 buffer holds value=index at every element, so any disturbance is visible."
   [f]
@@ -79,6 +86,43 @@
           (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds the buffer view"
                                 (g/download-range! s view out
                                                    {:src-element (dec n) :elements 2}))))))))
+
+(deftest resident-range-copy-stays-between-checked-views
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "resident range copy")
+    (let [session (g/make-session :ze:0)
+          values (float-array (map float (range 16)))]
+      (try
+        (g/alloc! session {:source [:float 16 values]
+                           :destination [:float 16 nil]})
+        (let [source (g/buffer-view session :source
+                                    {:byte-offset (* 4 3) :shape [5]})
+              destination (g/buffer-view session :destination
+                                         {:byte-offset (* 4 7) :shape [5]})]
+          (is (identical? destination
+                          (g/copy-range! session source destination {:elements 5})))
+          (is (= [0.0 0.0 0.0 0.0 0.0 0.0 0.0
+                  3.0 4.0 5.0 6.0 7.0 0.0 0.0 0.0 0.0]
+                 (vec (g/download session :destination))))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"exceeds the buffer view"
+                                (g/copy-range! session source destination
+                                               {:src-element 4 :elements 2}))))
+        (finally
+          (g/close-session! session))))))
+
+(deftest opencl-resident-range-copy-uses-the-device-buffer-path
+  (if-not @opencl-available?
+    (is true "OpenCL device unavailable")
+    (let [session (g/make-session :ocl:0)]
+      (try
+        (g/alloc! session {:source [:float 6 (float-array [1 2 3 4 5 6])]
+                           :destination [:float 6 nil]})
+        (g/copy-range! session :source :destination
+                       {:src-element 2 :dst-element 1 :elements 3})
+        (is (= [0.0 3.0 4.0 5.0 0.0 0.0]
+               (vec (g/download session :destination))))
+        (finally
+          (g/close-session! session))))))
 
 (deftest a-jvm-array-and-a-memory-segment-take-the-same-path
   (if-not @gp/gpu-available?

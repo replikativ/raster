@@ -865,6 +865,30 @@
         spec (checked-view-range-spec buffer view spec :download)]
     ((rt-resolve (:device-id @sess) "download-range!") buffer dst spec)))
 
+(defn copy-range!
+  "Copy a contiguous element range between resident buffers or views.
+
+   `spec` requires `:elements`; `:src-element` and `:dst-element` default to
+   zero and are relative to their respective views. Source and destination must
+   belong to this session and have the same storage dtype. The backend performs
+   a direct resident copy without materializing a JVM array. Returns `dst`."
+  [sess src dst {:keys [src-element dst-element elements]
+                 :or {src-element 0 dst-element 0}
+                 :as spec}]
+  (let [{src-buffer :buffer src-view :view} (resolve-resident-binding sess src)
+        {dst-buffer :buffer dst-view :view} (resolve-resident-binding sess dst)
+        src-spec (checked-view-range-spec src-buffer src-view spec :download)
+        dst-spec (checked-view-range-spec dst-buffer dst-view spec :upload)
+        src-dtype (dtype/canon (:dtype src-buffer))
+        dst-dtype (dtype/canon (:dtype dst-buffer))]
+    (when-not (= src-dtype dst-dtype)
+      (throw (ex-info "resident range copy requires identical storage dtypes"
+                      {:source-dtype src-dtype :destination-dtype dst-dtype})))
+    ((rt-resolve (:device-id @sess) "copy-buffer-range!")
+     src-buffer dst-buffer
+     (:src-element src-spec) (:dst-element dst-spec) elements)
+    dst))
+
 (defn- transfer-ranges!
   "The batched core. VALIDATES EVERY entry (`plan-range`) before EXECUTING ANY. A batch is how a
    whole KV cache moves — 36 per-layer buffers for gemma-270m — and a batched API newly makes a
