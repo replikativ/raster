@@ -13,7 +13,21 @@
    `emit-gemm-tiled`'s literals exactly, and the split-k policy must produce the same schedule it
    produced from its own constants."
   (:require [clojure.test :refer [deftest is testing]]
-            [raster.compiler.core.hardware :as hw]))
+            [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.core.hardware :as hw]
+            [raster.compiler.ir.kernel-launch :as launch]))
+
+(defn- split-schedule
+  [m n k fill-workgroups]
+  (let [tile (hw/gemm-tile-for nil)
+        requested (launch/resolve-expression
+                   {} (gemm/requested-splits
+                       {:m m :n n :k k :tile tile :fill-workgroups fill-workgroups}))]
+    (if (< requested 2)
+      [1 k]
+      (let [kc (launch/resolve-expression
+                {} (launch/align-up (launch/ceil-div k requested) (:block-k tile)))]
+        [(launch/resolve-expression {} (launch/ceil-div k kc)) kc]))))
 
 (deftest default-tile-equals-the-emitters-own-literals
   (testing "gemm-tile-for on no descriptor == emit-gemm-tiled's :or defaults, so adopting the one
@@ -51,10 +65,10 @@
       (is (= (gc 4096 128) (gc 4096 block-n))))))
 
 (deftest split-k-policy-is-unchanged-on-this-device
-  (testing "gemm-schedule now reads block-m/block-n/block-k instead of /128.0 and *32, and must
-            produce the same schedule it did from its own constants"
-    (let [sched (requiring-resolve 'raster.gpu.core/gemm-schedule)]
-      (is (= [1 1024] (sched 128 128 1024 64)) "already fills the machine → no split")
+  (testing "the emitted schedule expression reads block-m/block-n/block-k rather than independent
+            literals and preserves the established policy"
+    (let [sched split-schedule]
+      (is (= [1 1024] (sched 128 128 1024 64)) "short K does not amortize a split")
       (is (= [8 1024] (sched 64 64 8192 64)) "small tile-count, long K → split-k")
       (testing "and every K-chunk is a multiple of the tile's K-unroll, by construction"
         (let [[_ kc] (sched 64 64 8192 64)]

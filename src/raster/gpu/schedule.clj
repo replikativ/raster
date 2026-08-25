@@ -2,9 +2,8 @@
   "The schedule layer (S6) — schedule-as-DATA plus the register-budget feasibility gate.
 
    A `Schedule` is an EDN map attached to a compiled artifact (rides on the `Compiled`
-   record's `:schedule` field). It unifies the four scattered representations of today's
-   tuning knobs — the `gemm-schedule` pure fn, the `:gemm-precision` descriptor field, the
-   `*gemm-splitk-*` dynamic vars, and the hardcoded launch geometry — into ONE inspectable,
+   record's `:schedule` field). It unifies the former scattered GEMM precision, split-K policy,
+   and launch-geometry representations into ONE inspectable,
    pinnable structure, and adds the piece all three reference compilers (Halide anderson2021,
    oneDNN, Triton) have and raster lacked: a register-budget feasibility gate that rejects an
    infeasible schedule at COMPILE time instead of discovering it as a measurement-time spill.
@@ -58,6 +57,11 @@
     ;; fusion / cross-layer-resident schedule flips operands to :resident. The graph-level extension
     ;; for stationary LLMs (operand resident across the recorded decode sequence) lives here.
     :residency {:a :dram :b :dram :c :dram}
+    ;; Analytic seed for the generic direct-vs-split executable dispatch. An offline tuner may
+    ;; replace these data without changing a runtime binder or target emitter.
+    :gemm-dispatch {:target-fill-multiple 4
+                    :min-split-chunk 1024
+                    :max-splits 64}
     ;; Dynamic structured reductions keep their extents in the ABI. :auto emits compatible
     ;; schedules once and selects after those scalar values become concrete. The subgroup multiple
     ;; is the analytic crossover seed; measurement/autotuning may override it per machine.
@@ -190,7 +194,9 @@
         score-reuse-multiple
         (get-in schedule [:segmented-weighted-reduction :score-reuse-subgroup-multiple] 16)
         measured-selectors
-        (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})]
+        (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})
+        {:keys [target-fill-multiple min-split-chunk max-splits]}
+        (:gemm-dispatch schedule)]
     (when-not (valid-precisions prec)
       (throw (ex-info (str "schedule: unknown :precision " (pr-str prec) " — expected " valid-precisions)
                       {:precision prec})))
@@ -215,7 +221,14 @@
     (when (and (seq measured-selectors) (not= :auto reduction-strategy))
       (throw (ex-info "schedule: measured selectors require :strategy :auto"
                       {:strategy reduction-strategy
-                       :measured-selectors measured-selectors}))))
+                       :measured-selectors measured-selectors})))
+    (doseq [[field value] [[:target-fill-multiple target-fill-multiple]
+                           [:min-split-chunk min-split-chunk]
+                           [:max-splits max-splits]]]
+      (when-not (and (integer? value) (pos? value))
+        (throw (ex-info "schedule: GEMM dispatch controls must be positive integers"
+                        {:field field :value value
+                         :gemm-dispatch (:gemm-dispatch schedule)})))))
   (let [budget (grf-budget-bytes-per-lane schedule desc)
         acc    (acc-bytes-per-lane schedule)
         staged (register-staged-bytes-per-lane schedule)

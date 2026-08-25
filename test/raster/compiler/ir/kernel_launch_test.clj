@@ -43,6 +43,24 @@
 
 (deftest symbolic-storage-expressions-use-the-same-checked-evaluator
   (is (= 5 (launch/resolve-expression {'n 1025} (launch/ceil-div 'n 256))))
+  (is (= 768
+         (launch/resolve-expression
+          {'m 3 'k 257}
+          (launch/product 'm (launch/align-up (launch/ceil-div 'k 2) 256)))))
+  (let [tiles (launch/product (launch/ceil-div 'm 128) (launch/ceil-div 'n 128))
+        requested-splits (launch/minimum (launch/ceil-div 128 tiles)
+                                         (launch/floor-div 'k 1024)
+                                         32)]
+    (is (= #{'m 'n 'k} (launch/expression-references requested-splits)))
+    (is (= 26 (launch/resolve-expression {'m 13 'n 640 'k 262144}
+                                         requested-splits))))
+  (is (= [3 2]
+         (:group-count
+          (launch/realize
+           (launch/spec {:workgroup-size [256 1]
+                         :group-count [(launch/ceil-div 'n 128)
+                                       (launch/ceil-div 'm 128)]})
+           {'m 129 'n 257}))))
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be an integer"
                         (launch/resolve-expression {} (launch/ceil-div 'n 256)))))
 

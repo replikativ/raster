@@ -5,7 +5,8 @@
    scheduling value above both: every alternative implements the same logical call and differs
    only in its emitted schedule. Selection is pure data evaluated after symbolic ABI scalars
    become concrete and before a backend binder sees the selected executable."
-  (:require [raster.compiler.ir.kernel-executable :as kexec]))
+  (:require [raster.compiler.ir.kernel-executable :as kexec]
+            [raster.compiler.ir.kernel-launch :as klaunch]))
 
 (defrecord KernelDispatch
            [id
@@ -42,30 +43,82 @@
 
 (defn- validate-selector!
   [dispatch strategies common]
-  (let [{:keys [kind argument threshold at-least otherwise ranges below]}
+  (let [{:keys [kind argument expression threshold at-least otherwise ranges below]}
         (:selector dispatch)
         common-arguments (:arguments common)
-        indexes (keep-indexed (fn [index value] (when (= argument value) index))
-                              common-arguments)]
-    (when-not (= 1 (count indexes))
-      (throw (ex-info "kernel dispatch selector argument must have one common ABI position"
-                      {:id (:id dispatch) :argument argument
-                       :arguments common-arguments :indexes (vec indexes)})))
-    (let [slot (nth (:abi common) (first indexes))]
-      (when-not (= :scalar (:kind slot))
-        (throw (ex-info "kernel dispatch selector argument must name a scalar ABI slot"
-                        {:id (:id dispatch) :argument argument :slot slot}))))
+        scalar-arguments (->> (map vector (:abi common) common-arguments)
+                              (keep (fn [[slot compiler-value]]
+                                      (when (= :scalar (:kind slot)) compiler-value)))
+                              set)
+        validate-threshold! (fn []
+                              (when-not (and (finite-number? threshold)
+                                             (pos? (double threshold)))
+                                (throw (ex-info "kernel dispatch threshold must be finite and positive"
+                                                {:id (:id dispatch) :threshold threshold})))
+                              (doseq [[branch strategy] [[:at-least at-least]
+                                                         [:otherwise otherwise]]]
+                                (validate-selector-strategy! dispatch strategies branch strategy)))
+        validate-expression! (fn [owner expression]
+                               (when-not (klaunch/expression? expression)
+                                 (throw (ex-info
+                                         "kernel dispatch selector requires checked integer expression IR"
+                                         {:id (:id dispatch) :owner owner
+                                          :expression expression})))
+                               (let [references (klaunch/expression-references expression)]
+                                 (when-not (every? scalar-arguments references)
+                                   (throw (ex-info
+                                           "kernel dispatch expression reads values outside its scalar ABI"
+                                           {:id (:id dispatch) :owner owner
+                                            :references references
+                                            :scalar-arguments scalar-arguments})))))
+        validate-argument! (fn []
+                             (let [indexes (keep-indexed
+                                            (fn [index value] (when (= argument value) index))
+                                            common-arguments)]
+                               (when-not (= 1 (count indexes))
+                                 (throw (ex-info
+                                         "kernel dispatch selector argument must have one common ABI position"
+                                         {:id (:id dispatch) :argument argument
+                                          :arguments common-arguments :indexes (vec indexes)})))
+                               (let [slot (nth (:abi common) (first indexes))]
+                                 (when-not (= :scalar (:kind slot))
+                                   (throw (ex-info
+                                           "kernel dispatch selector argument must name a scalar ABI slot"
+                                           {:id (:id dispatch) :argument argument :slot slot}))))))]
     (case kind
       :runtime-scalar-threshold
       (do
-        (when-not (and (finite-number? threshold) (pos? (double threshold)))
-          (throw (ex-info "kernel dispatch threshold must be finite and positive"
-                          {:id (:id dispatch) :threshold threshold})))
-        (doseq [[branch strategy] [[:at-least at-least] [:otherwise otherwise]]]
-          (validate-selector-strategy! dispatch strategies branch strategy)))
+        (validate-argument!)
+        (validate-threshold!))
+
+      :runtime-expression-threshold
+      (do
+        (validate-expression! :expression expression)
+        (validate-threshold!))
+
+      :runtime-expression-cases
+      (let [cases (get-in dispatch [:selector :cases])
+            default (get-in dispatch [:selector :default])]
+        (when-not (and (vector? cases) (seq cases))
+          (throw (ex-info "kernel dispatch expression cases must be a non-empty ordered vector"
+                          {:id (:id dispatch) :cases cases})))
+        (validate-selector-strategy! dispatch strategies :default default)
+        (doseq [[index rule] (map-indexed vector cases)]
+          (when-not (= #{:expression :op :value :strategy} (set (keys rule)))
+            (throw (ex-info "kernel dispatch expression case has invalid fields"
+                            {:id (:id dispatch) :index index :rule rule})))
+          (validate-expression! [:cases index] (:expression rule))
+          (when-not (contains? #{:< :<= := :>= :>} (:op rule))
+            (throw (ex-info "kernel dispatch expression case has an invalid comparison"
+                            {:id (:id dispatch) :index index :op (:op rule)})))
+          (when-not (finite-number? (:value rule))
+            (throw (ex-info "kernel dispatch expression case requires a finite comparison value"
+                            {:id (:id dispatch) :index index :value (:value rule)})))
+          (validate-selector-strategy! dispatch strategies [:cases index] (:strategy rule))))
 
       :runtime-scalar-ranges
       (do
+        (validate-argument!)
         (validate-selector-strategy! dispatch strategies :below below)
         (when-not (vector? ranges)
           (throw (ex-info "kernel dispatch ranges must be an ordered vector"
@@ -173,6 +226,15 @@
   [value]
   (if (and (map? value) (contains? value :value)) (:value value) value))
 
+(defn- compare-value?
+  [op actual expected]
+  (case op
+    :< (< actual expected)
+    :<= (<= actual expected)
+    := (= actual expected)
+    :>= (>= actual expected)
+    :> (> actual expected)))
+
 (defn select-alternative
   "Select an executable alternative from concrete ABI-ordered values.
 
@@ -184,21 +246,27 @@
    (let [dispatch (validate! dispatch)]
      (if (and override (not= :auto override))
        (alternative dispatch override)
-       (let [{:keys [kind argument threshold at-least otherwise ranges below]}
+       (let [{:keys [kind argument expression threshold at-least otherwise ranges below]}
              (:selector dispatch)
              common-arguments (kexec/arguments (default-alternative dispatch))
              indexes (keep-indexed (fn [index value] (when (= argument value) index))
                                    common-arguments)]
-         (when-not (= 1 (count indexes))
-           (throw (ex-info "kernel dispatch selector argument must have one runtime position"
-                           {:id (:id dispatch) :argument argument
-                            :indexes (vec indexes)})))
          (when-not (= (count common-arguments) (count runtime-arguments))
            (throw (ex-info "kernel dispatch runtime argument count mismatch"
                            {:id (:id dispatch) :expected (count common-arguments)
                             :actual (count runtime-arguments)})))
-         (let [value (runtime-number (nth runtime-arguments (first indexes)))]
-           (when-not (number? value)
+         (when (contains? #{:runtime-scalar-threshold :runtime-scalar-ranges} kind)
+           (when-not (= 1 (count indexes))
+             (throw (ex-info "kernel dispatch selector argument must have one runtime position"
+                             {:id (:id dispatch) :argument argument
+                              :indexes (vec indexes)}))))
+         (let [environment (zipmap common-arguments (mapv runtime-number runtime-arguments))
+               value (case kind
+                       :runtime-expression-threshold
+                       (klaunch/resolve-expression environment expression)
+                       :runtime-expression-cases nil
+                       (runtime-number (nth runtime-arguments (first indexes))))]
+           (when (and (not= :runtime-expression-cases kind) (not (number? value)))
              (throw (ex-info "kernel dispatch selector requires a numeric runtime scalar"
                              {:id (:id dispatch) :argument argument :value value})))
            (alternative
@@ -206,6 +274,19 @@
             (case kind
               :runtime-scalar-threshold
               (if (>= (double value) (double threshold)) at-least otherwise)
+
+              :runtime-expression-threshold
+              (if (>= (double value) (double threshold)) at-least otherwise)
+
+              :runtime-expression-cases
+              (or (some (fn [{:keys [expression op value strategy]}]
+                          (when (compare-value?
+                                 op
+                                 (klaunch/resolve-expression environment expression)
+                                 value)
+                            strategy))
+                        (get-in dispatch [:selector :cases]))
+                  (get-in dispatch [:selector :default]))
 
               :runtime-scalar-ranges
               (reduce (fn [strategy range]

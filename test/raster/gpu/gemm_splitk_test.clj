@@ -12,9 +12,12 @@
      • the split-k GEMM agrees with the plain XMX GEMM (same f16 inputs, f32 accumulate)
        to f32 summation-order noise, across ragged m/n/k and several split counts —
        including a k-range that does not divide evenly and an m below one 8-row DPAS tile;
-     • the split-k DECISION (raster.gpu.core's policy knobs) leaves machine-filling GEMMs
-       alone and splits the low-occupancy ones."
+     • the compiler-emitted split-k schedule expression leaves machine-filling GEMMs alone
+       and splits the low-occupancy ones."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.dl.gpu-grad-parity :as gp]))
 
 (defn- rnd ^floats [n seed]
@@ -112,33 +115,35 @@
           (free! af) (free! h))))))
 
 (deftest split-k-policy-only-fires-on-low-occupancy-gemms
-  ;; Calls the BINDER'S OWN decision (gpu.core/gemm-schedule) — this test used to
-  ;; re-implement the policy by hand, which meant it could not catch a regression in the
-  ;; copy that actually schedules the GEMMs. One policy, one caller, one spec.
-  (require 'raster.gpu.core)
-  (let [core (find-ns 'raster.gpu.core)
-        schedule @(ns-resolve core 'gemm-schedule)
-        max-splits @(ns-resolve core '*gemm-splitk-max-splits*)
+  ;; Realize the compiler IR expression used by both KernelDispatch selection and graph-private
+  ;; split storage. There is no binder copy of this policy anymore.
+  (let [tile (hardware/gemm-tile-for nil)
         fill 32                                   ;; the Arc 140V's 8192 lanes / 256-item wg
-        decide (fn [m n k] (first (schedule m n k fill)))]
+        decide (fn [m n k & [fill-workgroups]]
+                 (launch/resolve-expression
+                  {} (gemm/requested-splits
+                      {:m m :n n :k k :tile tile
+                       :fill-workgroups (or fill-workgroups fill)})))]
     (testing "the tied-embedding backward (5 workgroups, k=262144) is split"
       (is (> (decide 13 640 262144) 1)))
     (testing "a GEMM that already fills the machine is NOT split"
-      (is (= 1 (decide 13 262144 640)))   ;; the head's forward logits: 2048 workgroups
-      (is (= 1 (decide 640 2048 64))))    ;; a :tn weight-gradient: 80 workgroups
+      (is (< (decide 13 262144 640) 2))   ;; the head's forward logits: 2048 workgroups
+      (is (< (decide 640 2048 64) 2)))    ;; a :tn weight-gradient: 80 workgroups
     (testing "a low-occupancy GEMM with a SHORT k is not split (chunks would be tiny)"
-      (is (= 1 (decide 64 640 512))))
+      (is (< (decide 64 640 512) 2)))
     (testing "split count stays within the cap"
-      (is (<= (decide 13 640 (* 1024 1024)) max-splits)))
+      (is (<= (decide 13 640 (* 1024 1024)) 64)))
     (testing "the k-chunk is a multiple of the 32-wide K-unroll and covers all of k"
-      (let [[s kc] (schedule 13 640 262144 fill)]
+      (let [s (decide 13 640 262144)
+            kc (launch/resolve-expression
+                {} (launch/align-up (launch/ceil-div 262144 s) (:block-k tile)))]
         (is (zero? (mod kc 32)))
         (is (>= (* s kc) 262144))))
     (testing "the schedule follows the HARDWARE, not the shape alone"
       ;; the same GEMM on a machine that only needs 4 workgroups to fill is NOT starved,
       ;; so it is not split — the fill count is an input, not a constant.
       (is (> (decide 13 640 262144) 1))
-      (is (= 1 (first (schedule 13 640 262144 4)))))))
+      (is (< (decide 13 640 262144 4) 2)))))
 
 (deftest hardware-derived-launch-geometry
   ;; The machine width is a HardwareDescriptor field, not a literal at each launch site.

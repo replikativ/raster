@@ -56,6 +56,9 @@
       (is (= {:strategy :auto :score-reuse-subgroup-multiple 16
               :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
+    (testing "GEMM dispatch policy is explicit, serializable schedule data"
+      (is (= {:target-fill-multiple 4 :min-split-chunk 1024 :max-splits 64}
+             (:gemm-dispatch derived))))
     (testing "a pinned override is recorded in :meta :overrides"
       (is (contains? (get-in (sched/resolve derived {:precision :f32-scalar}) [:meta :overrides])
                      :precision)))))
@@ -149,6 +152,20 @@
                               :measured-selectors
                               {"dispatch-a" {:kind :runtime-scalar-ranges}}}})
                            arc-desc))))
+  (testing "GEMM dispatch controls reject missing, zero, and non-integral policy data"
+    (doseq [invalid [{:max-splits 0}
+                     {:min-split-chunk 1.5}]]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"GEMM dispatch controls must be positive integers"
+           (sched/feasible?
+            (sched/resolve (sched/derive-default nil arc-desc)
+                           {:gemm-dispatch invalid})
+            arc-desc))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"GEMM dispatch controls must be positive integers"
+         (sched/feasible?
+          (update (sched/derive-default nil arc-desc) :gemm-dispatch dissoc :max-splits)
+          arc-desc))))
   (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
                           (sched/resolve (sched/derive-default nil arc-desc)

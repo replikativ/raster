@@ -388,6 +388,33 @@
 ;; Transpose kernel
 ;; ================================================================
 
+(defn emit-f32-to-f16-kernel
+  "Generate the vectorized f32→f16 conversion used by mixed-precision GEMM schedules.
+
+   `vector-width` is the compiler-selected number of elements per work-item and must be 1, 2, or
+   4. The scalar tail preserves correctness for arbitrary extents and for extents below the vector
+   width. Keeping this emitter in compiler codegen lets conversion participate in KernelGraph
+   scheduling instead of being synthesized privately by a runtime registry."
+  [kernel-name vector-width]
+  (let [w (long vector-width)]
+    (when-not (contains? #{1 2 4} w)
+      (throw (ex-info "f32-to-f16 vector width must be 1, 2, or 4"
+                      {:vector-width vector-width})))
+    (if (= 1 w)
+      (str "__kernel void " kernel-name
+           "(__global const float* restrict in, __global half* restrict out, int n) {\n"
+           "  for (int i = get_global_id(0); i < n; i += get_global_size(0)) "
+           "out[i] = (half)in[i];\n}\n")
+      (let [shift (case w 2 1 4 2)]
+        (str "__kernel void " kernel-name
+             "(__global const float* restrict in, __global half* restrict out, int n) {\n"
+             "  int nv = n >> " shift ";\n"
+             "  for (int i = get_global_id(0); i < nv; i += get_global_size(0))\n"
+             "    vstore_half" w "(vload" w "(i, in), i, out);\n"
+             "  for (int i = (nv << " shift ") + get_global_id(0); i < n; "
+             "i += get_global_size(0))\n"
+             "    out[i] = (half)in[i];\n}\n")))))
+
 (defn- render-c-index
   "Render a layout->offset index S-expression to C infix (matches the hand-written kernel strings:
    `(+ (* i cols) j)` → \"i * cols + j\"). Index arithmetic only (+ and *, symbols/ints)."
@@ -633,7 +660,7 @@
    separate emitter keyed by :matrix :family (the one genuine fork). Handles arbitrary M,N,K with
    full boundary checking; supports alpha/beta, c-dtype, split-k? (grid-z partials) and batched?
    (grid-z slabs)."
-  [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? batched? prefetch
+  [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? schedule-splits-arg? batched? prefetch
                          epilogue epilogue-params epilogue-helpers]
                   :or {block-m 128 block-n 128 sg-m 32 sg-n 32 block-k 32
                        matrix {:m 8 :n 16 :k 16 :subgroup 16}
@@ -687,7 +714,9 @@
        "__kernel void " kernel-name "(\n"
        "    __global const half* restrict A,\n    __global const half* restrict B,\n"
        "    __global " c-type "* restrict C,\n    int M, int N, int K"
-       (when split-k? ", int KC") (when (not= alpha 1.0) ", float alpha") (when (not= beta 0.0) ", float beta")
+       (when split-k? ", int KC")
+       (when (and split-k? schedule-splits-arg?) ", int splits")
+       (when (not= alpha 1.0) ", float alpha") (when (not= beta 0.0) ", float beta")
        epilogue-params
        ") {\n"
        "    int sg_id = get_sub_group_id();\n    int sg_lid = get_sub_group_local_id();\n"
