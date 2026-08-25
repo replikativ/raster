@@ -44,6 +44,7 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.gemm :as gpu-gemm]
             [raster.compiler.passes.parallel.compound-detect :as compound-detect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.loop-lift :as loop-lift]
@@ -1653,8 +1654,9 @@
    f16 UNDERFLOW (min normal 6.1e-5) is the one hazard a small-magnitude cotangent can hit
    — the remedy is standard AMP loss scaling, and it lives in the CALLER (scale the seed
    cotangent by S, use lr/S), not in this policy: the VJP is linear in the seed.
-   No size heuristics; the XMX hardware pitch gate (n<8 or k<8 → scalar) applies in
-   bind-program! regardless of policy."
+   The XMX pitch gate and direct-vs-split occupancy decision are emitted as checked
+   KernelDispatch expression cases. `bind-program!` selects and binds that compiler value; it does
+   not recognize GEMM shapes or reconstruct conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule]
                       :or {on-non-resident :throw gemm-precision :f16-xmx}}]
   (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
@@ -1665,7 +1667,8 @@
   ;; (:gemm-precision is deprecated sugar → the precision policy), and run the register-budget
   ;; FEASIBILITY GATE before any emission — an infeasible schedule (e.g. register double-buffering
   ;; that would spill the GRF file) is a loud compile error, not a measurement-time regression.
-  (let [resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
+  (let [hardware-descriptor (core-hw/descriptor-for device-id)
+        resolved-schedule ((requiring-resolve 'raster.gpu.schedule/schedule-for-device)
                            nil device-id schedule {:precision gemm-precision})
         gemm-precision (:precision resolved-schedule)
         resolved-var (or (resolve-deftm-var f-var dtype) f-var)
@@ -1831,16 +1834,58 @@
        :steps (mapv (fn [i step]
                       (cond
                         (= :gemm (:convention step))
-                        ;; GEMM: carries the A/B/C buffer syms + m/n/k size closures (BLAS arg
-                        ;; order is A B C m k n → keep m/n/k separate). bind-program! expands this
-                        ;; into [convert A→f16][convert B→f16][(transpose)][fp16 XMX gemm → f32 C].
-                        {:convention :gemm
-                         :variant (:variant step)
-                         :A (:A step) :B (:B step) :C (:C step)
-                         :m-fn (expr->arg-fn all-params scalar-lets (:m-expr step))
-                         :n-fn (expr->arg-fn all-params scalar-lets (:n-expr step))
-                         :k-fn (expr->arg-fn all-params scalar-lets (:k-expr step))
-                         :phase (keyword (str "gpu-step-" i))}
+                        ;; GEMM: the compiler closes this step over scalar/direct/split executable
+                        ;; graphs. The ordered argument contract is the sole binding authority;
+                        ;; the resident binder only supplies its concrete values and flattens the
+                        ;; selected graph.
+                        (let [phase (keyword (str "gpu-step-" i))
+                              m-argument (keyword (str (name phase) "-m"))
+                              n-argument (keyword (str (name phase) "-n"))
+                              k-argument (keyword (str (name phase) "-k"))
+                              tile (:tile resolved-schedule)
+                              {:keys [block-m block-n sg-m sg-n matrix]} tile
+                              workgroup-size
+                              (* (quot block-m sg-m) (quot block-n sg-n)
+                                 (:subgroup matrix 16))]
+                          {:convention :gemm
+                           :variant (:variant step)
+                           :A (:A step) :B (:B step) :C (:C step)
+                           :dispatch
+                           (gpu-gemm/emit-executable
+                            {:id (str f-var "-" device-id "-resident-gemm-" i "-"
+                                      (name (:variant step)) "-"
+                                      (Integer/toUnsignedString (hash tile) 16))
+                             :a (:A step) :b (:B step) :c (:C step)
+                             :m m-argument :n n-argument :k k-argument
+                             :variant (:variant step)
+                             ;; Emit the complete legal schedule family. The resolved precision
+                             ;; selects :f32-scalar at bind; :f16-xmx uses the checked cases.
+                             :precision :f16-xmx
+                             :tile tile
+                             :fill-workgroups
+                             (core-hw/fill-workgroups hardware-descriptor workgroup-size)
+                             :target-fill-multiple
+                             (get-in resolved-schedule [:gemm-dispatch :target-fill-multiple])
+                             :min-split-chunk
+                             (get-in resolved-schedule [:gemm-dispatch :min-split-chunk])
+                             :max-splits
+                             (get-in resolved-schedule [:gemm-dispatch :max-splits])})
+                           :argument-specs
+                           [{:kind :input :sym (:A step)}
+                            {:kind :input :sym (:B step)}
+                            {:kind :output :sym (:C step)}
+                            {:kind :scalar :type :int
+                             :value-fn (expr->arg-fn all-params scalar-lets (:m-expr step))}
+                            {:kind :scalar :type :int
+                             :value-fn (expr->arg-fn all-params scalar-lets (:n-expr step))}
+                            {:kind :scalar :type :int
+                             :value-fn (expr->arg-fn all-params scalar-lets (:k-expr step))}]
+                           ;; Generic schedule-path-to-strategy mapping. The binder does not know
+                           ;; which semantic operation owns :precision.
+                           :strategy-selection {:path [:precision]
+                                                :mapping {:f32-scalar :f32-scalar}
+                                                :default :auto}
+                           :phase phase})
 
                         (= :contract (:convention step))
                         (let [{:keys [kernel-name dispatch-id arguments]} step

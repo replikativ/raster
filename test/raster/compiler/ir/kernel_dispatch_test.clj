@@ -112,6 +112,29 @@
                                           :subgroup-score-reuse)))
         "an explicit override remains authoritative over measured selector data")))
 
+(deftest ordered-expression-cases-select-from-checked-shape-arithmetic
+  (let [scheduled
+        (kdispatch/with-selector
+          dispatch
+          {:kind :runtime-expression-cases
+           :cases [{:expression 'width :op :< :value 8 :strategy :reference}
+                   {:expression (klaunch/product 'width 2)
+                    :op :>= :value 512 :strategy :subgroup-score-reuse}]
+           :default :reference})
+        select #(kdispatch/alternative-strategy
+                 (kdispatch/select-alternative
+                  scheduled [:x :out {:type :long :value %}]))]
+    (is (= :reference (select 4)))
+    (is (= :reference (select 128)))
+    (is (= :subgroup-score-reuse (select 256)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"outside its scalar ABI"
+         (kdispatch/with-selector
+           dispatch
+           {:kind :runtime-expression-cases
+            :cases [{:expression 'not-in-the-abi :op :> :value 0 :strategy :reference}]
+            :default :subgroup-score-reuse})))))
+
 (deftest dispatch-preserves-one-interface-across-single-and-multi-kernel-schedules
   (let [graph (staged-graph)
         mixed (kdispatch/make

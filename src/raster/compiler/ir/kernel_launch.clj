@@ -7,6 +7,10 @@
 
 (defrecord RuntimeValue [value])
 (defrecord CeilDiv [value divisor])
+(defrecord FloorDiv [value divisor])
+(defrecord Product [factors])
+(defrecord AlignUp [value alignment])
+(defrecord Minimum [values])
 (defrecord LaunchSpec [workgroup-size group-count shared-memory-bytes])
 (defrecord LaunchGeometry [workgroup-size group-count shared-memory-bytes])
 
@@ -27,10 +31,45 @@
   [value divisor]
   (when (nil? value)
     (throw (ex-info "ceil-div launch value cannot be nil" {:value value :divisor divisor})))
-  (when-not (and (integer? divisor) (pos? divisor))
-    (throw (ex-info "ceil-div launch divisor must be a positive integer"
+  (when-not (or (not (integer? divisor)) (pos? divisor))
+    (throw (ex-info "ceil-div launch divisor must be positive"
                     {:value value :divisor divisor})))
   (->CeilDiv value divisor))
+
+(defn floor-div
+  "A checked floor division of non-negative integer expressions. The divisor may itself be a
+   symbolic integer expression and is proved positive when the expression is realized."
+  [value divisor]
+  (when (or (nil? value) (nil? divisor))
+    (throw (ex-info "floor-div operands cannot be nil" {:value value :divisor divisor})))
+  (when-not (or (not (integer? divisor)) (pos? divisor))
+    (throw (ex-info "floor-div divisor must be positive" {:value value :divisor divisor})))
+  (->FloorDiv value divisor))
+
+(defn product
+  "A checked product of integer launch/storage expressions. Products are explicit IR rather than
+   arbitrary Clojure forms so graph scratch sizes can remain inspectable and safely realizable."
+  [& factors]
+  (when-not (and (seq factors) (every? some? factors))
+    (throw (ex-info "product requires one or more non-nil factors" {:factors factors})))
+  (->Product (vec factors)))
+
+(defn align-up
+  "Round an integer launch/storage expression up to a positive static alignment."
+  [value alignment]
+  (when (nil? value)
+    (throw (ex-info "align-up value cannot be nil" {:value value :alignment alignment})))
+  (when-not (and (integer? alignment) (pos? alignment))
+    (throw (ex-info "align-up requires a positive integer alignment"
+                    {:value value :alignment alignment})))
+  (->AlignUp value alignment))
+
+(defn minimum
+  "The minimum of one or more integer expressions."
+  [& values]
+  (when-not (and (seq values) (every? some? values))
+    (throw (ex-info "minimum requires one or more non-nil values" {:values values})))
+  (->Minimum (vec values)))
 
 (defn launch-spec? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.LaunchSpec" x))
@@ -43,6 +82,50 @@
 
 (defn- ceil-div? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.CeilDiv" x))
+
+(defn- floor-div? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.FloorDiv" x))
+
+(defn- product? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.Product" x))
+
+(defn- align-up? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.AlignUp" x))
+
+(defn- minimum? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.Minimum" x))
+
+(defn expression?
+  "True for explicit symbolic integer-expression nodes and literal integers. Opaque compiler
+   values such as symbols are leaves and are therefore also accepted. Sequential Clojure forms
+   are deliberately rejected: callers must construct arithmetic with this namespace."
+  [x]
+  (cond
+    (integer? x) true
+    (runtime-value? x) (some? (:value x))
+    (ceil-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
+    (floor-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
+    (product? x) (and (seq (:factors x)) (every? expression? (:factors x)))
+    (align-up? x) (and (expression? (:value x))
+                       (integer? (:alignment x)) (pos? (:alignment x)))
+    (minimum? x) (and (seq (:values x)) (every? expression? (:values x)))
+    (sequential? x) false
+    :else (some? x)))
+
+(defn expression-references
+  "Return the opaque compiler-value leaves read by an integer expression."
+  [expression]
+  (cond
+    (integer? expression) #{}
+    (runtime-value? expression) #{(:value expression)}
+    (ceil-div? expression) (into (expression-references (:value expression))
+                                 (expression-references (:divisor expression)))
+    (floor-div? expression) (into (expression-references (:value expression))
+                                  (expression-references (:divisor expression)))
+    (product? expression) (reduce into #{} (map expression-references (:factors expression)))
+    (align-up? expression) (expression-references (:value expression))
+    (minimum? expression) (reduce into #{} (map expression-references (:values expression)))
+    :else #{expression}))
 
 (defn- dimension-vector!
   [owner field dimensions pred expected]
@@ -62,7 +145,11 @@
   [x]
   (or (and (integer? x) (pos? x))
       (runtime-value? x)
-      (ceil-div? x)))
+      (ceil-div? x)
+      (product? x)
+      (align-up? x)
+      (floor-div? x)
+      (minimum? x)))
 
 (defn validate-spec!
   "Validate and return a symbolic launch specification."
@@ -153,18 +240,42 @@
    compiler value such as a bound symbol. Keeping this evaluator here prevents graph runners from
    interpreting arbitrary compiler S-expressions."
   [resolve-value dimension]
-  (long
-   (cond
-     (integer? dimension) dimension
-     (runtime-value? dimension)
-     (resolve-integer! resolve-value dimension (:value dimension))
-     (ceil-div? dimension)
-     (let [value (resolve-integer! resolve-value dimension (:value dimension))
-           divisor (:divisor dimension)]
-       ;; This form avoids overflowing `value + divisor - 1` for a large positive value.
-       (+ (quot value divisor) (if (zero? (rem value divisor)) 0 1)))
-     :else (throw (ex-info "unsupported launch dimension expression"
-                           {:dimension dimension :actual (type dimension)})))))
+  (letfn [(resolve* [expression]
+            (long
+             (cond
+               (integer? expression) expression
+               (runtime-value? expression)
+               (resolve-integer! resolve-value expression (:value expression))
+               (ceil-div? expression)
+               (let [value (resolve* (:value expression))
+                     divisor (resolve* (:divisor expression))]
+                 (when-not (pos? divisor)
+                   (throw (ex-info "ceil-div resolved divisor must be positive"
+                                   {:expression expression :divisor divisor})))
+                 ;; This form avoids overflowing `value + divisor - 1` for a large positive value.
+                 (+ (quot value divisor) (if (zero? (rem value divisor)) 0 1)))
+               (floor-div? expression)
+               (let [value (resolve* (:value expression))
+                     divisor (resolve* (:divisor expression))]
+                 (when-not (pos? divisor)
+                   (throw (ex-info "floor-div resolved divisor must be positive"
+                                   {:expression expression :divisor divisor})))
+                 (quot value divisor))
+               (product? expression)
+               (reduce (fn [acc factor]
+                         (Math/multiplyExact (long acc) (long factor)))
+                       1 (map resolve* (:factors expression)))
+               (align-up? expression)
+               (let [value (resolve* (:value expression))
+                     alignment (:alignment expression)
+                     quotient (quot value alignment)]
+                 (Math/multiplyExact
+                  (long (+ quotient (if (zero? (rem value alignment)) 0 1)))
+                  (long alignment)))
+               (minimum? expression)
+               (reduce min (map resolve* (:values expression)))
+               :else (resolve-integer! resolve-value expression expression))))]
+    (resolve* dimension)))
 
 (defn realize
   "Resolve a LaunchSpec into concrete geometry. `resolve-value` maps a compiler value to a number."

@@ -28,7 +28,6 @@
   (:require [clojure.string :as str]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.core.dtype :as dtype]
-            [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.inference :as inf]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.execution-plan :as execution]
@@ -363,7 +362,7 @@
               (try (destroy-graph! (:prologue-graph prog)) (catch Exception _)))
             (when destroy-prepared!
               (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
-            ;; f16 GEMM-conversion scratch is allocated outside :buffers — free it here.
+            ;; Executable-graph private storage is allocated outside :buffers — free it here.
             (when (seq (:scratch-buffers prog))
               (let [free! (rt-resolve device-id "free-buffer!")]
                 (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
@@ -1617,75 +1616,6 @@
 ;; (returns a {:kernel :gc-seg …} bound map over GPU-RESIDENT buffers) collected into
 ;; a vector for ze-runtime/record-graph! (barrier-separated), replayed by replay-graph!.
 
-;; ── split-k schedule knobs (see the `splitk` fn in bind-program!) ──────────────
-;; The XMX GEMM launches ceil(n/128) x ceil(m/128) workgroups of 256 items (= 16
-;; hw threads). This iGPU (64 EU x 8 threads) holds 32 such workgroups, so any GEMM
-;; below that count is OCCUPANCY-bound, not memory- or compute-bound. Splitting k
-;; buys workgroups at constant DRAM traffic; the knobs bound how far.
-
-(def ^:dynamic *gemm-splitk-fill-wgs*
-  "Workgroups that saturate the device. nil = DERIVE it from the target's HardwareDescriptor
-   (machine-lanes / 256 — Arc 140V: 8192/256 = 32); bind to a number to override. A GEMM at
-   or above this count is NOT split.
-
-   This used to be the literal 32, which is this laptop's iGPU and no other machine's." nil)
-
-(def ^:dynamic *gemm-splitk-target-wgs*
-  "Workgroup count a split GEMM aims for — a few waves over the fill count, so memory
-   latency has something to hide behind. nil = 4x the fill count." nil)
-
-(def ^:dynamic *gemm-splitk-min-chunk*
-  "Smallest k-chunk worth giving a workgroup: below this the per-chunk fixed cost (A
-   prefetch, storing a full partial C tile) outweighs the reduction." 1024)
-
-(def ^:dynamic *gemm-splitk-max-splits*
-  "Hard cap on k-chunks — the partials buffer is splits·m·n f32." 64)
-
-(defn gemm-fill-workgroups
-  "Workgroups that fill `device-id` at the XMX GEMM's 256-item workgroup — the bound that
-   decides whether a GEMM is occupancy-starved. From the target's HardwareDescriptor unless
-   *gemm-splitk-fill-wgs* overrides."
-  [device-id]
-  (long (or *gemm-splitk-fill-wgs* (hw/fill-workgroups (hw/descriptor-for device-id) 256))))
-
-(defn gemm-schedule
-  "THE GEMM schedule decision, as a pure function of the shape and the machine width —
-   never of the model. Returns [splits k-chunk]; splits = 1 means the plain XMX GEMM.
-
-   The XMX GEMM tiles C into 128x128 blocks, so its grid is ceil(n/128) x ceil(m/128)
-   workgroups. When that is fewer than `fill-wgs`, the device runs partly EMPTY and no
-   inner-loop tuning can help — the only way to buy workgroups is to split the k-reduction
-   across a third grid dimension and combine the partials afterwards (same operands, same
-   DRAM traffic, same result up to f32 summation order).
-
-   Callers: bind-program! (the binder) and gemm_splitk_test (the executable spec). ONE
-   copy — the policy is not re-implemented anywhere."
-  ([m n k fill-wgs] (gemm-schedule m n k fill-wgs (or *gemm-splitk-target-wgs* (* 4 (long fill-wgs)))))
-  ([m n k fill-wgs target-wgs]
-   (let [{:keys [block-m block-n block-k]}
-         ((requiring-resolve 'raster.compiler.core.hardware/gemm-tile-for)
-          (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
-                (:device-id @(requiring-resolve 'raster.gpu.ze-runtime/state)))
-               (catch Throwable _ nil)))
-         ;; the split-k policy's occupancy estimate and K-chunk quantum are the SAME tile the
-         ;; kernel is emitted with — they were independent `/128.0` and `*32` literals, so a tile
-         ;; change silently decoupled the policy from the kernel it schedules
-         base (* (Math/ceil (/ (double n) (double block-n)))
-                 (Math/ceil (/ (double m) (double block-m))))]
-     (if (>= base (double fill-wgs))
-       [1 k]                              ;; already fills the machine
-       (let [want (long (Math/ceil (/ (double target-wgs) base)))
-             ;; each chunk must be a multiple of the K-unroll (block-k) and at least
-             ;; *gemm-splitk-min-chunk* long, or the per-chunk fixed cost (A prefetch + the
-             ;; store of a full partial C tile) swamps the reduction it does.
-             cap (quot (long k) (long *gemm-splitk-min-chunk*))
-             s (min want cap (long *gemm-splitk-max-splits*))]
-         (if (< s 2)
-           [1 k]
-           (let [ku (long block-k)
-                 kc (* ku (quot (+ (quot (long k) s) (dec ku)) ku))]
-             [(quot (+ (long k) kc -1) kc) kc])))))))
-
 (defn bind-program!
   "Bind a resident GPU program (a descriptor from pipeline/compile-gpu-program) to this session:
    allocate resident buffers for the array params + intermediate scratch, bind each kernel
@@ -1731,10 +1661,10 @@
                      without it the recorded graph is exactly the fast path (no profiling queue,
                      events, or overhead); run-program! on a profiled program still works.
 
-   :gemm steps bind per the resolved S6 schedule's precision — [:schedule :precision] (set at
-   compile time by compile-gpu-program, default :f16-xmx). :gemm-precision on the descriptor is a
-   back-compat fallback for a hand-built descriptor with no :schedule. A bind-time caller overrides
-   the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …):
+   Compiler-emitted executable steps may map resolved schedule data to a dispatch strategy. GEMM
+   currently maps [:schedule :precision] while its pitch and direct-vs-split decisions remain in
+   the dispatch selector. A bind-time caller may override the plain descriptor with
+   (assoc-in descriptor [:schedule :precision] …):
      :f16-xmx    — convert A/B f32→f16 and run the XMX gemm (f32 accumulate/output): the
                    mixed-precision (AMP) policy — f16 inputs, f32 math. Valid for BACKWARD
                    programs too (measured on the real gemma-3-270m layer VJP: adapter grads
@@ -1761,10 +1691,6 @@
                                   " — bind each program under a distinct :key")
                              {:key pkey :bound (keys (:programs @sess))})))
          {:keys [dtype all-params array-params allocs steps]} descriptor
-         ;; precision reads from the resolved S6 schedule (source of truth); :gemm-precision is
-         ;; back-compat sugar for a descriptor built before the schedule field, or one hand-assoc'd.
-         gemm-precision (or (get-in descriptor [:schedule :precision])
-                            (:gemm-precision descriptor) :f16-xmx)
          reduction-strategy
          (get-in descriptor [:schedule :segmented-weighted-reduction :strategy] :auto)
          effective-roles (merge (:array-roles descriptor) roles)
@@ -1828,31 +1754,16 @@
                                                        (str "scratch " sym)))))
                            allocs)
          info-fn   (rt-resolve device-id "kernel-registry-entry")
+         register-fn (rt-resolve device-id "register-kernel!")
          specialized-bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
          bind-call-fn (rt-resolve device-id "bind-kernel-call")
-         gemm-fn   (rt-resolve device-id "bind-registered-gemm!")
-         conv-fn   (rt-resolve device-id "bind-registered-convert!")
-         trans-fn  (rt-resolve device-id "bind-registered-transpose!")
          mkbuf-fn  (rt-resolve device-id "make-buffer")
          record-fn (rt-resolve device-id "record-graph!")
-         ;; ── the SCHEDULE seam ────────────────────────────────────────────────
-         ;; Every launch geometry below is a function of (shape, MACHINE WIDTH) and
-         ;; nothing else — never of the model. The machine width comes from the target's
-         ;; HardwareDescriptor, so the same program schedules itself differently on a
-         ;; different GPU instead of inheriting this laptop's iGPU as a literal.
-         desc      (hw/descriptor-for device-id)
-         fill-wgs  (gemm-fill-workgroups device-id)
-         ;; elementwise/convert vector width: widest that still fills the machine.
-         vec-width (fn [n] (hw/stream-vector-width desc n))
-         ;; SPLIT-K: see `gemm-schedule` — a GEMM whose grid is below the machine's fill
-         ;; count is occupancy-bound, and splitting k buys workgroups at constant DRAM
-         ;; traffic. See ze-runtime/bind-registered-gemm-splitk!.
-         splitk (fn [m n k] (gemm-schedule m n k fill-wgs))
          alloc-size-of (fn [sym-kw]
                          (some (fn [{:keys [sym size-fn]}]
                                  (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
                                allocs))
-         gemm-scratch (atom [])]
+         executable-scratch (atom [])]
      (alloc! sess (merge param-specs alloc-specs))
      (let [buffers (:buffers @sess)
            key-of (fn [sym] (or (get param->key sym) (get alloc->key sym) (keyword (name sym))))
@@ -1860,103 +1771,61 @@
                     (or (get buffers (key-of sym))
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
                                         {:sym sym :key (key-of sym) :ctx ctx :have (keys buffers)}))))
-           ;; A GEMM operand that is a :constant param (frozen weights) never changes on device,
-           ;; so its f32→f16 conversion — and, for the transposed variants, the transpose of that
-           ;; f16 copy — is the SAME work every replay. Those kernels are recorded into a separate
-           ;; PROLOGUE graph replayed exactly once at bind (see const-prologue? below), not into
-           ;; the per-step graph. The f16 scratch buffers are allocated either way, so this costs
-           ;; no VRAM; it just stops re-converting the weights every step. Measured on the gemma
-           ;; layer VJP (5.6M frozen weight elements vs ~0.2M activation elements): f32_to_f16
-           ;; 7.2 → 0.6 ms, transpose_half 3.2 → 0.2 ms per replay.
-           const-operand? (fn [sym] (= :constant (get effective-roles sym)))
+           bind-graph-executable
+           (fn [executable runtime-arguments phase]
+             (let [executable (kexec/validate! executable)
+                   {:keys [buffers scalar-values]}
+                   (kexec/graph-bindings executable runtime-arguments)
+                   temporary-buffers
+                   (into {}
+                         (map (fn [[id [temporary-dtype elements _]]]
+                                [id (mkbuf-fn elements temporary-dtype)]))
+                         (kgcall/temporary-specs executable scalar-values))
+                   _ (swap! executable-scratch into (vals temporary-buffers))
+                   graph-call (kgcall/make executable
+                                           (merge buffers temporary-buffers)
+                                           scalar-values)
+                   constant-buffers
+                   (into #{}
+                         (keep (fn [{:keys [id]}]
+                                 (when (= :constant (get effective-roles id)) id)))
+                         (:inputs executable))]
+               ;; Constant scheduling is graph-generic: any explicitly cacheable transform whose
+               ;; read set is already constant is hoisted, and its written temporaries become
+               ;; constant for subsequent transforms.
+               (:bounds
+                (reduce
+                 (fn [{:keys [constant-buffers bounds]} [scheduled-node called-node]]
+                   (let [called-artifact (get-in called-node [:call :artifact])
+                         reads (->> (:uses scheduled-node)
+                                    (filter #(contains? #{:read :read-write} (:access %)))
+                                    (map :buffer)
+                                    set)
+                         writes (->> (:uses scheduled-node)
+                                     (filter #(contains? #{:write :read-write} (:access %)))
+                                     (map :buffer)
+                                     set)
+                         constant? (and (true? (get-in called-artifact
+                                                       [:attributes :cacheable-transform?]))
+                                        (every? constant-buffers reads))
+                         _ (register-fn (:kernel-name called-artifact) called-artifact)
+                         prepared (assoc (bind-call-fn (:call called-node))
+                                         :phase (or (:id scheduled-node) phase)
+                                         :const-prologue? constant?)]
+                     {:constant-buffers (if constant?
+                                          (into constant-buffers writes)
+                                          constant-buffers)
+                      :bounds (conj bounds prepared)}))
+                 {:constant-buffers constant-buffers :bounds []}
+                 (map vector (:nodes executable) (:nodes graph-call))))))
            step->bounds
            (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator
                         artifact argument-specs] :as step}]
              (case convention
-               ;; GEMM (Option B): [convert A f32→f16][convert B f32→f16][fp16 XMX gemm → f32 C].
-               ;; A/B are converted into per-GEMM f16 scratch (kept alive on the session); the
-               ;; conversions of :constant operands are hoisted to the bind-time prologue graph.
-               :gemm
-               (let [m (long ((:m-fn step) args)) n (long ((:n-fn step) args)) k (long ((:k-fn step) args))
-                     abuf (buf-of (:A step) :gemm-A) bbuf (buf-of (:B step) :gemm-B)
-                     cbuf (buf-of (:C step) :gemm-C)
-                     a-const? (const-operand? (:A step))
-                     b-const? (const-operand? (:B step))]
-                 (if (or (= :f32-scalar gemm-precision) (< n 8) (< k 8))
-                   ;; Scalar f32 path, taken when (a) the :gemm-precision policy is
-                   ;; :f32-scalar (exact-grad training — see the docstring), or (b) the
-                   ;; XMX hardware pitch gate fires regardless of policy: the XMX
-                   ;; kernel's 2D-block reads need a >=16-byte pitch — the B-operand
-                   ;; VNNI read's pitch is N*2 bytes (fp16) and the A-operand row read's
-                   ;; pitch is K*2 bytes, so N<8 OR K<8 violates it and yields garbage
-                   ;; (relerr ~1; K<8 shows as scrambled + zeroed C rows).
-                   ;; Binds the plain scalar f32 GEMM: it reads the f32 residents
-                   ;; directly, so NO convert/transpose expansion kernels at all.
-                   ;; Resolved lazily — Level-Zero-only for now (like the scatter binder).
-                   (let [scalar-gemm-fn (rt-resolve device-id "bind-registered-gemm-scalar!")]
-                     [{:bound (scalar-gemm-fn abuf bbuf cbuf m n k (:variant step))
-                       :kernel-name (str "gemm_scalar_" (name (:variant step)))
-                       :phase (:phase step)}])
-                   (let [a16 (mkbuf-fn (* m k) :half)
-                     ;; The GEMM proper: one bound kernel, or — when the (m,n) tiling can't
-                     ;; fill the machine — a split-k PAIR (partial GEMM over a 3D grid +
-                     ;; a partials combine), which is a pure SCHEDULE change: same operands,
-                     ;; same DRAM traffic, same result up to f32 summation order.
-                         mk-gemm
-                         (fn [abuf* bbuf*]
-                           (let [[splits kc] (splitk m n k)]
-                             (if (= 1 (long splits))
-                               [["gemm_nonsquare_float" (gemm-fn abuf* bbuf* cbuf m n k :float) false]]
-                               (let [sk-fn (rt-resolve device-id "bind-registered-gemm-splitk!")
-                                     red-fn (rt-resolve device-id "bind-registered-splitk-reduce!")
-                                     parts (mkbuf-fn (* (long splits) m n) :float)]
-                                 (swap! gemm-scratch conj parts)
-                                 [["gemm_nonsquare_splitk"
-                                   (sk-fn abuf* bbuf* parts m n k kc splits) false]
-                                  ["gemm_splitk_reduce"
-                                   (red-fn parts cbuf (* m n) splits) false]]))))
-                     ;; each expansion kernel (convert/transpose/gemm) pre-bakes its FULL gc-seg —
-                     ;; wrap as {:bound bnd} with NO :group-count so record-graph! keeps the grid.
-                     ;; Each entry is [kernel-name bnd const?]: kernel-name so profiling can
-                     ;; attribute device time, const? = "depends only on :constant operands" ⇒
-                     ;; recorded into the bind-time prologue graph instead of the replay graph.
-                         raw
-                         (case (:variant step)
-                       ;; C = A[m,k] · B[k,n]
-                           :nn
-                           (let [b16 (mkbuf-fn (* k n) :half)]
-                             (swap! gemm-scratch conj a16 b16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
-                                   (mk-gemm a16 b16)))
-                       ;; C = A[m,k] · B[n,k]ᵀ — convert B then transpose [n,k]→[k,n], then :nn gemm.
-                       ;; (HF linear weights [out,in] and attention Q·Kᵀ are :nt.)
-                           :nt
-                           (let [b16 (mkbuf-fn (* n k) :half) bt16 (mkbuf-fn (* k n) :half)]
-                             (swap! gemm-scratch conj a16 b16 bt16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* m k) (vec-width (* m k))) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* n k) (vec-width (* n k))) b-const?]
-                                    ["transpose_half" (trans-fn b16 bt16 n k :half) b-const?]]
-                                   (mk-gemm a16 bt16)))
-                       ;; C[m,n] = Aᵀ·B — A stored [k,m], B [k,n]. Convert A then transpose
-                       ;; [k,m]→[m,k], convert B ([k,n] already the :nn B layout), then :nn gemm.
-                       ;; (linear-dW = dgemm-tn! : the weight-gradient backward matmul.)
-                           :tn
-                           (let [at16 (mkbuf-fn (* m k) :half) b16 (mkbuf-fn (* k n) :half)]
-                             (swap! gemm-scratch conj a16 at16 b16)
-                             (into [["f32_to_f16" (conv-fn abuf a16 (* k m) (vec-width (* k m))) a-const?]
-                                    ["transpose_half" (trans-fn a16 at16 k m :half) a-const?]
-                                    ["f32_to_f16" (conv-fn bbuf b16 (* k n) (vec-width (* k n))) b-const?]]
-                                   (mk-gemm at16 b16)))
-                           (throw (ex-info (str "GEMM variant not yet wired on resident path: " (:variant step)
-                                                " (only :nn / :nt / :tn)") {:variant (:variant step)})))]
-                     (mapv (fn [[nm b c]] {:bound b :kernel-name nm :phase (:phase step)
-                                           :const-prologue? (boolean c)})
-                           raw))))
                ;; Artifact-backed kernels share the complete executable value: emitted artifact,
                ;; ordered ABI values and realized launch. Reduction's single-group resident
                ;; schedule is explicit here rather than hidden in a special binder.
-               (:map :reduce :map-void :contract)
+               (:map :reduce :map-void :contract :gemm)
                (let [logical-or-physical-args
                      (mapv (fn [{:keys [kind sym type value-fn]}]
                              (if (= :scalar kind)
@@ -1969,13 +1838,23 @@
                         artifact logical-or-physical-args
                         (rt-resolve device-id "expand-pointer-binding"))
                        logical-or-physical-args)
-                     selected-artifact (if-let [dispatch (:dispatch step)]
-                                         (kdispatch/select-alternative
-                                          dispatch ordered-args reduction-strategy)
-                                         artifact)
-                     call (kcall/make selected-artifact ordered-args
-                                      (if (= :reduce convention) {:group-count [1]} {}))]
-                 [(assoc (bind-call-fn call) :phase (:phase step))])
+                     selection-override
+                     (if-let [{:keys [path mapping default]} (:strategy-selection step)]
+                       (get mapping (get-in (:schedule descriptor) path) default)
+                       (when (= :reduce convention) reduction-strategy))
+                     selected (if-let [dispatch (:dispatch step)]
+                                (kdispatch/select-alternative
+                                 dispatch ordered-args selection-override)
+                                artifact)]
+                 (case (kexec/kind selected)
+                   :kernel-artifact
+                   (let [call (kcall/make selected ordered-args
+                                          (if (= :reduce convention)
+                                            {:group-count [1]} {}))]
+                     [(assoc (bind-call-fn call) :phase (:phase step))])
+
+                   :kernel-graph
+                   (bind-graph-executable selected ordered-args (:phase step))))
                ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
                ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
                ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
@@ -2021,10 +1900,9 @@
                                     "are wired on the resident path")
                                {:convention convention :kernel kernel-name}))))
            bounds (vec (mapcat step->bounds steps))
-           ;; CONSTANT PROLOGUE: the f16 conversions/transposes of :constant GEMM operands run
-           ;; ONCE, in their own recorded graph replayed here at bind — the per-step graph holds
-           ;; only the kernels whose inputs can actually change between replays. Order within the
-           ;; prologue is preserved (a :nt/:tn transpose still follows its own convert).
+           ;; CONSTANT PROLOGUE: cacheable transforms over constant graph inputs run once in their
+           ;; own recorded graph replayed here at bind. The per-step graph holds only kernels whose
+           ;; inputs can change between replays; transform order remains the KernelGraph order.
            prologue-bounds (filterv :const-prologue? bounds)
            replay-bounds   (filterv (complement :const-prologue?) bounds)
            prologue-graph (when (seq prologue-bounds) (record-fn prologue-bounds))
@@ -2043,9 +1921,10 @@
                :prologue-graph prologue-graph
                :bounds bounds
                :profile? (boolean profile?)
-               ;; per-GEMM f16 conversion scratch (NOT in :buffers — allocated directly via
-               ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
-               :scratch-buffers @gemm-scratch
+               ;; Executable-graph private storage is allocated directly rather than entering the
+               ;; public resident buffer namespace. Keep it with the program for deterministic
+               ;; release; its identities and sizes came from KernelGraph, not runtime convention.
+               :scratch-buffers @executable-scratch
                :param->key param->key
                :alloc->key alloc->key
                :buffer-capacities

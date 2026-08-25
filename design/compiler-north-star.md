@@ -79,8 +79,9 @@ The first architectural correction is therefore:
 Raster has schedule data and hardware-aware contraction routes, but there is no
 single stage that applies a schedule to an algorithm and produces the kernel IR
 consumed by every emitter. Several scheduling axes are costed or gated more
-broadly than they are emitted, and GEMM-like leaves still sit partly outside the
-general SegOp route.
+broadly than they are emitted. Resident BLAS GEMM calls now close over compiler-emitted
+scalar/direct/split executable graphs, but their semantic front door still sits outside the
+general SegOp contraction route and the XMX leaf remains a target-specific emitter template.
 
 The required separation is:
 
@@ -226,6 +227,15 @@ target, and logical effects; graph topology, entry points, launch geometry,
 derived scalars, and private temporaries are schedule-owned and may differ.
 This is what permits a direct contraction and a split-K partial-plus-combine
 graph to compete without making split-K storage part of the user-visible call.
+
+The first resident GEMM slice uses this boundary directly. Compilation emits scalar f32, direct
+mixed-precision XMX, and split-K graphs with one `(A B C M N K)` ABI. Checked integer-expression
+IR derives the pitch gate, occupancy decision, private conversion/transpose/partials storage,
+`KC`, and 1–3D launches from shape and schedule data. The resident binder supplies ABI values and
+binds ordinary graph calls; it does not assemble a GEMM algorithm. Constant-only layout/conversion
+nodes are hoisted by a graph-generic cacheable-transform rule. Remaining work is to originate the
+same graphs from the canonical contraction/Screma route, add vendor matrix-instruction leaves, and
+make measured shape tables override the analytic selector.
 
 ### 3.4 Scheduled kernel graph and kernel IR
 

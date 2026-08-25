@@ -325,8 +325,12 @@
 (defn- gemm-dims
   "[{:variant :m :n :k} …] for every :gemm step of a descriptor at `args`."
   [prog args]
-  (mapv (fn [s] {:variant (:variant s)
-                 :m (long ((:m-fn s) args)) :n (long ((:n-fn s) args)) :k (long ((:k-fn s) args))})
+  (mapv (fn [s]
+          (let [[m-spec n-spec k-spec] (take-last 3 (:argument-specs s))]
+            {:variant (:variant s)
+             :m (long ((:value-fn m-spec) args))
+             :n (long ((:value-fn n-spec) args))
+             :k (long ((:value-fn k-spec) args))}))
         (filter #(= :gemm (:convention %)) (:steps prog))))
 
 (defn- run-trajectory!
