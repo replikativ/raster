@@ -11,8 +11,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pl]
-            [raster.dl.nn :as nn]))
+            [raster.dl.nn :as nn]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]))
 
 ;; A minimal elementwise forward: y = (x + w) * x  (residual-add then hadamard — the proven-
 ;; resident dt-two-step shape). Composing it twice with weights w0,w1 gives the intermediate
@@ -51,6 +54,41 @@
                               actual expected))
         scale (reduce max 1.0 (map #(Math/abs (double %)) expected))]
     (/ absolute scale)))
+
+(deftest public-output-order-is-not-limited-by-array-map-size
+  (let [output-ids (mapv #(keyword (str "output-" %)) (range 12))
+        resident-values (zipmap output-ids (range 12))
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:outputs output-ids}
+                     :node-views resident-values
+                     :closed? (atom false)})]
+    (is (= output-ids (vec (keys (gpu-link/outputs executable)))))
+    (is (= (range 12) (vals (gpu-link/outputs executable))))))
+
+(deftest attached-close-attempts-the-entire-reverse-order-teardown
+  (let [calls (atom [])
+        executable (gpu-link/map->LinkedExecutable
+                    {:session ::caller-session
+                     :owns-session? false
+                     :graph-key :graph
+                     :phases [:phase-0 :phase-1]
+                     :allocation-keys [:allocation-0 :allocation-1]
+                     :closed? (atom false)})]
+    (with-redefs [gpu/release-recorded-graph!
+                  (fn [_ graph]
+                    (swap! calls conj [:graph graph])
+                    (throw (ex-info "destructor failed" {})))
+                  gpu/release-prepared!
+                  (fn [_ phase] (swap! calls conj [:phase phase]))
+                  gpu/free-buffer!
+                  (fn [_ allocation] (swap! calls conj [:allocation allocation]))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"destructor failed"
+                            (gpu-link/close! executable))))
+    (is (= [[:graph :graph]
+            [:phase :phase-1] [:phase :phase-0]
+            [:allocation :allocation-1] [:allocation :allocation-0]]
+           @calls))
+    (is (nil? (gpu-link/close! executable)) "close remains idempotent after a destructor failure")))
 
 (deftest spike-two-instance-link
   (if-not @gp/gpu-available?
@@ -116,54 +154,67 @@
 (deftest spike-two-instance-gemm-link
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "C.spike 2-instance executable GEMM link")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session   (ns-resolve gpu 'make-session)
-          bind-step!     (ns-resolve gpu 'bind-step!)
-          record-graph!  (ns-resolve gpu 'record-graph!)
-          replay!        (ns-resolve gpu 'replay!)
-          alloc!         (ns-resolve gpu 'alloc!)
-          download       (ns-resolve gpu 'download)
-          close-session! (ns-resolve gpu 'close-session!)
-          rows 16 width 64
+    (let [rows 16 width 64
           x0 (fa (* rows width) 11)
           W0 (fa (* width width) 12)
           W1 (fa (* width width) 13)
-          args [x0 W0 rows width width]
           prog (pl/compile-gpu-program #'nn/linear-nb :ze:0 :dtype :float
                                        :gemm-precision :f16-xmx :on-non-resident :nil)
           _ (is (some? prog) "spike-gemm must extract as one resident contraction")
-          steps (:steps prog)
-          result-sym (:result-sym prog)]
-      (is (= [:gemm] (mapv :convention steps)))
-      (let [sess (make-session :ze:0)]
-        (try
-          (alloc! sess {:x0 [:float (* rows width) x0]
-                        :W0 [:float (* width width) W0]
-                        :W1 [:float (* width width) W1]
-                        :x1 [:float (* rows width) nil]
-                        :x2 [:float (* rows width) nil]})
-          (let [plan {0 {'x :x0 'W :W0 result-sym :x1}
-                      1 {'x :x1 'W :W1 result-sym :x2}}
-                phases
-                (vec
-                 (for [instance [0 1]
-                       step steps]
-                   (let [phase (keyword (str "gemm-i" instance))]
-                     (bind-step! sess (assoc step :phase phase) args (get plan instance)
-                                 {:schedule (:schedule prog) :roles {'W :constant}})
-                     phase)))
-                prepared-count
-                (reduce + (map #(count (get-in @sess [:prepared % :prepareds])) phases))
-                private-count
-                (reduce + (map #(count (get-in @sess [:prepared % :temporary-buffers])) phases))]
-            (is (> prepared-count 2)
-                "each semantic GEMM selects and flattens a multi-kernel schedule")
-            (is (pos? private-count) "conversion/layout storage stays step-private")
-            (record-graph! sess phases :gemm-composite)
-            (replay! sess :gemm-composite)
-            (let [actual (download sess :x2)
-                  expected (cpu-linear (cpu-linear x0 W0 rows width) W1 rows width)]
-              (is (< (relative-max-error actual expected) 2.0e-2)
-                  (str "linked mixed-precision GEMMs must match the CPU composition; relative max "
-                       (relative-max-error actual expected)))))
-          (finally (close-session! sess)))))))
+          result-sym (:result-sym prog)
+          scalar-values {'batch rows 'in-f width 'out-f width}
+          plan
+          (link-plan/make
+           {:id :two-linear-layers
+            :target :ze:0
+            :nodes [(link-plan/node {:id :x0 :dtype :float :shape [rows width]
+                                     :device :ze:0 :role :input})
+                    (link-plan/node {:id :W0 :dtype :float :shape [width width]
+                                     :device :ze:0 :role :constant :source W0})
+                    (link-plan/node {:id :W1 :dtype :float :shape [width width]
+                                     :device :ze:0 :role :constant :source W1})
+                    (link-plan/node {:id :x1 :dtype :float :shape [rows width]
+                                     :device :ze:0 :role :internal})
+                    (link-plan/node {:id :x2 :dtype :float :shape [rows width]
+                                     :device :ze:0 :role :output})]
+            :instances
+            [(link-plan/instance
+              {:id :linear-0 :descriptor prog :scalars scalar-values
+               :bindings {'x :x0 'W :W0 result-sym :x1}})
+             (link-plan/instance
+              {:id :linear-1 :descriptor prog :scalars scalar-values
+               :bindings {'x :x1 'W :W1 result-sym :x2}})]
+            :outputs [:x2]})
+          session (gpu/make-session :ze:0)
+          executable (gpu-link/instantiate! plan {:session session})]
+      (is (= [:gemm] (mapv :convention (:steps prog))))
+      (try
+        (let [session (:session executable)
+              phases (:phases executable)
+              prepared-count
+              (reduce + (map #(count (get-in @session [:prepared % :prepareds])) phases))
+              private-count
+              (reduce + (map #(count (get-in @session [:prepared % :temporary-buffers])) phases))]
+          (is (> prepared-count 2)
+              "each semantic GEMM selects and flattens a multi-kernel schedule")
+          (is (pos? private-count) "conversion/layout storage stays step-private")
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"have not been initialized"
+                                (gpu-link/run! executable))
+              "owned dynamic inputs must be uploaded before the first replay")
+          (gpu-link/upload! executable :x0 x0)
+          (let [resident-outputs (gpu-link/run! executable)
+                actual (gpu-link/download executable :x2)
+                expected (cpu-linear (cpu-linear x0 W0 rows width) W1 rows width)]
+            (is (= [:x2] (vec (keys resident-outputs)))
+                "invocation returns stable resident output views without a host copy")
+            (is (< (relative-max-error actual expected) 2.0e-2)
+                (str "linked mixed-precision GEMMs must match the CPU composition; relative max "
+                     (relative-max-error actual expected)))))
+        (finally
+          (gpu-link/close! executable)
+          (is (false? (:closed? @session))
+              "closing an attached linked executable does not close its caller session")
+          (is (empty? (:prepared @session)) "attached phase bindings are released")
+          (is (empty? (:graphs @session)) "attached graph recordings are released")
+          (is (empty? (:buffers @session)) "attached allocation registrations are released")
+          (gpu/close-session! session))))))

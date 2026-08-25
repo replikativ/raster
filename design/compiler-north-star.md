@@ -95,21 +95,27 @@ No schedule key is complete until it is declared, checked, costed, emitted, and
 measured. A key that intentionally models feasibility before emission must be
 labelled as such in the schema and excluded from claims of executable coverage.
 
-### 2.3 Executable steps compose, but artifact values do not yet link
+### 2.3 Executable steps and resident artifact values compose
 
-Descriptor instances now share one executable-step binder: a step may select a
+Descriptor instances share one executable-step binder: a step may select a
 single `KernelArtifact` or a multi-kernel `KernelGraph`, own its private
 temporaries, and flatten with other instances into one resident replay graph.
 This closes the mechanism gap for GEMM-containing layer composition.
 
-The public value layer remains incomplete. `Compiled` keeps its session
-internal, shape information is flat, a foreign `DeviceArray` cannot be rebound,
-and an ordinary device input is currently downloaded and uploaded. There is no
-validated data-valued link plan that proves node shape/view/effects/ownership
-before allocating and instantiating descriptors. These limitations still
-prevent independently compiled transformer layers, prefill/decode artifacts,
-and forward/backward/update artifacts from forming one public zero-copy device
-graph.
+`LinkPlan` lifts that mechanism into a public immutable compiler value. Stable
+typed/shaped nodes replace name-decoding binders; ordered descriptor instances
+carry scalar and schedule environments; pure validation proves views, ranges,
+ownership, aliases and producer/consumer effects before runtime allocation.
+Instantiation allocates internal nodes once and returns an owned executable
+value over one replay graph. It can also attach to a caller session and import
+borrowed/external allocations without taking ownership, which is the boundary
+needed by paged cache managers.
+
+The remaining value-layer convergence is narrower: port the pretrained decoder
+from handwritten buffer-name inspection, then make ordinary `Compiled` values
+produce and consume the same plan/node interface. `Compiled` still keeps its
+session internal and its public shape information is flat, so independently
+created `Compiled` values cannot yet be rebound into one plan directly.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
