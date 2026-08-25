@@ -93,3 +93,7 @@ explicit while still allowing pretrained runtimes to allocate first and publish 
 For paged attention, page allocation, cache relocation, transactional publication, batching and
 request scheduling remain runtime responsibilities. Raster receives borrowed/external node views
 and composes routed attention or paged append descriptors exactly like any other semantic program.
+When such a runtime replaces an interval of a compiled descriptor,
+`raster.compiler.ir.program-stage` selects and validates that interval from declared state/output
+effects and projects its before/selected/after descriptors. Those projections remain ordinary
+`LinkInstance` inputs; the linker still contains no attention-specific path.

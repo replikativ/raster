@@ -111,6 +111,12 @@ value over one replay graph. It can also attach to a caller session and import
 borrowed/external allocations without taking ownership, which is the boundary
 needed by paged cache managers.
 
+`ProgramStage` supplies the corresponding replacement seam for external runtime
+effects. A frontend declares stable state/output anchors; Raster derives the
+unique minimal descriptor interval from checked executable ABIs, proves its
+live boundary, and projects ordinary before/selected/after descriptors. Paged
+attention is the first consumer, not a special compiler pass or linker mode.
+
 The remaining value-layer convergence is narrower: port the pretrained decoder
 from handwritten buffer-name inspection, then make ordinary `Compiled` values
 produce and consume the same plan/node interface. `Compiled` still keeps its
