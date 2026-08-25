@@ -12,10 +12,14 @@
    {:id :indexed-edge-list-reference :route indexed-leaf/route-dynamic}])
 
 (defn- tuning-contract
-  [plan]
+  [plan dispatch-id]
   (let [{:keys [operands output accumulator-dtype] :as plan} (swr/validate! plan)
         schedule-key (swr/schedule-key plan)]
-    {:schedule-path [:segmented-weighted-reduction :measured-selector]
+    {:schedule-path [:segmented-weighted-reduction :measured-selectors]
+     ;; Dispatch IDs identify emitted candidate sets, independently of the analytic or measured
+     ;; policy selecting among them. Keying the schedule by that stable identity lets one compiled
+     ;; program carry distinct selectors for several structured reductions without collisions.
+     :schedule-key dispatch-id
      :numerical-mode {:operands (mapv :dtype operands)
                       :accumulate accumulator-dtype
                       :output (:dtype output)}
@@ -75,13 +79,14 @@
                                [:segmented-weighted-reduction
                                 :score-reuse-subgroup-multiple]
                                16))
-        measured-selector (get-in schedule
-                                  [:segmented-weighted-reduction :measured-selector])
         components (get-in plan [:value :components])
-        dispatch-key [(swr/algebra-key plan) subgroup-size
-                      (or measured-selector multiple)]
+        ;; Selection policy is deliberately absent. Recompiling with a measured selector must
+        ;; produce the same dispatch identity as the analytic program that was benchmarked.
+        dispatch-key [(swr/schedule-key plan) subgroup-size]
         id (format "raster_segmented_weighted_reduction_dispatch_%08x"
-                   (bit-and 0xffffffff (long (hash dispatch-key))))]
+                   (bit-and 0xffffffff (long (hash dispatch-key))))
+        measured-selector
+        (get-in schedule [:segmented-weighted-reduction :measured-selectors id])]
     (when (and (contains? by-strategy reference)
                (contains? by-strategy score-reuse))
       (let [dispatch
@@ -99,7 +104,7 @@
                            :algebra-plan-id (:id plan)}
               :attributes {:algebra :segmented-weighted-reduction
                            :algebra-key (swr/algebra-key plan)
-                           :tuning (tuning-contract plan)
+                           :tuning (tuning-contract plan id)
                            :selection (if measured-selector
                                         :measured-runtime-shape
                                         :analytic-runtime-shape)}})]

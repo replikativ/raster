@@ -9,7 +9,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.gpu.core :as gpu]
-            [raster.gpu.dispatch-tuning :as tuning]))
+            [raster.gpu.dispatch-tuning :as tuning]
+            [raster.gpu.program-tuning :as program-tuning]))
 
 (def ^:private reserved-measurement-options
   #{:before-sample! :compile-ms :hashes :timing-source})
@@ -168,14 +169,21 @@
             (throw (ex-info "schedule override requires a DispatchTuning"
                             {:tuning dispatch-tuning})))
         path (get-in dispatch [:attributes :tuning :schedule-path])
+        schedule-key (get-in dispatch [:attributes :tuning :schedule-key])
+        target-path (cond-> path (some? schedule-key) (conj schedule-key))
         selector (:selector dispatch-tuning)]
     (when-not (and (vector? path) (seq path) (every? keyword? path))
       (throw (ex-info "emitted dispatch does not declare a tuning schedule path"
                       {:dispatch-id (:id dispatch) :schedule-path path})))
+    (when-not (or (nil? schedule-key)
+                  (and (string? schedule-key) (not-empty schedule-key))
+                  (keyword? schedule-key))
+      (throw (ex-info "emitted dispatch declares an invalid tuning schedule key"
+                      {:dispatch-id (:id dispatch) :schedule-key schedule-key})))
     ;; Recheck the full device/artifact/ABI/numerical/layout identity before admitting cached or
     ;; transported tuning data into recompilation.
     (tuning/apply-tuning dispatch dispatch-tuning descriptor numerical-mode layout)
-    (assoc-in {} path selector)))
+    (assoc-in {} target-path selector)))
 
 (defn- compiled-case-fn
   [session program step-selector case-fn]
@@ -230,3 +238,85 @@
                                                   numerical-mode layout)
      :step-index step-index
      :phase (:phase compiled-step)}))
+
+(defn tune-program-dispatches!
+  "Execute an explicit program tuning plan and return one collision-free schedule override.
+
+   `runtime-values-fn` receives a manifest group. `case-fn` receives that group and one runtime
+   value, and returns the compiled benchmark case accepted by tune-program-dispatch!. Equivalent
+   sites are measured once through their first descriptor step. `:max-measurements` is an optional
+   fail-before-execution upper bound on alternatives × distinct runtime samples across selected
+   groups; cached results may perform fewer physical measurements."
+  [session program descriptor plan runtime-values-fn case-fn
+   & {:keys [max-measurements improvement-threshold force? measurement]
+      :or {improvement-threshold 0.001 force? false}}]
+  (let [plan (program-tuning/validate-plan! plan)]
+    (when-not (ifn? runtime-values-fn)
+      (throw (ex-info "program tuning requires a runtime-values callback"
+                      {:reason :invalid-program-tuning-runtime-values-callback})))
+    (when-not (ifn? case-fn)
+      (throw (ex-info "program tuning requires a benchmark case callback"
+                      {:reason :invalid-program-tuning-case-callback})))
+    (when-not (or (nil? max-measurements)
+                  (and (integer? max-measurements)
+                       (not (neg? (long max-measurements)))))
+      (throw (ex-info "program tuning :max-measurements must be a non-negative integer"
+                      {:reason :invalid-program-tuning-measurement-budget
+                       :max-measurements max-measurements})))
+    (let [jobs
+          (mapv
+           (fn [group]
+             (let [step (:representative-step-index group)
+                   {:keys [dispatch]} (gpu/bound-program-dispatch session program step)
+                   actual-signature (program-tuning/dispatch-signature dispatch)
+                   supplied-runtime-values (runtime-values-fn group)
+                   _runtime-values
+                   (when-not (and (coll? supplied-runtime-values)
+                                  (seq supplied-runtime-values)
+                                  (every? #(and (number? %)
+                                                (Double/isFinite (double %)))
+                                          supplied-runtime-values))
+                     (throw (ex-info "program tuning group requires non-empty finite runtime values"
+                                     {:reason :invalid-program-tuning-runtime-values
+                                      :group-id (:id group)
+                                      :runtime-values supplied-runtime-values})))
+                   runtime-values (vec (sort (distinct supplied-runtime-values)))]
+               (when-not (= (:signature group) actual-signature)
+                 (throw (ex-info "program tuning plan does not match its bound program step"
+                                 {:reason :program-tuning-plan-program-mismatch
+                                  :group-id (:id group) :step-index step
+                                  :planned (:signature group) :actual actual-signature})))
+               {:group group
+                :runtime-values runtime-values
+                :planned-measurements
+                (* (count (get-in group [:signature :artifacts]))
+                   (count runtime-values))}))
+           (:selected-groups plan))
+          planned-measurements (reduce + 0 (map :planned-measurements jobs))]
+      (when (and (some? max-measurements)
+                 (> planned-measurements (long max-measurements)))
+        (throw (ex-info "program tuning plan exceeds its physical measurement budget"
+                        {:reason :program-tuning-measurement-budget-exceeded
+                         :planned-measurements planned-measurements
+                         :max-measurements max-measurements
+                         :groups (mapv (comp :id :group) jobs)})))
+      (let [results
+            (mapv
+             (fn [{:keys [group runtime-values planned-measurements]}]
+               (assoc
+                (tune-program-dispatch!
+                 session program descriptor runtime-values
+                 #(case-fn group %)
+                 :step (:representative-step-index group)
+                 :improvement-threshold improvement-threshold
+                 :force? force?
+                 :measurement measurement)
+                :group-id (:id group)
+                :site-count (:site-count group)
+                :planned-measurements planned-measurements))
+             jobs)]
+        {:plan plan
+         :planned-measurements planned-measurements
+         :results results
+         :schedule-override
+         (program-tuning/merge-schedule-overrides (mapv :schedule-override results))}))))

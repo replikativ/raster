@@ -53,7 +53,8 @@
     (testing "the default policy is f16-xmx (training AMP)"
       (is (= :f16-xmx (:precision derived))))
     (testing "dynamic segmented reductions default to runtime shape selection"
-      (is (= {:strategy :auto :score-reuse-subgroup-multiple 16}
+      (is (= {:strategy :auto :score-reuse-subgroup-multiple 16
+              :measured-selectors {}}
              (:segmented-weighted-reduction derived))))
     (testing "a pinned override is recorded in :meta :overrides"
       (is (contains? (get-in (sched/resolve derived {:precision :f32-scalar}) [:meta :overrides])
@@ -133,19 +134,20 @@
                             {:segmented-weighted-reduction
                              {:score-reuse-subgroup-multiple 0}})
                            arc-desc)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must map dispatch IDs"
                           (sched/feasible?
                            (sched/resolve
                             (sched/derive-default nil arc-desc)
-                            {:segmented-weighted-reduction {:measured-selector :invalid}})
+                            {:segmented-weighted-reduction {:measured-selectors :invalid}})
                            arc-desc)))
-    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires :strategy :auto"
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :strategy :auto"
                           (sched/feasible?
                            (sched/resolve
                             (sched/derive-default nil arc-desc)
                             {:segmented-weighted-reduction
                              {:strategy :reference
-                              :measured-selector {:kind :runtime-scalar-ranges}}})
+                              :measured-selectors
+                              {"dispatch-a" {:kind :runtime-scalar-ranges}}}})
                            arc-desc))))
   (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
