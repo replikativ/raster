@@ -202,7 +202,8 @@
             (is (= (:selector result)
                    (get-in result
                            [:schedule-override :segmented-weighted-reduction
-                            :measured-selector])))
+                            :measured-selectors
+                            (get-in descriptor [:steps 0 :dispatch :id])])))
             (is (= :gpu-step-0 (:phase result)))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width

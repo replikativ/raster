@@ -163,7 +163,8 @@
 
 (deftest compiled-program-bridge-projects-a-case-and-returns-recompilation-data
   (let [tuning-contract
-        {:schedule-path [:generic-reduction :measured-selector]
+        {:schedule-path [:generic-reduction :measured-selectors]
+         :schedule-key "resident-benchmark-test"
          :numerical-mode {:input :f32 :accumulate :f32 :output :f32}
          :layout {:input :contiguous :output :contiguous}}
         compiled-dispatch (assoc-in dispatch [:attributes :tuning] tuning-contract)
@@ -218,7 +219,8 @@
     (is (= (:numerical-mode tuning-contract)
            (get-in @observed [:options :numerical-mode])))
     (is (= (:layout tuning-contract) (get-in @observed [:options :layout])))
-    (is (= {:generic-reduction {:measured-selector measured-selector}}
+    (is (= {:generic-reduction
+            {:measured-selectors {"resident-benchmark-test" measured-selector}}}
            (:schedule-override result)))
     (is (= measured-selector (:selector result)))
     (is (= :reduce (:phase result)))))

@@ -160,6 +160,7 @@
   (let [analytic (pipeline/compile-gpu-program
                   #'resident-structured-reduction-probe :ze:0 :dtype :float)
         argument (get-in analytic [:steps 0 :dispatch :selector :argument])
+        dispatch-id (get-in analytic [:steps 0 :dispatch :id])
         selector {:kind :runtime-scalar-ranges
                   :argument argument
                   :below :indexed-segmented-reduction-reference
@@ -170,7 +171,7 @@
         (pipeline/compile-gpu-program
          #'resident-structured-reduction-probe :ze:0 :dtype :float
          :schedule {:segmented-weighted-reduction
-                    {:strategy :auto :measured-selector selector}})
+                    {:strategy :auto :measured-selectors {dispatch-id selector}}})
         step (first (:steps descriptor))
         arguments-for
         (fn [args]
@@ -182,6 +183,7 @@
         narrow [(float-array 15) (float-array 15) (float-array 15)
                 (long-array 4) (long-array 4) 3 4 5 2]
         wide (assoc narrow 7 8)]
+    (is (= dispatch-id (get-in step [:dispatch :id])))
     (is (= selector (get-in step [:dispatch :selector])))
     (is (= :measured-runtime-shape (get-in step [:dispatch :attributes :selection])))
     (is (= :indexed-segmented-reduction-reference
@@ -232,8 +234,9 @@
     (is (= {'n-nodes 3 'n-edges 4 'emb-dim 5 'n-heads 2 'dk 2}
            (select-keys (get-in projected [:reference-inputs :scalars])
                         '[n-nodes n-edges emb-dim n-heads dk])))
-    (is (= [:segmented-weighted-reduction :measured-selector]
+    (is (= [:segmented-weighted-reduction :measured-selectors]
            (:schedule-path contract)))
+    (is (= (get-in descriptor [:steps 0 :dispatch :id]) (:schedule-key contract)))
     (is (= :segmented-weighted-reduction (get-in contract [:reference :kind])))
     (is (= :float (get-in contract [:numerical-mode :accumulate])))
     (is (= :indexed-dense-values (get-in contract [:layout :storage :kind])))

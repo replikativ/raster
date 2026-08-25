@@ -62,7 +62,8 @@
     ;; schedules once and selects after those scalar values become concrete. The subgroup multiple
     ;; is the analytic crossover seed; measurement/autotuning may override it per machine.
     :segmented-weighted-reduction {:strategy :auto
-                                   :score-reuse-subgroup-multiple 16}
+                                   :score-reuse-subgroup-multiple 16
+                                   :measured-selectors {}}
     :meta  {:target (:device-id desc)
             :machine-params (machine-params desc)
             :derived-by :raster.gpu.schedule/derive-default
@@ -188,8 +189,8 @@
         reduction-strategy (get-in schedule [:segmented-weighted-reduction :strategy] :auto)
         score-reuse-multiple
         (get-in schedule [:segmented-weighted-reduction :score-reuse-subgroup-multiple] 16)
-        measured-selector
-        (get-in schedule [:segmented-weighted-reduction :measured-selector])]
+        measured-selectors
+        (get-in schedule [:segmented-weighted-reduction :measured-selectors] {})]
     (when-not (valid-precisions prec)
       (throw (ex-info (str "schedule: unknown :precision " (pr-str prec) " — expected " valid-precisions)
                       {:precision prec})))
@@ -206,13 +207,15 @@
     (when-not (and (integer? score-reuse-multiple) (pos? score-reuse-multiple))
       (throw (ex-info "schedule: score-reuse subgroup multiple must be a positive integer"
                       {:score-reuse-subgroup-multiple score-reuse-multiple})))
-    (when (and (some? measured-selector) (not (map? measured-selector)))
-      (throw (ex-info "schedule: measured segmented reduction selector must be a map"
-                      {:measured-selector measured-selector})))
-    (when (and (some? measured-selector) (not= :auto reduction-strategy))
-      (throw (ex-info "schedule: a measured selector requires :strategy :auto"
+    (when-not (and (map? measured-selectors)
+                   (every? #(and (string? %) (not-empty %)) (keys measured-selectors))
+                   (every? map? (vals measured-selectors)))
+      (throw (ex-info "schedule: measured segmented reduction selectors must map dispatch IDs to selector maps"
+                      {:measured-selectors measured-selectors})))
+    (when (and (seq measured-selectors) (not= :auto reduction-strategy))
+      (throw (ex-info "schedule: measured selectors require :strategy :auto"
                       {:strategy reduction-strategy
-                       :measured-selector measured-selector}))))
+                       :measured-selectors measured-selectors}))))
   (let [budget (grf-budget-bytes-per-lane schedule desc)
         acc    (acc-bytes-per-lane schedule)
         staged (register-staged-bytes-per-lane schedule)
