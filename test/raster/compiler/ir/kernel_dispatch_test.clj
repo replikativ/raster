@@ -241,10 +241,72 @@
               {#'raster.gpu.core/rt-resolve
                (fn [_ function-name]
                  (case function-name
+                   "register-kernel!" (fn [_ _])
                    "bind-kernel-call" identity
                    (throw (ex-info "unexpected runtime resolution"
                                    {:function function-name}))))}
               #(gpu/bind-step! session step {:width width} identity))
-            (get-in @session [:prepared :probe :artifact :attributes :strategy])))]
+            (get-in @session [:prepared :probe :prepareds 0
+                              :artifact :attributes :strategy])))]
     (is (= :reference (selected 128)))
     (is (= :subgroup-score-reuse (selected 256)))))
+
+(deftest resident-step-flattens-and-releases-a-selected-kernel-graph
+  (let [graph (staged-graph)
+        mixed (kdispatch/make
+               {:id "resident-mixed-executable"
+                :alternatives [reference graph]
+                :default-strategy :reference
+                :selector {:kind :runtime-scalar-threshold
+                           :argument 'width :threshold 256
+                           :at-least :two-stage :otherwise :reference}})
+        step {:kernel-name (:kernel-name reference)
+              :phase :probe
+              :convention :contract
+              :artifact reference
+              :dispatch mixed
+              :argument-specs [{:kind :input :sym 'x}
+                               {:kind :output :sym 'out}
+                               {:kind :scalar :type :long
+                                :value-fn (fn [args] (:width args))}]}
+        session (atom {:device-id :probe
+                       :buffers {'x :resident-x 'out :resident-out}
+                       :prepared {} :graphs {}})
+        recorded (atom [])
+        destroyed (atom [])
+        freed (atom [])
+        resolver
+        (fn [_ function-name]
+          (case function-name
+            "register-kernel!" (fn [_ _])
+            "make-buffer" (fn [elements dtype] {:elements elements :dtype dtype})
+            "bind-kernel-call" (fn [call] {:kernel-call call})
+            "record-graph!" (fn [prepareds]
+                              (let [recording {:prepareds (vec prepareds)}]
+                                (swap! recorded conj recording)
+                                recording))
+            "free-buffer!" #(swap! freed conj %)
+            (throw (ex-info "unexpected runtime resolution" {:function function-name}))))
+        soft-resolver
+        (fn [_ function-name]
+          (case function-name
+            "destroy-prepared!" #(swap! destroyed conj [:prepared %])
+            "destroy-graph!" #(swap! destroyed conj [:graph %])
+            nil))]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve resolver
+       #'raster.gpu.core/rt-resolve-soft soft-resolver}
+      (fn []
+        (gpu/bind-step! session step {:width 256} identity)
+        (is (= 2 (count (get-in @session [:prepared :probe :prepareds]))))
+        (is (= 1 (count (get-in @session [:prepared :probe :temporary-buffers]))))
+        (gpu/record-graph! session [:probe] :linked)
+        (is (= 2 (count (get-in @recorded [0 :prepareds])))
+            "recording flattens the semantic step into its ordered kernel launches")
+        (gpu/bind-step! session step {:width 128} identity)
+        (is (= 2 (count (filter #(= :prepared (first %)) @destroyed)))
+            "replacing the phase releases every old graph-node binding")
+        (is (= 1 (count @freed)) "replacing the phase releases graph-private storage")
+        (gpu/record-graph! session [:probe] :linked)
+        (is (= 1 (count (filter #(= :graph (first %)) @destroyed)))
+            "re-recording releases the superseded command graph")))))

@@ -66,14 +66,6 @@
                  :ocl 'raster.gpu.ocl-runtime)]
     (requiring-resolve (symbol (str ns-sym) fn-name))))
 
-(defn- destroy-superseded!
-  "Destroy a prepared binding / graph being overwritten under the same key, so re-prepare! /
-  re-record! don't leak the previous dedicated kernel handle (or queue+list). Nil-safe."
-  [device-id destroyer-name old]
-  (when old
-    (when-let [d (rt-resolve-soft device-id destroyer-name)]
-      (try (d old) (catch Exception _)))))
-
 (defn- rt-resolve
   "Resolve a function from the appropriate runtime namespace."
   [device-id fn-name]
@@ -232,6 +224,45 @@
           (free-buffers-internal! @allocated device-id))
         (throw e)))))
 
+(defrecord BoundExecutableStep [prepareds temporary-buffers])
+
+(defn- bound-executable-step?
+  [value]
+  (instance? BoundExecutableStep value))
+
+(defn- prepared-bindings
+  "Return the ordered backend bindings represented by one prepared session entry. Plain bindings
+   from the low-level prepare! API remain valid; compiler steps use BoundExecutableStep because one
+   semantic step may select a multi-kernel schedule."
+  [entry]
+  (if (bound-executable-step? entry) (:prepareds entry) [entry]))
+
+(defn- destroy-prepared-entry!
+  "Destroy one plain prepared binding or one compiler-owned executable step. Kernel handles die
+   before their private storage because their argument state still refers to those buffers."
+  [device-id entry]
+  (when entry
+    (when-let [destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
+      (doseq [prepared (prepared-bindings entry)]
+        (try (destroy-prepared! prepared) (catch Exception _))))
+    (when (and (bound-executable-step? entry) (seq (:temporary-buffers entry)))
+      (try (free-buffers-internal! (:temporary-buffers entry) device-id)
+           (catch Exception _)))))
+
+(defn- recorded-graph-entry?
+  [value]
+  (true? (::recorded-graph value)))
+
+(defn- destroy-recorded-graph-entry!
+  [device-id entry]
+  (when entry
+    (when-let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")]
+      (doseq [graph (if (recorded-graph-entry? entry)
+                      [(:replay-graph entry) (:prologue-graph entry)]
+                      [entry])
+              :when graph]
+        (try (destroy-graph! graph) (catch Exception _))))))
+
 (defn- destroy-kernel-graph-entry!
   "Destroy one bound graph's backend recording, dedicated kernel handles and graph-owned
    temporaries/view handles. External root buffers remain session-owned and are never freed here."
@@ -351,8 +382,10 @@
         (let [ns-sym (case (backend-type device-id) :ze 'raster.gpu.ze-runtime :ocl 'raster.gpu.ocl-runtime)
               destroy-prepared! (requiring-resolve (symbol (str ns-sym) "destroy-prepared!"))
               destroy-graph!    (requiring-resolve (symbol (str ns-sym) "destroy-graph!"))]
-          (when destroy-graph!    (doseq [[_ g] graphs]   (try (destroy-graph! g)    (catch Exception _))))
-          (when destroy-prepared! (doseq [[_ p] prepared] (try (destroy-prepared! p) (catch Exception _))))
+          (doseq [[_ graph-entry] graphs]
+            (destroy-recorded-graph-entry! device-id graph-entry))
+          (doseq [[_ prepared-entry] prepared]
+            (destroy-prepared-entry! device-id prepared-entry))
           ;; bound resident programs: each holds a recorded graph (queue+list) AND the per-step
           ;; bound kernel handles (create-kernel-fresh per bind, NOT in the registry) — both must
           ;; be destroyed here or every session leaks them (the SIGABRT class of driver leak).
@@ -360,12 +393,17 @@
             (when destroy-graph! (try (destroy-graph! (:graph prog)) (catch Exception _)))
             (when (and destroy-graph! (:prologue-graph prog))
               (try (destroy-graph! (:prologue-graph prog)) (catch Exception _)))
-            (when destroy-prepared!
-              (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
-            ;; Executable-graph private storage is allocated outside :buffers — free it here.
-            (when (seq (:scratch-buffers prog))
-              (let [free! (rt-resolve device-id "free-buffer!")]
-                (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))
+            (if (seq (:bound-steps prog))
+              (doseq [bound-step (:bound-steps prog)]
+                (destroy-prepared-entry! device-id bound-step))
+              ;; Backward-compatible cleanup for resident program entries bound before executable
+              ;; steps became the common unit.
+              (do
+                (when destroy-prepared!
+                  (doseq [b (:bounds prog)] (try (destroy-prepared! b) (catch Exception _))))
+                (when (seq (:scratch-buffers prog))
+                  (let [free! (rt-resolve device-id "free-buffer!")]
+                    (doseq [b (:scratch-buffers prog)] (try (free! b) (catch Exception _)))))))))
         (doseq [[_ graph-entry] kernel-graphs]
           (destroy-kernel-graph-entry! device-id graph-entry))
         (free-session-buffers! buffers allocations device-id)
@@ -603,7 +641,7 @@
          device-id (:device-id @sess)
          bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
          prepared (bind-fn (:kernel-name kernel-info) buf-vec scalars n {:async? (boolean async?)})]
-     (destroy-superseded! device-id "destroy-prepared!" (get-in @sess [:prepared phase-key]))
+     (destroy-prepared-entry! device-id (get-in @sess [:prepared phase-key]))
      (swap! sess assoc-in [:prepared phase-key] prepared)
      prepared)))
 
@@ -616,9 +654,15 @@
   (let [prepared (or (get-in @sess [:prepared phase-key])
                      (throw (ex-info (str "Phase not prepared: " phase-key " — call prepare! first")
                                      {:prepared (keys (:prepared @sess))})))
+        bindings (prepared-bindings prepared)
+        _ (when-not (= 1 (count bindings))
+            (throw (ex-info (str "Phase " phase-key " is a " (count bindings)
+                                 "-kernel executable step — record it with record-graph! instead of "
+                                 "invoking one backend binding")
+                            {:phase phase-key :kernel-count (count bindings)})))
         device-id (:device-id @sess)
         launch-fn (rt-resolve device-id "launch-registered-bound!")]
-    (launch-fn prepared)))
+    (launch-fn (first bindings))))
 
 (defn sync!
   "Block until all async-dispatched kernels on this device have completed. Call once after a
@@ -639,14 +683,29 @@
   ([sess phase-keys graph-key]
    (let [device-id (:device-id @sess)
          record-fn (rt-resolve device-id "record-graph!")
-         prepareds (mapv (fn [pk]
-                           (or (get-in @sess [:prepared pk])
-                               (throw (ex-info (str "Phase not prepared: " pk " — call prepare! first")
-                                               {:prepared (keys (:prepared @sess))}))))
-                         phase-keys)
-         graph (record-fn prepareds)]
-     (destroy-superseded! device-id "destroy-graph!" (get-in @sess [:graphs graph-key]))
-     (swap! sess assoc-in [:graphs graph-key] graph)
+         entries (mapv (fn [pk]
+                         (or (get-in @sess [:prepared pk])
+                             (throw (ex-info (str "Phase not prepared: " pk " — call prepare! first")
+                                             {:prepared (keys (:prepared @sess))}))))
+                       phase-keys)
+         prepareds (vec (mapcat prepared-bindings entries))
+         prologue-prepareds (filterv :const-prologue? prepareds)
+         replay-prepareds (filterv (complement :const-prologue?) prepareds)
+         prologue-graph (when (seq prologue-prepareds) (record-fn prologue-prepareds))
+         graph (try
+                 (when prologue-graph
+                   ((rt-resolve device-id "replay-graph!") prologue-graph))
+                 (record-fn replay-prepareds)
+                 (catch Exception e
+                   (destroy-recorded-graph-entry! device-id prologue-graph)
+                   (throw e)))
+         entry (if prologue-graph
+                 {::recorded-graph true
+                  :replay-graph graph
+                  :prologue-graph prologue-graph}
+                 graph)]
+     (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
+     (swap! sess assoc-in [:graphs graph-key] entry)
      graph)))
 
 (defn replay!
@@ -654,8 +713,9 @@
   ([sess] (replay! sess :graph))
   ([sess graph-key]
    (let [device-id (:device-id @sess)
-         graph (or (get-in @sess [:graphs graph-key])
-                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))]
+         entry (or (get-in @sess [:graphs graph-key])
+                   (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
+         graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
      ((rt-resolve device-id "replay-graph!") graph))))
 
 (defn invoke-scan!
@@ -1406,55 +1466,196 @@
 ;; Resident GPU programs (Option A: pipeline → bound-dispatch path)
 ;; ================================================================
 
+(defn- allocate-executable-temporaries
+  [device-id temporary-specs]
+  (let [make-buffer (rt-resolve device-id "make-buffer")
+        allocated (volatile! {})]
+    (try
+      (doseq [[id [temporary-dtype elements _]] temporary-specs]
+        (vswap! allocated assoc id (make-buffer elements temporary-dtype)))
+      @allocated
+      (catch Exception e
+        (when (seq @allocated)
+          (free-buffers-internal! @allocated device-id))
+        (throw e)))))
+
+(defn- step-selection-override
+  [step schedule]
+  (if-let [{:keys [path mapping default]} (:strategy-selection step)]
+    (get mapping (get-in schedule path) default)
+    (when (= :reduce (:convention step))
+      (get-in schedule [:segmented-weighted-reduction :strategy] :auto))))
+
+(defn- bind-selected-executable
+  "Bind one selected KernelArtifact/KernelGraph without recording it. The returned value is the
+   common per-step ownership unit used by whole programs and descriptor composition."
+  [device-id executable runtime-arguments phase constant-buffer-ids group-count]
+  (let [executable (kexec/validate! executable)
+        register! (rt-resolve device-id "register-kernel!")
+        bind-call! (rt-resolve device-id "bind-kernel-call")]
+    (case (kexec/kind executable)
+      :kernel-artifact
+      (do
+        (register! (:kernel-name executable) executable)
+        (->BoundExecutableStep
+         [(assoc (bind-call! (kcall/make executable runtime-arguments
+                                         (cond-> {} group-count
+                                                 (assoc :group-count group-count))))
+                 :phase phase)] {}))
+
+      :kernel-graph
+      (let [{:keys [buffers scalar-values]}
+            (kexec/graph-bindings executable runtime-arguments)
+            temporary-buffers
+            (allocate-executable-temporaries
+             device-id (kgcall/temporary-specs executable scalar-values))
+            prepareds (volatile! [])]
+        (try
+          (let [graph-call (kgcall/make executable (merge buffers temporary-buffers) scalar-values)]
+            ;; Cacheable transforms form a graph-generic constant prologue: once every read is a
+            ;; captured constant, its private writes are constant for dependent transforms too.
+            (loop [scheduled-nodes (:nodes executable)
+                   called-nodes (:nodes graph-call)
+                   constants (set constant-buffer-ids)]
+              (when-let [scheduled-node (first scheduled-nodes)]
+                (let [called-node (first called-nodes)
+                      artifact (get-in called-node [:call :artifact])
+                      reads (->> (:uses scheduled-node)
+                                 (filter #(contains? #{:read :read-write} (:access %)))
+                                 (map :buffer) set)
+                      writes (->> (:uses scheduled-node)
+                                  (filter #(contains? #{:write :read-write} (:access %)))
+                                  (map :buffer) set)
+                      constant? (and (true? (get-in artifact
+                                                    [:attributes :cacheable-transform?]))
+                                     (every? constants reads))]
+                  (register! (:kernel-name artifact) artifact)
+                  (vswap! prepareds conj
+                          (assoc (bind-call! (:call called-node))
+                                 :phase (or (:id scheduled-node) phase)
+                                 :const-prologue? constant?))
+                  (recur (next scheduled-nodes) (next called-nodes)
+                         (if constant? (into constants writes) constants)))))
+            (->BoundExecutableStep @prepareds temporary-buffers))
+          (catch Exception e
+            (destroy-prepared-entry!
+             device-id (->BoundExecutableStep @prepareds temporary-buffers))
+            (throw e)))))))
+
+(defn- bind-resident-step
+  "The single descriptor-step binder. `resolve-buffer` maps a compiler array symbol to a resident
+   DeviceBuffer. Both whole-program binding and composition call this function; convention-specific
+   runtime expansion is confined here."
+  [device-id step args resolve-buffer schedule roles]
+  (let [{:keys [kernel-name phase convention artifact argument-specs arrays n-fn scalar-specs]}
+        step]
+    (case convention
+      (:map :reduce :map-void :contract :gemm)
+      (let [logical-or-physical-args
+            (mapv (fn [{:keys [kind sym type value-fn]}]
+                    (if (= :scalar kind)
+                      {:type type :value (value-fn args)}
+                      (resolve-buffer sym)))
+                  argument-specs)
+            interface (or artifact
+                          (some-> (:dispatch step) kdispatch/default-alternative))
+            ordered-args
+            (if (:logical-bindings? step)
+              (kcall/expand-logical-arguments
+               interface logical-or-physical-args
+               (rt-resolve device-id "expand-pointer-binding"))
+              logical-or-physical-args)
+            selected (if-let [dispatch (:dispatch step)]
+                       (kdispatch/select-alternative
+                        dispatch ordered-args (step-selection-override step schedule))
+                       artifact)
+            constant-buffer-ids
+            (when (= :kernel-graph (kexec/kind selected))
+              (into #{}
+                    (keep (fn [{:keys [id]}]
+                            (when (= :constant (get roles id)) id)))
+                    (:inputs selected)))
+            ;; A resident SegRed is deliberately a single-workgroup schedule. KernelGraphs own
+            ;; their complete launch geometry and therefore cannot accept this artifact override.
+            group-count (when (and (= :reduce convention)
+                                   (= :kernel-artifact (kexec/kind selected)))
+                          [1])]
+        (bind-selected-executable
+         device-id selected ordered-args phase constant-buffer-ids group-count))
+
+      :scatter
+      (do
+        (when (not= :ze (backend-type device-id))
+          (throw (ex-info "resident scatter steps are Level-Zero-only (no OpenCL implementation yet)"
+                          {:backend (backend-type device-id)
+                           :device-id device-id :step kernel-name})))
+        (when (> (count scalar-specs) 1)
+          (throw (ex-info (str "resident scatter step " kernel-name " has "
+                               (count scalar-specs)
+                               " scalars — only a single stride is modeled")
+                          {:kernel kernel-name :scalar-specs scalar-specs})))
+        (let [[out-sym src-sym idx-sym] arrays
+              out-buf (resolve-buffer out-sym)
+              src-buf (resolve-buffer src-sym)
+              idx-buf (resolve-buffer idx-sym)
+              n (long (n-fn args))
+              stride (when (seq scalar-specs)
+                       (long ((:value-fn (first scalar-specs)) args)))
+              ensure-zero! (rt-resolve device-id "ensure-zero-fill-kernel!")
+              specialized-bind! (rt-resolve device-id "bind-registered-map-void-kernel")
+              scatter-bind! (rt-resolve device-id "bind-registered-scatter-kernel!")
+              zero-kernel (ensure-zero! (:dtype out-buf))
+              prepareds (volatile! [])]
+          (try
+            (vswap! prepareds conj
+                    (assoc (specialized-bind! zero-kernel [out-buf] []
+                                              (long (:n-elements out-buf)))
+                           :phase phase))
+            (vswap! prepareds conj
+                    (assoc (scatter-bind! kernel-name [out-buf src-buf idx-buf] n stride)
+                           :phase phase))
+            (->BoundExecutableStep @prepareds {})
+            (catch Exception e
+              (destroy-prepared-entry! device-id (->BoundExecutableStep @prepareds {}))
+              (throw e)))))
+
+      (throw (ex-info (str "resident step binder cannot bind a " convention " step ("
+                           kernel-name ")")
+                      {:convention convention :kernel kernel-name})))))
+
 (defn bind-step!
   "Bind ONE compiled kernel step (a descriptor :steps entry) into the session under its :phase.
    Resolves the kernel's array args to resident buffers via `sym->key` (arg-name-symbol → session
-   buffer-key keyword) and its scalars via the step's value-fns over `args`. Handles all three
+   buffer-key keyword) and its scalars via the step's value-fns over `args`. Handles executable
    conventions uniformly — the per-step core shared by bind-program! (a single program, sym→key =
    name) and a multi-instance decode binder (one layer program bound once per layer, sym→key maps
    weights/KV per layer and scratch shared, like the decoder's pbk). Does NOT record a graph; the
    caller collects :phase keys and records once.
 
-     :map/:reduce/:map-void/:contract
-                Artifact ABI values and realized geometry bind through one KernelCall contract.
-                SegRed explicitly schedules one resident workgroup; maps realize their grid.
-                Logical SoA arguments expand through the backend representation adapter before
-                the physical KernelCall is constructed."
-  [sess step args sym->key]
-  (let [device-id (:device-id @sess)
-        {:keys [kernel-name phase convention artifact argument-specs]} step]
-    (when-not (#{:map-void :map :reduce :contract} convention)
-      (throw (ex-info (str "bind-step! cannot bind a " convention " step (" kernel-name
-                           ") — only artifact-backed kernel steps are supported on the resident path")
-                      {:convention convention :kernel kernel-name})))
-    (let [bufs (:buffers @sess)
-          resolve-buf (fn [a] (or (get bufs (sym->key a))
-                                  (throw (ex-info (str "No buffer for kernel arg: " a " → " (sym->key a))
-                                                  {:kernel kernel-name :available (keys bufs)}))))
-          bind-call-fn (rt-resolve device-id "bind-kernel-call")]
-      (case convention
-        (:map :reduce :map-void :contract)
-        (let [logical-or-physical-args
-              (mapv (fn [{:keys [kind sym type value-fn]}]
-                      (if (= :scalar kind)
-                        {:type type :value (value-fn args)}
-                        (resolve-buf sym)))
-                    argument-specs)
-              ordered-args
-              (if (:logical-bindings? step)
-                (kcall/expand-logical-arguments
-                 artifact logical-or-physical-args
-                 (rt-resolve device-id "expand-pointer-binding"))
-                logical-or-physical-args)
-              selected-artifact (if-let [dispatch (:dispatch step)]
-                                  (kdispatch/select-alternative dispatch ordered-args)
-                                  artifact)
-              call (kcall/make selected-artifact ordered-args
-                               (if (= :reduce convention) {:group-count [1]} {}))
-              prepared (bind-call-fn call)]
-          (swap! sess assoc-in [:prepared phase] prepared))
-        nil))
-    sess))
+     :map/:reduce/:map-void/:contract/:gemm
+                Select one ABI-compatible KernelArtifact or KernelGraph schedule. Graph-private
+                conversion/layout/split temporaries remain owned by the bound step.
+     :scatter   Expands to zero-fill + scatter behind the same ordered prepared-step boundary.
+
+   Optional opts carry descriptor context needed by composition: {:schedule <resolved schedule>
+   :roles {compiler-sym -> :constant|...}}. Captured constants make eligible graph transforms a
+   one-time prologue when record-graph! links the phases."
+  ([sess step args sym->key]
+   (bind-step! sess step args sym->key {}))
+  ([sess step args sym->key {:keys [schedule roles] :or {roles {}}}]
+   (let [device-id (:device-id @sess)
+         {:keys [kernel-name phase]} step
+         bufs (:buffers @sess)
+         resolve-buf (fn [sym]
+                       (let [key (sym->key sym)]
+                         (or (get bufs key)
+                             (throw (ex-info (str "No buffer for kernel arg: " sym " → " key)
+                                             {:kernel kernel-name :available (keys bufs)})))))
+         bound-step (bind-resident-step device-id step args resolve-buf schedule roles)
+         old (get-in @sess [:prepared phase])]
+     (swap! sess assoc-in [:prepared phase] bound-step)
+     (destroy-prepared-entry! device-id old)
+     sess)))
 
 ;; ----------------------------------------------------------------
 ;; Hand-authored op-chain (the manual resident decoder layer — gemma-first; converges to a single
@@ -1691,8 +1892,6 @@
                                   " — bind each program under a distinct :key")
                              {:key pkey :bound (keys (:programs @sess))})))
          {:keys [dtype all-params array-params allocs steps]} descriptor
-         reduction-strategy
-         (get-in descriptor [:schedule :segmented-weighted-reduction :strategy] :auto)
          effective-roles (merge (:array-roles descriptor) roles)
          argmap (zipmap all-params args)
          dt (if (= dtype :double) :double :float)
@@ -1753,190 +1952,65 @@
                                                        [alloc-dtype n nil]
                                                        (str "scratch " sym)))))
                            allocs)
-         info-fn   (rt-resolve device-id "kernel-registry-entry")
-         register-fn (rt-resolve device-id "register-kernel!")
-         specialized-bind-fn (rt-resolve device-id "bind-registered-map-void-kernel")
-         bind-call-fn (rt-resolve device-id "bind-kernel-call")
-         mkbuf-fn  (rt-resolve device-id "make-buffer")
-         record-fn (rt-resolve device-id "record-graph!")
-         alloc-size-of (fn [sym-kw]
-                         (some (fn [{:keys [sym size-fn]}]
-                                 (when (= (keyword (name sym)) sym-kw) (long (size-fn args))))
-                               allocs))
-         executable-scratch (atom [])]
+         record-fn (rt-resolve device-id "record-graph!")]
      (alloc! sess (merge param-specs alloc-specs))
      (let [buffers (:buffers @sess)
            key-of (fn [sym] (or (get param->key sym) (get alloc->key sym) (keyword (name sym))))
-           buf-of (fn [sym ctx]
+           buf-of (fn [sym]
                     (or (get buffers (key-of sym))
                         (throw (ex-info (str "bind-program!: no resident buffer for step array " sym)
-                                        {:sym sym :key (key-of sym) :ctx ctx :have (keys buffers)}))))
-           bind-graph-executable
-           (fn [executable runtime-arguments phase]
-             (let [executable (kexec/validate! executable)
-                   {:keys [buffers scalar-values]}
-                   (kexec/graph-bindings executable runtime-arguments)
-                   temporary-buffers
+                                        {:sym sym :key (key-of sym) :have (keys buffers)}))))
+           bound-steps (atom [])
+           prologue-graph (volatile! nil)
+           graph (volatile! nil)]
+       (try
+         (doseq [step steps]
+           (swap! bound-steps conj
+                  (bind-resident-step device-id step args buf-of
+                                      (:schedule descriptor) effective-roles)))
+         (let [bounds (vec (mapcat :prepareds @bound-steps))
+               scratch-buffers (vec (mapcat (comp vals :temporary-buffers) @bound-steps))
+               ;; CONSTANT PROLOGUE: cacheable transforms over captured graph inputs run once;
+               ;; replay contains only work whose inputs may change between calls.
+               prologue-bounds (filterv :const-prologue? bounds)
+               replay-bounds (filterv (complement :const-prologue?) bounds)]
+           (when (seq prologue-bounds)
+             (vreset! prologue-graph (record-fn prologue-bounds))
+             ((rt-resolve device-id "replay-graph!") @prologue-graph))
+           ;; The non-profiling call remains exactly the backend's one-arity fast path.
+           (vreset! graph
+                    (if profile?
+                      (record-fn replay-bounds {:barriers? true :profile? true})
+                      (record-fn replay-bounds)))
+           (swap! sess update :programs assoc pkey
+                  {:descriptor descriptor
+                   :roles effective-roles
+                   :graph @graph
+                   :prologue-graph @prologue-graph
+                   :bound-steps @bound-steps
+                   ;; Compatibility/inspection projections; ownership lives in :bound-steps.
+                   :bounds bounds
+                   :scratch-buffers scratch-buffers
+                   :profile? (boolean profile?)
+                   :param->key param->key
+                   :alloc->key alloc->key
+                   :buffer-capacities
                    (into {}
-                         (map (fn [[id [temporary-dtype elements _]]]
-                                [id (mkbuf-fn elements temporary-dtype)]))
-                         (kgcall/temporary-specs executable scalar-values))
-                   _ (swap! executable-scratch into (vals temporary-buffers))
-                   graph-call (kgcall/make executable
-                                           (merge buffers temporary-buffers)
-                                           scalar-values)
-                   constant-buffers
-                   (into #{}
-                         (keep (fn [{:keys [id]}]
-                                 (when (= :constant (get effective-roles id)) id)))
-                         (:inputs executable))]
-               ;; Constant scheduling is graph-generic: any explicitly cacheable transform whose
-               ;; read set is already constant is hoisted, and its written temporaries become
-               ;; constant for subsequent transforms.
-               (:bounds
-                (reduce
-                 (fn [{:keys [constant-buffers bounds]} [scheduled-node called-node]]
-                   (let [called-artifact (get-in called-node [:call :artifact])
-                         reads (->> (:uses scheduled-node)
-                                    (filter #(contains? #{:read :read-write} (:access %)))
-                                    (map :buffer)
-                                    set)
-                         writes (->> (:uses scheduled-node)
-                                     (filter #(contains? #{:write :read-write} (:access %)))
-                                     (map :buffer)
-                                     set)
-                         constant? (and (true? (get-in called-artifact
-                                                       [:attributes :cacheable-transform?]))
-                                        (every? constant-buffers reads))
-                         _ (register-fn (:kernel-name called-artifact) called-artifact)
-                         prepared (assoc (bind-call-fn (:call called-node))
-                                         :phase (or (:id scheduled-node) phase)
-                                         :const-prologue? constant?)]
-                     {:constant-buffers (if constant?
-                                          (into constant-buffers writes)
-                                          constant-buffers)
-                      :bounds (conj bounds prepared)}))
-                 {:constant-buffers constant-buffers :bounds []}
-                 (map vector (:nodes executable) (:nodes graph-call))))))
-           step->bounds
-           (fn [{:keys [kernel-name arrays n-fn scalar-specs convention accumulator
-                        artifact argument-specs] :as step}]
-             (case convention
-               ;; Artifact-backed kernels share the complete executable value: emitted artifact,
-               ;; ordered ABI values and realized launch. Reduction's single-group resident
-               ;; schedule is explicit here rather than hidden in a special binder.
-               (:map :reduce :map-void :contract :gemm)
-               (let [logical-or-physical-args
-                     (mapv (fn [{:keys [kind sym type value-fn]}]
-                             (if (= :scalar kind)
-                               {:type type :value (value-fn args)}
-                               (buf-of sym kernel-name)))
-                           argument-specs)
-                     ordered-args
-                     (if (:logical-bindings? step)
-                       (kcall/expand-logical-arguments
-                        artifact logical-or-physical-args
-                        (rt-resolve device-id "expand-pointer-binding"))
-                       logical-or-physical-args)
-                     selection-override
-                     (if-let [{:keys [path mapping default]} (:strategy-selection step)]
-                       (get mapping (get-in (:schedule descriptor) path) default)
-                       (when (= :reduce convention) reduction-strategy))
-                     selected (if-let [dispatch (:dispatch step)]
-                                (kdispatch/select-alternative
-                                 dispatch ordered-args selection-override)
-                                artifact)]
-                 (case (kexec/kind selected)
-                   :kernel-artifact
-                   (let [call (kcall/make selected ordered-args
-                                          (if (= :reduce convention)
-                                            {:group-count [1]} {}))]
-                     [(assoc (bind-call-fn call) :phase (:phase step))])
-
-                   :kernel-graph
-                   (bind-graph-executable selected ordered-args (:phase step))))
-               ;; scatter-add: out[index[e]*stride+d] += src[e*stride+d]. Expands to TWO bound
-               ;; kernels — a zero-fill of the accumulator, then the atomic-add scatter — so the
-               ;; recorded graph re-zeroes `out` each replay (zeros-like semantics) and fans
-               ;; overlapping destination indices in safely. arrays = [out src index]; the extra
-               ;; scalar (if present) is `stride`.
-               :scatter
-               (do (when (not= :ze (backend-type device-id))
-                     (throw (ex-info "resident scatter steps are Level-Zero-only (no OpenCL implementation yet)"
-                                     {:backend (backend-type device-id)
-                                      :device-id device-id
-                                      :step kernel-name})))
-                   (or (info-fn kernel-name)
-                       (throw (ex-info (str "Program kernel not registered: " kernel-name) {:kernel kernel-name})))
-                   (let [[out-sym src-sym idx-sym] arrays
-                         out-buf (buf-of out-sym :scatter-out)
-                         src-buf (buf-of src-sym :scatter-src)
-                         idx-buf (buf-of idx-sym :scatter-idx)
-                         n       (long (n-fn args))
-                         ;; A scatter step has AT MOST one scalar (the optional stride). Taking
-                         ;; `(first scalar-specs)` would silently drop any further scalars — so
-                         ;; assert the shape instead of miscompiling a multi-scalar scatter.
-                         _       (when (> (count scalar-specs) 1)
-                                   (throw (ex-info (str "resident scatter step " kernel-name
-                                                        " has " (count scalar-specs)
-                                                        " scalars — only a single stride is modeled")
-                                                   {:kernel kernel-name :scalar-specs scalar-specs})))
-                         stride  (when (seq scalar-specs) (long ((:value-fn (first scalar-specs)) args)))
-                         out-size (or (alloc-size-of accumulator)
-                                      ;; fallback: accumulator is a param, use its length
-                                      (nel (get argmap (symbol (name accumulator)))))
-                         ;; Resolved lazily (only a program with a scatter step needs them),
-                         ;; so a non-scatter program on a runtime lacking these fns (OpenCL) still
-                         ;; binds — resident scatter is Level-Zero-only for now.
-                         zerofill-fn (rt-resolve device-id "ensure-zero-fill-kernel!")
-                         scatter-fn (rt-resolve device-id "bind-registered-scatter-kernel!")
-                         zk (zerofill-fn (if (= dtype :double) :double :float))]
-                     [(assoc (specialized-bind-fn zk [out-buf] [] (long out-size))
-                             :phase (:phase step))
-                      (assoc (scatter-fn kernel-name [out-buf src-buf idx-buf] n stride)
-                             :phase (:phase step))]))
-               (throw (ex-info (str "bind-program! cannot bind a " convention " step — only "
-                                    ":map / :map-void / :contract / :reduce / :gemm / :scatter "
-                                    "are wired on the resident path")
-                               {:convention convention :kernel kernel-name}))))
-           bounds (vec (mapcat step->bounds steps))
-           ;; CONSTANT PROLOGUE: cacheable transforms over constant graph inputs run once in their
-           ;; own recorded graph replayed here at bind. The per-step graph holds only kernels whose
-           ;; inputs can change between replays; transform order remains the KernelGraph order.
-           prologue-bounds (filterv :const-prologue? bounds)
-           replay-bounds   (filterv (complement :const-prologue?) bounds)
-           prologue-graph (when (seq prologue-bounds) (record-fn prologue-bounds))
-           _ (when prologue-graph ((rt-resolve device-id "replay-graph!") prologue-graph))
-           ;; The non-profiling call is EXACTLY the 1-arity fast path (no opts map) so a
-           ;; recorded non-profiling graph is byte-for-byte what it was before profiling existed.
-           graph (if profile?
-                   (record-fn replay-bounds {:barriers? true :profile? true})
-                   (record-fn replay-bounds))]
-       (swap! sess update :programs assoc pkey
-              {:descriptor descriptor
-               :roles effective-roles
-               :graph graph
-               ;; kept for close-session! (its queue/list must be destroyed) and as the seam for a
-               ;; future refresh-constants! — replaying it re-derives the f16 copies of the weights.
-               :prologue-graph prologue-graph
-               :bounds bounds
-               :profile? (boolean profile?)
-               ;; Executable-graph private storage is allocated directly rather than entering the
-               ;; public resident buffer namespace. Keep it with the program for deterministic
-               ;; release; its identities and sizes came from KernelGraph, not runtime convention.
-               :scratch-buffers @executable-scratch
-               :param->key param->key
-               :alloc->key alloc->key
-               :buffer-capacities
-               (into {}
-                     (map (fn [buffer-key]
-                            [buffer-key (:n-elements (get buffers buffer-key))]))
-                     (concat (vals param->key) (vals alloc->key)))
-               ;; resolved buffer key of the functional :result-sym (may be a scratch alloc,
-               ;; hence resolved through THIS program's key-fn, not a raw name->keyword).
-               :result-key (when-let [rs (:result-sym descriptor)]
-                             (or (get param->key rs) (get alloc->key rs) (keyword (name rs))))}))
-     {::program-key pkey :descriptor descriptor})))
+                         (map (fn [buffer-key]
+                                [buffer-key (:n-elements (get buffers buffer-key))]))
+                         (concat (vals param->key) (vals alloc->key)))
+                   :result-key (when-let [rs (:result-sym descriptor)]
+                                 (or (get param->key rs) (get alloc->key rs)
+                                     (keyword (name rs))))})
+           {::program-key pkey :descriptor descriptor})
+         (catch Exception e
+           (when-let [destroy-graph! (rt-resolve-soft device-id "destroy-graph!")]
+             (when @graph (try (destroy-graph! @graph) (catch Exception _)))
+             (when @prologue-graph
+               (try (destroy-graph! @prologue-graph) (catch Exception _))))
+           (doseq [bound-step @bound-steps]
+             (destroy-prepared-entry! device-id bound-step))
+           (throw e)))))))
 
 (defn- resolve-program
   "Find the bound-program entry for run-program!'s second argument: a HANDLE from bind-program!
