@@ -181,6 +181,8 @@
   (delay (make-handle "clEnqueueWriteBuffer" (fd I32 PTR PTR I32 I64 I64 PTR I32 PTR PTR))))
 (def ^:private h-clEnqueueReadBuffer
   (delay (make-handle "clEnqueueReadBuffer" (fd I32 PTR PTR I32 I64 I64 PTR I32 PTR PTR))))
+(def ^:private h-clEnqueueCopyBuffer
+  (delay (make-handle "clEnqueueCopyBuffer" (fd I32 PTR PTR PTR I64 I64 I64 I32 PTR PTR))))
 (def ^:private h-clEnqueueFillBuffer
   (delay (make-handle "clEnqueueFillBuffer" (fd I32 PTR PTR PTR I64 I64 I64 I32 PTR PTR))))
 (def ^:private h-clReleaseMemObject
@@ -668,6 +670,24 @@
   [^OclBuffer buf dst spec]
   (execute-range! buf (plan-range buf dst spec :download) :download)
   dst)
+
+(defn copy-buffer-range!
+  "Synchronously enqueue a device-resident OpenCL buffer range copy."
+  [^OclBuffer src ^OclBuffer dst src-element dst-element elements]
+  (when-not (= (:dtype src) (:dtype dst))
+    (throw (ex-info "OpenCL resident copy requires matching dtypes"
+                    {:source-dtype (:dtype src) :destination-dtype (:dtype dst)})))
+  (let [element-bytes (long (get dtype-byte-sizes (:dtype src) 4))
+        src-byte (* (long src-element) element-bytes)
+        dst-byte (* (long dst-element) element-bytes)
+        byte-count (* (long elements) element-bytes)
+        queue (:queue @state)]
+    (cl-call! "clEnqueueCopyBuffer" @h-clEnqueueCopyBuffer
+              [queue (:cl-mem src) (:cl-mem dst)
+               src-byte dst-byte byte-count
+               (int 0) MemorySegment/NULL MemorySegment/NULL])
+    (cl-call! "clFinish" @h-clFinish [queue])
+    dst))
 
 (defn buffer->array
   "Copy an OclBuffer's contents to a new JVM array (device → host)."

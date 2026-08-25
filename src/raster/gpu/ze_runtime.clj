@@ -938,6 +938,21 @@
   (execute-range! buf (plan-range buf dst spec :download) :download)
   dst)
 
+(defn copy-buffer-range!
+  "Synchronously copy an element range between resident Level Zero buffers."
+  [^DeviceBuffer src ^DeviceBuffer dst src-element dst-element elements]
+  (when-not (= (:dtype src) (:dtype dst))
+    (throw (ex-info "Level Zero resident copy requires matching dtypes"
+                    {:source-dtype (:dtype src) :destination-dtype (:dtype dst)})))
+  (let [element-bytes (long (get dtype-byte-sizes (:dtype src) 4))
+        src-byte (* (long src-element) element-bytes)
+        dst-byte (* (long dst-element) element-bytes)
+        byte-count (* (long elements) element-bytes)]
+    (synchronize-async!)
+    (MemorySegment/copy (:segment src) src-byte
+                        (:segment dst) dst-byte byte-count)
+    dst))
+
 (defn buffer->array
   "Copy a DeviceBuffer's contents to a new JVM array.
   For :float16/:half, returns a short array of encoded FP16 values.
