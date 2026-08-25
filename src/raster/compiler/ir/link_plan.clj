@@ -510,11 +510,12 @@
                     {:reason :link-target-convention :target target :convention :scatter})))
   (let [step-facts (mapcat #(validate-instance-bindings! nodes %) instances)
         initialized (volatile! (into #{}
-                                     (keep (fn [[id {:keys [role source view]}]]
+                                     (keep (fn [[id {:keys [role source]}]]
+                                             ;; Ownership answers who releases storage, not whether
+                                             ;; the storage contains a value. In particular, an
+                                             ;; imported :internal node still needs an ordered writer.
                                              (when (or source
-                                                       (contains? #{:input :constant :state} role)
-                                                       (contains? #{:borrowed :external}
-                                                                  (get-in view [:allocation :ownership])))
+                                                       (contains? #{:input :constant :state} role))
                                                id)))
                                      nodes))
         written (volatile! #{})]

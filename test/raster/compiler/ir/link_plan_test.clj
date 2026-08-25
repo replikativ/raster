@@ -145,6 +145,18 @@
                                                (instance :producer :x :w0 :hidden)]
                                    :outputs [:out]}))
                                (catch clojure.lang.ExceptionInfo e e))))))))
+  (testing "external storage does not initialize an internal value"
+    (let [hidden (link/node {:id :hidden :dtype :float :shape [16] :device :ze:0
+                             :role :internal :ownership :external})]
+      (is (= :link-read-before-write
+             (:reason (ex-data (try
+                                 (link/make
+                                  {:id :external-order :target :ze:0
+                                   :nodes [(n :w :constant (float-array 16)) hidden
+                                           (n :out :output)]
+                                   :instances [(instance :consumer :hidden :w :out)]
+                                   :outputs [:out]})
+                                 (catch clojure.lang.ExceptionInfo e e))))))))
 
 (deftest physical-view-aliases-are-explicit-and-effect-checked
   (let [allocation (bview/allocation {:id :shared :byte-size 96 :memory-space :device

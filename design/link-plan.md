@@ -75,6 +75,11 @@ kernel storage, materialized view handles, and allocation registrations that it 
 or external plan allocations are supplied as `{allocation-id DeviceBuffer}` through
 `:external-buffers` and are never freed by Raster.
 
+Allocation ownership is deliberately independent of value readiness. Importing external storage
+does not initialize an `:internal` or `:output` node; it still needs an ordered producer. Declare a
+caller-supplied value as `:input`, `:constant`, or `:state` so validation records that semantic
+boundary explicitly.
+
 Owned `:input`/`:constant`/`:state` nodes without a plan initializer are tracked as pending. Replay
 fails until `gpu-link/upload!` initializes them. This makes input and first-use state readiness
 explicit while still allowing pretrained runtimes to allocate first and publish or upload later.
