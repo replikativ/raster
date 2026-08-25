@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.kernel-dispatch-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -310,3 +311,55 @@
         (gpu/record-graph! session [:probe] :linked)
         (is (= 1 (count (filter #(= :graph (first %)) @destroyed)))
             "re-recording releases the superseded command graph")))))
+
+(deftest resident-step-materializes-and-owns-checked-buffer-views
+  (let [root {:root true :dtype :float :n-elements 64 :byte-size 256}
+        allocation (bview/allocation {:id :root :byte-size 256 :memory-space :device
+                                      :device :ocl:0 :coherence :explicit-transfer
+                                      :ownership :owned})
+        session (atom {:device-id :ocl:0 :session-id :view-session
+                       :buffers {:storage root} :allocations {:storage allocation}
+                       :prepared {} :graphs {} :closed? false})
+        x-view (gpu/buffer-view session :storage {:shape [16]})
+        out-view (gpu/buffer-view session :storage {:byte-offset 64 :shape [16]})
+        slices (atom [])
+        freed (atom [])
+        destroyed (atom [])
+        resolver
+        (fn [_ name]
+          (case name
+            "slice-buffer" (fn [buffer byte-offset byte-length dt]
+                             (let [slice {:slice true :buffer buffer :byte-offset byte-offset
+                                          :byte-size byte-length :n-elements (quot byte-length 4)
+                                          :dtype dt}]
+                               (swap! slices conj slice)
+                               slice))
+            "register-kernel!" (fn [& _])
+            "bind-kernel-call" (fn [call] {:call call})
+            (throw (ex-info "unexpected runtime resolution" {:name name}))))
+        soft-resolver
+        (fn [_ name]
+          (case name
+            "destroy-prepared!" #(swap! destroyed conj %)
+            "free-buffer!" #(swap! freed conj %)
+            nil))
+        step {:kernel-name (:kernel-name reference)
+              :phase :view-step
+              :convention :map
+              :artifact reference
+              :argument-specs [{:kind :input :sym 'x}
+                               {:kind :output :sym 'out}
+                               {:kind :scalar :type :long
+                                :value-fn (fn [_] 16)}]}]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve resolver
+       #'raster.gpu.core/rt-resolve-soft soft-resolver}
+      (fn []
+        (gpu/bind-step! session step {} {'x x-view 'out out-view})
+        (is (= 1 (count @slices)) "the non-zero OpenCL range is one owned cl_mem sub-buffer")
+        (is (= 1 (count (get-in @session [:prepared :view-step :owned-view-buffers]))))
+        (gpu/release-prepared! session :view-step)
+        (is (= 1 (count @destroyed)))
+        (is (= @slices @freed) "view handles follow the bound step lifetime")
+        (is (not-any? #(identical? root %) @freed)
+            "the session-owned root allocation survives step release")))))

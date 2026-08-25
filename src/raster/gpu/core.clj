@@ -224,7 +224,7 @@
           (free-buffers-internal! @allocated device-id))
         (throw e)))))
 
-(defrecord BoundExecutableStep [prepareds temporary-buffers])
+(defrecord BoundExecutableStep [prepareds temporary-buffers owned-view-buffers])
 
 (defn- bound-executable-step?
   [value]
@@ -245,6 +245,12 @@
     (when-let [destroy-prepared! (rt-resolve-soft device-id "destroy-prepared!")]
       (doseq [prepared (prepared-bindings entry)]
         (try (destroy-prepared! prepared) (catch Exception _))))
+    ;; Level Zero slices are non-owning pointers. OpenCL sub-buffers are independently
+    ;; reference-counted cl_mem values and follow the executable step that materialized them.
+    (when (and (bound-executable-step? entry) (seq (:owned-view-buffers entry)))
+      (when-let [free! (rt-resolve-soft device-id "free-buffer!")]
+        (doseq [buffer (:owned-view-buffers entry)]
+          (try (free! buffer) (catch Exception _)))))
     (when (and (bound-executable-step? entry) (seq (:temporary-buffers entry)))
       (try (free-buffers-internal! (:temporary-buffers entry) device-id)
            (catch Exception _)))))
@@ -717,6 +723,26 @@
                    (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
          graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
      ((rt-resolve device-id "replay-graph!") graph))))
+
+(defn release-recorded-graph!
+  "Release one graph recorded by record-graph!. Idempotent. Prepared executable steps and their
+   resident buffers remain live until released separately."
+  [sess graph-key]
+  (locking sess
+    (when-let [entry (get-in @sess [:graphs graph-key])]
+      (swap! sess update :graphs dissoc graph-key)
+      (destroy-recorded-graph-entry! (:device-id @sess) entry)))
+  nil)
+
+(defn release-prepared!
+  "Release one phase prepared by prepare! or bind-step!. Idempotent. A recorded graph referring to
+   the phase must be released first; callers that own both should use that order."
+  [sess phase-key]
+  (locking sess
+    (when-let [entry (get-in @sess [:prepared phase-key])]
+      (swap! sess update :prepared dissoc phase-key)
+      (destroy-prepared-entry! (:device-id @sess) entry)))
+  nil)
 
 (defn invoke-scan!
   "Invoke a compiled Blelloch exclusive-scan kernel pair from the session.
@@ -1501,7 +1527,7 @@
          [(assoc (bind-call! (kcall/make executable runtime-arguments
                                          (cond-> {} group-count
                                                  (assoc :group-count group-count))))
-                 :phase phase)] {}))
+                 :phase phase)] {} []))
 
       :kernel-graph
       (let [{:keys [buffers scalar-values]}
@@ -1536,10 +1562,10 @@
                                  :const-prologue? constant?))
                   (recur (next scheduled-nodes) (next called-nodes)
                          (if constant? (into constants writes) constants)))))
-            (->BoundExecutableStep @prepareds temporary-buffers))
+            (->BoundExecutableStep @prepareds temporary-buffers []))
           (catch Exception e
             (destroy-prepared-entry!
-             device-id (->BoundExecutableStep @prepareds temporary-buffers))
+             device-id (->BoundExecutableStep @prepareds temporary-buffers []))
             (throw e)))))))
 
 (defn- bind-resident-step
@@ -1614,9 +1640,9 @@
             (vswap! prepareds conj
                     (assoc (scatter-bind! kernel-name [out-buf src-buf idx-buf] n stride)
                            :phase phase))
-            (->BoundExecutableStep @prepareds {})
+            (->BoundExecutableStep @prepareds {} [])
             (catch Exception e
-              (destroy-prepared-entry! device-id (->BoundExecutableStep @prepareds {}))
+              (destroy-prepared-entry! device-id (->BoundExecutableStep @prepareds {} []))
               (throw e)))))
 
       (throw (ex-info (str "resident step binder cannot bind a " convention " step ("
@@ -1645,13 +1671,40 @@
   ([sess step args sym->key {:keys [schedule roles] :or {roles {}}}]
    (let [device-id (:device-id @sess)
          {:keys [kernel-name phase]} step
-         bufs (:buffers @sess)
+         materialized (volatile! {})
+         owned-view-buffers (volatile! [])
          resolve-buf (fn [sym]
-                       (let [key (sym->key sym)]
-                         (or (get bufs key)
-                             (throw (ex-info (str "No buffer for kernel arg: " sym " → " key)
-                                             {:kernel kernel-name :available (keys bufs)})))))
-         bound-step (bind-resident-step device-id step args resolve-buf schedule roles)
+                       (let [key-or-view (sym->key sym)]
+                         (if (resident-buffer-view? key-or-view)
+                           (or (get @materialized key-or-view)
+                               (let [{:keys [buffer view]}
+                                     (resolve-resident-binding sess key-or-view)
+                                     _ (when-not (bview/contiguous? view)
+                                         (throw (ex-info
+                                                 "resident descriptor binding requires a contiguous view"
+                                                 {:kernel kernel-name :symbol sym :view (:id view)
+                                                  :shape (:shape view) :strides (:strides view)})))
+                                     {runtime-buffer :buffer owned-view? :owned-view?}
+                                     (runtime-buffer-for-view device-id buffer view)]
+                                 (when owned-view?
+                                   (vswap! owned-view-buffers conj runtime-buffer))
+                                 (vswap! materialized assoc key-or-view runtime-buffer)
+                                 runtime-buffer))
+                           (or (get-in @sess [:buffers key-or-view])
+                               (throw (ex-info (str "No buffer for kernel arg: " sym " → "
+                                                    key-or-view)
+                                               {:kernel kernel-name
+                                                :available (keys (:buffers @sess))}))))))
+         bound-step
+         (try
+           (assoc (bind-resident-step device-id step args resolve-buf schedule roles)
+                  :owned-view-buffers @owned-view-buffers)
+           (catch Exception e
+             (when (seq @owned-view-buffers)
+               (when-let [free! (rt-resolve-soft device-id "free-buffer!")]
+                 (doseq [buffer @owned-view-buffers]
+                   (try (free! buffer) (catch Exception _)))))
+             (throw e)))
          old (get-in @sess [:prepared phase])]
      (swap! sess assoc-in [:prepared phase] bound-step)
      (destroy-prepared-entry! device-id old)
