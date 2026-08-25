@@ -11,10 +11,9 @@
    bench is the integration seam (lands with the resident/Compiled path)."
   (:require [raster.gpu.schedule :as sched]
             [raster.compiler.core.hardware :as hw]
-            [clojure.java.io :as io])
-  (:import [java.io File]))
+            [raster.gpu.tuning-cache :as cache]))
 
-(def autotune-version 2)
+(def autotune-version 3)
 
 ;; ================================================================
 ;; Coordinate descent (Inductor) — greedy, one neighbourhood step at a time
@@ -49,18 +48,20 @@
 
 (defn schedule-neighbors
   "The moves coordinate-descent explores over an S6 Schedule. Two WIRED axes:
-     :precision — selects the XMX-f16 vs scalar GEMM binder.
-     :tile      — the GEMM tile (T2/T3), a CURATED per-descriptor candidate list
-                  (hw/gemm-tile-candidates) that drives emit-gemm-tiled +
-                  bind-registered-gemm-tiled! (real, priced kernels).
+     :tile — the GEMM tile (T2/T3), a CURATED per-descriptor candidate list
+             (hw/gemm-tile-candidates) that drives emit-gemm-tiled +
+             bind-registered-gemm-tiled! (real, priced kernels).
+
+   Precision is deliberately NOT a default search axis: it changes numerical mode and therefore
+   requires an explicit caller-provided neighborhood plus a distinct cache identity. Searching it
+   as an ordinary performance knob could silently exchange exact f32 math for mixed precision.
    :grf / :stage stay schema-only until the emitter consumes them (the S6 review found nothing
    reads them at emission) — searching an un-wired knob wastes measurements on an identical kernel.
 
-   NB split-k factor (~10× on deep-k occupancy-bound shapes, gemm_autotune_test) is a separate
-   GEMM-level occupancy axis measured directly there; promoting it to an S6 field is the next step."
+  NB split-k factor (~10× on deep-k occupancy-bound shapes, gemm_autotune_test) is a separate
+  GEMM-level occupancy axis measured directly there; promoting it to an S6 field is the next step."
   [desc]
-  {:precision (fn [_] [:f16-xmx :f32-scalar])
-   :tile      (fn [_] (hw/gemm-tile-candidates desc))})
+  {:tile (fn [_] (hw/gemm-tile-candidates desc))})
 
 ;; ================================================================
 ;; Disk cache — keyed by (op × shape-class × descriptor-signature × version)
@@ -73,27 +74,27 @@
   (select-keys descriptor [:device-id :vendor :arch :machine-lanes :grf-bytes-per-lane
                            :bandwidth-bytes-s :peak-flops :subgroup-size]))
 
-(defn cache-key [op-key shape-class descriptor]
-  (pr-str [op-key shape-class (descriptor-signature descriptor) autotune-version]))
+(def ^:private required-cache-identity-keys
+  #{:numerical-mode :emitter-hash :layout})
 
-(defn- cache-file ^File [key-str]
-  (io/file (System/getProperty "user.home") ".raster" "autotune"
-           (str (format "%08x" (hash key-str)) ".edn")))
+(defn- validate-cache-identity!
+  [identity]
+  (when-not (and (map? identity)
+                 (every? #(and (contains? identity %) (some? (get identity %)))
+                         required-cache-identity-keys))
+    (throw (ex-info "autotune cache identity requires numerical mode, emitter hash, and layout"
+                    {:identity identity :required required-cache-identity-keys})))
+  identity)
+
+(defn cache-key [op-key shape-class descriptor identity]
+  (pr-str [op-key shape-class (descriptor-signature descriptor)
+           (validate-cache-identity! identity) autotune-version]))
 
 (defn cache-get [key-str]
-  (let [f (cache-file key-str)]
-    (when (.exists f)
-      (try (let [{:keys [key config]} (read-string (slurp f))]
-             (when (= key key-str) config))
-           (catch Exception _ nil)))))
+  (cache/read-entry key-str))
 
 (defn cache-put! [key-str config]
-  (let [f (cache-file key-str)]
-    (io/make-parents f)
-    (let [tmp (File/createTempFile "atune" ".edn" (.getParentFile f))]
-      (spit tmp (pr-str {:key key-str :config config}))
-      (.renameTo tmp f))
-    config))
+  (cache/write-entry! key-str config))
 
 ;; ================================================================
 ;; The autotune entry — cache-or-search
@@ -103,9 +104,10 @@
   "The best Schedule for (op-key × shape-class × descriptor): from the disk cache, or found by
    coordinate-descent from the derive-default seed priced by `cost-fn` and then cached. `cost-fn`
    takes a candidate Schedule and returns its measured cost (lower better; +Inf = infeasible).
-   opts: :neighbors (override), :force? (ignore cache), :steps (program steps for derive-default)."
-  [op-key shape-class descriptor cost-fn & {:keys [neighbors force? steps]}]
-  (let [k (cache-key op-key shape-class descriptor)]
+   opts: :identity (REQUIRED: numerical mode + emitter hash + layout), :neighbors (override),
+   :force? (ignore cache), :steps (program steps for derive-default)."
+  [op-key shape-class descriptor cost-fn & {:keys [neighbors force? steps identity]}]
+  (let [k (cache-key op-key shape-class descriptor identity)]
     (or (when-not force? (cache-get k))
         (let [seed (sched/derive-default steps descriptor)
               result (coordinate-descent seed (or neighbors (schedule-neighbors descriptor)) cost-fn)]

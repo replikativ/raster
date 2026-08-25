@@ -54,6 +54,26 @@
                                                   :subgroup-score-reuse)))
       "an explicit schedule override is authoritative"))
 
+(deftest measured-runtime-ranges-select-without-runtime-tuning
+  (let [measured (kdispatch/with-selector
+                   dispatch
+                   {:kind :runtime-scalar-ranges
+                    :argument 'width
+                    :below :reference
+                    :ranges [{:at-least 192 :strategy :subgroup-score-reuse}
+                             {:at-least 768 :strategy :reference}]})
+        select #(kdispatch/artifact-strategy
+                 (kdispatch/select-artifact measured [:x :out {:type :long :value %}]))]
+    (is (= :reference (select 128)))
+    (is (= :subgroup-score-reuse (select 192)))
+    (is (= :subgroup-score-reuse (select 512)))
+    (is (= :reference (select 768)))
+    (is (= :subgroup-score-reuse
+           (kdispatch/artifact-strategy
+            (kdispatch/select-artifact measured [:x :out {:type :long :value 1}]
+                                       :subgroup-score-reuse)))
+        "an explicit override remains authoritative over measured selector data")))
+
 (deftest dispatch-rejects-incompatible-or-ambiguous-alternatives
   (testing "an alternative cannot silently change the ordered ABI"
     (is (thrown-with-msg?
@@ -70,7 +90,19 @@
           {:id "duplicate"
            :alternatives [reference (assoc subgroup :attributes {:strategy :reference})]
            :default-strategy :reference
-           :selector (:selector dispatch)})))))
+           :selector (:selector dispatch)}))))
+  (testing "measured range boundaries are ordered and name available strategies"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"strictly increasing"
+         (kdispatch/with-selector
+           dispatch {:kind :runtime-scalar-ranges :argument 'width :below :reference
+                     :ranges [{:at-least 256 :strategy :subgroup-score-reuse}
+                              {:at-least 128 :strategy :reference}]})))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"absent strategy"
+         (kdispatch/with-selector
+           dispatch {:kind :runtime-scalar-ranges :argument 'width :below :unknown
+                     :ranges []})))))
 
 (deftest both-resident-backends-register-the-same-pure-dispatch
   (doseq [[register! entry] [[ze/register-kernel-dispatch!

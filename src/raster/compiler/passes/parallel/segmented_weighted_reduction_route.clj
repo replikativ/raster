@@ -58,27 +58,36 @@
                                [:segmented-weighted-reduction
                                 :score-reuse-subgroup-multiple]
                                16))
+        measured-selector (get-in schedule
+                                  [:segmented-weighted-reduction :measured-selector])
         components (get-in plan [:value :components])
-        dispatch-key [(swr/algebra-key plan) subgroup-size multiple]
+        dispatch-key [(swr/algebra-key plan) subgroup-size
+                      (or measured-selector multiple)]
         id (format "raster_segmented_weighted_reduction_dispatch_%08x"
                    (bit-and 0xffffffff (long (hash dispatch-key))))]
     (when (and (contains? by-strategy reference)
                (contains? by-strategy score-reuse))
-      (kdispatch/make
-       {:id id
-        :alternatives artifacts
-        :default-strategy reference
-        :selector {:kind :runtime-scalar-threshold
-                   :argument components
-                   :threshold (* subgroup-size multiple)
-                   :at-least score-reuse
-                   :otherwise reference}
-        :provenance {:operation-id (get-in plan [:provenance :operation-id])
-                     :semantic-op (get-in plan [:provenance :semantic-op])
-                     :algebra-plan-id (:id plan)}
-        :attributes {:algebra :segmented-weighted-reduction
-                     :algebra-key (swr/algebra-key plan)
-                     :selection :runtime-shape}}))))
+      (let [dispatch
+            (kdispatch/make
+             {:id id
+              :alternatives artifacts
+              :default-strategy reference
+              :selector {:kind :runtime-scalar-threshold
+                         :argument components
+                         :threshold (* subgroup-size multiple)
+                         :at-least score-reuse
+                         :otherwise reference}
+              :provenance {:operation-id (get-in plan [:provenance :operation-id])
+                           :semantic-op (get-in plan [:provenance :semantic-op])
+                           :algebra-plan-id (:id plan)}
+              :attributes {:algebra :segmented-weighted-reduction
+                           :algebra-key (swr/algebra-key plan)
+                           :selection (if measured-selector
+                                        :measured-runtime-shape
+                                        :analytic-runtime-shape)}})]
+        (if measured-selector
+          (kdispatch/with-selector dispatch measured-selector)
+          dispatch)))))
 
 (defn route-dynamic
   ([plan] (route-dynamic plan nil))

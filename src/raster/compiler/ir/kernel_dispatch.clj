@@ -29,24 +29,55 @@
   [alternatives]
   (into {} (map (juxt artifact-strategy identity)) alternatives))
 
+(defn- finite-number?
+  [value]
+  (and (number? value) (Double/isFinite (double value))))
+
+(defn- validate-selector-strategy!
+  [dispatch strategies branch strategy]
+  (when-not (contains? strategies strategy)
+    (throw (ex-info "kernel dispatch selector names an absent strategy"
+                    {:id (:id dispatch) :branch branch :strategy strategy
+                     :strategies (set (keys strategies))}))))
+
 (defn- validate-selector!
   [dispatch strategies common-arguments]
-  (let [{:keys [kind argument threshold at-least otherwise]} (:selector dispatch)]
-    (when-not (= :runtime-scalar-threshold kind)
-      (throw (ex-info "kernel dispatch has an unsupported selector"
-                      {:id (:id dispatch) :selector (:selector dispatch)})))
+  (let [{:keys [kind argument threshold at-least otherwise ranges below]}
+        (:selector dispatch)]
     (when-not (some #(= argument %) common-arguments)
       (throw (ex-info "kernel dispatch selector argument is absent from the common ABI values"
                       {:id (:id dispatch) :argument argument
                        :arguments common-arguments})))
-    (when-not (and (number? threshold) (pos? (double threshold)))
-      (throw (ex-info "kernel dispatch threshold must be positive"
-                      {:id (:id dispatch) :threshold threshold})))
-    (doseq [[branch strategy] [[:at-least at-least] [:otherwise otherwise]]]
-      (when-not (contains? strategies strategy)
-        (throw (ex-info "kernel dispatch selector names an absent strategy"
-                        {:id (:id dispatch) :branch branch :strategy strategy
-                         :strategies (set (keys strategies))}))))))
+    (case kind
+      :runtime-scalar-threshold
+      (do
+        (when-not (and (finite-number? threshold) (pos? (double threshold)))
+          (throw (ex-info "kernel dispatch threshold must be finite and positive"
+                          {:id (:id dispatch) :threshold threshold})))
+        (doseq [[branch strategy] [[:at-least at-least] [:otherwise otherwise]]]
+          (validate-selector-strategy! dispatch strategies branch strategy)))
+
+      :runtime-scalar-ranges
+      (do
+        (validate-selector-strategy! dispatch strategies :below below)
+        (when-not (vector? ranges)
+          (throw (ex-info "kernel dispatch ranges must be an ordered vector"
+                          {:id (:id dispatch) :ranges ranges})))
+        (doseq [[index {:keys [at-least strategy] :as range}] (map-indexed vector ranges)]
+          (when-not (= #{:at-least :strategy} (set (keys range)))
+            (throw (ex-info "kernel dispatch range requires exactly :at-least and :strategy"
+                            {:id (:id dispatch) :index index :range range})))
+          (when-not (finite-number? at-least)
+            (throw (ex-info "kernel dispatch range boundary must be finite"
+                            {:id (:id dispatch) :index index :at-least at-least})))
+          (validate-selector-strategy! dispatch strategies [:ranges index] strategy))
+        (when-not (or (< (count ranges) 2)
+                      (apply < (map :at-least ranges)))
+          (throw (ex-info "kernel dispatch range boundaries must be strictly increasing"
+                          {:id (:id dispatch) :ranges ranges}))))
+
+      (throw (ex-info "kernel dispatch has an unsupported selector"
+                      {:id (:id dispatch) :selector (:selector dispatch)})))))
 
 (defn validate!
   "Validate a dispatch and return it unchanged.
@@ -112,6 +143,12 @@
   (let [dispatch (validate! dispatch)]
     (artifact dispatch (:default-strategy dispatch))))
 
+(defn with-selector
+  "Return `dispatch` with a replacement selector, revalidating it against the common ABI and
+   available strategies. Used to bake an offline tuning result into otherwise identical IR."
+  [dispatch selector]
+  (validate! (assoc (validate! dispatch) :selector selector)))
+
 (defn- runtime-number
   [value]
   (if (and (map? value) (contains? value :value)) (:value value) value))
@@ -127,7 +164,8 @@
    (let [dispatch (validate! dispatch)]
      (if (and override (not= :auto override))
        (artifact dispatch override)
-       (let [{:keys [argument threshold at-least otherwise]} (:selector dispatch)
+       (let [{:keys [kind argument threshold at-least otherwise ranges below]}
+             (:selector dispatch)
              common-arguments (:arguments (default-artifact dispatch))
              indexes (keep-indexed (fn [index value] (when (= argument value) index))
                                    common-arguments)]
@@ -143,5 +181,15 @@
            (when-not (number? value)
              (throw (ex-info "kernel dispatch selector requires a numeric runtime scalar"
                              {:id (:id dispatch) :argument argument :value value})))
-           (artifact dispatch (if (>= (double value) (double threshold))
-                                at-least otherwise))))))))
+           (artifact
+            dispatch
+            (case kind
+              :runtime-scalar-threshold
+              (if (>= (double value) (double threshold)) at-least otherwise)
+
+              :runtime-scalar-ranges
+              (reduce (fn [strategy range]
+                        (if (>= (double value) (double (:at-least range)))
+                          (:strategy range)
+                          (reduced strategy)))
+                      below ranges)))))))))

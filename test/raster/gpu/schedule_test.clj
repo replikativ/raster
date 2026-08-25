@@ -132,6 +132,20 @@
                             (sched/derive-default nil arc-desc)
                             {:segmented-weighted-reduction
                              {:score-reuse-subgroup-multiple 0}})
+                           arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be a map"
+                          (sched/feasible?
+                           (sched/resolve
+                            (sched/derive-default nil arc-desc)
+                            {:segmented-weighted-reduction {:measured-selector :invalid}})
+                           arc-desc)))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires :strategy :auto"
+                          (sched/feasible?
+                           (sched/resolve
+                            (sched/derive-default nil arc-desc)
+                            {:segmented-weighted-reduction
+                             {:strategy :reference
+                              :measured-selector {:kind :runtime-scalar-ranges}}})
                            arc-desc))))
   (testing "conflicting :gemm-precision sugar and :precision throw, not silently prefer the deprecated key"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"conflicting"
