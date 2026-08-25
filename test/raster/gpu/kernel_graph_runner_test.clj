@@ -2,10 +2,27 @@
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.gpu.core :as gpu]
             [raster.runtime.hardware :as hardware]))
+
+(defn- probe-artifact
+  []
+  (artifact/make
+   {:kernel-name "bound_call_probe"
+    :source (str "__kernel void bound_call_probe(__global const float* x, "
+                 "__global float* out, int n) {}")
+    :abi [(kabi/slot 'x :input :float :role :operand)
+          (kabi/slot 'out :output :float :role :result)
+          (kabi/slot 'n :scalar :int :role :bound)]
+    :arguments '[x out n]
+    :launch (launch/spec {:workgroup-size [64]
+                          :group-count [(launch/ceil-div 'n 64)]})
+    :effects {:kind :elementwise-map :reads ['x] :writes ['out]}}))
 
 (defn- emitted-graph []
   (let [node (soac/par-form->soac
@@ -140,6 +157,65 @@
           (is (not-any? #(or (identical? values-buffer %)
                              (identical? output-buffer %))
                         @freed)))))))
+
+(deftest one-kernel-call-binds-validates-and-measures-through-the-graph-runtime
+  (let [input-buffer {:dtype :float :n-elements 128 :byte-size 512}
+        output-buffer {:dtype :float :n-elements 128 :byte-size 512}
+        allocation (fn [id]
+                     (bview/allocation {:id id :byte-size 512 :memory-space :shared
+                                        :device :ze:0 :coherence :host-coherent
+                                        :ownership :owned}))
+        session (atom {:device-id :ze:0 :session-id :call-session
+                       :buffers {:x input-buffer :out output-buffer}
+                       :allocations {:x (allocation :x) :out (allocation :out)}
+                       :kernel-graphs {} :events {} :closed? false})
+        registered (atom [])
+        resets (atom 0)
+        replays (atom 0)
+        destroyed (atom [])
+        resolver
+        (fn [_ name]
+          (case name
+            "register-kernel!" (fn [kernel-name emitted]
+                                 (swap! registered conj [kernel-name emitted]))
+            "bind-kernel-call" (fn [call] {:kernel-call call})
+            "record-graph!" (fn [prepared opts]
+                              {:prepared prepared :profile? (:profile? opts)})
+            "submit-graph!" (fn [graph] {:graph graph})
+            "await-event!" identity
+            "event-complete?" (constantly true)
+            "release-event!" identity
+            "reset-graph-events!" (fn [_] (swap! resets inc))
+            "replay-graph!" (fn [_] (swap! replays inc))
+            "read-graph-timestamps!" (fn [_] {:wall-ms 0.001})
+            (throw (ex-info "unexpected mocked runtime function" {:name name}))))
+        soft-resolver
+        (fn [_ name]
+          (case name
+            "destroy-graph!" #(swap! destroyed conj [:graph %])
+            "destroy-prepared!" #(swap! destroyed conj [:prepared %])
+            nil))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver
+       (ns-resolve 'raster.gpu.core 'rt-resolve-soft) soft-resolver}
+      (fn []
+        (let [emitted (probe-artifact)
+              handle (gpu/bind-kernel-call!
+                      session :candidate emitted
+                      [:x :out {:type :int :value 128}]
+                      {:profile? true})
+              outputs (gpu/run-kernel-graph! session handle)
+              measured (gpu/measure-bound-kernel-graph!
+                        session handle :warmup-iterations 1 :budget-ms 1
+                        :min-samples 3 :max-samples 3)]
+          (is (= [["bound_call_probe" emitted]] @registered))
+          (is (identical? output-buffer (get outputs 'out)))
+          (is (= 1 @resets) "validation replay resets discarded profiling events")
+          (is (= :device-event (:timing-source measured)))
+          (is (= 1000.0 (:min-ns measured)))
+          (is (= (+ 1 5 3) @replays))
+          (gpu/release-kernel-graph! session handle)
+          (is (= 2 (count @destroyed))))))))
 
 (deftest opencl-sub-buffer-handles-follow-the-graph-lifetime
   (let [n 1025

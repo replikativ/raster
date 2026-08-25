@@ -41,13 +41,20 @@
                      :strategies (set (keys strategies))}))))
 
 (defn- validate-selector!
-  [dispatch strategies common-arguments]
+  [dispatch strategies common]
   (let [{:keys [kind argument threshold at-least otherwise ranges below]}
-        (:selector dispatch)]
-    (when-not (some #(= argument %) common-arguments)
-      (throw (ex-info "kernel dispatch selector argument is absent from the common ABI values"
+        (:selector dispatch)
+        common-arguments (:arguments common)
+        indexes (keep-indexed (fn [index value] (when (= argument value) index))
+                              common-arguments)]
+    (when-not (= 1 (count indexes))
+      (throw (ex-info "kernel dispatch selector argument must have one common ABI position"
                       {:id (:id dispatch) :argument argument
-                       :arguments common-arguments})))
+                       :arguments common-arguments :indexes (vec indexes)})))
+    (let [slot (nth (:abi common) (first indexes))]
+      (when-not (= :scalar (:kind slot))
+        (throw (ex-info "kernel dispatch selector argument must name a scalar ABI slot"
+                        {:id (:id dispatch) :argument argument :slot slot}))))
     (case kind
       :runtime-scalar-threshold
       (do
@@ -97,6 +104,7 @@
     (doseq [artifact alternatives] (kart/validate! artifact))
     (let [strategies (mapv artifact-strategy alternatives)
           strategy-set (set strategies)
+          kernel-names (mapv :kernel-name alternatives)
           common (first alternatives)
           common-view (select-keys common [:target :abi :arguments :temporaries :effects])]
       (when-not (every? keyword? strategies)
@@ -105,6 +113,9 @@
       (when-not (= (count strategies) (count strategy-set))
         (throw (ex-info "kernel dispatch alternative strategies must be unique"
                         {:id id :strategies strategies})))
+      (when-not (= (count kernel-names) (count (set kernel-names)))
+        (throw (ex-info "kernel dispatch alternatives must have unique emitted entry points"
+                        {:id id :kernel-names kernel-names})))
       (doseq [artifact (rest alternatives)]
         (when-not (= common-view
                      (select-keys artifact [:target :abi :arguments :temporaries :effects]))
@@ -115,7 +126,7 @@
       (when-not (contains? strategy-set default-strategy)
         (throw (ex-info "kernel dispatch default strategy is absent"
                         {:id id :default default-strategy :strategies strategy-set})))
-      (validate-selector! dispatch (strategy-map alternatives) (:arguments common)))
+      (validate-selector! dispatch (strategy-map alternatives) common))
     (doseq [[field value] [[:provenance provenance] [:attributes attributes]]]
       (when-not (map? value)
         (throw (ex-info "kernel dispatch metadata must be maps"

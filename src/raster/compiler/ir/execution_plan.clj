@@ -154,3 +154,18 @@
                               (when-not (contains? depended-on id) id))
                             (:nodes graph-call)))]
     (validate! (->ExecutionPlan [queue] [] operations outputs))))
+
+(defn from-kernel-call
+  "Lower one checked KernelCall to the same target-neutral compute/event contract used by a
+   KernelGraphCall. This is the executable unit used by offline candidate benchmarking: a single
+   emitted alternative still travels through an explicit queue and completion event."
+  ([call] (from-kernel-call :kernel-call call))
+  ([id call]
+   (let [call (kcall/validate! call)
+         queue (compute-queue)
+         completion (->LogicalEvent [:operation-complete id])]
+     (validate!
+      (->ExecutionPlan
+       [queue] []
+       [(->ScheduledOperation id call queue [] completion)]
+       [completion])))))
