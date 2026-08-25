@@ -154,6 +154,41 @@
       (is (nil? (:dispatch step)))
       (is (= emitted (get-in step [:artifact :attributes :strategy]))))))
 
+(deftest compiler-schedule-can-bake-an-offline-measured-selector
+  (let [analytic (pipeline/compile-gpu-program
+                  #'resident-structured-reduction-probe :ze:0 :dtype :float)
+        argument (get-in analytic [:steps 0 :dispatch :selector :argument])
+        selector {:kind :runtime-scalar-ranges
+                  :argument argument
+                  :below :indexed-segmented-reduction-reference
+                  :ranges [{:at-least 3
+                            :strategy
+                            :indexed-segmented-reduction-subgroup-score-reuse}]}
+        descriptor
+        (pipeline/compile-gpu-program
+         #'resident-structured-reduction-probe :ze:0 :dtype :float
+         :schedule {:segmented-weighted-reduction
+                    {:strategy :auto :measured-selector selector}})
+        step (first (:steps descriptor))
+        arguments-for
+        (fn [args]
+          (mapv (fn [{:keys [kind type value-fn]}]
+                  (if (= :scalar kind)
+                    {:type type :value (value-fn args)}
+                    (Object.)))
+                (:argument-specs step)))
+        narrow [(float-array 15) (float-array 15) (float-array 15)
+                (long-array 4) (long-array 4) 3 4 5 2]
+        wide (assoc narrow 7 8)]
+    (is (= selector (get-in step [:dispatch :selector])))
+    (is (= :measured-runtime-shape (get-in step [:dispatch :attributes :selection])))
+    (is (= :indexed-segmented-reduction-reference
+           (kdispatch/artifact-strategy
+            (kdispatch/select-artifact (:dispatch step) (arguments-for narrow)))))
+    (is (= :indexed-segmented-reduction-subgroup-score-reuse
+           (kdispatch/artifact-strategy
+            (kdispatch/select-artifact (:dispatch step) (arguments-for wide)))))))
+
 (deftest actual-gsdm-region-reaches-generic-structured-reduction-stage
   (let [diagnostic (pipeline/show-pipeline
                     #'gsdm/graph-attention-multihead

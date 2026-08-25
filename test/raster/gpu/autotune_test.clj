@@ -3,7 +3,14 @@
    the noise-rejection threshold, and the disk-cache round-trip."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.gpu.autotune :as at]
-            [raster.gpu.schedule :as sched]))
+            [raster.gpu.schedule :as sched]
+            [raster.gpu.tuning-cache :as cache])
+  (:import [java.nio.file Files]))
+
+(defn- temporary-cache-root
+  []
+  (.toFile (Files/createTempDirectory "raster-autotune-"
+                                      (make-array java.nio.file.attribute.FileAttribute 0))))
 
 (deftest coordinate-descent-finds-the-minimum
   ;; landscape minimized at {:a 8 :b :y}; ×2/÷2 moves on :a, two-valued :b
@@ -37,24 +44,51 @@
       (is (= :grf256 (get-in (:config r) [:grf :mode]))))))
 
 (deftest cache-roundtrip
-  (let [desc {:device-id :ze:0 :bandwidth-bytes-s 9.0e10 :peak-flops {:f32 4.0e12}}
-        k (at/cache-key (keyword (gensym "op")) :shape-Z desc)
-        cfg {:precision :f16-xmx :grf {:mode :grf128}}]
-    (is (nil? (at/cache-get k)) "cold miss")
-    (at/cache-put! k cfg)
-    (is (= cfg (at/cache-get k)) "round-trips from disk")
-    (testing "the key includes the measured perf signature — a re-calibrated machine misses"
-      (is (not= k (at/cache-key (keyword "op") :shape-Z (assoc desc :bandwidth-bytes-s 1.37e11)))))))
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [desc {:device-id :ze:0 :bandwidth-bytes-s 9.0e10 :peak-flops {:f32 4.0e12}}
+          identity {:numerical-mode :f32 :emitter-hash "emitter-v1" :layout :row-major}
+          k (at/cache-key :op-Z :shape-Z desc identity)
+          cfg {:precision :f16-xmx :grf {:mode :grf128}}]
+      (is (nil? (at/cache-get k)) "cold miss")
+      (at/cache-put! k cfg)
+      (is (= cfg (at/cache-get k)) "round-trips from disk")
+      (testing "the key includes the measured perf signature — a re-calibrated machine misses"
+        (is (not= k (at/cache-key :op-Z :shape-Z
+                                  (assoc desc :bandwidth-bytes-s 1.37e11)
+                                  identity))))
+      (testing "numerical mode, emitter, and layout are mandatory correctness identity"
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"requires numerical mode"
+                              (at/cache-key :op-Z :shape-Z desc {})))))))
 
 (deftest autotune-schedule-seeds-from-derive-default
-  (let [desc {:device-id :ze:0 :grf-bytes-per-lane 256 :bandwidth-bytes-s 9.0e10 :peak-flops {:f32 4.0e12} :balance 60}
-        ;; cost prefers f32-scalar (opposite of the f16-xmx default) + gates infeasible
-        cost (fn [s] (try (sched/feasible? s desc)
-                          (if (= (:precision s) :f32-scalar) 1.0 2.0)
-                          (catch clojure.lang.ExceptionInfo _ Double/POSITIVE_INFINITY)))
-        op (keyword (gensym "op"))
-        best (at/autotune-schedule op :shape-Q desc cost :force? true)]
-    (is (= :f32-scalar (:precision best)) "search moved off the f16-xmx seed to the cheaper config")
-    (testing "second call hits the cache without re-measuring"
-      (is (= :f32-scalar (:precision (at/autotune-schedule op :shape-Q desc
-                                                           (fn [_] (throw (ex-info "should-not-measure" {}))))))))))
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [desc {:device-id :ze:0 :grf-bytes-per-lane 256 :bandwidth-bytes-s 9.0e10 :peak-flops {:f32 4.0e12} :balance 60}
+          ;; cost prefers a smaller measured crossover multiplier while numerical mode stays fixed
+          cost (fn [s] (try (sched/feasible? s desc)
+                            (if (= 8 (get-in s [:segmented-weighted-reduction
+                                                :score-reuse-subgroup-multiple]))
+                              1.0 2.0)
+                            (catch clojure.lang.ExceptionInfo _ Double/POSITIVE_INFINITY)))
+          op :op-Q
+          identity {:numerical-mode :f16-f32
+                    :emitter-hash "segmented-reduction-v1"
+                    :layout :packed-edge-list}
+          reduction-neighbor
+          {[:segmented-weighted-reduction :score-reuse-subgroup-multiple]
+           (fn [_] [8 16])}
+          best (at/autotune-schedule op :shape-Q desc cost
+                                     :identity identity
+                                     :neighbors reduction-neighbor :force? true)]
+      (is (not (contains? (at/schedule-neighbors desc) :precision))
+          "default search never changes numerical mode")
+      (is (= :f16-xmx (:precision best)) "numerical mode remains fixed")
+      (is (= 8 (get-in best [:segmented-weighted-reduction
+                             :score-reuse-subgroup-multiple])))
+      (testing "second call hits the cache without re-measuring"
+        (is (= 8 (get-in (at/autotune-schedule
+                          op :shape-Q desc
+                          (fn [_] (throw (ex-info "should-not-measure" {})))
+                          :identity identity
+                          :neighbors reduction-neighbor)
+                         [:segmented-weighted-reduction
+                          :score-reuse-subgroup-multiple])))))))
