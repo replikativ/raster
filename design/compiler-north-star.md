@@ -95,13 +95,21 @@ No schedule key is complete until it is declared, checked, costed, emitted, and
 measured. A key that intentionally models feasibility before emission must be
 labelled as such in the schema and excluded from claims of executable coverage.
 
-### 2.3 Values do not yet compose across artifacts without copying
+### 2.3 Executable steps compose, but artifact values do not yet link
 
-`Compiled` is a sound whole-program MVP, but its session is internal, shape
-information is flat, a foreign `DeviceArray` cannot be rebound, and an ordinary
-device input is currently downloaded and uploaded. These limitations prevent
-independently compiled transformer layers, prefill/decode artifacts, and
-forward/backward/update artifacts from forming one zero-copy device graph.
+Descriptor instances now share one executable-step binder: a step may select a
+single `KernelArtifact` or a multi-kernel `KernelGraph`, own its private
+temporaries, and flatten with other instances into one resident replay graph.
+This closes the mechanism gap for GEMM-containing layer composition.
+
+The public value layer remains incomplete. `Compiled` keeps its session
+internal, shape information is flat, a foreign `DeviceArray` cannot be rebound,
+and an ordinary device input is currently downloaded and uploaded. There is no
+validated data-valued link plan that proves node shape/view/effects/ownership
+before allocating and instantiating descriptors. These limitations still
+prevent independently compiled transformer layers, prefill/decode artifacts,
+and forward/backward/update artifacts from forming one public zero-copy device
+graph.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.

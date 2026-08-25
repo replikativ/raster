@@ -2367,19 +2367,24 @@
       (when-let [kernels (:kernels result)]
         (println "\n--- Kernels ---")
         (doseq [k kernels]
-          (println (str "  " (:kernel-name k)
-                        (when-let [s (:strategy k)] (str "  strategy=" s))
-                        (when-let [r (:fallback-reason k)] (str "  fallback-reason=" r))
-                        (when-let [t (:tile k)]
-                          (str "  tile=" (:block-m t) "x" (:block-n t) "/" (:sg-m t) "x" (:sg-n t)
-                               " k" (:block-k t) " stages=" (:num-stages t 3)))
-                        (when-let [occ (:occupancy-estimate k)]
-                          (str "  occupancy=" (format "%.0f%%" (* 100.0 (:occupancy occ)))
-                               " limited-by=" (name (:limiting-factor occ))))))
-          (when-let [ds (seq (:declines k))]
-            (doseq [d ds]
-              (println (str "      declined " (:leaf d) ": " (:reason d)
-                            (when-let [m (:message d)] (str " — " m)))))))))
+          (let [attributes (:attributes k)
+                ;; KernelArtifact closed routing metadata under :attributes. Legacy emitted maps
+                ;; still carry the same fields at top level, so explain accepts both while keeping
+                ;; the executable value—not the mutable runtime registry—as the source of truth.
+                field #(or (get k %) (get attributes %))]
+            (println (str "  " (:kernel-name k)
+                          (when-let [s (field :strategy)] (str "  strategy=" s))
+                          (when-let [r (field :fallback-reason)] (str "  fallback-reason=" r))
+                          (when-let [t (field :tile)]
+                            (str "  tile=" (:block-m t) "x" (:block-n t) "/" (:sg-m t) "x" (:sg-n t)
+                                 " k" (:block-k t) " stages=" (:num-stages t 3)))
+                          (when-let [occ (field :occupancy-estimate)]
+                            (str "  occupancy=" (format "%.0f%%" (* 100.0 (:occupancy occ)))
+                                 " limited-by=" (name (:limiting-factor occ))))))
+            (when-let [ds (seq (field :declines))]
+              (doseq [d ds]
+                (println (str "      declined " (:leaf d) ": " (:reason d)
+                              (when-let [m (:message d)] (str " — " m))))))))))
 
     (println)
     result))
