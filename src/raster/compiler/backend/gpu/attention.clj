@@ -1,5 +1,5 @@
 (ns raster.compiler.backend.gpu.attention
-  "Portable FP16 reference lowering for logical attention over dense or CSR paged KV routes.
+  "Portable FP16-KV reference lowering for logical attention over dense or CSR paged KV routes.
 
    One work-item owns one output component and recomputes QK. This intentionally slow schedule is
    the executable semantic oracle for packed queries, GQA, independent K/V layouts and dimensions,
@@ -80,7 +80,7 @@
   (let [identity (select-keys problem
                               [:batch-size :q-heads :kv-heads :qk-head-dim :value-head-dim
                                :page-size :physical-pages :scale :k-format :v-format
-                               :k-layout :v-layout])
+                               :k-layout :v-layout :q-dtype :output-dtype])
         visibility (:visibility problem)
         identity (assoc identity
                         :route-kind (attention/route-kind (:route problem))
@@ -94,6 +94,24 @@
                           (assoc :key-index-capacity (:key-index-capacity visibility)))
                         :total-query-tokens (get-in problem [:query :total-tokens]))]
     (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity))))))
+
+(defn- opencl-type
+  [dtype]
+  (case dtype
+    :half "half"
+    :float "float"))
+
+(defn- load-float
+  [dtype expression]
+  (case dtype
+    :half (str "convert_float(" expression ")")
+    :float expression))
+
+(defn- store-float
+  [dtype expression]
+  (case dtype
+    :half (str "convert_half_rte(" expression ")")
+    :float expression))
 
 (defn- cache-base
   [{:keys [physical-pages page-size kv-heads]} layout dim]
@@ -123,7 +141,7 @@
          "    __global const int* attention_key_indices,\n")))
 
 (defn- route-initialization
-  [{:keys [route page-size]}]
+  [{:keys [route page-size output-dtype]}]
   (if (attention/dense-paged-route? route)
     (let [capacity (* (:pages-per-sequence route) page-size)]
       (str "  const int length = kv_lengths[batch];\n"
@@ -131,7 +149,7 @@
            "  if (length < 0 || length > " capacity
            " || kv_start_position < 0\n"
            "      || (long)kv_start_position + (long)length > 2147483648L) {\n"
-           "    output[out_index] = convert_half_rte(NAN);\n"
+           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
            "    return;\n"
            "  }\n"))
     (let [capacity (:page-index-capacity route)]
@@ -141,20 +159,20 @@
            "  const int kv_start_position = kv_start_positions[batch];\n"
            "  if (page_offsets[0] != 0 || page_begin < 0 || page_end < page_begin\n"
            "      || page_end > " capacity " || kv_start_position < 0) {\n"
-           "    output[out_index] = convert_half_rte(NAN);\n"
+           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
            "    return;\n"
            "  }\n"
            "  const int routed_page_count = page_end - page_begin;\n"
            "  if ((routed_page_count == 0 && final_page_length != 0)\n"
            "      || (routed_page_count > 0\n"
            "          && (final_page_length < 1 || final_page_length > " page-size "))) {\n"
-           "    output[out_index] = convert_half_rte(NAN);\n"
+           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
            "    return;\n"
            "  }\n"
            "  const int length = routed_page_count == 0 ? 0\n"
            "      : (routed_page_count - 1) * " page-size " + final_page_length;\n"
            "  if ((long)kv_start_position + (long)length > 2147483648L) {\n"
-           "    output[out_index] = convert_half_rte(NAN);\n"
+           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
            "    return;\n"
            "  }\n"))))
 
@@ -176,24 +194,24 @@
               window-right "L);\n"))))
 
 (defn- visibility-initialization
-  [visibility]
+  [visibility output-dtype]
   (when (attention/csr-visibility? visibility)
     (str "  const int attention_begin = attention_row_offsets[q_token];\n"
          "  const int attention_end = attention_row_offsets[q_token + 1];\n"
          "  if (attention_row_offsets[0] != 0 || attention_begin < 0\n"
          "      || attention_end < attention_begin || attention_end > "
          (:key-index-capacity visibility) ") {\n"
-         "    output[out_index] = convert_half_rte(NAN);\n"
+         "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
          "    return;\n"
          "  }\n")))
 
 (defn- visibility-loop-start
-  [visibility]
+  [visibility output-dtype]
   (if (attention/csr-visibility? visibility)
     (str "  for (int edge = attention_begin; edge < attention_end; ++edge) {\n"
          "    const int token = attention_key_indices[edge];\n"
          "    if (token < 0 || token >= length) {\n"
-         "      output[out_index] = convert_half_rte(NAN);\n"
+         "      output[out_index] = " (store-float output-dtype "NAN") ";\n"
          "      return;\n"
          "    }\n")
     "  for (int token = 0; token < length; ++token) {\n"))
@@ -201,21 +219,22 @@
 (defn- source
   [problem name]
   (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
-                page-size physical-pages scale k-layout v-layout visibility]} problem
+                page-size physical-pages scale k-layout v-layout visibility
+                q-dtype output-dtype]} problem
         total-query-tokens (:total-tokens query)
         gqa-ratio (quot q-heads kv-heads)
         k-base (cache-base problem k-layout qk-head-dim)
         v-base (cache-base problem v-layout value-head-dim)]
     (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
          "__kernel void " name "(\n"
-         "    __global const half* q,\n"
+         "    __global const " (opencl-type q-dtype) "* q,\n"
          "    __global const int* q_row_offsets,\n"
          "    __global const int* q_positions,\n"
          "    __global const half* k_pages,\n"
          "    __global const half* v_pages,\n"
          (route-signature route)
          (visibility-signature visibility)
-         "    __global half* output) {\n"
+         "    __global " (opencl-type output-dtype) "* output) {\n"
          "  const int d = (int)get_global_id(0);\n"
          "  const int q_head = (int)get_global_id(1);\n"
          "  const int q_token = (int)get_global_id(2);\n"
@@ -235,18 +254,18 @@
          "  }\n"
          "  const int q_position = q_positions[q_token];\n"
          "  if (!query_metadata_valid || batch < 0 || q_position < 0) {\n"
-         "    output[out_index] = convert_half_rte(NAN);\n"
+         "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
          "    return;\n"
          "  }\n"
          (route-initialization problem)
-         (visibility-initialization visibility)
+         (visibility-initialization visibility output-dtype)
          "  const int kv_head = q_head / " gqa-ratio ";\n"
          "  const long q_base = ((long)q_token * " q-heads
          " + q_head) * " qk-head-dim ";\n"
          "  float maximum = -3.402823466e+38f;\n"
          "  float denominator = 0.0f;\n"
          "  float accumulator = 0.0f;\n"
-         (visibility-loop-start visibility)
+         (visibility-loop-start visibility output-dtype)
          "    const long kv_position = (long)kv_start_position + token;\n"
          "    int visible = 1;\n"
          (visibility-statements (attention/position-filter visibility))
@@ -254,7 +273,7 @@
          "    const int logical_page = token / " page-size ";\n"
          "    const int physical_page = " (physical-page-expression route) ";\n"
          "    if (physical_page < 0 || physical_page >= " physical-pages ") {\n"
-         "      output[out_index] = convert_half_rte(NAN);\n"
+         "      output[out_index] = " (store-float output-dtype "NAN") ";\n"
          "      return;\n"
          "    }\n"
          "    const int page_token = token - logical_page * " page-size ";\n"
@@ -262,7 +281,8 @@
          "    const long v_base = " v-base ";\n"
          "    float dot = 0.0f;\n"
          "    for (int x = 0; x < " qk-head-dim "; ++x) {\n"
-         "      dot += convert_float(q[q_base + x]) * convert_float(k_pages[k_base + x]);\n"
+         "      dot += " (load-float q-dtype "q[q_base + x]")
+         " * convert_float(k_pages[k_base + x]);\n"
          "    }\n"
          "    const float logit = dot * " (Float/toString (float scale)) "f;\n"
          "    const float next_maximum = fmax(maximum, logit);\n"
@@ -273,8 +293,9 @@
          "    denominator = denominator * old_weight + new_weight;\n"
          "    maximum = next_maximum;\n"
          "  }\n"
-         "  output[out_index] = denominator == 0.0f ? (half)0\n"
-         "      : convert_half_rte(accumulator / denominator);\n"
+         "  output[out_index] = denominator == 0.0f ? "
+         (store-float output-dtype "0.0f") "\n"
+         "      : " (store-float output-dtype "accumulator / denominator") ";\n"
          "}\n")))
 
 (defn- ordered-inputs
@@ -283,8 +304,8 @@
 
 (defn- ordered-abi
   [problem]
-  (let [{:keys [query k-pages v-pages route visibility output]} problem
-        common [(kabi/slot (:values query) :input :half :c-name "q" :role :query)
+  (let [{:keys [query k-pages v-pages route visibility output q-dtype output-dtype]} problem
+        common [(kabi/slot (:values query) :input q-dtype :c-name "q" :role :query)
                 (kabi/slot (:row-offsets query) :input :int
                            :c-name "q_row_offsets" :role :query-rows)
                 (kabi/slot (:positions query) :input :int
@@ -315,10 +336,10 @@
                       :c-name "attention_key_indices" :role :attention-key-indices)])]
     (kabi/validate!
      (conj (into (into common route-slots) visibility-slots)
-           (kabi/slot output :output :half :c-name "output" :role :result)))))
+           (kabi/slot output :output output-dtype :c-name "output" :role :result)))))
 
 (defn emit-fp16-reference
-  "Emit a route-specialized plain-FP16 attention reference as a verified KernelArtifact."
+  "Emit route-specialized attention with FP16 K/V storage as a verified KernelArtifact."
   [plan desc]
   (let [plan (reference-plan! plan)
         {:keys [query output q-heads value-head-dim route] :as problem}
@@ -343,7 +364,8 @@
       :attributes {:strategy :fp16-reference :optimization-tier :reference
                    :algebra :segmented-weighted-reduction
                    :algebra-key (swr/algebra-key plan)
-                   :storage-dtype :half :accumulator-dtype :float
+                   :storage-dtype :half :q-dtype (:q-dtype problem)
+                   :output-dtype (:output-dtype problem) :accumulator-dtype :float
                    :route-kind (attention/route-kind route)
                    :visibility-kind (attention/visibility-kind (:visibility problem))
                    :k-layout (:k-layout problem) :v-layout (:v-layout problem)

@@ -31,10 +31,15 @@
        (decline problem :attention-quantized-kv-abi-unimplemented
                 {:k-format k-format :v-format v-format})
 
-       (not= [:half :half :half :half]
-             [q-dtype k-dtype v-dtype output-dtype])
+       (not (and (contains? #{:half :float} q-dtype)
+                 (= :half k-dtype)
+                 (= :half v-dtype)
+                 (contains? #{:half :float} output-dtype)))
        (decline problem :attention-reference-storage-unsupported
-                {:required [:half :half :half :half]
+                {:required {:q-dtype #{:half :float}
+                            :k-dtype :half
+                            :v-dtype :half
+                            :output-dtype #{:half :float}}
                  :actual [q-dtype k-dtype v-dtype output-dtype]})
 
        (not= :float accumulator-dtype)
