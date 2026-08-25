@@ -109,6 +109,22 @@
     (is (str/includes? source
                        "((long)physical_page * 2 + page_token) * 2 + kv_head) * 6"))))
 
+(deftest fp32-query-and-output-compose-with-fp16-kv-storage
+  (let [fp16-artifact (:artifact (route/route! (problem)))
+        artifact (:artifact (route/route!
+                             (problem :q-dtype :float :output-dtype :float)))
+        source (:source artifact)]
+    (is (not= (:kernel-name fp16-artifact) (:kernel-name artifact)))
+    (is (= [:float :int :int :half :half :int :int :int :float]
+           (mapv :dtype (:abi artifact))))
+    (is (= :float (get-in artifact [:attributes :q-dtype])))
+    (is (= :float (get-in artifact [:attributes :output-dtype])))
+    (is (str/includes? source "__global const float* q"))
+    (is (str/includes? source "__global float* output"))
+    (is (str/includes? source "dot += q[q_base + x] * convert_float(k_pages"))
+    (is (str/includes? source "output[out_index] = NAN;"))
+    (is (str/includes? source "output[out_index] = denominator == 0.0f ? 0.0f"))))
+
 (deftest unsupported-representations-return-machine-readable-declines
   (testing "quantization declines before generic dtype routing"
     (let [r (route/route
@@ -117,8 +133,8 @@
       (is (nil? (:strategy r)))
       (is (= :attention-quantized-kv-abi-unimplemented
              (get-in r [:declines 0 :reason])))))
-  (testing "plain non-FP16 storage declines rather than being reinterpreted"
-    (let [r (route/route (problem :q-dtype :float :output-dtype :float))]
+  (testing "non-FP16 K/V storage declines rather than being reinterpreted"
+    (let [r (route/route (problem :k-dtype :float))]
       (is (= :attention-reference-storage-unsupported
              (get-in r [:declines 0 :reason])))))
   (testing "a CPU target cannot receive GPU reference scheduling"

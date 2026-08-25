@@ -279,10 +279,49 @@
           (finally
             (gpu/release-kernel-graph! session handle)))))))
 
+(defn- run-mixed-io-case
+  [device-id]
+  (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
+        (make-case :dense-paged :interval)
+        expected (reference test-case)
+        problem (assoc problem :q-dtype :float :output-dtype :float)
+        graph (:graph (route/route!
+                       problem {:device-type :gpu :subgroup-size 16
+                                :max-workgroup-size 256}))
+        specs (attention/buffer-specs problem)
+        float-q (float-array (map decode-half q))
+        allocations
+        (merge {:q [:float (get-in specs ['q :elements]) float-q]
+                :q-row-offsets [:int (get-in specs ['q-row-offsets :elements]) q-offsets]
+                :q-positions [:int (get-in specs ['q-positions :elements]) q-positions]
+                :k-pages [:half (get-in specs ['k-pages :elements]) k]
+                :v-pages [:half (get-in specs ['v-pages :elements]) v]
+                :output [:float (get-in specs ['output :elements]) nil]}
+               (route-buffer-data test-case))]
+    (gpu/with-gpu-session [session device-id]
+      (gpu/alloc! session allocations)
+      (let [handle (gpu/bind-kernel-graph!
+                    session [:attention :mixed-io] graph (graph-bindings problem) {})]
+        (try
+          (gpu/run-kernel-graph! session handle)
+          (let [actual ^floats (gpu/download session :output)]
+            (is (= (count expected) (alength actual)))
+            (is (every? true?
+                        (map (fn [wanted got]
+                               (< (Math/abs (- (double wanted) (double got))) 1.0e-5))
+                             expected actual))))
+          (finally
+            (gpu/release-kernel-graph! session handle)))))))
+
 (deftest level-zero-packed-dense-attention-matches-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "packed dense-routed FP16 attention on Level Zero")
     (run-case :ze:0 :dense-paged :interval)))
+
+(deftest level-zero-fp32-query-and-output-with-fp16-kv-matches-reference
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "FP32-I/O packed attention over FP16 KV on Level Zero")
+    (run-mixed-io-case :ze:0)))
 
 (deftest opencl-packed-csr-attention-matches-reference
   (if-not @ocl-fp16-available?
