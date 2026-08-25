@@ -1993,6 +1993,12 @@
                ;; make-buffer) — kept here so close-session! can free it instead of leaking it.
                :scratch-buffers @gemm-scratch
                :param->key param->key
+               :alloc->key alloc->key
+               :buffer-capacities
+               (into {}
+                     (map (fn [buffer-key]
+                            [buffer-key (:n-elements (get buffers buffer-key))]))
+                     (concat (vals param->key) (vals alloc->key)))
                ;; resolved buffer key of the functional :result-sym (may be a scratch alloc,
                ;; hence resolved through THIS program's key-fn, not a raw name->keyword).
                :result-key (when-let [rs (:result-sym descriptor)]
@@ -2019,6 +2025,167 @@
             (throw (ex-info (str "run-program!: session holds " (count programs) " programs — "
                                  "pass the handle bind-program! returned (or a distinct descriptor)")
                             {:bound (keys programs)}))))))))
+
+(defn- select-dispatch-step
+  [descriptor selector]
+  (let [steps (:steps descriptor)
+        indexed (mapv vector (range) steps)
+        selected
+        (cond
+          (nil? selector)
+          (let [matches (filterv (fn [[_ step]] (some? (:dispatch step))) indexed)]
+            (when-not (= 1 (count matches))
+              (throw (ex-info "bound program requires exactly one dispatch step when :step is omitted"
+                              {:reason :ambiguous-program-dispatch-step
+                               :dispatch-phases (mapv (comp :phase second) matches)})))
+            (first matches))
+
+          (integer? selector)
+          (when (<= 0 (long selector) (dec (count steps)))
+            [(long selector) (nth steps (long selector))])
+
+          (keyword? selector)
+          (first (filterv (fn [[_ step]] (= selector (:phase step))) indexed))
+
+          :else
+          (throw (ex-info "program dispatch step selector must be nil, an index, or a phase keyword"
+                          {:reason :invalid-program-dispatch-step-selector
+                           :selector selector})))]
+    (when-not selected
+      (throw (ex-info "program dispatch step selector did not match a compiled step"
+                      {:reason :program-dispatch-step-not-found
+                       :selector selector :phases (mapv :phase steps)})))
+    (let [[index step] selected]
+      (when-not (:dispatch step)
+        (throw (ex-info "selected compiled program step has no KernelDispatch"
+                        {:reason :program-step-has-no-dispatch
+                         :selector selector :index index :phase (:phase step)})))
+      {:step-index index :step step :dispatch (kdispatch/validate! (:dispatch step))})))
+
+(defn bound-program-dispatch
+  "Return one compiled KernelDispatch step from a live resident program binding.
+
+   `step-selector` is nil (requiring exactly one dispatch step), a zero-based step index, or a
+   phase keyword. This is read-only compiler/runtime metadata; candidate binding remains explicit
+   through program-dispatch-arguments."
+  ([sess prog-or-handle]
+   (bound-program-dispatch sess prog-or-handle nil))
+  ([sess prog-or-handle step-selector]
+   (let [program (resolve-program sess prog-or-handle)]
+     (assoc (select-dispatch-step (:descriptor program) step-selector)
+            :descriptor (:descriptor program)))))
+
+(defn- physical-program-step-arguments
+  [step logical-arguments]
+  (if-not (:logical-bindings? step)
+    logical-arguments
+    (vec
+     (mapcat (fn [spec value]
+               (if (= :scalar (:kind spec))
+                 [value]
+                 (let [slots (:slots spec)]
+                   (when-not (= 1 (count slots))
+                     (throw (ex-info
+                             "offline dispatch tuning cannot project a multi-slot logical resident binding"
+                             {:reason :program-dispatch-multislot-logical-binding
+                              :phase (:phase step) :binding (:binding spec) :slots slots})))
+                   [value])))
+             (:argument-specs step) logical-arguments))))
+
+(defn program-dispatch-arguments
+  "Project one compiled dispatch step onto a bound program's resident buffers.
+
+   `program-arguments` follow the descriptor's :all-params order, just like bind-program!. The
+   returned :arguments are in the selected alternatives' physical ABI order and contain stable
+   session buffer keys plus typed scalar values. :reference-inputs retains the corresponding host
+   buffers and a scalar environment (including compiler scalar lets) for an independent evaluator.
+   Multi-slot logical SoA bindings fail explicitly until the resident program binder models their
+   field allocations as stable views."
+  ([sess prog-or-handle program-arguments]
+   (program-dispatch-arguments sess prog-or-handle nil program-arguments))
+  ([sess prog-or-handle step-selector program-arguments]
+   (let [program (resolve-program sess prog-or-handle)
+         descriptor (:descriptor program)
+         {:keys [step-index step dispatch] :as selected}
+         (select-dispatch-step descriptor step-selector)
+         all-params (:all-params descriptor)
+         _argument-count
+         (when-not (and (sequential? program-arguments)
+                        (= (count all-params) (count program-arguments)))
+           (throw (ex-info "program dispatch arguments must follow descriptor :all-params"
+                           {:reason :program-dispatch-argument-count
+                            :expected (count all-params)
+                            :actual (when (sequential? program-arguments)
+                                      (count program-arguments))
+                            :all-params all-params})))
+         argmap (zipmap all-params program-arguments)
+         key-of (fn [sym]
+                  (or (get (:param->key program) sym)
+                      (get (:alloc->key program) sym)
+                      (keyword (name sym))))
+         capacity-of (fn [key]
+                       (or (get (:buffer-capacities program) key)
+                           (get-in @sess [:buffers key :n-elements])))
+         require-capacity!
+         (fn [sym required]
+           (let [key (key-of sym)
+                 capacity (capacity-of key)]
+             (when (and (some? capacity) (> (long required) (long capacity)))
+               (throw (ex-info "compiled dispatch sample exceeds its resident buffer capacity"
+                               {:reason :program-dispatch-buffer-capacity
+                                :step-index step-index :phase (:phase step)
+                                :sym sym :key key
+                                :required-elements (long required)
+                                :capacity-elements (long capacity)})))))
+         _array-capacities
+         (doseq [sym (:array-params descriptor)]
+           (let [array (get argmap sym)]
+             (when-not (and array (.isArray (class array)))
+               (throw (ex-info "compiled dispatch array parameter must remain a JVM array"
+                               {:reason :program-dispatch-array-argument
+                                :sym sym :value-type (some-> array class)})))
+             (require-capacity! sym (java.lang.reflect.Array/getLength array))))
+         _scratch-capacities
+         (doseq [{:keys [sym size-fn]} (:allocs descriptor)]
+           (require-capacity! sym (size-fn program-arguments)))
+         logical-arguments
+         (mapv (fn [{:keys [kind sym type value-fn]}]
+                 (if (= :scalar kind)
+                   {:type type :value (value-fn program-arguments)}
+                   (let [key (key-of sym)]
+                     (when-not (contains? (:buffers @sess) key)
+                       (throw (ex-info "compiled dispatch argument has no live resident buffer"
+                                       {:reason :program-dispatch-buffer-not-resident
+                                        :step-index step-index :phase (:phase step)
+                                        :sym sym :key key})))
+                     key)))
+               (:argument-specs step))
+         arguments (physical-program-step-arguments step logical-arguments)
+         _abi (kabi/validate-arguments! (:abi (kdispatch/default-artifact dispatch)) arguments)
+         resident-bindings
+         (into {}
+               (keep (fn [[{:keys [kind sym]} value]]
+                       (when-not (= :scalar kind) [sym value])))
+               (map vector (:argument-specs step) logical-arguments))
+         direct-scalars (select-keys argmap (:scalar-params descriptor))
+         derived-scalars
+         (reduce (fn [bindings [{:keys [kind expression slot]} value]]
+                   (if (= :scalar kind)
+                     (let [raw (:value value)
+                           slot-name (:name slot)]
+                       (cond-> bindings
+                         slot-name (assoc slot-name raw)
+                         (symbol? expression) (assoc expression raw)))
+                     bindings))
+                 {}
+                 (map vector (:argument-specs step) logical-arguments))]
+     (assoc selected
+            :descriptor descriptor
+            :arguments arguments
+            :resident-bindings resident-bindings
+            :reference-inputs
+            {:buffers (select-keys argmap (:array-params descriptor))
+             :scalars (merge direct-scalars derived-scalars)}))))
 
 (defn run-program!
   "Replay a bound resident GPU program: refresh ONLY the :input array params (buffer POINTERS are

@@ -5,9 +5,11 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as fuse]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.reference.segmented-weighted-reduction :as reference]
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gsdm :as gsdm]
+            [raster.gpu.core :as gpu]
             [raster.numeric]))
 
 (defn- chain
@@ -188,6 +190,59 @@
     (is (= :indexed-segmented-reduction-subgroup-score-reuse
            (kdispatch/artifact-strategy
             (kdispatch/select-artifact (:dispatch step) (arguments-for wide)))))))
+
+(deftest compiled-dispatch-projects-resident-abi-and-reference-environment
+  (let [descriptor (pipeline/compile-gpu-program
+                    #'resident-structured-reduction-probe :ze:0 :dtype :float)
+        args [(float-array 15) (float-array 15) (float-array 15)
+              (long-array 4) (long-array 4) 3 4 5 2]
+        param->key (into {} (map (fn [sym] [sym (keyword (str "resident-" (name sym)))]))
+                         (:array-params descriptor))
+        alloc->key (into {} (map (fn [{:keys [sym]}] [sym (keyword (str "scratch-" (name sym)))])
+                                 (:allocs descriptor)))
+        buffers (into {} (map (fn [key] [key (Object.)]))
+                      (concat (vals param->key) (vals alloc->key)))
+        capacities
+        (merge (into {} (map (fn [sym]
+                               [(param->key sym)
+                                (alength (get (zipmap (:all-params descriptor) args) sym))]))
+                     (:array-params descriptor))
+               (into {} (map (fn [{:keys [sym size-fn]}]
+                               [(alloc->key sym) (size-fn args)]))
+                     (:allocs descriptor)))
+        session (atom {:programs {:probe {:descriptor descriptor
+                                          :param->key param->key
+                                          :alloc->key alloc->key
+                                          :buffer-capacities capacities}}
+                       :buffers buffers})
+        projected (gpu/program-dispatch-arguments session descriptor args)
+        contract (get-in projected [:dispatch :attributes :tuning])
+        expected (reference/evaluate (get-in contract [:reference :plan])
+                                     (:reference-inputs projected))]
+    (is (= 0 (:step-index projected)))
+    (is (= (mapv param->key (take 5 (:array-params descriptor)))
+           (subvec (:arguments projected) 0 5)))
+    (is (= (alloc->key (:result-sym descriptor)) (nth (:arguments projected) 5)))
+    (is (= (alloc->key (:result-sym descriptor))
+           (get-in projected [:resident-bindings (:result-sym descriptor)])))
+    (is (= [3 4 5 2 2 15]
+           (mapv :value (subvec (:arguments projected) 6))))
+    (is (identical? (first args)
+                    (get-in projected [:reference-inputs :buffers 'Q])))
+    (is (= {'n-nodes 3 'n-edges 4 'emb-dim 5 'n-heads 2 'dk 2}
+           (select-keys (get-in projected [:reference-inputs :scalars])
+                        '[n-nodes n-edges emb-dim n-heads dk])))
+    (is (= [:segmented-weighted-reduction :measured-selector]
+           (:schedule-path contract)))
+    (is (= :segmented-weighted-reduction (get-in contract [:reference :kind])))
+    (is (= :float (get-in contract [:numerical-mode :accumulate])))
+    (is (= :indexed-dense-values (get-in contract [:layout :storage :kind])))
+    (is (= :edge-list-by-destination (get-in contract [:layout :membership :kind])))
+    (is (= 15 (alength ^doubles expected)))
+    (is (every? zero? expected))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"exceeds its resident buffer capacity"
+         (gpu/program-dispatch-arguments session descriptor (assoc args 7 512))))))
 
 (deftest actual-gsdm-region-reaches-generic-structured-reduction-stage
   (let [diagnostic (pipeline/show-pipeline
