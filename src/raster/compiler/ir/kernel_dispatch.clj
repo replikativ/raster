@@ -1,11 +1,11 @@
 (ns raster.compiler.ir.kernel-dispatch
-  "A verified runtime choice among ABI-compatible emitted kernels.
+  "A verified runtime choice among ABI-compatible kernel executables.
 
-   KernelArtifact remains one entry point. KernelDispatch is the scheduling value above it: every
-   alternative implements the same logical call and differs only in emitted schedule/geometry.
-   Selection is pure data evaluated after symbolic ABI scalars become concrete and before a
-   backend binder sees a KernelCall."
-  (:require [raster.compiler.ir.kernel-artifact :as kart]))
+   An alternative may be one KernelArtifact or an emitted KernelGraph. KernelDispatch is the
+   scheduling value above both: every alternative implements the same logical call and differs
+   only in its emitted schedule. Selection is pure data evaluated after symbolic ABI scalars
+   become concrete and before a backend binder sees the selected executable."
+  (:require [raster.compiler.ir.kernel-executable :as kexec]))
 
 (defrecord KernelDispatch
            [id
@@ -21,13 +21,13 @@
   (and x (= "raster.compiler.ir.kernel_dispatch.KernelDispatch"
             (.getName (class x)))))
 
-(defn artifact-strategy
-  [artifact]
-  (get-in (kart/validate! artifact) [:attributes :strategy]))
+(defn alternative-strategy
+  [alternative]
+  (kexec/strategy alternative))
 
 (defn- strategy-map
   [alternatives]
-  (into {} (map (juxt artifact-strategy identity)) alternatives))
+  (into {} (map (juxt alternative-strategy identity)) alternatives))
 
 (defn- finite-number?
   [value]
@@ -90,7 +90,8 @@
   "Validate a dispatch and return it unchanged.
 
    Alternatives must have unique strategy identities and identical target, ABI, compiler argument
-   order, temporaries and effects. Their source and launch geometry may differ—that is the point."
+   order, and logical effects. Their entry points, launch geometry, graph topology, and private
+   temporaries may differ—that is the point."
   [dispatch]
   (when-not (kernel-dispatch? dispatch)
     (throw (ex-info "kernel dispatch must be a KernelDispatch value"
@@ -101,28 +102,36 @@
     (when-not (and (vector? alternatives) (seq alternatives))
       (throw (ex-info "kernel dispatch requires an ordered non-empty alternative vector"
                       {:id id :alternatives alternatives})))
-    (doseq [artifact alternatives] (kart/validate! artifact))
-    (let [strategies (mapv artifact-strategy alternatives)
+    (doseq [alternative alternatives] (kexec/validate! alternative))
+    (let [strategies (mapv alternative-strategy alternatives)
           strategy-set (set strategies)
-          kernel-names (mapv :kernel-name alternatives)
           common (first alternatives)
-          common-view (select-keys common [:target :abi :arguments :temporaries :effects])]
+          common-view (kexec/common-view common)
+          named-artifacts (mapcat (fn [alternative]
+                                    (map (juxt :kernel-name identity)
+                                         (kexec/artifacts alternative)))
+                                  alternatives)]
       (when-not (every? keyword? strategies)
         (throw (ex-info "every kernel dispatch alternative requires a keyword :strategy"
                         {:id id :strategies strategies})))
       (when-not (= (count strategies) (count strategy-set))
         (throw (ex-info "kernel dispatch alternative strategies must be unique"
                         {:id id :strategies strategies})))
-      (when-not (= (count kernel-names) (count (set kernel-names)))
-        (throw (ex-info "kernel dispatch alternatives must have unique emitted entry points"
-                        {:id id :kernel-names kernel-names})))
-      (doseq [artifact (rest alternatives)]
-        (when-not (= common-view
-                     (select-keys artifact [:target :abi :arguments :temporaries :effects]))
+      (doseq [alternative (rest alternatives)]
+        (when-not (= common-view (kexec/common-view alternative))
           (throw (ex-info "kernel dispatch alternatives must share target, ABI and logical effects"
                           {:id id
-                           :common-kernel (:kernel-name common)
-                           :different-kernel (:kernel-name artifact)}))))
+                           :common-strategy (alternative-strategy common)
+                           :different-strategy (alternative-strategy alternative)}))))
+      ;; Graph schedules may deliberately share entry points. Reuse is legal only when the name
+      ;; denotes the same emitted module/signature; otherwise backend registration is ambiguous.
+      (doseq [[kernel-name entries] (group-by first named-artifacts)]
+        (let [implementations (set (map (fn [[_ artifact]]
+                                          (select-keys artifact [:target :source :abi :arguments]))
+                                        entries))]
+          (when-not (= 1 (count implementations))
+            (throw (ex-info "kernel dispatch reuses an entry point for conflicting modules"
+                            {:id id :kernel-name kernel-name})))))
       (when-not (contains? strategy-set default-strategy)
         (throw (ex-info "kernel dispatch default strategy is absent"
                         {:id id :default default-strategy :strategies strategy-set})))
@@ -139,8 +148,8 @@
   (validate!
    (->KernelDispatch id alternatives default-strategy selector provenance attributes)))
 
-(defn artifact
-  "Return the artifact implementing `strategy`, or throw with the legal strategy set."
+(defn alternative
+  "Return the executable implementing `strategy`, or throw with the legal strategy set."
   [dispatch strategy]
   (let [dispatch (validate! dispatch)
         alternatives (strategy-map (:alternatives dispatch))]
@@ -149,10 +158,10 @@
                         {:id (:id dispatch) :strategy strategy
                          :strategies (set (keys alternatives))})))))
 
-(defn default-artifact
+(defn default-alternative
   [dispatch]
   (let [dispatch (validate! dispatch)]
-    (artifact dispatch (:default-strategy dispatch))))
+    (alternative dispatch (:default-strategy dispatch))))
 
 (defn with-selector
   "Return `dispatch` with a replacement selector, revalidating it against the common ABI and
@@ -164,20 +173,20 @@
   [value]
   (if (and (map? value) (contains? value :value)) (:value value) value))
 
-(defn select-artifact
-  "Select an artifact from concrete ABI-ordered values.
+(defn select-alternative
+  "Select an executable alternative from concrete ABI-ordered values.
 
    `override` is nil/:auto for data-driven selection or an explicit alternative strategy. The
    runtime threshold selector is intentionally generic: it knows only a compiler argument and a
    numeric crossover, not which model operation produced them."
-  ([dispatch runtime-arguments] (select-artifact dispatch runtime-arguments nil))
+  ([dispatch runtime-arguments] (select-alternative dispatch runtime-arguments nil))
   ([dispatch runtime-arguments override]
    (let [dispatch (validate! dispatch)]
      (if (and override (not= :auto override))
-       (artifact dispatch override)
+       (alternative dispatch override)
        (let [{:keys [kind argument threshold at-least otherwise ranges below]}
              (:selector dispatch)
-             common-arguments (:arguments (default-artifact dispatch))
+             common-arguments (kexec/arguments (default-alternative dispatch))
              indexes (keep-indexed (fn [index value] (when (= argument value) index))
                                    common-arguments)]
          (when-not (= 1 (count indexes))
@@ -192,7 +201,7 @@
            (when-not (number? value)
              (throw (ex-info "kernel dispatch selector requires a numeric runtime scalar"
                              {:id (:id dispatch) :argument argument :value value})))
-           (artifact
+           (alternative
             dispatch
             (case kind
               :runtime-scalar-threshold

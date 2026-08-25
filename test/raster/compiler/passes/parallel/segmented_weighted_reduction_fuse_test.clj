@@ -136,11 +136,11 @@
            (mapv (comp :kind :slot) (:argument-specs step))))
     (is (= [1 3] (get-in call [:geometry :group-count])))
     (is (= :indexed-segmented-reduction-reference
-           (kdispatch/artifact-strategy
-            (kdispatch/select-artifact (:dispatch step) call-arguments))))
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative (:dispatch step) call-arguments))))
     (is (= :indexed-segmented-reduction-subgroup-score-reuse
-           (kdispatch/artifact-strategy
-            (kdispatch/select-artifact (:dispatch step) wide-call-arguments))))
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative (:dispatch step) wide-call-arguments))))
     (is (= (:sym (first (:allocs descriptor))) (:result-sym descriptor)))))
 
 (deftest compiler-schedule-can-pin-either-dispatch-alternative
@@ -187,11 +187,11 @@
     (is (= selector (get-in step [:dispatch :selector])))
     (is (= :measured-runtime-shape (get-in step [:dispatch :attributes :selection])))
     (is (= :indexed-segmented-reduction-reference
-           (kdispatch/artifact-strategy
-            (kdispatch/select-artifact (:dispatch step) (arguments-for narrow)))))
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative (:dispatch step) (arguments-for narrow)))))
     (is (= :indexed-segmented-reduction-subgroup-score-reuse
-           (kdispatch/artifact-strategy
-            (kdispatch/select-artifact (:dispatch step) (arguments-for wide)))))))
+           (kdispatch/alternative-strategy
+            (kdispatch/select-alternative (:dispatch step) (arguments-for wide)))))))
 
 (deftest compiled-dispatch-projects-resident-abi-and-reference-environment
   (let [descriptor (pipeline/compile-gpu-program

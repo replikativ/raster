@@ -36,7 +36,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
-            [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
@@ -1154,74 +1154,81 @@
    The graph owns its temporary allocations and dedicated bound kernel handles. Binding validates
    the complete graph call, lowers dependencies to logical queue/event edges, then records a
    conservative dependency-safe sequence. Current backends map the logical plan to one in-order
-   compute queue; submit-kernel-graph! exposes asynchronous completion without native handles."
-  [sess graph-key graph buffer-keys scalar-values]
-  (let [{:keys [device-id closed?]} @sess
-        graph (kgraph/validate! graph)
-        external-ids (external-graph-buffer-ids graph)]
-    (when closed?
-      (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
-    (when-not (= external-ids (set (keys buffer-keys)))
-      (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
-                      {:expected external-ids :bound (set (keys buffer-keys))})))
-    (let [graph-buffer-by-id (into {} (map (juxt :id identity))
-                                   (concat (:inputs graph) (:outputs graph)))
-          external-bindings (into {}
-                                  (map (fn [[id key-or-view]]
-                                         [id (resolve-resident-binding sess key-or-view)]))
-                                  buffer-keys)
-          _ (doseq [[id {:keys [view]}] external-bindings]
-              (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
-          _ (validate-physical-aliases! graph external-bindings)
-          _ (release-graph-events! sess graph-key)
-          temporary-specs (kgcall/temporary-specs graph scalar-values)
-          temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
-          owned-view-buffers (volatile! [])
-          prepareds (volatile! [])
-          runtime-graph (volatile! nil)]
-      (try
-        (let [{:keys [buffers] :as materialized}
-              (materialize-external-buffers! device-id external-bindings)
-              _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
-              all-buffers (merge buffers temporary-buffers)
-              register! (rt-resolve device-id "register-kernel!")
-              bind-call! (rt-resolve device-id "bind-kernel-call")
-              record! (rt-resolve device-id "record-graph!")
-              graph-call (kgcall/make graph all-buffers scalar-values)
-              execution-plan (execution/from-kernel-graph-call graph-call)]
-          (doseq [node (:nodes graph)]
-            (let [artifact (:operation node)]
-              (register! (:kernel-name artifact) artifact)))
-          (doseq [node-call (:nodes graph-call)]
-            (let [prepared (assoc (bind-call! (:call node-call))
-                                  :phase (:id node-call))]
-              (vswap! prepareds conj prepared)))
+   compute queue; submit-kernel-graph! exposes asynchronous completion without native handles.
+
+   Option :profile? records device timestamp events for explicit offline measurement."
+  ([sess graph-key graph buffer-keys scalar-values]
+   (bind-kernel-graph! sess graph-key graph buffer-keys scalar-values {}))
+  ([sess graph-key graph buffer-keys scalar-values {:keys [profile?]
+                                                    :or {profile? false}}]
+   (let [{:keys [device-id closed?]} @sess
+         graph (kexec/validate! graph)
+         external-ids (external-graph-buffer-ids graph)]
+     (when closed?
+       (throw (ex-info "cannot bind a kernel graph in a closed GPU session" {:key graph-key})))
+     (when-not (= external-ids (set (keys buffer-keys)))
+       (throw (ex-info "kernel graph external bindings differ from graph inputs/outputs"
+                       {:expected external-ids :bound (set (keys buffer-keys))})))
+     (let [graph-buffer-by-id (into {} (map (juxt :id identity))
+                                    (concat (:inputs graph) (:outputs graph)))
+           external-bindings (into {}
+                                   (map (fn [[id key-or-view]]
+                                          [id (resolve-resident-binding sess key-or-view)]))
+                                   buffer-keys)
+           _ (doseq [[id {:keys [view]}] external-bindings]
+               (validate-external-view! (get graph-buffer-by-id id) view scalar-values))
+           _ (validate-physical-aliases! graph external-bindings)
+           _ (release-graph-events! sess graph-key)
+           temporary-specs (kgcall/temporary-specs graph scalar-values)
+           temporary-buffers (alloc-buffers-transactional temporary-specs device-id)
+           owned-view-buffers (volatile! [])
+           prepareds (volatile! [])
+           runtime-graph (volatile! nil)]
+       (try
+         (let [{:keys [buffers] :as materialized}
+               (materialize-external-buffers! device-id external-bindings)
+               _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
+               all-buffers (merge buffers temporary-buffers)
+               register! (rt-resolve device-id "register-kernel!")
+               bind-call! (rt-resolve device-id "bind-kernel-call")
+               record! (rt-resolve device-id "record-graph!")
+               graph-call (kgcall/make graph all-buffers scalar-values)
+               execution-plan (execution/from-kernel-graph-call graph-call)]
+           (doseq [node (:nodes graph)]
+             (let [artifact (:operation node)]
+               (register! (:kernel-name artifact) artifact)))
+           (doseq [node-call (:nodes graph-call)]
+             (let [prepared (assoc (bind-call! (:call node-call))
+                                   :phase (:id node-call))]
+               (vswap! prepareds conj prepared)))
           ;; Graph verification proves every dependency names an earlier node and every hazard is
           ;; represented. Serial recording is therefore a safe implementation of that partial
           ;; order on today's single in-order compute queues; the logical plan retains the DAG.
-          (vreset! runtime-graph (record! @prepareds {:barriers? true}))
-          (let [entry {:graph-call graph-call
-                       :execution-plan execution-plan
-                       :runtime-graph @runtime-graph
+           (vreset! runtime-graph (record! @prepareds (cond-> {:barriers? true}
+                                                        profile? (assoc :profile? true))))
+           (let [entry {:graph-call graph-call
+                        :execution-plan execution-plan
+                        :runtime-graph @runtime-graph
+                        :prepareds @prepareds
+                        :owned-view-buffers @owned-view-buffers
+                        :temporary-buffers temporary-buffers
+                        :buffer-keys buffer-keys
+                        :resident-views (into {} (map (fn [[id binding]]
+                                                        [id (:resident binding)]))
+                                              external-bindings)
+                        :outputs (select-keys all-buffers (map :id (:outputs graph)))
+                        :profile? (boolean profile?)}
+                 old (get-in @sess [:kernel-graphs graph-key])]
+             (swap! sess assoc-in [:kernel-graphs graph-key] entry)
+             (when old (destroy-kernel-graph-entry! device-id old))
+             (->KernelGraphHandle graph-key)))
+         (catch Exception e
+           (destroy-kernel-graph-entry!
+            device-id {:runtime-graph @runtime-graph
                        :prepareds @prepareds
                        :owned-view-buffers @owned-view-buffers
-                       :temporary-buffers temporary-buffers
-                       :buffer-keys buffer-keys
-                       :resident-views (into {} (map (fn [[id binding]]
-                                                       [id (:resident binding)]))
-                                             external-bindings)
-                       :outputs (select-keys all-buffers (map :id (:outputs graph)))}
-                old (get-in @sess [:kernel-graphs graph-key])]
-            (swap! sess assoc-in [:kernel-graphs graph-key] entry)
-            (when old (destroy-kernel-graph-entry! device-id old))
-            (->KernelGraphHandle graph-key)))
-        (catch Exception e
-          (destroy-kernel-graph-entry!
-           device-id {:runtime-graph @runtime-graph
-                      :prepareds @prepareds
-                      :owned-view-buffers @owned-view-buffers
-                      :temporary-buffers temporary-buffers})
-          (throw e))))))
+                       :temporary-buffers temporary-buffers})
+           (throw e)))))))
 
 (defn bind-kernel-call!
   "Bind one emitted KernelArtifact over session-resident arguments as a replayable graph.
@@ -1304,6 +1311,29 @@
                        :owned-view-buffers @owned-view-buffers
                        :temporary-buffers {}})
            (throw e)))))))
+
+(defn bind-kernel-executable!
+  "Bind one KernelArtifact or emitted KernelGraph through its common ordered external ABI.
+
+   Graph alternatives project pointer arguments to external GraphBuffer identities and typed
+   scalar arguments to the graph's symbolic scalar environment. Graph-owned temporaries and
+   derived bounds stay private. :group-count is meaningful only for a single artifact."
+  ([sess executable-key executable arguments]
+   (bind-kernel-executable! sess executable-key executable arguments {}))
+  ([sess executable-key executable arguments {:keys [group-count] :as options}]
+   (let [executable (kexec/validate! executable)]
+     (case (kexec/kind executable)
+       :kernel-artifact
+       (bind-kernel-call! sess executable-key executable arguments options)
+
+       :kernel-graph
+       (do
+         (when group-count
+           (throw (ex-info "group-count cannot override a multi-kernel graph schedule"
+                           {:key executable-key :group-count group-count})))
+         (let [{:keys [buffers scalar-values]} (kexec/graph-bindings executable arguments)]
+           (bind-kernel-graph! sess executable-key executable buffers scalar-values
+                               (select-keys options [:profile?]))))))))
 
 (defn kernel-graph-execution-plan
   "Return the pure backend-neutral queue/event plan for a bound KernelGraph."
@@ -1418,7 +1448,7 @@
                  (rt-resolve device-id "expand-pointer-binding"))
                 logical-or-physical-args)
               selected-artifact (if-let [dispatch (:dispatch step)]
-                                  (kdispatch/select-artifact dispatch ordered-args)
+                                  (kdispatch/select-alternative dispatch ordered-args)
                                   artifact)
               call (kcall/make selected-artifact ordered-args
                                (if (= :reduce convention) {:group-count [1]} {}))
@@ -1940,7 +1970,7 @@
                         (rt-resolve device-id "expand-pointer-binding"))
                        logical-or-physical-args)
                      selected-artifact (if-let [dispatch (:dispatch step)]
-                                         (kdispatch/select-artifact
+                                         (kdispatch/select-alternative
                                           dispatch ordered-args reduction-strategy)
                                          artifact)
                      call (kcall/make selected-artifact ordered-args
@@ -2185,7 +2215,7 @@
                      key)))
                (:argument-specs step))
          arguments (physical-program-step-arguments step logical-arguments)
-         _abi (kabi/validate-arguments! (:abi (kdispatch/default-artifact dispatch)) arguments)
+         _abi (kabi/validate-arguments! (:abi (kdispatch/default-alternative dispatch)) arguments)
          resident-bindings
          (into {}
                (keep (fn [[{:keys [kind sym]} value]]

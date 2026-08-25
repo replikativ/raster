@@ -390,6 +390,8 @@
     (kgraph/make
      {:inputs (mapv graph-buffer inputs)
       :outputs [(graph-buffer output)]
+      :abi (:abi artifact)
+      :arguments (:arguments artifact)
       :nodes [(kgraph/->ScheduledKernel node-id artifact uses [])]
       :effects {:kind :attention :logical-visibility true :ordered-page-routing true}
       :provenance {:operation-id id :semantic-op :attention}

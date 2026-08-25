@@ -1,10 +1,13 @@
 (ns raster.gpu.dispatch-benchmark-device-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-benchmark :as benchmark]
@@ -95,6 +98,64 @@
     (is (every? #(true? (get-in % [:validation :passed?])) (:measurements result)))
     (is (= :runtime-scalar-ranges (get-in result [:selector :kind])))))
 
+(defn- scan-graph
+  []
+  (let [node (soac/par-form->soac
+              'scan-result
+              '(raster.par/scan out acc 0.0 i n float (+ acc (aget values i)))
+              175)
+        operations (lower/lower-scan node nil :dtype :float)]
+    (emit/generate-scan-kernel-graph
+     (lower/scan-kernel-graph
+      node operations {:array-types {'values :float 'out :float}}))))
+
+(defn- tune-scan-graph!
+  [device-id]
+  (let [n 1025
+        graph (scan-graph)
+        strategy (get-in graph [:attributes :strategy])
+        graph-dispatch
+        (kdispatch/make
+         {:id "device-scan-graph-dispatch"
+          :alternatives [graph]
+          :default-strategy strategy
+          :selector {:kind :runtime-scalar-threshold :argument 'n :threshold 2
+                     :at-least strategy :otherwise strategy}})]
+    (binding [cache/*cache-root* (temporary-cache-root)]
+      (gpu/with-gpu-session*
+        device-id
+        (fn [session]
+          (gpu/alloc! session {:values [:float n (float-array n 1.0)]
+                               :out [:float n nil]})
+          (benchmark/tune-dispatch!
+           session graph-dispatch (hardware/descriptor-for device-id) [n]
+           (fn [runtime-n]
+             {:arguments [:values :out {:type :int :value runtime-n}]
+              :validate!
+              (fn [_]
+                (let [actual ^floats (gpu/download session :out)
+                      max-error
+                      (reduce max 0.0
+                              (map-indexed
+                               (fn [index value]
+                                 (Math/abs (- (double value) (double (inc index)))))
+                               actual))]
+                  {:passed? (< max-error 1.0e-5)
+                   :oracle-hash "inclusive-scan-f32-v1"
+                   :max-error max-error}))
+              :measurement {:warmup-iterations 0 :budget-ms 1
+                            :min-samples 3 :max-samples 5 :cv-threshold 100.0}})
+           :numerical-mode {:input :f32 :accumulate :f32 :output :f32}
+           :layout {:input :contiguous :output :contiguous}
+           :force? true))))))
+
+(defn- assert-graph-tuning!
+  [device-id]
+  (let [result (tune-scan-graph! device-id)]
+    (is (= 1 (count (:measurements result))))
+    (is (true? (get-in result [:measurements 0 :validation :passed?])))
+    (is (= :runtime-scalar-ranges (get-in result [:selector :kind])))))
+
 (deftest level-zero-validates-and-measures-emitted-dispatch-alternatives
   (if-not @gpu-probe/gpu-available?
     (gpu-probe/gpu-skip! "validated KernelDispatch benchmark on Level Zero")
@@ -104,3 +165,13 @@
   (if-not @opencl-available?
     (is true "OpenCL device unavailable")
     (assert-device-tuning! :ocl:0)))
+
+(deftest level-zero-validates-and-measures-a-multi-kernel-dispatch-alternative
+  (if-not @gpu-probe/gpu-available?
+    (gpu-probe/gpu-skip! "validated multi-kernel dispatch benchmark on Level Zero")
+    (assert-graph-tuning! :ze:0)))
+
+(deftest opencl-validates-and-measures-a-multi-kernel-dispatch-alternative
+  (if-not @opencl-available?
+    (is true "OpenCL device unavailable")
+    (assert-graph-tuning! :ocl:0)))

@@ -596,8 +596,35 @@
               :temporaries []
               :effects {:kind :scan-stage :phase phase}
               :provenance {:dialect :segscan :segop-id (:id operation) :graph-node id}
-              :attributes {:phase phase :dtype dtype :scan-workgroup scan-workgroup}})))]
-    (-> (kgraph/map-operations graph emit-node)
+              :attributes {:phase phase :dtype dtype :scan-workgroup scan-workgroup}})))
+        emitted (kgraph/map-operations graph emit-node)
+        external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
+        scalar-pairs (->> (:nodes emitted)
+                          (mapcat (fn [node]
+                                    (map vector (get-in node [:operation :abi])
+                                         (get-in node [:operation :arguments]))))
+                          (filter (fn [[slot argument]]
+                                    (and (= :scalar (:kind slot)) (symbol? argument))))
+                          vec)
+        scalar-groups (group-by second scalar-pairs)
+        _ (doseq [[argument pairs] scalar-groups]
+            (when-not (apply = (map (comp :kernel-dtype first) pairs))
+              (throw (ex-info "scan graph scalar has inconsistent emitted ABI dtypes"
+                              {:argument argument :slots (mapv first pairs)}))))
+        pointer-abi (mapv (fn [{:keys [id dtype role]}]
+                            (kabi/slot id (if (= :input role) :input :output) dtype))
+                          external-buffers)
+        scalar-arguments (vec (sort-by name (keys scalar-groups)))
+        scalar-abi (mapv (fn [argument]
+                           (let [slots (mapv first (get scalar-groups argument))
+                                 dtype (:kernel-dtype (first slots))
+                                 role (if (some #(= :bound (:role %)) slots)
+                                        :bound :parameter)]
+                             (kabi/slot argument :scalar dtype :role role)))
+                         scalar-arguments)]
+    (-> emitted
+        (assoc :abi (vec (concat pointer-abi scalar-abi))
+               :arguments (vec (concat (map :id external-buffers) scalar-arguments)))
         (assoc-in [:provenance :target-dialect] :opencl-c)
         (assoc-in [:attributes :emitted?] true)
         kgraph/validate!)))

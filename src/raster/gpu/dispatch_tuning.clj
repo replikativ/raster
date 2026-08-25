@@ -2,17 +2,18 @@
   "Explicit offline autotuning for a KernelDispatch.
 
    Compilation and runtime selection never benchmark. This namespace measures already-emitted,
-   ABI-compatible alternatives through a caller-supplied validated benchmark, converts winners at
-   sampled runtime scalar values into a piecewise selector, and atomically caches that selector.
+   ABI-compatible executable alternatives through a caller-supplied validated benchmark, converts
+   winners at sampled runtime scalar values into a piecewise selector, and atomically caches it.
    Applying a result rechecks the full identity: device, emitted sources, ABI, numerical mode, and
    layout. A stale or cross-device result therefore cannot silently select a kernel."
   (:require [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.tuning-cache :as cache])
   (:import [java.nio.charset StandardCharsets]
            [java.security MessageDigest]))
 
-(def tuning-version 1)
+(def tuning-version 2)
 
 (defrecord DispatchTuning
            [key identity selector measurements])
@@ -39,16 +40,37 @@
     (sequential? value) (mapv canonical-data value)
     :else value))
 
-(defn artifact-signature
-  "Stable correctness/performance identity of one emitted alternative."
-  [artifact]
-  {:strategy (kdispatch/artifact-strategy artifact)
-   :target (:target artifact)
-   :kernel-name (:kernel-name artifact)
-   :source-hash (sha256 (:source artifact))
-   :abi-hash (sha256 (pr-str (canonical-data (:abi artifact))))
-   :arguments-hash (sha256 (pr-str (:arguments artifact)))
-   :effects-hash (sha256 (pr-str (canonical-data (:effects artifact))))})
+(defn executable-signature
+  "Stable correctness/performance identity of one emitted executable alternative.
+
+   For a graph, the source hash covers node order, dependencies, uses, launch contracts, private
+   buffers, and every emitted module. A schedule change therefore cannot reuse stale tuning data
+   merely because its public ABI stayed constant."
+  [executable]
+  (let [executable (kexec/validate! executable)
+        graph? (= :kernel-graph (kexec/kind executable))
+        schedule (if graph?
+                   {:buffers {:inputs (:inputs executable)
+                              :outputs (:outputs executable)
+                              :temporaries (:temporaries executable)}
+                    :nodes (mapv (fn [node]
+                                   {:id (:id node)
+                                    :uses (:uses node)
+                                    :dependencies (:dependencies node)
+                                    :artifact (select-keys (:operation node)
+                                                           [:kernel-name :target :source :abi
+                                                            :arguments :launch :temporaries])})
+                                 (:nodes executable))}
+                   (select-keys executable
+                                [:kernel-name :target :source :launch :temporaries]))]
+    {:kind (kexec/kind executable)
+     :strategy (kdispatch/alternative-strategy executable)
+     :target (kexec/target executable)
+     :entry-points (kexec/entry-points executable)
+     :source-hash (sha256 (pr-str (canonical-data schedule)))
+     :abi-hash (sha256 (pr-str (canonical-data (kexec/abi executable))))
+     :arguments-hash (sha256 (pr-str (kexec/arguments executable)))
+     :effects-hash (sha256 (pr-str (canonical-data (kexec/effects executable))))}))
 
 (defn- device-signature
   [descriptor]
@@ -80,7 +102,7 @@
       :layout layout
       :policy {:runtime-values (vec runtime-values)
                :improvement-threshold (double improvement-threshold)}
-      :artifacts (mapv artifact-signature (:alternatives dispatch))})))
+      :alternatives (mapv executable-signature (:alternatives dispatch))})))
 
 (defn cache-key
   [identity]
@@ -122,9 +144,9 @@
    :budget-ms :cold-warm :timing-source :compile-ms :hashes])
 
 (defn- validate-benchmark-result!
-  [artifact runtime-value result]
+  [executable runtime-value result]
   (let [{:keys [measurement validation]} result
-        signature (artifact-signature artifact)]
+        signature (executable-signature executable)]
     (when-not (measurement/measurement? measurement)
       (throw (ex-info "dispatch benchmark must return a Measurement"
                       {:runtime-value runtime-value
@@ -194,10 +216,10 @@
   "Measure, validate, and cache a generic KernelDispatch selector OFFLINE.
 
    `runtime-values` are concrete numeric samples for the dispatch selector argument.
-   `benchmark-fn` is called as (benchmark-fn artifact runtime-value) and must return:
+   `benchmark-fn` is called as (benchmark-fn executable runtime-value) and must return:
 
      {:measurement Measurement
-      :validation {:passed? true :oracle-hash string :candidate-hash artifact-source-hash ...}}
+      :validation {:passed? true :oracle-hash string :candidate-hash executable-source-hash ...}}
 
    Correctness is therefore established before a timing can influence selection. Every result
    must be stationary and device-event timed. A candidate must improve on the dispatch default by

@@ -1850,7 +1850,7 @@
                                                              {:dispatch-id dispatch-id}))))
                               dispatch (when dispatch (kdispatch/validate! dispatch))
                               artifact (if dispatch
-                                         (kdispatch/default-artifact dispatch)
+                                         (kdispatch/default-alternative dispatch)
                                          (reg-entry kernel-name))
                               _ (when (and dispatch
                                            (not= kernel-name (:kernel-name artifact)))

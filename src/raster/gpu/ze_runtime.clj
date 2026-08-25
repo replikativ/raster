@@ -3599,13 +3599,13 @@
                                      {:dispatch-id dispatch-id
                                       :registered (keys @kernel-dispatch-registry)})))
         dispatch (kdispatch/validate! dispatch)
-        expected-default (:kernel-name (kdispatch/default-artifact dispatch))
+        expected-default (:kernel-name (kdispatch/default-alternative dispatch))
         _ (when-not (= expected-default default-kernel-name)
             (throw (ex-info "contraction dispatch marker default differs from its registry"
                             {:dispatch-id dispatch-id
                              :expected expected-default
                              :actual default-kernel-name})))
-        selected (kdispatch/select-artifact dispatch arguments)]
+        selected (kdispatch/select-alternative dispatch arguments)]
     (invoke-registered-contraction! (:kernel-name selected) arguments)))
 
 (defn invoke-gpu-transpose!
