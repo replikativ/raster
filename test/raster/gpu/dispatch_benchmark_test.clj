@@ -160,3 +160,75 @@
                           :layout {:input :row-major :output :row-major})]
               (is (= (:selector result) (:selector cached)))
               (is (= 6 @binds @releases)))))))))
+
+(deftest compiled-program-bridge-projects-a-case-and-returns-recompilation-data
+  (let [tuning-contract
+        {:schedule-path [:generic-reduction :measured-selector]
+         :numerical-mode {:input :f32 :accumulate :f32 :output :f32}
+         :layout {:input :contiguous :output :contiguous}}
+        compiled-dispatch (assoc-in dispatch [:attributes :tuning] tuning-contract)
+        program-descriptor
+        {:all-params '[x width]
+         :array-params '[x]
+         :scalar-params '[width]
+         :steps [{:phase :reduce
+                  :convention :contract
+                  :dispatch compiled-dispatch
+                  :artifact reference
+                  :abi abi
+                  :argument-specs
+                  [{:slot (nth abi 0) :kind :input :sym 'x}
+                   {:slot (nth abi 1) :kind :output :sym 'out}
+                   {:slot (nth abi 2) :kind :scalar :type :long :expression 'width
+                    :value-fn (fn [args] (nth args 1))}]}]}
+        session (atom {:programs {:compiled {:descriptor program-descriptor
+                                             :param->key {'x :resident-x}
+                                             :alloc->key {'out :resident-out}}}
+                       :buffers {:resident-x (Object.) :resident-out (Object.)}})
+        measured-selector {:kind :runtime-scalar-ranges
+                           :argument 'width :below :reference
+                           :ranges [{:at-least 256 :strategy :subgroup}]}
+        tuning-identity (tuning/tuning-identity
+                         compiled-dispatch descriptor [128 256]
+                         (:numerical-mode tuning-contract) (:layout tuning-contract) 0.001)
+        fake-tuning (tuning/->DispatchTuning
+                     (tuning/cache-key tuning-identity) tuning-identity measured-selector [])
+        observed (atom nil)
+        result
+        (with-redefs [benchmark/tune-dispatch!
+                      (fn [_ passed-dispatch passed-descriptor runtime-values passed-case-fn
+                           & options]
+                        (let [case (passed-case-fn 256)]
+                          (reset! observed
+                                  {:dispatch passed-dispatch
+                                   :descriptor passed-descriptor
+                                   :runtime-values runtime-values
+                                   :case case
+                                   :options (apply hash-map options)}))
+                        fake-tuning)]
+          (benchmark/tune-program-dispatch!
+           session program-descriptor descriptor [128 256]
+           (fn [width]
+             {:program-arguments [(float-array 1024) width]
+              :validate! (constantly {:passed? true :oracle-hash "compiled-reference"})})))]
+    (is (= [:resident-x :resident-out {:type :long :value 256}]
+           (get-in @observed [:case :arguments])))
+    (is (= 256 (get-in @observed
+                       [:case :compiled-binding :reference-inputs :scalars 'width])))
+    (is (= (:numerical-mode tuning-contract)
+           (get-in @observed [:options :numerical-mode])))
+    (is (= (:layout tuning-contract) (get-in @observed [:options :layout])))
+    (is (= {:generic-reduction {:measured-selector measured-selector}}
+           (:schedule-override result)))
+    (is (= measured-selector (:selector result)))
+    (is (= :reduce (:phase result)))))
+
+(deftest schedule-override-rejects-dispatch-without-an-emitter-path
+  (let [fake-tuning
+        (tuning/->DispatchTuning
+         "key" {} {:kind :runtime-scalar-ranges :argument 'width
+                   :below :reference :ranges []} [])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"does not declare a tuning schedule path"
+         (benchmark/tuning-schedule-override dispatch fake-tuning descriptor
+                                             {:input :f32} {:input :contiguous})))))

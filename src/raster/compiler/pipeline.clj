@@ -1879,6 +1879,7 @@
                            (mapv (fn [slot value]
                                    (if (= :scalar (:kind slot))
                                      {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                      :expression value
                                       :value-fn (expr->arg-fn all-params scalar-lets value)}
                                      {:slot slot :kind (:kind slot) :role (:role slot)
                                       :dtype (:dtype slot) :sym value}))
@@ -1913,6 +1914,7 @@
                                        {:slots (:slots entry) :kind :pointer
                                         :binding (:binding entry) :sym value}
                                        {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                        :expression value
                                         :value-fn (expr->arg-fn all-params scalar-lets value)})))
                                  plan marker-values)
                            :phase (keyword (str "gpu-step-" i))})
@@ -1946,6 +1948,7 @@
                            (mapv (fn [slot value]
                                    (if (= :scalar (:kind slot))
                                      {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                      :expression value
                                       :value-fn (expr->arg-fn all-params scalar-lets value)}
                                      {:slot slot :kind (:kind slot) :role (:role slot)
                                       :dtype (:dtype slot) :sym value}))

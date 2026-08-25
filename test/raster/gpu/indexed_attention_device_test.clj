@@ -1,5 +1,6 @@
 (ns raster.gpu.indexed-attention-device-test
   (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as route]
@@ -8,7 +9,10 @@
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
-            [raster.numeric]))
+            [raster.gpu.dispatch-benchmark :as benchmark]
+            [raster.gpu.tuning-cache :as cache]
+            [raster.numeric])
+  (:import [java.nio.file Files]))
 
 (def ^:private opencl-available?
   (delay
@@ -151,6 +155,55 @@
                               (map #(Math/abs (- (double %1) (double %2)))
                                    expected result))]
         {:selected selected :max-error max-error}))))
+
+(defn- temporary-cache-root
+  []
+  (.toFile (Files/createTempDirectory
+            "raster-compiled-dispatch-benchmark-"
+            (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(deftest compiled-resident-dispatch-tunes-and-returns-a-baked-schedule
+  (if-not @opencl-available?
+    (is true "OpenCL device unavailable")
+    (let [{:keys [buffers]} (test-case)
+          args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
+                (get buffers 'dst) (get buffers 'src) 3 4 5 2]
+          descriptor (pipeline/compile-gpu-program
+                      #'resident-indexed-attention-probe :ocl:0 :dtype :float)]
+      (binding [cache/*cache-root* (temporary-cache-root)]
+        (gpu/with-gpu-session [session :ocl:0]
+          (let [handle (gpu/bind-program! session descriptor args)
+                result
+                (benchmark/tune-program-dispatch!
+                 session handle (hardware/descriptor-for :ocl:0) [2]
+                 (fn [components]
+                   {:program-arguments args
+                    :validate!
+                    (fn [{:keys [case]}]
+                      (let [binding (:compiled-binding case)
+                            plan (get-in binding
+                                         [:dispatch :attributes :tuning :reference :plan])
+                            expected (reference/evaluate plan (:reference-inputs binding))
+                            output-key (get-in binding
+                                               [:resident-bindings (:result-sym descriptor)])
+                            actual ^floats (gpu/download session output-key)
+                            max-error
+                            (reduce max 0.0
+                                    (map #(Math/abs (- (double %1) (double %2)))
+                                         expected actual))]
+                        {:passed? (< max-error 2.0e-5)
+                         :oracle-hash (str "compiled-segmented-reference-v1-" components)
+                         :max-error max-error}))
+                    :measurement {:warmup-iterations 0 :budget-ms 1
+                                  :min-samples 3 :max-samples 5
+                                  :cv-threshold 100.0}})
+                 :force? true)]
+            (is (= 2 (count (get-in result [:tuning :measurements]))))
+            (is (= (:selector result)
+                   (get-in result
+                           [:schedule-override :segmented-weighted-reduction
+                            :measured-selector])))
+            (is (= :gpu-step-0 (:phase result)))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width
   (if-not @opencl-available?

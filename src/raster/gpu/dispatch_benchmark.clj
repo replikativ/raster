@@ -155,3 +155,78 @@
    :layout layout
    :improvement-threshold improvement-threshold
    :force? force?))
+
+(defn tuning-schedule-override
+  "Turn a measured selector into the compiler schedule override declared by its dispatch.
+
+   Emitters own the path because only they know which schedule axis produced their compatible
+   alternatives. This function is generic: it validates the selector against the dispatch and
+   writes no operation-specific key itself."
+  [dispatch dispatch-tuning descriptor numerical-mode layout]
+  (let [dispatch (kdispatch/validate! dispatch)
+        _ (when-not (tuning/dispatch-tuning? dispatch-tuning)
+            (throw (ex-info "schedule override requires a DispatchTuning"
+                            {:tuning dispatch-tuning})))
+        path (get-in dispatch [:attributes :tuning :schedule-path])
+        selector (:selector dispatch-tuning)]
+    (when-not (and (vector? path) (seq path) (every? keyword? path))
+      (throw (ex-info "emitted dispatch does not declare a tuning schedule path"
+                      {:dispatch-id (:id dispatch) :schedule-path path})))
+    ;; Recheck the full device/artifact/ABI/numerical/layout identity before admitting cached or
+    ;; transported tuning data into recompilation.
+    (tuning/apply-tuning dispatch dispatch-tuning descriptor numerical-mode layout)
+    (assoc-in {} path selector)))
+
+(defn- compiled-case-fn
+  [session program step-selector case-fn]
+  (fn [runtime-value]
+    (let [case (case-fn runtime-value)]
+      (when-not (map? case)
+        (throw (ex-info "compiled dispatch benchmark case must be a map"
+                        {:runtime-value runtime-value :case case})))
+      (when-not (contains? case :program-arguments)
+        (throw (ex-info "compiled dispatch benchmark case requires :program-arguments"
+                        {:runtime-value runtime-value :case-keys (set (keys case))})))
+      (let [binding (gpu/program-dispatch-arguments
+                     session program step-selector (:program-arguments case))]
+        (assoc case
+               :arguments (:arguments binding)
+               ;; Validation callbacks reach the compiler-owned reference plan and the projected
+               ;; host buffer/scalar environment through (:compiled-binding (:case context)).
+               :compiled-binding (dissoc binding :arguments))))))
+
+(defn tune-program-dispatch!
+  "Tune one KernelDispatch embedded in a live compiled resident program.
+
+   This closes the descriptor-to-driver seam without teaching the runtime any operation. Each
+   `case-fn` result supplies `:program-arguments` in descriptor order plus the same :validate!,
+   :before-run!, and :measurement callbacks accepted by tune-dispatch!. The bridge projects the
+   step's ordered :argument-specs onto the program's stable resident buffer keys and typed scalar
+   values. When :step is omitted, the program must contain exactly one dispatch step.
+
+   Numerical mode and layout default to emitter-owned tuning metadata but may be supplied
+   explicitly. Returns the DispatchTuning together with a schedule override ready to pass as
+   `:schedule` to compile-gpu-program. Compilation remains pure; this function is explicitly an
+   offline action."
+  [session program descriptor runtime-values case-fn
+   & {:keys [step numerical-mode layout improvement-threshold force? measurement]
+      :or {improvement-threshold 0.001 force? false}}]
+  (let [{:keys [dispatch step-index] compiled-step :step}
+        (gpu/bound-program-dispatch session program step)
+        contract (get-in dispatch [:attributes :tuning])
+        numerical-mode (or numerical-mode (:numerical-mode contract))
+        layout (or layout (:layout contract))
+        result (tune-dispatch!
+                session dispatch descriptor runtime-values
+                (compiled-case-fn session program step case-fn)
+                :numerical-mode numerical-mode
+                :layout layout
+                :improvement-threshold improvement-threshold
+                :force? force?
+                :measurement measurement)]
+    {:tuning result
+     :selector (:selector result)
+     :schedule-override (tuning-schedule-override dispatch result descriptor
+                                                  numerical-mode layout)
+     :step-index step-index
+     :phase (:phase compiled-step)}))

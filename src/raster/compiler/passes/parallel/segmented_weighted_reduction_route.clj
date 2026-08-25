@@ -11,6 +11,23 @@
   [{:id :indexed-edge-list-subgroup-score-reuse :route indexed-leaf/route-dynamic-score-reuse}
    {:id :indexed-edge-list-reference :route indexed-leaf/route-dynamic}])
 
+(defn- tuning-contract
+  [plan]
+  (let [{:keys [operands output accumulator-dtype] :as plan} (swr/validate! plan)
+        schedule-key (swr/schedule-key plan)]
+    {:schedule-path [:segmented-weighted-reduction :measured-selector]
+     :numerical-mode {:operands (mapv :dtype operands)
+                      :accumulate accumulator-dtype
+                      :output (:dtype output)}
+     ;; This is deliberately the compiler's physical schedule identity, not an attention label.
+     ;; A different storage/membership layout must miss the tuning cache even when its algebra is
+     ;; identical.
+     :layout (assoc (dissoc schedule-key :algebra)
+                    :membership (dissoc (:membership plan) :buffers))
+     ;; Reference interpretation is compiler metadata. The generic GPU benchmark merely exposes
+     ;; it to a caller-supplied oracle and never branches on this kind.
+     :reference {:kind :segmented-weighted-reduction :plan plan}}))
+
 (defn- selected-leaves
   [desc]
   (if (= :subgroup-score-reuse (:segmented-weighted-reduction-schedule desc))
@@ -82,6 +99,7 @@
                            :algebra-plan-id (:id plan)}
               :attributes {:algebra :segmented-weighted-reduction
                            :algebra-key (swr/algebra-key plan)
+                           :tuning (tuning-contract plan)
                            :selection (if measured-selector
                                         :measured-runtime-shape
                                         :analytic-runtime-shape)}})]
