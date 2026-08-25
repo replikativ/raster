@@ -2,9 +2,27 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.segop-opencl :as emit]
             [raster.compiler.ir.execution-plan :as execution]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-call :as kernel-call]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]))
+
+(defn- one-call
+  []
+  (let [artifact
+        (artifact/make
+         {:kernel-name "execution_plan_probe"
+          :source "__kernel void execution_plan_probe(__global float* out, int n) {}"
+          :abi [(kabi/slot 'out :output :float :role :result)
+                (kabi/slot 'n :scalar :int :role :bound)]
+          :arguments '[out n]
+          :launch (launch/spec {:workgroup-size [64]
+                                :group-count [(launch/ceil-div 'n 64)]})
+          :effects {:kind :elementwise-map :writes ['out]}})]
+    (kernel-call/make artifact [(Object.) {:type :int :value 128}])))
 
 (defn- emitted-graph []
   (let [node (soac/par-form->soac
@@ -45,3 +63,13 @@
            [queue] []
            [(execution/->ScheduledOperation :first :operation queue [later] done)]
            [done]))))))
+
+(deftest one-kernel-call-uses-the-same-logical-execution-contract
+  (let [call (one-call)
+        plan (execution/from-kernel-call :candidate call)
+        operation (first (:operations plan))]
+    (is (execution/execution-plan? plan))
+    (is (= call (:operation operation)))
+    (is (= :compute (get-in operation [:queue :class])))
+    (is (empty? (:waits operation)))
+    (is (= [(:completion operation)] (:outputs plan)))))

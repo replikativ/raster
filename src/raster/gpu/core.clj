@@ -33,6 +33,7 @@
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.execution-plan :as execution]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
@@ -1198,6 +1199,88 @@
                       :temporary-buffers temporary-buffers})
           (throw e))))))
 
+(defn bind-kernel-call!
+  "Bind one emitted KernelArtifact over session-resident arguments as a replayable graph.
+
+   `arguments` follow the artifact's PHYSICAL ABI order. Pointer entries are session buffer keys
+   or ResidentBufferViews; scalar entries are typed values such as `{:type :int :value 4096}`.
+   The resulting KernelCall is checked before driver contact and then recorded through the same
+   queue/event machinery as a multi-kernel graph. This is the generic runtime seam used to
+   validate and device-time one schedule alternative during explicit offline tuning.
+
+   Options: :profile? records device timestamp events; :group-count may override only the realized
+   grid, never the emitted workgroup geometry. Rebinding `call-key` replaces and releases the old
+   recording transactionally after the new recording succeeds."
+  ([sess call-key artifact arguments]
+   (bind-kernel-call! sess call-key artifact arguments {}))
+  ([sess call-key artifact arguments {:keys [profile? group-count]
+                                      :or {profile? false}}]
+   (let [{:keys [device-id closed?]} @sess
+         artifact (kart/validate! artifact)
+         abi (:abi artifact)]
+     (when closed?
+       (throw (ex-info "cannot bind a kernel call in a closed GPU session" {:key call-key})))
+     (when (nil? call-key)
+       (throw (ex-info "bound kernel call requires a non-nil key" {})))
+     (kabi/validate-arguments! abi arguments)
+     (let [pointer-bindings
+           (into {}
+                 (keep-indexed (fn [index [slot value]]
+                                 (when-not (= :scalar (:kind slot))
+                                   [index (resolve-resident-binding sess value)])))
+                 (mapv vector abi arguments))
+           _ (release-graph-events! sess call-key)
+           owned-view-buffers (volatile! [])
+           prepareds (volatile! [])
+           runtime-graph (volatile! nil)]
+       (try
+         (let [{:keys [buffers] :as materialized}
+               (materialize-external-buffers! device-id pointer-bindings)
+               _ (vreset! owned-view-buffers (:owned-view-buffers materialized))
+               runtime-arguments
+               (mapv (fn [index [slot value]]
+                       (if (= :scalar (:kind slot)) value (get buffers index)))
+                     (range) (mapv vector abi arguments))
+               call (kcall/make artifact runtime-arguments
+                                (cond-> {} group-count (assoc :group-count group-count)))
+               execution-plan (execution/from-kernel-call call-key call)
+               register! (rt-resolve device-id "register-kernel!")
+               bind-call! (rt-resolve device-id "bind-kernel-call")
+               record! (rt-resolve device-id "record-graph!")
+               _ (register! (:kernel-name artifact) artifact)
+               prepared (assoc (bind-call! call) :phase call-key)
+               _ (vreset! prepareds [prepared])
+               _ (vreset! runtime-graph
+                          (record! [prepared] {:barriers? true
+                                               :profile? (boolean profile?)}))
+               outputs
+               (into {}
+                     (keep-indexed
+                      (fn [index slot]
+                        (when (= :output (:kind slot))
+                          [(or (:binding slot) (:name slot))
+                           (nth runtime-arguments index)])))
+                     abi)
+               entry {:kernel-call call
+                      :execution-plan execution-plan
+                      :runtime-graph @runtime-graph
+                      :prepareds @prepareds
+                      :owned-view-buffers @owned-view-buffers
+                      :temporary-buffers {}
+                      :outputs outputs
+                      :profile? (boolean profile?)}
+               old (get-in @sess [:kernel-graphs call-key])]
+           (swap! sess assoc-in [:kernel-graphs call-key] entry)
+           (when old (destroy-kernel-graph-entry! device-id old))
+           (->KernelGraphHandle call-key))
+         (catch Exception e
+           (destroy-kernel-graph-entry!
+            device-id {:runtime-graph @runtime-graph
+                       :prepareds @prepareds
+                       :owned-view-buffers @owned-view-buffers
+                       :temporary-buffers {}})
+           (throw e)))))))
+
 (defn kernel-graph-execution-plan
   "Return the pure backend-neutral queue/event plan for a bound KernelGraph."
   [sess handle]
@@ -1239,9 +1322,16 @@
 (defn run-kernel-graph!
   "Submit a bound graph, wait for completion, and return its resident output buffers."
   [sess handle]
-  (let [event (submit-kernel-graph! sess handle)]
+  (let [{:keys [device-id]} @sess
+        {:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)
+        event (submit-kernel-graph! sess handle)]
     (try
-      (await-event! sess event)
+      (let [outputs (await-event! sess event)]
+        ;; A validation replay of a profiled graph intentionally discards its timestamps. Reset
+        ;; the per-kernel events so a subsequent measure-graph! replay can signal them legally.
+        (when profile?
+          ((rt-resolve device-id "reset-graph-events!") runtime-graph))
+        outputs)
       (finally
         (release-event! sess event)))))
 
@@ -2077,6 +2167,19 @@
                              (dissoc :before-sample!)
                              (assoc :timing-source :device-event))]
     (apply measurement/measure! sample-fn (mapcat identity measurement-opts))))
+
+(defn measure-bound-kernel-graph!
+  "Device-event measurement of a bound KernelGraphHandle.
+
+   The graph must have been recorded with `:profile? true` (currently supplied by
+   bind-kernel-call!). This keeps runtime graph representations private while exposing the same
+   bounded Measurement contract to generic offline tuning code."
+  [sess handle & {:as opts}]
+  (let [{:keys [runtime-graph profile?]} (resolve-kernel-graph-entry sess handle)]
+    (when-not profile?
+      (throw (ex-info "bound kernel graph was not recorded with :profile? true"
+                      {:handle handle})))
+    (apply measure-graph! sess runtime-graph (mapcat identity opts))))
 
 (defn measure-program!
   "Explicit offline device-event measurement of a bound resident program.

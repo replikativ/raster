@@ -102,7 +102,26 @@
          clojure.lang.ExceptionInfo #"absent strategy"
          (kdispatch/with-selector
            dispatch {:kind :runtime-scalar-ranges :argument 'width :below :unknown
-                     :ranges []})))))
+                     :ranges []}))))
+  (testing "a runtime selector must name exactly one scalar ABI position"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"must name a scalar"
+         (kdispatch/make
+          {:id "pointer-selector"
+           :alternatives [reference subgroup]
+           :default-strategy :reference
+           :selector {:kind :runtime-scalar-threshold :argument 'x :threshold 1
+                      :at-least :subgroup-score-reuse :otherwise :reference}}))))
+  (testing "alternatives need distinct runtime registry entry points"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"unique emitted entry points"
+         (kdispatch/make
+          {:id "duplicate-entry-point"
+           :alternatives [reference
+                          (assoc subgroup :kernel-name (:kernel-name reference)
+                                 :source (:source reference))]
+           :default-strategy :reference
+           :selector (:selector dispatch)})))))
 
 (deftest both-resident-backends-register-the-same-pure-dispatch
   (doseq [[register! entry] [[ze/register-kernel-dispatch!
