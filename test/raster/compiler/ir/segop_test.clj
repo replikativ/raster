@@ -39,6 +39,9 @@
                                   #{'a} #{'out} #{} grid
                                   :double 'out nil)]
       (is (segop/segop? seg-map))
+      (is (segop/segop-node? (segop/->SegContract 1 {} :double :ze:0)))
+      (is (not (segop/segop? (segop/->SegContract 1 {} :double :ze:0)))
+          "a contract is legal SegOp dialect input but not yet a scheduled KernelGraph operation")
       (is (not (segop/segop? {:not "a segop"}))))))
 
 ;; ================================================================

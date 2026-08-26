@@ -99,6 +99,13 @@
                     "raster.compiler.ir.segop.SegScan"}
                   (.getName (class x)))))
 
+(defn segop-node?
+  "Any operation legal in the SegOp dialect, including a semantic SegContract that must be routed
+   before it can become an executable KernelGraph operation."
+  [x]
+  (or (segop? x)
+      (and x (= "raster.compiler.ir.segop.SegContract" (.getName (class x))))))
+
 (defn segop-grid
   "Get the KernelGrid from a SegOp."
   [segop]

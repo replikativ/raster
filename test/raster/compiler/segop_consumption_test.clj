@@ -2,11 +2,9 @@
   "THE SEGOP BOUNDARY IS REAL: GPU and JVM SIMD backends CONSUME what segop-lower computed.
    Device-free.
 
-   `segop-lower` lowered every par form with the real target device and attached the SegOp to
-   the binder symbol as `::segops`. Nothing read it (north-star §2.1: 'the pass arrows are nominal
-   at the most important boundary'). `opencl-pass` re-lowered each form from scratch with `:ze:0`
-   HARDCODED — ignoring both the stored result and its own `device-id`. Two lowerings of one form,
-   one of them on the wrong device, and no way to tell which a kernel came from.
+   `segop-lower` lowers every par form with the real target device into a first-class typed equation.
+   `opencl-pass` used to re-lower each form from scratch with `:ze:0` hardcoded. The equation is now
+   consumed directly, with no binder metadata and no second lowering.
 
    Now the stored SegOp is consumed; re-lowering is the fallback, with the real device-id, and
    both paths are COUNTED (`:segop-reused` / `:segop-relowered`) so a form that bypasses the
@@ -65,12 +63,11 @@
       (is (= [:ze:1] @calls) (str "lower-soac was called with " @calls ", not the pass's device-id")))))
 
 (deftest a-body-position-form-is-consumed-too
-  (testing "segop-lower wraps a body-position par form in (do …) carrying ::body-segops; that
-            must be consumed exactly like a binding's ::segops"
+  (testing "a body-position equation is consumed exactly like a binding equation"
     (let [form '(let* [n 8192] (raster.par/map! O i n nil (clojure.core/* (clojure.core/aget X i) 2.0)))
           st (:stats (run (lowered form)))]
       (is (= 1 (:ze-maps st)))
-      (is (= 1 (:segop-reused st)) "consumed from ::body-segops")
+      (is (= 1 (:segop-reused st)) "consumed from the first-class equation")
       (is (nil? (:segop-relowered st))))))
 
 (deftest jvm-simd-consumes-the-boundary-too

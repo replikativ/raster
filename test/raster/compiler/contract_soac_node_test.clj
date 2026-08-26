@@ -20,14 +20,15 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.backend.gpu.opencl-pass :as op]
             [raster.compiler.pipeline :as pl]
             [raster.linalg.contract]))
 
 (def ^:private cform
   '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
-     (raster.numeric/* (clojure.core/aget A (clojure.core/+ (clojure.core/* i 128) l))
-                       (clojure.core/aget B (clojure.core/+ (clojure.core/* l 128) j)))))
+                        (raster.numeric/* (clojure.core/aget A (clojure.core/+ (clojure.core/* i 128) l))
+                                          (clojure.core/aget B (clojure.core/+ (clojure.core/* l 128) j)))))
 (def ^:private bound (list 'let* ['c cform] 'c))
 
 (deftest a-contraction-is-a-soac-node-carrying-its-facts
@@ -50,7 +51,9 @@
 
 (deftest segop-lower-records-a-segcontract-instead-of-declining
   (let [r (slp/segop-lower-pass bound {:target-device :ze:0 :dtype :double})
-        so (slp/get-segops (first (second (:form r))))]
+        p (:form r)
+        source (second (second bound))
+        so (program/operations-for-binding p 'c source)]
     (is (= 1 (:segops-lowered (:stats r))))
     (is (empty? (:segops-declined (:stats r))) "was {:reason :no-lowering-rule}")
     (is (instance? raster.compiler.ir.segop.SegContract (first so)))

@@ -51,23 +51,25 @@ Raster is not starting from a toy compiler:
 - The quantized path already covers Q4_0, Q8_0, Q4_K, and Q6_K, including
   staged contraction and DP4A-related work.
 
-These pieces are the foundation. The principal problem is that some of them are
-connected by metadata, duplicated lowering, string-template seams, or
-conventions that the dialect validator cannot actually prove.
+These pieces are the foundation. The SegOp boundary now uses a first-class typed
+`ParallelProgram`; remaining gaps are concentrated in the earlier SOAC program,
+the scheduled kernel-body representation, duplicated lowering, and string-template seams.
 
 ## 2. The load-bearing gaps
 
 ### 2.1 The middle end is not yet a sequence of real dialects
 
-`segop-lower-pass` currently leaves the original S-expression in place and
-attaches SegOps to binding-symbol metadata. Failed conversion is caught, printed
-as a warning, and treated as absence. The OpenCL backend can then reconstruct a
-SegOp on demand. Meanwhile, the `:segop-lowered` and `:gpu-planned` dialect
-validators prove only that the outer `let*` is ordered.
-
-This means the pass arrows are nominal at the most important boundary. A kernel
-can bypass the intended IR, and a failed lowering can quietly select a different
+`segop-lower-pass` now produces a `ParallelProgram` with ordered equations,
+SSA-like result IDs, `AbstractValue` contracts, effects, diagnostics, and provenance.
+GPU and JVM backends consume the recorded operations; the source expression is retained only to
+reconstruct scalar host control around them. The `:segop-lowered` validator performs a full
+operation/type legality check, and source equality invalidates an equation after a backend-local
+rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
 path.
+
+The remaining nominal boundary is earlier: SOAC fusion still works over an S-expression-derived
+graph rather than a first-class typed program, and the scheduled operations do not yet contain a
+general target-neutral kernel body.
 
 The first architectural correction is therefore:
 
