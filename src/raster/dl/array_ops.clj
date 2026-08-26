@@ -6,6 +6,8 @@
   rrules — compositions auto-differentiate through them.
 
   Core primitives:
+    argmax-rows!     - deterministic indexed row reduction into caller-owned storage
+    gather-rows!     - copy int-indexed rows into caller-owned dense storage
     scatter-add      - scatter values to indexed destinations (adjoint of gather)
     gather           - gather values from indexed sources (adjoint of scatter-add)
     indexed-dot      - batched indexed dot product (multi-head aware)
@@ -163,6 +165,22 @@
                              (recur (long (inc tile-in-row)) candidate-index candidate candidate-nan)
                              (recur (long (inc tile-in-row)) best-index best-value best-nan)))
                          (aset indices row best-index)))))))
+
+(deftm gather-rows!
+  "Copy rows selected by `indices[nrows]` from row-major `src[*,width]` into caller-owned
+  `out[nrows,width]`. Every output element has one writer, and rows of `src` may be selected
+  repeatedly. The operation is a generic indexed layout transform; embedding lookup is one use.
+
+  Indices are intentionally `int`, matching routed attention and indexed reductions. Callers own
+  bounds validation: every index must name a complete source row. `out` must not overlap `src`;
+  parallel output writes are not ordered against source reads."
+  (All [T] [src :- (Array T), indices :- (Array int), out :- (Array T),
+            nrows :- Long, width :- Long] :- Void
+       (par/map-void! i (* nrows width)
+                      (let [row (quot i width)
+                            col (rem i width)
+                            src-row (aget indices row)]
+                        (aset out i (aget src (+ (* src-row width) col)))))))
 
 ;; ================================================================
 ;; slice-strided-2d / scatter-strided-2d
