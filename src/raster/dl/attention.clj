@@ -383,30 +383,6 @@
                                                           a))))))
                                           0)))
 
-;; Decode RoPE (single token), par/map-void! over heads — the same NeoX/HF rotate-half as
-;; rope-pos with seq-len=1 (each head rotates its head-dim/2 pairs at absolute position
-;; pos-offset). Lowers to OpenCL and SIMD-vectorizes on CPU. Index math clojure.core; trig
-;; via raster.math. out is caller-provided (in-place-safe: reads x, writes out).
-(deftm rope-pos-gpu! (All [T] [x :- (Array T) out :- (Array T)
-                               heads :- Long head-dim :- Long
-                               theta :- Double pos-offset :- Long] :- Void
-                          (raster.par/map-void! h heads
-                                                (let [hdim2 (quot head-dim 2)
-                                                      base (clojure.core/* h head-dim)
-                                                      ln-theta (m/log theta)
-                                                      pos (double pos-offset)]
-                                                  (loop [i 0]
-                                                    (if (< i hdim2)
-                                                      (let [freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                                            ang (* pos freq)
-                                                            c (m/cos ang) s (m/sin ang)
-                                                            x0 (aget x (clojure.core/+ base i))
-                                                            x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                        (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                                                        (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))
-                                                        (recur (inc i)))
-                                                      nil))))))
-
 ;; KV-cache append (decode): write the current token's K (or V) slab of length kvrow = n_kv*head_dim
 ;; into the cache at absolute position `pos` (offset pos*kvrow). par/map-void! over kvrow — the
 ;; on-device equivalent of the CPU System/arraycopy append. Index math clojure.core (integer).
@@ -470,32 +446,36 @@
                                                                       (recur (inc d)))
                                                                   nil))))))
 
-;; ── Device-side-pos decode variants (#32): pos / cache_len come from 1-element DEVICE
-;; buffers read INSIDE the par body (so each is a kernel array param, not a host scalar baked at
-;; prepare!). The resident graph then binds ONCE and per token the host just writes posbuf/clenbuf
-;; + replays — no re-prepare / re-record. Reading the buffer inside the kernel (vs passing
-;; (aget posbuf 0) as a scalar arg) avoids the CSE-hoist that would otherwise pull the read out to
-;; a host-evaluated scalar-let.
-;; Flattened over heads×(head-dim/2) so the grid is heads*hdim2 work-items (one rotation each)
-;; instead of `heads` threads each looping hdim2 serially — the n=4 serial version wasted ~98% of
-;; the GPU (low occupancy is the dominant decode cost, NOT dispatch ~2µs nor kernel count).
-(deftm rope-pos-buf! (All [T] [x :- (Array T) out :- (Array T)
-                               heads :- Long head-dim :- Long
-                               theta :- Double posbuf :- (Array long)] :- Void
-                          (raster.par/map-void! idx (clojure.core/* heads (quot head-dim 2))
-                                                (let [hdim2 (quot head-dim 2)
-                                                      h (quot idx hdim2)
-                                                      i (rem idx hdim2)
-                                                      base (clojure.core/* h head-dim)
-                                                      ln-theta (m/log theta)
-                                                      pos (double (aget posbuf 0))
-                                                      freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
-                                                      ang (* pos freq)
-                                                      c (m/cos ang) s (m/sin ang)
-                                                      x0 (aget x (clojure.core/+ base i))
-                                                      x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
-                                                  (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
-                                                  (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
+;; ── Device-side-position decode RoPE (#32) ──
+;; x/out are row-major [nrows,heads,head-dim], while positions is one device-resident absolute
+;; position per row. The graph therefore binds once and updates positions between replays without
+;; host scalar rebinding. Flattening every rotary pair across rows keeps batch an ordinary launch
+;; axis and exposes enough work for the GPU even at small head counts.
+(deftm rope-pos-rows-buf!
+  "NeoX/HF rotate-half RoPE over row-major `[nrows,heads,head-dim]` values. `positions[row]`
+  selects each row's absolute position; x and out may alias because each work-item reads its pair
+  before writing either element."
+  (All [T] [x :- (Array T) out :- (Array T)
+            nrows :- Long heads :- Long head-dim :- Long
+            theta :- Double positions :- (Array int)] :- Void
+       (raster.par/map-void! idx (clojure.core/* nrows (clojure.core/* heads (quot head-dim 2)))
+                             (let [hdim2 (quot head-dim 2)
+                                   row-pairs (clojure.core/* heads hdim2)
+                                   row (quot idx row-pairs)
+                                   within-row (rem idx row-pairs)
+                                   h (quot within-row hdim2)
+                                   i (rem within-row hdim2)
+                                   base (clojure.core/+ (clojure.core/* row (clojure.core/* heads head-dim))
+                                                        (clojure.core/* h head-dim))
+                                   ln-theta (m/log theta)
+                                   pos (double (aget positions row))
+                                   freq (m/exp (* (/ (* -2.0 (double i)) (double head-dim)) ln-theta))
+                                   ang (* pos freq)
+                                   c (m/cos ang) s (m/sin ang)
+                                   x0 (aget x (clojure.core/+ base i))
+                                   x1 (aget x (clojure.core/+ (clojure.core/+ base i) hdim2))]
+                               (aset out (clojure.core/+ base i) (- (* x0 c) (* x1 s)))
+                               (aset out (clojure.core/+ (clojure.core/+ base i) hdim2) (+ (* x1 c) (* x0 s)))))))
 
 (deftm kv-append-buf! (All [T] [src :- (Array T) cache :- (Array T) kvrow :- Long posbuf :- (Array long)] :- Void
                            (raster.par/map-void! i kvrow

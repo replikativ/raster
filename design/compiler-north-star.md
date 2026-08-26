@@ -143,6 +143,13 @@ these projection, post-attention and head programs from the scheduled contractio
 than treating the Q4_K source kernel as the final abstraction; batching is not a linker convention
 or an attention special case.
 
+Buffered RoPE follows the same rule: one kernel consumes row-major `[B,heads,head-dim]` values and
+the routed attention `int positions[B]` buffer, so B=1 and B>1 neither select different kernels nor
+upload duplicate position representations. Dense semantic rows whose logical width differs from a
+quantized contraction's padded width still need an explicit layout transform. The preferred first
+implementation is a generated padded-row quantization adapter that synthesizes zeroes while packing,
+avoiding a materialized padding buffer; padding is layout, not quantization-specific memory ownership.
+
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
 

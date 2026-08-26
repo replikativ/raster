@@ -9,6 +9,7 @@
             [raster.dl.nn :as nn]
             [raster.dl.attention :as attn]
             [raster.compiler.backend.cpu.quant :as q]
+            [raster.compiler.pipeline :as pipeline]
             [raster.par :as par]
             [raster.gpu.core :as gpu]))
 
@@ -87,20 +88,34 @@
           (is (< (maxerr ra-ref (gpu/download sess :rao)) 1e-5) "residual-add")
           (finally (gpu/close-session! sess)))))))
 
-(deftest rope-pos-gpu-lowers
+(deftest rope-pos-rows-buffered-lowers
+  (let [kernels (:kernels (pipeline/show-pipeline #'attn/rope-pos-rows-buf!
+                                                  :target-device :ze:0 :dtype :float))]
+    (is (= 1 (count kernels)))
+    (is (= '[[out :float] [positions :int] [x :float]
+             [head-dim :int] [heads :int] [theta :float] [_n_bound :int]]
+           (mapv (juxt :name :dtype) (:abi (first kernels))))
+        "row count shapes the launch but is specialized out of the physical ABI"))
   (when (gpu-available?)
-    (testing "decode RoPE (rope-pos-gpu!, par over heads) lowers to OpenCL == CPU rope-pos"
-      (let [heads 8 hd 64 theta 10000.0 pos 5 n (* heads hd)
+    (testing "buffered RoPE lowers one independent position per row"
+      (let [nrows 3 heads 8 hd 64 theta 10000.0 positions (int-array [0 5 29])
+            row-width (* heads hd) n (* nrows row-width)
             x (gen n 1)
-            ycpu (attn/rope-pos x 1 heads hd theta pos)
+            ycpu (float-array n)
+            _ (dotimes [row nrows]
+                (let [xr (float-array row-width)]
+                  (System/arraycopy x (* row row-width) xr 0 row-width)
+                  (System/arraycopy (attn/rope-pos xr 1 heads hd theta (aget positions row))
+                                    0 ycpu (* row row-width) row-width)))
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :rope #'attn/rope-pos-gpu!)
-          (gpu/alloc! sess {:x [:float n x] :out [:float n nil]})
-          ;; scalars by name: head-dim pos-offset theta ; par bound = heads
-          (gpu/prepare! sess :rope {"x" :x "out" :out}
-                        [{:type :int :value hd} {:type :int :value pos} {:type :float :value theta}]
-                        heads {:kernel-phase :rope})
+          (gpu/compile! sess :rope #'attn/rope-pos-rows-buf!)
+          (gpu/alloc! sess {:x [:float n x] :out [:float n nil]
+                            :positions [:int nrows positions]})
+          ;; scalars by name: head-dim heads theta; nrows is represented in the launch bound.
+          (gpu/prepare! sess :rope {"x" :x "out" :out "positions" :positions}
+                        [{:type :int :value hd} {:type :int :value heads} {:type :float :value theta}]
+                        (* nrows heads (quot hd 2)) {:kernel-phase :rope})
           (gpu/invoke-bound! sess :rope)
           (is (< (maxerr ycpu (gpu/download sess :out)) 1e-4))
           (finally (gpu/close-session! sess)))))))
