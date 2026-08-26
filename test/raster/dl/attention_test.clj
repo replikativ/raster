@@ -287,6 +287,28 @@
                          (* (double (aget got i1)) (aget got i1)))]
             (is (< (Math/abs (- n-in n-out)) 1e-4) (str "pair " p))))))))
 
+(deftest rope-pos-rows-buffered-test
+  (let [nrows 3 heads 2 head-dim 8 theta 10000.0
+        positions (int-array [0 7 31])
+        x (float-array (map #(float (/ (- % 17) 13.0))
+                            (range (* nrows heads head-dim))))
+        out (float-array (alength x))]
+    (attn/rope-pos-rows-buf! x out nrows heads head-dim theta positions)
+    (dotimes [row nrows]
+      (let [offset (* row heads head-dim)
+            input-row (float-array (* heads head-dim))]
+        (System/arraycopy x offset input-row 0 (alength input-row))
+        (let [expected (attn/rope-pos input-row 1 heads head-dim theta (aget positions row))]
+          (dotimes [i (alength input-row)]
+            (is (< (Math/abs (- (double (aget ^floats expected i))
+                                (double (aget out (+ offset i)))))
+                   1.0e-5)
+                (str "row " row ", element " i))))))
+    (let [in-place (aclone x)]
+      (attn/rope-pos-rows-buf! in-place in-place nrows heads head-dim theta positions)
+      (is (java.util.Arrays/equals out ^floats in-place)
+          "each work-item reads its pair before an in-place write"))))
+
 ;; ================================================================
 ;; Decode attention with weight capture (timestamp alignment signal)
 ;; ================================================================

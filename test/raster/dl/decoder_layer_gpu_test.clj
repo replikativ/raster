@@ -54,6 +54,7 @@
                       :gate [:float IM nil :scratch] :up [:float IM nil :scratch] :hh [:float IM nil :scratch]
                       :hxp [:int (quot IM 4) nil :scratch] :hxs [:float (quot IM 256) nil :scratch] :hxb [:int (quot IM 32) nil :scratch]
                       :down [:float H nil :scratch] :down2 [:float H nil :scratch] :out [:float H nil :output]
+                      :positions [:int 1 (int-array [p]) :input]
                       :submax [:float (quot IM 32) nil :scratch]}
                      (wbuf "wq" Wq) (wbuf "wk" Wk) (wbuf "wv" Wv) (wbuf "wo" Wo) (wbuf "wg" Wg) (wbuf "wu" Wu) (wbuf "wd" Wd))
             qa (fn [ph xb xpb xsb bsb in nrows] {:op #'qk/quant-act-q8k-rows-gpu! :phase ph :bind {"x" xb "xp" xpb "xs" xsb "bsums" bsb "submax" :submax} :scalars {"in" in} :n (* nrows (quot in 32))})
@@ -63,8 +64,8 @@
             steps [(rms :n1 :x :win :xn 1 H) (qa :qx :xn :qxp :qxs :qxb H 1)
                    (mm :mq :qxp :qxs :qxb "wq" :Q H (* nq hd) 1) (mm :mk :qxp :qxs :qxb "wk" :K H kvrow 1) (mm :mv :qxp :qxs :qxb "wv" :V H kvrow 1)
                    (rms :qn :Q :wqn :Qn nq hd) (rms :kn :K :wkn :Kn nkv hd)
-                   {:op #'attn/rope-pos-gpu! :phase :rq :bind {"x" :Qn "out" :Qr} :scalars {"head-dim" hd "theta" theta "pos-offset" p} :n nq}
-                   {:op #'attn/rope-pos-gpu! :phase :rk :bind {"x" :Kn "out" :Kr} :scalars {"head-dim" hd "theta" theta "pos-offset" p} :n nkv}
+                   {:op #'attn/rope-pos-rows-buf! :phase :rq :bind {"x" :Qn "out" :Qr "positions" :positions} :scalars {"head-dim" hd "heads" nq "theta" theta} :n (* nq (quot hd 2))}
+                   {:op #'attn/rope-pos-rows-buf! :phase :rk :bind {"x" :Kn "out" :Kr "positions" :positions} :scalars {"head-dim" hd "heads" nkv "theta" theta} :n (* nkv (quot hd 2))}
                    {:op #'attn/kv-append! :phase :ak :bind {"src" :Kr "cache" :cK} :scalars {"pos" p "kvrow" kvrow} :n kvrow}
                    {:op #'attn/kv-append! :phase :av :bind {"src" :V "cache" :cV} :scalars {"pos" p "kvrow" kvrow} :n kvrow}
                    {:op #'attn/gqa-decode-attention-gpu! :phase :att :bind {"q" :Qr "k" :cK "v" :cV "out" :at "sc" :sc} :scalars {"cache-len" clen "group" grp "head-dim" hd "n-kv" nkv "scale" scale} :n nq}
