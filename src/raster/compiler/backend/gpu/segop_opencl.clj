@@ -19,6 +19,7 @@
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scan :as scan]
@@ -1331,15 +1332,78 @@
      :epilogue-params params
      :epilogue-helpers helpers}))
 
+(defn- emit-dpas-plan
+  "Lower one already-checked DPAS plan.  This remains the shadow target adapter while the
+   `emit-gemm-tiled` template is decomposed into per-operation KernelBody lowering.  All schedule,
+   layout and boundary decisions have already happened before this boundary."
+  [kernel-name row-arr col-arr out-sym [M N L] [i-sym j-sym] tile epilogue kernel-body]
+  (let [sg (long (get-in tile [:matrix :subgroup] 16))
+        ep (when epilogue
+             (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float)))
+        source (apply codegen/emit-gemm-tiled kernel-name
+                      (concat [:c-dtype :half
+                               :block-m (:block-m tile) :block-n (:block-n tile)
+                               :sg-m (:sg-m tile) :sg-n (:sg-n tile)
+                               :block-k (:block-k tile) :matrix (:matrix tile)
+                               :prefetch (:num-stages tile 3)]
+                              (when ep [:epilogue (:epilogue ep)
+                                        :epilogue-params (:epilogue-params ep)
+                                        :epilogue-helpers (:epilogue-helpers ep)])))]
+    (cond->
+     {:kernel-name kernel-name
+      :source source
+      :array-params [row-arr col-arr]
+      :abi (kabi/validate!
+            (vec (concat
+                  [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
+                   (kabi/slot col-arr :input :half :c-name "B" :role :operand)
+                   (kabi/slot out-sym :output :half :c-name "C" :role :result)
+                   (kabi/slot 'M :scalar :int :role :dimension)
+                   (kabi/slot 'N :scalar :int :role :dimension)
+                   (kabi/slot 'K :scalar :int :role :dimension)]
+                  (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
+                    (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
+                  (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+                    (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
+      :dims [M N L]
+      :dtype :half
+      :tile tile
+      :epilogue-params (when ep (:epilogue-params ep))
+      :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
+      :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))
+      :workgroup [(* (quot (:block-m tile) (:sg-m tile))
+                     (quot (:block-n tile) (:sg-n tile))
+                     sg) 1]
+      :tensorized true}
+      kernel-body (assoc :kernel-body kernel-body))))
+
+(defn generate-dpas-kernel-body
+  "Lower a verified, scheduled matrix KernelBody to the Intel OpenCL target.
+
+   This is deliberately a separate boundary from contraction scheduling.  The adapter currently
+   shadows the proven source generator; the body is nevertheless production data and is verified
+   before emission, so subsequent changes can replace one operation at a time without re-parsing
+   the contraction or inventing another schedule."
+  [kernel-body out-sym]
+  (let [kernel-body (kbody/validate! kernel-body)
+        {:keys [kind instruction-family dims bindings epilogue axis-symbols]}
+        (:attributes kernel-body)]
+    (when-not (and (= :matrix-contraction kind) (= :dpas instruction-family))
+      (throw (ex-info "OpenCL DPAS lowering requires a DPAS matrix KernelBody"
+                      {:kind kind :instruction-family instruction-family})))
+    (emit-dpas-plan (str "dpas_contract_" (gensym ""))
+                    (:row bindings) (:col bindings) out-sym dims
+                    (subvec (vec axis-symbols) 0 2)
+                    (:schedule kernel-body) epilogue kernel-body)))
+
 (defn generate-dpas-contraction-kernel
-  "DPAS/XMX-tensorized contraction → OpenCL (PEAK; raster's edge over Futhark's portable
-   ~50-70%-peak tiling). The general, IR-driven contribution is the LEGALITY GATE +
-   operand-orientation analysis (dpas-contraction-legal?); the DPAS BODY is the validated
-   emit-gemm-tiled reused verbatim (f16-in / f32-acc / f16-out, tile-parametric,
-   16 subgroups, K16 mad). The SOAC IR decides WHICH input is the row operand (→ A slot) vs
-   col operand (→ B slot) and the dims to launch with — so a batched or transposed
-   contraction re-tensorizes through the golden's :batched?/:split-k? variants rather than a
-   separate hand kernel. NON-gemm-specific at the IR boundary; peak at the hardware boundary.
+  "Legacy direct entry to the proven DPAS/XMX OpenCL emitter.
+
+   Production canonical f16 contractions now travel through ContractionFacts and a scheduled
+   KernelBody before reaching `generate-dpas-kernel-body`.  This entry remains as the source oracle
+   for the shadow adapter and for opaque epilogue helpers that have not yet become typed scalar IR.
+   Its legality analysis determines operand orientation and launch dimensions; the emitted body is
+   f16 input, f32 accumulation and f16 output with a tile-parametric K16 matrix instruction.
 
    Returns {:kernel-name :source :array-params [row-arr col-arr] :dims [M N L] :dtype :half
             :tensorized true}  — NB: :array-params is in [row col] BINDING order (row's
@@ -1358,66 +1422,9 @@
             ;; `tile` (e.g. an autotune result via hw/gemm-tile-candidates) overrides.
             ;; hw/derive-gemm-tile's own defaults reproduce the Arc 140V config, so passing no
             ;; descriptor is equivalent to the previous literal — with zero magic numbers here.
-            tile (or tile (hw/derive-gemm-tile (or desc {})))
-            sg (long (get-in tile [:matrix :subgroup] 16))
-            ;; EPILOGUE FUSION: fold the consumer expression into the store slot, so a
-            ;; bias/activation/residual/dequant costs no extra kernel and no DRAM round-trip of C.
-            ep (when epilogue
-                 (epilogue-splice epilogue
-                                  [(:i-sym gate) (:j-sym gate)]
-                                  (get epilogue :dtype :float)))
-            source (apply codegen/emit-gemm-tiled kernel-name
-                          (concat [:c-dtype :half
-                                   :block-m (:block-m tile) :block-n (:block-n tile)
-                                   :sg-m (:sg-m tile) :sg-n (:sg-n tile)
-                                   :block-k (:block-k tile) :matrix (:matrix tile)
-                                   ;; PIPELINE DEPTH. Omitting this pinned every routed kernel to
-                                   ;; emit-gemm-tiled's `:or prefetch 3` while the schedule, the
-                                   ;; SLM-capped feasibility filter and the autotuner all believed
-                                   ;; :num-stages was live — so tiles differing ONLY in :num-stages
-                                   ;; emitted identical source, and a tuner "measuring" that axis was
-                                   ;; measuring noise. The resident door has always passed it
-                                   ;; (ze_runtime `:prefetch (:num-stages tile 3)`); this door had
-                                   ;; not, which is the schema-without-emission that CLAUDE.md and
-                                   ;; north-star §10 forbid.
-                                   :prefetch (:num-stages tile 3)]
-                                  (when ep [:epilogue (:epilogue ep)
-                                            :epilogue-params (:epilogue-params ep)
-                                            :epilogue-helpers (:epilogue-helpers ep)])))]
-        {:kernel-name kernel-name
-         :source source
-         :array-params [row-arr col-arr]      ;; [A-slot B-slot] binding order
-         :abi (kabi/validate!
-               (vec (concat
-                     [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
-                      (kabi/slot col-arr :input :half :c-name "B" :role :operand)
-                      (kabi/slot out-sym :output :half :c-name "C" :role :result)
-                      (kabi/slot 'M :scalar :int :role :dimension)
-                      (kabi/slot 'N :scalar :int :role :dimension)
-                      (kabi/slot 'K :scalar :int :role :dimension)]
-                     (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
-                       (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
-                     (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
-                       (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
-         :dims [M N L]
-         :dtype :half
-         :tile tile
-         ;; The epilogue's operand arrays are EXTRA kernel params, appended AFTER the dims.
-         ;; Surfaced so a caller binds them — the signature has them either way, so omitting
-         ;; them from the descriptor would be a launch-arity bug (6 args bound to a 7-arg kernel).
-         :epilogue-params (when ep (:epilogue-params ep))
-         :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
-         ;; …and its SCALARS. epilogue-splice has always emitted these into the signature, but
-         ;; nothing surfaced them, so any epilogue carrying a `:scalars` entry tripped
-         ;; validate-descriptor's scalar count and threw. That unusable capability is exactly why
-         ;; `:scheme` had to invent a private per-tensor scale channel instead of being an
-         ;; epilogue. Surfacing them makes the scale expressible where it belongs.
-         :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))
-         ;; workgroup = (block-m/sg-m)·(block-n/sg-n) subgroups × the matrix subgroup size
-         :workgroup [(* (quot (:block-m tile) (:sg-m tile))
-                        (quot (:block-n tile) (:sg-n tile))
-                        sg) 1]
-         :tensorized true}))))
+            tile (or tile (hw/derive-gemm-tile (or desc {})))]
+        (emit-dpas-plan kernel-name row-arr col-arr out-sym [M N L]
+                        [(:i-sym gate) (:j-sym gate)] tile epilogue nil)))))
 
 ;; ================================================================
 ;; QUANT (int8) contraction — the SAME skeleton, WIDENING facet

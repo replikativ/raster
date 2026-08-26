@@ -393,6 +393,12 @@
                      (croute/route-contraction
                       form :dtype dtype
                       :facts (:facts bound-sc)
+                      :operation-id (:id bound-sc)
+                      ;; The resolved, feasibility-checked schedule is the single source of tile
+                      ;; geometry.  Previously this option reached opencl-pass but contractions
+                      ;; ignored it and re-derived a default, so a pinned/autotuned :tile changed
+                      ;; neither the KernelBody nor emitted source.
+                      :tile (:tile schedule)
                       :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
                                   device-id)
                                  (catch Throwable _ nil))))

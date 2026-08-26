@@ -2400,6 +2400,9 @@
                           (when-let [t (field :tile)]
                             (str "  tile=" (:block-m t) "x" (:block-n t) "/" (:sg-m t) "x" (:sg-n t)
                                  " k" (:block-k t) " stages=" (:num-stages t 3)))
+                          (when-let [body (field :kernel-body)]
+                            (str "  body=" (name (get-in body [:attributes :kind])) "/"
+                                 (name (get-in body [:attributes :instruction-family]))))
                           (when-let [occ (field :occupancy-estimate)]
                             (str "  occupancy=" (format "%.0f%%" (* 100.0 (:occupancy occ)))
                                  " limited-by=" (name (:limiting-factor occ))))))

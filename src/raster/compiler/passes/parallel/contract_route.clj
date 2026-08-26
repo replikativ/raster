@@ -24,7 +24,8 @@
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -93,7 +94,7 @@
             :dtype dtype
             :out-dtype out-dtype}
            (select-keys descriptor [:fallback-reason :declines :tile :tensorized :packed
-                                    :fused-epilogue :dims :stages]))}))
+                                    :fused-epilogue :dims :stages :kernel-body]))}))
 
 (defn kernel-signature-params
   "The parameter list of the single __kernel in `src`, split at top-level commas. Used to check a
@@ -244,13 +245,14 @@
   d)
 
 (defn route-contraction
-  "Route a contraction form to the hardware-optimal kernel via the DPAS legality gate.
-   dtype selects the element type of the intended kernel (:half tries DPAS; :byte/:int8 tries
-   the int8 quant leaves — dp4a for the :nt operand layout, quant naive-widening for :nn;
-   anything else, or a gate rejection, falls back to the register-tiled portable kernel).
-   int8 needs no decode descriptor: a scale is an ordinary :epilogue and a zero-point an ordinary
-   per-operand :decode, both carried on the form like any other contraction data."
-  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts]
+  "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
+
+   Canonical f16 products first become a target-neutral KernelBody and are then lowered by the
+   OpenCL DPAS backend.  Unsupported shapes retain the portable register-tiled route.  Byte/int8
+   products use the quant leaves (dp4a for :nt, widening for :nn) until those instruction families
+   consume the same scheduled body vocabulary.  Quantization remains an operand/decode concern,
+   not a buffer-ownership or graph-composition concern."
+  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id]
                     :or {dtype :half prefer-peak? false}}]
   (let [out-sym (second contract-form)
         free-axes (nth contract-form 2)
@@ -268,12 +270,14 @@
         ;; a fused contraction carries its epilogue in the form's trailing opts (par-fusion's
         ;; fuse-contract-map puts it there); an explicit :epilogue kwarg overrides.
         form-opts (apply hash-map (drop 5 contract-form))
+        contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
         epilogue (or epilogue (:epilogue form-opts))
         stages (or stages (:stages (apply hash-map (drop 5 contract-form))))
         ;; declared operand axis-maps, needed to tensorize a staged inner stage (the gate VERIFIES
         ;; them against the body rather than trusting them)
         operands (or operands (:operands (apply hash-map (drop 5 contract-form))))
-        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile epilogue))]
+        tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile
+                                                        epilogue contract-facts operation-id))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
@@ -286,52 +290,52 @@
       ;; format (int32 MAC inside the block, float accumulate across blocks) be expressed in the
       ;; contraction algebra at all. The flat leaves below cannot represent it — they have one
       ;; accumulator. 1 stage is the flat case and is left to them.
-      (and (seq stages) (> (count stages) 1))
-      (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
+        (and (seq stages) (> (count stages) 1))
+        (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
-            _ (let [cmb (:combine (or facts (cf/contraction-facts contract-form :dtype dtype)))]
-                (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
-                  (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
-                                       cmb ") — every accumulator level uses += and a lift's "
-                                       "linearity argument assumes addition")
-                                  {:reason :non-plus-combine-on-staged :combine cmb}))))
+              _ (let [cmb (:combine contract-facts)]
+                  (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
+                    (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
+                                         cmb ") — every accumulator level uses += and a lift's "
+                                         "linearity argument assumes addition")
+                                    {:reason :non-plus-combine-on-staged :combine cmb}))))
             ;; PEAK: with declared+verified operand maps, the inner stage tensorizes to dp4a (4 int8
             ;; MACs per int32 op) — the int8 peak leaf, and the same shape llama.cpp hand-writes.
             ;; Only attempted when the caller asked for peak AND the gate passes; a gate rejection
             ;; falls back to the scalar nest, so requesting peak can never yield a wrong kernel.
-            spec {:free-axes free-axes :stages stages
+              spec {:free-axes free-axes :stages stages
                   ;; the axes the FORM declared, read off FACTS — a single derivation whose only
                   ;; input is the form, so there is no separately-computed value to pass
                   ;; inconsistently (which is what made the span rule unfireable)
-                  :contract-axes (:contract-axes (or facts (cf/contraction-facts contract-form :dtype dtype)))
-                  :body (nth contract-form 4)
-                  :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
-                  :operands operands
-                  :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
-                                              :float)}
-            tz? (and prefer-peak? (seq operands)
-                     (:ok (sco/staged-inner-dp4a-legal? spec)))
-            k (sco/generate-staged-contraction-kernel
-               (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
-        {:strategy :staged-segred
-         :kernel-name (:kernel-name k) :source (:source k)
-         :array-params (:array-params k)
-         :abi (:abi k)
+                    :contract-axes (:contract-axes contract-facts)
+                    :body (nth contract-form 4)
+                    :inputs (vec (sort-by name (contract-operand-arrays (nth contract-form 4))))
+                    :operands operands
+                    :dtype dtype :out-dtype (or (:out-dtype (apply hash-map (drop 5 contract-form)))
+                                                :float)}
+              tz? (and prefer-peak? (seq operands)
+                       (:ok (sco/staged-inner-dp4a-legal? spec)))
+              k (sco/generate-staged-contraction-kernel
+                 (assoc spec :tensorize-inner? (boolean tz?)) out-sym)]
+          {:strategy :staged-segred
+           :kernel-name (:kernel-name k) :source (:source k)
+           :array-params (:array-params k)
+           :abi (:abi k)
          ;; the per-stage scale arrays are EXTRA pointer params — surfaced so a caller binds them
-         :lift-operands (:lift-operands k)
-         :dtype (:dtype k) :out-dtype (:out-dtype k)
-         :out-elems (:out-elems k)
-         :stages (:stages k)
+           :lift-operands (:lift-operands k)
+           :dtype (:dtype k) :out-dtype (:out-dtype k)
+           :out-elems (:out-elems k)
+           :stages (:stages k)
          ;; the operand BUFFERS are bound unchanged; only the kernel's view of them widens to int32
-         :tensorized (:tensorized k) :packed (:packed k)
-         :scalar-args [{:type :int :value nseg}]
-         :wg [256 1]
-         :grid [(ceil-div nseg 256) 1]})
+           :tensorized (:tensorized k) :packed (:packed k)
+           :scalar-args [{:type :int :value nseg}]
+           :wg [256 1]
+           :grid [(ceil-div nseg 256) 1]})
 
       ;; int8 → the quant leaves (dp4a for :nt, quant naive-widening for :nn)
-      (#{:byte :int8} dtype)
-      (route-quant contract-form out-sym n-free n-contract nseg prefer-peak?)
+        (#{:byte :int8} dtype)
+        (route-quant contract-form out-sym n-free n-contract nseg prefer-peak?)
 
       ;; 0 FREE axes → a full reduction to a scalar. This is the last cell of contract's
       ;; algebra: (n free, 0 contract) = map, (n, n) = contraction, (0, n) = REDUCTION. The
@@ -339,70 +343,70 @@
       ;; generate-segred-kernel's two-phase tree reduction already consumes, so no new emitter.
       ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
       ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
-      (zero? n-free)
-      (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-            k (sco/generate-segred-kernel sr out-sym :dtype dtype)
-            attrs (:attributes k)
-            red-bound (second (first contract-axes))]
-        {:strategy :full-reduce
-         :invoke :reduction
-         :artifact k
-         :kernel-name (:kernel-name k) :source (:source k)
-         :array-params (:array-params attrs)
-         :abi (:abi k) :arguments (:arguments k)
-         :dtype dtype :out-dtype dtype :out-elems 1
-         :n-phases (:n-phases attrs)
+        (zero? n-free)
+        (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+              k (sco/generate-segred-kernel sr out-sym :dtype dtype)
+              attrs (:attributes k)
+              red-bound (second (first contract-axes))]
+          {:strategy :full-reduce
+           :invoke :reduction
+           :artifact k
+           :kernel-name (:kernel-name k) :source (:source k)
+           :array-params (:array-params attrs)
+           :abi (:abi k) :arguments (:arguments k)
+           :dtype dtype :out-dtype dtype :out-elems 1
+           :n-phases (:n-phases attrs)
          ;; CARRY THE COMBINE for descriptor inspection as well as in the artifact attributes.
          ;; The staging runtime reads the artifact attributes for its host-side final combine.
-         :c-op (:c-op attrs) :identity-val (:identity-val attrs)
-         :reduce-bound red-bound          ; element count the reduction spans
-         :scalar-args [] :dims [1]})
+           :c-op (:c-op attrs) :identity-val (:identity-val attrs)
+           :reduce-bound red-bound          ; element count the reduction spans
+           :scalar-args [] :dims [1]})
 
-      (zero? n-contract)
-      (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
-            {:keys [kernel-name source array-params scalar-params abi]}
-            (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
-        {:strategy :segmap
-         :kernel-name kernel-name :source source :array-params array-params :abi abi
-         :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
-         :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
-                            {:type :int :value nseg})
-         :out-elems nseg :dims [nseg]})
+        (zero? n-contract)
+        (let [sm (cl/contract-form->segmap contract-form :dtype dtype)
+              {:keys [kernel-name source array-params scalar-params abi]}
+              (sco/generate-segmap-nd-kernel sm out-sym :dtype dtype)]
+          {:strategy :segmap
+           :kernel-name kernel-name :source source :array-params array-params :abi abi
+           :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+           :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
+                              {:type :int :value nseg})
+           :out-elems nseg :dims [nseg]})
 
       ;; 2 free + 1 contract → the tensorize fast path (DPAS if legal, else regtiled).
       ;; A `{::declines …}` result means BOTH tensorize leaves refused for a documented reason —
       ;; we fall through to the general naive leaf rather than hard-failing a perfectly legal
       ;; contraction, and carry the reasons onto that leaf's descriptor.
-      (and (= 2 n-free) (= 1 n-contract) (:strategy (tensorize-plan)))
-      (tensorize-plan)
+        (and (= 2 n-free) (= 1 n-contract) (:strategy (tensorize-plan)))
+        (tensorize-plan)
 
       ;; everything else (n-free≠2, n≥2 contract axes, or a tensorize-ineligible 2-free form)
       ;; → naive segmented reduce (general: any dtype, symbolic dims, any assoc combine).
       ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
-      :else
-      (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-            {:keys [kernel-name source array-params scalar-params abi]}
-            (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
+        :else
+        (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+              {:keys [kernel-name source array-params scalar-params abi]}
+              (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
             ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
             ;; "not eligible".
-            declines (when (and (= 2 n-free) (= 1 n-contract))
-                       (::declines (tensorize-plan)))]
-        (cond->
-        {:strategy :naive-segred
-         :declines (vec declines)
-         :kernel-name kernel-name :source source :array-params array-params :abi abi
-         :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+              declines (when (and (= 2 n-free) (= 1 n-contract))
+                         (::declines (tensorize-plan)))]
+          (cond->
+           {:strategy :naive-segred
+            :declines (vec declines)
+            :kernel-name kernel-name :source source :array-params array-params :abi abi
+            :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
          ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
-         :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
-                            {:type :int :value nseg})
-         :out-elems nseg :dims [nseg]}
+            :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
+                               {:type :int :value nseg})
+            :out-elems nseg :dims [nseg]}
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
-          (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))
+            (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.
@@ -423,6 +427,7 @@
     :non-aget-operand :not-a-contraction :not-2-free :body-has-unmodeled-terms
     ;; dtype / orientation / alignment
     :dtype-not-dpas :non-canonical-orientation :n-pitch-unaligned :k-pitch-unaligned
+    :non-zero-matrix-init :partial-matrix-k-fragment :matrix-family-not-lowered
     ;; declared-operand and quant-leaf legality
     :operand-without-a-declared-map :missing-declared-contract-axes
     :declared-operand-not-read-by-the-body :declared-map-does-not-match-the-body-index
@@ -464,57 +469,65 @@
    shape could express neither: a decline is usually LEGITIMATE (symbolic dims, a non-`+` combine and
    a non-product body are all perfectly good contractions that merely are not tiled-leaf shaped), and
    it is always worth REPORTING."
-  [contract-form out-sym dtype desc tile epilogue]
+  [contract-form out-sym dtype desc tile epilogue contract-facts operation-id]
   (let [acc (volatile! [])
         note! (fn [d] (vswap! acc conj d) nil)]
-   (try
-   (let [sr (cl/contract-form->segred contract-form :dtype dtype)
-         dpas (sco/generate-dpas-contraction-kernel sr out-sym :dtype dtype :desc desc :tile tile
-                                                    :epilogue epilogue)]
-    (when-not (:tensorized dpas)
-      ;; the DPAS gate DECLINES by returning {:tensorized false :reason …} rather than throwing,
-      ;; so its reason is available without an exception — record it either way
-      (note! (decline :dpas (:reason dpas) nil (dissoc dpas :tensorized :reason))))
-    (if (:tensorized dpas)
-      (let [[M N _L] (:dims dpas)
-            {:keys [block-m block-n]} (:tile dpas)]
-        {:strategy :dpas
-         :kernel-name (:kernel-name dpas)
-         :source (:source dpas)
-         :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
-         :abi (:abi dpas)
-         :dtype :half :out-dtype :half :out-elems (* M N)
-         :tile (:tile dpas)                          ; the DERIVED tile actually emitted
-         :fused-epilogue (boolean epilogue)
+    (try
+      (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype))
+            scheduled (contraction-schedule/plan-matrix-body contract-facts desc tile
+                                                             {:operation-id operation-id})
+         ;; Existing epilogues may still carry an opaque target helper.  They retain the proven
+         ;; emitter until that helper is represented as typed scalar IR; all ordinary expressions
+         ;; take the scheduled KernelBody route now.
+            dpas (if (= :opaque-epilogue-helper (:reason scheduled))
+                   (sco/generate-dpas-contraction-kernel @sr out-sym :dtype dtype :desc desc :tile tile
+                                                         :epilogue epilogue)
+                   (if (:ok scheduled)
+                     (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
+                     {:tensorized false :reason (:reason scheduled) :detail scheduled}))]
+        (when-not (:tensorized dpas)
+          (note! (decline :dpas (:reason dpas) nil (dissoc dpas :tensorized :reason))))
+        (if (:tensorized dpas)
+          (let [[M N _L] (:dims dpas)
+                {:keys [block-m block-n]} (:tile dpas)]
+            {:strategy :dpas
+             :kernel-name (:kernel-name dpas)
+             :source (:source dpas)
+             :array-params (:array-params dpas)          ; [row col] = [A-slot B-slot]
+             :abi (:abi dpas)
+             :dtype :half :out-dtype :half :out-elems (* M N)
+             :tile (:tile dpas)                          ; the DERIVED tile actually emitted
+             :kernel-body (:kernel-body dpas)             ; scheduled target-neutral body, when present
+             :fused-epilogue (boolean epilogue)
          ;; extra kernel args the epilogue needs, in signature order (after out + the dims)
-         :epilogue-operands (:epilogue-operands dpas)
-         :epilogue-scalars (:epilogue-scalars dpas)
-         :epilogue-params (:epilogue-params dpas)
-         :wg (:workgroup dpas)                       ; derived from that tile
-         :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
-         :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
-         :dims (:dims dpas)})
+             :epilogue-operands (:epilogue-operands dpas)
+             :epilogue-scalars (:epilogue-scalars dpas)
+             :epilogue-params (:epilogue-params dpas)
+             :wg (:workgroup dpas)                       ; derived from that tile
+             :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
+             :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
+             :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel
-      (let [rt (sco/generate-regtiled-contraction-kernel sr out-sym :dtype dtype)
-            [bm bn _bk] (:block rt)
-            [M N _L] (:dims rt)]
-        {:strategy :regtiled
-         :fallback-reason (:reason dpas)             ; kept: existing consumers read it
-         :declines @acc
-         :kernel-name (:kernel-name rt)
-         :source (:source rt)
-         :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
-         :abi (:abi rt)
-         :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
-         :wg (:workgroup rt)
-         :grid [(ceil-div N bn) (ceil-div M bm)]
-         :scalar-args []                             ; regtiled bakes dims → no scalar params
-         :dims (:dims rt)})))
-   (catch clojure.lang.ExceptionInfo e
+          (let [rt (sco/generate-regtiled-contraction-kernel @sr out-sym :dtype dtype)
+                [bm bn _bk] (:block rt)
+                [M N _L] (:dims rt)]
+            {:strategy :regtiled
+             :fallback-reason (:reason dpas)             ; kept: existing consumers read it
+             :declines @acc
+             :kernel-name (:kernel-name rt)
+             :source (:source rt)
+             :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
+             :abi (:abi rt)
+             :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
+             :wg (:workgroup rt)
+             :grid [(ceil-div N bn) (ceil-div M bm)]
+             :scalar-args []                             ; regtiled bakes dims → no scalar params
+             :dims (:dims rt)})))
+      (catch clojure.lang.ExceptionInfo e
      ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`
      ;; rethrows :raster/fatal and :raster/bug — those are not routing decisions.
-     (note! (decline-of (if (seq @acc) :regtiled :dpas) e))
-     {::declines @acc}))))
+        (note! (decline-of (if (seq @acc) :regtiled :dpas) e))
+        {::declines @acc}))))
 
 (defn- operand-map
   "The declared axis-map for `arr` if the form carries :maps, else DERIVE one by checking the
