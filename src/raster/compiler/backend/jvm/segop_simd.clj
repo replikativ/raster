@@ -842,7 +842,7 @@
   [segred]
   (let [idx (seg-idx segred)
         bound (seg-bound segred)
-        {:keys [acc init lambda]} (:reduce-op segred)
+        {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         ;; Scrub dead leaf-alias bindings (params pre-flatten) before emit.
         lambda (when lambda (normalize-invk (clean-dead-bindings lambda)))
         elem-type (or (:dtype segred)
@@ -984,7 +984,7 @@
                         scalar-bcasts (vec (mapcat (fn [[s sv]] [sv (list broadcast species-sym (list cf s))])
                                                    scalar-vec-syms))
                         ;; Scalar tail: desugar .invk for bytecode compiler
-                        raw-lambda (:lambda (:reduce-op segred))
+                        raw-lambda (:lambda (segop/scalar-reduce-op segred))
                         desugared-lambda (bc/desugar-invk raw-lambda)
                         scalar-body (clojure.walk/postwalk (fn [f] (if (= f idx) j-sym f)) desugared-lambda)
                         lanes-op (condp = op

@@ -55,17 +55,17 @@
       (is (= '[values indices nrows width] (:all-params descriptor)))
       (is (= '[values indices] (:array-params descriptor)))
       (is (= '[nrows width] (:scalar-params descriptor))))
-    (testing "the compiler owns typed product scratch"
-      (is (= ['partial-values 'partial-indices] (mapv :sym allocs)))
-      (is (= [:float :int] (mapv :dtype allocs)))
-      (is (= [12 12] (mapv #((:size-fn %) arguments) allocs))))
-    (testing "the reduction remains two ordered target-neutral map stages"
-      (is (= [:map-void :map-void] (mapv :convention steps)))
-      (is (= 2 (count steps)))
-      (is (= #{'partial-values 'partial-indices}
-             (set (take 2 (get-in steps [0 :artifact :arguments])))))
-      (is (= #{'indices 'partial-indices 'partial-values}
-             (set (take 3 (get-in steps [1 :artifact :arguments]))))))
+    (testing "schedule scratch is local to the emitted product kernel"
+      (is (empty? allocs))
+      (is (= :segmented-workgroup-tree
+             (get-in steps [0 :artifact :attributes :schedule :strategy]))))
+    (testing "the typed product reduction is one resident scheduled step"
+      (is (= [:map-void] (mapv :convention steps)))
+      (is (= 1 (count steps)))
+      (is (= ['values 'indices]
+             (vec (take 2 (get-in steps [0 :artifact :arguments])))))
+      (is (= [:float :int]
+             (get-in steps [0 :artifact :attributes :component-dtypes]))))
     (testing "OpenCL and Level Zero preserve the same typed lowering"
       (is (apply = (map (comp #(mapv :dtype %) :allocs val) descriptors)))
       (is (apply = (map (comp #(mapv :convention %) :steps val) descriptors)))
@@ -73,10 +73,12 @@
                                        (mapv (juxt :kind :dtype :kernel-dtype) (:abi step))) %)
                               :steps val)
                         descriptors))))
-    (testing "OpenCL C preserves integer schedule scalars and portable NaN comparison"
-      (is (str/includes? (first sources) "int tile_count"))
-      (is (str/includes? (first sources) "int tile_size"))
+    (testing "OpenCL C preserves mixed local products and portable NaN comparison"
+      (is (str/includes? (first sources) "__local float shared_0"))
+      (is (str/includes? (first sources) "__local int shared_1"))
+      (is (str/includes? (first sources) "for (int col = lid"))
+      (is (str/includes? (first sources) "barrier(CLK_LOCAL_MEM_FENCE)"))
       (is (every? #(not (str/includes? % "boolean(")) sources))
-      (is (every? #(str/includes? % "(float)(candidate) == (float)(candidate)") sources)))
+      (is (every? #(str/includes? % "(float)(elem_0) == (float)(elem_0)") sources)))
     (testing "the descriptor certifies as a composable LinkPlan before allocation"
       (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))

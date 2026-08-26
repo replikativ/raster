@@ -7,7 +7,7 @@
 (deftest contract-form-to-segred-nn
   (testing "matmul :nn form → segmented SegRed with free segments + reduced contract axis"
     (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
-                  (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
+                                     (* (aget A (+ (* i k) l)) (aget B (+ (* l n) j))))
           sr (cl/contract-form->segred form :id 5)]
       (is (instance? raster.compiler.ir.segop.SegRed sr))
       (testing "space: free axes are OUTER segment dims, contract axis is INNERMOST reduced"
@@ -17,11 +17,11 @@
         (is (= {:name 'l :bound 'k} (segop/seg-space-reduced-dim (:space sr))))
         (is (= '(* m n) (segop/seg-space-num-segments-expr (:space sr)))))
       (testing "reduce-op: init 0.0, combine +, product in the element slot; map-lambda nil"
-        (is (= 0.0 (:init (:reduce-op sr))))
-        (is (= '+ (first (:lambda (:reduce-op sr)))))
+        (is (= 0.0 (:init (segop/scalar-reduce-op sr))))
+        (is (= '+ (first (:lambda (segop/scalar-reduce-op sr)))))
         ;; combine is (+ acc <product>) — the product is the last operand
         (is (= '(* (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
-               (last (:lambda (:reduce-op sr)))))
+               (last (:lambda (segop/scalar-reduce-op sr)))))
         (is (nil? (:lambda sr))))
       (testing "inputs {A B}, output {C}, scalars = the dim bounds (not index vars/arrays)"
         (is (= '#{A B} (:inputs sr)))
@@ -35,7 +35,7 @@
 (deftest contract-form-single-free-axis
   (testing "matvec: 1 free axis → 1 segment dim + reduced dim, no phantom segments"
     (let [form '(raster.par/contract y [[i m]] [[l k]]
-                  (* (aget A (+ (* i k) l)) (aget x l)))
+                                     (* (aget A (+ (* i k) l)) (aget x l)))
           sr (cl/contract-form->segred form)]
       (is (= 2 (count (segop/seg-space-dims (:space sr)))))
       (is (= [{:name 'i :bound 'm}] (segop/seg-space-segment-dims (:space sr))))
@@ -47,16 +47,16 @@
 (deftest contract-form-custom-init-combine
   (testing "opts :init/:combine flow into reduce-op (e.g. max-plus semiring)"
     (let [form '(raster.par/contract C [[i m] [j n]] [[l k]]
-                  (+ (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
-                  :init -1.0e30 :combine max)
+                                     (+ (aget A (+ (* i k) l)) (aget B (+ (* l n) j)))
+                                     :init -1.0e30 :combine max)
           sr (cl/contract-form->segred form)]
-      (is (= -1.0e30 (:init (:reduce-op sr))))
-      (is (= 'max (first (:lambda (:reduce-op sr))))))))
+      (is (= -1.0e30 (:init (segop/scalar-reduce-op sr))))
+      (is (= 'max (first (:lambda (segop/scalar-reduce-op sr))))))))
 
 (deftest contract-form-three-free-axes
   (testing "batched matmul: 3 free axes → 3 segment dims, num-segments = product"
     (let [form '(raster.par/contract C [[b btch] [i m] [j n]] [[l k]]
-                  (* (aget A x) (aget B y)))
+                                     (* (aget A x) (aget B y)))
           sr (cl/contract-form->segred form)]
       (is (= 4 (count (segop/seg-space-dims (:space sr)))))
       (is (= 3 (count (segop/seg-space-segment-dims (:space sr)))))

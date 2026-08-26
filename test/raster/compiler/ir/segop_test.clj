@@ -107,7 +107,7 @@
     (let [soac (soac/par-form->soac 'result
                                     '(raster.par/reduce acc 0.0 j n (+ acc (aget a j))) 0)
           segops (lower/lower-reduce soac nil)
-          op (:reduce-op (first segops))]
+          op (segop/scalar-reduce-op (first segops))]
       (is (= 'acc (:acc op)))
       (is (= 0.0 (:init op))))))
 

@@ -454,7 +454,7 @@
                             (or bound
                                 (do (swap! stats update :segop-relowered (fnil inc 0))
                                     (let [soac (raster.compiler.ir.soac/par-form->soac
-                                                sym form (swap! segop-id-counter inc))
+                                                sym form (swap! segop-id-counter inc) :dtype dtype)
                                           segops (raster.compiler.passes.parallel.soac-lower/lower-soac
                                                   soac :cpu:0 :dtype dtype)]
                                       (first segops)))))

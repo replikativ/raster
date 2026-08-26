@@ -138,6 +138,70 @@
            (recur (inc ~idx-sym) ~body-expr)
            ~acc-sym)))))
 
+(defmacro product-reduce!
+  "Typed segmented product reduction.
+
+  Form:
+    (product-reduce! outputs
+      [[acc neutral dtype] ...]
+      [[segment-index segment-bound] ...]
+      reduce-index reduce-bound
+      [element-local value ...]
+      [element-value ...]
+      [[left right] ...]
+      [combine-local value ...]
+      [combined-value ...]
+      algebra)
+
+  `outputs` is ordered with the components; nil discards a final component.  `algebra` records
+  semantic facts for scheduling and is not a runtime argument.  The interpreted fallback is a
+  deterministic sequential fold per segment; accelerator lowering may choose a parallel tree.
+
+  Example: argmax reduces `[value,index]`, discards the winning value, and writes the index."
+  [outputs components segment-axes idx-sym bound-expr
+   element-bindings element-results combine-parameters combine-bindings combine-results algebra]
+  (assert (vector? outputs) "product-reduce!: outputs must be a vector")
+  (assert (and (vector? components) (seq components)
+               (every? #(and (vector? %) (= 3 (count %))) components))
+          "product-reduce!: components must be [[acc neutral dtype] ...]")
+  (assert (= (count outputs) (count components) (count element-results)
+             (count combine-parameters) (count combine-results))
+          "product-reduce!: outputs, components, element and combine results must have equal arity")
+  (assert (and (vector? segment-axes)
+               (every? #(and (vector? %) (= 2 (count %))) segment-axes))
+          "product-reduce!: segment axes must be [[index bound] ...]")
+  (assert (and (vector? element-bindings) (even? (count element-bindings)))
+          "product-reduce!: element bindings must be a flat binding vector")
+  (assert (and (vector? combine-bindings) (even? (count combine-bindings)))
+          "product-reduce!: combine bindings must be a flat binding vector")
+  (assert (every? #(and (vector? %) (= 2 (count %))) combine-parameters)
+          "product-reduce!: combine parameters must be [[left right] ...]")
+  (assert (map? algebra) "product-reduce!: algebra must be a map")
+  (let [accs (mapv first components)
+        neutrals (mapv second components)
+        n-sym (gensym "n__")
+        flat-index (clojure.core/reduce (fn [flat [segment bound]]
+                                          `(+ (* ~flat (int ~bound)) ~segment))
+                                        0 segment-axes)
+        stores (keep (fn [[out acc]]
+                       (when out `(clojure.core/aset ~out ~flat-index ~acc)))
+                     (clojure.core/map vector outputs accs))
+        fold `(let [~n-sym (long ~bound-expr)]
+                (loop [~idx-sym (long 0)
+                       ~@(mapcat vector accs neutrals)]
+                  (if (< ~idx-sym ~n-sym)
+                    (let [~@element-bindings
+                          ~@(mapcat (fn [[[left right] acc element]]
+                                      [left acc right element])
+                                    (clojure.core/map vector combine-parameters accs element-results))
+                          ~@combine-bindings]
+                      (recur (unchecked-inc ~idx-sym) ~@combine-results))
+                    (do ~@stores nil))))
+        segmented (clojure.core/reduce (fn [body [segment bound]]
+                                         `(dotimes [~segment (int ~bound)] ~body))
+                                       fold (reverse segment-axes))]
+    `(do ~segmented nil)))
+
 (defmacro contract
   "Explicit tensor contraction (SOAC). Declares FREE (parallel/output) axes and
   CONTRACTED (reduced) axes separately — the reliable, unambiguous scheduling signal

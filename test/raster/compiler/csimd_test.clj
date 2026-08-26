@@ -7,7 +7,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.cpu.csimd :as cs]
             [raster.compiler.backend.cpu.codegen :as cpu]
-            [raster.compiler.backend.gpu.c-emit :as ce]))
+            [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.ir.reduction :as reduction]))
 
 (defn- clang-avx2? []
   (try
@@ -17,19 +18,21 @@
 
 (defn- ssq-segred [dt]
   {:space {:dims [{:name 'i :bound 'n}]} :dtype dt
-   :reduce-op {:acc 'acc :init 0.0
-               :lambda '(.invk raster.numeric/_plus__m_double_double-impl acc
-                          (.invk raster.numeric/_star__m_double_double-impl
-                            (clojure.core/aget x (long i))
-                            (clojure.core/aget x (long i))))}})
+   :reduction (reduction/scalar
+               {:accumulator 'acc :neutral 0.0 :dtype dt :result 'out :index 'i
+                :step-result '(.invk raster.numeric/_plus__m_double_double-impl acc
+                                     (.invk raster.numeric/_star__m_double_double-impl
+                                            (clojure.core/aget x (long i))
+                                            (clojure.core/aget x (long i))))})})
 
 (defn- dot-segred [dt]
   {:space {:dims [{:name 'i :bound 'n}]} :dtype dt
-   :reduce-op {:acc 'acc :init 0.0
-               :lambda '(.invk raster.numeric/_plus__m_double_double-impl acc
-                          (.invk raster.numeric/_star__m_double_double-impl
-                            (clojure.core/aget a (long i))
-                            (clojure.core/aget b (long i))))}})
+   :reduction (reduction/scalar
+               {:accumulator 'acc :neutral 0.0 :dtype dt :result 'out :index 'i
+                :step-result '(.invk raster.numeric/_plus__m_double_double-impl acc
+                                     (.invk raster.numeric/_star__m_double_double-impl
+                                            (clojure.core/aget a (long i))
+                                            (clojure.core/aget b (long i))))})})
 
 (defn- run1 [native arrs n]
   (let [out (first arrs)]
@@ -85,8 +88,8 @@
 (defn- axpy-segmap [dt]
   {:space {:dims [{:name 'L :bound 'n}]} :dtype dt :out-sym 'y :cast-fn (if (= dt :float) 'float 'double)
    :lambda '(.invk raster.numeric/_plus__m_double_double-impl
-              (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
-              (clojure.core/aget b (long L)))})
+                   (.invk raster.numeric/_star__m_double_double-impl (clojure.core/aget a (long L)) s)
+                   (clojure.core/aget b (long L)))})
 
 (deftest segmap-elementwise-matches-scalar
   (testing "y[L]=a[L]*s+b[L] via compile-segmap-c == scalar, f64 and f32"
@@ -120,11 +123,11 @@
       (println "[csimd-test] clang/AVX2 unavailable — skipping")
       (let [segmap {:space {:dims [{:name 'L :bound 'n}]} :dtype :float :out-sym 'acc :cast-fn 'float
                     :lambda '(.invk raster.numeric/_plus__m_float_float-impl
-                               (clojure.core/aget acc (long L))
-                               (.invk raster.numeric/_star__m_float_float-impl
-                                 (clojure.core/aget scale (long L))
-                                 (float (.invk raster.numeric/_minus__m_long_long-impl
-                                          (long (clojure.core/aget iarr (long L))) k))))}
+                                    (clojure.core/aget acc (long L))
+                                    (.invk raster.numeric/_star__m_float_float-impl
+                                           (clojure.core/aget scale (long L))
+                                           (float (.invk raster.numeric/_minus__m_long_long-impl
+                                                         (long (clojure.core/aget iarr (long L))) k))))}
             {:keys [includes block]}
             (binding [cs/*array-types* '{acc :float scale :float iarr :int}
                       ce/*emit-config* cpu/cpu-config ce/*scalar-type* "float" ce/*int-vars* '#{n k}]

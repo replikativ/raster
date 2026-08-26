@@ -9,9 +9,10 @@
    later, the BlkRegTiling-style tiling pass consume this SegRed. A contraction is
    represented like a fused map→reduce: the product (map body) lives in the reduce
    combine's element slot `(+ acc <product>)`, so `map-lambda` is nil — matching how a
-   `SoacReduce` fuses its map into the combine (see soac-lower/reduce-op-info)."
+   `SoacReduce` fuses its map into the canonical reduction operator."
   (:require [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.par :as ir-par]
+            [raster.compiler.ir.reduction :as reduction]
             [clojure.set :as set]
             [clojure.walk :as walk]))
 
@@ -65,7 +66,10 @@
         space (segop/make-seg-space-nd (conj free-dims red-dim))
         acc-sym (gensym "acc__")
         ;; fused map→reduce: product sits in the combine's element slot.
-        reduce-op {:acc acc-sym :init init :lambda (list combine acc-sym body)}
+        reduction (reduction/scalar
+                   {:accumulator acc-sym :neutral init :dtype dtype :result out
+                    :index k-sym :step-result (list combine acc-sym body)
+                    :attributes {:source :raster.par/contract}})
         arrays  (set (ir-par/collect-aget-arrays body))
         inputs  (disj arrays out)
         ;; scalars = the symbol-valued axis bounds (the contraction dims). Body-level
@@ -74,13 +78,14 @@
                          (conj (mapv second free-axes) k-bound))]
     (segop/->SegRed id space
                     (segop/->SegLevel :thread :virtual)
-                    reduce-op
+                    reduction
                     nil                 ; map-lambda: nil (product is in the combine)
                     inputs
                     #{out}
                     (set/difference bound-syms arrays #{out})
                     grid
                     :segmented
+                    nil
                     dtype)))
 
 (defn contract-form->segmap

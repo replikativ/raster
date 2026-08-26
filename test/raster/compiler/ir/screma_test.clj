@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.screma-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]))
 
 ;; ================================================================
@@ -27,8 +28,8 @@
       (is (empty? (:scans screma)))
       (is (= 1 (count (:reduces screma))))
       (let [r (first (:reduces screma))]
-        (is (= 'acc (:acc r)))
-        (is (= 0.0 (:init r)))))))
+        (is (= ['acc] (reduction/accumulators r)))
+        (is (= [0.0] (reduction/neutrals r)))))))
 
 (deftest screma-from-scan-test
   (testing "SoacScan → Screma: pure scan with one scan op"
@@ -79,17 +80,19 @@
 
 (deftest screma-map-reduce-unfused-throws
   (testing "a reduce screma still carrying a :map-lambda is rejected, not silently reduce-only"
-    (let [screma (soac/->Screma 1 'r 'i 'n #{'a 'tmp} #{'r} #{}
-                                nil [] [{:acc 'acc :init 0.0
-                                         :lambda '(+ acc (aget tmp i))}]
+    (let [red (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :double
+                                 :result 'r :index 'i :step-result '(+ acc (aget tmp i))})
+          screma (soac/->Screma 1 'r 'i 'n #{'a 'tmp} #{'r} #{}
+                                nil [] [red]
                                 '(* (aget a i) 2.0))]
       (is (thrown-with-msg?
            Exception #"was not inlined into the reduce lambda"
            (soac/screma->par-form screma)))))
   (testing "a properly-fused reduce (no map-lambda) still converts"
-    (let [screma (soac/->Screma 1 'r 'i 'n #{'a} #{'r} #{}
-                                nil [] [{:acc 'acc :init 0.0
-                                         :lambda '(+ acc (aget a i))}]
+    (let [red (reduction/scalar {:accumulator 'acc :neutral 0.0 :dtype :double
+                                 :result 'r :index 'i :step-result '(+ acc (aget a i))})
+          screma (soac/->Screma 1 'r 'i 'n #{'a} #{'r} #{}
+                                nil [] [red]
                                 nil)]
       (is (= 'raster.par/reduce (first (soac/screma->par-form screma)))))))
 
