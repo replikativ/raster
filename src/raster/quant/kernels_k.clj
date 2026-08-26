@@ -143,6 +143,71 @@
                                   s))]
                        (ra/aset bsums sidx (int bs)))))))
 
+(deftm quant-act-q8k-padded-rows-gpu!
+  "Quantize dense row-major `[nrows,width]` activations into Q8_K leaves laid out at
+  `padded-in`. Elements in `[width,padded-in)` are synthesized as zero while packing, so callers
+  do not allocate or copy a padded activation tensor. `padded-in` must be a multiple of 256 and
+  at least `width`."
+  [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
+   submax :- (Array float), width :- Long, padded-in :- Long, nrows :- Long] :- Void
+  (do
+    (par/map-void! si (* (long nrows) (quot (long padded-in) 32))
+                   (let [nsub (quot (long padded-in) 32)
+                         row (quot si nsub)
+                         row-sub (rem si nsub)
+                         col-base (* row-sub 32)
+                         xbase (* row (long width))
+                         m (loop [k 0 m 0.0]
+                             (if (< k 32)
+                               (let [col (+ col-base k)]
+                                 (if (< col (long width))
+                                   (let [v (ra/aget x (+ xbase col))]
+                                     (recur (inc k) (max m (max v (- v)))))
+                                   (recur (inc k) m)))
+                               m))]
+                     (ra/aset submax si (float m))))
+    (par/map-void! sj (* (long nrows) (quot (long padded-in) 32))
+                   (let [nsb (quot (long padded-in) 256)
+                         nsub (quot (long padded-in) 32)
+                         row (quot sj nsub)
+                         row-sub (rem sj nsub)
+                         sb (quot row-sub 8)
+                         j (rem row-sub 8)
+                         mx (loop [k 0 m 0.0]
+                              (if (< k 8)
+                                (recur (inc k) (max m (ra/aget submax (+ (* row nsub) (* sb 8) k))))
+                                m))
+                         d (/ (double mx) 127.0)
+                         id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
+                         sidx (+ (* row nsub) (* sb 8) j)
+                         wbase (+ (* row (quot (long padded-in) 4)) (* sb 64) (* j 8))
+                         col-base (+ (* sb 256) (* j 32))
+                         xbase (* row (long width))]
+                     (ra/aset xs (+ (* row nsb) sb) (float d))
+                     (let [bs (loop [w 0 s 0]
+                                (if (< w 8)
+                                  (let [col (+ col-base (* w 4))
+                                        q0 (if (< col (long width))
+                                             (long (Math/round (* (double (ra/aget x (+ xbase col))) id)))
+                                             0)
+                                        q1 (if (< (+ col 1) (long width))
+                                             (long (Math/round (* (double (ra/aget x (+ xbase col 1))) id)))
+                                             0)
+                                        q2 (if (< (+ col 2) (long width))
+                                             (long (Math/round (* (double (ra/aget x (+ xbase col 2))) id)))
+                                             0)
+                                        q3 (if (< (+ col 3) (long width))
+                                             (long (Math/round (* (double (ra/aget x (+ xbase col 3))) id)))
+                                             0)
+                                        word (bit-or (bit-or (bit-and q0 0xFF)
+                                                             (bit-shift-left (bit-and q1 0xFF) 8))
+                                                     (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
+                                                             (bit-shift-left (bit-and q3 0xFF) 24)))]
+                                    (ra/aset xp (+ wbase w) (int word))
+                                    (recur (inc w) (+ s q0 q1 q2 q3)))
+                                  s))]
+                       (ra/aset bsums sidx (int bs)))))))
+
 ;; ---- dp4a int8-GEMV core (the format-agnostic hardware-accelerated path) ----
 ;; int8×int8 GEMV over int32-packed lanes: y[o] = Σ_w dp4a(wp[o*kw+w], xp[w]). par/dp4a
 ;; lowers to the portable rstr_dp4a helper which the OpenCL/C compiler pattern-matches to

@@ -32,6 +32,12 @@
     (System/arraycopy values (* row width) result 0 width)
     result))
 
+(defn- pad-rows [^floats values nrows width padded-width]
+  (let [result (float-array (* nrows padded-width))]
+    (dotimes [row nrows]
+      (System/arraycopy values (* row width) result (* row padded-width) width))
+    result))
+
 (defn- ref-matmul [^floats W-dq ^floats x-dq out in]
   (let [y (float-array out)]
     (dotimes [o out]
@@ -95,6 +101,37 @@
                (subvec (vec bsums) (* row nsub) (* (inc row) nsub)))
             (str "activation block sums row " row))))))
 
+(deftest q8k-padded-row-quantization-does-not-materialize-layout-padding
+  (let [nrows 3 width 640 padded-in 768
+        nsub (quot padded-in 32) nsb (quot padded-in 256)
+        dense (gen (* nrows width) 73)
+        padded (pad-rows dense nrows width padded-in)
+        expected-xp (int-array (* nrows (quot padded-in 4)))
+        expected-xs (float-array (* nrows nsb))
+        expected-bsums (int-array (* nrows nsub))
+        expected-submax (float-array (* nrows nsub))
+        actual-xp (int-array (alength expected-xp))
+        actual-xs (float-array (alength expected-xs))
+        actual-bsums (int-array (alength expected-bsums))
+        actual-submax (float-array (alength expected-submax))]
+    (qk/quant-act-q8k-rows-gpu! padded expected-xp expected-xs expected-bsums expected-submax
+                                padded-in nrows)
+    (qk/quant-act-q8k-padded-rows-gpu! dense actual-xp actual-xs actual-bsums actual-submax
+                                       width padded-in nrows)
+    (is (= (vec expected-xp) (vec actual-xp)) "packed words equal explicit zero padding")
+    (is (= (vec expected-xs) (vec actual-xs)) "super-block scales equal explicit zero padding")
+    (is (= (vec expected-bsums) (vec actual-bsums)) "sub-block sums equal explicit zero padding")
+    (is (= (vec expected-submax) (vec actual-submax)) "reduction scratch preserves row boundaries")
+    (let [equal-xp (int-array (alength expected-xp))
+          equal-xs (float-array (alength expected-xs))
+          equal-bsums (int-array (alength expected-bsums))
+          equal-submax (float-array (alength expected-submax))]
+      (qk/quant-act-q8k-padded-rows-gpu! padded equal-xp equal-xs equal-bsums equal-submax
+                                         padded-in padded-in nrows)
+      (is (= (vec expected-xp) (vec equal-xp)) "equal-width adapter agrees with branch-free packing")
+      (is (= (vec expected-xs) (vec equal-xs)) "equal-width adapter agrees on scales")
+      (is (= (vec expected-bsums) (vec equal-bsums)) "equal-width adapter agrees on sums"))))
+
 (deftest q4k-projection-shares-weights-across-activation-rows
   (let [nrows 3 in 512 out 11
         x (gen (* nrows in) 81)
@@ -119,6 +156,8 @@
 (deftest row-capable-q4k-path-lowers-through-the-shared-gpu-pipeline
   (let [quant-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-rows-gpu!
                                                         :target-device :ze:0 :dtype :float))
+        padded-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-padded-rows-gpu!
+                                                         :target-device :ze:0 :dtype :float))
         projection-kernels (:kernels (pipeline/show-pipeline #'qk/qmatmul-q4k-dp4a-rows!
                                                              :target-device :ze:0 :dtype :float))]
     (is (= 2 (count quant-kernels)) "Q8_K remains an ordered two-phase reduction")
@@ -126,6 +165,13 @@
              [[bsums :int] [submax :float] [x :float] [xp :int]
               [xs :float] [in :int] [_n_bound :int]]]
            (mapv #(mapv (juxt :name :dtype) (:abi %)) quant-kernels)))
+    (is (= '[[[submax :float] [x :float] [padded-in :int] [width :int] [_n_bound :int]]
+             [[bsums :int] [submax :float] [x :float] [xp :int] [xs :float]
+              [padded-in :int] [width :int] [_n_bound :int]]]
+           (mapv #(mapv (juxt :name :dtype) (:abi %)) padded-kernels))
+        "the adapter changes layout indexing without changing the two-phase Q8_K representation")
+    (is (every? #(re-find #"col < .*width" (:source %)) padded-kernels)
+        "both phases guard dense-row reads and synthesize the padding region")
     (is (= 1 (count projection-kernels)))
     (is (= '[[aq :byte] [bq :byte] [bsums :int] [da :float] [db :float]
              [wp :int] [xp :int] [xs :float] [y :float]

@@ -146,9 +146,10 @@ or an attention special case.
 Buffered RoPE follows the same rule: one kernel consumes row-major `[B,heads,head-dim]` values and
 the routed attention `int positions[B]` buffer, so B=1 and B>1 neither select different kernels nor
 upload duplicate position representations. Dense semantic rows whose logical width differs from a
-quantized contraction's padded width still need an explicit layout transform. The preferred first
-implementation is a generated padded-row quantization adapter that synthesizes zeroes while packing,
-avoiding a materialized padding buffer; padding is layout, not quantization-specific memory ownership.
+quantized contraction's padded width use a generated padded-row quantization adapter. It synthesizes
+zeroes while packing and therefore avoids a materialized padding buffer; the branch-free equal-width
+kernel remains available for already padded layouts. Padding is layout, not quantization-specific
+memory ownership.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.

@@ -275,24 +275,24 @@
 
 (deftest q8k-quant-then-q4k-projection-batches-independent-rows
   (when (gpu-available?)
-    (testing "one generated Q4_K path handles B>1 while sharing the packed weight leaves"
-      (let [nrows 3 out 17 in 512 nsb (quot in 256) nsub (quot in 32)
-            W (gen (* out in) 105) x (gen (* nrows in) 106)
+    (testing "dense B>1 rows synthesize layout padding while sharing the packed weight leaves"
+      (let [nrows 3 out 17 width 640 in 768 nsb (quot in 256) nsub (quot in 32)
+            W (gen (* out in) 105) x (gen (* nrows width) 106)
             {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
             wp (bytes->ints-le wq)
             yref (float-array (* nrows out))
             _ (dotimes [row nrows]
                 (let [xr (float-array in)
-                      _ (System/arraycopy x (* row in) xr 0 in)
+                      _ (System/arraycopy x (* row width) xr 0 width)
                       {:keys [xq xs bsums]} (q/quantize-act-q8k xr in q/q4-K)
                       yr (float-array out)]
                   (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq yr in out 0 out)
                   (System/arraycopy yr 0 yref (* row out) out)))
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :quant-rows #'qk/quant-act-q8k-rows-gpu!)
+          (gpu/compile! sess :quant-rows #'qk/quant-act-q8k-padded-rows-gpu!)
           (gpu/compile! sess :q4k-rows #'qk/qmatmul-q4k-dp4a-rows!)
-          (gpu/alloc! sess {:x [:float (* nrows in) x]
+          (gpu/alloc! sess {:x [:float (* nrows width) x]
                             :xp [:int (* nrows (quot in 4)) nil]
                             :xs [:float (* nrows nsb) nil]
                             :bsums [:int (* nrows nsub) nil]
@@ -302,9 +302,11 @@
                             :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
                             :y [:float (* nrows out) nil]})
           (let [bindings {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}]
-            (gpu/prepare! sess :quant-rows-max bindings [] (* nrows nsub)
+            (gpu/prepare! sess :quant-rows-max bindings
+                          [{:type :int :value in} {:type :int :value width}] (* nrows nsub)
                           {:kernel-phase :quant-rows :index 0})
-            (gpu/prepare! sess :quant-rows-pack bindings [{:type :int :value in}]
+            (gpu/prepare! sess :quant-rows-pack bindings
+                          [{:type :int :value in} {:type :int :value width}]
                           (* nrows nsub) {:kernel-phase :quant-rows :index 1}))
           (gpu/prepare! sess :q4k-rows
                         {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp
