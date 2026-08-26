@@ -21,6 +21,11 @@
 (defn- zero-init? [init]
   (and (number? init) (zero? init)))
 
+(defn- lowered-dpas-instruction?
+  [{:keys [family m n k subgroup]}]
+  (and (= :dpas family) (= 8 m) (= 16 k)
+       (contains? #{8 16} subgroup) (= n subgroup)))
+
 (defn- tile-valid?
   [{:keys [block-m block-n block-k sg-m sg-n matrix num-stages]}]
   (let [{:keys [m n k subgroup]} matrix
@@ -246,6 +251,9 @@
 
        (not= :dpas (:family matrix))
        (decline :matrix-family-not-lowered {:family (:family matrix)})
+
+       (not (lowered-dpas-instruction? matrix))
+       (decline :matrix-instruction-not-lowered {:matrix matrix})
 
        (not (tile-valid? tile))
        (throw (ex-info "matrix schedule tile is not divisible or contains an invalid extent"
