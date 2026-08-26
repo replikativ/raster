@@ -23,6 +23,8 @@
             [raster.compiler.ir.soac]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.segop :as segop]
             [raster.runtime.hardware :as hw]
             [clojure.set :as set]))
 
@@ -155,12 +157,10 @@
                                        (:body info2))
                           fused-expr (list 'raster.par/map! (:out info2) (:idx info2) (:bound info2)
                                            (:cast info2) inline-body)
-                          ;; sym2's SegOp describes expr2 before body1 was inlined. Keeping that
-                          ;; metadata makes boundary consumption silently emit expr2 alone. The
-                          ;; fused expression did not pass through segop-lower, so invalidate its
-                          ;; stale certificate and let the counted backend re-lowering handle it.
-                          fused-sym (vary-meta sym2 dissoc
-                                               :raster.compiler.passes.parallel.segop-lower-pass/segops)]
+                          ;; The ParallelProgram equation describes expr2 before body1 was inlined.
+                          ;; Its source-equality certificate will reject fused-expr and select the
+                          ;; counted backend re-lowering path.
+                          fused-sym sym2]
                       ;; Skip sym1 binding (tmp is eliminated), replace sym2 with fused
                       (recur (+ i 2) (conj result [fused-sym fused-expr]) true))
                     ;; Not fusable — keep both
@@ -390,9 +390,8 @@
 (def ^:private segop-id-counter (atom 0))
 
 (def ^:dynamic *bound-segops*
-  "SegOps segop-lower attached to the binding currently being transformed (its ::segops metadata),
-   or nil. The JVM SIMD backend used to re-lower every par form on the fly, same as opencl-pass
-   did before PR #98 — the third copy of that seam. Consumption is dtype-guarded."
+  "SegOps owned by the ParallelProgram equation currently being transformed, or nil for direct
+   S-expression callers. Consumption is dtype-guarded."
   nil)
 
 (defn simd-pass
@@ -405,13 +404,17 @@
     :min-elements — minimum elements for SIMD (default 8)"
   [form & {:keys [simd? min-elements] :or {simd? true min-elements nil}}]
   (if-not simd?
-    {:form (par/expand-par-forms form) :stats {:simd? false}}
-    (let [min-elements (or min-elements (effective-min-elements))
+    (let [p (when (parallel-program/parallel-program? form)
+              (parallel-program/validate! form segop/segop-node?))
+          source (if p (parallel-program/source-form p) form)]
+      {:form (par/expand-par-forms source) :stats {:simd? false}})
+    (let [parallel-program (when (parallel-program/parallel-program? form)
+                             (parallel-program/validate! form segop/segop-node?))
+          source-form (if parallel-program (parallel-program/source-form parallel-program) form)
+          min-elements (or min-elements (effective-min-elements))
           stats (atom {:simd-maps 0 :simd-reduces 0 :fallback 0 :fused 0 :skipped-small 0})
-          ;; On-the-fly SegOp computation for any par form
-          ;; the SegOps segop-lower attached to the binding being transformed — same seam as
-          ;; opencl-pass (*bound-segops* there). Consumed only when the dtype matches what this
-          ;; backend would derive, so consumption cannot silently change the SIMD element type.
+            ;; Equation SegOps are consumed only when the dtype matches what this backend derives,
+            ;; so program consumption cannot silently change the SIMD element type.
           take-bound (fn [pred dtype]
                        (when-let [so (first (filter #(and (pred %) (= dtype (:dtype %))) *bound-segops*))]
                          (swap! stats update :segop-reused (fnil inc 0))
@@ -529,10 +532,19 @@
                   (let [pairs (partition 2 bindings)
                         new-bindings (vec (mapcat (fn [[s e]]
                                                     [s (binding [*bound-segops*
-                                                                 (:raster.compiler.passes.parallel.segop-lower-pass/segops (meta s))]
+                                                                 (when parallel-program
+                                                                   (parallel-program/operations-for-binding
+                                                                    parallel-program s e))]
                                                          (transform e))])
                                                   pairs))
-                        new-body (doall (map transform body))]
+                        new-body (doall
+                                  (map (fn [expr]
+                                         (binding [*bound-segops*
+                                                   (when parallel-program
+                                                     (parallel-program/operations-for-source
+                                                      parallel-program expr))]
+                                           (transform expr)))
+                                       body))]
                     (list* let-sym new-bindings new-body))))
 
               ;; do block — recurse explicitly (not via generic seq, for clarity)
@@ -543,5 +555,5 @@
               (seq? form) (apply list (doall (map transform form)))
               (vector? form) (mapv transform form)
               :else form))]
-      {:form (transform form)
+      {:form (transform source-form)
        :stats @stats})))

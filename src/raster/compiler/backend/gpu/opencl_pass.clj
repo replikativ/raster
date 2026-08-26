@@ -13,6 +13,8 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
@@ -102,15 +104,12 @@
       :else (:ok r))))
 
 (def ^:dynamic *bound-segops*
-  "The SegOp records `segop-lower` attached to the binding CURRENTLY being transformed (its
-   `::segops` metadata), or nil in body position / when the pass did not run.
+  "The SegOp records owned by the ParallelProgram equation currently being transformed, or nil
+   when this backend was called directly on an S-expression.
 
    This is the seam that makes the SegOp boundary REAL instead of nominal. `segop-lower` lowered
-   every par form with the real target device and stored the result on the binder symbol — and
-   nothing read it: this pass re-lowered each form from scratch with `:ze:0` hardcoded, ignoring
-   both the stored result and its own `device-id` (north-star §2.1, ledger #6/#11). Now the
-   stored SegOp is consumed; re-lowering is the fallback and is COUNTED, so a form that bypasses
-   the pass's output shows up in the stats instead of silently taking a second path."
+   every par form with the real target device. The equation is consumed here; re-lowering remains
+   a counted compatibility path for callers that invoke opencl-pass directly."
   nil)
 
 (defn- take-bound-segop
@@ -277,8 +276,13 @@
   ;; DECLARED types from derive-param-types (opts) override the name-heuristic fallback in the
   ;; kernel generators — e.g. `features` (Long→int) and `gain-offset` (Double→float, whose name
   ;; would otherwise misfire the "offset"→int heuristic). Form-meta types are the base.
-  (let [top-scalar-types (merge (or (:scalar-types (meta form)) {}) scalar-types)
-        top-array-types (merge (or (:array-types (meta form)) {}) array-types)
+  (let [parallel-program (when (parallel-program/parallel-program? form)
+                           (parallel-program/validate! form segop/segop-node?))
+        source-form (if parallel-program (parallel-program/source-form parallel-program) form)
+        top-scalar-types (merge (or (:scalar-types (meta source-form)) {})
+                                (or (:scalar-types (meta form)) {}) scalar-types)
+        top-array-types (merge (or (:array-types (meta source-form)) {})
+                               (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
                      :ze-structured-reductions 0 :fallback 0})
         kernels (atom [])
@@ -558,22 +562,21 @@
             (and (seq? form) (contains? #{'let 'let*} (first form)))
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
-                  ;; the binder symbol carries what segop-lower computed for this init — make it
-                  ;; visible to the par branches so they consume it instead of re-lowering
                   new-bindings (vec (mapcat (fn [[sym expr]]
                                               [sym (binding [*bound-segops*
-                                                             (:raster.compiler.passes.parallel.segop-lower-pass/segops (meta sym))]
+                                                             (when parallel-program
+                                                               (parallel-program/operations-for-binding
+                                                                parallel-program sym expr))]
                                                      (transform expr))])
                                             pairs))
-                  new-body (mapv transform body-exprs)]
+                  new-body (mapv (fn [expr]
+                                   (binding [*bound-segops*
+                                             (when parallel-program
+                                               (parallel-program/operations-for-source
+                                                parallel-program expr))]
+                                     (transform expr)))
+                                 body-exprs)]
               (with-meta (apply list let-sym new-bindings new-body) (meta form)))
-
-            ;; a body-position par form: segop-lower wraps it in (do …) carrying ::body-segops
-            ;; — consume that exactly as a binding's ::segops, so body forms stop re-lowering
-            (and (seq? form) (= 'do (first form))
-                 (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form)))
-            (binding [*bound-segops* (:raster.compiler.passes.parallel.segop-lower-pass/body-segops (meta form))]
-              (with-meta (apply list 'do (mapv transform (rest form))) (meta form)))
 
             (and (seq? form) (= 'do (first form)))
             (with-meta (apply list 'do (mapv transform (rest form))) (meta form))
@@ -588,7 +591,7 @@
                 rebuilt))
 
             :else form))]
-    {:form (transform form)
+    {:form (transform source-form)
      :stats @stats
      :kernels @kernels
      :dispatches @dispatches}))

@@ -19,6 +19,7 @@
    operation with no alternate emitter."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.parallel-program :as program]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.ir.soac :as soac]))
@@ -46,8 +47,10 @@
                                            (+ acc (aget values i)))]
                   result)
            {})
-        binding (first (second (:form r)))
-        scheduled (slp/get-kernel-graph binding)]
+        p (:form r)
+        scheduled (program/kernel-graph-for-binding
+                   p 'result '(raster.par/scan out acc 0.0 i n double
+                                               (+ acc (aget values i))))]
     (is (= 1 (get-in r [:stats :segops-lowered])))
     (is (= 1 (get-in r [:stats :kernel-graphs-lowered])))
     (is (kernel-graph/kernel-graph? scheduled))
@@ -66,7 +69,7 @@
     (is (zero? (get-in r [:stats :kernel-graphs-lowered])))
     (is (= :segop (:stage d)))
     (is (= :scan-not-associative (:reason d)))
-    (is (= :no-segop-metadata-backend-lowers-or-uses-legacy-codegen (:fallback d)))))
+    (is (= :backend-relowers-or-uses-specialized-codegen (:fallback d)))))
 
 (deftest an-unrepresentable-par-form-becomes-a-diagnostic
   (testing "a par form with no lowering rule is the case that used to vanish onto stderr"

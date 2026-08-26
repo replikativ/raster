@@ -32,6 +32,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
             [raster.compiler.backend.intrinsics :as ix]
@@ -850,9 +851,8 @@
   (materialize/materialize-pass form opts))
 
 (defn- pass-segop-lower
-  "Lower par forms to SegOp records via SOAC intermediate.
-  SegOp records are attached as metadata on binding symbols.
-  (=> :materialized :segop-lowered)"
+  "Lower par forms to typed equations in a first-class SegOp ParallelProgram.
+  (=> :compound-detected :segop-lowered)"
   [form opts]
   (segop-lower/segop-lower-pass form opts))
 
@@ -867,12 +867,14 @@
   "Replace compound-kernel markers with their original dotimes form.
   Used by non-GPU backends (SIMD, scalar) that don't process compound markers."
   [form]
-  (walk/postwalk
-   (fn [f]
-     (if (and (seq? f) (= 'raster.compiler/compound-kernel (first f)))
-       (nth f 2)  ;; (compound-kernel metadata original-dotimes) → original-dotimes
-       f))
-   form))
+  (if (parallel-program/parallel-program? form)
+    (assoc form :source (strip-compound-markers (:source form)))
+    (walk/postwalk
+     (fn [f]
+       (if (and (seq? f) (= 'raster.compiler/compound-kernel (first f)))
+         (nth f 2)  ;; (compound-kernel metadata original-dotimes) → original-dotimes
+         f))
+     form)))
 
 (defn- pass-backend
   "Backend-specific optimization. Dispatches to SIMD, CUDA, OpenCL, or scalar.
@@ -884,7 +886,9 @@
       ;; CPU-C SIMD path: leave par/map!/par/reduce forms INTACT (neither scalarize
       ;; nor JVM-Vector-API lower) so the monolithic C backend can consume the same
       ;; SegRed/SegMap the JVM path builds, but emit __m256 intrinsics instead.
-      {:form (strip-compound-markers form) :stats nil :backend :par-preserve}
+      {:form (let [clean (strip-compound-markers form)]
+               (if (parallel-program/parallel-program? clean) (:source clean) clean))
+       :stats nil :backend :par-preserve}
       (case (device/select-runtime-backend target-device simd? nil)
         :cuda
         (throw (ex-info "CUDA backend not yet reimplemented (use :opencl)" {:target target-device}))
@@ -911,7 +915,9 @@
           {:form form :stats stats :backend :simd})
 
       ;; :scalar
-        {:form (par/expand-par-forms (strip-compound-markers form)) :stats nil :backend :scalar}))))
+        (let [clean (strip-compound-markers form)
+              source (if (parallel-program/parallel-program? clean) (:source clean) clean)]
+          {:form (par/expand-par-forms source) :stats nil :backend :scalar})))))
 
 (defn- pass-resolve-alength
   "Resolve (alength hoistable-buf) to original allocation size.
@@ -954,9 +960,12 @@
    :write-read-fuse  {:from :loop-lifted       :to :write-read-fused  :fn pass-write-read-fuse}
    :soac-fuse        {:from :write-read-fused  :to :soac-fused        :fn pass-soac-fuse}
    :materialize      {:from :soac-fused        :to :materialized      :fn pass-materialize}
-   :segop-lower      {:from :materialized      :to :segop-lowered     :fn pass-segop-lower}
-   :compound-detect  {:from :segop-lowered     :to :compound-detected :fn pass-compound-detect}
-   :backend          {:from :compound-detected :to :backend-applied   :fn pass-backend}
+   ;; Compound recognition still consumes the host/SOAC expression. SegOp conversion is the final
+   ;; middle-end boundary immediately before backend consumption, so no S-expression pass needs to
+   ;; tunnel scheduled operations through metadata.
+   :compound-detect  {:from :materialized      :to :compound-detected :fn pass-compound-detect}
+   :segop-lower      {:from :compound-detected :to :segop-lowered     :fn pass-segop-lower}
+   :backend          {:from :segop-lowered     :to :backend-applied   :fn pass-backend}
    :resolve-alength  {:from :backend-applied   :to :alength-resolved  :fn pass-resolve-alength}
    :mem-merge        {:from :alength-resolved  :to :mem-merged        :fn pass-mem-merge}
    ;; Building blocks for custom/GPU pipelines
@@ -1005,12 +1014,12 @@
 ;; ================================================================
 
 (def forward-passes
-  "Forward: lower → fixpoint → DCE → buffer-fuse → late-cleanup → loop-lift → write-read-fuse → soac-fuse → segop-lower → compound-detect → backend → resolve-alength → mem-merge.
+  "Forward: lower → fixpoint → DCE → buffer-fuse → late-cleanup → loop-lift → write-read-fuse → soac-fuse → compound-detect → segop-lower → backend → resolve-alength → mem-merge.
    fixpoint loops expand+normalize+rewalk until stable, handling composable AD inlining.
    loop-lift recovers par structure from dotimes/loop forms (e.g. SGD inlined to dotimes).
    write-read-fuse eliminates intermediate buffers by fusing 2D producers into 1D consumers (dW+SGD).
-   segop-lower converts par forms to SegOp IR for unified backend consumption."
-  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :segop-lower :compound-detect :backend :resolve-alength :mem-merge])
+   segop-lower converts par forms to a typed SegOp ParallelProgram for unified backend consumption."
+  [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize :compound-detect :segop-lower :backend :resolve-alength :mem-merge])
 
 (def gpu-resident-pre-soa-passes
   "forward-passes up to (and including) :materialize. The resident GPU path splits here so
@@ -1020,8 +1029,8 @@
   [:lower :structured-reduction-fuse :fixpoint :dce :buffer-fuse :late-cleanup :loop-lift :write-read-fuse :soac-fuse :materialize])
 
 (def gpu-resident-post-soa-passes
-  "forward-passes from :segop-lower onward — resumed (from :materialized) after soa-lower."
-  [:segop-lower :compound-detect :backend :resolve-alength :mem-merge])
+  "forward-passes from :compound-detect onward — resumed (from :materialized) after soa-lower."
+  [:compound-detect :segop-lower :backend :resolve-alength :mem-merge])
 
 ;; ================================================================
 ;; Diagnostic runner for show-pipeline

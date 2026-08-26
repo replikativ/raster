@@ -3,9 +3,8 @@
    pins the four ways the tool lied before Phase 0:
 
      * it reported the HOST CPU as 'Hardware:' for a :ze:0 compile;
-     * a metadata-only pass (segop-lower recording a decline) left the form `=` to the previous
-       stage, and the `[unchanged]` short-circuit dropped its stats — hiding the diagnostic exactly
-       when it existed;
+     * the former metadata-only segop pass could leave the form `=` to the previous stage, and the
+       `[unchanged]` short-circuit dropped its stats — hiding the diagnostic exactly when it existed;
      * three live passes had no label and fell out of a hand-maintained table that carried three
        dead ones — a fourth disagreeing description of the pipeline, in the tool meant to be the
        truth;
@@ -48,9 +47,8 @@
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "explain-pipeline: declines")
     (let [s (explain #'raster.linalg.contract/contract-mm :target-device :ze:0)]
-      (testing "segop-lower RECORDS the contraction as a SegContract (Phase 1c made it a SOAC
-                node; this stage used to print a decline). A metadata-only pass leaves the form
-                unchanged, and the stage must still print its stats instead of collapsing"
+      (testing "segop-lower records the contraction as a first-class SegContract equation; this
+                stage used to print a decline, and its stats must remain visible"
         (is (re-find #":segops-lowered 1" s))
         (is (not (re-find #"DECLINED a conversion" s)) "nothing declines any more"))
       (testing "the kernel section names the leaf, the headline reason, and every leaf that refused"

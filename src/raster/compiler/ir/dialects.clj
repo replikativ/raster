@@ -19,6 +19,8 @@
              :refer [def-dialect def-derived valid? validate]]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.util :as util]
             [clojure.set :as set]))
 
@@ -491,6 +493,22 @@
 ;; Dialect registry for pipeline integration
 ;; ================================================================
 
+(defn valid-segop-program?
+  [value]
+  (try
+    (and (= :segop (:dialect value))
+         (parallel-program/validate! value segop/segop-node?)
+         true)
+    (catch clojure.lang.ExceptionInfo _ false)))
+
+(defn validate-segop-program
+  [value]
+  (try
+    (parallel-program/validate! value segop/segop-node?)
+    :ok
+    (catch clojure.lang.ExceptionInfo e
+      {:fail :segop-program :details (ex-data e) :message (.getMessage e)})))
+
 (def dialect-checkers
   "Map from dialect keyword to [valid? validate] function pairs.
   Used by run-passes to validate IR at pass boundaries."
@@ -515,7 +533,7 @@
    :par-fused        [valid-let*-ordered? validate-let*-ordered]
    :soac-fused       [valid-let*-ordered? validate-let*-ordered]
    :materialized     [valid-let*-ordered? validate-let*-ordered]
-   :segop-lowered    [valid-let*-ordered? validate-let*-ordered]
+   :segop-lowered    [valid-segop-program? validate-segop-program]
    :compound-detected [valid-let*-ordered? validate-let*-ordered]
    :gpu-planned      [valid-let*-ordered? validate-let*-ordered]
    :dtype-remapped   [valid-let*-ordered? validate-let*-ordered]
