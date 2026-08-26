@@ -36,7 +36,9 @@
             [raster.arrays :as ra]
             [raster.ad.reverse :as rev]
             [raster.compiler.pipeline :as pl]
-            [raster.dl.gpu-grad-parity :as gp]))
+            [raster.dl.gpu-grad-parity :as gp]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 ;; ── the twin block (concrete float, LoRA delta inline) ──────────────────────────
 
@@ -236,13 +238,7 @@
 (deftest gemma-lora-block-resident-train-step
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gemma LoRA block resident train-step")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          download (ns-resolve gpu 'download)
-          cfg CFG
+    (let [cfg CFG
           lr 0.02
           n-steps 25
           st0 (init-state cfg)
@@ -257,20 +253,22 @@
         (println "  [gemma train-step] resident steps:" (count (:steps prog))
                  "by kind:" step-kinds))
       (when prog
-        (let [sess (make-session :ze:0)]
+        (let [sess (gpu/make-session :ze:0)]
           (try
-            (bind-program! sess prog args
-                           (merge (zipmap adapter-syms (repeat :state))
-                                  (zipmap '[x input-ln q-norm k-norm post-attn
-                                            pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
-                                          (repeat :constant))))
-            (let [gpu-state (fn [] (reduce (fn [m s]
-                                             (assoc m s (download sess (keyword (name s)))))
+            (let [program
+                  (fixture/instantiate!
+                   sess prog args
+                   (merge (zipmap adapter-syms (repeat :state))
+                          (zipmap '[x input-ln q-norm k-norm post-attn
+                                    pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
+                                  (repeat :constant))))
+                  gpu-state (fn [] (reduce (fn [m s]
+                                             (assoc m s (fixture/download program s)))
                                            st0 adapter-syms))
                   gpu-losses (loop [k 0 losses [(host-loss cfg st0)]]
                                (if (= k n-steps)
                                  losses
-                                 (do (run-program! sess prog args)
+                                 (do (fixture/run! program args)
                                      (recur (inc k)
                                             (conj losses (host-loss cfg (gpu-state)))))))
                   cpu-losses (cpu-train! cfg (clone-adapters st0) lr n-steps)
@@ -296,7 +294,7 @@
                 (doseq [[k g c] (map vector (range) gpu-losses cpu-losses)]
                   (is (< (/ (Math/abs (- g c)) (max 1e-9 (Math/abs c))) 1.0e-3)
                       (format "step %d GPU %.6f vs CPU %.6f" k g c)))))
-            (finally (close-session! sess))))))))
+            (finally (gpu/close-session! sess))))))))
 
 ;; ═════════════════════════════════════════════════════════════════════════════════
 ;; MIXED-PRECISION BACKWARD (S2a): the SAME resident train step (value+grad + SGD) under
@@ -336,38 +334,33 @@
 (defn- run-trajectory!
   "n-steps of the resident train step under `prog`'s GEMM policy in a fresh session.
    Returns the host loss trajectory [loss(state_0) … loss(state_n)]."
-  [gpu prog cfg st0 lr n-steps]
-  (let [make-session (ns-resolve gpu 'make-session)
-        bind-program! (ns-resolve gpu 'bind-program!)
-        run-program! (ns-resolve gpu 'run-program!)
-        close-session! (ns-resolve gpu 'close-session!)
-        download (ns-resolve gpu 'download)
-        st (clone-adapters st0)
+  [prog cfg st0 lr n-steps]
+  (let [st (clone-adapters st0)
         args (train-args cfg st lr)
-        sess (make-session :ze:0)]
+        sess (gpu/make-session :ze:0)]
     (try
-      (let [h (bind-program! sess prog args
-                             (merge (zipmap adapter-syms (repeat :state))
-                                    (zipmap '[x input-ln q-norm k-norm post-attn
-                                              pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
-                                            (repeat :constant)))
-                             {:key :train})]
+      (let [program
+            (fixture/instantiate!
+             sess prog args
+             (merge (zipmap adapter-syms (repeat :state))
+                    (zipmap '[x input-ln q-norm k-norm post-attn
+                              pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd tgt]
+                            (repeat :constant))))]
         (loop [k 0 losses [(host-loss cfg st)]]
           (if (= k n-steps)
             losses
-            (do (run-program! sess h args)
+            (do (fixture/run! program args)
                 (recur (inc k)
                        (conj losses
                              (host-loss cfg (reduce (fn [m s]
-                                                      (assoc m s (download sess (keyword (name s)))))
+                                                      (assoc m s (fixture/download program s)))
                                                     st adapter-syms))))))))
-      (finally (close-session! sess)))))
+      (finally (gpu/close-session! sess)))))
 
 (deftest gemma-lora-mixed-precision-backward-trajectory
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "gemma LoRA mixed-precision backward")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          cfg CFG-MP
+    (let [cfg CFG-MP
           lr 0.02
           n-steps 25
           st0 (init-state cfg)
@@ -375,7 +368,7 @@
           p32 (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
                                       :on-non-resident :nil :gemm-precision :f32-scalar)
           ;; the descriptor is plain data: the precision is a bind-time re-tag on the SAME program.
-          ;; The S6 schedule is the source of truth bind-program! reads, so the override goes
+          ;; The S6 schedule is the source of truth the linked step binder reads, so this override goes
           ;; through [:schedule :precision] (NOT the deprecated top-level :gemm-precision, which the
           ;; schedule now shadows — assoc'ing it would be a silent no-op and both trajectories would
           ;; run f32).
@@ -389,8 +382,8 @@
             (is (every? (fn [{:keys [n k]}] (and (>= n 8) (>= k 8))) dims)
                 (str "gemm steps below the n>=8/k>=8 pitch gate would silently stay scalar: "
                      (pr-str (filter (fn [{:keys [n k]}] (or (< n 8) (< k 8))) dims)))))
-          (let [l32 (run-trajectory! gpu p32 cfg st0 lr n-steps)
-                l16 (run-trajectory! gpu p16 cfg st0 lr n-steps)]
+          (let [l32 (run-trajectory! p32 cfg st0 lr n-steps)
+                l16 (run-trajectory! p16 cfg st0 lr n-steps)]
             (println "  [mixed-precision bwd] f32-scalar loss:"
                      (mapv #(format "%.6f" %) (take 3 l32)) "…"
                      (mapv #(format "%.6f" %) (take-last 2 l32)))
@@ -407,164 +400,3 @@
               (doseq [[k a b] (map vector (range) l32 l16)]
                 (is (< (/ (Math/abs (- a b)) (max 1.0e-9 (Math/abs a))) 5.0e-3)
                     (format "step %d: f32 %.6f vs f16 %.6f" k a b))))))))))
-
-;; ═════════════════════════════════════════════════════════════════════════════════
-;; DUAL-PROGRAM SHARED SESSION (task #9): the fwd program and the VJP train-step
-;; program bound into ONE session over shared weight+adapter buffers. The fwd
-;; program reads the adapters the train program updates on-device — NO per-step
-;; adapter download/re-upload (the finetune 18-layer loop's refresh-adapters!
-;; round-trip) and NO second copy of the frozen weights (the ~2x VRAM of the
-;; two-session path).
-;; ═════════════════════════════════════════════════════════════════════════════════
-
-;; Forward-only program twin (finetune.train/gblock-fwd! shape): yo := gblk(x,…),
-;; residual-add! with the constant zero buffer = the resident copy-to-output-param.
-(deftm gblk-fwd!
-  [x :- (Array float)
-   input-ln :- (Array float) q-norm :- (Array float) k-norm :- (Array float)
-   post-attn :- (Array float) pre-ffn :- (Array float) post-ffn :- (Array float)
-   Wq :- (Array float) Aq :- (Array float) Bq :- (Array float)
-   Wk :- (Array float) Ak :- (Array float) Bk :- (Array float)
-   Wv :- (Array float) Av :- (Array float) Bv :- (Array float)
-   Wo :- (Array float) Ao :- (Array float) Bo :- (Array float)
-   Wg :- (Array float) Ag :- (Array float) Bg :- (Array float)
-   Wu :- (Array float) Au :- (Array float) Bu :- (Array float)
-   Wd :- (Array float) Ad :- (Array float) Bd :- (Array float)
-   zero :- (Array float) yo :- (Array float)
-   seq :- Long d :- Long nq :- Long nkv :- Long hd :- Long dff :- Long r :- Long
-   eps :- Double theta :- Double] :- (Array float)
-  (let [y (raster.dl.gemma-train-resident-test/gblk x
-                                                    input-ln q-norm k-norm post-attn pre-ffn post-ffn
-                                                    Wq Aq Bq Wk Ak Bk Wv Av Bv Wo Ao Bo Wg Ag Bg Wu Au Bu Wd Ad Bd
-                                                    seq d nq nkv hd dff r eps theta)]
-    (raster.dl.nn/residual-add! y zero yo (clojure.core/* seq d))
-    yo))
-
-(defn- fwd-args*
-  "gblk-fwd! arg vector for a state map."
-  [{:keys [seq d nq nkv hd dff r eps theta]} st zero yo]
-  (-> (mapv st '[x input-ln q-norm k-norm post-attn pre-ffn post-ffn
-                 Wq Aq Bq Wk Ak Bk Wv Av Bv Wo Ao Bo Wg Ag Bg Wu Au Bu Wd Ad Bd])
-      (conj zero yo)
-      (into [seq d nq nkv hd dff r eps theta])))
-
-(def ^:private frozen-syms
-  '[x input-ln q-norm k-norm post-attn pre-ffn post-ffn Wq Wk Wv Wo Wg Wu Wd])
-
-(defn- session-bytes [sess]
-  (reduce + 0 (map :byte-size (vals (:buffers @sess)))))
-
-(deftest gemma-lora-dual-program-shared-session
-  (if-not @gp/gpu-available?
-    (gp/gpu-skip! "gemma dual-program shared session")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          download (ns-resolve gpu 'download)
-          cfg CFG
-          lr 0.02
-          n (* (:seq cfg) (:d cfg))
-          st0 (init-state cfg)
-          trn-prog (pl/compile-gpu-program #'gblk-train-step :ze:0 :dtype :float
-                                           :on-non-resident :nil :gemm-precision :f32-scalar)
-          fwd-prog (pl/compile-gpu-program #'gblk-fwd! :ze:0 :dtype :float
-                                           :on-non-resident :nil :gemm-precision :f32-scalar)
-          trn-roles (merge (zipmap adapter-syms (repeat :state))
-                           (zipmap (conj frozen-syms 'tgt) (repeat :constant)))
-          ;; the interleaved schedule: k train steps, fwd-only eval, k more, eval again
-          k-steps 5
-          run-schedule! (fn [train! eval!]
-                          (vec (for [_ (range 2)]
-                                 (do (dotimes [_ k-steps] (train!))
-                                     (eval!)))))]
-      (is (some? trn-prog) "train-step twin must extract fully resident")
-      (is (some? fwd-prog) "fwd twin must extract fully resident")
-      (when (and trn-prog fwd-prog)
-        ;; ── baseline: the OLD two-session path with the explicit refresh round-trip ──
-        (let [stB (clone-adapters st0)
-              t-sess (make-session :ze:0)
-              f-sess (make-session :ze:0)
-              baseline
-              (try
-                (bind-program! t-sess trn-prog (train-args cfg stB lr) trn-roles)
-                (bind-program! f-sess fwd-prog (fwd-args* cfg stB (float-array n) (float-array n))
-                               (merge (zipmap frozen-syms (repeat :constant))
-                                      {'zero :constant}
-                                      (zipmap adapter-syms (repeat :input))))
-                (let [refresh! (fn [] (doseq [s adapter-syms]
-                                        (let [^floats host (stB s)
-                                              ^floats dev (download t-sess (keyword (name s)))]
-                                          (System/arraycopy dev 0 host 0 (alength host)))))
-                      evals (run-schedule!
-                             #(run-program! t-sess trn-prog (train-args cfg stB lr))
-                             #(do (refresh!)
-                                  (get (run-program! f-sess fwd-prog
-                                                     (fwd-args* cfg stB (float-array 0) (float-array 0)))
-                                       'yo)))]
-                  {:evals evals
-                   :adapters (do (refresh!) (reduce (fn [m s] (assoc m s (aclone ^floats (stB s)))) {} adapter-syms))
-                   :bytes (+ (session-bytes t-sess) (session-bytes f-sess))})
-                (finally (close-session! t-sess) (close-session! f-sess)))]
-          ;; ── shared: BOTH programs in ONE session, weights + adapters shared ──
-          (let [stS (clone-adapters st0)
-                sess (make-session :ze:0)]
-            (try
-              (let [trn-h (bind-program! sess trn-prog (train-args cfg stS lr) trn-roles
-                                         {:key :train})]
-                (testing "collision without :reuse-buffers fails loud"
-                  (is (thrown? clojure.lang.ExceptionInfo
-                               (bind-program! sess fwd-prog
-                                              (fwd-args* cfg stS (float-array n) (float-array n))
-                                              {} {:key :fwd}))))
-                (testing "re-binding an already-bound program key fails loud"
-                  (is (thrown? clojure.lang.ExceptionInfo
-                               (bind-program! sess trn-prog (train-args cfg stS lr) trn-roles
-                                              {:key :train}))))
-                (let [fwd-h (bind-program! sess fwd-prog
-                                           (fwd-args* cfg stS (float-array n) (float-array n))
-                                           (merge (zipmap frozen-syms (repeat :constant))
-                                                  {'zero :constant}
-                                                  ;; adapters :state — SHARED with the train
-                                                  ;; program, never re-uploaded by run-program!
-                                                  (zipmap adapter-syms (repeat :state)))
-                                           {:key :fwd :reuse-buffers true})
-                      evals (run-schedule!
-                             #(run-program! sess trn-h (train-args cfg stS lr))
-                             #(get (run-program! sess fwd-h
-                                                 (fwd-args* cfg stS (float-array 0) (float-array 0)))
-                                   'yo))
-                      shared-adapters (reduce (fn [m s] (assoc m s (download sess (keyword (name s)))))
-                                              {} adapter-syms)
-                      shared-bytes (session-bytes sess)
-                      max-abs-diff (fn [^floats a ^floats b]
-                                     (reduce max 0.0 (map #(Math/abs (- (double %1) (double %2)))
-                                                          (seq a) (seq b))))]
-                  (testing "fwd sees the VJP-updated adapters with NO refresh round-trip"
-                    (doseq [[i [ys yb]] (map-indexed vector (map vector evals (:evals baseline)))]
-                      (is (< (max-abs-diff ys yb) 1.0e-5)
-                          (format "eval %d: shared-session fwd output diverges from two-session baseline" i))))
-                  (testing "on-device adapter state matches the two-session trajectory (f32 noise)"
-                    (doseq [s adapter-syms]
-                      (is (< (max-abs-diff (shared-adapters s) (get (:adapters baseline) s)) 1.0e-5)
-                          (str s " trajectory diverged"))))
-                  (testing "loss after interleaved training matches the baseline"
-                    (let [lS (host-loss cfg (merge stS shared-adapters))
-                          lB (host-loss cfg (merge stS (:adapters baseline)))]
-                      (println (format "  [dual-program] loss shared %.6f vs two-session %.6f" lS lB))
-                      (is (< (/ (Math/abs (- lS lB)) (max 1e-9 (Math/abs lB))) 1.0e-4))))
-                  (testing "shared session VRAM drops by the duplicated shared-param bytes"
-                    ;; the baseline holds the common params (x, frozen weights/norms, adapters)
-                    ;; TWICE — once per session. Sharing must eliminate that second copy. (At
-                    ;; these tiny dims scratch dominates; at real gemma dims the shared frozen
-                    ;; weights ARE the ~2x — 1.7 GB → ~0.9 GB for the 18-layer stack.)
-                    (let [shared-param-bytes (reduce + 0 (map #(* 4 (alength ^floats (stS %)))
-                                                              (concat frozen-syms adapter-syms)))]
-                      (println (format "  [dual-program] VRAM: shared %d KiB vs two-session %d KiB (%.2fx, %d KiB dedup'd)"
-                                       (long (/ shared-bytes 1024)) (long (/ (:bytes baseline) 1024))
-                                       (double (/ shared-bytes (:bytes baseline)))
-                                       (long (/ shared-param-bytes 1024))))
-                      (is (<= shared-bytes (- (:bytes baseline) shared-param-bytes))
-                          "the second copy of every shared param must be gone")))))
-              (finally (close-session! sess)))))))))

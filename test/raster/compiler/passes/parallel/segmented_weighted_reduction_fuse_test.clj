@@ -10,6 +10,7 @@
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.numeric]))
 
 (defn- chain
@@ -202,8 +203,6 @@
                          (:array-params descriptor))
         alloc->key (into {} (map (fn [{:keys [sym]}] [sym (keyword (str "scratch-" (name sym)))])
                                  (:allocs descriptor)))
-        buffers (into {} (map (fn [key] [key (Object.)]))
-                      (concat (vals param->key) (vals alloc->key)))
         capacities
         (merge (into {} (map (fn [sym]
                                [(param->key sym)
@@ -212,20 +211,26 @@
                (into {} (map (fn [{:keys [sym size-fn]}]
                                [(alloc->key sym) (size-fn args)]))
                      (:allocs descriptor)))
-        session (atom {:programs {:probe {:descriptor descriptor
-                                          :param->key param->key
-                                          :alloc->key alloc->key
-                                          :buffer-capacities capacities}}
-                       :buffers buffers})
-        projected (gpu/program-dispatch-arguments session descriptor args)
+        node-id (merge param->key alloc->key)
+        views (into {}
+                    (map (fn [[sym key]]
+                           [key (gpu/->ResidentBufferView
+                                 :test-session key
+                                 {:byte-length (* 4 (get capacities key)) :dtype :float})]))
+                    node-id)
+        executable
+        (link/map->LinkedExecutable
+         {:plan {:instances [{:id :probe :descriptor descriptor :bindings node-id}]}
+          :session (atom {}) :node-views views :closed? (atom false)})
+        projected (link/dispatch-arguments executable args)
         contract (get-in projected [:dispatch :attributes :tuning])
         expected (reference/evaluate (get-in contract [:reference :plan])
                                      (:reference-inputs projected))]
     (is (= 0 (:step-index projected)))
-    (is (= (mapv param->key (take 5 (:array-params descriptor)))
+    (is (= (mapv (comp views param->key) (take 5 (:array-params descriptor)))
            (subvec (:arguments projected) 0 5)))
-    (is (= (alloc->key (:result-sym descriptor)) (nth (:arguments projected) 5)))
-    (is (= (alloc->key (:result-sym descriptor))
+    (is (= (views (alloc->key (:result-sym descriptor))) (nth (:arguments projected) 5)))
+    (is (= (views (alloc->key (:result-sym descriptor)))
            (get-in projected [:resident-bindings (:result-sym descriptor)])))
     (is (= [3 4 5 2 2 15]
            (mapv :value (subvec (:arguments projected) 6))))
@@ -244,8 +249,8 @@
     (is (= 15 (alength ^doubles expected)))
     (is (every? zero? expected))
     (is (thrown-with-msg?
-         clojure.lang.ExceptionInfo #"exceeds its resident buffer capacity"
-         (gpu/program-dispatch-arguments session descriptor (assoc args 7 512))))))
+         clojure.lang.ExceptionInfo #"exceeds its resident node view"
+         (link/dispatch-arguments executable (assoc args 7 512))))))
 
 (deftest actual-gsdm-region-reaches-generic-structured-reduction-stage
   (let [diagnostic (pipeline/show-pipeline

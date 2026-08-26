@@ -19,7 +19,9 @@
             [raster.dl.attention :as attn]
             [raster.arrays :as ra]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.dl.nn :as nn]))
+            [raster.dl.nn :as nn]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 ;; Availability + skip routing use the shared HONEST probe (raster.dl.gpu-grad-parity):
 ;; a broken ze-runtime load fails loud via gp/gpu-skip! instead of a silent "no device"
@@ -36,18 +38,13 @@
     (/ err mag)))
 
 (defn- run-resident [f-var args]
-  (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-        make-session (ns-resolve gpu 'make-session)
-        bind-program! (ns-resolve gpu 'bind-program!)
-        run-program! (ns-resolve gpu 'run-program!)
-        close-session! (ns-resolve gpu 'close-session!)
-        p (pl/compile-gpu-program f-var :ze:0 :dtype :float)
-        s (make-session :ze:0)]
+  (let [p (pl/compile-gpu-program f-var :ze:0 :dtype :float)
+        s (gpu/make-session :ze:0)]
     (try
-      (bind-program! s p args {})
-      (let [r (run-program! s p args)]
+      (let [program (fixture/instantiate! s p args)
+            r (fixture/run! program args)]
         {:descriptor p :out (or (get r (:result-sym p)) (first (vals r)))})
-      (finally (close-session! s)))))
+      (finally (gpu/close-session! s)))))
 
 (deftest gpu-ad-gemm-variants
   (if-not @gp/gpu-available?
@@ -185,7 +182,7 @@
 (deftest gpu-gemm-small-n-scalar-fallback
   ;; XMX GEMM's B-operand 2D-block VNNI read requires Intel 2D-block IO's 16-byte minimum
   ;; pitch (N*2 bytes at fp16) — output-column dims N<8 violated it and produced garbage
-  ;; (relerr ~1). bind-program! now routes N<8 :gemm steps to a plain scalar f32 kernel
+  ;; (relerr ~1). The linked binder routes N<8 :gemm steps to a plain scalar f32 kernel
   ;; (no f16 convert/transpose). n=8 stays on the XMX path (16-byte pitch = the minimum)
   ;; as the boundary control.
   (if-not @gp/gpu-available?
@@ -210,7 +207,7 @@
                 (str ":nn n=" n " relerr " (rel-err out cpu)))))))))
 
 (deftest gpu-reduce-step-program-binds-and-replays
-  ;; bind-program! (the resident whole-offload binder) wired only :map/:map-void/:gemm/
+  ;; The former resident whole-program binder wired only :map/:map-void/:gemm/
   ;; :scatter step kinds; a program containing a par/reduce whose result stays resident
   ;; (the #42 resident-reduce work: fuse-reduce-results gives it a device 1-elem out-buf)
   ;; threw at bind time even though bind-step! already handled :reduce. This pins the

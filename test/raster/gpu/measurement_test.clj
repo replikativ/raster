@@ -1,6 +1,7 @@
 (ns raster.gpu.measurement-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.gpu.core :as gpu]
+            [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]))
 
 (deftest summarizes-device-samples
@@ -71,14 +72,10 @@
          (is (= (+ 1 5 3) @replays))
          (is (= @replays @reads))))))
 
-(deftest stateful-program-measurement-requires-restore
-  (let [descriptor {:all-params [] :array-params []}
-        session (atom {:device-id :probe
-                       :programs {:program {:descriptor descriptor
-                                            :roles {'cache :state}
-                                            :graph {}
-                                            :param->key {}
-                                            :profile? true}}})]
+(deftest stateful-linked-measurement-requires-restore
+  (let [executable
+        (link/map->LinkedExecutable
+         {:plan {:nodes {:cache {:role :state}}}
+          :pending-inputs (atom #{}) :closed? (atom false)})]
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"require :before-sample!"
-                          (gpu/measure-program! session descriptor []
-                                                :budget-ms 1)))))
+                          (link/measure! executable :budget-ms 1)))))

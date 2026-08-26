@@ -2416,7 +2416,7 @@
 
 (defn bind-registered-gemm-scalar!
   "Bind the plain scalar (non-XMX) f32 GEMM kernel over RESIDENT f32 DeviceBuffers for
-  recording into a command graph — the small-N fallback for bind-program!'s :gemm steps
+  recording into a command graph—the small-N fallback for linked :gemm steps
   (XMX's 2D-block B read violates the 16-byte minimum pitch when N<8 and produces
   garbage). Reads/writes the f32 buffers directly: no f16 convert or transpose expansion.
   variant :nn (C=A·B), :nt (C=A·Bᵀ, B stored [n,k]), :tn (C=Aᵀ·B, A stored [k,m]).

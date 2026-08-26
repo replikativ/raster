@@ -8,7 +8,7 @@
    Device-gated (Level-Zero, via the gpu_grad_parity honesty gate):
      A1 — the gemma LoRA resident train-step ported to `(r/compile …)` + `(step …)`, threaded
           as device values across 25 steps with ZERO host download in the loop, producing
-          adapters BIT-IDENTICAL to the raw bind-program!/run-program! path (A6 no-regression),
+          adapters BIT-IDENTICAL across independent certified executions (A6 determinism),
           and a decreasing loss trajectory.
      A3 — frozen weights are :constant (captured at bind), never per-call inputs.
      A4 — multi-output: the out-tree projects all 14 donated adapters as DeviceArrays."
@@ -16,12 +16,10 @@
             [raster.core :refer [deftm]]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.resident-plan :as resident-plan]
-            [raster.compiler.pipeline :as pl]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.gemma-train-resident-test :as g]
             [raster.dl.nn :as nn]
             [raster.gpu.compiled :as r]
-            [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
             [raster.gpu.value :as v]))
 
@@ -125,8 +123,6 @@
                        (compiled {:x input}))
               output (get result (keyword (name (:result-sym (:descriptor compiled)))))]
           (is (every? #(= 15.0 (double %)) (v/->host output)))
-          (is (empty? (:programs @(:session (:executable compiled))))
-              "the invocation is a LinkPlan graph, not bind-program!")
           (let [profile (r/profile compiled)]
             (is (= 2 (count (:profile profile))))
             (is (pos? (:device-wall-ms profile)))
@@ -184,26 +180,25 @@
           n-steps 25
           st0  (init-state cfg)
           args (train-args cfg st0 lr)
-          ;; ── raw reference path: bind-program! + N× run-program! ──
-          gpu  (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session   (ns-resolve gpu 'make-session)
-          bind-program!  (ns-resolve gpu 'bind-program!)
-          run-program!   (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          download       (ns-resolve gpu 'download)
-          raw-prog (pl/compile-gpu-program #'raster.dl.gemma-train-resident-test/gblk-train-step
-                                           :ze:0 :dtype :float
-                                           :on-non-resident :nil :gemm-precision :f32-scalar)
-          _ (is (some? raw-prog) "gblk-train-step must extract fully resident")
-          raw-final
-          (let [sess (make-session :ze:0)]
-            (try
-              (bind-program! sess raw-prog args
-                             (merge (zipmap adapters (repeat :state))
-                                    (zipmap frozen-syms (repeat :constant))))
-              (dotimes [_ n-steps] (run-program! sess raw-prog args))
-              (reduce (fn [m s] (assoc m s (download sess (keyword (name s))))) {} adapters)
-              (finally (close-session! sess))))
+          ;; Independent certified execution: guards deterministic lowering/runtime behavior.
+          reference-step
+          (r/compile #'raster.dl.gemma-train-resident-test/gblk-train-step
+                     args
+                     {:target :ze:0 :dtype :float
+                      :donate adapters :constants frozen-syms
+                      :gemm-precision :f32-scalar})
+          reference-final
+          (try
+            (let [last-out (loop [iteration 0 output nil]
+                             (if (= iteration n-steps)
+                               output
+                               (recur (inc iteration) (reference-step {}))))]
+              (reduce (fn [values symbol]
+                        (assoc values symbol
+                               (v/->host (get last-out
+                                              (keyword (str (name symbol) "'"))))))
+                      {} adapters))
+            (finally (r/close! reference-step)))
           ;; ── artifact-as-value path: r/compile + N× (step {}) ──
           step (r/compile #'raster.dl.gemma-train-resident-test/gblk-train-step
                           args
@@ -215,8 +210,7 @@
           (is (resident-plan/certified-plan? (:lowering step)))
           (is (gpu-link/linked-executable? (:executable step)))
           (is (= (r/plan step) (:plan (:executable step))))
-          (is (empty? (:programs @(:session (:executable step))))
-              "Compiled must not register a legacy bind-program! executable"))
+          (is (= :link-plan (get-in (r/certificate step) [:target-dialect]))))
         (testing "A3: frozen weights are :constant, never per-call inputs"
           (let [roles (into {} (map (juxt :sym :role)) (:in-tree step))]
             (is (every? #(= :constant (roles %)) frozen-syms)
@@ -247,12 +241,12 @@
                     (str key " shares the certified LinkPlan allocation identity"))
                 (is (= node (get-in da [:view :allocation :id]))
                     (str key " preserves the LinkPlan allocation identity at runtime")))))
-          (testing "A1/A6: the value path is BIT-IDENTICAL to the raw run-program! path"
+          (testing "A1/A6: independent certified executions are bit-identical"
             (doseq [s adapters]
               (let [art (v/->host (get last-out (keyword (str (name s) "'"))))
-                    raw (get raw-final s)]
-                (is (java.util.Arrays/equals ^floats art ^floats raw)
-                    (str s ": artifact adapters must match the raw path bit-for-bit")))))
+                    reference (get reference-final s)]
+                (is (java.util.Arrays/equals ^floats art ^floats reference)
+                    (str s ": certified executions must match bit-for-bit")))))
           (testing "A1: the trained adapters differ from init (learning happened)"
             (doseq [s adapters]
               (is (not (java.util.Arrays/equals

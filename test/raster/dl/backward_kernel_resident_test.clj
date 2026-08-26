@@ -328,7 +328,7 @@
 ;; divergence of the default :f16-xmx path is pure f16 INPUT-CONVERSION noise, not an
 ;; AD/compile defect — under :f32-scalar the same compiled program matches the CPU f32
 ;; reference at ~1e-6-level. This pins the policy end-to-end: compile-gpu-program
-;; carries :gemm-precision on the descriptor, bind-program! binds scalar GEMMs for it.
+;; carries :gemm-precision on the descriptor, and the linked binder selects scalar GEMMs for it.
 (deftest attn-block-f32-scalar-gemm-precision-parity
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "attn-block :f32-scalar gemm-precision parity")

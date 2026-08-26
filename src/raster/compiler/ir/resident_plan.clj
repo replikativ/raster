@@ -152,7 +152,7 @@
    Host array arguments remain exact initializers for owned parameter allocations, including
    output/state parameters. Borrowed/external allocations use the arguments only to specialize
    dtype and shape; their storage and readiness are supplied explicitly at instantiation. This
-   preserves `bind-program!`'s initial-value semantics without confusing ownership with readiness."
+   preserves resident initial-value semantics without confusing ownership with readiness."
   [{:keys [id target descriptor arguments roles outputs shapes node-ids ownership memory-space
            aliases attributes instance-id]
     :or {roles {} shapes {} node-ids {} ownership {} memory-space {}
