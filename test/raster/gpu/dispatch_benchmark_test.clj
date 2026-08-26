@@ -10,6 +10,7 @@
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.dispatch-tuning :as tuning]
+            [raster.gpu.link :as link]
             [raster.gpu.measurement :as measurement]
             [raster.gpu.tuning-cache :as cache])
   (:import [java.nio.file Files]))
@@ -237,10 +238,18 @@
                    {:slot (nth abi 1) :kind :output :sym 'out}
                    {:slot (nth abi 2) :kind :scalar :type :long :expression 'width
                     :value-fn (fn [args] (nth args 1))}]}]}
-        session (atom {:programs {:compiled {:descriptor program-descriptor
-                                             :param->key {'x :resident-x}
-                                             :alloc->key {'out :resident-out}}}
-                       :buffers {:resident-x (Object.) :resident-out (Object.)}})
+        x-view (gpu/->ResidentBufferView :test-session :resident-x
+                                         {:byte-length 4096 :dtype :float})
+        out-view (gpu/->ResidentBufferView :test-session :resident-out
+                                           {:byte-length 4 :dtype :float})
+        executable
+        (link/map->LinkedExecutable
+         {:plan {:instances [{:id :compiled
+                              :descriptor program-descriptor
+                              :bindings {'x :x 'out :out}}]}
+          :session (atom {})
+          :node-views {:x x-view :out out-view}
+          :closed? (atom false)})
         measured-selector {:kind :runtime-scalar-ranges
                            :argument 'width :below :reference
                            :ranges [{:at-least 256 :strategy :subgroup}]}
@@ -262,23 +271,34 @@
                                    :case case
                                    :options (apply hash-map options)}))
                         fake-tuning)]
-          (benchmark/tune-program-dispatch!
-           session program-descriptor descriptor [128 256]
+          (benchmark/tune-linked-dispatch!
+           executable descriptor [128 256]
            (fn [width]
-             {:program-arguments [(float-array 1024) width]
+             {:descriptor-arguments [(float-array 1024) width]
               :validate! (constantly {:passed? true :oracle-hash "compiled-reference"})})))]
-    (is (= [:resident-x :resident-out {:type :long :value 256}]
+    (is (= [x-view out-view {:type :long :value 256}]
            (get-in @observed [:case :arguments])))
     (is (= 256 (get-in @observed
-                       [:case :compiled-binding :reference-inputs :scalars 'width])))
+                       [:case :linked-binding :reference-inputs :scalars 'width])))
     (is (= (:numerical-mode tuning-contract)
            (get-in @observed [:options :numerical-mode])))
     (is (= (:layout tuning-contract) (get-in @observed [:options :layout])))
     (is (= {:generic-reduction
             {:measured-selectors {"resident-benchmark-test" measured-selector}}}
            (:schedule-override result)))
+    (is (= :compiled (:instance-id result)))
     (is (= measured-selector (:selector result)))
-    (is (= :reduce (:phase result)))))
+    (is (= :reduce (:phase result)))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"exceeds its resident node view"
+         (link/dispatch-arguments executable [(float-array 1025) 256])))
+    (let [composed (assoc-in executable [:plan :instances]
+                             [(get-in executable [:plan :instances 0])
+                              (assoc (get-in executable [:plan :instances 0]) :id :second)])]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"requires an explicit instance selector"
+           (link/linked-dispatch composed)))
+      (is (= :second (:instance-id (link/linked-dispatch composed :second nil)))))))
 
 (deftest schedule-override-rejects-dispatch-without-an-emitter-path
   (let [fake-tuning

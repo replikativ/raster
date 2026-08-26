@@ -9,6 +9,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
             [raster.gpu.value :as value]))
@@ -205,6 +207,205 @@
         (throw (ex-info "linked executable has no such node"
                         {:reason :link-runtime-node :node node-id
                          :nodes (set (keys (:node-views executable)))})))))
+
+(defn- select-instance
+  [plan selector]
+  (let [instances (:instances plan)
+        selected
+        (cond
+          (nil? selector)
+          (when (= 1 (count instances)) (first instances))
+
+          (integer? selector)
+          (when (<= 0 (long selector) (dec (count instances)))
+            (nth instances (long selector)))
+
+          :else
+          (first (filter #(= selector (:id %)) instances)))]
+    (or selected
+        (throw
+         (ex-info
+          (if (nil? selector)
+            "a composed executable requires an explicit instance selector"
+            "linked executable instance selector did not match")
+          {:reason (if (nil? selector)
+                     :ambiguous-linked-instance
+                     :linked-instance-not-found)
+           :selector selector
+           :instances (mapv :id instances)})))))
+
+(defn- select-dispatch-step
+  [descriptor selector]
+  (let [steps (:steps descriptor)
+        indexed (mapv vector (range) steps)
+        selected
+        (cond
+          (nil? selector)
+          (let [matches (filterv (fn [[_ step]] (some? (:dispatch step))) indexed)]
+            (when (= 1 (count matches)) (first matches)))
+
+          (integer? selector)
+          (when (<= 0 (long selector) (dec (count steps)))
+            [(long selector) (nth steps (long selector))])
+
+          (keyword? selector)
+          (first (filterv (fn [[_ step]] (= selector (:phase step))) indexed))
+
+          :else
+          (throw (ex-info "linked dispatch step selector must be nil, an index, or a phase keyword"
+                          {:reason :invalid-linked-dispatch-step-selector
+                           :selector selector})))]
+    (when-not selected
+      (throw (ex-info (if (nil? selector)
+                        "a linked instance requires exactly one dispatch step when the step is omitted"
+                        "linked dispatch step selector did not match")
+                      {:reason (if (nil? selector)
+                                 :ambiguous-linked-dispatch-step
+                                 :linked-dispatch-step-not-found)
+                       :selector selector
+                       :dispatch-phases
+                       (mapv (comp :phase second)
+                             (filterv (fn [[_ step]] (some? (:dispatch step))) indexed))})))
+    (let [[index step] selected]
+      (when-not (:dispatch step)
+        (throw (ex-info "selected linked step has no KernelDispatch"
+                        {:reason :linked-step-has-no-dispatch
+                         :selector selector :index index :phase (:phase step)})))
+      {:step-index index :step step :dispatch (kdispatch/validate! (:dispatch step))})))
+
+(defn linked-dispatch
+  "Return one KernelDispatch from a live certified executable.
+
+   `instance-selector` is nil for a one-instance plan, a zero-based instance index, or a stable
+   LinkInstance id. `step-selector` is nil when that instance has exactly one dispatch, a
+   zero-based step index, or a phase keyword. Composed plans require an explicit instance so
+   compiler inspection never falls back to session registry or symbol-name inference."
+  ([executable]
+   (linked-dispatch executable nil nil))
+  ([executable step-selector]
+   (linked-dispatch executable nil step-selector))
+  ([executable instance-selector step-selector]
+   (let [executable (ensure-live! executable :linked-dispatch)
+         instance (select-instance (:plan executable) instance-selector)]
+     (assoc (select-dispatch-step (:descriptor instance) step-selector)
+            :instance-id (:id instance)
+            :descriptor (:descriptor instance)))))
+
+(defn- physical-step-arguments
+  [step logical-arguments]
+  (if-not (:logical-bindings? step)
+    logical-arguments
+    (vec
+     (mapcat (fn [spec value]
+               (if (= :scalar (:kind spec))
+                 [value]
+                 (let [slots (:slots spec)]
+                   (when-not (= 1 (count slots))
+                     (throw (ex-info
+                             "linked dispatch tuning cannot project a multi-view logical binding"
+                             {:reason :linked-dispatch-multiview-binding
+                              :phase (:phase step) :binding (:binding spec) :slots slots})))
+                   [value])))
+             (:argument-specs step) logical-arguments))))
+
+(defn dispatch-arguments
+  "Project a tuning sample onto one linked instance's resident views and physical kernel ABI.
+
+   `descriptor-arguments` follow the selected descriptor's `:all-params` order. Array values remain
+   host-side reference inputs; device arguments come only from the instance's certified bindings.
+   Samples may use shorter arrays or smaller dynamic scratch extents than the allocated node view,
+   but may never exceed it."
+  ([executable descriptor-arguments]
+   (dispatch-arguments executable nil nil descriptor-arguments))
+  ([executable step-selector descriptor-arguments]
+   (dispatch-arguments executable nil step-selector descriptor-arguments))
+  ([executable instance-selector step-selector descriptor-arguments]
+   (let [executable (ensure-live! executable :dispatch-arguments)
+         plan (:plan executable)
+         instance (select-instance plan instance-selector)
+         descriptor (:descriptor instance)
+         {:keys [step-index step dispatch] :as selected}
+         (select-dispatch-step descriptor step-selector)
+         all-params (:all-params descriptor)
+         _argument-count
+         (when-not (and (sequential? descriptor-arguments)
+                        (= (count all-params) (count descriptor-arguments)))
+           (throw (ex-info "linked dispatch arguments must follow descriptor :all-params"
+                           {:reason :linked-dispatch-argument-count
+                            :instance (:id instance)
+                            :expected (count all-params)
+                            :actual (when (sequential? descriptor-arguments)
+                                      (count descriptor-arguments))
+                            :all-params all-params})))
+         argmap (zipmap all-params descriptor-arguments)
+         bindings (:bindings instance)
+         resident-of
+         (fn [sym]
+           (let [node-id (get bindings sym ::missing)]
+             (when (= ::missing node-id)
+               (throw (ex-info "linked dispatch symbol has no certified node binding"
+                               {:reason :linked-dispatch-binding
+                                :instance (:id instance) :symbol sym})))
+             (node-view executable node-id)))
+         capacity-of
+         (fn [sym]
+           (let [view (:view (resident-of sym))]
+             (quot (:byte-length view) (dtype/bytes-of (:dtype view)))))
+         require-capacity!
+         (fn [sym required]
+           (let [capacity (capacity-of sym)]
+             (when (> (long required) (long capacity))
+               (throw (ex-info "linked dispatch sample exceeds its resident node view"
+                               {:reason :linked-dispatch-buffer-capacity
+                                :instance (:id instance) :step-index step-index
+                                :phase (:phase step) :symbol sym
+                                :required-elements (long required)
+                                :capacity-elements (long capacity)})))))
+         _array-capacities
+         (doseq [sym (:array-params descriptor)]
+           (let [array (get argmap sym)]
+             (when-not (and array (.isArray (class array)))
+               (throw (ex-info "linked dispatch array parameter must be a JVM array"
+                               {:reason :linked-dispatch-array-argument
+                                :instance (:id instance) :symbol sym
+                                :value-type (some-> array class)})))
+             (require-capacity! sym (java.lang.reflect.Array/getLength array))))
+         _scratch-capacities
+         (doseq [{:keys [sym size-fn]} (:allocs descriptor)]
+           (require-capacity! sym (size-fn descriptor-arguments)))
+         logical-arguments
+         (mapv (fn [{:keys [kind sym type value-fn]}]
+                 (if (= :scalar kind)
+                   {:type type :value (value-fn descriptor-arguments)}
+                   (resident-of sym)))
+               (:argument-specs step))
+         arguments (physical-step-arguments step logical-arguments)
+         _abi (kabi/validate-arguments! (:abi (kdispatch/default-alternative dispatch)) arguments)
+         resident-bindings
+         (into {}
+               (keep (fn [[{:keys [kind sym]} value]]
+                       (when-not (= :scalar kind) [sym value])))
+               (map vector (:argument-specs step) logical-arguments))
+         direct-scalars (select-keys argmap (:scalar-params descriptor))
+         derived-scalars
+         (reduce (fn [values [{:keys [kind expression slot]} value]]
+                   (if (= :scalar kind)
+                     (let [raw (:value value)
+                           slot-name (:name slot)]
+                       (cond-> values
+                         slot-name (assoc slot-name raw)
+                         (symbol? expression) (assoc expression raw)))
+                     values))
+                 {}
+                 (map vector (:argument-specs step) logical-arguments))]
+     (assoc selected
+            :instance-id (:id instance)
+            :descriptor descriptor
+            :arguments arguments
+            :resident-bindings resident-bindings
+            :reference-inputs
+            {:buffers (select-keys argmap (:array-params descriptor))
+             :scalars (merge direct-scalars derived-scalars)}))))
 
 (defn outputs
   "Return the plan's ordered output node identities mapped to resident views."
