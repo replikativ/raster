@@ -7,7 +7,8 @@
 
    This is the GPU counterpart to segop_simd.clj — both consume the
    same SegOp IR but produce different target code."
-  (:require [raster.compiler.backend.gpu.opencl-codegen :as codegen]
+  (:require [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
+            [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -1283,8 +1284,8 @@
      :acc-regs acc-regs}))
 
 (defn epilogue-splice
-  "Build the (fn [acc-expr row col] -> C-expr) + param-decls + helpers that emit-gemm-tiled's
-   store-splice expects, from a DOMAIN-AGNOSTIC spec. The compiler learns no op names: the spec is
+  "Build the OpenCL scalar-expression spelling consumed by a matrix store region from a
+   DOMAIN-AGNOSTIC spec. The compiler learns no op names: the spec is
    just an EXPRESSION over the accumulator and some operands, each operand carrying its own
    axis-map, so bias / activation / residual / dequant-scale are all the same mechanism and
    COMPOSE by nesting (one bigger expression), per CLAUDE.md's domain-agnostic-passes rule.
@@ -1332,23 +1333,67 @@
      :epilogue-params params
      :epilogue-helpers helpers}))
 
+(defn- nested-kernel-operations [operations]
+  (mapcat (fn [operation]
+            (cons operation
+                  (when-let [nested (:operations operation)]
+                    (nested-kernel-operations nested))))
+          operations))
+
+(defn- kernel-body-store-splice
+  "Lower the typed ScalarRegion attached to KernelBody stores into the existing OpenCL scalar
+  expression vocabulary.  Matrix emission itself never sees the source contraction or epilogue
+  descriptor; its only target-specific input is this spelling of the store region."
+  [kernel-body]
+  (let [stores (filter #(instance? raster.compiler.ir.kernel_body.TileStore %)
+                       (nested-kernel-operations (:operations kernel-body)))
+        regions (distinct (map :value-region stores))]
+    (when-not (= 1 (count regions))
+      (throw (ex-info "all matrix tile stores must carry the same scalar region"
+                      {:reason :raster/bug :regions (vec regions)})))
+    (when-let [region (first regions)]
+      (let [operand-ids (set (map :sym (:operands region)))
+            scalar-ids (remove operand-ids (rest (:parameters region)))
+            parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
+            scalars (mapv (fn [id]
+                            (let [parameter (or (get parameters id)
+                                                (throw (ex-info "scalar region parameter is absent from the kernel ABI"
+                                                                {:reason :raster/bug
+                                                                 :parameter id})))]
+                              {:sym id :dtype (:dtype parameter)}))
+                          scalar-ids)
+            spec {:acc (first (:parameters region))
+                  :expr (:expression region)
+                  :operands (:operands region)
+                  :scalars scalars}
+            target (epilogue-splice spec
+                                    (subvec (vec (get-in kernel-body [:attributes :axis-symbols])) 0 2)
+                                    (:result-dtype region))]
+        (assoc target :spec spec)))))
+
 (defn- emit-dpas-plan
-  "Lower one already-checked DPAS plan.  This remains the shadow target adapter while the
-   `emit-gemm-tiled` template is decomposed into per-operation KernelBody lowering.  All schedule,
-   layout and boundary decisions have already happened before this boundary."
+  "Lower one already-checked DPAS plan.  A KernelBody takes the direct operation lowerer; nil uses
+  the legacy template solely for the independent oracle and opaque-helper compatibility path."
   [kernel-name row-arr col-arr out-sym [M N L] [i-sym j-sym] tile epilogue kernel-body]
-  (let [sg (long (get-in tile [:matrix :subgroup] 16))
-        ep (when epilogue
-             (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float)))
-        source (apply codegen/emit-gemm-tiled kernel-name
-                      (concat [:c-dtype :half
-                               :block-m (:block-m tile) :block-n (:block-n tile)
-                               :sg-m (:sg-m tile) :sg-n (:sg-n tile)
-                               :block-k (:block-k tile) :matrix (:matrix tile)
-                               :prefetch (:num-stages tile 3)]
-                              (when ep [:epilogue (:epilogue ep)
-                                        :epilogue-params (:epilogue-params ep)
-                                        :epilogue-helpers (:epilogue-helpers ep)])))]
+  (let [effective-tile (if kernel-body (:schedule kernel-body) tile)
+        sg (long (get-in effective-tile [:matrix :subgroup] 16))
+        ep (if kernel-body
+             (kernel-body-store-splice kernel-body)
+             (when epilogue
+               (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float))))
+        effective-epilogue (or (:spec ep) epilogue)
+        source (if kernel-body
+                 (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body ep)
+                 (apply codegen/emit-gemm-tiled kernel-name
+                        (concat [:c-dtype :half
+                                 :block-m (:block-m effective-tile)
+                                 :block-n (:block-n effective-tile)
+                                 :sg-m (:sg-m effective-tile) :sg-n (:sg-n effective-tile)
+                                 :block-k (:block-k effective-tile) :matrix (:matrix effective-tile)
+                                 :prefetch (:num-stages effective-tile 3)]
+                                (when ep [:epilogue (:epilogue ep)
+                                          :epilogue-params (:epilogue-params ep)
+                                          :epilogue-helpers (:epilogue-helpers ep)]))))]
     (cond->
      {:kernel-name kernel-name
       :source source
@@ -1361,29 +1406,30 @@
                    (kabi/slot 'M :scalar :int :role :dimension)
                    (kabi/slot 'N :scalar :int :role :dimension)
                    (kabi/slot 'K :scalar :int :role :dimension)]
-                  (for [{:keys [sym dtype] :or {dtype :float}} (:operands epilogue)]
+                  (for [{:keys [sym dtype] :or {dtype :float}} (:operands effective-epilogue)]
                     (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
-                  (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+                  (for [{:keys [sym dtype] :or {dtype :float}} (:scalars effective-epilogue)]
                     (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
       :dims [M N L]
       :dtype :half
-      :tile tile
+      :tile effective-tile
       :epilogue-params (when ep (:epilogue-params ep))
-      :epilogue-operands (when ep (mapv :sym (:operands epilogue)))
-      :epilogue-scalars (when ep (mapv :sym (:scalars epilogue)))
-      :workgroup [(* (quot (:block-m tile) (:sg-m tile))
-                     (quot (:block-n tile) (:sg-n tile))
-                     sg) 1]
+      :epilogue-operands (when ep (mapv :sym (:operands effective-epilogue)))
+      :epilogue-scalars (when ep (mapv :sym (:scalars effective-epilogue)))
+      :workgroup (if kernel-body
+                   (get-in kernel-body [:launch :workgroup-size])
+                   [(* (quot (:block-m effective-tile) (:sg-m effective-tile))
+                       (quot (:block-n effective-tile) (:sg-n effective-tile))
+                       sg) 1])
       :tensorized true}
       kernel-body (assoc :kernel-body kernel-body))))
 
 (defn generate-dpas-kernel-body
   "Lower a verified, scheduled matrix KernelBody to the Intel OpenCL target.
 
-   This is deliberately a separate boundary from contraction scheduling.  The adapter currently
-   shadows the proven source generator; the body is nevertheless production data and is verified
-   before emission, so subsequent changes can replace one operation at a time without re-parsing
-   the contraction or inventing another schedule."
+   This is deliberately a separate boundary from contraction scheduling.  The production path
+   walks explicit body operations and layouts directly.  The legacy source generator remains only
+   behind `generate-dpas-contraction-kernel` as an independent equivalence oracle."
   [kernel-body out-sym]
   (let [kernel-body (kbody/validate! kernel-body)
         {:keys [kind instruction-family dims bindings epilogue axis-symbols]}
@@ -1401,7 +1447,7 @@
 
    Production canonical f16 contractions now travel through ContractionFacts and a scheduled
    KernelBody before reaching `generate-dpas-kernel-body`.  This entry remains as the source oracle
-   for the shadow adapter and for opaque epilogue helpers that have not yet become typed scalar IR.
+   for the direct operation lowerer and for opaque epilogue helpers that have not yet become typed scalar IR.
    Its legality analysis determines operand orientation and launch dimensions; the emitted body is
    f16 input, f32 accumulation and f16 output with a tile-parametric K16 matrix instruction.
 

@@ -225,7 +225,7 @@
   "Strategies whose emitter has a store splice, and can therefore honour an :epilogue.
    A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
    blacklist got this wrong twice, most recently by exempting the only shape production produces.
-   `:dpas` splices through emit-gemm-tiled; the three staged-emitter strategies splice at the store
+   `:dpas` splices through the KernelBody ScalarRegion; the three staged-emitter strategies splice at the store
    (which is how a quant dequant scale is expressed since :scheme was deleted)."
   #{:dpas :dp4a :quant-naive :staged-segred})
 
@@ -428,6 +428,7 @@
     ;; dtype / orientation / alignment
     :dtype-not-dpas :non-canonical-orientation :n-pitch-unaligned :k-pitch-unaligned
     :non-zero-matrix-init :partial-matrix-k-fragment :matrix-family-not-lowered
+    :matrix-instruction-not-lowered
     ;; declared-operand and quant-leaf legality
     :operand-without-a-declared-map :missing-declared-contract-axes
     :declared-operand-not-read-by-the-body :declared-map-does-not-match-the-body-index

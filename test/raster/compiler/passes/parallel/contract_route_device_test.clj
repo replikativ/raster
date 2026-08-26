@@ -209,21 +209,21 @@
   ([r bufs] (launch-int8-routed r bufs {}))
   ([r bufs scalars]
    (let [ze (find-ns 'raster.gpu.ze-runtime)
-        [gx gy] (:grid r)
-        o ((ns-resolve ze 'make-buffer) (:out-elems r) :float)]
-    ((ns-resolve ze 'register-kernel!) (:kernel-name r) {:source (:source r) :dtype :byte})
-    (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
-          args (-> (mapv #(:segment (get bufs %)) (:array-params r))
-                   (conj (:segment o))
-                   (into (mapv (fn [sym] {:type :float :value (float (get scalars sym))})
-                               (:epilogue-scalars r)))
-                   (into (:scalar-args r)))]
-      ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) [gx gy] args)
-      (vec ((ns-resolve ze 'buffer->float-array) o))))))
+         [gx gy] (:grid r)
+         o ((ns-resolve ze 'make-buffer) (:out-elems r) :float)]
+     ((ns-resolve ze 'register-kernel!) (:kernel-name r) {:source (:source r) :dtype :byte})
+     (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
+           args (-> (mapv #(:segment (get bufs %)) (:array-params r))
+                    (conj (:segment o))
+                    (into (mapv (fn [sym] {:type :float :value (float (get scalars sym))})
+                                (:epilogue-scalars r)))
+                    (into (:scalar-args r)))]
+       ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) [gx gy] args)
+       (vec ((ns-resolve ze 'buffer->float-array) o))))))
 
 (defn- mk-i8 [xs] (let [ze (find-ns 'raster.gpu.ze-runtime)]
                     ((ns-resolve ze 'array->buffer!) ((ns-resolve ze 'make-buffer) (count xs) :byte)
-                     (byte-array (map byte xs)))))
+                                                     (byte-array (map byte xs)))))
 
 (deftest c1-int8-routes-to-quant-leaves
   (if-not @gpu?
@@ -234,7 +234,7 @@
           Aget (fn [i] (nth Ab i)) Bget (fn [i] (nth Bv i))
           close? (fn [xs ys] (every? true? (map #(< (/ (Math/abs (- (double %1) (double %2)))
                                                        (max 1.0 (Math/abs (double %2)))) 1.0e-6)
-                                                 xs ys)))]
+                                                xs ys)))]
       (testing ":nt (B stored [N,K]) → :dp4a peak leaf; int8 matmul dequant == reference"
         (let [form (list 'raster.par/contract 'C [['i M] ['j N]] [['l K]]
                          (list '* (list 'aget 'A (list '+ (list '* 'i K) 'l))
@@ -336,21 +336,21 @@
   (let [strategy (fn [form & opts] (:strategy (apply route/route-contraction form opts)))]
     (testing "0 contract axes → :segmap"
       (is (= :segmap (strategy '(raster.par/contract C [[i 4] [j 3]] []
-                                  (* (aget a i) (aget b j))) :dtype :double))))
+                                                     (* (aget a i) (aget b j))) :dtype :double))))
     (testing "n free ≠ 2 → :naive-segred"
       (is (= :naive-segred (strategy '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
-                                        (* (aget A x) (aget B y))) :dtype :double))))
+                                                           (* (aget A x) (aget B y))) :dtype :double))))
     (testing "n ≥ 2 contract axes → :naive-segred (flattened)"
       (is (= :naive-segred (strategy '(raster.par/contract C [[i 4]] [[l1 2] [l2 3]]
-                                        (* (aget A x) (aget V y))) :dtype :double))))
+                                                           (* (aget A x) (aget V y))) :dtype :double))))
     (testing "2 free + 1 contract: f16 canonical → :dpas, f64 → :regtiled"
       (is (= :dpas (strategy (matmul-form 128 128 128) :dtype :half)))
       (is (= :regtiled (strategy (matmul-form 128 128 128) :dtype :double))))
     (testing "int8 :nt → :dp4a, :nn → :quant-naive, :nn + prefer-peak? → :dp4a + transpose"
       (let [nt '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
-                  (* (aget A (+ (* i 8) l)) (aget B (+ (* j 8) l))))
+                                     (* (aget A (+ (* i 8) l)) (aget B (+ (* j 8) l))))
             nn '(raster.par/contract C [[i 4] [j 4]] [[l 8]]
-                  (* (aget A (+ (* i 8) l)) (aget B (+ (* l 4) j))))]
+                                     (* (aget A (+ (* i 8) l)) (aget B (+ (* l 4) j))))]
         (is (= :dp4a (strategy nt :dtype :byte)))
         (is (= :quant-naive (strategy nn :dtype :byte)))
         (let [r (route/route-contraction nn :dtype :byte :prefer-peak? true)]
@@ -383,7 +383,7 @@
         (is (= [256 1] (:wg r)))
         (is (= [4 2] (:grid r)))))                     ; ceil(512/128), ceil(256/128)
     (testing "a part with HALF the GRF and subgroup 8 gets a rescaled tile AND launch geometry"
-      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+      (let [small {:matrix {:m 8 :n 8 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
             r (route/route-contraction mm :dtype :half :desc small)]
         (is (= {:block-m 64 :block-n 64 :sg-m 16 :sg-n 16 :block-k 32}
                (select-keys (:tile r) [:block-m :block-n :sg-m :sg-n :block-k])))
@@ -395,7 +395,7 @@
         (is (= t (:tile r)))
         (is (not= (:block-m (hw {})) (:block-m t)) "the override must actually differ")))
     (testing "the emitted kernel source carries the derived tile, not a constant"
-      (let [small {:matrix {:m 8 :n 16 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
+      (let [small {:matrix {:m 8 :n 8 :k 16 :subgroup 8} :grf-bytes-per-lane 128}
             src (:source (route/route-contraction mm :dtype :half :desc small))]
         (is (re-find #"intel_reqd_sub_group_size\(8\)" src)
             "subgroup size must follow the descriptor into the kernel attribute")))))

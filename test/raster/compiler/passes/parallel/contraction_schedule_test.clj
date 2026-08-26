@@ -1,9 +1,12 @@
 (ns raster.compiler.passes.parallel.contraction-schedule-test
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [clojure.walk :as walk]
             [raster.compiler.backend.gpu.opencl-pass :as opencl]
+            [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
@@ -56,7 +59,18 @@
     (is (= :non-zero-matrix-init
            (:reason (schedule/plan-matrix-body
                      (facts/contraction-facts (matrix-form 128 128 128 1.0) :dtype :half)
-                     nil nil))))))
+                     nil nil)))))
+  (testing "matrix N and subgroup width must agree with an implemented DPAS spelling"
+    (let [desc {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 8}}
+          planned (schedule/plan-matrix-body
+                   (facts/contraction-facts (matrix-form 128 128 128) :dtype :half)
+                   desc nil)
+          routed (route/route-contraction (matrix-form 128 128 128)
+                                          :dtype :half :desc desc)]
+      (is (false? (:ok planned)))
+      (is (= :matrix-instruction-not-lowered (:reason planned)))
+      (is (= :regtiled (:strategy routed)))
+      (is (= :matrix-instruction-not-lowered (:fallback-reason routed))))))
 
 (deftest the-production-route-carries-the-body-into-the-executable-artifact
   (let [routed (route/route-contraction (matrix-form 128 128 128) :dtype :half)
@@ -89,6 +103,51 @@
     (is (= (:tile oracle) (:tile routed)))
     (is (= (:workgroup oracle) (:wg routed)))
     (is (body/kernel-body? (:kernel-body routed)))))
+
+(deftest typed-store-regions-lower-identically-to-the-epilogue-oracle
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
+                  :operands [{:sym 'bias
+                              :map (axis-map/of-axes [['j 128]])
+                              :dtype :float}]}
+        form (concat (matrix-form 128 128 128) [:epilogue epilogue])
+        routed (route/route-contraction form :dtype :half)
+        oracle (segop-opencl/generate-dpas-contraction-kernel
+                (contract-lower/contract-form->segred form :dtype :half) 'C
+                :epilogue epilogue)
+        normalize #(str/replace % #"dpas_contract_[0-9]+" "dpas_contract_N")]
+    (is (= (normalize (:source oracle)) (normalize (:source routed))))
+    (is (= '[bias] (:epilogue-operands routed)))
+    (is (re-find #"bias\[col\]" (:source routed)))
+    (is (some :value-region (get-in routed [:kernel-body :operations 0 :operations])))))
+
+(deftest production-kernel-body-lowering-does-not-call-the-legacy-template
+  (with-redefs [opencl-codegen/emit-gemm-tiled
+                (fn [& _]
+                  (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+    (let [routed (route/route-contraction (matrix-form 128 128 128) :dtype :half)]
+      (is (= :dpas (:strategy routed)))
+      (is (re-find #"intel_sub_group_f16_f16_matrix_mad_k16" (:source routed)))
+      (is (body/kernel-body? (:kernel-body routed))))))
+
+(deftest direct-lowering-refuses-an-operation-coordinate-that-disagrees-with-the-schedule
+  (let [kernel (:body (schedule/plan-matrix-body
+                       (facts/contraction-facts (matrix-form 128 128 128) :dtype :half)
+                       nil nil))
+        changed? (atom false)
+        corrupt (walk/postwalk
+                 (fn [value]
+                   (if (and (not @changed?)
+                            (instance? raster.compiler.ir.kernel_body.TileLoad value))
+                     (do (reset! changed? true)
+                         (update value :coordinates
+                                 #(assoc % 0 (body/expression :add (first %) 1))))
+                     value))
+                 kernel)]
+    (is @changed?)
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                          #"rhs tile coordinates"
+                          (segop-opencl/generate-dpas-kernel-body corrupt 'C)))))
 
 (deftest a-partial-matrix-fragment-falls-back-with-an-explanation
   (let [routed (route/route-contraction (matrix-form 128 128 24) :dtype :half)]
