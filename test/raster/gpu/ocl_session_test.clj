@@ -107,6 +107,25 @@
           (is (= [3 255 411] (vec result))))
         (finally (gpu/close-session! s))))))
 
+(deftest ocl-resident-row-gather-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl row gather (no OpenCL device)")
+    (let [nrows 3
+          width 4
+          table (float-array (map float (range 32)))
+          indices (int-array [5 1 5])
+          rows (float-array (* nrows width))
+          descriptor (pl/compile-gpu-program #'ops/gather-rows! :ocl:0 :dtype :float)
+          s (gpu/make-session :ocl:0)]
+      (try
+        (let [program (fixture/instantiate! s descriptor [table indices rows nrows width])
+              result (get (fixture/run! program [table indices rows nrows width]) 'out)]
+          (is (= [20.0 21.0 22.0 23.0
+                  4.0 5.0 6.0 7.0
+                  20.0 21.0 22.0 23.0]
+                 (vec result))))
+        (finally (gpu/close-session! s))))))
+
 (deftest ocl-resident-segmap-artifact-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl resident SegMap artifact (no OpenCL device)")

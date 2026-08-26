@@ -160,6 +160,12 @@ exposes the next general IR requirement: `SegRed` needs typed product/tuple accu
 workgroup/subgroup schedule. Once that exists, the general scheduled reduction should subsume the
 two-map implementation and lower to target-local shared/shuffle reductions without changing callers.
 
+Row selection remains a separate generic operation. `gather-rows!` consumes shared row-major source
+storage and `int[B]` indices, writes caller-owned dense `[B,width]` output, and maps every output
+element independently. Consequently greedy decode composes indexed reduction and row gather as
+ordinary graph dataflow; top-k, sampling, beam search, or external token policy can replace the
+producer without changing embedding storage or introducing a decoder-tail compiler primitive.
+
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
 
