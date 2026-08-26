@@ -29,7 +29,9 @@
             [raster.compiler.pipeline :as pl]
             [raster.par]
             [raster.arrays]
-            [raster.ad.reverse :as rev]))
+            [raster.ad.reverse :as rev]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 ;; Resident bridge kernel: copy the (untyped Object) grad `src` — pulled out of the
 ;; value+grad result vector via nth, so it carries no array tag — into a caller-
@@ -138,18 +140,13 @@
   "Bind + replay f-var's resident descriptor on ze:0 for `args`; returns the result array.
    gemm-precision is compile-gpu-program's :gemm-precision (:f16-xmx | :f32-scalar)."
   [f-var args dtype gemm-precision]
-  (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-        make-session (ns-resolve gpu 'make-session)
-        bind-program! (ns-resolve gpu 'bind-program!)
-        run-program! (ns-resolve gpu 'run-program!)
-        close-session! (ns-resolve gpu 'close-session!)
-        p (pl/compile-gpu-program f-var :ze:0 :dtype dtype :gemm-precision gemm-precision)
-        s (make-session :ze:0)]
+  (let [p (pl/compile-gpu-program f-var :ze:0 :dtype dtype :gemm-precision gemm-precision)
+        s (gpu/make-session :ze:0)]
     (try
-      (bind-program! s p args {})
-      (let [r (run-program! s p args)]
+      (let [program (fixture/instantiate! s p args)
+            r (fixture/run! program args)]
         {:descriptor p :out (or (get r (:result-sym p)) (first (vals r)))})
-      (finally (close-session! s)))))
+      (finally (gpu/close-session! s)))))
 
 (defn- rel-err [gpu cpu]
   (let [err (reduce max 0.0 (map #(Math/abs (double (- %1 %2))) (seq gpu) (seq cpu)))
@@ -171,7 +168,7 @@
                                ['__gout__ :- ret-type '__gn__ :- 'Long]))]
     (eval
      ;; return the bare __gout__ SYMBOL (not the copy-into! call) so the resident
-     ;; descriptor's :result-sym is a plain array-param symbol — run-program!'s
+     ;; descriptor's :result-sym is a plain array-param symbol—the linked fixture's
      ;; functional-result path calls (name result-sym) and chokes on a call list.
      `(raster.core/deftm ~wname ~param-vec :- ~ret-type
         (let [vg# ((rev/value+grad (var ~loss-fqsym)) ~@names)

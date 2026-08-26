@@ -783,7 +783,7 @@
   "Register generated GPU kernels eagerly so they're available at eval time.
   Registers into the TARGET backend's registry (ze for :ze:N, ocl for :ocl:N) —
   a hardcoded ze registration left :ocl programs unbindable (kernel lookup at
-  bind-program! time hits the per-backend registry)."
+  LinkedExecutable instantiation hits the per-backend registry)."
   ([kernels] (register-gpu-kernels! kernels :ze:0))
   ([kernels device-id]
    (when (seq kernels)
@@ -1636,7 +1636,7 @@
                         compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
 
    :gemm-precision sets the resident :gemm binding policy. It is now deprecated SUGAR for the S6
-   schedule's [:schedule :precision] (the source of truth bind-program! reads). A bind-time caller
+   schedule's [:schedule :precision] (the source of truth the linked step binder reads). A caller
    overrides the policy on the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …)
    — NOT (assoc descriptor :gemm-precision …), which the resolved schedule now shadows:
      :f16-xmx (default) — convert A/B f32→f16, XMX gemm, f32 C accumulate/output. The
@@ -1655,7 +1655,7 @@
    — the remedy is standard AMP loss scaling, and it lives in the CALLER (scale the seed
    cotangent by S, use lr/S), not in this policy: the VJP is linear in the seed.
    The XMX pitch gate and direct-vs-split occupancy decision are emitted as checked
-   KernelDispatch expression cases. `bind-program!` selects and binds that compiler value; it does
+   KernelDispatch expression cases. LinkPlan instantiation selects and binds that compiler value; it does
    not recognize GEMM shapes or reconstruct conversion/split kernels."
   [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule]
                       :or {on-non-resident :throw gemm-precision :f16-xmx}}]
@@ -2006,9 +2006,9 @@
                           {:kernel-name kernel-name
                            :arrays arrays
                            ;; :reduce steps carry the resident 1-elem output buffer (sym keyword) so
-                           ;; bind-program! wires it like a map output (it lives in :allocs as scratch).
+                           ;; LinkPlan instantiation wires it like a map output (it lives in :allocs as scratch).
                            :output (when output (keyword (name output)))
-                           ;; :scatter steps carry the accumulator buffer sym so bind-program! can
+                           ;; :scatter steps carry the accumulator buffer sym so the linked binder can
                            ;; zero it (a zero-fill kernel prepended to the atomic-add scatter) each
                            ;; replay — the zeros-like semantics of scatter-add's output.
                            :accumulator (when accumulator (keyword (name accumulator)))

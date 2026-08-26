@@ -1124,7 +1124,7 @@
        kernels have no alpha/beta at all (the split-k emitter explicitly THROWS on
        beta≠0 — its partials are summed by a separate reduce kernel); and
      - beta≠0 READS C, which collides with the residency model: buffer contents are
-       uploaded once at BIND, and run-program! re-uploads only :input buffers. A beta=1
+       uploaded once at instantiation, and linked invocation re-uploads only :input buffers. A beta=1
        GEMM writing an :output param would be correct on the FIRST replay and then
        silently ACCUMULATE ACROSS REPLAYS — trading one silent miscompile for another.
        A sound implementation must additionally prove that C's pre-step contents are

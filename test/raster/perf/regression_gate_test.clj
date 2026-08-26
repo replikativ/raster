@@ -11,7 +11,7 @@
      clojure -M:perf --update-baseline  ;; re-seed after an INTENDED speedup (ratchet down)
 
    HOW IT GATES. Each canary times a compiled kernel with microbench/do-bench (device
-   kernels will use profile-program! as GPU canaries land — B1) and asserts its
+   kernels will use LinkedExecutable profiling as GPU canaries land—B1) and asserts its
    STATIONARY median has not regressed past baseline × SLACK. The slack band is wide
    enough that the ±2–3% steady-state noise never flakes, tight enough to catch a real
    ≥15% regression. A missing baseline for this machine RECORDS instead of failing (first
@@ -22,7 +22,7 @@
 
    COVERAGE (grows with the agenda — each canary guards the phase that could regress it):
      - cpu/simd-reduce      : device-free, proves the mechanism + guards the JVM-SIMD path.
-     - TODO B1: gemm-leaf   : fixed-shape GEMM device median (profile-program!).
+     - TODO B1: gemm-leaf   : fixed-shape GEMM device median (gpu.link/measure!).
      - TODO B2: epilogue    : fused-epilogue microkernel host median.
      - TODO A3: train-step  : MLP/LeNet compiled train-step µs/step."
   (:require [clojure.test :refer [deftest is testing]]

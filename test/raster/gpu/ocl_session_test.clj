@@ -1,6 +1,6 @@
 (ns raster.gpu.ocl-session-test
-  "Resident-session layer on the OpenCL backend: compile → bind-program! →
-  record → replay → download, on whatever OpenCL device is available. With
+  "Linked resident execution on OpenCL: compile → certify → instantiate → replay → download,
+  on whatever OpenCL device is available. With
   RASTER_OCL_DEVICE_TYPE=cpu this runs on POCL/Intel-CPU — the no-GPU
   vendor-portability oracle (CUDA/HIP Phase A). Skips cleanly without OpenCL.
 
@@ -11,7 +11,9 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.pipeline :as pl]
             [raster.arrays :as ra]
-            [raster.core :refer [deftm]]))
+            [raster.core :refer [deftm]]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]))
 
 (def ^:private ocl-available?
   (delay (try (require 'raster.gpu.ocl-runtime)
@@ -63,95 +65,76 @@
 (deftest ocl-resident-session-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl-session test (no OpenCL device)")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          p (pl/compile-gpu-program #'ocl-session-ax! :ocl:0 :dtype :float)
+    (let [p (pl/compile-gpu-program #'ocl-session-ax! :ocl:0 :dtype :float)
           n 4096
           x (float-array (map float (range n)))
           y (float-array n)
-          s (make-session :ocl:0)]
+          s (gpu/make-session :ocl:0)]
       (try
-        (bind-program! s p [x y (float 2.0) n] {'x :input 'y :output})
-        (testing "replayed program computes correctly"
-          (let [r (run-program! s p [x y (float 2.0) n])
-                ^floats yg (get r 'y)]
-            (is (every? (fn [i] (< (Math/abs (- (aget yg (int i)) (* 2.0 i))) 1e-3))
-                        (range n)))))
-        (testing "replay is stable across repeated runs"
-          (let [r2 (run-program! s p [x y (float 2.0) n])
-                ^floats yg (get r2 'y)]
-            (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3))))
-        (finally (close-session! s))))))
+        (let [program (fixture/instantiate! s p [x y (float 2.0) n]
+                                            {'x :input 'y :output})]
+          (testing "replayed program computes correctly"
+            (let [r (fixture/run! program [x y (float 2.0) n])
+                  ^floats yg (get r 'y)]
+              (is (every? (fn [i] (< (Math/abs (- (aget yg (int i)) (* 2.0 i))) 1e-3))
+                          (range n)))))
+          (testing "replay is stable across repeated runs"
+            (let [r2 (fixture/run! program [x y (float 2.0) n])
+                  ^floats yg (get r2 'y)]
+              (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3)))))
+        (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-segmap-artifact-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl resident SegMap artifact (no OpenCL device)")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          descriptor (pl/compile-gpu-program #'ocl-session-map :ocl:0 :dtype :float)
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-map :ocl:0 :dtype :float)
           n 4096
           x (float-array (map float (range n)))
           y (float-array n)
-          s (make-session :ocl:0)]
+          s (gpu/make-session :ocl:0)]
       (try
-        (let [handle (bind-program! s descriptor [x y (float 2.0) n])
-              result (get (run-program! s handle [x y (float 2.0) n]) 'y)]
+        (let [program (fixture/instantiate! s descriptor [x y (float 2.0) n])
+              result (get (fixture/run! program [x y (float 2.0) n]) 'y)]
           (is (= [:map] (mapv :convention (:steps descriptor))))
           (is (every? (fn [i] (< (Math/abs (- (aget ^floats result (int i)) (* 2.0 i)))
                                   1e-3))
                       (range n))))
-        (finally (close-session! s))))))
+        (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-contraction-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl resident contraction (no OpenCL device)")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          descriptor (pl/compile-gpu-program #'ocl-session-contract :ocl:0 :dtype :float)
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-contract :ocl:0 :dtype :float)
           A (float-array (map float (range 64)))
           B (float-array (repeat 64 (float 1.0)))
-          s (make-session :ocl:0)]
+          s (gpu/make-session :ocl:0)]
       (try
-        (let [handle (bind-program! s descriptor [A B])
-              result (get (run-program! s handle [A B]) 'C)]
+        (let [program (fixture/instantiate! s descriptor [A B])
+              result (get (fixture/run! program [A B]) 'C)]
           (is (= [:contract] (mapv :convention (:steps descriptor))))
           (is (= (vec (mapcat #(repeat 8 (float %))
                               (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
                                    (range 8))))
                  (vec result))))
-        (finally (close-session! s))))))
+        (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-reduction-ordered-abi-roundtrip
   (if-not @ocl-available?
     (println "SKIP ocl resident reduction (no OpenCL device)")
-    (let [gpu (do (require 'raster.gpu.core) (find-ns 'raster.gpu.core))
-          make-session (ns-resolve gpu 'make-session)
-          bind-program! (ns-resolve gpu 'bind-program!)
-          run-program! (ns-resolve gpu 'run-program!)
-          close-session! (ns-resolve gpu 'close-session!)
-          descriptor (pl/compile-gpu-program #'ocl-session-reduce :ocl:0 :dtype :float)
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-reduce :ocl:0 :dtype :float)
           n 1024
           scale 0.75
           x (float-array (map #(float (/ (inc %) 1024.0)) (range n)))
           out (float-array n)
           expected-sum (reduce + 0.0 (map #(* scale (double %)) (seq x)))
-          s (make-session :ocl:0)]
+          s (gpu/make-session :ocl:0)]
       (try
-        (let [handle (bind-program! s descriptor [x out scale n])
-              result (get (run-program! s handle [x out scale n]) 'out)
+        (let [program (fixture/instantiate! s descriptor [x out scale n])
+              result (get (fixture/run! program [x out scale n]) 'out)
               red-step (first (filter #(= :reduce (:convention %)) (:steps descriptor)))]
           (is (= [:input :output :scalar :scalar]
                  (mapv :kind (:argument-specs red-step))))
           (is (< (Math/abs (- (double (aget ^floats result 511))
                               (* (double (aget x 511)) expected-sum)))
                  1e-3)))
-        (finally (close-session! s))))))
+        (finally (gpu/close-session! s))))))

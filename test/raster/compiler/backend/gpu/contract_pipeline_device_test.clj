@@ -11,6 +11,7 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
             [raster.gpu.core :as gpu]
+            [raster.gpu.descriptor-fixture :as fixture]
             [raster.gpu.ze-runtime :as ze]))
 
 (def ^:private gpu?
@@ -48,8 +49,8 @@
           B (float-array (repeat 64 (float 1.0)))
           session (gpu/make-session :ze:0)]
       (try
-        (let [handle (gpu/bind-program! session descriptor [A B])
-              result (get (gpu/run-program! session handle [A B]) 'C)]
+        (let [program (fixture/instantiate! session descriptor [A B])
+              result (get (fixture/run! program [A B]) 'C)]
           (is (= [:contract] (mapv :convention (:steps descriptor))))
           (is (= (vec (mapcat #(repeat 8 (float %))
                               (map (fn [row] (reduce + (range (* row 8) (* (inc row) 8))))
