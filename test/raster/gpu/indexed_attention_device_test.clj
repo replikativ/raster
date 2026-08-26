@@ -1,6 +1,8 @@
 (ns raster.gpu.indexed-attention-device-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.indexed-attention-recognize :as recognize]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-route :as route]
@@ -10,6 +12,7 @@
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-benchmark :as benchmark]
+            [raster.gpu.link :as link]
             [raster.gpu.tuning-cache :as cache]
             [raster.numeric])
   (:import [java.nio.file Files]))
@@ -147,14 +150,24 @@
                   plan {:buffers {'Q q 'K k 'V v 'dst dst 'src src}
                         :scalars shape-env})]
     (gpu/with-gpu-session [session :ocl:0]
-      (let [handle (gpu/bind-program! session descriptor args)
-            selected (get-in @session [:programs :program :bounds 0
-                                       :kernel-call :artifact :attributes :strategy])
-            result (get (gpu/run-program! session handle args) (:result-sym descriptor))
-            max-error (reduce max 0.0
-                              (map #(Math/abs (- (double %1) (double %2)))
-                                   expected result))]
-        {:selected selected :max-error max-error}))))
+      (let [lowering (resident-plan/lower
+                      {:id (random-uuid) :target :ocl:0 :descriptor descriptor
+                       :arguments args :outputs [(:result-sym descriptor)]})
+            executable (link/instantiate! (:plan lowering) {:session session})
+            result-node (get-in lowering [:certificate :bindings (:result-sym descriptor)])]
+        (try
+          (let [binding (link/dispatch-arguments executable args)
+                selected (-> (kdispatch/select-alternative
+                              (:dispatch binding) (:arguments binding))
+                             :attributes :strategy)
+                _ (link/run! executable)
+                result (link/download executable result-node)
+                max-error (reduce max 0.0
+                                  (map #(Math/abs (- (double %1) (double %2)))
+                                       expected result))]
+            {:selected selected :max-error max-error})
+          (finally
+            (link/close! executable)))))))
 
 (defn- temporary-cache-root
   []
@@ -172,39 +185,45 @@
                       #'resident-indexed-attention-probe :ocl:0 :dtype :float)]
       (binding [cache/*cache-root* (temporary-cache-root)]
         (gpu/with-gpu-session [session :ocl:0]
-          (let [handle (gpu/bind-program! session descriptor args)
-                result
-                (benchmark/tune-program-dispatch!
-                 session handle (hardware/descriptor-for :ocl:0) [2]
-                 (fn [components]
-                   {:program-arguments args
-                    :validate!
-                    (fn [{:keys [case]}]
-                      (let [binding (:compiled-binding case)
-                            plan (get-in binding
-                                         [:dispatch :attributes :tuning :reference :plan])
-                            expected (reference/evaluate plan (:reference-inputs binding))
-                            output-key (get-in binding
-                                               [:resident-bindings (:result-sym descriptor)])
-                            actual ^floats (gpu/download session output-key)
-                            max-error
-                            (reduce max 0.0
-                                    (map #(Math/abs (- (double %1) (double %2)))
-                                         expected actual))]
-                        {:passed? (< max-error 2.0e-5)
-                         :oracle-hash (str "compiled-segmented-reference-v1-" components)
-                         :max-error max-error}))
-                    :measurement {:warmup-iterations 0 :budget-ms 1
-                                  :min-samples 3 :max-samples 5
-                                  :cv-threshold 100.0}})
-                 :force? true)]
-            (is (= 2 (count (get-in result [:tuning :measurements]))))
-            (is (= (:selector result)
-                   (get-in result
-                           [:schedule-override :segmented-weighted-reduction
-                            :measured-selectors
-                            (get-in descriptor [:steps 0 :dispatch :id])])))
-            (is (= :gpu-step-0 (:phase result)))))))))
+          (let [lowering (resident-plan/lower
+                          {:id (random-uuid) :target :ocl:0 :descriptor descriptor
+                           :arguments args :outputs [(:result-sym descriptor)]})
+                executable (link/instantiate! (:plan lowering) {:session session})
+                result-node (get-in lowering
+                                    [:certificate :bindings (:result-sym descriptor)])]
+            (try
+              (let [result
+                    (benchmark/tune-linked-dispatch!
+                     executable (hardware/descriptor-for :ocl:0) [2]
+                     (fn [components]
+                       {:descriptor-arguments args
+                        :validate!
+                        (fn [{:keys [case]}]
+                          (let [binding (:linked-binding case)
+                                plan (get-in binding
+                                             [:dispatch :attributes :tuning :reference :plan])
+                                expected (reference/evaluate plan (:reference-inputs binding))
+                                actual ^floats (link/download executable result-node)
+                                max-error
+                                (reduce max 0.0
+                                        (map #(Math/abs (- (double %1) (double %2)))
+                                             expected actual))]
+                            {:passed? (< max-error 2.0e-5)
+                             :oracle-hash (str "compiled-segmented-reference-v1-" components)
+                             :max-error max-error}))
+                        :measurement {:warmup-iterations 0 :budget-ms 1
+                                      :min-samples 3 :max-samples 5
+                                      :cv-threshold 100.0}})
+                     :force? true)]
+                (is (= 2 (count (get-in result [:tuning :measurements]))))
+                (is (= (:selector result)
+                       (get-in result
+                               [:schedule-override :segmented-weighted-reduction
+                                :measured-selectors
+                                (get-in descriptor [:steps 0 :dispatch :id])])))
+                (is (= :gpu-step-0 (:phase result))))
+              (finally
+                (link/close! executable)))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width
   (if-not @opencl-available?

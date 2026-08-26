@@ -11,6 +11,7 @@
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.gpu.core :as gpu]
             [raster.gpu.dispatch-tuning :as tuning]
+            [raster.gpu.link :as link]
             [raster.gpu.program-tuning :as program-tuning]))
 
 (def ^:private reserved-measurement-options
@@ -186,48 +187,49 @@
     (tuning/apply-tuning dispatch dispatch-tuning descriptor numerical-mode layout)
     (assoc-in {} target-path selector)))
 
-(defn- compiled-case-fn
-  [session program step-selector case-fn]
+(defn- linked-case-fn
+  [executable instance-selector step-selector case-fn]
   (fn [runtime-value]
     (let [case (case-fn runtime-value)]
       (when-not (map? case)
-        (throw (ex-info "compiled dispatch benchmark case must be a map"
+        (throw (ex-info "linked dispatch benchmark case must be a map"
                         {:runtime-value runtime-value :case case})))
-      (when-not (contains? case :program-arguments)
-        (throw (ex-info "compiled dispatch benchmark case requires :program-arguments"
+      (when-not (contains? case :descriptor-arguments)
+        (throw (ex-info "linked dispatch benchmark case requires :descriptor-arguments"
                         {:runtime-value runtime-value :case-keys (set (keys case))})))
-      (let [binding (gpu/program-dispatch-arguments
-                     session program step-selector (:program-arguments case))]
+      (let [binding (link/dispatch-arguments
+                     executable instance-selector step-selector (:descriptor-arguments case))]
         (assoc case
                :arguments (:arguments binding)
                ;; Validation callbacks reach the compiler-owned reference plan and the projected
-               ;; host buffer/scalar environment through (:compiled-binding (:case context)).
-               :compiled-binding (dissoc binding :arguments))))))
+               ;; host buffer/scalar environment through (:linked-binding (:case context)).
+               :linked-binding (dissoc binding :arguments))))))
 
-(defn tune-program-dispatch!
-  "Tune one KernelDispatch embedded in a live compiled resident program.
+(defn tune-linked-dispatch!
+  "Tune one KernelDispatch embedded in a live LinkedExecutable.
 
    This closes the descriptor-to-driver seam without teaching the runtime any operation. Each
-   `case-fn` result supplies `:program-arguments` in descriptor order plus the same :validate!,
+   `case-fn` result supplies `:descriptor-arguments` in descriptor order plus :validate!,
    :before-run!, and :measurement callbacks accepted by tune-dispatch!. The bridge projects the
-   step's ordered :argument-specs onto the program's stable resident buffer keys and typed scalar
-   values. When :step is omitted, the program must contain exactly one dispatch step.
+   step's ordered :argument-specs onto certified resident node views and typed scalar values. When
+   :instance is omitted, the executable must contain exactly one instance; when :step is omitted,
+   that instance must contain exactly one dispatch step.
 
    Numerical mode and layout default to emitter-owned tuning metadata but may be supplied
    explicitly. Returns the DispatchTuning together with a schedule override ready to pass as
    `:schedule` to compile-gpu-program. Compilation remains pure; this function is explicitly an
    offline action."
-  [session program descriptor runtime-values case-fn
-   & {:keys [step numerical-mode layout improvement-threshold force? measurement]
+  [executable descriptor runtime-values case-fn
+   & {:keys [instance step numerical-mode layout improvement-threshold force? measurement]
       :or {improvement-threshold 0.001 force? false}}]
-  (let [{:keys [dispatch step-index] compiled-step :step}
-        (gpu/bound-program-dispatch session program step)
+  (let [{:keys [dispatch step-index instance-id] compiled-step :step}
+        (link/linked-dispatch executable instance step)
         contract (get-in dispatch [:attributes :tuning])
         numerical-mode (or numerical-mode (:numerical-mode contract))
         layout (or layout (:layout contract))
         result (tune-dispatch!
-                session dispatch descriptor runtime-values
-                (compiled-case-fn session program step case-fn)
+                (:session executable) dispatch descriptor runtime-values
+                (linked-case-fn executable instance step case-fn)
                 :numerical-mode numerical-mode
                 :layout layout
                 :improvement-threshold improvement-threshold
@@ -237,19 +239,20 @@
      :selector (:selector result)
      :schedule-override (tuning-schedule-override dispatch result descriptor
                                                   numerical-mode layout)
+     :instance-id instance-id
      :step-index step-index
      :phase (:phase compiled-step)}))
 
-(defn tune-program-dispatches!
+(defn tune-linked-dispatches!
   "Execute an explicit program tuning plan and return one collision-free schedule override.
 
    `runtime-values-fn` receives a manifest group. `case-fn` receives that group and one runtime
-   value, and returns the compiled benchmark case accepted by tune-program-dispatch!. Equivalent
+   value, and returns the compiled benchmark case accepted by tune-linked-dispatch!. Equivalent
    sites are measured once through their first descriptor step. `:max-measurements` is an optional
    fail-before-execution upper bound on alternatives × distinct runtime samples across selected
    groups; cached results may perform fewer physical measurements."
-  [session program descriptor plan runtime-values-fn case-fn
-   & {:keys [max-measurements improvement-threshold force? measurement]
+  [executable descriptor plan runtime-values-fn case-fn
+   & {:keys [instance max-measurements improvement-threshold force? measurement]
       :or {improvement-threshold 0.001 force? false}}]
   (let [plan (program-tuning/validate-plan! plan)]
     (when-not (ifn? runtime-values-fn)
@@ -268,7 +271,7 @@
           (mapv
            (fn [group]
              (let [step (:representative-step-index group)
-                   {:keys [dispatch]} (gpu/bound-program-dispatch session program step)
+                   {:keys [dispatch]} (link/linked-dispatch executable instance step)
                    actual-signature (program-tuning/dispatch-signature dispatch)
                    supplied-runtime-values (runtime-values-fn group)
                    _runtime-values
@@ -305,9 +308,10 @@
             (mapv
              (fn [{:keys [group runtime-values planned-measurements]}]
                (assoc
-                (tune-program-dispatch!
-                 session program descriptor runtime-values
+                (tune-linked-dispatch!
+                 executable descriptor runtime-values
                  #(case-fn group %)
+                 :instance instance
                  :step (:representative-step-index group)
                  :improvement-threshold improvement-threshold
                  :force? force?

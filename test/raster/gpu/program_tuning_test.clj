@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.dispatch-benchmark :as benchmark]
+            [raster.gpu.link :as link]
             [raster.gpu.program-tuning :as program-tuning]))
 
 (def ^:private abi
@@ -105,10 +106,12 @@
 (deftest program-runner-checks-budget-before-tuning-and-merges-results
   (let [manifest (program-tuning/manifest descriptor)
         plan (program-tuning/tuning-plan manifest)
-        session (atom {:programs {:program {:descriptor descriptor}}})
+        executable (link/map->LinkedExecutable
+                    {:plan {:instances [{:id :program :descriptor descriptor}]}
+                     :closed? (atom false)})
         calls (atom [])
         fake-tune
-        (fn [_ _ _ runtime-values _ & options]
+        (fn [_ _ runtime-values _ & options]
           (let [step (:step (apply hash-map options))
                 dispatch (get-in descriptor [:steps step :dispatch])
                 id (:id dispatch)
@@ -122,17 +125,17 @@
              {:generic-reduction {:measured-selectors {id selector}}}
              :step-index step
              :phase (get-in descriptor [:steps step :phase])}))]
-    (with-redefs [benchmark/tune-program-dispatch! fake-tune]
+    (with-redefs [benchmark/tune-linked-dispatch! fake-tune]
       (is (thrown-with-msg?
            clojure.lang.ExceptionInfo #"exceeds its physical measurement budget"
-           (benchmark/tune-program-dispatches!
-            session descriptor {} plan
+           (benchmark/tune-linked-dispatches!
+            executable {} plan
             (constantly [256 128 256])
             (fn [& _] {})
             :max-measurements 7)))
       (is (empty? @calls))
-      (let [result (benchmark/tune-program-dispatches!
-                    session descriptor {} plan
+      (let [result (benchmark/tune-linked-dispatches!
+                    executable {} plan
                     (constantly [256 128 256])
                     (fn [& _] {})
                     :max-measurements 8)]
