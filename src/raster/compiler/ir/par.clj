@@ -30,13 +30,13 @@
     (list 'let* ['n-active__ (list 'int n-active) 'n-agents__ (list 'long n-agents) 'base__ (list 'long base-seed)]
           (list 'dotimes [i-sym 'n-active__]
                 (list 'let* ['state__ (list 'unchecked-add 'base__
-                                           (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
-                            's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
-                            's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
-                            's3__ (list 'bit-xor 's2__ (list 'unsigned-bit-shift-right 's2__ 27))
-                            's4__ (list 'unchecked-multiply 's3__ SM-MIX2)
-                            's5__ (list 'bit-xor 's4__ (list 'unsigned-bit-shift-right 's4__ 31))
-                            'idx__ (list 'int (list 'mod (list 'bit-and 's5__ Long/MAX_VALUE) 'n-agents__))]
+                                            (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
+                             's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
+                             's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
+                             's3__ (list 'bit-xor 's2__ (list 'unsigned-bit-shift-right 's2__ 27))
+                             's4__ (list 'unchecked-multiply 's3__ SM-MIX2)
+                             's5__ (list 'bit-xor 's4__ (list 'unsigned-bit-shift-right 's4__ 31))
+                             'idx__ (list 'int (list 'mod (list 'bit-and 's5__ Long/MAX_VALUE) 'n-agents__))]
                       (list 'clojure.core/aset ids-arr i-sym 'idx__)))
           ids-arr)))
 
@@ -57,12 +57,12 @@
     (list 'let* ['n__ (list 'int n) 'base__ (list 'long base-seed)]
           (list 'dotimes [i-sym 'n__]
                 (list 'let* ['state__ (list 'unchecked-add 'base__
-                                           (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
-                            's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
-                            's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
-                            's3__ (list 'bit-xor 's2__ (list 'unsigned-bit-shift-right 's2__ 27))
-                            's4__ (list 'unchecked-multiply 's3__ SM-MIX2)
-                            's5__ (list 'bit-xor 's4__ (list 'unsigned-bit-shift-right 's4__ 31))]
+                                            (list 'unchecked-multiply (list 'long i-sym) SM-GAMMA))
+                             's1__ (list 'bit-xor 'state__ (list 'unsigned-bit-shift-right 'state__ 30))
+                             's2__ (list 'unchecked-multiply 's1__ SM-MIX1)
+                             's3__ (list 'bit-xor 's2__ (list 'unsigned-bit-shift-right 's2__ 27))
+                             's4__ (list 'unchecked-multiply 's3__ SM-MIX2)
+                             's5__ (list 'bit-xor 's4__ (list 'unsigned-bit-shift-right 's4__ 31))]
                       (list 'clojure.core/aset seeds-arr i-sym 's5__)))
           seeds-arr)))
 
@@ -269,7 +269,7 @@
                       (list 'let* [idx-sym (list 'clojure.core/aget index i-sym)]
                             (list 'dotimes [d-sym 'stride__]
                                   (list 'let* ['src-pos__ (list '+ (list '* i-sym 'stride__) d-sym)
-                                              'dst-pos__ (list '+ (list '* idx-sym 'stride__) d-sym)]
+                                               'dst-pos__ (list '+ (list '* idx-sym 'stride__) d-sym)]
                                         (list 'clojure.core/aset out 'dst-pos__
                                               (list '+ (list 'clojure.core/aget out 'dst-pos__)
                                                     (list 'clojure.core/aget src 'src-pos__)))))))
@@ -294,7 +294,7 @@
           (list 'let* ['n__ (list 'int n) 'stride__ (list 'int stride)]
                 (list 'dotimes [i-sym 'n__]
                       (list 'let* ['sbase__ (list '* (list 'clojure.core/aget index i-sym) 'stride__)
-                                  'obase__ (list '* i-sym 'stride__)]
+                                   'obase__ (list '* i-sym 'stride__)]
                             (list 'dotimes [d-sym 'stride__]
                                   (list 'clojure.core/aset out (list '+ 'obase__ d-sym)
                                         (list 'clojure.core/aget src (list '+ 'sbase__ d-sym))))))
@@ -308,7 +308,7 @@
     (list 'let* ['n__ (list 'int n)]
           (list 'dotimes [i-sym 'n__]
                 (list 'let* ['k__ (list 'clojure.core/aget keys i-sym)
-                            'v__ (list 'clojure.core/aget vals i-sym)]
+                             'v__ (list 'clojure.core/aget vals i-sym)]
                       (list 'clojure.core/aset output 'k__
                             (list (or op '+) (list 'clojure.core/aget output 'k__) 'v__))))
           output)))
@@ -327,6 +327,9 @@
 
     (and (seq? form) (= 'raster.par/reduce (first form)))
     (expand-par-forms (expand-par-reduce form))
+
+    (and (seq? form) (= 'raster.par/product-reduce! (first form)))
+    (expand-par-forms (macroexpand-1 form))
 
     ;; contract = an annotated redomap; the CPU/correctness fallback is its macro expansion
     ;; (a sequential dotimes over the free space of a per-tuple reduce over the contract axis).
@@ -386,6 +389,7 @@
                     'raster.par/map2! 'par/map2!
                     'raster.par/contract 'par/contract
                     'raster.par/reduce 'par/reduce
+                    'raster.par/product-reduce! 'par/product-reduce!
                     'raster.par/reduce-into 'par/reduce-into
                     'raster.par/scan 'par/scan
                     'raster.par/scan-exclusive 'par/scan-exclusive
@@ -428,6 +432,12 @@
   "Check if a form is a raster.par/reduce parallel reduction."
   [form]
   (and (seq? form) (contains? #{'raster.par/reduce 'par/reduce} (first form))))
+
+(defn par-product-reduce-form?
+  "Check if a form is a typed segmented product reduction."
+  [form]
+  (and (seq? form)
+       (contains? #{'raster.par/product-reduce! 'par/product-reduce!} (first form))))
 
 (defn par-stencil-form?
   "Check if a form is a raster.par/stencil! parallel stencil."
@@ -561,6 +571,55 @@
            :rebuild (fn [[acc' idx'] [body'] [init' bound']]
                       (pl form head acc' init' idx' bound' body'))})
 
+        ;; product-reduce!: output/component/segment vectors are structural. Accumulators,
+        ;; segment indices, the reduction index and local region bindings are all lexical binders.
+        (par-product-reduce-form? form)
+        (let [[_ outputs components segment-axes idx bound
+               element-bindings element-results combine-parameters
+               combine-bindings combine-results algebra] form
+              accs (mapv first components)
+              seg-idxs (mapv first segment-axes)
+              element-locals (vec (take-nth 2 element-bindings))
+              combine-params (vec (mapcat identity combine-parameters))
+              combine-locals (vec (take-nth 2 combine-bindings))
+              scoped (vec (concat accs seg-idxs [idx] element-locals
+                                  combine-params combine-locals))
+              inner (vec (concat (take-nth 2 (rest element-bindings)) element-results
+                                 (take-nth 2 (rest combine-bindings)) combine-results))
+              outer (vec (concat outputs
+                                 (map second components)
+                                 (map second segment-axes)
+                                 [bound algebra]))]
+          {:scoped-syms scoped :inner-exprs inner :outer-exprs outer
+           :rebuild
+           (fn [scoped' inner' outer']
+             (let [ncomp (count components)
+                   nseg (count segment-axes)
+                   nelem-local (count element-locals)
+                   ncombine-param (count combine-params)
+                   ncombine-local (count combine-locals)
+                   [accs' rest-scoped] (split-at ncomp scoped')
+                   [seg-idxs' rest-scoped] (split-at nseg rest-scoped)
+                   idx' (first rest-scoped)
+                   rest-scoped (rest rest-scoped)
+                   [element-locals' rest-scoped] (split-at nelem-local rest-scoped)
+                   [combine-params' combine-locals'] (split-at ncombine-param rest-scoped)
+                   [element-values' rest-inner] (split-at nelem-local inner')
+                   [element-results' rest-inner] (split-at ncomp rest-inner)
+                   [combine-values' combine-results'] (split-at ncombine-local rest-inner)
+                   [outputs' rest-outer] (split-at ncomp outer')
+                   [neutrals' rest-outer] (split-at ncomp rest-outer)
+                   [segment-bounds' [bound' algebra']] (split-at nseg rest-outer)
+                   components' (mapv (fn [acc neutral [_ _ dtype]] [acc neutral dtype])
+                                     accs' neutrals' components)
+                   segment-axes' (mapv vector seg-idxs' segment-bounds')
+                   element-bindings' (vec (mapcat vector element-locals' element-values'))
+                   combine-parameters' (mapv vec (partition 2 combine-params'))
+                   combine-bindings' (vec (mapcat vector combine-locals' combine-values'))]
+               (pl form head (vec outputs') components' segment-axes' idx' bound'
+                   element-bindings' (vec element-results') combine-parameters'
+                   combine-bindings' (vec combine-results') algebra')))})
+
         ;; scan / scan-exclusive: (head out acc init idx bound cast body)
         (or (= n "scan") (= n "scan-exclusive"))
         (let [[_ out acc init idx bound cast body] form]
@@ -614,6 +673,25 @@
         (let [[_ out idx bound cast body] form]
           (cond-> {:out out :idx idx :bound bound :cast cast :body body}
             elem-type (assoc :elem-type elem-type)))))))
+
+(defn extract-par-product-reduce-info
+  "Extract the ordered structural fields of `raster.par/product-reduce!`."
+  [form]
+  (when (par-product-reduce-form? form)
+    (let [[_ outputs components segment-axes idx bound
+           element-bindings element-results combine-parameters
+           combine-bindings combine-results algebra] form]
+      {:outputs (vec outputs)
+       :components (vec components)
+       :segment-axes (vec segment-axes)
+       :idx idx
+       :bound bound
+       :element-bindings (vec element-bindings)
+       :element-results (vec element-results)
+       :combine-parameters (vec combine-parameters)
+       :combine-bindings (vec combine-bindings)
+       :combine-results (vec combine-results)
+       :algebra algebra})))
 
 (defn extract-par-map2-info
   "Extract structured info from a par/map2! form.

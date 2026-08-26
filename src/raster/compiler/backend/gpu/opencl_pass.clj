@@ -152,7 +152,8 @@
           (or (segop-attempt stats :segred form dtype :none
                              #(let [sym (gensym "red_")
                                     soac (raster.compiler.ir.soac/par-form->soac
-                                          sym form (swap! segop-id-counter inc))]
+                                          sym form (swap! segop-id-counter inc)
+                                          :dtype (or dtype :double))]
                                 (first (raster.compiler.passes.parallel.soac-lower/lower-soac
                                         soac (or device-id :ze:0) :dtype (or dtype :double)))))
               (let [decline (last (:segop-declined @stats))]
@@ -434,6 +435,15 @@
                               segred nil :dtype dtype :scalar-types top-scalar-types)
                       k (register-kernel! kernel :ze-reduces)]
                   (emit-reduction-invocation k nil))))
+
+            ;; Typed segmented product reduction. The portable schedule is one deterministic
+            ;; workgroup tree per segment; mixed result components remain separate ABI buffers.
+            (par/par-product-reduce-form? form)
+            (let [segred (par->segred stats form dtype device-id)
+                  kernel (segop-cl/generate-product-reduction-kernel
+                          segred :scalar-types top-scalar-types :array-types top-array-types)
+                  k (register-kernel! kernel :ze-reduces)]
+              (emit-map-void-invocation k))
 
             ;; === Specialized forms — delegate to legacy generators ===
 

@@ -154,13 +154,16 @@ kernel remains available for already padded layouts. Padding is layout, not quan
 memory ownership.
 
 Decoder selection is likewise an ordinary indexed row reduction, not an attention or quantization
-primitive. Its first portable schedule reduces parallel 256-element tiles into compiler-owned
-structure-of-arrays `(value,index)` scratch and then merges those products per row. The semantic ABI
+primitive. Scalar reduction is now the one-component case of a canonical typed `ProductReduction`;
+multi-result reductions carry ordered, independently typed components plus distinct element and
+closed binary-combine regions. The first portable `ReductionSchedule` maps a segmented product to
+strided lane folds, a fixed workgroup-local tree and segment stores. Its workgroup is constrained by
+the target thread limit and the sum of every component's local-memory width, while numerical mode
+and tuning candidates remain inspectable data. `argmax-rows!` therefore emits one mixed-type
+`(value,index)` workgroup tree per row with no compiler-visible global scratch. The semantic ABI
 contains only values, output indices, row count and width; ties select the lowest index, and the first
-NaN outranks numeric values so corruption is visible and deterministic. This slice deliberately
-exposes the next general IR requirement: `SegRed` needs typed product/tuple accumulators and a
-workgroup/subgroup schedule. Once that exists, the general scheduled reduction should subsume the
-two-map implementation and lower to target-local shared/shuffle reductions without changing callers.
+NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
+multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
 
 Row selection remains a separate generic operation. `gather-rows!` consumes shared row-major source
 storage and `int[B]` indices, writes caller-owned dense `[B,width]` output, and maps every output

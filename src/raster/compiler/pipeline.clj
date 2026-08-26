@@ -606,7 +606,8 @@
   scalar math, aliases, constants) MUST carry :raster.type/tag at the fixpoint
   edge."
   [head]
-  (or (contains? '#{raster.par/map-void! par/map-void! dotimes} head)
+  (or (contains? '#{raster.par/map-void! par/map-void!
+                    raster.par/product-reduce! par/product-reduce! dotimes} head)
       (contains? census-exempt-int-arith-heads head)
       (= :vector head)))
 

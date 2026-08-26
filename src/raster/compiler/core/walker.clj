@@ -200,6 +200,14 @@
                resolved (if (and (symbol? head) (namespace head))
                           (resolve-aliased-symbol head (:source-ns ctx))
                           head)]
+           (= 'raster.par/product-reduce! resolved)))
+    :par-product-reduce
+
+    (and (seq? form)
+         (let [head (first form)
+               resolved (if (and (symbol? head) (namespace head))
+                          (resolve-aliased-symbol head (:source-ns ctx))
+                          head)]
            (= 'raster.par/scan resolved)))
     :par-scan
 
@@ -951,6 +959,58 @@
       (with-meta
         (list 'raster.par/reduce acc-sym walked-init i-sym walked-bound (walk body-expr body-ctx))
         {:tag acc-tag :raster.type/tag acc-tag :raster.type/elem-type elem-type}))))
+
+(defmethod walk-form :par-product-reduce
+  [form ctx]
+  (let [[_ outputs components segment-axes idx-sym bound-expr
+         element-bindings element-results combine-parameters
+         combine-bindings combine-results algebra] form
+        dtype-tag {:float 'float :double 'double :int 'int :long 'long :byte 'byte}
+        acc-env (reduce (fn [env [acc _ dtype]]
+                          (if-let [tag (get dtype-tag dtype)] (ctx-assoc-type env acc tag) env))
+                        ctx components)
+        index-env (reduce (fn [env [segment _]] (ctx-assoc-type env segment 'long))
+                          (ctx-assoc-type acc-env idx-sym 'long)
+                          segment-axes)
+        [element-env walked-element-bindings]
+        (reduce (fn [[env bindings] [sym init]]
+                  (let [walked (walk init env)
+                        tag (or (inf/hint-tag sym) (inf/infer-arg-tag walked (:type-env env)))
+                        env' (if tag (ctx-assoc-type env sym tag) env)]
+                    [env' (conj bindings sym walked)]))
+                [index-env []]
+                (partition 2 element-bindings))
+        combine-env
+        (reduce (fn [env [[left right] [_ _ dtype]]]
+                  (if-let [tag (get dtype-tag dtype)]
+                    (-> env (ctx-assoc-type left tag) (ctx-assoc-type right tag))
+                    env))
+                ctx (map vector combine-parameters components))
+        [combine-result-env walked-combine-bindings]
+        (reduce (fn [[env bindings] [sym init]]
+                  (let [walked (walk init env)
+                        tag (or (inf/hint-tag sym) (inf/infer-arg-tag walked (:type-env env)))
+                        env' (if tag (ctx-assoc-type env sym tag) env)]
+                    [env' (conj bindings sym walked)]))
+                [combine-env []]
+                (partition 2 combine-bindings))
+        hinted-outputs
+        (mapv (fn [out]
+                (if-let [tag (and (symbol? out) (ctx-get-tag ctx out))]
+                  (stamp-type-meta out tag)
+                  out))
+              outputs)]
+    (list 'raster.par/product-reduce!
+          hinted-outputs
+          (mapv (fn [[acc neutral dtype]] [acc (walk neutral ctx) dtype]) components)
+          (mapv (fn [[segment bound]] [segment (walk bound ctx)]) segment-axes)
+          idx-sym (walk bound-expr ctx)
+          (vec walked-element-bindings)
+          (mapv #(walk % element-env) element-results)
+          combine-parameters
+          (vec walked-combine-bindings)
+          (mapv #(walk % combine-result-env) combine-results)
+          algebra)))
 
 (defmethod walk-form :par-scan [form ctx]
   (let [[_ out-sym acc-sym init-expr i-sym bound-expr cast-fn body-expr] form

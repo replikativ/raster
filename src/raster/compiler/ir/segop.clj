@@ -13,7 +13,8 @@
   Each SegOp carries a KernelGrid with pre-computed launch config
   based on raster.runtime.hardware device properties."
   (:require [raster.runtime.hardware :as hw]
-            [raster.compiler.core.hardware :as chw]))
+            [raster.compiler.core.hardware :as chw]
+            [raster.compiler.ir.reduction :as reduction]))
 
 ;; ================================================================
 ;; Segmented space and grid config
@@ -53,14 +54,20 @@
            [id          ;; int
             space       ;; SegSpace
             level       ;; SegLevel
-            reduce-op   ;; {:acc sym :init expr :lambda expr}
+            reduction  ;; ProductReduction — ordered typed semantic operator
             lambda      ;; expr — map body before reduction (or nil for direct)
             inputs      ;; #{sym}
             outputs     ;; #{sym}
             scalars     ;; #{sym}
             grid        ;; KernelGrid
             phase       ;; :single | :block-local | :cross-block
+            schedule    ;; ReductionSchedule or nil for the scalar compatibility schedule
             dtype])      ;; :double | :float — element type
+
+(defn scalar-reduce-op
+  "Project a scalar SegRed for emitters that have not yet gained product scheduling."
+  [segred]
+  (reduction/scalar-op (:reduction segred)))
 
 (defrecord SegContract
            [id          ;; int

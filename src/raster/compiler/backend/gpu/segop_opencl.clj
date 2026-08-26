@@ -22,6 +22,7 @@
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scan :as scan]
+            [raster.compiler.ir.reduction :as reduction]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -190,6 +191,202 @@
 ;; SegRed → OpenCL kernel (two-phase reduction)
 ;; ================================================================
 
+(defn- product-neutral-c
+  [neutral dtype]
+  (let [dtype (dt/canon dtype)
+        field (when (symbol? neutral) (name neutral))]
+    (cond
+      (and (contains? #{:float :double :half} dtype) (= "POSITIVE_INFINITY" field)) "INFINITY"
+      (and (contains? #{:float :double :half} dtype) (= "NEGATIVE_INFINITY" field)) "-INFINITY"
+      (and (= :int dtype) (= "MAX_VALUE" field)) "INT_MAX"
+      (and (= :int dtype) (= "MIN_VALUE" field)) "INT_MIN"
+      (and (= :long dtype) (= "MAX_VALUE" field)) "LONG_MAX"
+      (and (= :long dtype) (= "MIN_VALUE" field)) "LONG_MIN"
+      (and (number? neutral) (Double/isInfinite (double neutral)))
+      (if (pos? (double neutral)) "INFINITY" "-INFINITY")
+      (number? neutral) (case dtype
+                          :float (str (float neutral) "f")
+                          :double (str (double neutral))
+                          (str (long neutral)))
+      (and (seq? neutral) (= 2 (count neutral)))
+      (product-neutral-c (second neutral) dtype)
+      :else (throw (ex-info "product reduction neutral has no OpenCL literal"
+                            {:reason :product-reduction-neutral-not-emittable
+                             :neutral neutral :dtype dtype})))))
+
+(defn generate-product-reduction-kernel
+  "Lower a typed segmented ProductReduction to one deterministic workgroup tree per segment.
+
+   This is the portable scheduled body. Every lane folds a strided subset, then the declared
+   closed combine region merges lane products in a fixed tree. Mixed component dtypes share no
+   representation assumptions; each gets its own typed local array."
+  [segred & {:keys [kernel-name-prefix scalar-types array-types]
+             :or {kernel-name-prefix "product_reduce" scalar-types {} array-types {}}}]
+  (let [operator (reduction/validate! (:reduction segred))
+        schedule (reduction/validate-schedule! (:schedule segred))
+        _ (when-not (= :segmented-workgroup-tree (:strategy schedule))
+            (throw (ex-info "product reduction schedule has no OpenCL lowering"
+                            {:reason :product-reduction-schedule-not-emittable
+                             :strategy (:strategy schedule)})))
+        _ (when-not (true? (get-in operator [:algebra :associative?]))
+            (throw (ex-info "parallel product schedule requires an explicit associative algebra"
+                            {:reason :product-reduction-not-associative
+                             :algebra (:algebra operator)})))
+        components (:components operator)
+        element (reduction/element-region operator)
+        combine (reduction/combine-region operator)
+        space (:space segred)
+        segment-dims (segop/seg-space-segment-dims space)
+        reduced-dim (segop/seg-space-reduced-dim space)
+        idx (:name reduced-dim)
+        bound (:bound reduced-dim)
+        block-size (:workgroup-size schedule)
+        _ (when-not (and (pos-int? block-size) (zero? (bit-and block-size (dec block-size))))
+            (throw (ex-info "product reduction workgroup size must be a positive power of two"
+                            {:reason :product-reduction-workgroup :block-size block-size})))
+        num-segments (segop/seg-space-num-segments-expr space)
+        launch-segments (let [bounds (mapv :bound segment-dims)]
+                          (case (count bounds)
+                            0 1
+                            1 (klaunch/runtime-value (first bounds))
+                            (apply klaunch/product bounds)))
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        input-params (vec (sort-by name (:inputs segred)))
+        output-params (vec (keep :result components))
+        output-dtypes (into {} (keep (fn [{:keys [result dtype]}]
+                                       (when result [result dtype]))) components)
+        bound-syms (reduce clojure.set/union #{}
+                           (map (comp util/free-syms :bound) (segop/seg-space-dims space)))
+        scalar-params (vec (sort-by name (clojure.set/union (:scalars segred) bound-syms)))
+        scalar-types (merge (into {} (map (fn [s] [s :int]) bound-syms)) scalar-types)
+        default-ctype (dt/ctype :opencl (or (:dtype segred) :float))
+        scalar-ctype #(ce/scalar-native-type % scalar-types default-ctype)
+        scalar-dtype (fn [s] (case (scalar-ctype s)
+                               "int" :int "long" :long "double" :double "float" :float))
+        input-dtype #(get array-types % (get array-types (symbol (name %)) (:dtype segred)))
+        input-ctype #(dt/ctype :opencl (input-dtype %))
+        component-ctype #(dt/ctype :opencl (:dtype %))
+        pointer-params
+        (concat
+         (map #(str "__global const " (input-ctype %) "* restrict " (ce/c-symbol %)) input-params)
+         (map #(str "__global " (dt/ctype :opencl (get output-dtypes %)) "* restrict "
+                    (ce/c-symbol %)) output-params))
+        scalar-param-decls (map #(str (scalar-ctype %) " " (ce/c-symbol %)) scalar-params)
+        all-params (str/join ", " (concat pointer-params scalar-param-decls ["int _n_bound"]))
+        array-syms (set (concat input-params output-params))
+        int-vars (into #{idx} (concat (map :name segment-dims)
+                                      (filter #(contains? #{:int :long} (scalar-dtype %)) scalar-params)))
+        emit-index-expr
+        (fn [expr]
+          (binding [ce/*emit-config* ce/opencl-config
+                    ce/*scalar-type* default-ctype
+                    ce/*idx-sym* idx
+                    ce/*int-vars* (into ce/*int-vars* int-vars)]
+            (ce/emit-expr expr idx array-syms (ce/c-symbol idx))))
+        bound-c (emit-index-expr bound)
+        emit-result
+        (fn [region result dtype substitutions]
+          (let [form (list 'let* (:bindings region) result)
+                form (util/subst-syms substitutions (ce/normalize-array-prims form))]
+            (binding [ce/*emit-config* ce/opencl-config
+                      ce/*scalar-type* (dt/ctype :opencl dtype)
+                      ce/*idx-sym* idx
+                      ce/*int-vars* (into ce/*int-vars* int-vars)]
+              (ce/emit-expr (ce/adapt-casts-for-dtype form dtype) idx array-syms (ce/c-symbol idx)))))
+        acc-names (mapv #(str "acc_" %) (range (count components)))
+        elem-names (mapv #(str "elem_" %) (range (count components)))
+        next-names (mapv #(str "next_" %) (range (count components)))
+        shared-names (mapv #(str "shared_" %) (range (count components)))
+        element-lines
+        (mapv (fn [component result elem-name]
+                (str (component-ctype component) " " elem-name " = "
+                     (emit-result element result (:dtype component) {}) ";"))
+              components (:results element) elem-names)
+        combine-lines
+        (fn [left-names right-names destination-names]
+          (let [substitutions
+                (into {}
+                      (mapcat (fn [[[left right] left-name right-name]]
+                                [[left (symbol left-name)] [right (symbol right-name)]])
+                              (map vector (:parameters combine) left-names right-names)))]
+            (mapv (fn [component result destination]
+                    (str (component-ctype component) " " destination " = "
+                         (emit-result combine result (:dtype component) substitutions) ";"))
+                  components (:results combine) destination-names)))
+        segment-decls
+        (loop [dims (reverse segment-dims) remaining "segment" lines []]
+          (if-let [{:keys [name bound]} (first dims)]
+            (let [cname (ce/c-symbol name)
+                  cbound (emit-index-expr bound)]
+              (recur (next dims) (str "(" remaining " / " cbound ")")
+                     (conj lines (str "int " cname " = " remaining " % " cbound ";"))))
+            (str/join "\n    " (reverse lines))))
+        initial-lines (mapv (fn [component acc-name]
+                              (str (component-ctype component) " " acc-name " = "
+                                   (product-neutral-c (:neutral component) (:dtype component)) ";"))
+                            components acc-names)
+        first-combine (combine-lines acc-names elem-names next-names)
+        assign-next (mapv #(str % " = " %2 ";") acc-names next-names)
+        shared-decls (mapv (fn [component shared]
+                             (str "__local " (component-ctype component) " " shared
+                                  "[" block-size "];"))
+                           components shared-names)
+        shared-store (mapv #(str % "[lid] = " %2 ";") shared-names acc-names)
+        tree-left (mapv #(str % "[lid]") shared-names)
+        tree-right (mapv #(str % "[lid + stride]") shared-names)
+        tree-next (mapv #(str "tree_next_" %) (range (count components)))
+        tree-combine (combine-lines tree-left tree-right tree-next)
+        tree-store (mapv #(str % "[lid] = " %2 ";") shared-names tree-next)
+        final-stores (mapv (fn [result shared]
+                             (str (ce/c-symbol result) "[segment] = " shared "[0];"))
+                           output-params
+                           (keep (fn [[component shared]] (when (:result component) shared))
+                                 (map vector components shared-names)))
+        source (str (apply codegen/extension-pragmas (distinct (concat (map :dtype components)
+                                                                       (map input-dtype input-params))))
+                    "__kernel void " kernel-name "(" all-params ") {\n"
+                    "    int segment = get_group_id(0);\n"
+                    "    if (segment >= _n_bound) return;\n"
+                    "    int lid = get_local_id(0);\n    " segment-decls "\n    "
+                    (str/join "\n    " shared-decls) "\n    "
+                    (str/join "\n    " initial-lines) "\n"
+                    "    for (int " (ce/c-symbol idx) " = lid; " (ce/c-symbol idx) " < "
+                    bound-c "; " (ce/c-symbol idx) " += " block-size ") {\n        "
+                    (str/join "\n        " element-lines) "\n        "
+                    (str/join "\n        " first-combine) "\n        "
+                    (str/join "\n        " assign-next) "\n    }\n    "
+                    (str/join "\n    " shared-store) "\n"
+                    "    barrier(CLK_LOCAL_MEM_FENCE);\n"
+                    "    for (int stride = " (/ block-size 2) "; stride > 0; stride >>= 1) {\n"
+                    "        if (lid < stride) {\n            "
+                    (str/join "\n            " tree-combine) "\n            "
+                    (str/join "\n            " tree-store) "\n        }\n"
+                    "        barrier(CLK_LOCAL_MEM_FENCE);\n    }\n"
+                    "    if (lid == 0) {\n        " (str/join "\n        " final-stores)
+                    "\n    }\n}\n")
+        abi (kabi/validate!
+             (vec (concat
+                   (map #(kabi/slot % :input (input-dtype %)
+                                    :c-name (ce/c-symbol %) :role :operand)
+                        input-params)
+                   (map #(kabi/slot % :output (get output-dtypes %)
+                                    :c-name (ce/c-symbol %) :role :effect)
+                        output-params)
+                   (map #(kabi/slot % :scalar (scalar-dtype %)
+                                    :c-name (ce/c-symbol %) :role :parameter)
+                        scalar-params)
+                   [(kabi/slot '_n_bound :scalar :int :c-name "_n_bound" :role :bound)])))
+        arguments (vec (concat input-params output-params scalar-params [num-segments]))]
+    (kart/make
+     {:kernel-name kernel-name :source source :abi abi :arguments arguments
+      :launch (klaunch/spec {:workgroup-size [block-size] :group-count [launch-segments]})
+      :temporaries [] :effects {:kind :product-reduction}
+      :provenance {:dialect :segred :segop-id (:id segred)}
+      :attributes {:array-params (vec (concat input-params output-params))
+                   :scalar-params scalar-params :written-arrays (set output-params)
+                   :component-dtypes (reduction/dtypes operator)
+                   :schedule schedule}})))
+
 (defn generate-segred-kernel
   "Generate OpenCL C reduction kernels from a SegRed record.
 
@@ -208,7 +405,7 @@
                      :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}}}]
   (let [idx (seg-idx segred)
         bound (seg-bound segred)
-        {:keys [acc init lambda]} (:reduce-op segred)
+        {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         ;; #55 fix: normalize devirtualized array prims ((.invk aget-impl arr i)
         ;; → canonical aget head) BEFORE any rewrapping, exactly as SegMap does.
         ;; Without it, a parametric-array kernel (qlinear-k) emitted broken
@@ -653,7 +850,7 @@
                             {:space space})))
         dtype (or (:dtype segred) dtype)
         ctype (dt/ctype :opencl dtype)
-        {:keys [acc init lambda]} (:reduce-op segred)
+        {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         lambda (ce/normalize-array-prims lambda)
         ;; combine op + element detection (mirrors generate-segred-kernel)
         op-sym (when (seq? lambda) (descriptor/semantic-op lambda))
@@ -829,11 +1026,11 @@
         i-sym (:name fi) j-sym (:name fj) l-sym (:name red-dim)
         dtype (or (:dtype segred) dtype)
         ctype (dt/ctype :opencl dtype)
-        {:keys [init lambda]} (:reduce-op segred)
+        {:keys [init lambda]} (segop/scalar-reduce-op segred)
         lambda (ce/normalize-array-prims lambda)
         _ (when-not (#{'+ 'clojure.core/+ 'raster.numeric/+} (descriptor/semantic-op lambda))
             (throw (ex-info "tensorize: combine must be +" {:reason :non-plus-combine :op (descriptor/semantic-op lambda)})))
-        acc-sym (:acc (:reduce-op segred))
+        acc-sym (:acc (segop/scalar-reduce-op segred))
         acc-at? (fn [a] (or (= a acc-sym) (and (seq? a) (= 'double (first a)) (= acc-sym (second a)))))
         op-args (vec (descriptor/call-args lambda))
         elem (let [a0 (nth op-args 0) a1 (nth op-args 1)] (if (acc-at? a0) a1 a0))

@@ -47,7 +47,7 @@
     (let [pi  (par/extract-par-reduce-info form)
           dt  (or (:elem-type pi) dtype)
           sym (gensym "red_")
-          sc  (soac/par-form->soac sym form (swap! segop-id inc))]
+          sc  (soac/par-form->soac sym form (swap! segop-id inc) :dtype dt)]
       (first (soac-lower/lower-soac sc :cpu:0 :dtype dt)))
     (catch Exception _ nil)))
 
@@ -421,7 +421,7 @@
         ;; zero-init (= {0}) preserves Clojure array semantics (heap arrays are zeroed);
         ;; clang elides it when the array is fully written before read.
         local-decls (apply str (for [[s size elem] local-buffers]
-                                  (str (elem->ctype elem "double") " " (ce/c-symbol s) "[" size "] = {0};\n  ")))
+                                 (str (elem->ctype elem "double") " " (ce/c-symbol s) "[" size "] = {0};\n  ")))
         ;; array params that the body writes (aset target) are in-place OUTPUT params —
         ;; emit them non-const; read-only input arrays stay const.
         written (written-array-syms stripped)

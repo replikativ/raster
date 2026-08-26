@@ -13,10 +13,13 @@
          Stage 2: scan of block totals
          Stage 3: carry-in combination (SegMap)"
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
 
@@ -47,15 +50,44 @@
   [grid]
   (segop/->KernelGrid 1 (:block-size grid) (:shared-mem-bytes grid)))
 
+(defn- floor-power-of-two
+  [n]
+  (loop [power 1]
+    (if (<= (* 2 power) n)
+      (recur (* 2 power))
+      power)))
+
+(defn- product-grid
+  "Constrain a product reduction's workgroup by both the target's thread limit and its SLM
+   budget. Each component has an independent local array, so charging only the primary dtype
+   would make mixed products legal on paper while overcommitting local memory at emission."
+  [device-id planned reduction]
+  (let [descriptor (hardware/descriptor-for device-id)
+        bytes-per-lane (reduce + (map (comp dtype/bytes-of :dtype) (:components reduction)))
+        slm-budget (long (or (get-in descriptor [:cache :slm])
+                             (:shared-memory-per-block descriptor)
+                             65536))
+        max-by-slm (max 1 (quot slm-budget bytes-per-lane))
+        max-workgroup (long (:max-workgroup-size descriptor 1024))
+        workgroup-size (floor-power-of-two
+                        (max 1 (min (long (:block-size planned))
+                                    max-workgroup
+                                    max-by-slm)))]
+    {:grid (segop/->KernelGrid (:num-blocks planned)
+                               workgroup-size
+                               (* workgroup-size bytes-per-lane))
+     :slm-budget slm-budget
+     :bytes-per-lane bytes-per-lane}))
+
 (defn- screma-map-lambda
   [soac]
   (when (soac/screma? soac)
     (:map-lambda soac)))
 
-(defn- reduce-op-info
+(defn- reduction-info
   [soac]
   (if (soac/soac-reduce? soac)
-    {:acc (:acc soac) :init (:init soac) :lambda (:lambda soac)}
+    (:reduction soac)
     (first (:reduces soac))))
 
 (defn- scan-op-info
@@ -74,7 +106,7 @@
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
   (let [dtype (or (:elem-type soac) dtype)
         bound (:bound soac)
-        idx (:idx soac)
+        idx (soac/soac-idx soac)
         space (segop/make-seg-space idx bound)
         level (segop/->SegLevel :thread :virtual)
         grid (phase-grid :map device-id bound dtype)
@@ -103,49 +135,76 @@
 
   Returns a vector of SegRed records (1 or 2 elements)."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
-  (let [dtype (or (:elem-type soac) dtype)
+  (let [reduction (reduction-info soac)
+        product? (some? (:combine reduction))
+        dtype (or (first (map :dtype (:components reduction))) (:elem-type soac) dtype)
         bound (:bound soac)
-        idx (:idx soac)
-        reduce-op (reduce-op-info soac)
+        idx (soac/soac-idx soac)
         map-lambda (screma-map-lambda soac)
-        space (segop/make-seg-space idx bound)
-        grid-1 (phase-grid :reduce device-id bound dtype)
+        space (segop/make-seg-space-nd
+               (conj (mapv (fn [[name axis-bound]] {:name name :bound axis-bound})
+                           (or (:segment-axes soac) []))
+                     {:name idx :bound bound}))
+        planned-grid (phase-grid :reduce device-id bound dtype)
+        product-grid-info (when product? (product-grid device-id planned-grid reduction))
+        grid-1 (or (:grid product-grid-info) planned-grid)
+        product-schedule
+        (when product?
+          (let [workgroup-size (:block-size grid-1)
+                candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
+            (reduction/schedule
+             {:strategy :segmented-workgroup-tree
+              :workgroup-size workgroup-size
+              :stages [:lane-fold :workgroup-tree :segment-store]
+              :tuning-space {:workgroup-size candidates
+                             :elements-per-lane [:runtime-stride]}
+              :numerical-mode (select-keys (:algebra reduction)
+                                           [:order :reassociation :overflow])
+              :attributes {:scratch :workgroup-local
+                           :component-dtypes (reduction/dtypes reduction)
+                           :scratch-bytes-per-lane (:bytes-per-lane product-grid-info)
+                           :slm-budget (:slm-budget product-grid-info)}})))
         execution (execution-plan/reduce-execution bound grid-1)]
-    (case (:strategy execution)
-      :single
-      [(segop/->SegRed (:id soac)
-                       space
-                       (segop/->SegLevel :block :none)
-                       reduce-op
-                       map-lambda
-                       (:inputs soac)
-                       (or (soac-outputs* soac) #{(:sym soac)})
-                       (:scalars soac)
-                       (single-block-grid grid-1)
-                       :single
-                       dtype)]
+    (if product?
+      [(segop/->SegRed (:id soac) space (segop/->SegLevel :block :virtual)
+                       reduction map-lambda (:inputs soac)
+                       (set (filter symbol? (or (:outputs soac) []))) (:scalars soac)
+                       grid-1 :product product-schedule dtype)]
+      (case (:strategy execution)
+        :single
+        [(segop/->SegRed (:id soac)
+                         space
+                         (segop/->SegLevel :block :none)
+                         reduction
+                         map-lambda
+                         (:inputs soac)
+                         (or (soac-outputs* soac) #{(:sym soac)})
+                         (:scalars soac)
+                         (single-block-grid grid-1)
+                         :single nil
+                         dtype)]
 
-      :two-phase
-      (let [level-1 (segop/->SegLevel :block :virtual)
-            phase-1 (segop/->SegRed (:id soac) space level-1
-                                    reduce-op map-lambda
-                                    (:inputs soac)
-                                    (or (soac-outputs* soac) #{(:sym soac)})
-                                    (:scalars soac)
-                                    grid-1 :block-local
-                                    dtype)
-            partials-sym (gensym "partials_")
-            phase-2-idx (gensym "j_")
-            phase-2-space (segop/make-seg-space phase-2-idx (:num-blocks grid-1))
-            grid-2 (single-block-grid grid-1)
-            level-2 (segop/->SegLevel :block :none)
-            phase-2 (segop/->SegRed (+ (:id soac) 1000)
-                                    phase-2-space level-2
-                                    reduce-op nil
-                                    #{partials-sym} #{(:sym soac)}
-                                    #{} grid-2 :cross-block
-                                    dtype)]
-        [phase-1 phase-2]))))
+        :two-phase
+        (let [level-1 (segop/->SegLevel :block :virtual)
+              phase-1 (segop/->SegRed (:id soac) space level-1
+                                      reduction map-lambda
+                                      (:inputs soac)
+                                      (or (soac-outputs* soac) #{(:sym soac)})
+                                      (:scalars soac)
+                                      grid-1 :block-local nil
+                                      dtype)
+              partials-sym (gensym "partials_")
+              phase-2-idx (gensym "j_")
+              phase-2-space (segop/make-seg-space phase-2-idx (:num-blocks grid-1))
+              grid-2 (single-block-grid grid-1)
+              level-2 (segop/->SegLevel :block :none)
+              phase-2 (segop/->SegRed (+ (:id soac) 1000)
+                                      phase-2-space level-2
+                                      reduction nil
+                                      #{partials-sym} #{(:sym soac)}
+                                      #{} grid-2 :cross-block nil
+                                      dtype)]
+          [phase-1 phase-2])))))
 
 ;; ================================================================
 ;; Scan lowering — single or three-stage

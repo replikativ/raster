@@ -1678,6 +1678,45 @@
           new-body (map #(resolve-dispatch-walk % par-env) body-forms)
           r (apply list head acc resolved-init idx resolved-bound new-body)]
       (if-let [m (meta expr)] (with-meta r m) r))
+    ;; product-reduce!: accumulators, segment indices, reduction index and region locals are scoped.
+    (and (symbol? (first expr))
+         (contains? #{'raster.par/product-reduce! 'par/product-reduce!} (first expr)))
+    (let [[head outputs components segment-axes idx bound
+           element-bindings element-results combine-parameters
+           combine-bindings combine-results algebra] expr
+          acc-env (reduce (fn [e [acc init _dtype]]
+                            (if-let [tag (inf/infer-arg-tag init env)] (assoc e acc tag) e))
+                          env components)
+          index-env (into (assoc acc-env idx 'long) (map (fn [[segment _]] [segment 'long]) segment-axes))
+          [element-env element-bindings']
+          (reduce (fn [[e bindings] [sym init]]
+                    (let [resolved (resolve-dispatch-walk init e)
+                          tag (inf/infer-arg-tag resolved e)]
+                      [(if tag (assoc e sym tag) e) (conj bindings sym resolved)]))
+                  [index-env []] (partition 2 element-bindings))
+          combine-env (reduce (fn [e [[left right] [acc _ _]]]
+                                (if-let [tag (get acc-env acc)]
+                                  (assoc e left tag right tag) e))
+                              env (map vector combine-parameters components))
+          [combine-result-env combine-bindings']
+          (reduce (fn [[e bindings] [sym init]]
+                    (let [resolved (resolve-dispatch-walk init e)
+                          tag (inf/infer-arg-tag resolved e)]
+                      [(if tag (assoc e sym tag) e) (conj bindings sym resolved)]))
+                  [combine-env []] (partition 2 combine-bindings))
+          r (list head outputs
+                  (mapv (fn [[acc init dtype]]
+                          [acc (resolve-dispatch-walk init env) dtype]) components)
+                  (mapv (fn [[segment segment-bound]]
+                          [segment (resolve-dispatch-walk segment-bound env)]) segment-axes)
+                  idx (resolve-dispatch-walk bound env)
+                  (vec element-bindings')
+                  (mapv #(resolve-dispatch-walk % element-env) element-results)
+                  combine-parameters
+                  (vec combine-bindings')
+                  (mapv #(resolve-dispatch-walk % combine-result-env) combine-results)
+                  algebra)]
+      (if-let [m (meta expr)] (with-meta r m) r))
     ;; Qualified symbol call: try dispatch resolution then recurse into args
     (and (symbol? (first expr)) (namespace (first expr)))
     (let [;; First recurse into args so nested calls get resolved
@@ -1731,4 +1770,3 @@
    (-> (inline-deftm-calls form max-depth false true)
        inline-invk
        flatten-nested-lets)))
-

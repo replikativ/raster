@@ -12,6 +12,7 @@
     SoacStencil — neighborhood stencil (fixed radius)
     ScalarBinding — non-parallel scalar/allocation binding"
   (:require [raster.compiler.ir.par :as par]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.form :as form]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -36,13 +37,11 @@
 (defrecord SoacReduce
            [id          ;; int
             sym         ;; symbol
-            acc         ;; symbol — accumulator variable
-            init        ;; expr — initial accumulator value
-            idx         ;; symbol — loop index variable
+            reduction   ;; ProductReduction — scalar reduce is one component
+            segment-axes ;; ordered [[idx bound] ...], empty for a scalar/full reduction
             bound       ;; expr — iteration count
-            lambda      ;; expr — reduction body
             inputs      ;; #{sym} — array symbols read
-            output      ;; symbol — result symbol (= sym)
+            outputs     ;; ordered logical result symbols (nil components are not materialized)
             scalars])   ;; #{sym} — free scalars
 
 (defrecord SoacScan
@@ -258,10 +257,53 @@
                       :acc-sym (:acc info))
           elem-type (or (:elem-type info)
                         (:raster.type/elem-type (meta expr)))]
-      (cond-> (->SoacReduce id sym (:acc info) (:init info)
-                            (:idx info) (:bound info)
-                            (:body info) inputs sym scalars)
+      (cond-> (->SoacReduce id sym
+                            (reduction/scalar
+                             {:accumulator (:acc info)
+                              :neutral (:init info)
+                              :dtype (or elem-type dtype :double)
+                              :result sym
+                              :index (:idx info)
+                              :step-result (:body info)
+                              :attributes {:source :raster.par/reduce}})
+                            [] (:bound info) inputs [sym] scalars)
         elem-type (assoc :elem-type elem-type)))
+
+    (par/par-product-reduce-form? expr)
+    (let [{:keys [outputs components segment-axes idx bound
+                  element-bindings element-results combine-parameters
+                  combine-bindings combine-results algebra]}
+          (par/extract-par-product-reduce-info expr)
+          component-records
+          (mapv (fn [[component-id [acc neutral dtype] result]]
+                  {:id component-id :accumulator acc :neutral neutral :dtype dtype :result result})
+                (map vector (range) components outputs))
+          region-form (list 'let* element-bindings (vec element-results))
+          combine-form (list 'let* combine-bindings (vec combine-results))
+          accumulators (set (map first components))
+          segment-indices (set (map first segment-axes))
+          inputs (collect-aget-arrays region-form)
+          output-set (set (filter symbol? outputs))
+          excluded (set/union inputs output-set accumulators segment-indices #{idx}
+                              (set (take-nth 2 element-bindings))
+                              (set (mapcat identity combine-parameters))
+                              (set (take-nth 2 combine-bindings))
+                              descriptor/aget-ops descriptor/aset-ops
+                              #{'do 'let 'let* 'if 'double 'float 'int 'long})
+          scalar-uses (set/union (util/free-syms region-form) (util/free-syms combine-form)
+                                 (reduce set/union #{} (map (comp util/free-syms second) components)))
+          scalars (set/difference scalar-uses excluded)
+          operator (reduction/make
+                    {:components component-records
+                     :index idx
+                     :element-bindings element-bindings
+                     :element-results element-results
+                     :combine-parameters combine-parameters
+                     :combine-bindings combine-bindings
+                     :combine-results combine-results
+                     :algebra algebra
+                     :attributes {:source :raster.par/product-reduce!}})]
+      (->SoacReduce id sym operator (vec segment-axes) bound inputs (vec outputs) scalars))
 
     ;; Scan: (raster.par/scan out acc init idx bound cast body)
     (and (seq? expr) (= 'raster.par/scan (first expr)))
@@ -350,8 +392,23 @@
              (:idx soac) (:bound soac) (:cast-fn soac) (:lambda soac)))
 
      SoacReduce
-     (list 'raster.par/reduce (:acc soac) (:init soac)
-           (:idx soac) (:bound soac) (:lambda soac))
+     (if (= :raster.par/product-reduce! (get-in soac [:reduction :attributes :source]))
+       (list 'raster.par/product-reduce!
+             (reduction/results (:reduction soac))
+             (mapv (fn [component]
+                     [(:accumulator component) (:neutral component) (:dtype component)])
+                   (:components (:reduction soac)))
+             (:segment-axes soac)
+             (:index (:reduction soac)) (:bound soac)
+             (:bindings (reduction/element-region (:reduction soac)))
+             (:results (reduction/element-region (:reduction soac)))
+             (:parameters (reduction/combine-region (:reduction soac)))
+             (:bindings (reduction/combine-region (:reduction soac)))
+             (:results (reduction/combine-region (:reduction soac)))
+             (:algebra (:reduction soac)))
+       (let [{:keys [acc init lambda]} (reduction/scalar-op (:reduction soac))]
+         (list 'raster.par/reduce acc init
+               (:index (:reduction soac)) (:bound soac) lambda)))
 
      SoacScan
      (list 'raster.par/scan (:out soac) (:acc soac) (:init soac)
@@ -493,7 +550,7 @@
     #{(:out (:facts node))}
     (cond
       (soac-map? node)     (:outputs node)
-      (soac-reduce? node)  #{(:output node)}
+      (soac-reduce? node)  (set (filter symbol? (:outputs node)))
       (soac-scan? node)    (:outputs node)
       (soac-stencil? node) (:outputs node)
       :else nil)))
@@ -506,7 +563,8 @@
 (defn soac-idx
   "Get the index variable for a SOAC node."
   [node]
-  (when (soac? node) (:idx node)))
+  (when (soac? node)
+    (if (soac-reduce? node) (:index (:reduction node)) (:idx node))))
 
 (defn node-all-free-syms
   "Get all free symbols referenced by a node (inputs + outputs + scalars + bound + init).
@@ -517,10 +575,12 @@
   (if (instance? ScalarBinding node)
     (util/free-syms (:expr node))
     (set/union (or (:inputs node) #{})
-               (if (:pure? node) #{} (or (:outputs node) #{}))
+               (if (:pure? node) #{} (set (filter symbol? (or (:outputs node) #{}))))
                (or (:scalars node) #{})
                (util/free-syms (:bound node))
-               (if (:init node) (util/free-syms (:init node)) #{}))))
+               (if (soac-reduce? node)
+                 (reduce set/union #{} (map util/free-syms (reduction/neutrals (:reduction node))))
+                 (if (:init node) (util/free-syms (:init node)) #{})))))
 
 (defn- expr-written-arrays
   "Arrays written via aset (bare or devirtualized) anywhere in `expr`. Used so a
@@ -593,11 +653,12 @@
                     (:cast-fn soac) [] [] (:lambda soac))
 
           SoacReduce
-          (->Screma (:id soac) (:sym soac) (:idx soac) (:bound soac)
-                    (:inputs soac) #{(:output soac)} (:scalars soac)
-                    nil [] [{:acc (:acc soac) :init (:init soac)
-                             :lambda (:lambda soac)}]
-                    nil)
+          (if (seq (:segment-axes soac))
+            soac
+            (->Screma (:id soac) (:sym soac) (:index (:reduction soac)) (:bound soac)
+                      (:inputs soac) (set (filter symbol? (:outputs soac))) (:scalars soac)
+                      nil [] [(:reduction soac)]
+                      nil))
 
           SoacScan
           (->Screma (:id soac) (:sym soac) (:idx soac) (:bound soac)
@@ -625,9 +686,9 @@
 
           ;; Pure reduce: one reduce, no map-lambda
           (and (empty? (:scans screma)) (= 1 (count (:reduces screma))) (nil? (:map-lambda screma)))
-          (let [r (first (:reduces screma))]
-            (list 'raster.par/reduce (:acc r) (:init r)
-                  (:idx screma) (:bound screma) (:lambda r)))
+          (let [{:keys [acc init lambda]} (reduction/scalar-op (first (:reduces screma)))]
+            (list 'raster.par/reduce acc init
+                  (:idx screma) (:bound screma) lambda))
 
           ;; Pure scan: one scan, no map-lambda
           (and (= 1 (count (:scans screma))) (empty? (:reduces screma)) (nil? (:map-lambda screma)))
@@ -720,7 +781,8 @@
       ;; Map→Reduce
       (and (:map-lambda producer) (seq (:reduces consumer)))
       (assoc consumer
-             :reduces (mapv (fn [r] (update r :lambda substitute)) (:reduces consumer))
+             :reduces (mapv (fn [r] (update-in r [:step :results] #(mapv substitute %)))
+                            (:reduces consumer))
              :inputs new-inputs
              :scalars new-scalars)
 

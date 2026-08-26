@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.soac-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]
             [raster.par :as par]))
 
@@ -30,13 +31,13 @@
       (is (instance? raster.compiler.ir.soac.SoacReduce node))
       (is (= 1 (:id node)))
       (is (= 'result (:sym node)))
-      (is (= 'acc (:acc node)))
-      (is (= 0.0 (:init node)))
-      (is (= 'j (:idx node)))
+      (is (= ['acc] (reduction/accumulators (:reduction node))))
+      (is (= [0.0] (reduction/neutrals (:reduction node))))
+      (is (= 'j (:index (:reduction node))))
       (is (= 'n (:bound node)))
-      (is (= '(+ acc (aget a j)) (:lambda node)))
+      (is (= ['(+ acc (aget a j))] (:results (reduction/fold-region (:reduction node)))))
       (is (= #{'a} (:inputs node)))
-      (is (= 'result (:output node))))))
+      (is (= ['result] (:outputs node))))))
 
 (deftest par-scan->soac-test
   (testing "Convert raster.par/scan to SoacScan"

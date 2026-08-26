@@ -1,6 +1,5 @@
 (ns raster.dl.row-gather-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]
@@ -75,11 +74,10 @@
     (testing "selection and lookup compose without a fused attention primitive"
       (is (= [7 400] (vec token-indices)))
       (is (= [21.0 22.0 23.0 1200.0 1201.0 1202.0] (vec rows))))
-    (testing "the compiled graph retains three ordered kernels and only reduction scratch"
-      (is (= [:map-void :map-void :map-void] (mapv :convention (:steps descriptor))))
-      (is (= [true true]
-             (mapv (fn [{:keys [sym]} prefix] (str/starts-with? (name sym) prefix))
-                   (:allocs descriptor) ["partial-values" "partial-indices"])))
-      (is (= [:float :int] (mapv :dtype (:allocs descriptor)))))
+    (testing "the compiled graph retains one scheduled reduction and one independent row gather"
+      (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
+      (is (empty? (:allocs descriptor)))
+      (is (= :segmented-workgroup-tree
+             (get-in descriptor [:steps 0 :artifact :attributes :schedule :strategy]))))
     (testing "the ordinary multi-output descriptor certifies before allocation"
       (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))

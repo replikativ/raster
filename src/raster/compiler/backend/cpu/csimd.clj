@@ -20,6 +20,7 @@
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.segop :as segop]
             [clojure.string :as str]
             [clojure.walk :as walk]))
 
@@ -97,7 +98,7 @@
   [segred]
   (let [idx   (ss/seg-idx segred)
         bound (ss/seg-bound segred)
-        {:keys [acc init lambda]} (:reduce-op segred)
+        {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         lambda (when lambda (ss/normalize-invk (ss/clean-dead-bindings lambda)))]
     (when (and acc init idx bound (seq? lambda) (>= (count lambda) 3))
       (let [op   (first lambda)
@@ -270,58 +271,58 @@
   ([segred isa array-syms] (compile-segred-c segred isa array-syms nil))
   ([segred isa array-syms target]
    (when-let [{:keys [idx bound acc init elem-expr factors]} (reduction-plan segred)]
-    (let [acc (ce/c-symbol (or target acc))
-          elem (vt-of (:dtype segred))
-          ti   (in/simd-type-info isa elem)
-          vadd (in/simd-op isa :+ elem)
-          vfma (in/simd-op isa :fma elem)]
-      (when (and ti vadd (or (nil? factors) vfma))
-        (let [vt    (:vtype ti)
-              lanes (:lanes ti)
-              nacc  (n-accumulators elem)
-              stride (* nacc lanes)
-              accs  (mapv #(str "va" %) (range nacc))
-              n-c   (ce/emit-expr bound nil array-syms "idx")
-              hsum  (hsum-fn elem)
+     (let [acc (ce/c-symbol (or target acc))
+           elem (vt-of (:dtype segred))
+           ti   (in/simd-type-info isa elem)
+           vadd (in/simd-op isa :+ elem)
+           vfma (in/simd-op isa :fma elem)]
+       (when (and ti vadd (or (nil? factors) vfma))
+         (let [vt    (:vtype ti)
+               lanes (:lanes ti)
+               nacc  (n-accumulators elem)
+               stride (* nacc lanes)
+               accs  (mapv #(str "va" %) (range nacc))
+               n-c   (ce/emit-expr bound nil array-syms "idx")
+               hsum  (hsum-fn elem)
               ;; per-accumulator lane-block offset: k*lanes (k=0 → "0")
-              blk   (fn [k] (str (* k lanes)))
+               blk   (fn [k] (str (* k lanes)))
               ;; main loop body: nacc independent FMA/mul-add accumulations
-              step  (str/join
-                     "\n    "
-                     (for [k (range nacc)]
-                       (if factors
-                         (let [[f1 f2] factors
-                               [a1 b1] (ss/aget-form? f1 idx)
-                               [a2 b2] (ss/aget-form? f2 idx)]
-                           (str (accs k) " = " vfma "("
-                                (vec-load ti a1 b1 "j" (blk k) array-syms) ", "
-                                (vec-load ti a2 b2 "j" (blk k) array-syms) ", "
-                                (accs k) ");"))
-                         ;; non-fused: elem is a single affine load → add
-                         (let [[a b] (ss/aget-form? elem-expr idx)]
-                           (str (accs k) " = " vadd "(" (accs k) ", "
-                                (vec-load ti a b "j" (blk k) array-syms) ");")))))
-              ;; combine accumulators pairwise via vadd
-              combine (reduce (fn [a b] (str vadd "(" a ", " b ")")) accs)
-              ;; scalar tail element at counter j
-              tail-elem (if factors
+               step  (str/join
+                      "\n    "
+                      (for [k (range nacc)]
+                        (if factors
                           (let [[f1 f2] factors
                                 [a1 b1] (ss/aget-form? f1 idx)
                                 [a2 b2] (ss/aget-form? f2 idx)]
-                            (str (scalar-aget a1 b1 "j" array-syms) " * "
-                                 (scalar-aget a2 b2 "j" array-syms)))
+                            (str (accs k) " = " vfma "("
+                                 (vec-load ti a1 b1 "j" (blk k) array-syms) ", "
+                                 (vec-load ti a2 b2 "j" (blk k) array-syms) ", "
+                                 (accs k) ");"))
+                         ;; non-fused: elem is a single affine load → add
                           (let [[a b] (ss/aget-form? elem-expr idx)]
-                            (scalar-aget a b "j" array-syms)))]
-          {:includes simd-includes
-           :helpers  simd-helpers
-           :block
-           (str "{\n"
-                "  const int _n = " n-c ";\n"
-                (apply str (for [a accs] (str "  " vt " " a " = " (:setzero ti) "();\n")))
-                "  int j = 0;\n"
-                "  for (; j + " stride " <= _n; j += " stride ") {\n    "
-                step "\n  }\n"
-                "  " vt " _vc = " combine ";\n"
-                "  " acc " = (" init ") + " hsum "(_vc);\n"
-                "  for (; j < _n; j++) " acc " = " acc " + (" tail-elem ");\n"
-                "}")}))))))
+                            (str (accs k) " = " vadd "(" (accs k) ", "
+                                 (vec-load ti a b "j" (blk k) array-syms) ");")))))
+              ;; combine accumulators pairwise via vadd
+               combine (reduce (fn [a b] (str vadd "(" a ", " b ")")) accs)
+              ;; scalar tail element at counter j
+               tail-elem (if factors
+                           (let [[f1 f2] factors
+                                 [a1 b1] (ss/aget-form? f1 idx)
+                                 [a2 b2] (ss/aget-form? f2 idx)]
+                             (str (scalar-aget a1 b1 "j" array-syms) " * "
+                                  (scalar-aget a2 b2 "j" array-syms)))
+                           (let [[a b] (ss/aget-form? elem-expr idx)]
+                             (scalar-aget a b "j" array-syms)))]
+           {:includes simd-includes
+            :helpers  simd-helpers
+            :block
+            (str "{\n"
+                 "  const int _n = " n-c ";\n"
+                 (apply str (for [a accs] (str "  " vt " " a " = " (:setzero ti) "();\n")))
+                 "  int j = 0;\n"
+                 "  for (; j + " stride " <= _n; j += " stride ") {\n    "
+                 step "\n  }\n"
+                 "  " vt " _vc = " combine ";\n"
+                 "  " acc " = (" init ") + " hsum "(_vc);\n"
+                 "  for (; j < _n; j++) " acc " = " acc " + (" tail-elem ");\n"
+                 "}")}))))))
