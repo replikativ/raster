@@ -11,11 +11,14 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pl]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
-            [raster.gpu.link :as gpu-link]))
+            [raster.gpu.link :as gpu-link]
+            [raster.gpu.value :as value])
+  (:import [java.util.concurrent.atomic AtomicBoolean]))
 
 ;; A minimal elementwise forward: y = (x + w) * x  (residual-add then hadamard — the proven-
 ;; resident dt-two-step shape). Composing it twice with weights w0,w1 gives the intermediate
@@ -89,6 +92,111 @@
             [:allocation :allocation-1] [:allocation :allocation-0]]
            @calls))
     (is (nil? (gpu-link/close! executable)) "close remains idempotent after a destructor failure")))
+
+(deftest linked-device-input-is-zero-copy-or-device-to-device
+  (let [destination-buffer (Object.)
+        source-buffer (Object.)
+        destination-allocation
+        (bview/allocation {:id :destination :byte-size 16 :memory-space :device
+                           :device :ze:0 :ownership :owned})
+        source-allocation
+        (bview/allocation {:id :source :byte-size 16 :memory-space :device
+                           :device :ze:0 :ownership :external})
+        destination-view (bview/view destination-allocation {:dtype :float :shape [4]})
+        source-view (bview/view source-allocation {:dtype :float :shape [4]})
+        resident (gpu/->ResidentBufferView :session :destination-key destination-view)
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:target :ze:0
+                            :nodes {:destination {:id :destination :role :input
+                                                  :view destination-view}}}
+                     :session ::session
+                     :node-views {:destination resident}
+                     :pending-inputs (atom #{:destination})
+                     :closed? (atom false)})
+        device-array (fn [buffer view]
+                       (value/map->DeviceArray
+                        {:buffer buffer :device :ze:0 :dtype :float :shape [4] :view view
+                         :owner ::value/external :freed (AtomicBoolean. false)}))]
+    (testing "the exact destination view is a zero-copy readiness transition"
+      (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                    gpu/copy-range! (fn [& _] (throw (AssertionError. "unexpected copy")))
+                    gpu/register-buffer! (fn [& _] (throw (AssertionError. "unexpected import")))]
+        (is (identical? executable
+                        (gpu-link/write! executable :destination
+                                         (device-array destination-buffer destination-view))))
+        (is (empty? @(:pending-inputs executable)))))
+    (testing "a foreign compatible DeviceArray is copied resident-to-resident and detached"
+      (reset! (:pending-inputs executable) #{:destination})
+      (let [calls (atom [])
+            imported (gpu/->ResidentBufferView :session :temporary-key source-view)]
+        (with-redefs [gpu/buffer (fn [_ _] destination-buffer)
+                      gpu/register-buffer! (fn [_ key buffer opts]
+                                             (swap! calls conj [:register key buffer opts]))
+                      gpu/buffer-view (fn [_ key _]
+                                        (is (some? key))
+                                        imported)
+                      gpu/copy-range! (fn [_ src dst spec]
+                                        (swap! calls conj [:copy src dst spec]))
+                      gpu/free-buffer! (fn [_ key] (swap! calls conj [:detach key]))]
+          (gpu-link/write! executable :destination (device-array source-buffer source-view)))
+        (is (= [:register :copy :detach] (mapv first @calls)))
+        (is (= {:elements 4} (-> @calls second last)))
+        (is (empty? @(:pending-inputs executable)))))))
+
+(deftest owned-runtime-allocation-preserves-the-certified-identity
+  (let [session (atom {:device-id :ze:0 :session-id :session
+                       :buffers {} :allocations {} :closed? false})
+        buffer {:byte-size 16 :alignment 64 :dtype :float :n-elements 4}]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'alloc-buffers-transactional)
+       (fn [specs _device]
+         (is (= {:node [:float 4 nil {:allocation-id :certified
+                                      :memory-space :device
+                                      :coherence :device-only
+                                      :alignment 64}]}
+                specs))
+         {:node buffer})}
+      (fn []
+        (gpu/alloc! session
+                    {:node [:float 4 nil {:allocation-id :certified
+                                          :memory-space :device
+                                          :coherence :device-only
+                                          :alignment 64}]})))
+    (is (= :certified (get-in @session [:allocations :node :id])))
+    (is (= :device (get-in @session [:allocations :node :memory-space])))
+    (is (= :device-only (get-in @session [:allocations :node :coherence])))
+    (is (= 64 (get-in @session [:allocations :node :alignment])))))
+
+(deftest stable-recorded-graph-profiling-keeps-backend-handles-private
+  (let [graph (Object.)
+        session (atom {:device-id :ze:0
+                       :graphs {:profiled {::gpu/recorded-graph true
+                                           :replay-graph graph :profile? true}}})
+        calls (atom [])
+        resolver (fn [_device name]
+                   (case name
+                     "replay-graph!" (fn [actual]
+                                       (is (identical? graph actual))
+                                       (swap! calls conj :replay))
+                     "read-graph-timestamps!"
+                     (fn [actual]
+                       (is (identical? graph actual))
+                       (swap! calls conj :read)
+                       {:wall-ms 1.5
+                        :kernels [{:kernel-name "k0" :phase :p0 :ms 1.0
+                                   :context-ms 0.25}]})
+                     (throw (ex-info "unexpected runtime resolution" {:name name}))))]
+    (with-redefs-fn {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      (fn []
+        (let [profile (gpu/profile-recorded-graph! session :profiled)]
+          (is (= [:replay :read] @calls))
+          (is (= 1.0 (:kernel-total-ms profile)))
+          (is (= 1.5 (:device-wall-ms profile)))
+          (is (= [{:kernel-name "k0" :phase :p0 :ms 1.0 :context-ms 0.25}]
+                 (:profile profile))))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not created"
+                          (gpu/profile-recorded-graph!
+                           (atom {:device-id :ze:0 :graphs {:plain graph}}) :plain)))))
 
 (deftest spike-two-instance-link
   (if-not @gp/gpu-available?

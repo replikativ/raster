@@ -97,6 +97,20 @@
     (is (= [(get-in lowering [:certificate :bindings (:result-sym descriptor)])]
            (get-in lowering [:plan :outputs])))))
 
+(deftest array-dependent-specialization-closures-survive-link-lowering
+  (let [x (float-array 12)
+        w (float-array 12)
+        descriptor (assoc-in (descriptor) [:allocs 0 :size-fn]
+                             (fn [arguments]
+                               (java.lang.reflect.Array/getLength (nth arguments 0))))
+        lowering (resident/lower
+                  {:id :array-shaped :target :ze:0 :descriptor descriptor
+                   :arguments [x w 12]})
+        instance (first (get-in lowering [:plan :instances]))]
+    (is (identical? x (first (link/instance-arguments instance))))
+    (is (= [12] (get-in lowering [:plan :nodes [:array-shaped 'y] :view :shape])))
+    (is (resident/certified-plan? lowering))))
+
 (deftest generated-gemm-descriptor-crosses-the-same-certified-boundary
   (let [rows 4
         width 16
