@@ -30,11 +30,15 @@
     (is (= {:dtype :half :elements 160 :role :inout} (get specs 'key-pages)))
     (is (= {:dtype :half :elements 120 :role :inout} (get specs 'value-pages)))))
 
-(deftest slot-values-must-be-unique-and-in-bounds
+(deftest active-slot-values-must-be-unique-and-in-bounds
   (let [value (problem)]
     (is (= [19 0 7] (append/validate-slot-values! value [19 0 7])))
+    (is (= [-1 -1 7] (append/validate-slot-values! value [-1 -1 7]))
+        "inactive lanes may share the no-write sentinel")
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unique destination"
                           (append/validate-slot-values! value [1 1 2])))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the physical pool"
+                          (append/validate-slot-values! value [1 -2 2])))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside the physical pool"
                           (append/validate-slot-values! value [1 2 20])))))
 
@@ -44,6 +48,7 @@
     (is (= :fp32-to-fp16-reference strategy))
     (is (str/includes? source "key_pages[dst] = convert_half_rte(key_rows[src]);"))
     (is (str/includes? source "value_pages[dst] = convert_half_rte(value_rows[src]);"))
+    (is (str/includes? source "if (slot < 0"))
     (is (not (str/includes? source "atomic")))
     (is (= ['key-rows 'value-rows 'slots 'key-pages 'value-pages]
            (:arguments artifact)))
