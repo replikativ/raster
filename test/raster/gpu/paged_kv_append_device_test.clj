@@ -30,7 +30,7 @@
         physical-slots (* page-size physical-pages)
         key-rows (float-array [1.1 -2.2 3.3 -4.4, 5.5 -6.6 7.7 -8.8])
         value-rows (float-array [0.25 -0.5 0.75, 1.25 -1.5 1.75])
-        slots (int-array [5 1])
+        slots (int-array [5 -1])
         sentinel (half-bits 42.0)
         key-pages (short-array (repeat (* physical-slots key-width) sentinel))
         value-pages (short-array (repeat (* physical-slots value-width) sentinel))
@@ -64,7 +64,7 @@
             (doseq [slot (range physical-slots)
                     component (range key-width)]
               (let [index (+ (* slot key-width) component)
-                    lane ({5 0, 1 1} slot)
+                    lane ({5 0} slot)
                     expected (if lane
                                (half-bits (aget key-rows (+ (* lane key-width) component)))
                                sentinel)]
@@ -72,7 +72,7 @@
             (doseq [slot (range physical-slots)
                     component (range value-width)]
               (let [index (+ (* slot value-width) component)
-                    lane ({5 0, 1 1} slot)
+                    lane ({5 0} slot)
                     expected (if lane
                                (half-bits (aget value-rows (+ (* lane value-width) component)))
                                sentinel)]

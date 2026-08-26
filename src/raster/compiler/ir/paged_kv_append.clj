@@ -1,8 +1,9 @@
 (ns raster.compiler.ir.paged-kv-append
   "Backend-neutral assignment of projected K/V rows into physical cache slots.
 
-  The operation is deliberately narrower than scatter-add: every batch lane
-  names one unique physical slot and overwrites its complete key and value rows.
+  The operation is deliberately narrower than scatter-add: every active batch
+  lane names one unique physical slot and overwrites its complete key and value
+  rows. Slot -1 marks an inactive lane and performs no write.
   Page allocation and reservation remain runtime responsibilities; this IR owns
   only checked tensor geometry, dtype conversion semantics, and write effects."
   (:require [raster.compiler.core.dtype :as dtype]))
@@ -131,9 +132,11 @@
 (defn validate-slot-values!
   "Validate one host-visible physical slot vector and return it unchanged.
 
-  Slots must be unique because assignment has no atomic conflict resolution.
-  This check belongs before descriptor upload; the device kernel separately
-  bounds-checks slots so corrupted descriptor memory cannot overwrite pages."
+  Active slots must be unique because assignment has no atomic conflict
+  resolution. `-1` is the inactive-lane sentinel and may occur repeatedly. This
+  check belongs before descriptor upload; the device kernel separately ignores
+  negative slots and bounds-checks active ones so corrupted descriptor memory
+  cannot overwrite pages."
   [problem slots]
   (let [{:keys [batch-size]} (validate! problem)
         capacity (physical-slots problem)
@@ -142,10 +145,11 @@
       (throw (ex-info "Paged K/V append slot vector has the wrong lane count"
                       {:expected batch-size :actual (count values)})))
     (doseq [[lane slot] (map-indexed vector values)]
-      (when-not (and (integer? slot) (<= 0 (long slot)) (< (long slot) capacity))
+      (when-not (and (integer? slot) (<= -1 (long slot)) (< (long slot) capacity))
         (throw (ex-info "Paged K/V append slot is outside the physical pool"
                         {:lane lane :slot slot :physical-slots capacity}))))
-    (when-not (= (count values) (count (set values)))
-      (throw (ex-info "Paged K/V append requires unique destination slots"
-                      {:slots values})))
+    (let [active (remove #(= -1 (long %)) values)]
+      (when-not (= (count active) (count (set active)))
+        (throw (ex-info "Paged K/V append requires unique destination slots"
+                        {:slots values}))))
     slots))
