@@ -3,13 +3,24 @@
 `LinkPlan` is Raster's public, backend-neutral boundary for composing compiled resident program
 descriptors without decoding kernel names or copying intermediate values through the host.
 
-The boundary has two layers:
+The boundary has three layers:
 
 - `raster.compiler.ir.link-plan` contains immutable compiler values and pure validation;
+- `raster.compiler.ir.resident-plan` certifies the lowering of an ordinary resident descriptor;
 - `raster.gpu.link` instantiates a validated plan into resident allocations and one replay graph.
 
 No attention, GEMM, quantization, or model-layer convention exists in the linker. A descriptor step
 may select a `KernelArtifact` or `KernelGraph`; both pass through the common executable-step binder.
+
+The resident-descriptor conversion is proof-carrying in the compiler sense. It returns a
+`CertifiedResidentPlan` containing the target plan and a `ResidentPlanCertificate`. The witness
+records the source parameter order, pointer/value identity mapping, scalar specialization, roles,
+resolved schedule, target, realized value contracts, aliases, and public outputs. `verify!`
+independently re-derives those facts from the target plan and its embedded descriptor. Mutation or
+omission therefore fails before runtime contact; later layers never reconstruct this information
+from ABI spelling. This certificate proves preservation across this structural lowering boundary;
+the earlier obligation that executable kernels implement the source program remains with their own
+dialect conversions and numerical oracles.
 
 ## Values
 
@@ -92,8 +103,8 @@ explicit while still allowing pretrained runtimes to allocate first and publish 
   composite abstract value rather than an implicit tuple convention.
 - The initial dependency schedule is serial. Queue/event partitioning can lower from the same
   proven effects later without changing node or instance identity.
-- A single `Compiled` value has not yet been rebased onto `LinkPlan`; this is the next convergence
-  step after the pretrained decoder uses the semantic boundary.
+- A single resident descriptor now has a pure, certified lowering to `LinkPlan`. `Compiled` has not
+  yet been rebased onto that result; its runtime path is the next convergence step.
 
 For paged attention, page allocation, cache relocation, transactional publication, batching and
 request scheduling remain runtime responsibilities. Raster receives borrowed/external node views

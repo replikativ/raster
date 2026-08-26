@@ -117,11 +117,14 @@ unique minimal descriptor interval from checked executable ABIs, proves its
 live boundary, and projects ordinary before/selected/after descriptors. Paged
 attention is the first consumer, not a special compiler pass or linker mode.
 
-The remaining value-layer convergence is narrower: port the pretrained decoder
-from handwritten buffer-name inspection, then make ordinary `Compiled` values
-produce and consume the same plan/node interface. `Compiled` still keeps its
-session internal and its public shape information is flat, so independently
-created `Compiled` values cannot yet be rebound into one plan directly.
+The pretrained decoder now composes through declared `ProgramStage` boundaries and `LinkPlan`
+node identities rather than handwritten buffer-name inspection. An ordinary resident descriptor
+also has a pure certifying conversion into a one-instance plan: the checkable witness preserves
+parameter order, pointer/value identity, scalar specialization, roles, realized view contracts,
+schedule, aliases, target, and outputs. The remaining value-layer convergence is runtime-facing:
+make `Compiled` instantiate and invoke that certified plan, then permit independently created
+`Compiled` values to rebind into one plan without host copies. `Compiled` still keeps its session
+internal and its public shape information is flat.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.

@@ -184,7 +184,12 @@
             (if (contains? array-params parameter) nil (get scalars parameter)))
           (:all-params descriptor))))
 
-(defn- pointer-symbols [descriptor]
+(defn descriptor-pointer-symbols
+  "Return the exact set of compiler symbols that the resident descriptor binds as pointers.
+
+   This is part of the public descriptor-to-LinkPlan conversion boundary. Consumers must use it
+   instead of independently reconstructing pointer membership from names or parameter roles."
+  [descriptor]
   (into #{}
         (mapcat (fn [step]
                   (if (= :scatter (:convention step))
@@ -457,7 +462,7 @@
 
 (defn- validate-instance-bindings! [nodes instance]
   (let [{:keys [id descriptor bindings roles]} instance
-        expected (pointer-symbols descriptor)
+        expected (descriptor-pointer-symbols descriptor)
         actual (set (keys bindings))]
     (when-not (= expected actual)
       (throw (ex-info "link instance bindings differ from descriptor pointer symbols"
