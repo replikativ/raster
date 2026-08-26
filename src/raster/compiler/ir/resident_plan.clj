@@ -8,6 +8,7 @@
    facts from symbols, buffer names, or emitted kernels."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.abstract-value :as abstract-value]
             [raster.compiler.ir.link-plan :as link-plan]))
 
 (defrecord ResidentPlanCertificate
@@ -85,9 +86,82 @@
                  (if parameter? :input :internal))]
     (if (= :scratch role) :internal role)))
 
-(defn- value-contract [symbol origin node]
-  {:symbol symbol
-   :origin origin
+(defn- physical-option [options symbol field default]
+  (get options [symbol field] (get options symbol default)))
+
+(defn- validate-value-spec! [symbol {:keys [abstract physical-layout leaves] :as spec}]
+  (when-not (and (map? spec) (vector? leaves) (seq leaves))
+    (throw (ex-info "resident logical value specification requires ordered leaves"
+                    {:reason :resident-plan-value-spec :symbol symbol :spec spec})))
+  (when-not abstract
+    (throw (ex-info "resident composite value specification requires an AbstractValue"
+                    {:reason :resident-plan-value-abstract :symbol symbol})))
+  (abstract-value/validate! abstract)
+  (when-not (or (nil? physical-layout) (map? physical-layout))
+    (throw (ex-info "resident value physical layout must be a descriptor map"
+                    {:reason :resident-plan-value-layout :symbol symbol
+                     :physical-layout physical-layout})))
+  (let [fields (mapv :field leaves)]
+    (when (or (some nil? fields) (not= (count fields) (count (distinct fields))))
+      (throw (ex-info "resident value fields must be present, unique, and ordered"
+                      {:reason :resident-plan-value-fields :symbol symbol :fields fields}))))
+  spec)
+
+(defn- parameter-leaves [symbol argument value-spec]
+  (if value-spec
+    (let [{:keys [leaves]} (validate-value-spec! symbol value-spec)
+          fields (mapv :field leaves)]
+      (when-not (and (map? argument) (= (set fields) (set (keys argument))))
+        (throw (ex-info "resident composite argument must map every declared field to storage"
+                        {:reason :resident-plan-composite-argument :symbol symbol
+                         :expected (set fields) :actual (when (map? argument)
+                                                          (set (keys argument)))})))
+      (mapv (fn [{:keys [field dtype] :as leaf}]
+              (let [source (get argument field)
+                    actual-dtype (primitive-array-dtype source)]
+                (when-not actual-dtype
+                  (throw (ex-info "resident composite fields must be primitive JVM arrays"
+                                  {:reason :resident-plan-array-argument :symbol symbol
+                                   :field field :actual (some-> source type)})))
+                (when (and dtype (not= (dtype/canon dtype) actual-dtype))
+                  (throw (ex-info "resident composite field dtype differs from its specification"
+                                  {:reason :resident-plan-field-dtype :symbol symbol :field field
+                                   :expected dtype :actual actual-dtype})))
+                (assoc leaf :dtype actual-dtype :elements (array-length symbol source)
+                       :source source)))
+            leaves))
+    [{:field :value :dtype (primitive-array-dtype argument)
+      :elements (array-length symbol argument) :source argument}]))
+
+(defn- allocation-leaves [symbol allocation default-dtype arguments]
+  (mapv (fn [{:keys [field dtype size-fn] :as leaf}]
+          (let [elements
+                (try (long (size-fn arguments))
+                     (catch Exception error
+                       (throw (ex-info "resident allocation shape did not resolve"
+                                       {:reason :resident-plan-allocation-shape
+                                        :symbol symbol :field field}
+                                       error))))]
+            (assoc leaf :dtype (dtype/canon dtype) :elements elements :source nil)))
+        (link-plan/descriptor-allocation-leaves allocation default-dtype)))
+
+(defn- leaf-node-id [plan-id node-ids value-id symbol field leaf-count]
+  (if (= 1 leaf-count)
+    value-id
+    (get node-ids [symbol field] [plan-id symbol field])))
+
+(defn- leaf-shape [shapes symbol field leaf-count elements]
+  (let [shape (vec (or (get shapes [symbol field])
+                       (when (= 1 leaf-count) (get shapes symbol))
+                       [elements]))]
+    (when-not (= elements (reduce * 1 shape))
+      (throw (ex-info "resident value shape differs from its storage extent"
+                      {:reason :resident-plan-shape :symbol symbol :field field
+                       :elements elements :shape shape})))
+    shape))
+
+(defn- leaf-contract [name node]
+  {:name name
    :node (:id node)
    :dtype (dtype/canon (get-in node [:view :dtype]))
    :shape (get-in node [:view :shape])
@@ -97,19 +171,33 @@
    :ownership (get-in node [:view :allocation :ownership])
    :role (:role node)})
 
+(defn- value-contract [symbol origin value nodes]
+  (let [leaves (mapv (fn [{:keys [name node]}]
+                       (leaf-contract name (get nodes node)))
+                     (:leaves value))
+        flat (when (= 1 (count leaves)) (first leaves))]
+    (merge {:symbol symbol
+            :origin origin
+            :value (:id value)
+            :abstract (:abstract value)
+            :physical-layout (:physical-layout value)
+            :leaves leaves}
+           ;; Preserve the original certificate query surface for one-leaf descriptors.
+           (dissoc flat :name))))
+
 (defn- derive-certificate [plan]
   (let [instance (first (:instances plan))
         descriptor (:descriptor instance)
-        symbol-by-node (set/map-invert (:bindings instance))
         alloc-symbols (set (map :sym (:allocs descriptor)))
         values (into {}
-                     (map (fn [[node-id node]]
-                            (let [symbol (get symbol-by-node node-id)]
-                              [symbol (value-contract symbol
-                                                      (if (contains? alloc-symbols symbol)
-                                                        :allocation :parameter)
-                                                      node)])))
-                     (:nodes plan))]
+                     (map (fn [[symbol value-id]]
+                            [symbol (value-contract
+                                     symbol
+                                     (if (contains? alloc-symbols symbol)
+                                       :allocation :parameter)
+                                     (get-in plan [:values value-id])
+                                     (:nodes plan))]))
+                     (:bindings instance))]
     (->ResidentPlanCertificate
      :resident-program :link-plan (:id plan) (:target plan) (:id instance)
      (:all-params descriptor) (:array-params descriptor) (:scalar-params descriptor)
@@ -145,14 +233,17 @@
    - `:id`, `:target`, `:descriptor`, and ordered `:arguments` are required;
    - `:roles` overrides descriptor array roles;
    - `:outputs` is an ordered vector of public output symbols (default: `:result-sym`);
-   - `:shapes` may refine the default flat parameter/allocation shapes;
-   - `:node-ids` supplies stable public identities (default `[plan-id symbol]`);
+   - descriptor `:value-specs` describes composite array parameters as an AbstractValue, physical
+     layout, and ordered leaves; composite `:allocs` use the same facets plus leaf size closures;
+   - `:shapes` may refine flat values by symbol or physical leaves by `[symbol field]`;
+   - `:node-ids` supplies logical identities by symbol and optional physical identities by
+     `[symbol field]`;
    - `:ownership`, `:memory-space`, `:aliases`, and `:attributes` refine LinkPlan storage.
 
-   Host array arguments remain exact initializers for owned parameter allocations, including
-   output/state parameters. Borrowed/external allocations use the arguments only to specialize
-   dtype and shape; their storage and readiness are supplied explicitly at instantiation. This
-   preserves resident initial-value semantics without confusing ownership with readiness."
+   Flat arguments remain primitive arrays. Composite arguments are field-to-primitive-array maps.
+   They remain exact initializers for owned parameter leaves, including output/state parameters.
+   Borrowed/external allocations use them only to specialize dtype and shape; their storage and
+   readiness are supplied explicitly at instantiation."
   [{:keys [id target descriptor arguments roles outputs shapes node-ids ownership memory-space
            aliases attributes instance-id]
     :or {roles {} shapes {} node-ids {} ownership {} memory-space {}
@@ -182,49 +273,74 @@
         output-symbols (set outputs)
         scalar-values (select-keys argument-map (:scalar-params descriptor))
         ordered-symbols (vec (concat (:array-params descriptor) (map :sym (:allocs descriptor))))
-        resolved-node-ids (mapv #(node-id-for id node-ids %) ordered-symbols)
-        _ (unique-vector! :resident-plan-node-ids "resident-plan node identities"
-                          resolved-node-ids)
-        nodes
+        value-specs (or (:value-specs descriptor) {})
+        _ (when-not (set/subset? (set (keys value-specs)) array-symbols)
+            (throw (ex-info "resident descriptor value specs must name array parameters"
+                            {:reason :resident-plan-value-spec-symbols
+                             :specs (set (keys value-specs)) :arrays array-symbols})))
+        value-descriptors
         (mapv
          (fn [symbol]
            (let [parameter? (contains? array-symbols symbol)
-                 argument (when parameter? (get argument-map symbol))
                  allocation (get alloc-map symbol)
-                 default-elements (if parameter?
-                                    (array-length symbol argument)
-                                    (try (long ((:size-fn allocation) arguments))
-                                         (catch Exception error
-                                           (throw (ex-info
-                                                   "resident allocation shape did not resolve"
-                                                   {:reason :resident-plan-allocation-shape
-                                                    :symbol symbol}
-                                                   error)))))
-                 shape (vec (get shapes symbol [default-elements]))
-                 _ (when-not (= default-elements (reduce * 1 shape))
-                     (throw (ex-info "resident value shape differs from its storage extent"
-                                     {:reason :resident-plan-shape :symbol symbol
-                                      :elements default-elements :shape shape})))
-                 storage-dtype (if parameter?
-                                 (primitive-array-dtype argument)
-                                 (or (:dtype allocation) (:dtype descriptor)))
-                 node-id (node-id-for id node-ids symbol)
-                 value-ownership (get ownership symbol :owned)]
-             (link-plan/node
-              {:id node-id :allocation-id node-id :dtype storage-dtype :shape shape
-               :device target :memory-space (get memory-space symbol :device)
-               :ownership value-ownership
-               :role (node-role symbol parameter? descriptor roles output-symbols)
-               :source (when (= :owned value-ownership) argument)})))
+                 value-spec (if parameter? (get value-specs symbol)
+                                (when (contains? allocation :leaves) allocation))
+                 _ (when value-spec (validate-value-spec! symbol value-spec))
+                 leaves (if parameter?
+                          (parameter-leaves symbol (get argument-map symbol) value-spec)
+                          (allocation-leaves symbol allocation (:dtype descriptor) arguments))
+                 value-id (node-id-for id node-ids symbol)
+                 leaf-count (count leaves)
+                 leaves (mapv (fn [{:keys [field] :as leaf}]
+                                (assoc leaf :node-id
+                                       (leaf-node-id id node-ids value-id symbol field leaf-count)))
+                              leaves)]
+             {:symbol symbol :parameter? parameter? :allocation allocation
+              :value-spec value-spec :value-id value-id :leaves leaves
+              :role (node-role symbol parameter? descriptor roles output-symbols)}))
          ordered-symbols)
-        bindings (zipmap ordered-symbols resolved-node-ids)
+        _ (unique-vector! :resident-plan-node-ids "resident-plan value identities"
+                          (mapv :value-id value-descriptors))
+        _ (unique-vector! :resident-plan-node-ids "resident-plan node identities"
+                          (mapv :node-id (mapcat :leaves value-descriptors)))
+        nodes
+        (vec
+         (mapcat
+          (fn [{:keys [symbol parameter? role leaves]}]
+            (let [leaf-count (count leaves)]
+              (mapv
+               (fn [{:keys [field dtype elements source node-id]}]
+                 (let [value-ownership (physical-option ownership symbol field :owned)]
+                   (link-plan/node
+                    {:id node-id :allocation-id node-id :dtype dtype
+                     :shape (leaf-shape shapes symbol field leaf-count elements)
+                     :device target
+                     :memory-space (physical-option memory-space symbol field :device)
+                     :ownership value-ownership :role role
+                     :source (when (and parameter? (= :owned value-ownership)) source)})))
+               leaves)))
+          value-descriptors))
+        logical-values
+        (vec
+         (keep (fn [{:keys [value-id value-spec leaves]}]
+                 (when value-spec
+                   (link-plan/value
+                    {:id value-id :abstract (:abstract value-spec)
+                     :physical-layout (:physical-layout value-spec)
+                     :leaves (mapv (fn [{:keys [field node-id]}]
+                                     {:name field :node node-id})
+                                   leaves)})))
+               value-descriptors))
+        value-by-symbol (into {} (map (juxt :symbol identity)) value-descriptors)
+        bindings (into {} (map (juxt :symbol :value-id)) value-descriptors)
         instance (link-plan/instance
                   {:id (or instance-id [id :instance]) :descriptor descriptor
                    :bindings bindings :scalars scalar-values :schedule (:schedule descriptor)
                    :roles roles :arguments (vec arguments)})
         plan (link-plan/make
-              {:id id :target target :nodes nodes :instances [instance]
-               :outputs (mapv bindings outputs) :aliases aliases
+              {:id id :target target :nodes nodes :values logical-values :instances [instance]
+               :outputs (vec (mapcat #(map :node-id (:leaves (get value-by-symbol %))) outputs))
+               :aliases aliases
                :attributes (assoc attributes :lowered-from :resident-program)})
         lowering (->CertifiedResidentPlan plan (derive-certificate plan))]
     (verify! lowering)))

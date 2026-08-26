@@ -226,6 +226,19 @@
                        :values (set (keys (:values plan)))})))
     (mapv :node (:leaves link-value))))
 
+(defn output-value-ids
+  "Return public logical value identities in physical output order. LinkPlan validation guarantees
+   that each selected value contributes all of its leaves contiguously and in field order."
+  [plan]
+  (let [positions (zipmap (:outputs plan) (range))]
+    (->> (:values plan)
+         (keep (fn [[value-id value]]
+                 (let [leaf-positions (mapv positions (map :node (:leaves value)))]
+                   (when (every? some? leaf-positions)
+                     [value-id (first leaf-positions)]))))
+         (sort-by second)
+         (mapv first))))
+
 (defn validate-instance!
   [instance]
   (when-not (link-instance? instance)
@@ -273,7 +286,7 @@
 
 (defn instance
   "Construct one descriptor instance. `:bindings` is data—not a name-decoding function—and maps
-   every pointer-valued compiler symbol used by the descriptor to a LinkNode identity. `:scalars`
+   every pointer-valued compiler symbol used by the descriptor to a LinkValue identity. `:scalars`
    supplies exactly the descriptor's scalar parameters. Optional ordered `:arguments` retains the
    complete compile-time specialization environment for descriptor closures whose shapes depend on
    array parameters; runtime pointer binding still comes exclusively from `:bindings`."
@@ -284,7 +297,7 @@
   "Return the descriptor's ordered specialization arguments. Explicit arguments retain array
    values for descriptor shape closures; absent arguments preserve the hand-built-plan
    shorthand of nil array positions plus exact named scalars. Runtime pointers are never taken
-   from this vector: resident binding uses LinkNodes exclusively."
+   from this vector: resident binding uses certified LinkValue leaves exclusively."
   [instance]
   (let [{:keys [descriptor scalars arguments]} (validate-instance! instance)
         array-params (set (:array-params descriptor))]
@@ -307,6 +320,28 @@
                             (when (not= :scalar kind) sym))
                           (:argument-specs step)))))
         (:steps descriptor)))
+
+(defn descriptor-allocation-leaves
+  "Return one descriptor allocation's ordered physical leaf specifications. Legacy flat
+   allocations become a single `:value` leaf; composite allocations declare `:leaves` containing
+   `:field`, `:dtype`, and `:size-fn`."
+  ([allocation] (descriptor-allocation-leaves allocation nil))
+  ([{:keys [sym dtype size-fn leaves] :as allocation} default-dtype]
+   (let [leaves (if (contains? allocation :leaves)
+                  leaves
+                  [{:field :value :dtype (or dtype default-dtype) :size-fn size-fn}])]
+     (when-not (and (vector? leaves) (seq leaves))
+       (throw (ex-info "descriptor allocation requires ordered physical leaves"
+                       {:reason :link-allocation-leaves :symbol sym :leaves leaves})))
+     (doseq [{:keys [field dtype size-fn] :as leaf} leaves]
+       (when (or (nil? field) (nil? dtype) (not (ifn? size-fn)))
+         (throw (ex-info "descriptor allocation leaf requires :field, :dtype, and :size-fn"
+                         {:reason :link-allocation-leaf :symbol sym :leaf leaf}))))
+     (let [fields (mapv :field leaves)]
+       (when-not (= (count fields) (count (distinct fields)))
+         (throw (ex-info "descriptor allocation fields must be unique and ordered"
+                         {:reason :link-allocation-fields :symbol sym :fields fields}))))
+     leaves)))
 
 (defn- step-interface [step]
   (or (:artifact step)
@@ -610,6 +645,18 @@
     (when-not (= (count outputs) (count (distinct outputs)))
       (throw (ex-info "link plan output identities must be unique"
                       {:reason :link-output-duplicates :outputs outputs})))
+    (let [positions (zipmap outputs (range))]
+      (doseq [[value-id link-value] values
+              :let [leaf-nodes (mapv :node (:leaves link-value))
+                    leaf-positions (vec (keep positions leaf-nodes))]
+              :when (seq leaf-positions)]
+        (when-not (and (= (count leaf-nodes) (count leaf-positions))
+                       (= leaf-positions
+                          (vec (range (first leaf-positions)
+                                      (+ (first leaf-positions) (count leaf-positions))))))
+          (throw (ex-info "public outputs must flatten whole logical values in field order"
+                          {:reason :link-output-value :value value-id :leaves leaf-nodes
+                           :positions leaf-positions :outputs outputs})))))
     (when-not (and (set? aliases) (every? set? aliases))
       (throw (ex-info "link plan aliases must be a set of two-node sets"
                       {:reason :link-aliases :aliases aliases})))
@@ -677,31 +724,40 @@
                          :value-role (get-in nodes [(-> values (get value-id) :leaves first :node)
                                                     :role])}))))
     (let [args (instance-arguments instance)]
-      (doseq [{:keys [sym dtype size-fn]} (:allocs descriptor)]
+      (doseq [{:keys [sym] :as allocation} (:allocs descriptor)]
         (let [value-id (get bindings sym)
               leaves (get-in values [value-id :leaves])
-              _ (when-not (= 1 (count leaves))
-                  (throw (ex-info "descriptor flat allocation cannot realize a composite value"
-                                  {:reason :link-composite-allocation-required :instance id
-                                   :symbol sym :value value-id :leaves leaves})))
-              node-id (:node (first leaves))
-              link-node (get nodes node-id)
-              expected-elements
-              (try (long (size-fn args))
-                   (catch Exception e
-                     (throw (ex-info "link descriptor allocation extent did not resolve from its specialization environment"
-                                     {:reason :link-allocation-shape :instance id :symbol sym}
-                                     e))))
-              actual-elements (shape-elements (get-in link-node [:view :shape]))]
-          (when-not (= (dtype/canon dtype) (dtype/canon (get-in link-node [:view :dtype])))
-            (throw (ex-info "link internal node dtype differs from its descriptor allocation"
-                            {:reason :link-allocation-dtype :instance id :symbol sym :node node-id
-                             :expected dtype :actual (get-in link-node [:view :dtype])})))
-          (when-not (= expected-elements actual-elements)
-            (throw (ex-info "link internal node shape differs from its descriptor allocation"
-                            {:reason :link-allocation-shape :instance id :symbol sym :node node-id
-                             :expected-elements expected-elements
-                             :actual-elements actual-elements})))))
+              specs (descriptor-allocation-leaves allocation (:dtype descriptor))]
+          (when-not (= (count specs) (count leaves))
+            (throw (ex-info "descriptor allocation leaf count differs from its logical value"
+                            {:reason :link-allocation-leaf-count :instance id :symbol sym
+                             :value value-id :specs specs :leaves leaves})))
+          (doseq [[{:keys [field dtype size-fn]} {:keys [name node]}]
+                  (map vector specs leaves)]
+            (let [link-node (get nodes node)
+                  expected-elements
+                  (try (long (size-fn args))
+                       (catch Exception e
+                         (throw
+                          (ex-info
+                           "link descriptor allocation extent did not resolve from its specialization environment"
+                           {:reason :link-allocation-shape :instance id :symbol sym :field field}
+                           e))))
+                  actual-elements (shape-elements (get-in link-node [:view :shape]))]
+              (when-not (= field name)
+                (throw (ex-info "descriptor allocation field differs from its logical leaf"
+                                {:reason :link-allocation-field :instance id :symbol sym
+                                 :expected field :actual name :node node})))
+              (when-not (= (dtype/canon dtype) (dtype/canon (get-in link-node [:view :dtype])))
+                (throw (ex-info "link internal node dtype differs from its descriptor allocation"
+                                {:reason :link-allocation-dtype :instance id :symbol sym
+                                 :field field :node node :expected dtype
+                                 :actual (get-in link-node [:view :dtype])})))
+              (when-not (= expected-elements actual-elements)
+                (throw (ex-info "link internal node shape differs from its descriptor allocation"
+                                {:reason :link-allocation-shape :instance id :symbol sym
+                                 :field field :node node :expected-elements expected-elements
+                                 :actual-elements actual-elements})))))))
       (mapv (fn [[step-index step]]
               (instance-step-facts nodes values instance step-index step))
             (map-indexed vector (:steps descriptor))))))
