@@ -7,6 +7,7 @@
    executable selection and graph recording deliberately live in raster.gpu.link."
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -17,8 +18,9 @@
 (def binder-roles #{:input :constant :state :output :scratch})
 
 (defrecord LinkNode [id view role source])
+(defrecord LinkValue [id abstract physical-layout leaves])
 (defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
-(defrecord LinkPlan [id target nodes instances outputs aliases attributes])
+(defrecord LinkPlan [id target nodes values instances outputs aliases attributes])
 
 (defn link-node? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkNode" (.getName (class x)))))
@@ -28,6 +30,9 @@
 
 (defn link-plan? [x]
   (and x (= "raster.compiler.ir.link_plan.LinkPlan" (.getName (class x)))))
+
+(defn link-value? [x]
+  (and x (= "raster.compiler.ir.link_plan.LinkValue" (.getName (class x)))))
 
 (defn- shape-elements [shape]
   (reduce * 1 shape))
@@ -134,6 +139,92 @@
                    (bview/view allocation {:id id :byte-offset byte-offset :dtype dtype
                                            :shape shape :strides strides})))]
     (validate-node! (->LinkNode id view role source))))
+
+(defn value
+  "Construct one logical value realized by ordered physical LinkNode leaves.
+
+   Each leaf is `{:name field-id :node node-id}`. The order is the physical ABI order; names are
+   independently checked against KernelABI `:field` identities so equal-dtype fields cannot be
+   silently swapped. `:physical-layout` identifies the realized packing independently of the
+   AbstractValue's logical layout and numerical representation."
+  [{:keys [id abstract physical-layout leaves]}]
+  (when (nil? id)
+    (throw (ex-info "a link value requires a stable identity" {:reason :link-value-id})))
+  (av/validate! abstract)
+  (when-not (or (nil? physical-layout) (map? physical-layout))
+    (throw (ex-info "link value physical layout must be a descriptor map or nil"
+                    {:reason :link-value-physical-layout :value id
+                     :physical-layout physical-layout})))
+  (when-not (and (vector? leaves) (seq leaves)
+                 (every? #(and (map? %) (:name %) (contains? % :node)) leaves))
+    (throw (ex-info "a link value requires ordered named physical leaves"
+                    {:reason :link-value-leaves :value id :leaves leaves})))
+  (let [names (mapv :name leaves)
+        nodes (mapv :node leaves)]
+    (when-not (= (count names) (count (distinct names)))
+      (throw (ex-info "link value leaf names must be unique"
+                      {:reason :link-value-leaf-names :value id :names names})))
+    (when-not (= (count nodes) (count (distinct nodes)))
+      (throw (ex-info "one link value cannot repeat a physical node"
+                      {:reason :link-value-leaf-nodes :value id :nodes nodes}))))
+  (->LinkValue id abstract
+               (or physical-layout {:kind (if (= 1 (count leaves)) :dense :ordered-fields)})
+               leaves))
+
+(defn- node-abstract-value
+  [node]
+  (let [view (bview/validate-view! (:view node))
+        allocation (:allocation view)]
+    (av/tensor {:dtype (:dtype view)
+                :shape (:shape view)
+                :logical-layout {:strides (:strides view)}
+                :memory-space (:memory-space allocation)
+                :placement {:device (:device allocation)}
+                :ownership (:ownership allocation)})))
+
+(defn- implicit-value
+  [node]
+  (value {:id (:id node)
+          :abstract (node-abstract-value node)
+          :leaves [{:name :value :node (:id node)}]}))
+
+(defn- normalize-values
+  [nodes values]
+  (let [explicit (cond
+                   (nil? values) {}
+                   (map? values) values
+                   :else (into {} (map (juxt :id identity)) values))
+        _ (doseq [[value-id link-value] explicit]
+            (when-not (link-value? link-value)
+              (throw (ex-info "link plan values must be LinkValue records"
+                              {:reason :link-value-type :value value-id
+                               :actual (type link-value)})))
+            (when-not (= value-id (:id link-value))
+              (throw (ex-info "link value map key differs from the value identity"
+                              {:reason :link-value-map-key :key value-id
+                               :value (:id link-value)})))
+            (value link-value))
+        claimed (mapcat (fn [[_ link-value]] (map :node (:leaves link-value))) explicit)
+        frequencies (frequencies claimed)]
+    (when-let [[node-id count] (first (filter (fn [[_ count]] (< 1 count)) frequencies))]
+      (throw (ex-info "one physical node cannot belong to multiple logical values"
+                      {:reason :link-value-overlap :node node-id :claims count})))
+    (merge explicit
+           (into {}
+                 (keep (fn [[node-id link-node]]
+                         (when-not (contains? frequencies node-id)
+                           [node-id (implicit-value link-node)])))
+                 nodes))))
+
+(defn value-node-ids
+  "Ordered physical LinkNode identities realizing `value-id`."
+  [plan value-id]
+  (let [link-value (get (:values plan) value-id)]
+    (when-not link-value
+      (throw (ex-info "link value identity is absent"
+                      {:reason :link-absent-value :value value-id
+                       :values (set (keys (:values plan)))})))
+    (mapv :node (:leaves link-value))))
 
 (defn validate-instance!
   [instance]
@@ -245,7 +336,7 @@
       (get-in schedule [:segmented-weighted-reduction :strategy] :auto))))
 
 (defn- abi-step-facts
-  [nodes instance step-index step]
+  [nodes values instance step-index step]
   (let [{:keys [id descriptor bindings schedule]} instance
         args (instance-arguments instance)
         interface (kexec/validate! (step-interface step))
@@ -258,44 +349,71 @@
                       {:reason :link-step-abi :instance id :step step-index
                        :phase (:phase step) :argument-symbols spec-syms
                        :abi-bindings logical-names})))
-    (let [facts
+    (let [binding-facts
           (mapv (fn [sym {:keys [slots]}]
-                  (let [node-id (get bindings sym ::missing)
-                        node (get nodes node-id)
-                        slot-dtypes (set (map (comp dtype/canon :dtype) slots))]
-                    (when (= ::missing node-id)
+                  (let [value-id (get bindings sym ::missing)
+                        link-value (get values value-id)
+                        leaves (:leaves link-value)]
+                    (when (= ::missing value-id)
                       (throw (ex-info "link instance omits a descriptor pointer binding"
                                       {:reason :link-missing-binding :instance id :symbol sym
                                        :phase (:phase step)})))
-                    (when-not node
-                      (throw (ex-info "link instance binding names an absent node"
-                                      {:reason :link-absent-node :instance id :symbol sym
-                                       :node node-id :phase (:phase step)})))
-                    (when-not (bview/contiguous? (:view node))
-                      (throw (ex-info "linked kernel ABI bindings currently require contiguous views"
-                                      {:reason :link-noncontiguous-binding :instance id
-                                       :symbol sym :node node-id :phase (:phase step)
-                                       :shape (get-in node [:view :shape])
-                                       :strides (get-in node [:view :strides])})))
-                    (when-not (= 1 (count slots))
-                      (throw (ex-info "one link node cannot represent a multi-slot composite ABI"
-                                      {:reason :link-composite-binding-required :instance id
-                                       :symbol sym :node node-id :slots slots
-                                       :dtypes slot-dtypes})))
-                    (when-not (= (dtype/canon (get-in node [:view :dtype])) (first slot-dtypes))
-                      (throw (ex-info "link node dtype differs from the executable ABI"
-                                      {:reason :link-node-dtype :instance id :symbol sym :node node-id
-                                       :expected (first slot-dtypes)
-                                       :actual (get-in node [:view :dtype])})))
-                    {:symbol sym :node node-id
-                     :access (reduce merge-access nil (map slot-access slots))}))
+                    (when-not link-value
+                      (throw (ex-info "link instance binding names an absent logical value"
+                                      {:reason :link-absent-value :instance id :symbol sym
+                                       :value value-id :phase (:phase step)})))
+                    (when-not (= (count slots) (count leaves))
+                      (throw (ex-info "logical value leaf count differs from its physical ABI group"
+                                      {:reason :link-value-abi-leaves :instance id :symbol sym
+                                       :value value-id :slots slots :leaves leaves})))
+                    (when (and (< 1 (count leaves)) (not (:logical-bindings? step)))
+                      (throw (ex-info "composite link value requires logical descriptor binding"
+                                      {:reason :link-composite-binding-mode :instance id
+                                       :symbol sym :value value-id :phase (:phase step)})))
+                    (let [leaf-facts
+                          (mapv
+                           (fn [slot {:keys [name node] :as leaf}]
+                             (let [link-node (get nodes node)]
+                               (when-not link-node
+                                 (throw (ex-info "link value leaf names an absent physical node"
+                                                 {:reason :link-value-leaf-node :instance id
+                                                  :symbol sym :value value-id :leaf leaf})))
+                               (when-not (bview/contiguous? (:view link-node))
+                                 (throw (ex-info "linked kernel ABI bindings currently require contiguous views"
+                                                 {:reason :link-noncontiguous-binding :instance id
+                                                  :symbol sym :node node :phase (:phase step)
+                                                  :shape (get-in link-node [:view :shape])
+                                                  :strides (get-in link-node [:view :strides])})))
+                               (when (and (:field slot) (not= (:field slot) name))
+                                 (throw (ex-info "link value physical field order differs from its ABI"
+                                                 {:reason :link-value-abi-field :instance id
+                                                  :symbol sym :value value-id :node node
+                                                  :expected (:field slot) :actual name})))
+                               (when-not (= (dtype/canon (get-in link-node [:view :dtype]))
+                                            (dtype/canon (:dtype slot)))
+                                 (throw (ex-info "link node dtype differs from the executable ABI"
+                                                 {:reason :link-node-dtype :instance id :symbol sym
+                                                  :value value-id :node node
+                                                  :expected (:dtype slot)
+                                                  :actual (get-in link-node [:view :dtype])})))
+                               {:symbol sym :value value-id :node node
+                                :field name :access (slot-access slot)}))
+                           slots leaves)]
+                      {:symbol sym :value value-id :slots slots :leaves leaves
+                       :facts leaf-facts})))
                 spec-syms slot-groups)
+          physical-pointers (vec (mapcat (comp (partial map :node) :leaves) binding-facts))
+          scalar-arguments
+          (mapv (fn [{:keys [type value-fn]}] {:type type :value (value-fn args)})
+                (filterv #(= :scalar (:kind %)) (:argument-specs step)))
           runtime-arguments
-          (mapv (fn [{:keys [kind type value-fn sym]}]
-                  (if (= :scalar kind)
-                    {:type type :value (value-fn args)}
-                    (get bindings sym)))
-                (:argument-specs step))
+          (loop [slots (kexec/abi interface)
+                 pointers physical-pointers scalars scalar-arguments result []]
+            (if-let [slot (first slots)]
+              (if (= :scalar (:kind slot))
+                (recur (next slots) pointers (next scalars) (conj result (first scalars)))
+                (recur (next slots) (next pointers) scalars (conj result (first pointers))))
+              (vec result)))
           selected (if-let [dispatch (:dispatch step)]
                      (kdispatch/select-alternative
                       dispatch runtime-arguments
@@ -325,7 +443,8 @@
                             {:reason :link-node-range :instance id :step step-index
                              :phase (:phase step) :buffer (:id buffer) :node node-id
                              :expected expected :capacity capacity})))))
-      {:instance id :step step-index :phase (:phase step) :facts facts})))
+      {:instance id :step step-index :phase (:phase step)
+       :facts (vec (mapcat :facts binding-facts))})))
 
 (defn- scatter-step-facts
   [nodes instance step-index step]
@@ -385,10 +504,10 @@
              {:symbol index-sym :node index-id :access :read}]}))
 
 (defn- instance-step-facts
-  [nodes instance step-index step]
+  [nodes values instance step-index step]
   (if (= :scatter (:convention step))
     (scatter-step-facts nodes instance step-index step)
-    (abi-step-facts nodes instance step-index step)))
+    (abi-step-facts nodes values instance step-index step)))
 
 (defn- canonical-alias-pair [pair]
   (let [pair (set pair)]
@@ -401,7 +520,7 @@
   (when-not (link-plan? plan)
     (throw (ex-info "expected a LinkPlan value"
                     {:reason :link-plan-type :plan plan :actual (type plan)})))
-  (let [{:keys [id target nodes instances outputs aliases attributes]} plan]
+  (let [{:keys [id target nodes values instances outputs aliases attributes]} plan]
     (when (nil? id)
       (throw (ex-info "a link plan requires a stable identity" {:reason :link-plan-id})))
     (when-not (keyword? target)
@@ -420,6 +539,64 @@
           (throw (ex-info "link node allocation belongs to a different device"
                           {:reason :link-node-device :node node-id
                            :target target :device device})))))
+    (when-not (and (map? values) (seq values))
+      (throw (ex-info "a link plan requires a non-empty logical value map"
+                      {:reason :link-values :values values})))
+    (let [claimed (volatile! #{})]
+      (doseq [[value-id link-value] values]
+        (value link-value)
+        (when-not (= value-id (:id link-value))
+          (throw (ex-info "link value map key differs from the value identity"
+                          {:reason :link-value-map-key :key value-id
+                           :value (:id link-value)})))
+        (let [leaf-nodes (mapv :node (:leaves link-value))
+              leaf-records (mapv nodes leaf-nodes)
+              roles (set (map :role leaf-records))
+              ownerships (set (map #(get-in % [:view :allocation :ownership]) leaf-records))
+              memory-spaces (set (map #(get-in % [:view :allocation :memory-space]) leaf-records))
+              devices (set (map #(get-in % [:view :allocation :device]) leaf-records))]
+          (when-not (every? some? leaf-records)
+            (throw (ex-info "link value leaf names an absent physical node"
+                            {:reason :link-value-leaf-node :value value-id
+                             :leaves leaf-nodes :nodes (set (keys nodes))})))
+          (when-let [overlap (seq (set/intersection @claimed (set leaf-nodes)))]
+            (throw (ex-info "one physical node cannot belong to multiple logical values"
+                            {:reason :link-value-overlap :value value-id :nodes (set overlap)})))
+          (vswap! claimed into leaf-nodes)
+          (when-not (= 1 (count roles))
+            (throw (ex-info "one logical value requires one dataflow role across its leaves"
+                            {:reason :link-value-roles :value value-id :roles roles})))
+          (when-not (= 1 (count ownerships))
+            (throw (ex-info "one logical value requires atomic ownership across its leaves"
+                            {:reason :link-value-ownership :value value-id
+                             :ownerships ownerships})))
+          (when-not (= 1 (count memory-spaces))
+            (throw (ex-info "one logical value requires one memory space across its leaves"
+                            {:reason :link-value-memory-spaces :value value-id
+                             :memory-spaces memory-spaces})))
+          (when-not (= 1 (count devices))
+            (throw (ex-info "one logical value cannot span devices before sharding lowering"
+                            {:reason :link-value-devices :value value-id :devices devices})))
+          (let [abstract (:abstract link-value)
+                abstract-device (get-in abstract [:placement :device])]
+            (when (and (:ownership abstract)
+                       (not= #{(:ownership abstract)} ownerships))
+              (throw (ex-info "logical ownership differs from its physical realization"
+                              {:reason :link-value-abstract-ownership :value value-id
+                               :abstract (:ownership abstract) :physical ownerships})))
+            (when (and (:memory-space abstract)
+                       (not= #{(:memory-space abstract)} memory-spaces))
+              (throw (ex-info "logical memory space differs from its physical realization"
+                              {:reason :link-value-abstract-memory-space :value value-id
+                               :abstract (:memory-space abstract) :physical memory-spaces})))
+            (when (and abstract-device (not= #{abstract-device} devices))
+              (throw (ex-info "logical placement differs from its physical realization"
+                              {:reason :link-value-abstract-device :value value-id
+                               :abstract abstract-device :physical devices}))))))
+      (when-not (= @claimed (set (keys nodes)))
+        (throw (ex-info "every physical LinkNode must realize exactly one logical value"
+                        {:reason :link-value-coverage :claimed @claimed
+                         :nodes (set (keys nodes))}))))
     (when-not (and (vector? instances) (seq instances))
       (throw (ex-info "a link plan requires an ordered non-empty instance vector"
                       {:reason :link-instances :instances instances})))
@@ -475,7 +652,7 @@
                         {:reason :link-spurious-alias :alias pair}))))
     plan))
 
-(defn- validate-instance-bindings! [nodes instance]
+(defn- validate-instance-bindings! [nodes values instance]
   (let [{:keys [id descriptor bindings roles]} instance
         expected (descriptor-pointer-symbols descriptor)
         actual (set (keys bindings))]
@@ -488,18 +665,26 @@
       (throw (ex-info "link instance roles name symbols outside its pointer bindings"
                       {:reason :link-role-symbols :instance id
                        :extra (set/difference (set (keys roles)) expected)})))
-    (doseq [[sym node-id] bindings]
-      (when-not (contains? nodes node-id)
-        (throw (ex-info "link instance binding names an absent node"
-                        {:reason :link-absent-node :instance id :symbol sym :node node-id})))
+    (doseq [[sym value-id] bindings]
+      (when-not (contains? values value-id)
+        (throw (ex-info "link instance binding names an absent logical value"
+                        {:reason :link-absent-value :instance id :symbol sym :value value-id})))
       (when (and (= :constant (get roles sym))
-                 (not= :constant (get-in nodes [node-id :role])))
-        (throw (ex-info "a constant instance binding requires a constant LinkNode"
-                        {:reason :link-role-mismatch :instance id :symbol sym :node node-id
-                         :node-role (get-in nodes [node-id :role])}))))
+                 (not= :constant (get-in nodes [(-> values (get value-id) :leaves first :node)
+                                                :role])))
+        (throw (ex-info "a constant instance binding requires a constant logical value"
+                        {:reason :link-role-mismatch :instance id :symbol sym :value value-id
+                         :value-role (get-in nodes [(-> values (get value-id) :leaves first :node)
+                                                    :role])}))))
     (let [args (instance-arguments instance)]
       (doseq [{:keys [sym dtype size-fn]} (:allocs descriptor)]
-        (let [node-id (get bindings sym)
+        (let [value-id (get bindings sym)
+              leaves (get-in values [value-id :leaves])
+              _ (when-not (= 1 (count leaves))
+                  (throw (ex-info "descriptor flat allocation cannot realize a composite value"
+                                  {:reason :link-composite-allocation-required :instance id
+                                   :symbol sym :value value-id :leaves leaves})))
+              node-id (:node (first leaves))
               link-node (get nodes node-id)
               expected-elements
               (try (long (size-fn args))
@@ -518,17 +703,17 @@
                              :expected-elements expected-elements
                              :actual-elements actual-elements})))))
       (mapv (fn [[step-index step]]
-              (instance-step-facts nodes instance step-index step))
+              (instance-step-facts nodes values instance step-index step))
             (map-indexed vector (:steps descriptor))))))
 
-(defn- validate-effects! [{:keys [target nodes instances outputs aliases] :as plan}]
+(defn- validate-effects! [{:keys [target nodes values instances outputs aliases] :as plan}]
   (when (and (not (let [target-name (name target)]
                     (or (= "ze" target-name) (.startsWith target-name "ze:"))))
              (some #(= :scatter (:convention %))
                    (mapcat (comp :steps :descriptor) instances)))
     (throw (ex-info "linked scatter execution is not available on this target backend"
                     {:reason :link-target-convention :target target :convention :scatter})))
-  (let [step-facts (mapcat #(validate-instance-bindings! nodes %) instances)
+  (let [step-facts (mapcat #(validate-instance-bindings! nodes values %) instances)
         initialized (volatile! (into #{}
                                      (keep (fn [[id {:keys [role source]}]]
                                              ;; Ownership answers who releases storage, not whether
@@ -581,14 +766,17 @@
 (defn make
   "Construct and purely validate a LinkPlan.
 
-   `:nodes` may be a node-id map or an ordered collection of LinkNodes. `:aliases` is an explicit
-   collection of two-node collections for overlapping views; undeclared physical overlap fails.
-   Instance order and each descriptor's step order define the current serial dependency schedule."
-  [{:keys [id target nodes instances outputs aliases attributes]
+   `:nodes` may be a node-id map or an ordered collection of LinkNodes. Optional `:values` groups
+   nodes into ordered logical LinkValues; every unclaimed node receives an implicit one-leaf value
+   with the same identity. `:aliases` explicitly declares overlapping views. Instance order and
+   each descriptor's step order define the current serial dependency schedule."
+  [{:keys [id target nodes values instances outputs aliases attributes]
     :or {outputs [] aliases #{} attributes {}}}]
   (let [nodes (if (map? nodes) nodes (into {} (map (juxt :id identity)) nodes))
+        values (normalize-values nodes values)
         aliases (into #{} (map canonical-alias-pair) aliases)]
-    (validate! (->LinkPlan id target nodes (vec instances) (vec outputs) aliases attributes))))
+    (validate! (->LinkPlan id target nodes values (vec instances) (vec outputs) aliases
+                           attributes))))
 
 (defn instance-roles
   "Resolve compiler-symbol roles for the runtime binder. Only `:constant` affects executable
@@ -597,12 +785,14 @@
   (when-not (link-plan? plan)
     (throw (ex-info "instance-roles requires a LinkPlan" {:actual (type plan)})))
   (validate-instance! instance)
-  (let [nodes (:nodes plan)]
+  (let [nodes (:nodes plan)
+        values (:values plan)]
     (merge
      (into {}
-           (map (fn [[sym node-id]]
-                  [sym (case (get-in nodes [node-id :role])
-                         :internal :scratch
-                         (get-in nodes [node-id :role]))]))
-           (:bindings instance))
+           (map (fn [[sym value-id]]
+                  (let [node-id (get-in values [value-id :leaves 0 :node])]
+                    [sym (case (get-in nodes [node-id :role])
+                           :internal :scratch
+                           (get-in nodes [node-id :role]))]))
+                (:bindings instance)))
      (:roles instance))))

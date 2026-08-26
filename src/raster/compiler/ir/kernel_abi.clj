@@ -11,19 +11,21 @@
 (def ^:private kinds #{:input :output :scalar})
 
 (defn slot
-  "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, and :binding.
+  "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, and :field.
 
    `:binding` names the logical caller value that supplies a physical pointer slot. It is
    normally absent (and therefore identical to `:name`), but an SoA argument has one physical
-   slot per field and all of those slots share the same logical binding."
-  [nm kind dtype & {:keys [c-name kernel-dtype role binding]}]
+   slot per field and all of those slots share the same logical binding.
+   `:field` identifies this physical leaf within a composite logical binding."
+  [nm kind dtype & {:keys [c-name kernel-dtype role binding field]}]
   (cond-> {:name nm
            :c-name (or c-name (name nm))
            :kind kind
            :dtype (dt/canon dtype)
            :kernel-dtype (dt/canon (or kernel-dtype dtype))}
     role (assoc :role role)
-    binding (assoc :binding binding)))
+    binding (assoc :binding binding)
+    field (assoc :field field)))
 
 (defn validate!
   "Validate an ordered ABI and return it unchanged.  A kernel has at least one output;
@@ -46,18 +48,31 @@
                         {:index i :slot s :dtype (get s k)}))))
     (when (and (= :scalar (:kind s)) (:binding s))
       (throw (ex-info "kernel ABI scalar slot cannot have a logical pointer :binding"
+                      {:index i :slot s :abi abi})))
+    (when (and (= :scalar (:kind s)) (:field s))
+      (throw (ex-info "kernel ABI scalar slot cannot name a composite pointer field"
+                      {:index i :slot s :abi abi})))
+    (when (and (:field s) (nil? (:binding s)))
+      (throw (ex-info "kernel ABI composite field requires an explicit logical binding"
                       {:index i :slot s :abi abi}))))
   (when-not (= (count abi) (count (distinct (map :c-name abi))))
     (throw (ex-info "kernel ABI parameter names must be unique" {:abi abi})))
   (let [pointers (vec (remove #(= :scalar (:kind %)) abi))]
     (doseq [binding (distinct (keep :binding pointers))]
-      (let [indexes (keep-indexed (fn [i slot] (when (= binding (:binding slot)) i)) pointers)]
+      (let [bound-slots (filterv #(= binding (:binding %)) pointers)
+            indexes (keep-indexed (fn [i slot] (when (= binding (:binding slot)) i)) pointers)]
         (when-not (= (count indexes) (inc (- (apply max indexes) (apply min indexes))))
           (throw (ex-info "kernel ABI physical slots for one logical binding must be contiguous"
-                          {:binding binding :indexes (vec indexes) :abi abi}))))))
-  (when-not (some #(= :output (:kind %)) abi)
-    (throw (ex-info "kernel ABI must contain at least one output" {:abi abi})))
-  abi)
+                          {:binding binding :indexes (vec indexes) :abi abi})))
+        (when (and (< 1 (count bound-slots))
+                   (not (and (every? :field bound-slots)
+                             (= (count bound-slots)
+                                (count (distinct (map :field bound-slots)))))))
+          (throw (ex-info "composite ABI slots require unique explicit field identities"
+                          {:binding binding :slots bound-slots :abi abi})))))
+    (when-not (some #(= :output (:kind %)) abi)
+      (throw (ex-info "kernel ABI must contain at least one output" {:abi abi})))
+    abi))
 
 (defn pointer-slots
   "Pointer-valued ABI slots, in kernel signature order."
@@ -176,7 +191,7 @@
     {:pairs pairs
      :pointer-pairs (filterv (fn [[slot _]] (not= :scalar (:kind slot))) pairs)
      :scalar-pairs (filterv (fn [[slot _]] (and (= :scalar (:kind slot))
-                                                 (not= :bound (:role slot)))) pairs)
+                                                (not= :bound (:role slot)))) pairs)
      :result-pair (first result-pairs)
      :bound-pair (first bound-pairs)}))
 

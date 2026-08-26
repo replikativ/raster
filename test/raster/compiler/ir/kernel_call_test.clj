@@ -5,6 +5,7 @@
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.ocl-runtime :as ocl]
+            [raster.gpu.resident-value :as resident-value]
             [raster.gpu.ze-runtime :as ze]))
 
 (def ^:private artifact
@@ -79,8 +80,10 @@
           :source (str "__kernel void logical_soa_contract_test("
                        "__global const float* particles_x, "
                        "__global const int* particles_id, __global float* out, int n) {}")
-          :abi [(kabi/slot 'particles_x :input :float :binding 'particles :role :operand)
-                (kabi/slot 'particles_id :input :int :binding 'particles :role :operand)
+          :abi [(kabi/slot 'particles_x :input :float :binding 'particles :field :x
+                           :role :operand)
+                (kabi/slot 'particles_id :input :int :binding 'particles :field :id
+                           :role :operand)
                 (kabi/slot 'out :output :float :role :effect)
                 (kabi/slot 'n :scalar :int :role :bound)]
           :arguments '[particles_x particles_id out n]
@@ -108,6 +111,14 @@
             (ze/->GpuSoA 'Particle 'ParticleSoA 65
                          [{:name "x" :dtype :float :seg :seg-x}
                           {:name "id" :dtype :int :seg :seg-id}]))))
+    (let [resident (resident-value/composite
+                    :particles
+                    [{:name :x :value {:dtype :float :resident :x}}
+                     {:name :id :value {:dtype :int :resident :id}}])]
+      (is (= [{:dtype :float :resident :x} {:dtype :int :resident :id}]
+             (ze/expand-pointer-binding (first plan) resident)))
+      (is (= [{:dtype :float :resident :x} {:dtype :int :resident :id}]
+             (ocl/expand-pointer-binding (first plan) resident))))
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"field order/name"
          (ze/expand-pointer-binding

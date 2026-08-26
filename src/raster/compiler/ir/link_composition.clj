@@ -39,7 +39,23 @@
                              (throw (ex-info "each link component requires :id and :lowering"
                                              {:reason :link-composition-component
                                               :component component})))
-                           (update component :lowering verify-component!))
+                           (let [component (update component :lowering verify-component!)
+                                 composite-values
+                                 (into {}
+                                       (filter (fn [[_ value]] (< 1 (count (:leaves value)))))
+                                       (get-in component [:lowering :plan :values]))]
+                             ;; The current composition API connects physical node endpoints. It
+                             ;; cannot yet prove that every leaf of two logical values is unified
+                             ;; atomically, so refusing the whole component is safer than silently
+                             ;; splitting ownership or field order during namespacing.
+                             (when (seq composite-values)
+                               (throw
+                                (ex-info
+                                 "logical composite values require value-level link composition"
+                                 {:reason :link-composition-logical-values
+                                  :component (:id component)
+                                  :values (set (keys composite-values))})))
+                             component))
                          components)
         ids (mapv :id components)]
     (when (empty? components)

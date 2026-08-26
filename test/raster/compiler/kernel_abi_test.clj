@@ -48,8 +48,8 @@
                                                       [{:type :int :value 2}]))))
 
 (deftest soa-physical-slots-collapse-to-one-logical-binding
-  (let [abi [(kabi/slot 'particles_x :output :float :binding 'particles :role :inout)
-             (kabi/slot 'particles_id :output :int :binding 'particles :role :inout)
+  (let [abi [(kabi/slot 'particles_x :output :float :binding 'particles :field :x :role :inout)
+             (kabi/slot 'particles_id :output :int :binding 'particles :field :id :role :inout)
              (kabi/slot '_n_bound :scalar :int :role :bound)]]
     (is (= '[particles] (kabi/pointer-binding-names abi)))
     (is (= '[particles]
@@ -62,10 +62,11 @@
                           (kabi/validate-physical-pointer-dtypes! abi [:float :float]))))
   (testing "a logical SoA cannot be split around another physical binding"
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be contiguous"
-          (kabi/validate!
-           [(kabi/slot 'particles_x :output :float :binding 'particles)
-            (kabi/slot 'other :input :float)
-            (kabi/slot 'particles_id :output :int :binding 'particles)])))))
+                          (kabi/validate!
+                           [(kabi/slot 'particles_x :output :float :binding 'particles :field :x)
+                            (kabi/slot 'other :input :float)
+                            (kabi/slot 'particles_id :output :int :binding 'particles
+                                       :field :id)])))))
 
 (deftest repeated-unbound-name-remains-positional
   (testing "an in-place generic map may bind the same value as an input and the result"

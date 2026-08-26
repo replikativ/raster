@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.link-plan-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as artifact]
@@ -132,13 +133,13 @@
                                              :instances [(instance :layer :x :w :out)]
                                              :outputs [:out]})
                                  (catch clojure.lang.ExceptionInfo e e))))))))
-  (testing "a flat node cannot silently stand in for a multi-buffer SoA value"
+  (testing "one logical value binds an explicitly ordered multi-buffer ABI"
     (let [soa-kernel
           (artifact/make
            {:kernel-name "link_soa"
             :source "__kernel void link_soa(float* x_a, float* x_b, float* y, long n) {}"
-            :abi [(kabi/slot 'x_a :input :float :binding 'x)
-                  (kabi/slot 'x_b :input :float :binding 'x)
+            :abi [(kabi/slot 'x_a :input :float :binding 'x :field :a)
+                  (kabi/slot 'x_b :input :float :binding 'x :field :b)
                   (kabi/slot 'y :output :float)
                   (kabi/slot 'n :scalar :long)]
             :arguments '[x_a x_b y n]
@@ -159,14 +160,46 @@
                                                  :value-fn (fn [args] (long (nth args 1)))}]}]
                       :result-sym 'y}
           i (link/instance {:id :soa :descriptor descriptor
-                            :bindings {'x :x 'y :out} :scalars {'n 16}})]
-      (is (= :link-composite-binding-required
-             (:reason (ex-data
-                       (try
-                         (link/make {:id :soa :target :ze:0
-                                     :nodes [(n :x :input (float-array 16)) (n :out :output)]
-                                     :instances [i] :outputs [:out]})
-                         (catch clojure.lang.ExceptionInfo e e))))))))
+                            :bindings {'x :x 'y :out} :scalars {'n 16}})
+          x-a (n :x-a :input (float-array 16))
+          x-b (n :x-b :input (float-array 16))
+          x (link/value {:id :x
+                         :abstract (av/tensor {:dtype :float :shape [16]
+                                               :representation {:kind :soa-test}})
+                         :physical-layout {:kind :soa :field-order [:a :b]}
+                         :leaves [{:name :a :node :x-a}
+                                  {:name :b :node :x-b}]})
+          plan (link/make {:id :soa :target :ze:0
+                           :nodes [x-a x-b (n :out :output)]
+                           :values [x] :instances [i] :outputs [:out]})]
+      (is (= [:x-a :x-b] (link/value-node-ids plan :x)))
+      (is (= :soa-test (get-in plan [:values :x :abstract :representation :kind])))
+      (is (= [:a :b] (get-in plan [:values :x :physical-layout :field-order])))
+      (is (= :link-value-abstract-ownership
+             (:reason
+              (ex-data
+               (try
+                 (link/make {:id :soa-ownership :target :ze:0
+                             :nodes [x-a x-b (n :out :output)]
+                             :values [(link/value
+                                       {:id :x
+                                        :abstract (assoc (:abstract x) :ownership :borrowed)
+                                        :leaves (:leaves x)})]
+                             :instances [i] :outputs [:out]})
+                 (catch clojure.lang.ExceptionInfo error error))))))
+      (is (= :link-value-abi-field
+             (:reason
+              (ex-data
+               (try
+                 (link/make {:id :soa-swapped :target :ze:0
+                             :nodes [x-a x-b (n :out :output)]
+                             :values [(link/value
+                                       {:id :x
+                                        :abstract (:abstract x)
+                                        :leaves [{:name :b :node :x-a}
+                                                 {:name :a :node :x-b}]})]
+                             :instances [i] :outputs [:out]})
+                 (catch clojure.lang.ExceptionInfo error error))))))))
   (testing "an internal consumer cannot precede its producer"
     (is (= :link-read-before-write
            (:reason (ex-data (try

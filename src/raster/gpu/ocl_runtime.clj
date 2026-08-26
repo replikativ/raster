@@ -24,7 +24,8 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.gpu.resident-value :as resident-value]))
 
 ;; ================================================================
 ;; Library loading
@@ -479,17 +480,19 @@
         arrays))
 
 (defn expand-pointer-binding
-  "Expand one logical artifact pointer binding into OpenCL physical resident values. OpenCL's
-   current resident representation is one OclBuffer per logical value; multi-slot SoA bindings
-   fail here explicitly until an OpenCL SoA view is introduced. Driver state is not touched."
-  [{:keys [binding slots]} value]
-  (when-not (= 1 (count slots))
-    (throw (ex-info "OpenCL has no resident representation for a multi-slot logical pointer"
-                    {:binding binding :slots slots :value-type (type value)})))
-  (when-not (or (device-buffer? value) (instance? MemorySegment value))
-    (throw (ex-info "OpenCL logical pointer requires OclBuffer/MemorySegment"
-                    {:binding binding :slot (first slots) :value-type (type value)})))
-  [value])
+  "Expand one logical artifact pointer binding into OpenCL physical resident values. Driver state
+   is not touched; composite validation is shared with the Level Zero backend."
+  [{:keys [binding slots] :as group} value]
+  (if (resident-value/resident-composite? value)
+    (resident-value/expand group value)
+    (do
+      (when-not (= 1 (count slots))
+        (throw (ex-info "multi-slot logical pointer requires a resident composite value"
+                        {:binding binding :slots slots :value-type (type value)})))
+      (when-not (or (device-buffer? value) (instance? MemorySegment value))
+        (throw (ex-info "OpenCL logical pointer requires OclBuffer/MemorySegment"
+                        {:binding binding :slot (first slots) :value-type (type value)})))
+      [value])))
 
 (defn- kernel-info-value
   "Read a compiler-owned emitter attribute from an artifact or a remaining specialized entry."

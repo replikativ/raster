@@ -11,7 +11,11 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.core :refer [deftm]]
             [raster.dl.gpu-grad-parity :as gp]
+            [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.compiler.pipeline :as pl]
             [raster.dl.nn :as nn]
@@ -67,6 +71,58 @@
                      :closed? (atom false)})]
     (is (= output-ids (vec (keys (gpu-link/outputs executable)))))
     (is (= (range 12) (vals (gpu-link/outputs executable))))))
+
+(deftest linked-composite-value-expands-through-the-common-runtime
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "LinkValue composite ABI expansion")
+    (let [n 16
+          x-a (float-array (map float (range n)))
+          x-b (float-array (map #(float (* 2 %)) (range n)))
+          expected (float-array (map + x-a x-b))
+          kernel
+          (artifact/make
+           {:kernel-name "linked_composite_add"
+            :source (str "__kernel void linked_composite_add("
+                         "__global const float* x_a, __global const float* x_b, "
+                         "__global float* y, long n) { "
+                         "long i = get_global_id(0); if (i < n) y[i] = x_a[i] + x_b[i]; }")
+            :abi [(kabi/slot 'x_a :input :float :binding 'x :field :a)
+                  (kabi/slot 'x_b :input :float :binding 'x :field :b)
+                  (kabi/slot 'y :output :float)
+                  (kabi/slot 'n :scalar :long)]
+            :arguments '[x_a x_b y n]
+            :launch (launch/spec {:workgroup-size [64]
+                                  :group-count [(launch/ceil-div 'n 64)]})})
+          descriptor
+          {:dtype :float :all-params '[x n] :array-params '[x] :scalar-params '[n]
+           :array-roles {'x :input}
+           :allocs [{:sym 'y :dtype :float :size-fn (fn [args] (long (nth args 1)))}]
+           :steps [{:phase :add :kernel-name "linked_composite_add" :convention :map
+                    :artifact kernel :logical-bindings? true
+                    :argument-specs [{:kind :pointer :sym 'x}
+                                     {:kind :output :sym 'y}
+                                     {:kind :scalar :type :long
+                                      :value-fn (fn [args] (long (nth args 1)))}]}]
+           :result-sym 'y}
+          node (fn [id role source]
+                 (link-plan/node {:id id :dtype :float :shape [n] :device :ze:0
+                                  :role role :source source}))
+          nodes [(node :x-a :input x-a) (node :x-b :input x-b) (node :y :output nil)]
+          composite (link-plan/value
+                     {:id :x
+                      :abstract (av/tensor {:dtype :float :shape [n]
+                                            :representation {:kind :soa-test}})
+                      :leaves [{:name :a :node :x-a} {:name :b :node :x-b}]})
+          instance (link-plan/instance
+                    {:id :add :descriptor descriptor :bindings {'x :x 'y :y}
+                     :scalars {'n n} :arguments [nil n]})
+          plan (link-plan/make {:id :composite-add :target :ze:0 :nodes nodes
+                                :values [composite] :instances [instance] :outputs [:y]})
+          executable (gpu-link/instantiate! plan)]
+      (try
+        (gpu-link/run! executable)
+        (is (= (vec expected) (vec (gpu-link/download executable :y))))
+        (finally (gpu-link/close! executable))))))
 
 (deftest attached-close-attempts-the-entire-reverse-order-teardown
   (let [calls (atom [])
