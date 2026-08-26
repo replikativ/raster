@@ -58,6 +58,18 @@
       :coherence (:coherence allocation)
       :alignment (:alignment allocation)}]))
 
+(defn- resident-link-value [plan node-views value-id]
+  (let [link-value (get-in plan [:values value-id])
+        fields (mapv (fn [{:keys [name node]}]
+                       {:name name :value (get node-views node)})
+                     (:leaves link-value))]
+    (when-not (and link-value (every? :value fields))
+      (throw (ex-info "validated link value disappeared during instantiation"
+                      {:reason :link-runtime-value :value value-id})))
+    (if (= 1 (count fields))
+      (:value (first fields))
+      (resident-value/composite value-id fields))))
+
 (defn- cleanup-attached!
   [session graph-key phases allocation-keys]
   ;; A failed backend destructor must not strand the resources that follow it. Preserve the first
@@ -161,18 +173,13 @@
                (gpu/bind-step!
                 session (assoc step :phase phase) (link-plan/instance-arguments instance)
                 (fn [symbol]
-                  (let [value-id (get bindings symbol)
-                        link-value (get-in plan [:values value-id])
-                        fields (mapv (fn [{:keys [name node]}]
-                                       {:name name :value (get node-views node)})
-                                     (:leaves link-value))]
-                    (when-not (and link-value (every? :value fields))
-                      (throw (ex-info "validated link value disappeared during instantiation"
-                                      {:instance (:id instance) :symbol symbol
-                                       :value value-id})))
-                    (if (= 1 (count fields))
-                      (:value (first fields))
-                      (resident-value/composite value-id fields))))
+                  (let [value-id (get bindings symbol)]
+                    (try (resident-link-value plan node-views value-id)
+                         (catch clojure.lang.ExceptionInfo error
+                           (throw (ex-info (.getMessage error)
+                                           (assoc (ex-data error)
+                                                  :instance (:id instance) :symbol symbol)
+                                           error))))))
                 {:schedule (or (:schedule instance) (get-in instance [:descriptor :schedule]))
                  :roles (link-plan/instance-roles plan instance)})
                (vswap! phases conj phase)))
@@ -217,6 +224,13 @@
         (throw (ex-info "linked executable has no such node"
                         {:reason :link-runtime-node :node node-id
                          :nodes (set (keys (:node-views executable)))})))))
+
+(defn value-view
+  "Return one logical resident value. Dense values return their ResidentBufferView; composite
+   values return an ordered ResidentComposite whose field identities match the certified ABI."
+  [executable value-id]
+  (let [executable (ensure-live! executable :value-view)]
+    (resident-link-value (:plan executable) (:node-views executable) value-id)))
 
 (defn- select-instance
   [plan selector]
@@ -310,13 +324,42 @@
                (if (= :scalar (:kind spec))
                  [value]
                  (let [slots (:slots spec)]
-                   (when-not (= 1 (count slots))
-                     (throw (ex-info
-                             "linked dispatch tuning cannot project a multi-view logical binding"
-                             {:reason :linked-dispatch-multiview-binding
-                              :phase (:phase step) :binding (:binding spec) :slots slots})))
-                   [value])))
+                   (if (resident-value/resident-composite? value)
+                     (let [fields (:fields value)]
+                       (when-not (= (count slots) (count fields))
+                         (throw (ex-info "linked dispatch composite differs from its ABI"
+                                         {:reason :linked-dispatch-composite-count
+                                          :phase (:phase step) :binding (:binding spec)
+                                          :slots slots :fields fields})))
+                       (mapv (fn [slot field]
+                               (let [view (:view (:value field))]
+                                 (when (and (:field slot)
+                                            (not= (:field slot) (:name field)))
+                                   (throw
+                                    (ex-info "linked dispatch composite field order differs from its ABI"
+                                             {:reason :linked-dispatch-composite-field
+                                              :phase (:phase step) :slot slot :field field})))
+                                 (when-not (= (dtype/canon (:dtype slot))
+                                              (dtype/canon (:dtype view)))
+                                   (throw
+                                    (ex-info "linked dispatch composite dtype differs from its ABI"
+                                             {:reason :linked-dispatch-composite-dtype
+                                              :phase (:phase step) :slot slot :field field})))
+                                 (:value field)))
+                             slots fields))
+                     (do
+                       (when-not (= 1 (count slots))
+                         (throw (ex-info
+                                 "linked dispatch multi-slot binding requires a composite value"
+                                 {:reason :linked-dispatch-multiview-binding
+                                  :phase (:phase step) :binding (:binding spec) :slots slots})))
+                       [value])))))
              (:argument-specs step) logical-arguments))))
+
+(defn- resident-fields [value]
+  (if (resident-value/resident-composite? value)
+    (:fields value)
+    [{:name :value :value value}]))
 
 (defn dispatch-arguments
   "Project a tuning sample onto one linked instance's resident views and physical kernel ABI.
@@ -351,38 +394,69 @@
          bindings (:bindings instance)
          resident-of
          (fn [sym]
-           (let [node-id (get bindings sym ::missing)]
-             (when (= ::missing node-id)
-               (throw (ex-info "linked dispatch symbol has no certified node binding"
+           (let [value-id (get bindings sym ::missing)]
+             (when (= ::missing value-id)
+               (throw (ex-info "linked dispatch symbol has no certified value binding"
                                {:reason :linked-dispatch-binding
                                 :instance (:id instance) :symbol sym})))
-             (node-view executable node-id)))
-         capacity-of
-         (fn [sym]
-           (let [view (:view (resident-of sym))]
-             (quot (:byte-length view) (dtype/bytes-of (:dtype view)))))
+             (if (contains? (get-in executable [:plan :values]) value-id)
+               (value-view executable value-id)
+               ;; Compatibility for synthetic dispatch fixtures predating LinkValue. A validated
+               ;; production plan always takes the branch above.
+               (node-view executable value-id))))
          require-capacity!
-         (fn [sym required]
-           (let [capacity (capacity-of sym)]
+         (fn [sym field resident required]
+           (let [view (:view resident)
+                 capacity (quot (:byte-length view) (dtype/bytes-of (:dtype view)))]
              (when (> (long required) (long capacity))
                (throw (ex-info "linked dispatch sample exceeds its resident node view"
                                {:reason :linked-dispatch-buffer-capacity
                                 :instance (:id instance) :step-index step-index
-                                :phase (:phase step) :symbol sym
+                                :phase (:phase step) :symbol sym :field field
                                 :required-elements (long required)
                                 :capacity-elements (long capacity)})))))
          _array-capacities
          (doseq [sym (:array-params descriptor)]
-           (let [array (get argmap sym)]
-             (when-not (and array (.isArray (class array)))
-               (throw (ex-info "linked dispatch array parameter must be a JVM array"
-                               {:reason :linked-dispatch-array-argument
-                                :instance (:id instance) :symbol sym
-                                :value-type (some-> array class)})))
-             (require-capacity! sym (java.lang.reflect.Array/getLength array))))
+           (let [argument (get argmap sym)
+                 spec (get-in descriptor [:value-specs sym])
+                 fields (resident-fields (resident-of sym))]
+             (if spec
+               (let [expected (mapv :field (:leaves spec))]
+                 (when-not (and (map? argument) (= (set expected) (set (keys argument)))
+                                (= expected (mapv :name fields)))
+                   (throw (ex-info "linked dispatch composite parameter differs from its value spec"
+                                   {:reason :linked-dispatch-composite-argument
+                                    :instance (:id instance) :symbol sym
+                                    :expected expected :argument argument :fields fields})))
+                 (doseq [[field resident] (map vector expected (map :value fields))
+                         :let [array (get argument field)]]
+                   (when-not (and array (.isArray (class array)))
+                     (throw (ex-info "linked dispatch composite field must be a JVM array"
+                                     {:reason :linked-dispatch-array-argument
+                                      :instance (:id instance) :symbol sym :field field
+                                      :value-type (some-> array class)})))
+                   (require-capacity! sym field resident
+                                      (java.lang.reflect.Array/getLength array))))
+               (do
+                 (when-not (and argument (.isArray (class argument)))
+                   (throw (ex-info "linked dispatch array parameter must be a JVM array"
+                                   {:reason :linked-dispatch-array-argument
+                                    :instance (:id instance) :symbol sym
+                                    :value-type (some-> argument class)})))
+                 (require-capacity! sym :value (:value (first fields))
+                                    (java.lang.reflect.Array/getLength argument))))))
          _scratch-capacities
-         (doseq [{:keys [sym size-fn]} (:allocs descriptor)]
-           (require-capacity! sym (size-fn descriptor-arguments)))
+         (doseq [{:keys [sym] :as allocation} (:allocs descriptor)
+                 :let [fields (resident-fields (resident-of sym))
+                       specs (link-plan/descriptor-allocation-leaves
+                              allocation (:dtype descriptor))]
+                 [spec field] (map vector specs fields)]
+           (when-not (= (:field spec) (:name field))
+             (throw (ex-info "linked dispatch allocation fields differ from the resident value"
+                             {:reason :linked-dispatch-allocation-field :symbol sym
+                              :expected (:field spec) :actual (:name field)})))
+           (require-capacity! sym (:field spec) (:value field)
+                              ((:size-fn spec) descriptor-arguments)))
          logical-arguments
          (mapv (fn [{:keys [kind sym type value-fn]}]
                  (if (= :scalar kind)
@@ -433,6 +507,21 @@
                                position-order))))
           (map (fn [node-id] [node-id (node-view executable node-id)]))
           output-ids)))
+
+(defn output-values
+  "Return the plan's public logical values in declared output order without copying to the host."
+  [executable]
+  (let [executable (ensure-live! executable :output-values)
+        value-ids (link-plan/output-value-ids (:plan executable))
+        rank (zipmap value-ids (range))]
+    (into (sorted-map-by (fn [left right]
+                           (let [position-order (compare (get rank left Long/MAX_VALUE)
+                                                         (get rank right Long/MAX_VALUE))]
+                             (if (zero? position-order)
+                               (compare (pr-str left) (pr-str right))
+                               position-order))))
+          (map (fn [value-id] [value-id (value-view executable value-id)]))
+          value-ids)))
 
 (defn run!
   "Replay the linked graph synchronously and return its resident output views. No host copies."

@@ -175,6 +175,11 @@
       (is (= [:x-a :x-b] (link/value-node-ids plan :x)))
       (is (= :soa-test (get-in plan [:values :x :abstract :representation :kind])))
       (is (= [:a :b] (get-in plan [:values :x :physical-layout :field-order])))
+      (is (= :link-output-value
+             (:reason
+              (ex-data
+               (try (link/validate! (assoc plan :outputs [:x-a]))
+                    (catch clojure.lang.ExceptionInfo error error))))))
       (is (= :link-value-abstract-ownership
              (:reason
               (ex-data

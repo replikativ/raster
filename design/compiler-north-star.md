@@ -130,8 +130,8 @@ come only from certified node bindings. Independently lowered `Prepared` artifac
 before allocation through semantic input/output keys. The composition certificate namespaces
 component identities, unifies explicit dataflow and shared constant/input nodes, and re-derives one
 validated plan; one later instantiation therefore removes even the device copy. The remaining
-value-layer cleanup is ranged-view/cross-component ownership composition and retirement of the
-duplicate legacy whole-program binding API after parity.
+value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
+the duplicate legacy whole-program binding API is retired.
 
 Pretrained-rstr's batch boundary is the next concrete shape test: weights bind once to shared
 constant nodes, while residual, scratch, position, logits and token storage are lane-local nodes or
@@ -157,8 +157,12 @@ and an ordered set of named `LinkNode` leaves. Kernel ABI field identities certi
 and the common resident binder expands the same composite contract for Level Zero and OpenCL. A
 Q4_K value can therefore be represented by packed blocks, scales and sums while allocation remains
 generic byte storage; the allocator does not branch on Q4_K. Existing dense plans receive implicit
-one-leaf values. Value-level cross-component composition and descriptor-owned composite scratch
-allocation remain explicit next slices and currently fail before runtime.
+one-leaf values. The follow-up slice makes resident parameter and allocation descriptors speak the
+same contract: composite parameters have field initializers, composite scratch has independent
+leaf size closures, and allocation still sees only typed byte ranges. Certified composition now
+unifies and shares whole logical values atomically while retaining both logical and physical
+certificate mappings; public composite outputs must flatten every leaf in field order. The
+remaining value-layer boundary is ranged/subview composition with explicit ownership transfer.
 
 ### 2.5 Workload coverage is broad at the backend edge, not yet through one door
 

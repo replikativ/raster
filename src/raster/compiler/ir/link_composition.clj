@@ -13,7 +13,8 @@
 
 (defrecord LinkCompositionCertificate
            [source-dialect target-dialect plan-id target component-plan-ids
-            connections shares node-mapping allocation-mapping instance-mapping outputs])
+            connections shares value-mapping node-mapping allocation-mapping instance-mapping
+            outputs])
 (defrecord CertifiedLinkComposition [plan certificate components specification])
 
 (defn certificate? [x]
@@ -39,23 +40,7 @@
                              (throw (ex-info "each link component requires :id and :lowering"
                                              {:reason :link-composition-component
                                               :component component})))
-                           (let [component (update component :lowering verify-component!)
-                                 composite-values
-                                 (into {}
-                                       (filter (fn [[_ value]] (< 1 (count (:leaves value)))))
-                                       (get-in component [:lowering :plan :values]))]
-                             ;; The current composition API connects physical node endpoints. It
-                             ;; cannot yet prove that every leaf of two logical values is unified
-                             ;; atomically, so refusing the whole component is safer than silently
-                             ;; splitting ownership or field order during namespacing.
-                             (when (seq composite-values)
-                               (throw
-                                (ex-info
-                                 "logical composite values require value-level link composition"
-                                 {:reason :link-composition-logical-values
-                                  :component (:id component)
-                                  :values (set (keys composite-values))})))
-                             component))
+                           (update component :lowering verify-component!))
                          components)
         ids (mapv :id components)]
     (when (empty? components)
@@ -66,20 +51,30 @@
                       {:reason :link-composition-component-ids :ids ids})))
     components))
 
-(defn- node-ref! [component-plans [component-id node-id :as reference]]
+(defn- value-ref! [component-plans [component-id value-id :as reference]]
   (when-not (and (vector? reference) (= 2 (count reference)))
-    (throw (ex-info "a link composition node reference is [component-id node-id]"
-                    {:reason :link-composition-node-reference :reference reference})))
+    (throw (ex-info "a link composition value reference is [component-id value-id]"
+                    {:reason :link-composition-value-reference :reference reference})))
   (let [plan (get component-plans component-id)]
     (when-not plan
       (throw (ex-info "a link composition node reference names an absent component"
                       {:reason :link-composition-component-reference
                        :reference reference :components (set (keys component-plans))})))
-    (when-not (contains? (:nodes plan) node-id)
-      (throw (ex-info "a link composition node reference names an absent component node"
-                      {:reason :link-composition-node-reference :reference reference
-                       :nodes (set (keys (:nodes plan)))})))
-    reference))
+    (if (contains? (:values plan) value-id)
+      reference
+      (let [owners (into []
+                         (keep (fn [[candidate value]]
+                                 (when (some #(= value-id (:node %)) (:leaves value))
+                                   candidate)))
+                         (:values plan))]
+        (if (= 1 (count owners))
+          ;; Compatibility for callers holding a physical output identity from an older
+          ;; certificate. Even one leaf resolves to its whole logical value atomically.
+          [component-id (first owners)]
+          (throw (ex-info "a link composition value reference names an absent component value"
+                          {:reason :link-composition-value-reference :reference reference
+                           :physical-owners owners
+                           :values (set (keys (:values plan)))})))))))
 
 (defn- namespace-id [composition-id component-id kind id]
   [composition-id component-id kind id])
@@ -95,10 +90,15 @@
                         (assoc allocation :id (namespace-id composition-id component-id
                                                             :allocation (:id allocation)))))))
 
-(defn- namespace-instance [composition-id component-id node-mapping instance]
+(defn- namespace-value [composition-id component-id node-mapping value]
+  (assoc value
+         :id (namespace-id composition-id component-id :value (:id value))
+         :leaves (mapv #(update % :node node-mapping) (:leaves value))))
+
+(defn- namespace-instance [composition-id component-id value-mapping instance]
   (assoc instance
          :id (namespace-id composition-id component-id :instance (:id instance))
-         :bindings (update-vals (:bindings instance) node-mapping)))
+         :bindings (update-vals (:bindings instance) value-mapping)))
 
 (defn- endpoint-contract [node]
   (let [view (:view node)
@@ -112,23 +112,37 @@
                               [:byte-size :memory-space :device :alignment :coherence
                                :ownership])}))
 
-(defn- require-equal-contract! [kind references nodes]
-  (let [contracts (mapv (comp endpoint-contract nodes) references)]
+(defn- value-contract [value nodes]
+  {:abstract (:abstract value)
+   :physical-layout (:physical-layout value)
+   :leaves (mapv (fn [{:keys [name node]}]
+                   {:name name :view (endpoint-contract (get nodes node))})
+                 (:leaves value))})
+
+(defn- require-equal-contract! [kind references values nodes]
+  (let [contracts (mapv #(value-contract (get values %) nodes) references)]
     (when-not (apply = contracts)
       (throw (ex-info "composed boundary values have different realized view contracts"
                       {:reason :link-composition-view-contract :kind kind
                        :references references :contracts contracts})))))
 
-(defn- require-single-node-allocations! [references nodes]
+(defn- require-single-node-allocations! [references values nodes]
   ;; Step 4 generalizes this to ranged/subview boundary unification. Rejecting it here is crucial:
   ;; rebasing one endpoint of a multi-view allocation would silently change the other aliases.
   (let [counts (frequencies (map #(get-in % [:view :allocation :id]) (vals nodes)))]
     (doseq [reference references
-            :let [allocation-id (get-in nodes [reference :view :allocation :id])]]
+            node-id (map :node (:leaves (get values reference)))
+            :let [allocation-id (get-in nodes [node-id :view :allocation :id])]]
       (when-not (= 1 (get counts allocation-id))
         (throw (ex-info "composition across a multi-view allocation requires ranged-view linking"
-                        {:reason :link-composition-ranged-view :node reference
+                        {:reason :link-composition-ranged-view :value reference :node node-id
                          :allocation allocation-id :views (get counts allocation-id)}))))))
+
+(defn- value-role [plan value-id]
+  (get-in plan [:nodes (get-in plan [:values value-id :leaves 0 :node]) :role]))
+
+(defn- public-output-value? [plan value-id]
+  (contains? (set (link-plan/output-value-ids plan)) value-id))
 
 (defn- normalize-connections! [connections component-plans component-order]
   (let [connections
@@ -137,43 +151,43 @@
                   (throw (ex-info "a dataflow connection requires exactly :from and :to"
                                   {:reason :link-composition-connection
                                    :connection connection})))
-                {:from (node-ref! component-plans from)
-                 :to (node-ref! component-plans to)})
+                {:from (value-ref! component-plans from)
+                 :to (value-ref! component-plans to)})
               connections)
         targets (mapv :to connections)]
     (when-not (= (count targets) (count (distinct targets)))
       (throw (ex-info "a composed consumer node has more than one producer"
                       {:reason :link-composition-producers :targets targets})))
     (doseq [{:keys [from to]} connections
-            :let [[from-component from-node] from
-                  [to-component to-node] to
+            :let [[from-component from-value] from
+                  [to-component to-value] to
                   from-plan (get component-plans from-component)
                   to-plan (get component-plans to-component)]]
       (when-not (< (get component-order from-component) (get component-order to-component))
         (throw (ex-info "link dataflow connections must follow component schedule order"
                         {:reason :link-composition-order :from from :to to})))
-      (when-not (some #{from-node} (:outputs from-plan))
-        (throw (ex-info "a link dataflow producer must be a declared component output"
+      (when-not (public-output-value? from-plan from-value)
+        (throw (ex-info "a link dataflow producer must be a declared logical component output"
                         {:reason :link-composition-producer-boundary :from from
                          :outputs (:outputs from-plan)})))
-      (when-not (= :input (get-in to-plan [:nodes to-node :role]))
-        (throw (ex-info "a link dataflow consumer must be an input boundary"
+      (when-not (= :input (value-role to-plan to-value))
+        (throw (ex-info "a link dataflow consumer must be a logical input boundary"
                         {:reason :link-composition-consumer-role :to to
-                         :role (get-in to-plan [:nodes to-node :role])}))))
+                         :role (value-role to-plan to-value)}))))
     connections))
 
 (defn- normalize-shares! [shares component-plans]
   (mapv
    (fn [share]
-     (let [references (mapv #(node-ref! component-plans %) share)]
+     (let [references (mapv #(value-ref! component-plans %) share)]
        (when-not (<= 2 (count references))
          (throw (ex-info "a shared boundary group requires at least two nodes"
                          {:reason :link-composition-share :share share})))
        (when-not (= (count references) (count (distinct references)))
          (throw (ex-info "a shared boundary group cannot repeat a node"
                          {:reason :link-composition-share-duplicates :share share})))
-       (let [roles (mapv (fn [[component-id node-id]]
-                           (get-in component-plans [component-id :nodes node-id :role]))
+       (let [roles (mapv (fn [[component-id value-id]]
+                           (value-role (get component-plans component-id) value-id))
                          references)]
          (when-not (and (apply = roles) (contains? #{:input :constant} (first roles)))
            (throw (ex-info "shared boundaries must all be inputs or all be constants"
@@ -199,6 +213,13 @@
                       {:reason :link-composition-share-source :nodes references})))
     (first sources)))
 
+(defn- leaf-groups [value-groups values]
+  (mapcat
+   (fn [group]
+     (let [leaf-vectors (mapv #(get-in values [% :leaves]) group)]
+       (apply mapv (fn [& leaves] (mapv :node leaves)) leaf-vectors)))
+   value-groups))
+
 (defn- derive-composition
   [id components {:keys [connections shares outputs attributes]
                   :or {connections [] shares [] attributes {}} :as specification}]
@@ -216,13 +237,13 @@
         connections (normalize-connections! connections component-plans component-order)
         shares (normalize-shares! shares component-plans)
         _ (distinct-groups! connections shares)
-        outputs (mapv #(node-ref! component-plans %) outputs)
+        outputs (mapv #(value-ref! component-plans %) outputs)
         _ (when (empty? outputs)
             (throw (ex-info "link composition requires explicit public outputs"
                             {:reason :link-composition-outputs})))
-        _ (doseq [[component-id node-id :as output] outputs]
-            (when-not (some #{node-id} (get-in component-plans [component-id :outputs]))
-              (throw (ex-info "a composite output must be a declared component output"
+        _ (doseq [[component-id value-id :as output] outputs]
+            (when-not (public-output-value? (get component-plans component-id) value-id)
+              (throw (ex-info "a composite output must be a declared logical component output"
                               {:reason :link-composition-output-boundary :output output}))))
         node-mapping0
         (into {}
@@ -240,17 +261,43 @@
                                  [(:id node) node]))
                              (get-in lowering [:plan :nodes])))
                       components))
-        namespaced-ref #(get node-mapping0 %)
+        value-mapping0
+        (into {}
+              (mapcat (fn [{component-id :id lowering :lowering}]
+                        (map (fn [value-id]
+                               [[component-id value-id]
+                                (namespace-id id component-id :value value-id)])
+                             (keys (get-in lowering [:plan :values]))))
+                      components))
+        values0
+        (into {}
+              (mapcat (fn [{component-id :id lowering :lowering}]
+                        (map (fn [[_ value]]
+                               (let [value (namespace-value
+                                            id component-id
+                                            #(get node-mapping0 [component-id %]) value)]
+                                 [(:id value) value]))
+                             (get-in lowering [:plan :values])))
+                      components))
+        namespaced-value-ref #(get value-mapping0 %)
         connection-pairs (mapv (fn [{:keys [from to]}]
-                                 [(namespaced-ref from) (namespaced-ref to)])
+                                 [(namespaced-value-ref from) (namespaced-value-ref to)])
                                connections)
-        share-groups (mapv #(mapv namespaced-ref %) shares)
-        endpoint-groups (concat connection-pairs share-groups)
-        _ (doseq [group endpoint-groups]
-            (require-equal-contract! :boundary group nodes0)
-            (require-single-node-allocations! group nodes0))
-        _ (doseq [group share-groups] (canonical-source group nodes0))
-        replacements
+        share-groups (mapv #(mapv namespaced-value-ref %) shares)
+        value-groups (concat connection-pairs share-groups)
+        _ (doseq [group value-groups]
+            (require-equal-contract! :boundary group values0 nodes0)
+            (require-single-node-allocations! group values0 nodes0))
+        connection-leaf-pairs (vec (leaf-groups connection-pairs values0))
+        share-leaf-groups (vec (leaf-groups share-groups values0))
+        _ (doseq [group share-leaf-groups] (canonical-source group nodes0))
+        node-replacements
+        (into {}
+              (concat (map (fn [[source target]] [target source]) connection-leaf-pairs)
+                      (mapcat (fn [[canonical & others]]
+                                (map (fn [other] [other canonical]) others))
+                              share-leaf-groups)))
+        value-replacements
         (into {}
               (concat (map (fn [[source target]] [target source]) connection-pairs)
                       (mapcat (fn [[canonical & others]]
@@ -261,18 +308,18 @@
               (map (fn [[discarded canonical]]
                      [(get-in nodes0 [discarded :view :allocation :id])
                       (get-in nodes0 [canonical :view :allocation :id])]))
-              replacements)
-        connected-sources (set (map first connection-pairs))
+              node-replacements)
+        connected-sources (set (map first connection-leaf-pairs))
         shared-source-by-node
         (into {}
               (mapcat (fn [group]
                         (let [source (canonical-source group nodes0)]
                           (map (fn [node-id] [node-id source]) group)))
-                      share-groups))
+                      share-leaf-groups))
         nodes
         (into {}
               (keep (fn [[node-id node]]
-                      (when-not (contains? replacements node-id)
+                      (when-not (contains? node-replacements node-id)
                         (let [allocation (get-in node [:view :allocation])
                               allocation-id (:id allocation)
                               allocation-id' (get allocation-replacements allocation-id
@@ -284,9 +331,20 @@
                                      (assoc :source (get shared-source-by-node node-id)))]
                           [node-id node]))))
               nodes0)
-        resolve-node #(get replacements % %)
+        resolve-node #(get node-replacements % %)
+        resolve-value #(get value-replacements % %)
+        values
+        (into {}
+              (keep (fn [[value-id value]]
+                      (when-not (contains? value-replacements value-id)
+                        [value-id (update value :leaves
+                                          (fn [leaves]
+                                            (mapv #(update % :node resolve-node) leaves)))])))
+              values0)
         node-mapping (into {} (map (fn [[reference node-id]]
                                      [reference (resolve-node node-id)])) node-mapping0)
+        value-mapping (into {} (map (fn [[reference value-id]]
+                                      [reference (resolve-value value-id)])) value-mapping0)
         allocation-mapping
         (into {}
               (mapcat (fn [{component-id :id lowering :lowering}]
@@ -311,8 +369,8 @@
          (mapcat (fn [{component-id :id lowering :lowering}]
                    (map (fn [instance]
                           (namespace-instance id component-id
-                                              (comp resolve-node
-                                                    #(get node-mapping0 [component-id %]))
+                                              (comp resolve-value
+                                                    #(get value-mapping0 [component-id %]))
                                               instance))
                         (get-in lowering [:plan :instances])))
                  components))
@@ -322,9 +380,11 @@
                             :when (neg? (compare (pr-str left-id) (pr-str right-id)))
                             :when (bview/overlaps? (:view left) (:view right))]
                         #{left-id right-id}))
-        output-ids (mapv node-mapping outputs)
+        output-value-ids (mapv value-mapping outputs)
+        output-ids (vec (mapcat #(map :node (get-in values [% :leaves])) output-value-ids))
         plan (link-plan/make
-              {:id id :target target :nodes nodes :instances instances :outputs output-ids
+              {:id id :target target :nodes nodes :values values
+               :instances instances :outputs output-ids
                :aliases aliases
                :attributes (merge attributes
                                   {:lowered-from :certified-link-composition
@@ -334,7 +394,8 @@
         (->LinkCompositionCertificate
          :certified-link-plans :link-plan id target
          (mapv (comp :id :plan :lowering) components)
-         connections shares node-mapping allocation-mapping instance-mapping output-ids)]
+         connections shares value-mapping node-mapping allocation-mapping instance-mapping
+         output-ids)]
     {:plan plan :certificate certificate :components components
      :specification (assoc specification :connections connections :shares shares
                            :outputs outputs :attributes attributes)}))
@@ -365,12 +426,12 @@
 
    `components` is an ordered vector of `{:id component-id :lowering certified-lowering}`.
    `specification` requires ordered `:outputs` and optionally contains:
-   - `:connections` — `{:from [producer-id output-node] :to [consumer-id input-node]}`;
-   - `:shares` — groups of equal input/constant boundary node references;
+   - `:connections` — `{:from [producer-id output-value] :to [consumer-id input-value]}`;
+   - `:shares` — groups of equal input/constant logical value references;
    - `:attributes` — inspectable composite metadata.
 
-   This first contract intentionally rejects endpoints whose allocation has multiple views. The
-   following AbstractValue/view consolidation pass will make ranged boundary composition explicit."
+   Composite values unify atomically across their ordered leaves. Endpoints whose individual
+   physical allocations have multiple views remain rejected until ranged composition is explicit."
   [{:keys [id components] :as request}]
   (let [specification (select-keys request [:connections :shares :outputs :attributes])
         {:keys [plan certificate components specification]}

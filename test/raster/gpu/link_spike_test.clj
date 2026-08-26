@@ -17,10 +17,12 @@
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.link-plan :as link-plan]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pl]
             [raster.dl.nn :as nn]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as gpu-link]
+            [raster.gpu.resident-value :as resident-value]
             [raster.gpu.value :as value])
   (:import [java.util.concurrent.atomic AtomicBoolean]))
 
@@ -72,31 +74,88 @@
     (is (= output-ids (vec (keys (gpu-link/outputs executable)))))
     (is (= (range 12) (vals (gpu-link/outputs executable))))))
 
+(deftest public-logical-outputs-preserve-composite-field-order
+  (let [composite (link-plan/value
+                   {:id :pair
+                    :abstract (av/tensor {:dtype :float :shape [4]})
+                    :physical-layout {:kind :ordered-fields :field-order [:data :scale]}
+                    :leaves [{:name :data :node :data} {:name :scale :node :scale}]})
+        dense (link-plan/value
+               {:id :dense :abstract (av/tensor {:dtype :float :shape [4]})
+                :leaves [{:name :value :node :dense-node}]})
+        executable (gpu-link/map->LinkedExecutable
+                    {:plan {:outputs [:data :scale :dense-node]
+                            :values {:pair composite :dense dense}}
+                     :node-views {:data :data-view :scale :scale-view :dense-node :dense-view}
+                     :closed? (atom false)})
+        outputs (gpu-link/output-values executable)]
+    (is (= [:pair :dense] (vec (keys outputs))))
+    (is (= :dense-view (:dense outputs)))
+    (is (= [:data :scale] (mapv :name (get-in outputs [:pair :fields]))))
+    (is (= [:data-view :scale-view] (mapv :value (get-in outputs [:pair :fields]))))))
+
+(deftest composite-dispatch-projection-preserves-certified-physical-abi
+  (let [allocation-a (bview/allocation {:id :a :byte-size 16 :memory-space :device
+                                        :device :ze:0})
+        allocation-b (bview/allocation {:id :b :byte-size 16 :memory-space :device
+                                        :device :ze:0})
+        view-a (gpu/->ResidentBufferView :session :a
+                                         (bview/view allocation-a {:dtype :float :shape [4]}))
+        view-b (gpu/->ResidentBufferView :session :b
+                                         (bview/view allocation-b {:dtype :int :shape [4]}))
+        composite (resident-value/composite
+                   :pair [{:name :data :value view-a} {:name :index :value view-b}])
+        slots [(kabi/slot 'pair_data :input :float :binding 'pair :field :data)
+               (kabi/slot 'pair_index :input :int :binding 'pair :field :index)]
+        step {:phase :dispatch :logical-bindings? true
+              :argument-specs [{:kind :pointer :binding 'pair :slots slots}
+                               {:kind :scalar}]}
+        scalar {:type :long :value 4}]
+    (is (= [view-a view-b scalar]
+           (#'gpu-link/physical-step-arguments step [composite scalar])))))
+
 (deftest linked-composite-value-expands-through-the-common-runtime
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "LinkValue composite ABI expansion")
     (let [n 16
           x-a (float-array (map float (range n)))
           x-b (float-array (map #(float (* 2 %)) (range n)))
-          expected (float-array (map + x-a x-b))
+          expected-sum (float-array (map + x-a x-b))
+          expected-difference (float-array (map - x-a x-b))
           kernel
           (artifact/make
            {:kernel-name "linked_composite_add"
             :source (str "__kernel void linked_composite_add("
                          "__global const float* x_a, __global const float* x_b, "
-                         "__global float* y, long n) { "
-                         "long i = get_global_id(0); if (i < n) y[i] = x_a[i] + x_b[i]; }")
+                         "__global float* y_sum, __global float* y_difference, long n) { "
+                         "long i = get_global_id(0); if (i < n) { "
+                         "y_sum[i] = x_a[i] + x_b[i]; "
+                         "y_difference[i] = x_a[i] - x_b[i]; } }")
             :abi [(kabi/slot 'x_a :input :float :binding 'x :field :a)
                   (kabi/slot 'x_b :input :float :binding 'x :field :b)
-                  (kabi/slot 'y :output :float)
+                  (kabi/slot 'y_sum :output :float :binding 'y :field :sum)
+                  (kabi/slot 'y_difference :output :float :binding 'y :field :difference)
                   (kabi/slot 'n :scalar :long)]
-            :arguments '[x_a x_b y n]
+            :arguments '[x_a x_b y_sum y_difference n]
             :launch (launch/spec {:workgroup-size [64]
                                   :group-count [(launch/ceil-div 'n 64)]})})
           descriptor
           {:dtype :float :all-params '[x n] :array-params '[x] :scalar-params '[n]
            :array-roles {'x :input}
-           :allocs [{:sym 'y :dtype :float :size-fn (fn [args] (long (nth args 1)))}]
+           :value-specs
+           {'x {:abstract (av/tensor {:dtype :float :shape ['n]
+                                      :representation {:kind :two-input-fields}})
+                :physical-layout {:kind :ordered-fields :field-order [:a :b]}
+                :leaves [{:field :a :dtype :float} {:field :b :dtype :float}]}}
+           :allocs
+           [{:sym 'y
+             :abstract (av/tensor {:dtype :float :shape ['n]
+                                   :representation {:kind :two-output-fields}})
+             :physical-layout {:kind :ordered-fields :field-order [:sum :difference]}
+             :leaves [{:field :sum :dtype :float
+                       :size-fn (fn [args] (long (nth args 1)))}
+                      {:field :difference :dtype :float
+                       :size-fn (fn [args] (long (nth args 1)))}]}]
            :steps [{:phase :add :kernel-name "linked_composite_add" :convention :map
                     :artifact kernel :logical-bindings? true
                     :argument-specs [{:kind :pointer :sym 'x}
@@ -104,24 +163,17 @@
                                      {:kind :scalar :type :long
                                       :value-fn (fn [args] (long (nth args 1)))}]}]
            :result-sym 'y}
-          node (fn [id role source]
-                 (link-plan/node {:id id :dtype :float :shape [n] :device :ze:0
-                                  :role role :source source}))
-          nodes [(node :x-a :input x-a) (node :x-b :input x-b) (node :y :output nil)]
-          composite (link-plan/value
-                     {:id :x
-                      :abstract (av/tensor {:dtype :float :shape [n]
-                                            :representation {:kind :soa-test}})
-                      :leaves [{:name :a :node :x-a} {:name :b :node :x-b}]})
-          instance (link-plan/instance
-                    {:id :add :descriptor descriptor :bindings {'x :x 'y :y}
-                     :scalars {'n n} :arguments [nil n]})
-          plan (link-plan/make {:id :composite-add :target :ze:0 :nodes nodes
-                                :values [composite] :instances [instance] :outputs [:y]})
-          executable (gpu-link/instantiate! plan)]
+          lowering (resident-plan/lower
+                    {:id :composite-add :target :ze:0 :descriptor descriptor
+                     :arguments [{:a x-a :b x-b} n]})
+          executable (gpu-link/instantiate! (:plan lowering))
+          sum-node [:composite-add 'y :sum]
+          difference-node [:composite-add 'y :difference]]
       (try
         (gpu-link/run! executable)
-        (is (= (vec expected) (vec (gpu-link/download executable :y))))
+        (is (= (vec expected-sum) (vec (gpu-link/download executable sum-node))))
+        (is (= (vec expected-difference)
+               (vec (gpu-link/download executable difference-node))))
         (finally (gpu-link/close! executable))))))
 
 (deftest attached-close-attempts-the-entire-reverse-order-teardown
