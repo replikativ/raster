@@ -1,8 +1,8 @@
 (ns raster.quant.kernels-k-gpu-test
-  "The SAME composable K-quant GEMV deftms (qmatmul-q{4,6}k-gpu!) compile to OpenCL via the
+  "The composable K-quant GEMV/GEMM deftms compile to OpenCL via the
    shared c_emit and run on the GPU (ze:0), byte-exact with the CPU composable kernel on
    identical quantized inputs. Proves the format registry reaches a working GPU kernel through
-   the work-item-per-row par/map-void! twin — int8 weights + float scales + int bsums in one
+   shared par/map-void! path — int8 weights + float scales + int bsums in one
    mixed-dtype kernel. Skipped when no GPU device is present."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.quant.kernels-k :as qk]
@@ -154,30 +154,6 @@
             (is (every? (fn [o] (= (int (aget yref o)) (int (aget ^floats ygpu o)))) (range out))))
           (finally (gpu/close-session! sess)))))))
 
-(deftest q4k-gpu-matches-cpu
-  (when (gpu-available?)
-    (testing "Q4_K work-item-per-row kernel on ze:0 == CPU composable"
-      (let [out 32 in 256
-            W (gen (* out in) 11) x (gen in 22)
-            {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
-            {:keys [xq xs bsums]}    (q/quantize-act-q8k x in q/q4-K)
-            ycpu (float-array out)
-            _ (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq ycpu in out 0 out)
-            sess (gpu/make-session :ze:0)]
-        (try
-          (gpu/compile! sess :q4k #'qk/qmatmul-q4k-gpu!)
-          (gpu/alloc! sess {:xq [:byte (alength xq) xq] :xs [:float (alength xs) xs]
-                            :bsums [:int (alength bsums) bsums] :wq [:byte (alength wq) wq]
-                            :da [:float (alength da) da] :db [:float (alength db) db]
-                            :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
-                            :y [:float out nil]})
-          (gpu/invoke! sess :q4k
-                       {"xq" :xq "xs" :xs "bsums" :bsums "wq" :wq "da" :da "db" :db
-                        "aq" :aq "bq" :bq "y" :y}
-                       [{:type :int :value in}] out)
-          (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
-          (finally (gpu/close-session! sess)))))))
-
 (deftest q4k-dp4a-bound-dispatch
   (when (gpu-available?)
     (testing "prepare!/invoke-bound! (sync) and async prepare!+sync! match invoke! result"
@@ -192,18 +168,18 @@
             scal [{:type :int :value in}]
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a!)
+          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:xp [:int (alength xp) xp] :xs [:float (alength xs) xs]
                             :bsums [:int (alength bsums) bsums] :wp [:int (alength wp) wp]
                             :da [:float (alength da) da] :db [:float (alength db) db]
                             :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
                             :y [:float out nil]})
           ;; synchronous bound dispatch
-          (gpu/prepare! sess :q4kdp sym scal out)
+          (gpu/prepare! sess :q4kdp sym (conj scal {:type :int :value out}) out)
           (gpu/invoke-bound! sess :q4kdp)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "sync bound")
           ;; async bound dispatch: zero result, batch-launch, sync, then read
-          (gpu/prepare! sess :q4kdp sym scal out {:async? true})
+          (gpu/prepare! sess :q4kdp sym (conj scal {:type :int :value out}) out {:async? true})
           (dotimes [_ 3] (gpu/invoke-bound! sess :q4kdp))
           (gpu/sync! sess)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3) "async bound + sync!")
@@ -227,13 +203,13 @@
             a (mk 11 22) b (mk 99 88)
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:axp [:int (alength ^ints (:xp a)) (:xp a)] :axs [:float (alength ^floats (:xs a)) (:xs a)] :abs [:int (alength ^ints (:bsums a)) (:bsums a)]
                             :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
                             :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)]
                             :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
-          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in}] out {:kernel-phase :mm})
-          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
           (gpu/invoke-bound! sess :a)
           (gpu/invoke-bound! sess :b)
           (is (< (maxerr (:ycpu a) (gpu/download sess :ay)) 1e-3) "binding A correct")
@@ -243,7 +219,8 @@
 (deftest q8k-quant-then-matmul-chain
   (when (gpu-available?)
     (testing "GPU q8_K activation quantizer feeds dp4a matmul, all on-device in one graph"
-      ;; The decode enabler: quantize the float activation ON the GPU (quant-act-q8k-gpu!),
+      ;; The decode enabler: quantize the float activation ON the GPU
+      ;; (quant-act-q8k-rows-gpu!),
       ;; then the matmul consumes xp/xs/bsums with NO host round-trip. Recorded as a 2-op graph
       ;; (barrier enforces quant→matmul order). Result must match the CPU dequant reference.
       (let [out 32 in 256 nsb (quot in 256)
@@ -260,8 +237,8 @@
                    y)
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :quant #'qk/quant-act-q8k-gpu!)
-          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/compile! sess :quant #'qk/quant-act-q8k-rows-gpu!)
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:x [:float in x]
                             :xp [:int (quot in 4) nil] :xs [:float nsb nil] :bsums [:int (quot in 32) nil]
                             :submax [:float (* nsb 8) nil]
@@ -271,14 +248,57 @@
           (gpu/prepare! sess :quant {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
                         [] (* nsb 8) {:kernel-phase :quant :index 0})
           (gpu/prepare! sess :quant2 {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}
-                        [] (* nsb 8) {:kernel-phase :quant :index 1})
+                        [{:type :int :value in}] (* nsb 8) {:kernel-phase :quant :index 1})
           (gpu/prepare! sess :mm {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
-                        [{:type :int :value in}] out {:kernel-phase :mm})
+                        [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
           (gpu/record-graph! sess [:quant :quant2 :mm])
           (gpu/replay! sess)
           (let [ygpu (gpu/download sess :y)
                 scale (reduce max 1e-9 (map (fn [v] (Math/abs (double v))) (seq yref)))]
             (is (< (/ (maxerr yref ygpu) scale) 1e-2) "on-device quant→matmul == CPU dequant ref"))
+          (finally (gpu/close-session! sess)))))))
+
+(deftest q8k-quant-then-q4k-projection-batches-independent-rows
+  (when (gpu-available?)
+    (testing "one generated Q4_K path handles B>1 while sharing the packed weight leaves"
+      (let [nrows 3 out 17 in 512 nsb (quot in 256) nsub (quot in 32)
+            W (gen (* out in) 105) x (gen (* nrows in) 106)
+            {:keys [wq da db aq bq]} (q/quantize-weight-q4k W q/q4-K)
+            wp (bytes->ints-le wq)
+            yref (float-array (* nrows out))
+            _ (dotimes [row nrows]
+                (let [xr (float-array in)
+                      _ (System/arraycopy x (* row in) xr 0 in)
+                      {:keys [xq xs bsums]} (q/quantize-act-q8k xr in q/q4-K)
+                      yr (float-array out)]
+                  (qk/qmatmul-q4k-composable! xq xs bsums wq da db aq bq yr in out 0 out)
+                  (System/arraycopy yr 0 yref (* row out) out)))
+            sess (gpu/make-session :ze:0)]
+        (try
+          (gpu/compile! sess :quant-rows #'qk/quant-act-q8k-rows-gpu!)
+          (gpu/compile! sess :q4k-rows #'qk/qmatmul-q4k-dp4a-rows!)
+          (gpu/alloc! sess {:x [:float (* nrows in) x]
+                            :xp [:int (* nrows (quot in 4)) nil]
+                            :xs [:float (* nrows nsb) nil]
+                            :bsums [:int (* nrows nsub) nil]
+                            :submax [:float (* nrows nsub) nil]
+                            :wp [:int (alength wp) wp]
+                            :da [:float (alength da) da] :db [:float (alength db) db]
+                            :aq [:byte (alength aq) aq] :bq [:byte (alength bq) bq]
+                            :y [:float (* nrows out) nil]})
+          (let [bindings {"x" :x "xp" :xp "xs" :xs "bsums" :bsums "submax" :submax}]
+            (gpu/prepare! sess :quant-rows-max bindings [] (* nrows nsub)
+                          {:kernel-phase :quant-rows :index 0})
+            (gpu/prepare! sess :quant-rows-pack bindings [{:type :int :value in}]
+                          (* nrows nsub) {:kernel-phase :quant-rows :index 1}))
+          (gpu/prepare! sess :q4k-rows
+                        {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp
+                         "da" :da "db" :db "aq" :aq "bq" :bq "y" :y}
+                        [{:type :int :value in} {:type :int :value out}]
+                        (* nrows out) {:kernel-phase :q4k-rows})
+          (gpu/record-graph! sess [:quant-rows-max :quant-rows-pack :q4k-rows])
+          (gpu/replay! sess)
+          (is (< (maxerr yref (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 
 (deftest q4k-dp4a-command-graph
@@ -295,11 +315,11 @@
             a (mk 11 22) b (mk 77 88)
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a!)
+          (gpu/compile! sess :mm #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:axp [:int (alength ^ints (:xp a)) (:xp a)] :axs [:float (alength ^floats (:xs a)) (:xs a)] :abs [:int (alength ^ints (:bsums a)) (:bsums a)] :awp [:int (alength ^ints (:wp a)) (:wp a)] :ada [:float (alength ^floats (:da a)) (:da a)] :adb [:float (alength ^floats (:db a)) (:db a)] :aaq [:byte (alength ^bytes (:aq a)) (:aq a)] :abq [:byte (alength ^bytes (:bq a)) (:bq a)] :ay [:float out nil]
                             :bxp [:int (alength ^ints (:xp b)) (:xp b)] :bxs [:float (alength ^floats (:xs b)) (:xs b)] :bbs [:int (alength ^ints (:bsums b)) (:bsums b)] :bwp [:int (alength ^ints (:wp b)) (:wp b)] :bda [:float (alength ^floats (:da b)) (:da b)] :bdb [:float (alength ^floats (:db b)) (:db b)] :baq [:byte (alength ^bytes (:aq b)) (:aq b)] :bbq [:byte (alength ^bytes (:bq b)) (:bq b)] :by [:float out nil]})
-          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in}] out {:kernel-phase :mm})
-          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :a {"xp" :axp "xs" :axs "bsums" :abs "wp" :awp "da" :ada "db" :adb "aq" :aaq "bq" :abq "y" :ay} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
+          (gpu/prepare! sess :b {"xp" :bxp "xs" :bxs "bsums" :bbs "wp" :bwp "da" :bda "db" :bdb "aq" :baq "bq" :bbq "y" :by} [{:type :int :value in} {:type :int :value out}] out {:kernel-phase :mm})
           (gpu/record-graph! sess [:a :b])
           (gpu/replay! sess)
           (is (< (maxerr (:y a) (gpu/download sess :ay)) 1e-3) "graph op A")
@@ -321,7 +341,7 @@
             wp (bytes->ints-le wq) xp (pack-i8 xq)
             sess (gpu/make-session :ze:0)]
         (try
-          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a!)
+          (gpu/compile! sess :q4kdp #'qk/qmatmul-q4k-dp4a-rows!)
           (gpu/alloc! sess {:xp [:int (alength xp) xp] :xs [:float (alength xs) xs]
                             :bsums [:int (alength bsums) bsums] :wp [:int (alength wp) wp]
                             :da [:float (alength da) da] :db [:float (alength db) db]
@@ -330,7 +350,7 @@
           (gpu/invoke! sess :q4kdp
                        {"xp" :xp "xs" :xs "bsums" :bsums "wp" :wp "da" :da "db" :db
                         "aq" :aq "bq" :bq "y" :y}
-                       [{:type :int :value in}] out)
+                       [{:type :int :value in} {:type :int :value out}] out)
           (is (< (maxerr ycpu (gpu/download sess :y)) 1e-3))
           (finally (gpu/close-session! sess)))))))
 

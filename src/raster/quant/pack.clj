@@ -9,7 +9,7 @@
     - `quantize-one-q8`  → signed q8_0 int32-packed rows {:wp :ws} read by
       qmatmul-i8-gemm! / i8gemv-dp4a!.
     - `q4k-of`           → the Q4_K dp4a buffer set {:wp :da :db :aq :bq}
-      read by qmatmul-q4k-dp4a!, delegating to the validated CPU packer
+      read by qmatmul-q4k-dp4a-rows!, delegating to the validated CPU packer
       (raster.compiler.backend.cpu.quant/quantize-weight-q4k), zero-padding
       rows to in % 256 == 0 and reinterpreting the nibble bytes as int[].
 
@@ -45,7 +45,7 @@
 (defn q4k-of
   "Quantize a row-major [out,in] f32 weight to the Q4_K dp4a buffer set
   {:wp int[] :da :db floats :aq :bq bytes :in <padded in> :out} — the layout
-  qmatmul-q4k-dp4a! reads. Rows are zero-padded to in % 256 == 0."
+  qmatmul-q4k-dp4a-rows! reads. Rows are zero-padded to in % 256 == 0."
   [^floats W ^long out ^long in]
   (let [inp (nextpad in)
         z (cq/quantize-weight-q4k (padw W out in inp) cq/q4-K)]

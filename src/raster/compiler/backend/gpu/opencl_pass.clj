@@ -55,8 +55,8 @@
   (when (and params tags)
     {:scalar-types (into {} (keep (fn [[p t]]
                                     (case t
-                                      (long longs int ints) [p :int]
-                                      (double doubles float floats) [p :float]
+                                      (long int) [p :int]
+                                      (double float) [p :float]
                                       nil))
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]

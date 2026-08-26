@@ -1451,20 +1451,20 @@
    bare nil (the silent-empty-graph footgun)."
   ([form] (extract-gpu-program form nil))
   ([form kernel-info-fn]
-  (if-not (and (seq? form) (#{'let* 'let} (first form)))
-    {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
-    (let [bindings (partition 2 (second form))
-          body (last form)
-          allocs (volatile! [])
-          steps (volatile! [])
-          scalar-lets (volatile! [])
+   (if-not (and (seq? form) (#{'let* 'let} (first form)))
+     {::non-resident {:why :not-a-let-form :form (when (seq? form) (first form))}}
+     (let [bindings (partition 2 (second form))
+           body (last form)
+           allocs (volatile! [])
+           steps (volatile! [])
+           scalar-lets (volatile! [])
           ;; Intermediate array BINDINGS produced in this program: allocs and
           ;; kernel/GEMM step outputs. These are device-only buffers — a host
           ;; scalar/size-let may NOT read them (see the scalar-let guard below).
           ;; Array PARAMS are deliberately NOT tracked here: the per-call arg-fn
           ;; receives the host arrays, so `(alength W)` on a param stays a valid
           ;; host size expr.
-          device-buffers (volatile! #{})
+           device-buffers (volatile! #{})
           ;; Array aliases: bindings of the form `sym = <bare array symbol>` (e.g. a
           ;; fused-buffer alias `db = hfuse_out`, or a residual/broadcast copy result
           ;; the SOAC fuser rewired to an existing buffer). These carry NO computation —
@@ -1474,75 +1474,75 @@
           ;; binding reaches the array-tag?/reads-device-buffer rejects and defeats an
           ;; otherwise-straight-line resident program (e.g. QLoRA residual base+delta
           ;; backward, where residual-add's two grad copies fuse to one buffer).
-          aliases (volatile! {})
-          ok (volatile! true)
-          reason (volatile! nil)
-          reject! (fn [why sym expr]
-                    (vreset! ok false)
-                    (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
-      (doseq [[sym expr0] bindings]
-        (let [expr (if (seq @aliases) (util/subst-syms @aliases expr0) expr0)]
-          (cond
+           aliases (volatile! {})
+           ok (volatile! true)
+           reason (volatile! nil)
+           reject! (fn [why sym expr]
+                     (vreset! ok false)
+                     (when-not @reason (vreset! reason {:why why :sym sym :form expr})))]
+       (doseq [[sym expr0] bindings]
+         (let [expr (if (seq @aliases) (util/subst-syms @aliases expr0) expr0)]
+           (cond
           ;; pure array-alias binding (`sym = other-array-symbol`) → copy-propagate.
-            (and (symbol? expr)
-                 (or (contains? @device-buffers expr) (array-tag? sym)))
-            (do (vswap! aliases assoc sym expr)
-                (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
-            (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
-            (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
-                (vswap! device-buffers conj sym))
+             (and (symbol? expr)
+                  (or (contains? @device-buffers expr) (array-tag? sym)))
+             (do (vswap! aliases assoc sym expr)
+                 (when (contains? @device-buffers expr) (vswap! device-buffers conj sym)))
+             (and (seq? expr) (contains? gpu-array-alloc-heads (first expr)))
+             (do (vswap! allocs conj {:sym sym :size-expr (second expr)})
+                 (vswap! device-buffers conj sym))
           ;; devirtualized array alloc (alloc-like/zeros-like .invk) — a GEMM/kernel output buffer.
-            (alloc-invk? expr)
-            (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
-                (vswap! device-buffers conj sym))
-            (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
-            (if-let [s (parse-gpu-step sym expr)]
-              (let [ordered-result
-                    (when (and (:arguments s) kernel-info-fn)
-                      (let [abi (:abi (kernel-info-fn (:kernel-name s)))
-                            result-indexes (keep-indexed
-                                            (fn [i slot]
-                                              (when (= :result (:role slot)) i))
-                                            abi)]
-                        (when (= 1 (count result-indexes))
-                          {:value (nth (:arguments s) (first result-indexes))})))]
-                (if (and (= :reduce (:convention s)) ordered-result
-                         (nil? (:value ordered-result)))
+             (alloc-invk? expr)
+             (do (vswap! allocs conj {:sym sym :size-expr (alloc-invk-size expr)})
+                 (vswap! device-buffers conj sym))
+             (and (seq? expr) (symbol? (first expr)) (contains? gpu-invoke-heads (first expr)))
+             (if-let [s (parse-gpu-step sym expr)]
+               (let [ordered-result
+                     (when (and (:arguments s) kernel-info-fn)
+                       (let [abi (:abi (kernel-info-fn (:kernel-name s)))
+                             result-indexes (keep-indexed
+                                             (fn [i slot]
+                                               (when (= :result (:role slot)) i))
+                                             abi)]
+                         (when (= 1 (count result-indexes))
+                           {:value (nth (:arguments s) (first result-indexes))})))]
+                 (if (and (= :reduce (:convention s)) ordered-result
+                          (nil? (:value ordered-result)))
                   ;; The explicit nil :result is the host-scalar staging protocol. It cannot be
                   ;; recorded into a resident graph, but must remain a clean non-resident fallback
                   ;; (rather than reaching descriptor construction and throwing there).
-                  (reject! :host-scalar-reduction sym expr)
-                  (do (vswap! steps conj s) (vswap! device-buffers conj sym)
+                   (reject! :host-scalar-reduction sym expr)
+                   (do (vswap! steps conj s) (vswap! device-buffers conj sym)
                   ;; A :map step's runtime VALUE is its out buffer (invoke-registered-kernel
                   ;; returns output-array), so the binding sym is a pure alias of the out
                   ;; array. Copy-propagate it like any other array alias — a later step
                   ;; that reads the binding sym (e.g. the primary of a horizontally-fused
                   ;; multi-output map, whose out is a fusion-materialized buffer) must
                   ;; resolve to the REAL resident buffer at bind time.
-                  (when (and (#{:map :contract :reduce} (:convention s)) ordered-result)
-                    (let [out (:value ordered-result)]
-                      (when (and (symbol? out) (not= sym out))
-                        (vswap! aliases assoc sym out)))))))
-              (reject! :unparseable-kernel-invoke sym expr))
+                       (when (and (#{:map :contract :reduce} (:convention s)) ordered-result)
+                         (let [out (:value ordered-result)]
+                           (when (and (symbol? out) (not= sym out))
+                             (vswap! aliases assoc sym out)))))))
+               (reject! :unparseable-kernel-invoke sym expr))
           ;; devirtualized BLAS GEMM (.invk dgemm*-impl …) → a :gemm step. A non-default
           ;; alpha/beta is NOT representable by the resident GEMM kernels (they compute
           ;; C = A·B and overwrite C) — reject it by NAME instead of silently dropping the
           ;; scalars, which turned an ACCUMULATE (C += A·B, beta=1) into an OVERWRITE on
           ;; GPU while CPU accumulated. See gemm-alpha-beta-default?.
-            (gemm-invk? expr)
-            (if-let [s (parse-gpu-step sym expr)]
-              (if (op/gemm-default-alpha-beta? (:alpha-expr s) (:beta-expr s))
-                (do (vswap! steps conj s) (vswap! device-buffers conj sym))
-                (reject! :unsupported-gemm-alpha-beta sym expr))
-              (reject! :unparseable-gemm sym expr))
+             (gemm-invk? expr)
+             (if-let [s (parse-gpu-step sym expr)]
+               (if (op/gemm-default-alpha-beta? (:alpha-expr s) (:beta-expr s))
+                 (do (vswap! steps conj s) (vswap! device-buffers conj sym))
+                 (reject! :unsupported-gemm-alpha-beta sym expr))
+               (reject! :unparseable-gemm sym expr))
           ;; An ARRAY-tagged binding that reached here is an unlowered device-array op (an
           ;; elementwise/reduction op with no resident kernel, or an array alias the resident path
           ;; can't rewire) — NOT a host scalar-let. Reject the straight-line extraction so the
           ;; caller falls back to the staging fn (rather than eval'ing an array .invk as a scalar
           ;; size closure). E.g. an AD-emitted daxpy-diff-into! or a raw loss reduction that did
           ;; not lower to a par kernel in this composed path.
-            (array-tag? sym)
-            (reject! :unlowered-array-op sym expr)
+             (array-tag? sym)
+             (reject! :unlowered-array-op sym expr)
           ;; A SCALAR binding whose init READS an intermediate device buffer is a
           ;; reduction (device array → scalar), NOT a host size-let — e.g. the
           ;; primal `(.invk mse-loss-impl pred tgt n)` reducing the pred buffer to
@@ -1554,18 +1554,18 @@
           ;; until then, reject so the caller falls back cleanly (non-resident)
           ;; rather than throwing. Reading an array PARAM (host-available, e.g.
           ;; alength) is fine — only intermediate buffers are tracked.
-            (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
-            (reject! :scalar-let-reads-device-buffer sym expr)
+             (seq (set/intersection (mem/sexp-free-vars expr) @device-buffers))
+             (reject! :scalar-let-reads-device-buffer sym expr)
           ;; A pure scalar binding (no nested kernel) feeds sizes/counts — keep it.
-            (not (contains-gpu-invoke? expr))
-            (vswap! scalar-lets into [sym expr])
+             (not (contains-gpu-invoke? expr))
+             (vswap! scalar-lets into [sym expr])
           ;; control flow / kernel-result-into-scalar → not straight-line.
-            :else (reject! :control-flow-or-host-scalar sym expr))))
-      (let [body (if (seq @aliases) (util/subst-syms @aliases body) body)]
-        (cond
-          (not @ok)      {::non-resident @reason}
-          (empty? @steps) {::non-resident {:why :no-kernel-steps}}
-          :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))))
+             :else (reject! :control-flow-or-host-scalar sym expr))))
+       (let [body (if (seq @aliases) (util/subst-syms @aliases body) body)]
+         (cond
+           (not @ok)      {::non-resident @reason}
+           (empty? @steps) {::non-resident {:why :no-kernel-steps}}
+           :else {:allocs @allocs :steps @steps :scalar-lets @scalar-lets :result body}))))))
 
 (defn- strip-meta
   "Drop a symbol's metadata — the walker stamps :tag, and a primitive-initialized local can't
@@ -2235,12 +2235,24 @@
         effective-dtype (or dtype (infer-dtype resolved-var)
                             ;; Scalar-only functions default to double precision
                             :double)
+        source-ns (let [m (meta resolved-var)]
+                    (or (when-let [s (:raster.core/deftm-source-ns m)]
+                          (try (the-ns s) (catch Exception _ nil)))
+                        (when (var? resolved-var) (.ns ^clojure.lang.Var resolved-var))))
         param-env (build-param-env f-var dtype)
+        gpu-param-types (when target-device
+                          (opencl-pass/derive-param-types
+                           (:raster.core/deftm-params (meta resolved-var))
+                           (:raster.core/deftm-tags (meta resolved-var))
+                           effective-dtype))
         opts (cond-> {:inline? inline?
                       :active-params active-params
                       :simd? simd? :target-device target-device
                       :dtype effective-dtype}
-               param-env (assoc :param-env param-env))
+               param-env (assoc :param-env param-env)
+               source-ns (assoc :source-ns source-ns)
+               gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
+                                      :array-types (:array-types gpu-param-types)))
         {:keys [stages stats]} (run-passes-diagnostic raw-form passes opts)
         backend-type (get-in stages [:backend-type])]
     (-> {:walked raw-form
