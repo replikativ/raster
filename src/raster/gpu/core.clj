@@ -490,7 +490,11 @@
    Topology-aware: uses zero-copy on integrated GPUs, memcpy on discrete.
 
    sess: session atom
-   buffer-specs: {key → [dtype n source-array-or-nil]}
+   buffer-specs: {key → [dtype n source-array-or-nil allocation-opts?]}
+
+   `allocation-opts`, when present, carries the same stable allocation metadata accepted by
+   register-buffer!, including :allocation-id. The fourth element affects the public allocation
+   contract only; allocation and initial upload still use the first three elements.
 
    Buffers are merged into the session — call multiple times to add more.
    If allocation fails partway through, already-allocated buffers are freed."
@@ -508,7 +512,8 @@
               (try
                 (into {}
                       (map (fn [[key buffer]]
-                             [key (allocation-contract device-id session-id key buffer :owned {})]))
+                             [key (allocation-contract device-id session-id key buffer :owned
+                                                       (or (nth (get buffer-specs key) 3 nil) {}))]))
                       new-bufs)
                 (catch Exception e
                   (free-buffers-internal! new-bufs device-id)
@@ -685,8 +690,9 @@
   phase-keys: ordered vector of phase-keys previously bound via prepare!. The kernel sequence
   and buffer pointers are fixed; buffer CONTENTS may change between replays. Stored under :graph
   (or graph-key). Re-record only if the sequence or a buffer is reallocated."
-  ([sess phase-keys] (record-graph! sess phase-keys :graph))
-  ([sess phase-keys graph-key]
+  ([sess phase-keys] (record-graph! sess phase-keys :graph {}))
+  ([sess phase-keys graph-key] (record-graph! sess phase-keys graph-key {}))
+  ([sess phase-keys graph-key {:keys [profile?] :or {profile? false}}]
    (let [device-id (:device-id @sess)
          record-fn (rt-resolve device-id "record-graph!")
          entries (mapv (fn [pk]
@@ -701,14 +707,19 @@
          graph (try
                  (when prologue-graph
                    ((rt-resolve device-id "replay-graph!") prologue-graph))
-                 (record-fn replay-prepareds)
+                 ;; Keep the non-profiling recording on the backend's exact fast path. Profiling
+                 ;; events are a graph-construction property, not a replay flag.
+                 (if profile?
+                   (record-fn replay-prepareds {:barriers? true :profile? true})
+                   (record-fn replay-prepareds))
                  (catch Exception e
                    (destroy-recorded-graph-entry! device-id prologue-graph)
                    (throw e)))
-         entry (if prologue-graph
+         entry (if (or prologue-graph profile?)
                  {::recorded-graph true
                   :replay-graph graph
-                  :prologue-graph prologue-graph}
+                  :prologue-graph prologue-graph
+                  :profile? (boolean profile?)}
                  graph)]
      (destroy-recorded-graph-entry! device-id (get-in @sess [:graphs graph-key]))
      (swap! sess assoc-in [:graphs graph-key] entry)
@@ -722,7 +733,12 @@
          entry (or (get-in @sess [:graphs graph-key])
                    (throw (ex-info (str "No graph: " graph-key " — call record-graph! first") {})))
          graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
-     ((rt-resolve device-id "replay-graph!") graph))))
+     ((rt-resolve device-id "replay-graph!") graph)
+     ;; A normal replay intentionally discards profiling data, just like run-program!. Events
+     ;; must be reset before the next replay; profile-recorded-graph! reads and resets instead.
+     (when (and (recorded-graph-entry? entry) (:profile? entry))
+       (when-let [reset-fn (rt-resolve-soft device-id "reset-graph-events!")]
+         (reset-fn graph))))))
 
 (defn release-recorded-graph!
   "Release one graph recorded by record-graph!. Idempotent. Prepared executable steps and their
@@ -2365,6 +2381,30 @@
        :device-wall-ms (:wall-ms prof)
        :host-wall-ms (/ (- t1 t0) 1.0e6)})))
 
+(defn profile-recorded-graph!
+  "Replay a graph recorded by record-graph! with `{:profile? true}` and return its backend-neutral
+   device-event profile. Unlike replay!, this consumes (and resets) the timestamps instead of
+   discarding them. The graph representation remains private to the session layer."
+  [sess graph-key]
+  (let [device-id (:device-id @sess)
+        entry (or (get-in @sess [:graphs graph-key])
+                  (throw (ex-info (str "No graph: " graph-key " — call record-graph! first")
+                                  {:graph-key graph-key})))
+        graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
+    (when-not (and (recorded-graph-entry? entry) (:profile? entry))
+      (throw (ex-info "recorded graph was not created with {:profile? true}"
+                      {:graph-key graph-key})))
+    (let [replay-fn (rt-resolve device-id "replay-graph!")
+          read-ts-fn (rt-resolve device-id "read-graph-timestamps!")
+          t0 (System/nanoTime)
+          _ (replay-fn graph)
+          t1 (System/nanoTime)
+          prof (read-ts-fn graph)]
+      {:profile (mapv #(select-keys % [:kernel-name :phase :ms :context-ms]) (:kernels prof))
+       :kernel-total-ms (reduce + 0.0 (map :ms (:kernels prof)))
+       :device-wall-ms (:wall-ms prof)
+       :host-wall-ms (/ (- t1 t0) 1.0e6)})))
+
 (defn measure-graph!
   "Repeatedly measure a PROFILING runtime graph with backend device events.
 
@@ -2394,6 +2434,19 @@
                              (dissoc :before-sample!)
                              (assoc :timing-source :device-event))]
     (apply measurement/measure! sample-fn (mapcat identity measurement-opts))))
+
+(defn measure-recorded-graph!
+  "Repeatedly measure a session graph recorded with `{:profile? true}`. This is the stable-key
+   counterpart to measure-graph! and keeps backend graph handles out of compiler/runtime APIs."
+  [sess graph-key & {:as opts}]
+  (let [entry (or (get-in @sess [:graphs graph-key])
+                  (throw (ex-info (str "No graph: " graph-key " — call record-graph! first")
+                                  {:graph-key graph-key})))
+        graph (if (recorded-graph-entry? entry) (:replay-graph entry) entry)]
+    (when-not (and (recorded-graph-entry? entry) (:profile? entry))
+      (throw (ex-info "recorded graph was not created with {:profile? true}"
+                      {:graph-key graph-key})))
+    (apply measure-graph! sess graph (mapcat identity opts))))
 
 (defn measure-bound-kernel-graph!
   "Device-event measurement of a bound KernelGraphHandle.

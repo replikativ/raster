@@ -17,7 +17,7 @@
 (def binder-roles #{:input :constant :state :output :scratch})
 
 (defrecord LinkNode [id view role source])
-(defrecord LinkInstance [id descriptor bindings scalars schedule roles])
+(defrecord LinkInstance [id descriptor bindings scalars schedule roles arguments])
 (defrecord LinkPlan [id target nodes instances outputs aliases attributes])
 
 (defn link-node? [x]
@@ -140,7 +140,7 @@
   (when-not (link-instance? instance)
     (throw (ex-info "link plan instances must be LinkInstance values"
                     {:reason :link-instance-type :instance instance :actual (type instance)})))
-  (let [{:keys [id descriptor bindings scalars schedule roles]} instance]
+  (let [{:keys [id descriptor bindings scalars schedule roles arguments]} instance]
     (when (nil? id)
       (throw (ex-info "a link instance requires a stable identity" {:reason :link-instance-id})))
     (when-not (and (map? descriptor) (vector? (:steps descriptor))
@@ -158,6 +158,19 @@
       (throw (ex-info "link instance scalars differ from the descriptor scalar parameters"
                       {:reason :link-scalars :instance id
                        :expected (set (:scalar-params descriptor)) :actual (set (keys scalars))})))
+    (when arguments
+      (when-not (and (vector? arguments) (= (count (:all-params descriptor)) (count arguments)))
+        (throw (ex-info "link instance specialization arguments must follow descriptor order"
+                        {:reason :link-instance-arguments :instance id
+                         :parameters (:all-params descriptor)
+                         :expected (count (:all-params descriptor))
+                         :actual (when (sequential? arguments) (count arguments))})))
+      (let [environment (zipmap (:all-params descriptor) arguments)]
+        (when-not (= scalars (select-keys environment (:scalar-params descriptor)))
+          (throw (ex-info "link instance scalars differ from its specialization arguments"
+                          {:reason :link-instance-argument-scalars :instance id
+                           :scalars scalars
+                           :arguments (select-keys environment (:scalar-params descriptor))})))))
     (when-not (or (nil? schedule) (map? schedule))
       (throw (ex-info "link instance schedule must be nil or resolved schedule data"
                       {:reason :link-schedule :instance id :schedule schedule})))
@@ -170,19 +183,24 @@
 (defn instance
   "Construct one descriptor instance. `:bindings` is data—not a name-decoding function—and maps
    every pointer-valued compiler symbol used by the descriptor to a LinkNode identity. `:scalars`
-   supplies exactly the descriptor's scalar parameters."
-  [{:keys [id descriptor bindings scalars schedule roles] :or {scalars {} roles {}}}]
-  (validate-instance! (->LinkInstance id descriptor bindings scalars schedule roles)))
+   supplies exactly the descriptor's scalar parameters. Optional ordered `:arguments` retains the
+   complete compile-time specialization environment for descriptor closures whose shapes depend on
+   array parameters; runtime pointer binding still comes exclusively from `:bindings`."
+  [{:keys [id descriptor bindings scalars schedule roles arguments] :or {scalars {} roles {}}}]
+  (validate-instance! (->LinkInstance id descriptor bindings scalars schedule roles arguments)))
 
 (defn instance-arguments
-  "Build the descriptor's ordered runtime argument vector. Array positions are intentionally nil:
-   resident binding uses LinkNodes, while scalar/shape closures read their named scalar positions."
+  "Return the descriptor's ordered specialization arguments. Explicit arguments retain array
+   values for descriptor shape closures; absent arguments preserve the hand-built-plan
+   shorthand of nil array positions plus exact named scalars. Runtime pointers are never taken
+   from this vector: resident binding uses LinkNodes exclusively."
   [instance]
-  (let [{:keys [descriptor scalars]} (validate-instance! instance)
+  (let [{:keys [descriptor scalars arguments]} (validate-instance! instance)
         array-params (set (:array-params descriptor))]
-    (mapv (fn [parameter]
-            (if (contains? array-params parameter) nil (get scalars parameter)))
-          (:all-params descriptor))))
+    (or arguments
+        (mapv (fn [parameter]
+                (if (contains? array-params parameter) nil (get scalars parameter)))
+              (:all-params descriptor)))))
 
 (defn descriptor-pointer-symbols
   "Return the exact set of compiler symbols that the resident descriptor binds as pointers.
@@ -489,7 +507,7 @@
               expected-elements
               (try (long (size-fn args))
                    (catch Exception e
-                     (throw (ex-info "link descriptor allocation extent did not resolve from scalars"
+                     (throw (ex-info "link descriptor allocation extent did not resolve from its specialization environment"
                                      {:reason :link-allocation-shape :instance id :symbol sym}
                                      e))))
               actual-elements (shape-elements (get-in link-node [:view :shape]))]

@@ -221,7 +221,7 @@
         instance (link-plan/instance
                   {:id (or instance-id [id :instance]) :descriptor descriptor
                    :bindings bindings :scalars scalar-values :schedule (:schedule descriptor)
-                   :roles roles})
+                   :roles roles :arguments (vec arguments)})
         plan (link-plan/make
               {:id id :target target :nodes nodes :instances [instance]
                :outputs (mapv bindings outputs) :aliases aliases

@@ -119,12 +119,22 @@ attention is the first consumer, not a special compiler pass or linker mode.
 
 The pretrained decoder now composes through declared `ProgramStage` boundaries and `LinkPlan`
 node identities rather than handwritten buffer-name inspection. An ordinary resident descriptor
-also has a pure certifying conversion into a one-instance plan: the checkable witness preserves
+has a pure certifying conversion into a one-instance plan: the checkable witness preserves
 parameter order, pointer/value identity, scalar specialization, roles, realized view contracts,
-schedule, aliases, target, and outputs. The remaining value-layer convergence is runtime-facing:
-make `Compiled` instantiate and invoke that certified plan, then permit independently created
-`Compiled` values to rebind into one plan without host copies. `Compiled` still keeps its session
-internal and its public shape information is flat.
+schedule, aliases, target, and outputs. `Compiled` owns that witness and invokes only its
+`LinkedExecutable`; compatible device inputs use an exact-view no-op or a device-to-device copy,
+never an implicit host round trip. The runtime preserves the certified allocation identities and
+profiles the same stable recorded-graph boundary. Each instance also retains the complete ordered
+specialization environment required by descriptor shape closures, while runtime pointers still
+come only from certified node bindings. The remaining value-layer convergence is to
+compose independently created compiled instances into one plan, where shared node identity removes
+even the device copy, then retire the duplicate legacy whole-program binding API after parity.
+
+Pretrained-rstr's batch boundary is the next concrete shape test: weights bind once to shared
+constant nodes, while residual, scratch, position, logits and token storage are lane-local nodes or
+disjoint views. Packed Q/K/V and attention views already fit LinkPlan. The missing performance work
+is a compiler shape/schedule transform that emits projection, post-attention and head programs with
+a leading logical batch dimension; batching is not a linker convention or an attention special case.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.

@@ -13,11 +13,16 @@
      A3 — frozen weights are :constant (captured at bind), never per-call inputs.
      A4 — multi-output: the out-tree projects all 14 donated adapters as DeviceArrays."
   (:require [clojure.test :refer [deftest testing is]]
+            [raster.core :refer [deftm]]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pl]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.dl.gemma-train-resident-test :as g]
+            [raster.dl.nn :as nn]
             [raster.gpu.compiled :as r]
+            [raster.gpu.core :as gpu]
+            [raster.gpu.link :as gpu-link]
             [raster.gpu.value :as v]))
 
 ;; ── access the gemma harness (privates) ──────────────────────────────────────────
@@ -28,6 +33,11 @@
 ;; ════════════════════════════════════════════════════════════════════════════════
 
 (defrecord ^:private FakeBuf [n-elements dtype])
+
+(deftm artifact-two-step
+  [x :- (Array float) bias :- (Array float) n :- Long] :- (Array float)
+  (let [sum (nn/residual-add x bias n)]
+    (nn/hadamard sum x n)))
 
 (deftest a2-donation-invalidation
   (testing "an ::owned value is live and readable until consumed"
@@ -97,6 +107,35 @@
           (v/free! slice)
           (v/free! base))))))
 
+(deftest compiled-device-input-never-round-trips-through-host
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "Compiled LinkedExecutable device input")
+    (let [n 64
+          bias (float-array (repeat n 2.0))
+          initial (float-array n)
+          input (v/->device (float-array (repeat n 3.0)) :ze:0)
+          compiled (r/compile #'artifact-two-step [initial bias n]
+                              {:target :ze:0 :constants '[bias]
+                               :on-non-resident :throw :profile? true})]
+      (try
+        (let [result (with-redefs [v/->host
+                                   (fn [_]
+                                     (throw (AssertionError.
+                                             "Compiled must not download a device input")))]
+                       (compiled {:x input}))
+              output (get result (keyword (name (:result-sym (:descriptor compiled)))))]
+          (is (every? #(= 15.0 (double %)) (v/->host output)))
+          (is (empty? (:programs @(:session (:executable compiled))))
+              "the invocation is a LinkPlan graph, not bind-program!")
+          (let [profile (r/profile compiled)]
+            (is (= 2 (count (:profile profile))))
+            (is (pos? (:device-wall-ms profile)))
+            (is (not (v/live? output))
+                "profiling invalidates an earlier output whose resident storage it overwrites")))
+        (finally
+          (v/free! input)
+          (r/close! compiled))))))
+
 ;; ════════════════════════════════════════════════════════════════════════════════
 ;; A5 — inspection over a Compiled record (CPU, no device)
 ;; ════════════════════════════════════════════════════════════════════════════════
@@ -109,7 +148,7 @@
                     :dtype :float
                     :steps [{:convention :map} {:convention :gemm} {:convention :map}]}
         c (r/map->Compiled
-           {:session nil :handle nil
+           {:lowering nil :executable nil
             :in-tree  [{:key :a :sym 'a :role :input :donate? false :shape [4] :dtype :float}]
             :out-tree [{:key :b' :sym 'b :shape [4] :dtype :float :from :donated}]
             :donated  {:a :a'}
@@ -172,6 +211,12 @@
                            :donate adapters :constants frozen-syms
                            :gemm-precision :f32-scalar})]
       (try
+        (testing "Compiled is the certified LinkPlan API, not a parallel resident binder"
+          (is (resident-plan/certified-plan? (:lowering step)))
+          (is (gpu-link/linked-executable? (:executable step)))
+          (is (= (r/plan step) (:plan (:executable step))))
+          (is (empty? (:programs @(:session (:executable step))))
+              "Compiled must not register a legacy bind-program! executable"))
         (testing "A3: frozen weights are :constant, never per-call inputs"
           (let [roles (into {} (map (juxt :sym :role)) (:in-tree step))]
             (is (every? #(= :constant (roles %)) frozen-syms)
@@ -194,11 +239,14 @@
             (doseq [{:keys [key sym]} (:out-tree step)
                     :let [da (get last-out key)]
                     :when da]
-              (let [resident-key ((ns-resolve gpu 'resident-key)
-                                  (:session step) (:handle step) sym)]
-                (is (= (get-in @(:session step) [:allocations resident-key :id])
+              (let [node (get-in (r/certificate step) [:bindings sym])
+                    resident (gpu-link/node-view (:executable step) node)
+                    session (:session (:executable step))]
+                (is (= (get-in @session [:allocations (:key resident) :id])
                        (get-in da [:view :allocation :id]))
-                    (str key " shares the session allocation identity")))))
+                    (str key " shares the certified LinkPlan allocation identity"))
+                (is (= node (get-in da [:view :allocation :id]))
+                    (str key " preserves the LinkPlan allocation identity at runtime")))))
           (testing "A1/A6: the value path is BIT-IDENTICAL to the raw run-program! path"
             (doseq [s adapters]
               (let [art (v/->host (get last-out (keyword (str (name s) "'"))))

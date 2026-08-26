@@ -8,14 +8,16 @@
   (:refer-clojure :exclude [run!])
   (:require [clojure.set :as set]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.link-plan :as link-plan]
-            [raster.gpu.core :as gpu]))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.value :as value]))
 
 (declare close! run!)
 
 (defrecord LinkedExecutable
            [plan session owns-session? graph-key phases allocation-keys node-views pending-inputs
-            closed?]
+            profile? closed?]
   java.io.Closeable
   (close [this] (close! this))
   clojure.lang.IFn
@@ -47,7 +49,11 @@
       (throw (ex-info "linked allocation byte size is not integral in its storage dtype"
                       {:reason :link-allocation-size :allocation (:id allocation)
                        :byte-size bytes :dtype dt})))
-    [dt (quot bytes element-bytes) nil]))
+    [dt (quot bytes element-bytes) nil
+     {:allocation-id (:id allocation)
+      :memory-space (:memory-space allocation)
+      :coherence (:coherence allocation)
+      :alignment (:alignment allocation)}]))
 
 (defn- cleanup-attached!
   [session graph-key phases allocation-keys]
@@ -73,7 +79,7 @@
    Attached executables own only their phases, graph recording and allocation registrations. Their
    close does not close the caller session and never frees caller-owned buffers."
   ([plan] (instantiate! plan {}))
-  ([plan {:keys [session external-buffers] :or {external-buffers {}}}]
+  ([plan {:keys [session external-buffers profile?] :or {external-buffers {} profile? false}}]
    ;; This is intentionally the first operation. Everything below may contact a backend.
    (let [plan (link-plan/validate! plan)
          target (:target plan)
@@ -159,7 +165,7 @@
                  :roles (link-plan/instance-roles plan instance)})
                (vswap! phases conj phase)))
            (let [gkey (graph-key execution-id)]
-             (gpu/record-graph! session @phases gkey)
+             (gpu/record-graph! session @phases gkey {:profile? profile?})
              (vreset! recorded-key gkey)
              (->LinkedExecutable plan session owns-session? gkey @phases @allocation-keys
                                  node-views
@@ -173,6 +179,7 @@
                                                                                    :ownership])))
                                                        node-id)))
                                              (:nodes plan)))
+                                 (boolean profile?)
                                  (atom false)))))
        (catch Throwable error
          (if owns-session?
@@ -240,6 +247,125 @@
                        {:elements (reduce * 1 (get-in node [:view :shape]))})
     (swap! (:pending-inputs executable) disj node-id)
     executable))
+
+(defn- same-buffer-range?
+  [left-buffer left-view right-buffer right-view]
+  (and (identical? left-buffer right-buffer)
+       (= (:byte-offset left-view) (:byte-offset right-view))
+       (= (:byte-length left-view) (:byte-length right-view))))
+
+(defn- overlapping-buffer-range?
+  [left-buffer left-view right-buffer right-view]
+  (and (identical? left-buffer right-buffer)
+       (< (:byte-offset left-view) (bview/byte-end right-view))
+       (< (:byte-offset right-view) (bview/byte-end left-view))))
+
+(defn write!
+  "Initialize or replace one complete contiguous LinkNode from a host value or DeviceArray.
+
+   Host values use upload!. A compatible DeviceArray already naming the exact destination range
+   is accepted without a copy; every other compatible resident value uses a backend device copy,
+   never device→host→device. Partially overlapping ranges fail explicitly because backend
+   overlap semantics are not a portable memory contract. Returns the executable."
+  [executable node-id source]
+  (if-not (value/device-array? source)
+    (upload! executable node-id source)
+    (let [executable (ensure-live! executable :write!)
+          node (get-in executable [:plan :nodes node-id])
+          _ (when-not node (node-view executable node-id))
+          _ (when-not (value/live? source)
+              (throw (ex-info "cannot write from a consumed or freed DeviceArray"
+                              {:reason :link-device-input-lifetime :node node-id})))
+          _ (when-not (= (:device source) (get-in executable [:plan :target]))
+              (throw (ex-info "DeviceArray target differs from linked executable target"
+                              {:reason :link-device-input-target :node node-id
+                               :source (:device source)
+                               :target (get-in executable [:plan :target])})))
+          source-view (bview/validate-view! (:view source))
+          destination (node-view executable node-id)
+          destination-view (:view destination)
+          _ (when-not (= [(:dtype destination-view) (:shape destination-view)]
+                         [(:dtype source-view) (:shape source-view)])
+              (throw (ex-info "DeviceArray dtype/shape differs from LinkNode"
+                              {:reason :link-device-input-contract :node node-id
+                               :source {:dtype (:dtype source-view) :shape (:shape source-view)}
+                               :destination {:dtype (:dtype destination-view)
+                                             :shape (:shape destination-view)}})))
+          _ (when-not (and (bview/contiguous? source-view)
+                           (bview/contiguous? destination-view))
+              (throw (ex-info "linked DeviceArray writes require contiguous views"
+                              {:reason :link-device-input-layout :node node-id})))
+          session (:session executable)
+          destination-buffer (gpu/buffer session (:key destination))
+          source-buffer (:buffer source)
+          elements (reduce * 1 (:shape destination-view))]
+      (cond
+        (same-buffer-range? source-buffer source-view destination-buffer destination-view)
+        nil
+
+        (overlapping-buffer-range? source-buffer source-view destination-buffer destination-view)
+        (throw (ex-info "linked DeviceArray write has partially overlapping source/destination"
+                        {:reason :link-device-input-overlap :node node-id}))
+
+        (identical? source-buffer destination-buffer)
+        (let [source-resident
+              (gpu/buffer-view session (:key destination)
+                               {:id (:id source-view)
+                                :byte-offset (:byte-offset source-view)
+                                :dtype (:dtype source-view)
+                                :shape (:shape source-view)
+                                :strides (:strides source-view)})]
+          (gpu/copy-range! session source-resident destination {:elements elements}))
+
+        :else
+        (let [temporary-key [::device-input (random-uuid)]
+              allocation (:allocation source-view)]
+          (gpu/register-buffer! session temporary-key source-buffer
+                                {:ownership :borrowed
+                                 :allocation-id [::device-input-allocation (random-uuid)]
+                                 :memory-space (:memory-space allocation)
+                                 :coherence (:coherence allocation)
+                                 :alignment (:alignment allocation)})
+          (try
+            (let [source-resident
+                  (gpu/buffer-view session temporary-key
+                                   {:id (:id source-view)
+                                    :byte-offset (:byte-offset source-view)
+                                    :dtype (:dtype source-view)
+                                    :shape (:shape source-view)
+                                    :strides (:strides source-view)})]
+              (gpu/copy-range! session source-resident destination {:elements elements}))
+            (finally
+              ;; Borrowed registrations are detached, never freed.
+              (gpu/free-buffer! session temporary-key)))))
+      (swap! (:pending-inputs executable) disj node-id)
+      executable)))
+
+(defn profile!
+  "Profile one replay of an executable instantiated with `{:profile? true}`. Inputs must be ready."
+  [executable]
+  (let [executable (ensure-live! executable :profile!)]
+    (when (seq @(:pending-inputs executable))
+      (throw (ex-info "linked executable has inputs or state that have not been initialized"
+                      {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
+    (gpu/profile-recorded-graph! (:session executable) (:graph-key executable))))
+
+(defn measure!
+  "Measure a profiled LinkedExecutable with device events. Stateful plans require the explicit
+   `:before-sample!` restore hook so repeated samples cannot silently measure mutated state."
+  [executable & {:keys [before-sample!] :as opts}]
+  (let [executable (ensure-live! executable :measure!)
+        state-nodes (into #{} (keep (fn [[node-id node]]
+                                      (when (= :state (:role node)) node-id)))
+                          (get-in executable [:plan :nodes]))]
+    (when (seq @(:pending-inputs executable))
+      (throw (ex-info "linked executable has inputs or state that have not been initialized"
+                      {:reason :link-pending-inputs :nodes @(:pending-inputs executable)})))
+    (when (and (seq state-nodes) (nil? before-sample!))
+      (throw (ex-info "stateful linked executables require :before-sample! restoration"
+                      {:reason :link-stateful-measurement :state-nodes state-nodes})))
+    (apply gpu/measure-recorded-graph! (:session executable) (:graph-key executable)
+           (mapcat identity opts))))
 
 (defn download
   "Download one complete contiguous LinkNode view. Debug/host-boundary helper, not invocation."
