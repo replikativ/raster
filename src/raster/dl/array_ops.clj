@@ -103,6 +103,67 @@
 ;; GENERIC PRIMITIVES
 ;; ================================================================
 
+(deftm argmax-rows!
+  "Write the deterministic argmax of each row in row-major `values[nrows,width]` to
+  `indices[nrows]`. Ties choose the smallest column. NaN is ordered above every numeric value,
+  so a row containing NaNs returns the first NaN column and exposes numerical corruption rather
+  than silently choosing an unrelated finite logit.
+
+  The schedule is a two-stage product reduction: parallel 256-element tiles write compiler-owned
+  `(value,index)` scratch, then one work-item merges the tile results for each row. This avoids the
+  noncompetitive one-work-item-per-vocabulary scan while keeping the public ABI free of scratch.
+  `width` must be positive."
+  [values :- (Array float), indices :- (Array int), nrows :- Long, width :- Long] :- Void
+  (let [tile-size (long 256)
+        tile-count (long (quot (+ width (dec tile-size)) tile-size))
+        partial-values (float-array (* nrows tile-count))
+        partial-indices (int-array (* nrows tile-count))]
+    (par/map-void! tile (* nrows tile-count)
+                   (let [row (quot tile tile-count)
+                         tile-in-row (rem tile tile-count)
+                         start (* tile-in-row tile-size)
+                         end (min width (+ start tile-size))
+                         row-base (* row width)
+                         first-value (aget values (+ row-base start))
+                         first-nan (int (if (== first-value first-value) 0 1))]
+                     (loop [col (long (inc start)) best-index (int start)
+                            best-value (float first-value) best-nan first-nan]
+                       (if (< col end)
+                         (let [candidate (aget values (+ row-base col))
+                               candidate-nan (int (if (== candidate candidate) 0 1))
+                               better (int (if (== candidate-nan 1)
+                                             (if (== best-nan 0) 1 0)
+                                             (if (== best-nan 1)
+                                               0
+                                               (if (> candidate best-value) 1 0))))]
+                           (if (== better 1)
+                             (recur (long (inc col)) (int col) candidate candidate-nan)
+                             (recur (long (inc col)) best-index best-value best-nan)))
+                         (do
+                           (aset partial-values tile best-value)
+                           (aset partial-indices tile best-index))))))
+    (par/map-void! row nrows
+                   (let [base (* row tile-count)
+                         first-value (aget partial-values base)
+                         first-index (aget partial-indices base)
+                         first-nan (int (if (== first-value first-value) 0 1))]
+                     (loop [tile-in-row (long 1) best-index first-index
+                            best-value (float first-value) best-nan first-nan]
+                       (if (< tile-in-row tile-count)
+                         (let [tile (+ base tile-in-row)
+                               candidate (aget partial-values tile)
+                               candidate-index (aget partial-indices tile)
+                               candidate-nan (int (if (== candidate candidate) 0 1))
+                               better (int (if (== candidate-nan 1)
+                                             (if (== best-nan 0) 1 0)
+                                             (if (== best-nan 1)
+                                               0
+                                               (if (> candidate best-value) 1 0))))]
+                           (if (== better 1)
+                             (recur (long (inc tile-in-row)) candidate-index candidate candidate-nan)
+                             (recur (long (inc tile-in-row)) best-index best-value best-nan)))
+                         (aset indices row best-index)))))))
+
 ;; ================================================================
 ;; slice-strided-2d / scatter-strided-2d
 ;;

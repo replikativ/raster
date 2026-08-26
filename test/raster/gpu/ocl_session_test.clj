@@ -12,6 +12,7 @@
             [raster.compiler.pipeline :as pl]
             [raster.arrays :as ra]
             [raster.core :refer [deftm]]
+            [raster.dl.array-ops :as ops]
             [raster.gpu.core :as gpu]
             [raster.gpu.descriptor-fixture :as fixture]))
 
@@ -82,6 +83,28 @@
             (let [r2 (fixture/run! program [x y (float 2.0) n])
                   ^floats yg (get r2 'y)]
               (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3)))))
+        (finally (gpu/close-session! s))))))
+
+(deftest ocl-resident-indexed-row-reduction-roundtrip
+  (if-not @ocl-available?
+    (println "SKIP ocl indexed row reduction (no OpenCL device)")
+    (let [nrows 3
+          width 513
+          values (float-array (* nrows width) (float -10.0))
+          indices (int-array nrows)
+          descriptor (pl/compile-gpu-program #'ops/argmax-rows! :ocl:0 :dtype :float)
+          s (gpu/make-session :ocl:0)]
+      (aset values 3 (float 9.0))
+      (aset values 256 (float 9.0))
+      (aset values 512 (float 9.0))
+      (aset values (+ width 255) Float/NaN)
+      (aset values (+ width 257) Float/NaN)
+      (aset values (+ width 300) (float 100.0))
+      (aset values (+ (* 2 width) 411) (float 8.0))
+      (try
+        (let [program (fixture/instantiate! s descriptor [values indices nrows width])
+              result (get (fixture/run! program [values indices nrows width]) 'indices)]
+          (is (= [3 255 411] (vec result))))
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-segmap-artifact-roundtrip
