@@ -73,11 +73,10 @@
                         {:reason :program-stage-scatter :phase (:phase step) :arrays arrays})))
       {output :write source :read index :read})
     (let [interface (kexec/validate! (step-interface step))
-          logical-names (kabi/pointer-binding-names (kexec/abi interface))
+          slot-groups (kabi/logical-pointer-slot-groups (kexec/abi interface))
+          logical-names (mapv :binding slot-groups)
           pointer-specs (filterv #(not= :scalar (:kind %)) (:argument-specs step))
-          symbols (mapv :sym pointer-specs)
-          slots-by-logical (group-by #(or (:binding %) (:name %))
-                                     (kabi/pointer-slots (kexec/abi interface)))]
+          symbols (mapv :sym pointer-specs)]
       (when-not (= (count logical-names) (count symbols))
         (throw (ex-info "program stage pointer plan differs from its executable ABI"
                         {:reason :program-stage-abi :phase (:phase step)
@@ -86,16 +85,16 @@
         (throw (ex-info "program stage pointer plan requires compiler symbols"
                         {:reason :program-stage-symbols :phase (:phase step)
                          :symbols symbols})))
-      (reduce (fn [accesses [symbol logical-name]]
+      (reduce (fn [accesses [symbol {:keys [binding slots]}]]
                 (let [access (reduce merge-access nil
-                                     (map slot-access (get slots-by-logical logical-name)))]
+                                     (map slot-access slots))]
                   (when-not access
                     (throw (ex-info "program stage ABI pointer has no readable or writable effect"
                                     {:reason :program-stage-access :phase (:phase step)
-                                     :symbol symbol :binding logical-name})))
+                                     :symbol symbol :binding binding})))
                   (update accesses symbol merge-access access)))
               {}
-              (map vector symbols logical-names)))))
+              (map vector symbols slot-groups)))))
 
 (defn descriptor-accesses
   "Return the ordered per-step access maps of a resident descriptor."

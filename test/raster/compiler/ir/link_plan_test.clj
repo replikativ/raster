@@ -65,6 +65,41 @@
     (is (= {'x :input 'w :constant 'y :scratch}
            (link/instance-roles plan (first (:instances plan)))))))
 
+(deftest repeated-ordinary-abi-slots-model-in-place-access-not-a-composite-value
+  (let [in-place-kernel
+        (artifact/make
+         {:kernel-name "link_in_place"
+          :source "__kernel void link_in_place(float* input, float* output, long n) {}"
+          :abi [(kabi/slot 'x :input :float :c-name "input")
+                (kabi/slot 'x :output :float :c-name "output")
+                (kabi/slot 'n :scalar :long)]
+          :arguments '[x x n]
+          :launch (launch/spec {:workgroup-size [64]
+                                :group-count [(launch/ceil-div 'n 64)]})
+          :effects {:kind :map :reads '[x] :writes '[x]}})
+        in-place-descriptor
+        {:dtype :float
+         :all-params '[x n]
+         :array-params '[x]
+         :scalar-params '[n]
+         :array-roles {'x :state}
+         :allocs []
+         :steps [{:phase :in-place :kernel-name "link_in_place" :convention :map
+                  :artifact in-place-kernel
+                  :argument-specs [{:kind :input :sym 'x}
+                                   {:kind :output :sym 'x}
+                                   {:kind :scalar :type :long
+                                    :value-fn (fn [args] (long (nth args 1)))}]}]
+         :result-sym 'x}
+        x (n :x :state (float-array 16))
+        instance (link/instance {:id :in-place :descriptor in-place-descriptor
+                                 :bindings {'x :x} :scalars {'n 16}})]
+    (is (= ['x 'x]
+           (kabi/pointer-binding-names (:abi in-place-kernel))))
+    (is (link/link-plan?
+         (link/make {:id :in-place :target :ze:0 :nodes [x]
+                     :instances [instance] :outputs [:x]})))))
+
 (deftest validation-closes-bindings-shapes-dtypes-and-ordered-effects
   (testing "every pointer symbol is explicitly bound"
     (let [i (assoc (instance :layer :x :w0 :out) :bindings {'x :x 'y :out})]
@@ -144,7 +179,7 @@
                                    :instances [(instance :consumer :hidden :w1 :out)
                                                (instance :producer :x :w0 :hidden)]
                                    :outputs [:out]}))
-                               (catch clojure.lang.ExceptionInfo e e))))))))
+                               (catch clojure.lang.ExceptionInfo e e)))))))
   (testing "external storage does not initialize an internal value"
     (let [hidden (link/node {:id :hidden :dtype :float :shape [16] :device :ze:0
                              :role :internal :ownership :external})]
@@ -156,7 +191,7 @@
                                            (n :out :output)]
                                    :instances [(instance :consumer :hidden :w :out)]
                                    :outputs [:out]})
-                                 (catch clojure.lang.ExceptionInfo e e))))))))
+                                 (catch clojure.lang.ExceptionInfo e e)))))))))
 
 (deftest physical-view-aliases-are-explicit-and-effect-checked
   (let [allocation (bview/allocation {:id :shared :byte-size 96 :memory-space :device

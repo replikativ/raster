@@ -69,6 +69,22 @@
   [abi]
   (filterv #(= :scalar (:kind %)) (validate! abi)))
 
+(defn logical-pointer-slot-groups
+  "Ordered logical pointer groups over the physical ABI.
+
+   Only adjacent slots carrying an explicit equal `:binding` form one composite logical value.
+   Repeated ordinary `:name` values remain separate groups: an in-place kernel may legally pass
+   the same buffer in distinct input and output positions without claiming a composite ABI."
+  [abi]
+  (reduce (fn [groups slot]
+            (let [binding (or (:binding slot) (:name slot))
+                  previous (peek groups)]
+              (if (and (:binding slot)
+                       (= binding (:binding previous)))
+                (-> groups pop (conj (update previous :slots conj slot)))
+                (conj groups {:binding binding :slots [slot]}))))
+          [] (pointer-slots abi)))
+
 (defn pointer-binding-names
   "Logical caller pointer values, in first physical-signature occurrence order.
 
@@ -76,14 +92,7 @@
    C pointer slots but is supplied by one logical GpuSoA value; those slots carry a shared
    `:binding` and collapse to one name here."
   [abi]
-  (:names
-   (reduce (fn [{:keys [seen] :as acc} slot]
-             (if-let [binding (:binding slot)]
-               (if (contains? seen binding)
-                 acc
-                 (-> acc (update :names conj binding) (update :seen conj binding)))
-               (update acc :names conj (:name slot))))
-           {:names [] :seen #{}} (pointer-slots abi))))
+  (mapv :binding (logical-pointer-slot-groups abi)))
 
 (defn validate-arguments!
   "Check that `arguments` supplies exactly one value per ordered ABI slot."
