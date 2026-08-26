@@ -1,5 +1,5 @@
 (ns raster.quant.kernels-k
-  "Composable K-quant GEMV kernels — the SAME deftm compiles to CPU-C (gcc auto-vectorizes
+  "Composable K-quant GEMV/GEMM kernels — the SAME deftm compiles to CPU-C (gcc auto-vectorizes
   the dpbusd-able inner loop) and, via the shared c_emit, to OpenCL/GPU. The scalar per-row
   dot mirrors the validated references (raster.compiler.backend.cpu.quant/q4k-q8k-dot,
   q6k-q8k-dot); the fused 8-col-lanes peak SIMD is the orthogonal #27 optimization serving
@@ -79,9 +79,9 @@
     y))
 
 ;; ---- q8_K activation quantizer (the GPU-resident enabler) ----
-;; float activation x[in] → q8_K for the dp4a matmul, ON the GPU: per 256-super-block
+;; float activation x[nrows,in] → q8_K for the dp4a matmul, ON the GPU: per 256-super-block
 ;; d = max|x|/127; int8 quants packed 4-per-int32 element-order (xp); xs = d; bsums = per
-;; 32-sub-block int sum. Output feeds qmatmul-q4k-dp4a! directly (no host round-trip), so
+;; 32-sub-block int sum. Output feeds qmatmul-q4k-dp4a-rows! directly (no host round-trip), so
 ;; norm→quant→matmul chains run entirely on-device in a graph.
 ;;
 ;; 2-PHASE PARALLEL (was: one work-item per super-block, 512-deep serial — the same
@@ -89,49 +89,59 @@
 ;; phase 1 computes per-32-sub-block |max| (nsb*8 items, 32-deep), phase 2 folds the 8
 ;; sibling submaxes (float max is EXACT under reassociation → d is bit-identical to the
 ;; serial scan) and quantizes its 32 elements (nsb*8 items, ~40-deep). `submax` is an
-;; nsb*8 float scratch. The 8 same-value xs writes per super-block are benign.
-(deftm quant-act-q8k-gpu!
+;; nrows*nsb*8 float scratch. The 8 same-value xs writes per super-block are benign.
+(deftm quant-act-q8k-rows-gpu!
+  "Q8_K activation quantization over a row-major [nrows,in] tensor. The physical result is
+  the ordered `(xp,xs,bsums)` representation with row-major leaves; `submax` is transient
+  reduction scratch. Batch is an ordinary outer shape axis and does not affect the format."
   [x :- (Array float), xp :- (Array int), xs :- (Array float), bsums :- (Array int),
-   submax :- (Array float), nsb :- Long] :- Void
+   submax :- (Array float), in :- Long, nrows :- Long] :- Void
   (do
-    (par/map-void! si (* (long nsb) 8)
-      (let [base (* (long si) 32)
-            m (loop [k 0 m 0.0]
-                (if (< k 32)
-                  (let [v (ra/aget x (+ base k))]
-                    (recur (inc k) (max m (max v (- v)))))
-                  m))]
-        (ra/aset submax si (float m))))
-    (par/map-void! sj (* (long nsb) 8)
-      (let [sb (quot sj 8)
-            j (rem sj 8)
-            mx (loop [k 0 m 0.0]
-                 (if (< k 8)
-                   (recur (inc k) (max m (ra/aget submax (+ (* (long sb) 8) k))))
-                   m))
-            d (/ (double mx) 127.0)
-            id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
-            sidx (+ (* (long sb) 8) j)
-            wbase (+ (* (long sb) 64) (* j 8))
-            ebase (+ (* (long sb) 256) (* j 32))]
-        (ra/aset xs sb (float d))
-        (let [bs (loop [w 0 s 0]
-                   (if (< w 8)
+    (par/map-void! si (* (long nrows) (quot (long in) 32))
+                   (let [base (* (long si) 32)
+                         m (loop [k 0 m 0.0]
+                             (if (< k 32)
+                               (let [v (ra/aget x (+ base k))]
+                                 (recur (inc k) (max m (max v (- v)))))
+                               m))]
+                     (ra/aset submax si (float m))))
+    (par/map-void! sj (* (long nrows) (quot (long in) 32))
+                   (let [nsb (quot (long in) 256)
+                         nsub (quot (long in) 32)
+                         row (quot sj nsub)
+                         row-sub (rem sj nsub)
+                         sb (quot row-sub 8)
+                         j (rem row-sub 8)
+                         mx (loop [k 0 m 0.0]
+                              (if (< k 8)
+                                (recur (inc k) (max m (ra/aget submax (+ (* row nsub) (* sb 8) k))))
+                                m))
+                         d (/ (double mx) 127.0)
+                         id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)
+                         sidx (+ (* row nsub) (* sb 8) j)
+                         wbase (+ (* row (quot (long in) 4)) (* sb 64) (* j 8))
+                         ebase (+ (* row (long in)) (* sb 256) (* j 32))]
+                     (ra/aset xs (+ (* row nsb) sb) (float d))
+                     (let [bs (loop [w 0 s 0]
+                                (if (< w 8)
                      ;; |x·id| ≤ 127 by construction (id = 127/max|x|), so round lands in
                      ;; int8 range without an explicit clamp; the (long ...) cast types q.
-                     (let [e (+ ebase (* w 4))
-                           q0 (long (Math/round (* (double (ra/aget x e)) id)))
-                           q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
-                           q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
-                           q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
-                           word (bit-or (bit-and q0 0xFF)
-                                        (bit-shift-left (bit-and q1 0xFF) 8)
-                                        (bit-shift-left (bit-and q2 0xFF) 16)
-                                        (bit-shift-left (bit-and q3 0xFF) 24))]
-                       (ra/aset xp (+ wbase w) (int word))
-                       (recur (inc w) (+ s q0 q1 q2 q3)))
-                     s))]
-          (ra/aset bsums sidx (int bs)))))))
+                                  (let [e (+ ebase (* w 4))
+                                        q0 (long (Math/round (* (double (ra/aget x e)) id)))
+                                        q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
+                                        q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
+                                        q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                           ;; Keep bit-or binary in the shared IR. The JVM bytecode backend's
+                           ;; primitive bit op is binary; passing four operands used to discard
+                           ;; the high two lanes while OpenCL happened to accept the variadic form.
+                                        word (bit-or (bit-or (bit-and q0 0xFF)
+                                                             (bit-shift-left (bit-and q1 0xFF) 8))
+                                                     (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
+                                                             (bit-shift-left (bit-and q3 0xFF) 24)))]
+                                    (ra/aset xp (+ wbase w) (int word))
+                                    (recur (inc w) (+ s q0 q1 q2 q3)))
+                                  s))]
+                       (ra/aset bsums sidx (int bs)))))))
 
 ;; ---- dp4a int8-GEMV core (the format-agnostic hardware-accelerated path) ----
 ;; int8×int8 GEMV over int32-packed lanes: y[o] = Σ_w dp4a(wp[o*kw+w], xp[w]). par/dp4a
@@ -149,72 +159,46 @@
                                a))]
                    (ra/aset y o (float acc)))))
 
-;; ---- GPU shape: par/map-void! over output rows (one work-item per row) ----
-;; The GPU form the opencl-pass turns into a kernel (work-item o computes y[o]). Same K
-;; dot as the composable CPU deftm; the GPU int8 path needs byte buffers / int32-packing
-;; (dp4a) — see #26. This is the work-item-mapped twin of qmatmul-q4k-composable!.
-(deftm qmatmul-q4k-gpu!
-  [xq :- (Array byte), xs :- (Array float), bsums :- (Array int),
-   wq :- (Array byte), da :- (Array float), db :- (Array float),
-   aq :- (Array byte), bq :- (Array byte),
-   y :- (Array float), in :- Long, out :- Long] :- Void
-  (par/map-void! o out
-                 (let [nsb (quot (long in) 256) nsub (quot (long in) 32) wrow (quot (long in) 2)
-                       wb (* (long o) wrow) sbb (* (long o) nsb) subb (* (long o) nsub)
-                       acc (loop [sb 0 a 0.0]
-                             (if (< sb nsb)
-                               (let [sbase (* sb 256)
-                                     dav (double (ra/aget da (+ sbb sb)))
-                                     dbv (double (ra/aget db (+ sbb sb)))
-                                     dact (double (ra/aget xs sb))
-                                     ssum (loop [j 0 s 0.0]
-                                            (if (< j 8)
-                                              (let [base (+ sbase (* j 32)) sidx (+ (* sb 8) j)
-                                                    aj (* dav (long (ra/aget aq (+ subb sidx))))
-                                                    bj (* dbv (long (ra/aget bq (+ subb sidx))))
-                                                    dp (loop [k 0 d 0]
-                                                         (if (< k 16)
-                                                           (let [bv (bit-and (long (ra/aget wq (+ wb (quot base 2) k))) 0xFF)]
-                                                             (recur (inc k)
-                                                                    (+ d (* (bit-and bv 0xF) (long (ra/aget xq (+ base k))))
-                                                                       (* (bit-shift-right bv 4) (long (ra/aget xq (+ base k 16)))))))
-                                                           d))]
-                                                (recur (inc j) (+ s (* aj (double dp)) (* bj (double (ra/aget bsums sidx))))))
-                                              s))]
-                                 (recur (inc sb) (+ a (* dact ssum))))
-                               a))]
-                   (ra/aset y o (float acc)))))
-
 ;; ---- Q4_K dp4a GPU kernel (the hardware-accelerated path) ----
-;; Same scale/min fold as qmatmul-q4k-gpu!, but the 32-element sub-block dot is computed
+;; Same scale/min fold as qmatmul-q4k-composable!, but the 32-element sub-block dot is computed
 ;; with par/dp4a over int32-packed lanes. Weights uploaded as int32 (wq nibbles reinterpreted
 ;; little-endian): one int read yields 4 low nibbles (wi & 0x0F0F0F0F → elements k..k+3) AND
 ;; 4 high nibbles ((wi>>4) & 0x0F0F0F0F → elements k+16..k+19), the llama.cpp mmvq trick.
 ;; Activation xq packed element-order to int32 (xp). Nibbles 0..15 are positive int8, so the
 ;; signed dp4a equals the unsigned-nibble × signed-act dpbusd of the composable kernel.
-(deftm qmatmul-q4k-dp4a!
+(deftm qmatmul-q4k-dp4a-rows!
+  "Q4_K projection for shared weights and row-major Q8_K activations. Each work-item owns one
+  `(row,output-channel)` pair. Only activation and result leaves carry a row offset; packed
+  weights and their scale/min metadata are shared across rows."
   [xp :- (Array int), xs :- (Array float), bsums :- (Array int),
    wp :- (Array int), da :- (Array float), db :- (Array float),
    aq :- (Array byte), bq :- (Array byte),
-   y :- (Array float), in :- Long, out :- Long] :- Void
-  (par/map-void! o out
-                 (let [nsb (quot (long in) 256)
+   y :- (Array float), in :- Long, out :- Long, nrows :- Long] :- Void
+  (par/map-void! ro (* (long nrows) (long out))
+                 (let [row (quot ro (long out))
+                       o (rem ro (long out))
+                       nsb (quot (long in) 256)
+                       nsub (quot (long in) 32)
+                       xiw (quot (long in) 4)
                        wiw (quot (long in) 8)           ; weight int32 words per row (in/2 bytes / 4)
                        wb (* (long o) wiw)
                        sbb (* (long o) nsb)
-                       subb (* (long o) (quot (long in) 32))
-                       acc (loop [sb 0 a 0.0]
+                       subb (* (long o) nsub)
+                       xb (* row xiw)
+                       xsb-base (* row nsb)
+                       bsum-base (* row nsub)
+                       acc (loop [sb 0 a (float 0.0)]
                              (if (< sb nsb)
-                               (let [dav (double (ra/aget da (+ sbb sb)))
-                                     dbv (double (ra/aget db (+ sbb sb)))
-                                     dact (double (ra/aget xs sb))
+                               (let [dav (ra/aget da (+ sbb sb))
+                                     dbv (ra/aget db (+ sbb sb))
+                                     dact (ra/aget xs (+ xsb-base sb))
                                      wsb (+ wb (* sb 32))   ; 32 int words / super-block
-                                     xsb (* sb 64)          ; 64 act words / super-block
-                                     ssum (loop [j 0 s 0.0]
+                                     xsb (+ xb (* sb 64))   ; 64 act words / super-block
+                                     ssum (loop [j 0 s (float 0.0)]
                                             (if (< j 8)
                                               (let [sidx (+ (* sb 8) j)
-                                                    aj (* dav (long (ra/aget aq (+ subb sidx))))
-                                                    bj (* dbv (long (ra/aget bq (+ subb sidx))))
+                                                    aj (* dav (float (long (ra/aget aq (+ subb sidx)))))
+                                                    bj (* dbv (float (long (ra/aget bq (+ subb sidx)))))
                                                     wj (+ wsb (* j 4)) xj (+ xsb (* j 8))
                                                     dp (loop [r 0 d 0]
                                                          (if (< r 4)
@@ -225,11 +209,11 @@
                                                                  d2 (par/dp4a hi (ra/aget xp (+ xj 4 r)) d1)]
                                                              (recur (inc r) d2))
                                                            d))]
-                                                (recur (inc j) (+ s (* aj (double dp)) (* bj (double (ra/aget bsums sidx))))))
+                                                (recur (inc j) (+ s (* aj (float dp)) (* bj (float (ra/aget bsums (+ bsum-base sidx)))))))
                                               s))]
                                  (recur (inc sb) (+ a (* dact ssum))))
                                a))]
-                   (ra/aset y o (float acc)))))
+                   (ra/aset y (+ (* row (long out)) o) acc))))
 
 ;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).
 (deftm qmatmul-q6k-gpu!
@@ -314,32 +298,32 @@
   [x :- (Array float), xp :- (Array int), xs :- (Array float),
    in :- Long, nrows :- Long] :- Void
   (par/map-void! rb (* nrows (quot in 32))
-    (let [nb (quot in 32)
-          b (rem rb nb)
-          r (quot rb nb)
-          base (+ (* r in) (* b 32))
-          mx (loop [k 0 m 0.0]
-               (if (< k 32)
-                 (let [v (ra/aget x (+ base k))]
-                   (recur (inc k) (max m (max v (- v)))))
-                 m))
-          d (/ (double mx) 127.0)
-          id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)]
-      (ra/aset xs rb (float d))
-      (loop [w 0]
-        (if (< w 8)
-          (let [e (+ base (* w 4))
-                q0 (long (Math/round (* (double (ra/aget x e)) id)))
-                q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
-                q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
-                q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
-                word (bit-or (bit-and q0 0xFF)
-                             (bit-shift-left (bit-and q1 0xFF) 8)
-                             (bit-shift-left (bit-and q2 0xFF) 16)
-                             (bit-shift-left (bit-and q3 0xFF) 24))]
-            (ra/aset xp (+ (* rb 8) w) (int word))
-            (recur (inc w)))
-          nil)))))
+                 (let [nb (quot in 32)
+                       b (rem rb nb)
+                       r (quot rb nb)
+                       base (+ (* r in) (* b 32))
+                       mx (loop [k 0 m 0.0]
+                            (if (< k 32)
+                              (let [v (ra/aget x (+ base k))]
+                                (recur (inc k) (max m (max v (- v)))))
+                              m))
+                       d (/ (double mx) 127.0)
+                       id (if (> (double d) 0.0) (/ 1.0 (double d)) 0.0)]
+                   (ra/aset xs rb (float d))
+                   (loop [w 0]
+                     (if (< w 8)
+                       (let [e (+ base (* w 4))
+                             q0 (long (Math/round (* (double (ra/aget x e)) id)))
+                             q1 (long (Math/round (* (double (ra/aget x (+ e 1))) id)))
+                             q2 (long (Math/round (* (double (ra/aget x (+ e 2))) id)))
+                             q3 (long (Math/round (* (double (ra/aget x (+ e 3))) id)))
+                             word (bit-or (bit-or (bit-and q0 0xFF)
+                                                  (bit-shift-left (bit-and q1 0xFF) 8))
+                                          (bit-or (bit-shift-left (bit-and q2 0xFF) 16)
+                                                  (bit-shift-left (bit-and q3 0xFF) 24)))]
+                         (ra/aset xp (+ (* rb 8) w) (int word))
+                         (recur (inc w)))
+                       nil)))))
 
 (deftm qmatmul-i8-gemm!
   "Signed q8_0 x q8_0 GEMM for prefill: one work-item per (token, out-row) —
@@ -350,21 +334,21 @@
    wp :- (Array int), ws :- (Array float), y :- (Array float),
    in :- Long, out :- Long, nrows :- Long] :- Void
   (par/map-void! ot (* nrows out)
-    (let [o (rem ot out)
-          t (quot ot out)
-          nb (quot in 32)
-          ni4 (quot in 4)
-          acc (loop [b 0 a 0.0]
-                (if (< b nb)
-                  (let [dp (loop [k 0 d 0]
-                             (if (< k 8)
-                               (recur (inc k)
-                                      (par/dp4a (ra/aget wp (+ (* o ni4) (* b 8) k))
-                                                (ra/aget xp (+ (* t ni4) (* b 8) k)) d))
-                               d))]
-                    (recur (inc b)
-                           (+ a (* (* (double (ra/aget ws (+ (* o nb) b)))
-                                      (double (ra/aget xs (+ (* t nb) b))))
-                                   (double dp)))))
-                  a))]
-      (ra/aset y (+ (* t out) o) (float acc)))))
+                 (let [o (rem ot out)
+                       t (quot ot out)
+                       nb (quot in 32)
+                       ni4 (quot in 4)
+                       acc (loop [b 0 a 0.0]
+                             (if (< b nb)
+                               (let [dp (loop [k 0 d 0]
+                                          (if (< k 8)
+                                            (recur (inc k)
+                                                   (par/dp4a (ra/aget wp (+ (* o ni4) (* b 8) k))
+                                                             (ra/aget xp (+ (* t ni4) (* b 8) k)) d))
+                                            d))]
+                                 (recur (inc b)
+                                        (+ a (* (* (double (ra/aget ws (+ (* o nb) b)))
+                                                   (double (ra/aget xs (+ (* t nb) b))))
+                                                (double dp)))))
+                               a))]
+                   (ra/aset y (+ (* t out) o) (float acc)))))

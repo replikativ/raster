@@ -34,6 +34,14 @@
   (first (:kernels (apply opencl-pass/opencl-pass form
                           (concat [:min-elements 0] opts)))))
 
+(deftest declared-gpu-parameter-types-preserve-the-scalar-array-partition
+  (is (= {:scalar-types {'in :int 'scale :float}
+          :array-types {'packed :int 'metadata :byte 'values :float}}
+         (opencl-pass/derive-param-types
+          '[packed metadata values in scale]
+          '[ints bytes floats long float]
+          :float))))
+
 (deftest generate-segmap-kernel-artifact-simple-test
   (testing "Simple element-wise add with OpenCL syntax"
     (let [form '(raster.par/map! out i n double (+ (aget a i) (aget b i)))
@@ -93,8 +101,8 @@
 (deftest generate-par-map-void-ordered-abi-test
   (testing "multi-write/inout map-void ABI follows the emitted signature and preserves dtypes"
     (let [form '(raster.par/map-void! i n
-                  (do (aset y i (* scale (aget x i)))
-                      (aset state i (+ (aget state i) limit))))
+                                      (do (aset y i (* scale (aget x i)))
+                                          (aset state i (+ (aget state i) limit))))
           k (par-opencl/generate-par-map-void-kernel
              form :dtype :float
              :array-types {'state :int 'x :float 'y :float}
@@ -165,8 +173,8 @@
 (deftest opencl-pass-map-void-marker-follows-abi-test
   (testing "the compatibility marker is projected from the ordered ABI"
     (let [form '(raster.par/map-void! i n
-                  (do (aset y i (* scale (aget x i)))
-                      (aset state i (+ (aget state i) limit))))
+                                      (do (aset y i (* scale (aget x i)))
+                                          (aset state i (+ (aget state i) limit))))
           result (opencl-pass/opencl-pass
                   form :device-id :ze:0 :dtype :float
                   :array-types {'state :int 'x :float 'y :float}

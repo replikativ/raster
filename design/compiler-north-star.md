@@ -133,11 +133,15 @@ validated plan; one later instantiation therefore removes even the device copy. 
 value-layer cleanup is ranged-view composition and explicit cross-component ownership transfer;
 the duplicate legacy whole-program binding API is retired.
 
-Pretrained-rstr's batch boundary is the next concrete shape test: weights bind once to shared
+Pretrained-rstr's batch boundary is the current concrete shape test: weights bind once to shared
 constant nodes, while residual, scratch, position, logits and token storage are lane-local nodes or
-disjoint views. Packed Q/K/V and attention views already fit LinkPlan. The missing performance work
-is a compiler shape/schedule transform that emits projection, post-attention and head programs with
-a leading logical batch dimension; batching is not a linker convention or an attention special case.
+disjoint views. Packed Q/K/V and attention views already fit LinkPlan. The first projection slice now
+makes Q8_K activation quantization and Q4_K DP4A projection uniformly row-capable: row count is an
+ordinary outer shape/launch extent, activation leaves are row-major, and packed weight leaves remain
+shared. B=1 is no longer a separate kernel contract. The remaining performance work is to derive
+these projection, post-attention and head programs from the scheduled contraction/SOAC path rather
+than treating the Q4_K source kernel as the final abstraction; batching is not a linker convention
+or an attention special case.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.

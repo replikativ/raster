@@ -56,28 +56,28 @@
                       :down [:float H nil :scratch] :down2 [:float H nil :scratch] :out [:float H nil :output]
                       :submax [:float (quot IM 32) nil :scratch]}
                      (wbuf "wq" Wq) (wbuf "wk" Wk) (wbuf "wv" Wv) (wbuf "wo" Wo) (wbuf "wg" Wg) (wbuf "wu" Wu) (wbuf "wd" Wd))
-            qa (fn [ph xb xpb xsb bsb nsb] {:op #'qk/quant-act-q8k-gpu! :phase ph :bind {"x" xb "xp" xpb "xs" xsb "bsums" bsb "submax" :submax} :scalars {} :n (* 8 (long nsb))})
-            mm (fn [ph xpb xsb bsb pre yb in n] {:op #'qk/qmatmul-q4k-dp4a! :phase ph :bind {"xp" xpb "xs" xsb "bsums" bsb "wp" (keyword (str pre "p")) "da" (keyword (str pre "da")) "db" (keyword (str pre "db")) "aq" (keyword (str pre "aq")) "bq" (keyword (str pre "bq")) "y" yb} :scalars {"in" in} :n n})
+            qa (fn [ph xb xpb xsb bsb in nrows] {:op #'qk/quant-act-q8k-rows-gpu! :phase ph :bind {"x" xb "xp" xpb "xs" xsb "bsums" bsb "submax" :submax} :scalars {"in" in} :n (* nrows (quot in 32))})
+            mm (fn [ph xpb xsb bsb pre yb in out nrows] {:op #'qk/qmatmul-q4k-dp4a-rows! :phase ph :bind {"xp" xpb "xs" xsb "bsums" bsb "wp" (keyword (str pre "p")) "da" (keyword (str pre "da")) "db" (keyword (str pre "db")) "aq" (keyword (str pre "aq")) "bq" (keyword (str pre "bq")) "y" yb} :scalars {"in" in "out" out} :n (* nrows out)})
             rms (fn [ph xb wb ob rows feat] {:op #'nn/rms-norm! :phase ph :bind {"x" xb "weight" wb "out" ob} :scalars {"eps" eps "features" feat "gain-offset" 1.0} :n rows})
             radd (fn [ph ab bb ob n] {:op #'nn/residual-add! :phase ph :bind {"a" ab "b" bb "out" ob} :scalars {} :n n})
-            steps [(rms :n1 :x :win :xn 1 H) (qa :qx :xn :qxp :qxs :qxb (quot H 256))
-                   (mm :mq :qxp :qxs :qxb "wq" :Q H (* nq hd)) (mm :mk :qxp :qxs :qxb "wk" :K H kvrow) (mm :mv :qxp :qxs :qxb "wv" :V H kvrow)
+            steps [(rms :n1 :x :win :xn 1 H) (qa :qx :xn :qxp :qxs :qxb H 1)
+                   (mm :mq :qxp :qxs :qxb "wq" :Q H (* nq hd) 1) (mm :mk :qxp :qxs :qxb "wk" :K H kvrow 1) (mm :mv :qxp :qxs :qxb "wv" :V H kvrow 1)
                    (rms :qn :Q :wqn :Qn nq hd) (rms :kn :K :wkn :Kn nkv hd)
                    {:op #'attn/rope-pos-gpu! :phase :rq :bind {"x" :Qn "out" :Qr} :scalars {"head-dim" hd "theta" theta "pos-offset" p} :n nq}
                    {:op #'attn/rope-pos-gpu! :phase :rk :bind {"x" :Kn "out" :Kr} :scalars {"head-dim" hd "theta" theta "pos-offset" p} :n nkv}
                    {:op #'attn/kv-append! :phase :ak :bind {"src" :Kr "cache" :cK} :scalars {"pos" p "kvrow" kvrow} :n kvrow}
                    {:op #'attn/kv-append! :phase :av :bind {"src" :V "cache" :cV} :scalars {"pos" p "kvrow" kvrow} :n kvrow}
                    {:op #'attn/gqa-decode-attention-gpu! :phase :att :bind {"q" :Qr "k" :cK "v" :cV "out" :at "sc" :sc} :scalars {"cache-len" clen "group" grp "head-dim" hd "n-kv" nkv "scale" scale} :n nq}
-                   (qa :qaa :at :axp :axs :axb (quot (* nq hd) 256)) (mm :mo :axp :axs :axb "wo" :O (* nq hd) H)
+                   (qa :qaa :at :axp :axs :axb (* nq hd) 1) (mm :mo :axp :axs :axb "wo" :O (* nq hd) H 1)
                    (rms :npa :O :wpa :O2 1 H) (radd :r1 :x :O2 :x1 H)
-                   (rms :npf :x1 :wpf :x1n 1 H) (qa :qf :x1n :fxp :fxs :fxb (quot H 256))
-                   (mm :mg :fxp :fxs :fxb "wg" :gate H IM) (mm :mu :fxp :fxs :fxb "wu" :up H IM)
+                   (rms :npf :x1 :wpf :x1n 1 H) (qa :qf :x1n :fxp :fxs :fxb H 1)
+                   (mm :mg :fxp :fxs :fxb "wg" :gate H IM 1) (mm :mu :fxp :fxs :fxb "wu" :up H IM 1)
                    {:op #'nn/gelu-mul! :phase :ge :bind {"gate" :gate "up" :up "out" :hh} :scalars {} :n IM}
-                   (qa :qh :hh :hxp :hxs :hxb (quot IM 256)) (mm :md :hxp :hxs :hxb "wd" :down IM H)
+                   (qa :qh :hh :hxp :hxs :hxb IM 1) (mm :md :hxp :hxs :hxb "wd" :down IM H 1)
                    (rms :npff :down :wpff :down2 1 H) (radd :r2 :x1 :down2 :out H)]
             sess (gpu/make-session :ze:0)]
         (try (gpu/chain-program! sess buffers steps)
-          (let [o (get (gpu/run-chain! sess {:x x}) :out)]
-            (is (= 25 (count steps)))
-            (is (< (relerr o Oref) 2e-2) "full decoder layer matches CPU Q4_K reference"))
-          (finally (gpu/close-session! sess)))))))
+             (let [o (get (gpu/run-chain! sess {:x x}) :out)]
+               (is (= 25 (count steps)))
+               (is (< (relerr o Oref) 2e-2) "full decoder layer matches CPU Q4_K reference"))
+             (finally (gpu/close-session! sess)))))))
