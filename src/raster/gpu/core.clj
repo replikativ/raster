@@ -39,7 +39,8 @@
             [raster.compiler.ir.kernel-graph-call :as kgcall]
             [raster.compiler.pipeline :as pl]
             [raster.core :as rcore]
-            [raster.gpu.measurement :as measurement]))
+            [raster.gpu.measurement :as measurement]
+            [raster.gpu.resident-value :as resident-value]))
 
 ;; ================================================================
 ;; Backend dispatch
@@ -1664,28 +1665,33 @@
          {:keys [kernel-name phase]} step
          materialized (volatile! {})
          owned-view-buffers (volatile! [])
-         resolve-buf (fn [sym]
-                       (let [key-or-view (sym->key sym)]
-                         (if (resident-buffer-view? key-or-view)
-                           (or (get @materialized key-or-view)
-                               (let [{:keys [buffer view]}
-                                     (resolve-resident-binding sess key-or-view)
-                                     _ (when-not (bview/contiguous? view)
-                                         (throw (ex-info
-                                                 "resident descriptor binding requires a contiguous view"
-                                                 {:kernel kernel-name :symbol sym :view (:id view)
-                                                  :shape (:shape view) :strides (:strides view)})))
-                                     {runtime-buffer :buffer owned-view? :owned-view?}
-                                     (runtime-buffer-for-view device-id buffer view)]
-                                 (when owned-view?
-                                   (vswap! owned-view-buffers conj runtime-buffer))
-                                 (vswap! materialized assoc key-or-view runtime-buffer)
-                                 runtime-buffer))
-                           (or (get-in @sess [:buffers key-or-view])
-                               (throw (ex-info (str "No buffer for kernel arg: " sym " → "
-                                                    key-or-view)
-                                               {:kernel kernel-name
-                                                :available (keys (:buffers @sess))}))))))
+         materialize
+         (fn materialize [sym key-or-view]
+           (cond
+             (resident-value/resident-composite? key-or-view)
+             (resident-value/map-values #(materialize sym %) key-or-view)
+
+             (resident-buffer-view? key-or-view)
+             (or (get @materialized key-or-view)
+                 (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+                       _ (when-not (bview/contiguous? view)
+                           (throw (ex-info
+                                   "resident descriptor binding requires a contiguous view"
+                                   {:kernel kernel-name :symbol sym :view (:id view)
+                                    :shape (:shape view) :strides (:strides view)})))
+                       {runtime-buffer :buffer owned-view? :owned-view?}
+                       (runtime-buffer-for-view device-id buffer view)]
+                   (when owned-view?
+                     (vswap! owned-view-buffers conj runtime-buffer))
+                   (vswap! materialized assoc key-or-view runtime-buffer)
+                   runtime-buffer))
+
+             :else
+             (or (get-in @sess [:buffers key-or-view])
+                 (throw (ex-info (str "No buffer for kernel arg: " sym " → " key-or-view)
+                                 {:kernel kernel-name
+                                  :available (keys (:buffers @sess))})))))
+         resolve-buf (fn [sym] (materialize sym (sym->key sym)))
          bound-step
          (try
            (assoc (bind-resident-step device-id step args resolve-buf schedule roles)

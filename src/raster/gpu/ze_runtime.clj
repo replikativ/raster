@@ -37,7 +37,8 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.gpu.resident-value :as resident-value]))
 
 ;; ================================================================
 ;; Library loading
@@ -1170,10 +1171,13 @@
 
 (defn expand-pointer-binding
   "Expand one logical artifact pointer binding into Level Zero's physical resident values.
-   A GpuSoA supplies one checked field segment per ABI slot; ordinary resident buffers supply one
-   slot. This function is driver-free and is called before KernelCall construction."
-  [{:keys [binding slots]} value]
+   A ResidentComposite or legacy GpuSoA supplies one checked value per ABI field; ordinary resident
+   buffers supply one slot. This function is driver-free and runs before KernelCall construction."
+  [{:keys [binding slots] :as group} value]
   (cond
+    (resident-value/resident-composite? value)
+    (resident-value/expand group value)
+
     (gpu-soa? value)
     (let [fields (:field-segs ^GpuSoA value)]
       (when-not (= (count slots) (count fields))
@@ -1193,7 +1197,7 @@
       (mapv :seg fields))
 
     (not= 1 (count slots))
-    (throw (ex-info "multi-slot logical pointer requires a GpuSoA resident value"
+    (throw (ex-info "multi-slot logical pointer requires a resident composite or GpuSoA value"
                     {:binding binding :slots slots :value-type (type value)}))
 
     (or (device-buffer? value) (instance? MemorySegment value))

@@ -169,6 +169,7 @@
                                              (element-dtype element-tag)
                                              :c-name (ce/c-symbol field-sym)
                                              :binding s
+                                             :field field-name
                                              :role (pointer-role s))))
                               (:fields (get soa-expansions (symbol (name s))))))
                        soa-arr-params)

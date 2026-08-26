@@ -150,6 +150,16 @@ Consequently, shape polymorphism, layout propagation, aliasing, device
 placement, and future distributed sharding do not share a single checked
 contract.
 
+The first value-layer slice now makes that separation concrete. `AbstractValue` records logical
+dtype/shape/layout, numerical representation, memory space, placement, sharding, ownership and
+effects without containing a buffer or backend handle. `LinkValue` records a later physical layout
+and an ordered set of named `LinkNode` leaves. Kernel ABI field identities certify the flattening,
+and the common resident binder expands the same composite contract for Level Zero and OpenCL. A
+Q4_K value can therefore be represented by packed blocks, scales and sums while allocation remains
+generic byte storage; the allocator does not branch on Q4_K. Existing dense plans receive implicit
+one-leaf values. Value-level cross-component composition and descriptor-owned composite scratch
+allocation remain explicit next slices and currently fail before runtime.
+
 ### 2.5 Workload coverage is broad at the backend edge, not yet through one door
 
 Triton's practical strength is not merely its set of operations. Masks, block

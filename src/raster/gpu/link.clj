@@ -13,6 +13,7 @@
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.link-plan :as link-plan]
             [raster.gpu.core :as gpu]
+            [raster.gpu.resident-value :as resident-value]
             [raster.gpu.value :as value]))
 
 (declare close! run!)
@@ -160,9 +161,18 @@
                (gpu/bind-step!
                 session (assoc step :phase phase) (link-plan/instance-arguments instance)
                 (fn [symbol]
-                  (or (get node-views (get bindings symbol))
-                      (throw (ex-info "validated link binding disappeared during instantiation"
-                                      {:instance (:id instance) :symbol symbol}))))
+                  (let [value-id (get bindings symbol)
+                        link-value (get-in plan [:values value-id])
+                        fields (mapv (fn [{:keys [name node]}]
+                                       {:name name :value (get node-views node)})
+                                     (:leaves link-value))]
+                    (when-not (and link-value (every? :value fields))
+                      (throw (ex-info "validated link value disappeared during instantiation"
+                                      {:instance (:id instance) :symbol symbol
+                                       :value value-id})))
+                    (if (= 1 (count fields))
+                      (:value (first fields))
+                      (resident-value/composite value-id fields))))
                 {:schedule (or (:schedule instance) (get-in instance [:descriptor :schedule]))
                  :roles (link-plan/instance-roles plan instance)})
                (vswap! phases conj phase)))
