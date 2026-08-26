@@ -126,9 +126,12 @@ schedule, aliases, target, and outputs. `Compiled` owns that witness and invokes
 never an implicit host round trip. The runtime preserves the certified allocation identities and
 profiles the same stable recorded-graph boundary. Each instance also retains the complete ordered
 specialization environment required by descriptor shape closures, while runtime pointers still
-come only from certified node bindings. The remaining value-layer convergence is to
-compose independently created compiled instances into one plan, where shared node identity removes
-even the device copy, then retire the duplicate legacy whole-program binding API after parity.
+come only from certified node bindings. Independently lowered `Prepared` artifacts now compose
+before allocation through semantic input/output keys. The composition certificate namespaces
+component identities, unifies explicit dataflow and shared constant/input nodes, and re-derives one
+validated plan; one later instantiation therefore removes even the device copy. The remaining
+value-layer cleanup is ranged-view/cross-component ownership composition and retirement of the
+duplicate legacy whole-program binding API after parity.
 
 Pretrained-rstr's batch boundary is the next concrete shape test: weights bind once to shared
 constant nodes, while residual, scratch, position, logits and token storage are lane-local nodes or

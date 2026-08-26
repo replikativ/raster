@@ -1,11 +1,11 @@
 (ns raster.gpu.compiled
   "The `Compiled` artifact — a functional, inspectable GPU program value (S4 §2).
 
-   `(r/compile #'train-step args {:target :ze:0 :donate [adapters…] :constants [Wq …]})`
-   returns a `Compiled` that implements `IFn`: calling it replays the resident program and
-   returns device values (`raster.gpu.value/DeviceArray`), not host arrays. The resident
-   descriptor is certified into the same LinkPlan used for composition and instantiated as a
-   LinkedExecutable. There is one value/view/runtime path, not an artifact-only binder beside it.
+   `(r/compile #'train-step args opts)` returns a `Compiled` that implements `IFn`: calling it
+   replays the resident program and returns device values, not host arrays. For composition,
+   `(r/lower ...)` returns an allocation-free `Prepared`; independently lowered values compose
+   through semantic boundaries and only the composite is instantiated. Resident descriptors and
+   compositions are certified into the same LinkPlan/LinkedExecutable path.
 
    The three artifact primitives, honestly scoped to the whole-program MVP:
      • device value      — outputs are DeviceArrays over resident buffers; no host round-trip.
@@ -21,6 +21,7 @@
   (:refer-clojure :exclude [compile])
   (:require [clojure.set :as set]
             [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.link-composition :as link-composition]
             [raster.compiler.ir.resident-plan :as resident-plan]
             [raster.compiler.pipeline :as pl]
             [raster.gpu.core :as gpu]
@@ -34,15 +35,15 @@
 ;; ================================================================
 
 (defrecord Compiled
-           [lowering     ;; CertifiedResidentPlan: checkable descriptor→LinkPlan witness
+           [lowering     ;; certified resident or composition lowering into LinkPlan
             executable  ;; LinkedExecutable: the sole resident runtime representation
             in-tree      ;; ordered [{:key :sym :role :donate? :shape :dtype} …] — the arg spec
             out-tree     ;; ordered [{:key :sym :shape :dtype :from} …] — the result spec (multi-output)
             donated      ;; {in-key → out-key} — the alias plan (JAX input_output_aliases)
             schedule     ;; the S6 Schedule map (reserved; nil until S6 fills it)
             target       ;; device-id + (future) HardwareDescriptor
-            descriptor   ;; the raw compile-gpu-program descriptor — inspectable
-            args         ;; captured example args (:all-params order): resident bind contents + shape source
+            descriptor   ;; raw descriptor or inspectable composite descriptor
+            args         ;; captured specialization arguments (empty for a composite)
             live-outputs] ;; atom holding the DeviceArrays projected by the LAST invocation. They
                           ;; alias resident buffers the next replay overwrites, so they are
                           ;; invalidated (marked dead) at the start of the next invoke and at close!
@@ -52,7 +53,11 @@
   (invoke [this] (invoke-compiled this {}))
   (applyTo [this argseq] (apply invoke-compiled this argseq)))
 
+(defrecord Prepared
+           [lowering in-tree out-tree donated schedule target descriptor args])
+
 (defn compiled? [x] (instance? Compiled x))
+(defn prepared? [x] (instance? Prepared x))
 
 ;; ================================================================
 ;; Role derivation (§4.2) and tree construction
@@ -74,9 +79,10 @@
            explicit-roles)))
 
 (defn- build-in-tree
-  [lowering descriptor donate]
+  [lowering descriptor arguments donate]
   (let [donate-set (set donate)
-        values (:values (:certificate lowering))]
+        values (:values (:certificate lowering))
+        argument-map (zipmap (:all-params descriptor) arguments)]
     (vec (for [p (:array-params descriptor)
                :let [{:keys [node role shape dtype]} (get values p)]]
            {:key     (keyword (name p))
@@ -85,7 +91,8 @@
             :role    role
             :donate? (contains? donate-set p)
             :shape   shape
-            :dtype   dtype}))))
+            :dtype   dtype
+            :default (get argument-map p)}))))
 
 (defn- build-out-tree
   "Out-tree = donated in→out nodes + any explicit :outputs + the functional :result-sym + taps.
@@ -121,14 +128,14 @@
     [::compiled qualified target dtype signature (:schedule descriptor)]))
 
 ;; ================================================================
-;; Compile (the public verb)
+;; Pure lowering, composition, and runtime compilation
 ;; ================================================================
 
-(defn compile
-  "Compile a deftm var into a `Compiled` artifact bound on `target`.
+(defn lower
+  "Lower a deftm var into a certified, allocation-free `Prepared` artifact.
 
    args  — example args in the descriptor's :all-params order. Supplies BOTH the shapes
-           compile-gpu-program derives AND the initial resident buffer contents at bind.
+           compile-gpu-program derives AND the eventual resident initializers.
    opts  — {:target :ze:0            device-id (default :ze:0)
             :dtype  :float           element dtype (default :float)
             :donate  [sym …]         resident :state threaded as values (donation)
@@ -138,10 +145,9 @@
             :roles   {sym → role}    explicit role override (last word)
             :gemm-precision :f16-xmx|:f32-scalar
             :on-non-resident :nil|:throw
-            :profile? bool           bind in profiling mode (for r/profile)
             :schedule <map>}         reserved S6 schedule (threaded into the cache key)"
   [fn-var args {:keys [target dtype donate constants outputs taps roles
-                       gemm-precision on-non-resident profile? schedule]
+                       gemm-precision on-non-resident schedule]
                 :or {target :ze:0 dtype :float on-non-resident :nil}}]
   (let [prog (apply pl/compile-gpu-program fn-var target
                     (cond-> [:dtype dtype :on-non-resident on-non-resident]
@@ -161,12 +167,152 @@
                   {:id (compilation-id fn-var target dtype prog args)
                    :target target :descriptor prog :arguments args
                    :roles eff-roles :outputs public-symbols})
-        executable (gpu-link/instantiate! (:plan lowering) {:profile? profile?})
-        in-tree  (build-in-tree lowering prog donate)
+        in-tree  (build-in-tree lowering prog args donate)
         out-tree (build-out-tree lowering donate outputs result-sym taps)
         donated  (into {} (map (fn [s] [(keyword (name s)) (keyword (str (name s) "'"))]) donate))]
-    (->Compiled lowering executable in-tree out-tree donated (:schedule prog) target prog args
-                (atom nil))))
+    (->Prepared lowering in-tree out-tree donated (:schedule prog) target prog args)))
+
+(defn instantiate!
+  "Instantiate one pure Prepared artifact as a callable Compiled value. All component plans have
+   already been composed, so this performs one allocation/binding/graph-recording operation."
+  ([prepared] (instantiate! prepared {}))
+  ([prepared opts]
+   (when-not (prepared? prepared)
+     (throw (ex-info "instantiate! requires an allocation-free Prepared artifact"
+                     {:reason :compiled-prepared-type :actual (type prepared)})))
+   (let [{:keys [lowering in-tree out-tree donated schedule target descriptor args]} prepared
+         executable (gpu-link/instantiate! (:plan lowering) opts)]
+     (->Compiled lowering executable in-tree out-tree donated schedule target descriptor args
+                 (atom nil)))))
+
+(defn- semantic-entry! [components side [component-id key :as reference]]
+  (when-not (and (vector? reference) (= 2 (count reference)))
+    (throw (ex-info "a semantic artifact reference is [component-id key]"
+                    {:reason :compiled-composition-reference :reference reference})))
+  (let [prepared (get components component-id)
+        entries (case side :input (:in-tree prepared) :output (:out-tree prepared))
+        matches (filterv #(= key (:key %)) entries)]
+    (when-not (= 1 (count matches))
+      (throw (ex-info "a semantic artifact reference must resolve exactly once"
+                      {:reason :compiled-composition-reference :side side :reference reference
+                       :available (mapv :key entries)})))
+    (first matches)))
+
+(defn compose
+  "Compose independently lowered Prepared artifacts through semantic boundary keys.
+
+   Request shape:
+   {:id stable-id
+    :components [{:id component-id :program prepared} ...]
+    :connections [{:from [producer-id output-key] :to [consumer-id input-key]} ...]
+    :shares [[[component-id input-or-constant-key] ...] ...]
+    :outputs [{:key composite-output-key :from [component-id output-key]} ...]}
+
+   Remaining component inputs are exposed under `[component-id input-key]`. Composition happens
+   before allocation, so connected intermediates and shared constants have one physical
+   allocation. Donation across independent artifacts is deferred until the ownership/view pass
+   can certify cross-component state threading."
+  [{:keys [id components connections shares outputs attributes]
+    :or {connections [] shares [] attributes {}}}]
+  (let [components (mapv (fn [component]
+                           (when-not (and (map? component) (contains? component :id)
+                                          (prepared? (:program component)))
+                             (throw (ex-info
+                                     "each compiled component requires :id and a Prepared :program"
+                                     {:reason :compiled-composition-component
+                                      :component component})))
+                           component)
+                         components)
+        component-map (into {} (map (juxt :id :program)) components)
+        _ (when-not (= (count components) (count component-map))
+            (throw (ex-info "compiled component identities must be unique"
+                            {:reason :compiled-composition-component-ids
+                             :ids (mapv :id components)})))
+        donated-components (filterv (comp seq :donated :program) components)
+        _ (when (seq donated-components)
+            (throw (ex-info "cross-component donation requires the composite ownership pass"
+                            {:reason :compiled-composition-donation
+                             :components (mapv :id donated-components)})))
+        resolved-connections
+        (mapv (fn [{:keys [from to]}]
+                {:from from :to to
+                 :from-entry (semantic-entry! component-map :output from)
+                 :to-entry (semantic-entry! component-map :input to)})
+              connections)
+        resolved-shares
+        (mapv (fn [group]
+                (mapv (fn [reference]
+                        {:reference reference
+                         :entry (semantic-entry! component-map :input reference)})
+                      group))
+              shares)
+        output-specs
+        (mapv (fn [{:keys [key from] :as output}]
+                (when-not (= #{:key :from} (set (keys output)))
+                  (throw (ex-info "a composite output requires exactly :key and :from"
+                                  {:reason :compiled-composition-output :output output})))
+                {:key key :from from
+                 :entry (semantic-entry! component-map :output from)})
+              outputs)
+        _ (when-not (= (count output-specs) (count (distinct (map :key output-specs))))
+            (throw (ex-info "composite output keys must be unique and ordered"
+                            {:reason :compiled-composition-output-keys
+                             :keys (mapv :key output-specs)})))
+        low-level
+        (link-composition/compose
+         {:id id
+          :components (mapv (fn [{:keys [id program]}]
+                              {:id id :lowering (:lowering program)})
+                            components)
+          :connections (mapv (fn [{:keys [from to from-entry to-entry]}]
+                               {:from [(first from) (:node from-entry)]
+                                :to [(first to) (:node to-entry)]})
+                             resolved-connections)
+          :shares (mapv (fn [group]
+                          (mapv (fn [{:keys [reference entry]}]
+                                  [(first reference) (:node entry)])
+                                group))
+                        resolved-shares)
+          :outputs (mapv (fn [{:keys [from entry]}]
+                           [(first from) (:node entry)])
+                         output-specs)
+          :attributes attributes})
+        node-mapping (get-in low-level [:certificate :node-mapping])
+        mapped-node (fn [component-id node-id]
+                      (or (get node-mapping [component-id node-id])
+                          (throw (ex-info
+                                  "certified semantic node disappeared during composition"
+                                  {:reason :compiled-composition-node
+                                   :component component-id :node node-id}))))
+        consumed-inputs (set (map :to resolved-connections))
+        discarded-shares (set (mapcat (fn [group] (map :reference (rest group)))
+                                      resolved-shares))
+        in-tree
+        (vec
+         (for [{component-id :id program :program} components
+               entry (:in-tree program)
+               :let [reference [component-id (:key entry)]]
+               :when (not (contains? consumed-inputs reference))
+               :when (not (contains? discarded-shares reference))]
+           (assoc entry :key reference :sym [component-id (:sym entry)]
+                  :node (mapped-node component-id (:node entry)))))
+        out-tree
+        (mapv (fn [{:keys [key from entry]}]
+                (assoc entry :key key :sym [(first from) (:sym entry)] :from :composed
+                       :node (mapped-node (first from) (:node entry))))
+              output-specs)
+        descriptor {:all-params [] :array-params [] :scalar-params []
+                    :steps (vec (mapcat (comp :steps :descriptor :program) components))
+                    :result-sym nil :composite? true}
+        schedules (mapv (comp :schedule :program) components)]
+    (->Prepared low-level in-tree out-tree {} schedules (:target (:plan low-level))
+                descriptor [])))
+
+(defn compile
+  "Lower and instantiate a deftm as one callable Compiled artifact. Use `lower`, `compose`, then
+   `instantiate!` when independently compiled programs must share resident values."
+  [fn-var args opts]
+  (instantiate! (lower fn-var args opts) (select-keys opts [:profile?])))
 
 ;; ================================================================
 ;; Functional invocation (§2.3)
@@ -196,12 +342,11 @@
    Mutation of resident :state is invisible: the caller sees fresh output values and the old
    donated inputs invalidated — never a mutation."
   [^Compiled c inputs]
-  (let [{:keys [executable in-tree out-tree donated descriptor target args]} c
+  (let [{:keys [executable in-tree out-tree donated target]} c
         in-nodes     (into {} (map (juxt :key identity)) in-tree)
         input-nodes  (filterv #(= :input (:role %)) in-tree)
         input-keys   (set (map :key input-nodes))
         donated-keys (set (keys donated))
-        captured (zipmap (:all-params descriptor) args)
         ;; 0. VALIDATE inputs: every passed key must be an :input-role param or a donated slot —
         ;;    never a :constant/:state key silently ignored (fail-loud, §7.7).
         _ (doseq [[k _v] inputs]
@@ -213,8 +358,8 @@
         ;; 1. Every dynamic input is refreshed on every invocation, preserving the resident-program
         ;;    contract. gpu-link/write! accepts host values and performs D2D for foreign device
         ;;    values; it never materializes a DeviceArray through v/->host.
-        _ (doseq [{:keys [key sym node]} input-nodes]
-            (gpu-link/write! executable node (get inputs key (get captured sym))))
+        _ (doseq [{:keys [key node default]} input-nodes]
+            (gpu-link/write! executable node (get inputs key default)))
         ;; 2. Donation remains stricter than an ordinary input: the passed value must already be
         ;;    this exact state view. Moving a foreign value and then calling it donation would hide
         ;;    a copy and misrepresent ownership.
@@ -258,11 +403,11 @@
 
 (defn explain
   "Print the artifact's shape: in-tree / out-tree / donation plan / target / schedule and the
-   resident step-kind histogram. Returns the Compiled unchanged."
-  [^Compiled c]
+   resident step-kind histogram. Works before or after instantiation and returns its argument."
+  [c]
   (let [{:keys [in-tree out-tree donated target schedule descriptor]} c
         kinds (frequencies (map :convention (:steps descriptor)))]
-    (println "Compiled artifact")
+    (println (if (prepared? c) "Prepared artifact" "Compiled artifact"))
     (println "  target   :" target)
     (println "  in-tree  :" (mapv (fn [n] [(:key n) (:role n) (when (:donate? n) :donate)]) in-tree))
     (println "  out-tree :" (mapv (fn [n] [(:key n) (:from n)]) out-tree))
@@ -273,24 +418,23 @@
 
 (defn ir
   "Return the descriptor's resident steps (the artifact's lowered IR) for inspection."
-  [^Compiled c]
+  [c]
   (mapv #(select-keys % [:convention :phase :variant :kernel-name]) (:steps (:descriptor c))))
 
 (defn plan
   "Return the validated LinkPlan that is the artifact's public executable representation."
-  [^Compiled c]
+  [c]
   (:plan (:lowering c)))
 
 (defn certificate
-  "Return the checkable resident-descriptor→LinkPlan lowering certificate."
-  [^Compiled c]
+  "Return the checkable resident or composition lowering certificate."
+  [c]
   (:certificate (:lowering c)))
 
 (defn- refresh-captured-inputs!
   [^Compiled c]
-  (let [captured (zipmap (get-in c [:descriptor :all-params]) (:args c))]
-    (doseq [{:keys [sym node role]} (:in-tree c) :when (= :input role)]
-      (gpu-link/write! (:executable c) node (get captured sym))))
+  (doseq [{:keys [node role default]} (:in-tree c) :when (= :input role)]
+    (gpu-link/write! (:executable c) node default))
   c)
 
 (defn profile
@@ -299,22 +443,10 @@
   [^Compiled c]
   (refresh-captured-inputs! c)
   (invalidate-live-outputs! c)
-  (let [descriptor (:descriptor c)
-        certificate (certificate c)
-        roles (:roles certificate)
-        bindings (:bindings certificate)
-        result-sym (:result-sym descriptor)
-        output-symbols (vec (concat (for [sym (:array-params descriptor)
-                                          :when (= :output (get roles sym))]
-                                      sym)
-                                    (when (and result-sym
-                                               (not (some #{result-sym}
-                                                          (:array-params descriptor))))
-                                      [result-sym])))
-        profile-result (gpu-link/profile! (:executable c))
-        result (into {} (map (fn [sym]
-                               [sym (gpu-link/download (:executable c) (get bindings sym))]))
-                     output-symbols)]
+  (let [profile-result (gpu-link/profile! (:executable c))
+        result (into {} (map (fn [{:keys [key node]}]
+                               [key (gpu-link/download (:executable c) node)]))
+                     (:out-tree c))]
     (assoc profile-result :result result)))
 
 (defn measure
@@ -332,7 +464,7 @@
   "The serializable identity of the artifact minus closures (§2b C5): in/out trees, donation,
    schedule, target, and the descriptor's step kinds + concrete shapes. Excludes the non-
    serializable closures (:n-fn/:m-fn/…) and SPIR-V modules."
-  [^Compiled c]
+  [c]
   {:in-tree  (mapv #(select-keys % [:key :role :donate? :shape :dtype]) (:in-tree c))
    :out-tree (mapv #(select-keys % [:key :from :shape :dtype]) (:out-tree c))
    :donated  (:donated c)

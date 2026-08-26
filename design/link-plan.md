@@ -7,6 +7,8 @@ The boundary has three layers:
 
 - `raster.compiler.ir.link-plan` contains immutable compiler values and pure validation;
 - `raster.compiler.ir.resident-plan` certifies the lowering of an ordinary resident descriptor;
+- `raster.compiler.ir.link-composition` certifies namespacing and boundary unification across
+  independently lowered plans;
 - `raster.gpu.link` instantiates a validated plan into resident allocations and one replay graph.
 
 No attention, GEMM, quantization, or model-layer convention exists in the linker. A descriptor step
@@ -21,6 +23,13 @@ omission therefore fails before runtime contact; later layers never reconstruct 
 from ABI spelling. This certificate proves preservation across this structural lowering boundary;
 the earlier obligation that executable kernels implement the source program remains with their own
 dialect conversions and numerical oracles.
+
+`CertifiedLinkComposition` applies the same rule recursively. Ordered certified components are
+namespaced before explicit output→input connections and equal input/constant sharing canonicalize
+node and allocation identities. Its witness records source plan identities, connections, sharing,
+node/allocation/instance mappings and outputs. Verification rechecks every source certificate and
+re-derives the complete target plan. Composition therefore occurs before allocation: an
+intermediate connected by identity cannot acquire an implicit host or device copy at runtime.
 
 ## Values
 
@@ -103,8 +112,12 @@ explicit while still allowing pretrained runtimes to allocate first and publish 
   composite abstract value rather than an implicit tuple convention.
 - The initial dependency schedule is serial. Queue/event partitioning can lower from the same
   proven effects later without changing node or instance identity.
-- A single resident descriptor now has a pure, certified lowering to `LinkPlan`. `Compiled` has not
-  yet been rebased onto that result; its runtime path is the next convergence step.
+- `raster.gpu.compiled/lower` returns an allocation-free `Prepared` value. Independently lowered
+  artifacts compose through semantic input/output keys and only the final Prepared value is passed
+  to `instantiate!`; `compile` remains the single-program lower+instantiate convenience.
+- Composition currently rejects endpoints whose allocation contains several views and rejects
+  cross-component donation. Ranged view unification and ownership threading belong to the next
+  `AbstractValue`/view consolidation rather than an implicit whole-buffer convention.
 
 For paged attention, page allocation, cache relocation, transactional publication, batching and
 request scheduling remain runtime responsibilities. Raster receives borrowed/external node views

@@ -250,21 +250,18 @@
         args (instance-arguments instance)
         interface (kexec/validate! (step-interface step))
         pointer-specs (filterv #(not= :scalar (:kind %)) (:argument-specs step))
-        pointer-slots (kabi/pointer-slots (kexec/abi interface))
-        logical-names (kabi/pointer-binding-names (kexec/abi interface))
+        slot-groups (kabi/logical-pointer-slot-groups (kexec/abi interface))
+        logical-names (mapv :binding slot-groups)
         spec-syms (mapv :sym pointer-specs)]
     (when-not (= (count spec-syms) (count logical-names))
       (throw (ex-info "link descriptor step pointer plan differs from its executable ABI"
                       {:reason :link-step-abi :instance id :step step-index
                        :phase (:phase step) :argument-symbols spec-syms
                        :abi-bindings logical-names})))
-    (let [slots-by-logical
-          (group-by #(or (:binding %) (:name %)) pointer-slots)
-          facts
-          (mapv (fn [sym logical-name]
+    (let [facts
+          (mapv (fn [sym {:keys [slots]}]
                   (let [node-id (get bindings sym ::missing)
                         node (get nodes node-id)
-                        slots (get slots-by-logical logical-name)
                         slot-dtypes (set (map (comp dtype/canon :dtype) slots))]
                     (when (= ::missing node-id)
                       (throw (ex-info "link instance omits a descriptor pointer binding"
@@ -292,7 +289,7 @@
                                        :actual (get-in node [:view :dtype])})))
                     {:symbol sym :node node-id
                      :access (reduce merge-access nil (map slot-access slots))}))
-                spec-syms logical-names)
+                spec-syms slot-groups)
           runtime-arguments
           (mapv (fn [{:keys [kind type value-fn sym]}]
                   (if (= :scalar kind)
