@@ -1,0 +1,82 @@
+(ns raster.dl.indexed-reduction-test
+  (:require [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.resident-plan :as resident-plan]
+            [raster.compiler.pipeline :as pipeline]
+            [raster.dl.array-ops :as ops]))
+
+(defn- reduction-rows
+  [nrows width]
+  (float-array
+   (for [row (range nrows)
+         col (range width)]
+     (float
+      (case row
+        0 (if (contains? #{3 256 512} col) 11.0 (- -1000.0 col))
+        1 (if (contains? #{255 257} col) Float/NaN (if (= col 300) 100.0 col))
+        2 (- (Math/abs (- col 411)))
+        3 (if (contains? #{10 400} col) Float/POSITIVE_INFINITY (- col)))))))
+
+(deftest deterministic-argmax-rows-test
+  (let [nrows 4
+        width 600
+        values (reduction-rows nrows width)
+        indices (int-array nrows)]
+    (ops/argmax-rows! values indices nrows width)
+    (testing "ties cross tile boundaries and choose the first column"
+      (is (= 3 (aget indices 0))))
+    (testing "NaN outranks numeric values and chooses the first NaN"
+      (is (= 255 (aget indices 1))))
+    (testing "ordinary negative and infinite rows retain deterministic ordering"
+      (is (= [411 10] (subvec (vec indices) 2))))))
+
+(deftest argmax-rows-resident-lowering-test
+  (let [nrows 4
+        width 600
+        values (reduction-rows nrows width)
+        indices (int-array nrows)
+        arguments [values indices nrows width]
+        descriptors (into {}
+                          (map (fn [target]
+                                 [target (pipeline/compile-gpu-program
+                                          #'ops/argmax-rows! target :dtype :float)]))
+                          [:ocl:0 :ze:0])
+        descriptor (get descriptors :ocl:0)
+        allocs (:allocs descriptor)
+        steps (:steps descriptor)
+        sources (mapv #(get-in % [:artifact :source]) steps)
+        lowering (resident-plan/lower
+                  {:id :indexed-row-reduction
+                   :target :ocl:0
+                   :descriptor descriptor
+                   :arguments arguments
+                   :outputs ['indices]})]
+    (testing "the semantic ABI contains no schedule scratch"
+      (is (= '[values indices nrows width] (:all-params descriptor)))
+      (is (= '[values indices] (:array-params descriptor)))
+      (is (= '[nrows width] (:scalar-params descriptor))))
+    (testing "the compiler owns typed product scratch"
+      (is (= ['partial-values 'partial-indices] (mapv :sym allocs)))
+      (is (= [:float :int] (mapv :dtype allocs)))
+      (is (= [12 12] (mapv #((:size-fn %) arguments) allocs))))
+    (testing "the reduction remains two ordered target-neutral map stages"
+      (is (= [:map-void :map-void] (mapv :convention steps)))
+      (is (= 2 (count steps)))
+      (is (= #{'partial-values 'partial-indices}
+             (set (take 2 (get-in steps [0 :artifact :arguments])))))
+      (is (= #{'indices 'partial-indices 'partial-values}
+             (set (take 3 (get-in steps [1 :artifact :arguments]))))))
+    (testing "OpenCL and Level Zero preserve the same typed lowering"
+      (is (apply = (map (comp #(mapv :dtype %) :allocs val) descriptors)))
+      (is (apply = (map (comp #(mapv :convention %) :steps val) descriptors)))
+      (is (apply = (map (comp #(mapv (fn [step]
+                                       (mapv (juxt :kind :dtype :kernel-dtype) (:abi step))) %)
+                              :steps val)
+                        descriptors))))
+    (testing "OpenCL C preserves integer schedule scalars and portable NaN comparison"
+      (is (str/includes? (first sources) "int tile_count"))
+      (is (str/includes? (first sources) "int tile_size"))
+      (is (every? #(not (str/includes? % "boolean(")) sources))
+      (is (every? #(str/includes? % "(float)(candidate) == (float)(candidate)") sources)))
+    (testing "the descriptor certifies as a composable LinkPlan before allocation"
+      (is (resident-plan/certified-plan? (resident-plan/verify! lowering))))))

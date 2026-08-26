@@ -151,6 +151,15 @@ zeroes while packing and therefore avoids a materialized padding buffer; the bra
 kernel remains available for already padded layouts. Padding is layout, not quantization-specific
 memory ownership.
 
+Decoder selection is likewise an ordinary indexed row reduction, not an attention or quantization
+primitive. Its first portable schedule reduces parallel 256-element tiles into compiler-owned
+structure-of-arrays `(value,index)` scratch and then merges those products per row. The semantic ABI
+contains only values, output indices, row count and width; ties select the lowest index, and the first
+NaN outranks numeric values so corruption is visible and deterministic. This slice deliberately
+exposes the next general IR requirement: `SegRed` needs typed product/tuple accumulators and a
+workgroup/subgroup schedule. Once that exists, the general scheduled reduction should subsume the
+two-map implementation and lower to target-local shared/shuffle reductions without changing callers.
+
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
 
