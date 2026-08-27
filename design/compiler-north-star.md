@@ -456,6 +456,19 @@ release. Completion owns the lifetime of every referenced graph, kernel,
 allocation, and view; destruction must first establish completion. Status
 observation alone is not assumed to establish host memory visibility.
 
+The first transfer realization uses that same public event contract for
+bounds-checked batches of host/resident ranges. A completed transfer reports
+bytes, command count, elapsed time, and timing provenance. OpenCL uses owned
+native staging and device-event timestamps; a caller may reuse upload sources
+after submission, while download destinations become visible only after the
+host wait. Level Zero's current shared allocations complete their Panama copy
+inline and report host-monotonic timing explicitly rather than pretending that
+a device copy event exists. Logical compute and transfer queues initially map
+to one physical in-order OpenCL queue, preserving ordering until execution-plan
+lowering can express and realize cross-queue dependencies safely. Immediate-wait
+measurements are the calibration path; `host-wall-ns` otherwise includes any
+intentional host work between submission and wait.
+
 Device-to-device binding is the normal path. Host transfer is an explicit graph
 edge with a reason and byte count. The compiler's memory plan owns temporary
 liveness, reuse, alignment, and peak-memory accounting.

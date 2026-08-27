@@ -33,6 +33,11 @@
   []
   (->LogicalQueue :compute-0 :compute 0 :in-order))
 
+(defn transfer-queue
+  "The default target-neutral in-order host/device transfer queue."
+  []
+  (->LogicalQueue :transfer-0 :transfer 0 :in-order))
+
 (defn validate!
   "Validate and return an ExecutionPlan.
 

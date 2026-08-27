@@ -12,10 +12,60 @@
    The second invariant: out-of-range is an ERROR, never a clamp. `array->buffer!` clamps to
    `(min buf src)` bytes, which is fine for a whole-buffer copy and exactly wrong for a range."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as g]
             [raster.gpu.device-probe :as device-probe])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
+
+(deftest asynchronous-transfer-batches-use-the-common-event-contract
+  (let [buffer {:dtype :float :n-elements 8 :byte-size 32}
+        allocation (bview/allocation
+                    {:id :buffer-allocation :byte-size 32 :memory-space :device
+                     :device :ze:0 :coherence :host-coherent :ownership :owned})
+        session (atom {:device-id :ze:0 :session-id :transfer-session
+                       :buffers {:buffer buffer} :allocations {:buffer allocation}
+                       :kernel-graphs {} :events {} :closed? false})
+        source (float-array 8)
+        submitted (atom [])
+        awaited (atom [])
+        released (atom [])
+        resolver
+        (fn [_ name]
+          (case name
+            "plan-range" (fn [_ host {:keys [elements] :as spec} direction]
+                           {:host host :spec spec :direction direction
+                            :n-bytes (* 4 elements)})
+            "submit-range-batch!" (fn [entries direction]
+                                    (let [token {:entries entries :direction direction}]
+                                      (swap! submitted conj token)
+                                      token))
+            "event-complete?" (constantly false)
+            "await-event!" (fn [token]
+                             (swap! awaited conj token)
+                             {:timing-source :device-event :elapsed-ns 40
+                              :bytes 32 :commands 1 :direction :upload
+                              :asynchronous? true})
+            "release-event!" #(swap! released conj %)
+            (throw (ex-info "unexpected mocked runtime function" {:name name}))))]
+    (with-redefs-fn
+      {(ns-resolve 'raster.gpu.core 'rt-resolve) resolver}
+      (fn []
+        (let [event (g/submit-upload-ranges!
+                     session [[:buffer source {:elements 8}]])]
+          (is (g/gpu-event? event))
+          (is (= :transfer (get-in event [:queue :class])))
+          (is (false? (g/event-complete? session event)))
+          (is (thrown-with-msg? clojure.lang.ExceptionInfo #"must be awaited"
+                                (g/event-measurement session event)))
+          (is (= [buffer] (g/await-event! session event)))
+          (let [measurement (g/event-measurement session event)]
+            (is (= :device-event (:timing-source measurement)))
+            (is (= 32 (:bytes measurement)))
+            (is (<= 0 (:submit-host-ns measurement) (:host-wall-ns measurement))))
+          (g/release-event! session event)
+          (is (= @submitted @awaited @released))
+          (is (empty? (:events @session))))))))
 
 ;; gemma-270m's real KV shape: 2048 positions x (1 kv-head x 256 head-dim)
 (def ^:private maxpos 2048)
@@ -204,6 +254,60 @@
             (let [k (keyword (str kind l)) tag (* 1e6 (+ 1 (* 2 l) (if (= kind "vc") 1 0)))]
               (is (every? (fn [i] (== (aget ^floats (get outs k) i) (float (+ tag i)))) (range n))
                   (str k " carries ITS OWN layer's prefix, not a neighbour's")))))))))
+
+(defn- asynchronous-mixed-storage-roundtrip!
+  [device-id expected-timing-source]
+  (let [n 257
+        float-source (float-array (map #(float (+ 1 %)) (range n)))
+        half-source (short-array (map #(Float/floatToFloat16 (float (+ 1 %))) (range n)))
+        expected-float (aclone float-source)
+        expected-half (aclone half-source)
+        float-destination (float-array n)
+        half-destination (short-array n)
+        session (g/make-session device-id)]
+    (try
+      (g/alloc! session {:float-buffer [:float n nil]
+                         :half-buffer [:half n nil]})
+      (let [event (g/submit-upload-ranges!
+                   session [[:float-buffer float-source {:elements n}]
+                            [:half-buffer half-source {:elements n}]])]
+        ;; Upload owns its staging at return: caller mutation cannot change the submitted payload.
+        (dotimes [i n]
+          (aset float-source i (float -1.0))
+          (aset half-source i (short 0)))
+        (is (= [n n] (mapv :n-elements (g/await-event! session event))))
+        (let [measurement (g/event-measurement session event)]
+          (is (= expected-timing-source (:timing-source measurement)))
+          (is (= (+ (* 4 n) (* 2 n)) (:bytes measurement)))
+          (is (= 2 (:commands measurement)))
+          (is (<= 0 (:elapsed-ns measurement))))
+        (g/release-event! session event))
+      (let [event (g/submit-download-ranges!
+                   session [[:float-buffer float-destination {:elements n}]
+                            [:half-buffer half-destination {:elements n}]])]
+        (when (= :device-event expected-timing-source)
+          (is (every? zero? float-destination)
+              "OpenCL download staging is not host-visible before await")
+          (is (every? zero? half-destination)))
+        (is (= [float-destination half-destination]
+               (g/await-event! session event)))
+        (is (= expected-timing-source
+               (:timing-source (g/event-measurement session event))))
+        (g/release-event! session event))
+      (is (= (vec expected-float) (vec float-destination)))
+      (is (= (vec expected-half) (vec half-destination)))
+      (finally
+        (g/close-session! session)))))
+
+(deftest level-zero-asynchronous-batch-has-honest-host-timing
+  (if-not @gp/gpu-available?
+    (gp/gpu-skip! "asynchronous mixed-storage range batch on Level Zero")
+    (asynchronous-mixed-storage-roundtrip! :ze:0 :host-monotonic)))
+
+(deftest opencl-asynchronous-batch-has-device-event-timing
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "asynchronous mixed-storage range batch on OpenCL")
+    (asynchronous-mixed-storage-roundtrip! :ocl:0 :device-event)))
 
 (deftest a-bad-entry-anywhere-leaves-the-whole-cache-untouched
   (if-not @gp/gpu-available?

@@ -103,6 +103,7 @@
     CL_DEVICE_TYPE_GPU))
 (def ^:private CL_MEM_READ_WRITE (long 1))
 (def ^:private CL_MEM_COPY_HOST_PTR (long 32))
+(def ^:private CL_FALSE (int 0))
 (def ^:private CL_TRUE (int 1))
 (def ^:private CL_COMPLETE 0)
 (def ^:private CL_QUEUE_PROFILING_ENABLE (long 2))
@@ -414,9 +415,12 @@
           _ (when (not= CL_SUCCESS (read-int err-seg))
               (throw (ex-info "clCreateContext failed" {:error (read-int err-seg)})))
 
-          ;; Create in-order command queue (CL 1.x compatible)
+          ;; One physical in-order queue initially realizes the backend-neutral compute and
+          ;; transfer queue classes. Profiling is enabled so transfer GPUEvents have device
+          ;; timestamps without introducing unsynchronized cross-queue execution.
           queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
-                                      (into-array Object [ctx device (long 0) err-seg]))
+                                      (into-array Object
+                                                  [ctx device CL_QUEUE_PROFILING_ENABLE err-seg]))
           _ (when (not= CL_SUCCESS (read-int err-seg))
               (throw (ex-info "clCreateCommandQueue failed" {:error (read-int err-seg)})))]
 
@@ -1482,6 +1486,94 @@
   (when (and event (not (.equals ^MemorySegment event MemorySegment/NULL)))
     (cl-call! "clReleaseEvent" @h-clReleaseEvent [event])))
 
+(defn submit-range-batch!
+  "Submit a validated range batch on the profiling-enabled OpenCL queue without waiting.
+
+   Every command owns a private native staging slice until the returned completion token is
+   awaited and released. Upload sources are copied into immutable staging before return; download
+   destinations are populated only by await-event!, after device completion establishes host
+   visibility."
+  [entries direction]
+  (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
+        total-bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
+    (if (empty? active)
+      {:complete? true
+       :completion {:timing-source :host-monotonic
+                    :elapsed-ns 0 :bytes total-bytes :commands 0
+                    :direction direction :asynchronous? false}}
+      (let [queue (:queue @state)
+            arena (Arena/ofShared)
+            event-outs (.allocate arena (* 8 (count active)))
+            status-out (.allocate arena I32)
+            enqueued (volatile! 0)]
+        (try
+          (let [copies
+                (mapv
+                 (fn [[index [^OclBuffer buffer
+                              {:keys [buf-off host-off n-bytes host-seg]}]]]
+                   (let [n-bytes (long n-bytes)
+                         staging (.allocate arena n-bytes 64)
+                         event-out (.asSlice event-outs (* 8 index) 8)]
+                     (when (= :upload direction)
+                       (MemorySegment/copy ^MemorySegment host-seg (long host-off)
+                                           staging 0 n-bytes))
+                     (cl-call! (if (= :upload direction)
+                                 "clEnqueueWriteBuffer" "clEnqueueReadBuffer")
+                               (if (= :upload direction)
+                                 @h-clEnqueueWriteBuffer @h-clEnqueueReadBuffer)
+                               [queue (:cl-mem buffer) CL_FALSE (long buf-off) n-bytes
+                                staging (int 0) MemorySegment/NULL event-out])
+                     (vswap! enqueued inc)
+                     {:staging staging :host-seg host-seg :host-off (long host-off)
+                      :n-bytes n-bytes}))
+                 (map-indexed vector active))]
+            (cl-call! "clFlush" @h-clFlush [queue])
+            (let [events (mapv #(.get event-outs PTR (* 8 %)) (range (count active)))
+                  final-offset (* 8 (dec (count active)))]
+              {:transfer? true
+               :queue queue
+               :direction direction
+               :bytes total-bytes
+               :copies copies
+               :events events
+               :event (peek events)
+               :event-array (.asSlice event-outs final-offset 8)
+               :status-out status-out
+               :arena arena}))
+          (catch Exception error
+            ;; A failed enqueue can leave earlier nonblocking commands live. Keep their staging
+            ;; valid until the queue is drained, then release every event written so far.
+            (try (cl-call! "clFinish" @h-clFinish [queue]) (catch Exception _))
+            (doseq [index (range @enqueued)]
+              (try (release-native-event! (.get event-outs PTR (* 8 index)))
+                   (catch Exception _)))
+            (.close arena)
+            (throw error)))))))
+
+(defn- await-transfer!
+  [{:keys [direction bytes copies events]}]
+  (when (= :download direction)
+    (doseq [{:keys [staging host-seg host-off n-bytes]} copies]
+      (MemorySegment/copy ^MemorySegment staging 0 ^MemorySegment host-seg
+                          (long host-off) (long n-bytes))))
+  (let [arena (Arena/ofConfined)]
+    (try
+      (let [value (.allocate arena I64)
+            read-ts (fn [event parameter]
+                      (cl-call! "clGetEventProfilingInfo" @h-clGetEventProfilingInfo
+                                [event (int parameter) (long 8) value MemorySegment/NULL])
+                      (.get value I64 0))
+            start (read-ts (first events) CL_PROFILING_COMMAND_START)
+            end (read-ts (peek events) CL_PROFILING_COMMAND_END)]
+        {:timing-source :device-event
+         :elapsed-ns (- end start)
+         :bytes bytes
+         :commands (count events)
+         :direction direction
+         :asynchronous? true})
+      (finally
+        (.close arena)))))
+
 (defn- clear-profile-state!
   [graph]
   (when-let [profile-state (:profile-state graph)]
@@ -1532,10 +1624,13 @@
 
 (defn await-event!
   "Wait for a runtime-private OpenCL completion token."
-  [{:keys [complete? event-array]}]
+  [{:keys [complete? completion transfer? event-array] :as token}]
   (when-not complete?
     (cl-call! "clWaitForEvents" @h-clWaitForEvents [(int 1) event-array]))
-  nil)
+  (cond
+    complete? completion
+    transfer? (await-transfer! token)
+    :else nil))
 
 (defn event-complete?
   "Nonblocking query of a runtime-private OpenCL completion token."
@@ -1550,14 +1645,16 @@
 
 (defn release-event!
   "Release a runtime-private OpenCL completion token. The caller must establish completion."
-  [{:keys [complete? profile? event ^Arena arena]}]
+  [{:keys [complete? profile? transfer? events event ^Arena arena]}]
   (when-not complete?
     ;; A profiled graph retains every event until read-graph-timestamps! (or reset) consumes the
     ;; sample. The graph owns the shared arena in that interval. Ordinary completion tokens keep
     ;; the previous immediate-release behavior.
     (when-not profile?
       (try
-        (release-native-event! event)
+        (if transfer?
+          (doseq [native-event events] (release-native-event! native-event))
+          (release-native-event! event))
         (finally
           (.close arena)))))
   nil)

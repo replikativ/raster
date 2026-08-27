@@ -924,6 +924,28 @@
     :upload   (MemorySegment/copy ^MemorySegment host-seg (long host-off) (:segment buf) (long buf-off) (long n-bytes))
     :download (MemorySegment/copy (:segment buf) (long buf-off) ^MemorySegment host-seg (long host-off) (long n-bytes))))
 
+(defn submit-range-batch!
+  "Execute a validated range batch against Level Zero shared allocations.
+
+   Shared allocations are host coherent, so there is no device copy command to signal: Panama
+   performs the copies before submission returns. The common GPUEvent contract still represents
+   this legal inline completion and reports host-monotonic timing rather than claiming a device
+  event measurement."
+  [entries direction]
+  (let [active (filterv (fn [[_ plan]] (pos? (long (:n-bytes plan)))) entries)
+        started (System/nanoTime)]
+    (doseq [[buffer plan] active]
+      (execute-range! buffer plan direction))
+    (let [elapsed (- (System/nanoTime) started)
+          bytes (reduce + 0 (map (comp long :n-bytes second) entries))]
+      {:complete? true
+       :completion {:timing-source :host-monotonic
+                    :elapsed-ns elapsed
+                    :bytes bytes
+                    :commands (count active)
+                    :direction direction
+                    :asynchronous? false}})))
+
 (defn upload-range!
   "Copy `elements` elements from `src` (JVM array or MemorySegment, starting at element
    `src-element`) into `buf` starting at element `dst-element`. Elements, not bytes: the byte
@@ -2991,24 +3013,29 @@
 
 (defn await-event!
   "Wait for a runtime-private graph completion token."
-  [{:keys [queue]}]
-  (ze-call! "zeCommandQueueSynchronize" @h-zeCommandQueueSynchronize
-            [queue (long -1)])
-  nil)
+  [{:keys [complete? completion queue]}]
+  (if complete?
+    completion
+    (do
+      (ze-call! "zeCommandQueueSynchronize" @h-zeCommandQueueSynchronize
+                [queue (long -1)])
+      nil)))
 
 (defn event-complete?
   "Nonblocking query of a runtime-private graph completion token."
-  [{:keys [queue]}]
-  (let [result (int (.invokeWithArguments
-                     ^MethodHandle @h-zeCommandQueueSynchronize
-                     ^java.util.List (java.util.List/of
-                                      (object-array [queue (long 0)]))))]
-    (cond
-      (= result ZE_RESULT_SUCCESS) true
-      (= result ZE_RESULT_NOT_READY) false
-      :else (throw (ex-info (str "Level Zero error querying graph event: 0x"
-                                 (Integer/toHexString result))
-                            {:result result :context "zeCommandQueueSynchronize"})))))
+  [{:keys [complete? queue]}]
+  (if complete?
+    true
+    (let [result (int (.invokeWithArguments
+                       ^MethodHandle @h-zeCommandQueueSynchronize
+                       ^java.util.List (java.util.List/of
+                                        (object-array [queue (long 0)]))))]
+      (cond
+        (= result ZE_RESULT_SUCCESS) true
+        (= result ZE_RESULT_NOT_READY) false
+        :else (throw (ex-info (str "Level Zero error querying graph event: 0x"
+                                   (Integer/toHexString result))
+                              {:result result :context "zeCommandQueueSynchronize"}))))))
 
 (defn release-event!
   "Release a runtime-private graph completion token. Queue ownership remains with the graph."
