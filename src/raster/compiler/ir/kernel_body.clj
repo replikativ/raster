@@ -6,7 +6,10 @@
   explicit, but target spellings such as Intel DPAS, CUDA WMMA or AMD MFMA are not.  Backends lower
   these values to their own dialect; they must not recover a schedule by inspecting source text."
   (:require [clojure.set :as set]
-            [raster.compiler.ir.axis-map :as axis-map]))
+            [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
@@ -17,6 +20,23 @@
 (defrecord Mask [id predicates])
 (defrecord Fragment [id dtype shape layout])
 (defrecord ScalarRegion [parameters expression operands result-dtype])
+
+;; General scalar/control kernel vocabulary.  Results are SSA values; :predicate is an internal
+;; control type rather than a public storage dtype.  Memory operations remain element/rank aware,
+;; while representation decode and numerical conversion are explicit scalar expressions.
+(defrecord ValueSpec [id type])
+(defrecord Literal [value type])
+(defrecord ScalarExpr [op arguments result-type options])
+(defrecord ScalarCompute [result expression])
+(defrecord ScalarLoad [result buffer coordinates predicate other cache])
+(defrecord ScalarStore [buffer coordinates value predicate])
+(defrecord Yield [values])
+(defrecord IfRegion [condition then-operations else-operations results])
+(defrecord LoopArg [binding initial])
+(defrecord ForLoop [index lower upper step iter-args operations results attributes])
+(defrecord Participation [kind])
+(defrecord Collective
+           [result kind scope width input operator source-lane participation association])
 
 (defrecord FragmentInit [fragment value])
 (defrecord TileLoad [fragment buffer coordinates mask cache])
@@ -34,6 +54,11 @@
 (def ^:private index-ops #{:add :sub :mul :floor-div :ceil-div :mod :min :max})
 (def ^:private predicate-ops #{:lt :lte :eq :and :or :not})
 (def ^:private cache-policies #{:default :cached :streaming})
+(def ^:private internal-types #{:predicate})
+(def ^:private special-scalar-ops #{:cast :select :isnan})
+(def ^:private cast-rounding-policies #{:toward-zero :nearest-even :up :down :exact})
+(def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact})
+(def ^:private collective-kinds #{:reduce :broadcast})
 
 (defn- record-kind? [class-name value]
   (and value (= class-name (.getName (class value)))))
@@ -59,6 +84,38 @@
     (throw (ex-info "kernel predicate has an unsupported operation"
                     {:operation op :arguments arguments})))
   (->Predicate op (vec arguments)))
+
+(defn value
+  "Construct a typed SSA result declaration.  `:predicate` is reserved for internal control."
+  [id type]
+  (->ValueSpec id type))
+
+(defn literal
+  "Construct a typed scalar literal.  Literals are explicit so target lowering never infers the
+  width of a Clojure number."
+  [value type]
+  (->Literal value type))
+
+(defn scalar-expression
+  "Construct a target-neutral scalar expression using the canonical intrinsic key space.
+
+  `options` is intentionally explicit and op-specific.  In particular, casts must state both
+  rounding and overflow behavior."
+  ([op result-type arguments]
+   (scalar-expression op result-type arguments {}))
+  ([op result-type arguments options]
+   (->ScalarExpr op (vec arguments) result-type (or options {}))))
+
+(defn cast-expression
+  "Construct an explicit numerical conversion."
+  [argument result-type rounding overflow]
+  (scalar-expression :cast result-type [argument]
+                     {:rounding rounding :overflow overflow}))
+
+(defn full-participation
+  "Every lane in the collective's statically selected subgroup participates."
+  []
+  (->Participation :full))
 
 (def ^:private scalar-region-forbidden-ops
   '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
@@ -92,7 +149,7 @@
 
 (defn- expression? [value]
   (cond
-    (or (number? value) (value-id? value)) true
+    (or (integer? value) (value-id? value)) true
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (and (contains? index-ops (:op value))
          (seq (:arguments value))
@@ -102,7 +159,7 @@
 (defn- expression-references [value]
   (cond
     (value-id? value) #{value}
-    (number? value) #{}
+    (integer? value) #{}
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (reduce into #{} (map expression-references (:arguments value)))
     :else #{}))
@@ -119,6 +176,54 @@
                   (predicate-references %)
                   (expression-references %))
                (:arguments value))))
+
+(defn- scalar-type?
+  [type]
+  (or (contains? internal-types type) (dtype/known? type)))
+
+(defn- canonical-type
+  [type]
+  (if (contains? internal-types type) type (dtype/canon type)))
+
+(defn- value-spec!
+  [owner spec]
+  (when-not (and (record-kind? "raster.compiler.ir.kernel_body.ValueSpec" spec)
+                 (value-id? (:id spec))
+                 (scalar-type? (:type spec)))
+    (throw (ex-info (str owner " requires a typed ValueSpec") {:value spec})))
+  spec)
+
+(defn- literal!
+  [literal]
+  (let [type (when (scalar-type? (:type literal)) (canonical-type (:type literal)))
+        value (:value literal)
+        valid-value?
+        (case type
+          :predicate (instance? Boolean value)
+          :byte (and (integer? value) (<= Byte/MIN_VALUE value Byte/MAX_VALUE))
+          :int (and (integer? value) (<= Integer/MIN_VALUE value Integer/MAX_VALUE))
+          :long (and (integer? value) (<= Long/MIN_VALUE value Long/MAX_VALUE))
+          (:half :float :double) (number? value)
+          false)]
+    (when-not (and (record-kind? "raster.compiler.ir.kernel_body.Literal" literal)
+                   type valid-value?)
+      (throw (ex-info "kernel literal value and type disagree" {:literal literal})))
+    literal))
+
+(defn- launch-bound-value
+  [value]
+  (if (record-kind? "raster.compiler.ir.kernel_launch.RuntimeValue" value)
+    (:value value)
+    value))
+
+(defn- collective-association?
+  [association width]
+  (or (= :implementation-defined association)
+      (and (map? association)
+           (= :shuffle-down-tree (:kind association))
+           (zero? (bit-and width (dec width)))
+           (= (vec (:distances association))
+              (vec (take-while pos? (iterate #(quot % 2) (quot width 2))))))))
 
 (defn- shape! [owner shape]
   (when-not (and (vector? shape) (seq shape)
@@ -142,7 +247,14 @@
                "raster.compiler.ir.kernel_body.MatrixMad"
                "raster.compiler.ir.kernel_body.Loop"
                "raster.compiler.ir.kernel_body.Guard"
-               "raster.compiler.ir.kernel_body.TileStore"}
+               "raster.compiler.ir.kernel_body.TileStore"
+               "raster.compiler.ir.kernel_body.ScalarCompute"
+               "raster.compiler.ir.kernel_body.ScalarLoad"
+               "raster.compiler.ir.kernel_body.ScalarStore"
+               "raster.compiler.ir.kernel_body.Yield"
+               "raster.compiler.ir.kernel_body.IfRegion"
+               "raster.compiler.ir.kernel_body.ForLoop"
+               "raster.compiler.ir.kernel_body.Collective"}
              (some-> value class .getName)))
 
 (declare validate-operations!)
@@ -336,6 +448,119 @@
         (when-let [region (:value-region operation)]
           (validate-scalar-region! region storage epilogue-abi)))
 
+      (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
+      (do
+        (value-spec! "scalar compute result" (:result operation))
+        (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr"
+                                (:expression operation))
+          (throw (ex-info "scalar compute requires an explicit ScalarExpr"
+                          {:operation operation}))))
+
+      (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
+      (let [p (parameter (:buffer operation))]
+        (value-spec! "scalar load result" (:result operation))
+        (when (= :scalar (:kind p))
+          (throw (ex-info "scalar loads require buffer storage" {:buffer p})))
+        (when-not (and (vector? (:coordinates operation))
+                       (every? expression? (:coordinates operation)))
+          (throw (ex-info "scalar-load coordinates must use explicit index expressions"
+                          {:coordinates (:coordinates operation)})))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "scalar-load coordinates must match the buffer rank"
+                          {:buffer (:buffer operation) :shape (:shape p)
+                           :coordinates (:coordinates operation)})))
+        (mask (:predicate operation))
+        (when (and (:predicate operation) (nil? (:other operation)))
+          (throw (ex-info "masked scalar load requires an explicit other value"
+                          {:operation operation})))
+        (when (and (nil? (:predicate operation)) (some? (:other operation)))
+          (throw (ex-info "unmasked scalar load cannot carry an ignored other value"
+                          {:operation operation})))
+        (when-not (contains? cache-policies (:cache operation))
+          (throw (ex-info "scalar load has an unsupported cache policy"
+                          {:cache (:cache operation)}))))
+
+      (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation)
+      (let [p (parameter (:buffer operation))]
+        (when (contains? #{:input :scalar} (:kind p))
+          (throw (ex-info "scalar stores require writable output storage" {:buffer p})))
+        (when-not (and (vector? (:coordinates operation))
+                       (every? expression? (:coordinates operation)))
+          (throw (ex-info "scalar-store coordinates must use explicit index expressions"
+                          {:coordinates (:coordinates operation)})))
+        (when-not (= (count (:shape p)) (count (:coordinates operation)))
+          (throw (ex-info "scalar-store coordinates must match the buffer rank"
+                          {:buffer (:buffer operation) :shape (:shape p)
+                           :coordinates (:coordinates operation)})))
+        (mask (:predicate operation)))
+
+      (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
+      (do
+        (when-not (and (value-id? (:condition operation))
+                       (vector? (:then-operations operation))
+                       (vector? (:else-operations operation))
+                       (vector? (:results operation)))
+          (throw (ex-info "kernel if region is incomplete" {:operation operation})))
+        (doseq [result (:results operation)] (value-spec! "if result" result))
+        (validate-operations! (:then-operations operation) storage fragments masks scope epilogue-abi)
+        (validate-operations! (:else-operations operation) storage fragments masks scope epilogue-abi))
+
+      (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
+      (let [index (:index operation)]
+        (value-spec! "kernel for-loop index" index)
+        (when-not (contains? #{:int :long} (canonical-type (:type index)))
+          (throw (ex-info "kernel for-loop index must have an integral dtype"
+                          {:index index})))
+        (when-not (and (expression? (:lower operation)) (expression? (:upper operation))
+                       (integer? (:step operation)) (pos? (:step operation))
+                       (vector? (:iter-args operation))
+                       (every? #(record-kind? "raster.compiler.ir.kernel_body.LoopArg" %)
+                               (:iter-args operation))
+                       (vector? (:results operation))
+                       (= (count (:iter-args operation)) (count (:results operation)))
+                       (map? (:attributes operation)))
+          (throw (ex-info "kernel for-loop requires typed carried values and explicit bounds"
+                          {:loop operation})))
+        (doseq [arg (:iter-args operation)]
+          (value-spec! "loop carried binding" (:binding arg)))
+        (doseq [result (:results operation)] (value-spec! "loop result" result))
+        (when (contains? scope (get-in operation [:index :id]))
+          (throw (ex-info "kernel for-loop induction value shadows an existing value"
+                          {:index index :scope scope})))
+        (validate-operations! (:operations operation) storage fragments masks
+                              (conj scope (:id index)) epilogue-abi))
+
+      (record-kind? "raster.compiler.ir.kernel_body.Yield" operation)
+      (when-not (vector? (:values operation))
+        (throw (ex-info "kernel region yield values must be an ordered vector"
+                        {:operation operation})))
+
+      (record-kind? "raster.compiler.ir.kernel_body.Collective" operation)
+      (do
+        (value-spec! "collective result" (:result operation))
+        (when-not (and (contains? collective-kinds (:kind operation))
+                       (= :subgroup (:scope operation))
+                       (integer? (:width operation)) (pos? (:width operation))
+                       (record-kind? "raster.compiler.ir.kernel_body.Participation"
+                                     (:participation operation))
+                       (= :full (get-in operation [:participation :kind])))
+          (throw (ex-info "kernel collective has an unsupported execution contract"
+                          {:operation operation})))
+        (case (:kind operation)
+          :reduce
+          (when-not (and (keyword? (:operator operation))
+                         (nil? (:source-lane operation))
+                         (collective-association? (:association operation)
+                                                  (:width operation)))
+            (throw (ex-info "subgroup reduction requires an operator and no source lane"
+                            {:operation operation})))
+          :broadcast
+          (when-not (and (nil? (:operator operation))
+                         (nil? (:association operation))
+                         (expression? (:source-lane operation)))
+            (throw (ex-info "subgroup broadcast requires a source lane and no reduction association"
+                            {:operation operation})))))
+
       :else
       (throw (ex-info "kernel body contains an unsupported operation"
                       {:operation operation :actual (type operation)})))))
@@ -347,6 +572,427 @@
     (when-not (operation? operation)
       (throw (ex-info "kernel body contains a non-operation value" {:operation operation})))
     (validate-operation! operation storage fragments masks scope epilogue-abi)))
+
+;; ---------------------------------------------------------------------------
+;; Typed SSA and convergence verification for the general scalar vocabulary.
+;; ---------------------------------------------------------------------------
+
+(def ^:private all-uniform #{:workgroup :subgroup})
+(def ^:private subgroup-uniform #{:subgroup})
+(def ^:private lane-varying #{})
+
+(defn- join-uniformity
+  [infos]
+  (if (seq infos)
+    (reduce set/intersection all-uniform (map :uniformity infos))
+    all-uniform))
+
+(defn- typed-info!
+  [values id owner]
+  (or (get values id)
+      (throw (ex-info (str owner " references a value before it is defined")
+                      {:reason :kernel-body-use-before-definition :value id}))))
+
+(declare scalar-info!)
+
+(defn- literal-info!
+  [literal]
+  (literal! literal)
+  {:type (canonical-type (:type literal)) :uniformity all-uniform})
+
+(defn- scalar-argument-info!
+  [argument values]
+  (cond
+    (record-kind? "raster.compiler.ir.kernel_body.Literal" argument)
+    (literal-info! argument)
+
+    (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr" argument)
+    (scalar-info! argument values)
+
+    (value-id? argument)
+    (typed-info! values argument "scalar expression")
+
+    :else
+    (throw (ex-info "scalar expression operands must be typed values, literals, or expressions"
+                    {:argument argument}))))
+
+(defn- same-types!
+  [owner infos]
+  (let [types (mapv :type infos)]
+    (when-not (apply = types)
+      (throw (ex-info (str owner " operand types must agree") {:types types})))
+    (first types)))
+
+(defn- scalar-info!
+  [expression values]
+  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr" expression)
+    (throw (ex-info "expected an explicit ScalarExpr" {:expression expression})))
+  (let [{:keys [op arguments result-type options]} expression
+        result-type (when (scalar-type? result-type) (canonical-type result-type))
+        infos (mapv #(scalar-argument-info! % values) arguments)
+        intrinsic (intrinsics/descriptor op)
+        canonical-op (intrinsics/canonical op)]
+    (when-not result-type
+      (throw (ex-info "scalar expression requires a known result type"
+                      {:expression expression :result-type (:result-type expression)})))
+    (cond
+      (= :cast op)
+      (let [source-type (:type (first infos))
+            source-integral? (contains? #{:byte :int :long} source-type)
+            result-integral? (contains? #{:byte :int :long} result-type)
+            rounding (:rounding options)
+            overflow (:overflow options)]
+        (when-not (= 1 (count infos))
+          (throw (ex-info "scalar cast requires one operand" {:expression expression})))
+        (when-not (= #{:rounding :overflow} (set (keys options)))
+          (throw (ex-info "scalar cast must state exactly its rounding and overflow policies"
+                          {:reason :kernel-body-cast-policy :options options})))
+        (when-not (and (contains? cast-rounding-policies (:rounding options))
+                       (contains? cast-overflow-policies (:overflow options)))
+          (throw (ex-info "scalar cast has an unsupported numerical policy"
+                          {:reason :kernel-body-cast-policy :options options})))
+        (when (or (= :predicate result-type) (= :predicate (:type (first infos))))
+          (throw (ex-info "numeric casts cannot create or consume predicates"
+                          {:expression expression})))
+        ;; Rounding has no meaning when the source is already integral. Wrapping is a
+        ;; representation operation only between integral types; floating conversions must
+        ;; choose an explicit exact, checked, or saturating contract.
+        (when-not (and (or (not source-integral?) (= :exact rounding))
+                       (or (not= :wrap overflow)
+                           (and source-integral? result-integral?)))
+          (throw (ex-info "scalar cast policies disagree with its source and result dtypes"
+                          {:reason :kernel-body-cast-policy
+                           :source-type source-type :result-type result-type
+                           :rounding rounding :overflow overflow}))))
+
+      (= :select op)
+      (do
+        (when-not (= 3 (count infos))
+          (throw (ex-info "scalar select requires predicate, true, and false operands"
+                          {:expression expression})))
+        (when-not (= :predicate (:type (first infos)))
+          (throw (ex-info "scalar select condition must be a predicate"
+                          {:condition (first infos)})))
+        (let [selected-type (same-types! "scalar select" (subvec infos 1))]
+          (when-not (= result-type selected-type)
+            (throw (ex-info "scalar select result type disagrees with its values"
+                            {:result-type result-type :value-type selected-type})))))
+
+      (= :isnan op)
+      (do
+        (when-not (and (= 1 (count infos))
+                       (dtype/fp-dtype? (:type (first infos)))
+                       (= :predicate result-type)
+                       (empty? options))
+          (throw (ex-info "isnan requires one floating operand and a predicate result"
+                          {:expression expression}))))
+
+      intrinsic
+      (let [arity (:arity intrinsic)
+            kind (:kind intrinsic)
+            operand-type (same-types! "scalar intrinsic" infos)]
+        (when-not (= arity (count infos))
+          (throw (ex-info "scalar intrinsic arity mismatch"
+                          {:operation canonical-op :expected arity :actual (count infos)})))
+        (when (seq options)
+          (throw (ex-info "scalar intrinsic does not accept unspecified lowering options"
+                          {:operation canonical-op :options options})))
+        (when (= :predicate operand-type)
+          (throw (ex-info "numeric intrinsics cannot consume predicate values"
+                          {:operation canonical-op})))
+        (when-not (intrinsics/accepts-scalar-dtype? canonical-op operand-type)
+          (throw (ex-info "scalar intrinsic is not defined for its operand dtype"
+                          {:reason :kernel-body-intrinsic-dtype
+                           :operation canonical-op :operand-type operand-type})))
+        (if (= :cmp kind)
+          (when-not (= :predicate result-type)
+            (throw (ex-info "comparison intrinsic must produce a predicate"
+                            {:operation canonical-op :result-type result-type})))
+          (when-not (= result-type operand-type)
+            (throw (ex-info "scalar intrinsic result type must equal its operand type"
+                            {:operation canonical-op :result-type result-type
+                             :operand-type operand-type})))))
+
+      :else
+      (throw (ex-info "scalar expression has an unknown canonical operation"
+                      {:operation op :allowed-special special-scalar-ops})))
+    {:type result-type :uniformity (join-uniformity infos)}))
+
+(defn- expression-info!
+  [expression values]
+  (let [infos (mapv #(typed-info! values % "index expression")
+                    (expression-references expression))
+        types (set (map :type infos))]
+    (when-not (every? #{:int :long} types)
+      (throw (ex-info "index expression references a non-integral SSA value"
+                      {:reason :kernel-body-index-dtype :expression expression :types types})))
+    (when (> (count types) 1)
+      (throw (ex-info "index expression mixes integral widths without an explicit conversion"
+                      {:reason :kernel-body-index-dtype :expression expression :types types})))
+    {:type (or (first types) :int)
+     :uniformity (join-uniformity infos)}))
+
+(defn- expression-uniformity
+  [expression values]
+  (:uniformity (expression-info! expression values)))
+
+(defn- mask-uniformity
+  [mask-id mask-map values]
+  (if-not mask-id
+    all-uniform
+    (let [mask (or (get mask-map mask-id)
+                   (throw (ex-info "kernel operation references an undeclared mask"
+                                   {:mask mask-id})))]
+      (join-uniformity
+       (map #(typed-info! values % "kernel mask")
+            (mapcat predicate-references (:predicates mask)))))))
+
+(defn- scalar-value-info!
+  [value values]
+  (cond
+    (record-kind? "raster.compiler.ir.kernel_body.Literal" value) (literal-info! value)
+    (record-kind? "raster.compiler.ir.kernel_body.ScalarExpr" value) (scalar-info! value values)
+    (value-id? value) (typed-info! values value "kernel scalar operation")
+    :else (throw (ex-info "kernel scalar value must be typed" {:value value}))))
+
+(defn- claim-value!
+  [claimed reserved values spec owner]
+  (value-spec! owner spec)
+  (let [id (:id spec)]
+    (when (or (contains? reserved id) (contains? values id) (contains? @claimed id))
+      (throw (ex-info "kernel SSA result identity is not globally unique"
+                      {:reason :kernel-body-duplicate-ssa :value id :owner owner})))
+    (swap! claimed conj id))
+  spec)
+
+(defn- terminal-yield!
+  [owner operations]
+  (when-not (and (vector? operations) (seq operations)
+                 (record-kind? "raster.compiler.ir.kernel_body.Yield" (peek operations)))
+    (throw (ex-info (str owner " must terminate in Yield") {:operations operations})))
+  (when (some #(record-kind? "raster.compiler.ir.kernel_body.Yield" %)
+              (pop operations))
+    (throw (ex-info (str owner " may only yield as its terminal operation")
+                    {:operations operations})))
+  (peek operations))
+
+(declare validate-dataflow-operations!)
+
+(defn- validate-region!
+  [owner operations expected-results values context]
+  (let [yield-op (terminal-yield! owner operations)
+        branch-values (validate-dataflow-operations! (pop operations) values context)
+        yielded (mapv #(scalar-value-info! % branch-values) (:values yield-op))
+        expected-types (mapv (comp canonical-type :type) expected-results)
+        actual-types (mapv :type yielded)]
+    (when-not (= expected-types actual-types)
+      (throw (ex-info (str owner " yield arity or types disagree with its declared results")
+                      {:reason :kernel-body-yield-mismatch
+                       :expected expected-types :actual actual-types})))
+    yielded))
+
+(defn- static-workgroup-width!
+  [launch]
+  (let [workgroup (cond
+                    (launch/launch-spec? launch) (:workgroup-size (launch/validate-spec! launch))
+                    (map? launch) (:workgroup-size launch)
+                    :else nil)]
+    (when-not (and (vector? workgroup) (seq workgroup) (every? pos-int? workgroup))
+      (throw (ex-info "collective KernelBody requires a static workgroup launch"
+                      {:reason :kernel-body-collective-launch :launch launch})))
+    (reduce * workgroup)))
+
+(defn- validate-dataflow-operation!
+  [operation values {:keys [storage masks claimed reserved control-uniformity launch schedule]
+                     :as context}]
+  (cond
+    (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
+    (let [result (claim-value! claimed reserved values (:result operation) "scalar compute")
+          info (scalar-info! (:expression operation) values)
+          declared (canonical-type (:type result))]
+      (when-not (= declared (:type info))
+        (throw (ex-info "scalar compute result type disagrees with its expression"
+                        {:result result :expression-type (:type info)})))
+      (assoc values (:id result) info))
+
+    (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
+    (let [result (claim-value! claimed reserved values (:result operation) "scalar load")
+          buffer (get storage (:buffer operation))
+          result-type (canonical-type (:type result))
+          buffer-type (canonical-type (:dtype buffer))
+          _ (doseq [coordinate (:coordinates operation)]
+              (expression-uniformity coordinate values))
+          predicate-uniformity (mask-uniformity (:predicate operation) masks values)
+          other-info (when (:predicate operation)
+                       (scalar-value-info! (:other operation) values))]
+      (when-not (= result-type buffer-type)
+        (throw (ex-info "scalar load result type must equal the buffer element type"
+                        {:reason :kernel-body-load-dtype :result result :buffer buffer})))
+      (when (and other-info (not= result-type (:type other-info)))
+        (throw (ex-info "masked scalar load other value has the wrong type"
+                        {:reason :kernel-body-load-other-dtype
+                         :expected result-type :actual (:type other-info)})))
+      (assoc values (:id result)
+             {:type result-type
+              ;; ABI slots may alias for in-place programs. Neither an :input role nor identical
+              ;; coordinates prove immutability, so loads cannot establish uniform control until
+              ;; the body/ABI seam carries a checked readonly/noalias fact.
+              :uniformity (reduce set/intersection lane-varying
+                                  (cond-> [predicate-uniformity]
+                                    other-info (conj (:uniformity other-info))))}))
+
+    (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation)
+    (let [buffer (get storage (:buffer operation))
+          stored (scalar-value-info! (:value operation) values)
+          buffer-type (canonical-type (:dtype buffer))]
+      (doseq [coordinate (:coordinates operation)]
+        (expression-uniformity coordinate values))
+      (mask-uniformity (:predicate operation) masks values)
+      (when-not (= buffer-type (:type stored))
+        (throw (ex-info "scalar store value type must equal the buffer element type"
+                        {:reason :kernel-body-store-dtype
+                         :buffer buffer :value-type (:type stored)})))
+      values)
+
+    (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
+    (let [condition (typed-info! values (:condition operation) "kernel if condition")]
+      (when-not (= :predicate (:type condition))
+        (throw (ex-info "kernel if condition must be a predicate value"
+                        {:reason :kernel-body-if-condition :condition condition})))
+      (let [results (:results operation)
+            branch-context (update context :control-uniformity set/intersection
+                                   (:uniformity condition))
+            then-values (validate-region! "kernel if then-region" (:then-operations operation)
+                                          results values branch-context)
+            else-values (validate-region! "kernel if else-region" (:else-operations operation)
+                                          results values branch-context)]
+        (reduce (fn [env [result then-info else-info]]
+                  (claim-value! claimed reserved values result "kernel if result")
+                  (assoc env (:id result)
+                         {:type (canonical-type (:type result))
+                          :uniformity (reduce set/intersection (:uniformity condition)
+                                              [(:uniformity then-info)
+                                               (:uniformity else-info)])}))
+                values (map vector results then-values else-values))))
+
+    (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
+    (let [index (:index operation)
+          lower-info (expression-info! (:lower operation) values)
+          upper-info (expression-info! (:upper operation) values)
+          index-type (canonical-type (:type index))
+          lower-uniformity (:uniformity lower-info)
+          upper-uniformity (:uniformity upper-info)
+          loop-control (reduce set/intersection control-uniformity
+                               [lower-uniformity upper-uniformity])
+          iter-args (:iter-args operation)
+          results (:results operation)
+          initials (mapv #(scalar-value-info! (:initial %) values) iter-args)]
+      (when-not (= index-type (:type lower-info) (:type upper-info))
+        (throw (ex-info "kernel for-loop index and bounds must have one integral type"
+                        {:reason :kernel-body-loop-index-dtype :index index
+                         :lower-type (:type lower-info) :upper-type (:type upper-info)})))
+      (claim-value! claimed reserved values index "kernel for-loop index")
+      (doseq [[arg initial] (map vector iter-args initials)]
+        (let [binding (:binding arg)]
+          (claim-value! claimed reserved values binding "kernel loop-carried binding")
+          (when-not (= (canonical-type (:type binding)) (:type initial))
+            (throw (ex-info "kernel loop initial value type disagrees with its binding"
+                            {:reason :kernel-body-loop-initial :arg arg :initial initial})))))
+      (let [loop-values (into (assoc values (:id index)
+                                     {:type (canonical-type (:type index))
+                                      :uniformity loop-control})
+                              (map (fn [arg initial]
+                                     ;; Backedge values may become lane-varying after iteration
+                                     ;; one.  Until we compute a region fixed point, this is the
+                                     ;; conservative fact available inside the loop.
+                                     [(:id (:binding arg))
+                                      (assoc initial :uniformity lane-varying)])
+                                   iter-args initials))
+            yielded (validate-region! "kernel for-loop body" (:operations operation)
+                                      (mapv :binding iter-args) loop-values
+                                      (assoc context :control-uniformity loop-control))]
+        (reduce (fn [env [result yielded-info initial-info]]
+                  (claim-value! claimed reserved values result "kernel for-loop result")
+                  (when-not (= (canonical-type (:type result)) (:type yielded-info))
+                    (throw (ex-info "kernel for-loop result type disagrees with its yielded value"
+                                    {:reason :kernel-body-loop-result
+                                     :result result :yielded yielded-info})))
+                  (assoc env (:id result)
+                         (assoc yielded-info :uniformity
+                                ;; The loop may execute zero times, so its result cannot be
+                                ;; more uniform than either the initial or backedge value.
+                                (reduce set/intersection loop-control
+                                        [(:uniformity initial-info)
+                                         (:uniformity yielded-info)]))))
+                values (map vector results yielded initials))))
+
+    (record-kind? "raster.compiler.ir.kernel_body.Collective" operation)
+    (let [result (claim-value! claimed reserved values (:result operation) "subgroup collective")
+          input (scalar-value-info! (:input operation) values)
+          result-type (canonical-type (:type result))
+          width (:width operation)
+          workgroup-width (static-workgroup-width! launch)
+          scheduled-width (or (:subgroup-size schedule)
+                              (get-in schedule [:score-reduction :width])
+                              (get-in schedule [:matrix :subgroup]))]
+      (when-not (contains? control-uniformity :subgroup)
+        (throw (ex-info "subgroup collective appears in lane-divergent control flow"
+                        {:reason :kernel-body-divergent-collective
+                         :operation operation :control-uniformity control-uniformity})))
+      (when-not (= result-type (:type input))
+        (throw (ex-info "collective result type must equal its input type"
+                        {:reason :kernel-body-collective-dtype
+                         :result result :input input})))
+      (when-not (and (<= width workgroup-width) (zero? (mod workgroup-width width))
+                     (integer? scheduled-width) (= width scheduled-width))
+        (throw (ex-info "collective width disagrees with launch or scheduled subgroup geometry"
+                        {:reason :kernel-body-collective-width :width width
+                         :workgroup-width workgroup-width :scheduled-width scheduled-width})))
+      (case (:kind operation)
+        :reduce
+        (let [operator (intrinsics/canonical (:operator operation))]
+          (when-not (and (contains? #{:+ :* :min :max :bit-and :bit-or :bit-xor} operator)
+                         (intrinsics/accepts-scalar-dtype? operator (:type input)))
+            (throw (ex-info "subgroup reduction operator is not associative for its input dtype"
+                            {:reason :kernel-body-collective-operator
+                             :operator (:operator operation) :input-type (:type input)}))))
+        :broadcast
+        (let [lane (:source-lane operation)]
+          (when-not (and (integer? lane) (<= 0 lane) (< lane width))
+            (throw (ex-info "subgroup broadcast source lane must be statically in range"
+                            {:reason :kernel-body-broadcast-source
+                             :source-lane lane :width width})))))
+      (assoc values (:id result) {:type result-type :uniformity subgroup-uniform}))
+
+    (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
+    (let [guard-uniformity (mask-uniformity (:mask operation) masks values)]
+      (validate-dataflow-operations!
+       (:operations operation) values
+       (update context :control-uniformity set/intersection guard-uniformity))
+      values)
+
+    (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
+    (let [loop-uniformity (reduce set/intersection control-uniformity
+                                  [(expression-uniformity (:lower operation) values)
+                                   (expression-uniformity (:upper operation) values)])]
+      (validate-dataflow-operations!
+       (:operations operation)
+       (assoc values (:index operation) {:type :int :uniformity loop-uniformity})
+       (assoc context :control-uniformity loop-uniformity))
+      values)
+
+    (record-kind? "raster.compiler.ir.kernel_body.Yield" operation)
+    (throw (ex-info "Yield is only legal as a structured region terminator"
+                    {:reason :kernel-body-misplaced-yield :operation operation}))
+
+    ;; Matrix fragment operations do not define scalar SSA values.
+    :else values))
+
+(defn- validate-dataflow-operations!
+  [operations values context]
+  (reduce (fn [env operation]
+            (validate-dataflow-operation! operation env context))
+          values operations))
 
 (defn validate!
   "Verify a scheduled KernelBody and return it unchanged."
@@ -369,10 +1015,12 @@
     (unique-ids! "kernel masks" masks)
     (unique-ids! "kernel fragments" fragments)
     (doseq [p parameters]
+      (when-not (record-kind? "raster.compiler.ir.kernel_body.KernelParameter" p)
+        (throw (ex-info "kernel parameter must be a KernelParameter value" {:parameter p})))
       (when-not (contains? parameter-kinds (:kind p))
         (throw (ex-info "kernel parameter has an unsupported kind" {:parameter p})))
-      (when-not (keyword? (:dtype p))
-        (throw (ex-info "kernel parameter requires a dtype" {:parameter p})))
+      (when-not (dtype/known? (:dtype p))
+        (throw (ex-info "kernel parameter requires a known dtype" {:parameter p})))
       (when-not (keyword? (:role p))
         (throw (ex-info "kernel parameter requires a semantic role" {:parameter p})))
       (if (= :scalar (:kind p))
@@ -386,13 +1034,17 @@
                               {:parameter p}))))))
     (let [parameter-map (into {} (map (juxt :id identity)) parameters)
           scalar-ids (set (map :id (filter #(= :scalar (:kind %)) parameters)))
+          launch-dimensions (launch/dimensions launch)
           index-scope
           (reduce
            (fn [scope idx]
              (cond
                (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                (when-not (and (contains? index-sources (:source idx))
-                              (integer? (:axis idx)) (not (neg? (:axis idx))))
+                              (integer? (:axis idx))
+                              (case (:source idx)
+                                :group (< -1 (:axis idx) launch-dimensions)
+                                (:subgroup :lane) (zero? (:axis idx))))
                  (throw (ex-info "kernel index binding has an invalid hardware source" {:index idx})))
 
                (record-kind? "raster.compiler.ir.kernel_body.IndexCompute" idx)
@@ -453,7 +1105,8 @@
                                 (integer? group-axis)
                                 (< group-axis (count (:group-count launch)))
                                 (= (first parent-shape)
-                                   (nth (:group-count launch) group-axis)))
+                                   (launch-bound-value
+                                    (nth (:group-count launch) group-axis))))
                    (throw (ex-info
                            "kernel buffer view is not a launch-bounded contiguous leading slice"
                            {:view view :parent parent :launch launch
@@ -465,14 +1118,20 @@
                              :layout (:layout view) :view view))))
            {} views)
           storage (merge parameter-map view-map)]
+      (let [section-ids (vec (concat (map :id parameters) (map :id views) (map :id indices)
+                                     (map :id masks) (map :id fragments)))]
+        (when-not (= (count section-ids) (count (set section-ids)))
+          (throw (ex-info "kernel storage, index, mask, and fragment identities must be globally unique"
+                          {:reason :kernel-body-section-id-collision :ids section-ids}))))
       (doseq [m masks]
         (when-not (and (record-kind? "raster.compiler.ir.kernel_body.Mask" m)
                        (vector? (:predicates m)) (seq (:predicates m))
                        (every? predicate? (:predicates m)))
           (throw (ex-info "kernel mask requires explicit predicates" {:mask m}))))
       (doseq [f fragments]
-        (when-not (keyword? (:dtype f))
-          (throw (ex-info "kernel fragment requires a dtype" {:fragment f})))
+        (when-not (and (record-kind? "raster.compiler.ir.kernel_body.Fragment" f)
+                       (dtype/known? (:dtype f)))
+          (throw (ex-info "kernel fragment requires a known dtype" {:fragment f})))
         (shape! "kernel fragment" (:shape f))
         (layout! "kernel fragment" (:layout f)))
       (doseq [[field value] [[:schedule schedule] [:launch launch] [:provenance provenance]
@@ -480,12 +1139,41 @@
         (when-not (map? value)
           (throw (ex-info "kernel body descriptive sections must be maps"
                           {:field field :value value}))))
+      (launch/validate-spec! launch)
       (validate-operations! operations
                             storage
                             (into {} (map (juxt :id identity)) fragments)
                             (into {} (map (juxt :id identity)) masks)
                             index-scope
-                            (mapv :id (filter #(= :epilogue (:role %)) parameters)))))
+                            (mapv :id (filter #(= :epilogue (:role %)) parameters)))
+      (let [initial-values
+            (reduce
+             (fn [values idx]
+               (let [uniformity
+                     (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
+                       (case (:source idx)
+                         :group all-uniform
+                         :subgroup subgroup-uniform
+                         :lane lane-varying)
+                       (expression-uniformity (:expression idx) values))]
+                 (assoc values (:id idx) {:type :int :uniformity uniformity})))
+             (into {}
+                   (map (fn [parameter]
+                          [(:id parameter)
+                           {:type (canonical-type (:dtype parameter))
+                            :uniformity all-uniform}])
+                        (filter #(= :scalar (:kind %)) parameters)))
+             indices)
+            reserved (set (concat (keys storage) (map :id indices) (map :id masks)
+                                  (map :id fragments)))
+            context {:storage storage
+                     :masks (into {} (map (juxt :id identity)) masks)
+                     :claimed (atom #{})
+                     :reserved reserved
+                     :control-uniformity all-uniform
+                     :launch launch
+                     :schedule schedule}]
+        (validate-dataflow-operations! operations initial-values context))))
   body)
 
 (defn make

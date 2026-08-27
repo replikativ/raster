@@ -10,7 +10,8 @@
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (defn- decline [reason & [data]]
   (merge {:ok false :reason reason} data))
@@ -231,8 +232,8 @@
                    (fragment-id "store" mm nn) region)))
         workgroup-size (* subgroup-rows subgroup-cols subgroup)
         group-count (or launch-group-count
-                        [(body/expression :ceil-div n-parameter block-n)
-                         (body/expression :ceil-div m-parameter block-m)])]
+                        [(launch/ceil-div (launch/runtime-value n-parameter) block-n)
+                         (launch/ceil-div (launch/runtime-value m-parameter) block-m)])]
     (body/make
      {:id id
       :parameters (matrix-parameters row col out M N K dimension-parameters
@@ -244,8 +245,9 @@
       :fragments fragments
       :operations [(body/->Guard :tile-active (vec (concat init-ops [k-loop] stores)))]
       :schedule tile
-      :launch {:workgroup-size (into [workgroup-size] (repeat (dec (count group-count)) 1))
-               :group-count group-count}
+      :launch (launch/spec
+               {:workgroup-size (into [workgroup-size] (repeat (dec (count group-count)) 1))
+                :group-count group-count})
       :provenance provenance
       :attributes (merge
                    {:kind :matrix-contraction

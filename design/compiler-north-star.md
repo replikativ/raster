@@ -97,6 +97,18 @@ No schedule key is complete until it is declared, checked, costed, emitted, and
 measured. A key that intentionally models feasibility before emission must be
 labelled as such in the schema and excluded from claims of executable coverage.
 
+The first general `KernelBody` vocabulary now extends the matrix-fragment path with typed scalar
+SSA, explicit literals and conversions, rank-checked scalar loads/stores, structured `if` and
+loop-carried regions, and full-participation subgroup reductions/broadcasts. Branch and loop yields
+are typed products; use-before-definition, identity collisions, divergent collectives, implicit
+masked-load values, conversion policy gaps, and launch/subgroup mismatches fail verification. Body
+launches use the shared `LaunchSpec`, keeping host launch expressions separate from in-kernel index
+arithmetic. Local allocation, barriers, masked collectives, and asynchronous copies remain absent
+until a concrete schedule supplies enough information to verify lifetime, alignment, execution and
+memory scopes, memory semantics, participation, and shared-byte accounting. The next production
+vertical is scheduled routed `SegmentedWeightedReduction -> KernelBody` with an invariant external
+ABI; it must not introduce an attention operation into this vocabulary.
+
 ### 2.3 Executable steps and resident artifact values compose
 
 Descriptor instances share one executable-step binder: a step may select a

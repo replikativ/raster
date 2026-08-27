@@ -184,9 +184,9 @@
                       :shape [m n]}]
       :operation-buffers {c c-view}
       :k-range [k-lower k-upper]
-      :launch-group-count [(kbody/expression :ceil-div n (:block-n tile))
-                           (kbody/expression :ceil-div m (:block-m tile))
-                           splits]
+      :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
+                           (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+                           (klaunch/runtime-value splits)]
       :attributes {:grid-z {:index z :extent splits :purpose :reduction-partition}}
       :parameter-names {kc "KC" splits "splits"}})))
 
@@ -210,9 +210,9 @@
                      {:id c-view :buffer c
                       :element-offset (kbody/expression :mul z m n) :shape [m n]}]
       :operation-buffers {a a-view b b-view c c-view}
-      :launch-group-count [(kbody/expression :ceil-div n (:block-n tile))
-                           (kbody/expression :ceil-div m (:block-m tile))
-                           batch]
+      :launch-group-count [(klaunch/ceil-div (klaunch/runtime-value n) (:block-n tile))
+                           (klaunch/ceil-div (klaunch/runtime-value m) (:block-m tile))
+                           (klaunch/runtime-value batch)]
       :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}}
       :parameter-names {batch "batch"}})))
 

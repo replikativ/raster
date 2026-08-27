@@ -192,6 +192,32 @@
 
 (defn descriptor [op] (get table (canonical op)))
 
+;; Semantic scalar domains are centralized beside canonical operator identity.  Backend facets say
+;; how an operation is spelled; they do not by themselves prove that (for example) sqrt accepts an
+;; integer or bit-and accepts a float.
+(def ^:private integral-ops
+  #{:bit-and :bit-or :bit-xor :shl :shr :ushr :rem :mod :quot :wi8-dot :dp4a})
+
+(def ^:private floating-ops
+  #{:sqrt :floor :ceil :trunc :round :sin :cos :tan :exp :log :pow :fma
+    :asin :acos :atan :atan2 :sinh :cosh :tanh :asinh :acosh :atanh :cbrt
+    :log2 :log10 :exp2 :exp10 :expm1 :log1p :hypot :deg2rad :rad2deg
+    :copysign :flipsign})
+
+(defn accepts-scalar-dtype?
+  "Whether canonical scalar operation `op` is semantically defined for compiler dtype `dtype`.
+  This is independent of whether a particular backend has a lowering facet."
+  [op dtype]
+  (let [op (canonical op)
+        integral? (contains? #{:byte :int :long} dtype)
+        floating? (contains? #{:half :float :double} dtype)
+        numeric? (or integral? floating?)]
+    (and op
+         (cond
+           (contains? integral-ops op) integral?
+           (contains? floating-ops op) floating?
+           :else numeric?))))
+
 ;; ---------------------------------------------------------------------------
 ;; wasm accessor — canonical key + element vt → encoder opcode keyword
 ;; ---------------------------------------------------------------------------
