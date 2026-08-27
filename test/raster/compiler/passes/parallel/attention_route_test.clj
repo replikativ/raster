@@ -98,6 +98,7 @@
     (is (empty? declines))
     (is (swr-schedule/schedule? swr-schedule))
     (is (= :one-workgroup-per-segment (:segment-mapping swr-schedule)))
+    (is (= :contiguous-interval (:membership-traversal swr-schedule)))
     (is (= {:kind :lane-strided :components 6 :components-per-lane 1}
            (:value-mapping swr-schedule)))
     (is (= {:workgroup-size [16 1] :group-count [4 4]} schedule))
@@ -110,7 +111,9 @@
     (is (str/includes? source "const float dot = sub_group_reduce_add(partial_dot)"))
     (is (str/includes? source "old_weight = sub_group_broadcast(old_weight, 0)"))
     (is (str/includes? source "const int kv_head = q_head / 2"))
-    (is (str/includes? source "if (length == 0)"))
+    (is (str/includes? source "if (attention_begin == attention_end)"))
+    (is (str/includes? source
+                       "for (int token = (int)attention_begin; token < (int)attention_end"))
     (is (str/includes? source "float maximum"))
     (is (str/includes? source "accumulator0 = accumulator0 * old_weight"))))
 
@@ -118,18 +121,24 @@
   (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
     (if-not clang?
       (is true "clang unavailable")
-      (let [source (get-in
-                    (route/route!
-                     (problem :qk-head-dim 256 :value-head-dim 256)
-                     {:device-type :gpu :vendor "Intel"
-                      :subgroup-size 16 :max-workgroup-size 256})
-                    [:artifact :source])
-            result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
-                             "-fsyntax-only" "-" :in source)]
-        (is (str/includes? source "const int d15 = (int)lane + 240;"))
-        (is (str/includes? source "float accumulator15 = 0.0f;"))
-        (is (not (str/includes? source "accumulator16")))
-        (is (zero? (:exit result)) (:err result))))))
+      (doseq [[physical-route visibility]
+              [[(dense-route) (attention/visibility)]
+               [(dense-route) (csr-visibility)]
+               [(csr-route) (attention/visibility)]
+               [(csr-route) (csr-visibility)]]]
+        (let [source (get-in
+                      (route/route!
+                       (problem :route physical-route :visibility visibility
+                                :qk-head-dim 256 :value-head-dim 256)
+                       {:device-type :gpu :vendor "Intel"
+                        :subgroup-size 16 :max-workgroup-size 256})
+                      [:artifact :source])
+              result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                               "-fsyntax-only" "-" :in source)]
+          (is (str/includes? source "const int d15 = (int)lane + 240;"))
+          (is (str/includes? source "float accumulator15 = 0.0f;"))
+          (is (not (str/includes? source "accumulator16")))
+          (is (zero? (:exit result)) (:err result)))))))
 
 (deftest cooperative-schedule-is-validated-and-target-legality-is-explicit
   (let [desc {:device-type :gpu :vendor "Intel"
@@ -149,6 +158,11 @@
            (try
              (swr-schedule/validate!
               (assoc-in schedule [:value-mapping :components-per-lane] 2))
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :segmented-weighted-reduction-membership-traversal
+           (try
+             (swr-schedule/validate!
+              (assoc schedule :membership-traversal :sequential))
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (is (= :attention-cooperative-schedule-plan-mismatch
            (try
@@ -193,25 +207,28 @@
     (is (= :score-reuse-register-state-too-wide
            (get-in too-wide [:declines 0 :reason])))))
 
-(deftest csr-route-has-native-compact-page-abi
+(deftest csr-route-has-native-compact-page-abi-and-cooperative-schedule
   (let [{:keys [artifact reference? declines]}
         (route/route! (problem :route (csr-route)) intel-desc)]
-    (is reference?)
-    (is (= :score-reuse-route-unsupported (get-in declines [0 :reason])))
+    (is (false? reference?))
+    (is (empty? declines))
     (is (= :csr-paged (get-in artifact [:attributes :route-kind])))
     (is (= '[q q-row-offsets q-positions k-pages v-pages page-offsets page-indices
              last-page-lengths kv-start-positions output]
            (:arguments artifact)))
     (is (= ["page_offsets" "page_indices" "last_page_lengths"]
            (subvec (mapv :c-name (:abi artifact)) 5 8)))
+    (is (= :contiguous-interval
+           (get-in artifact [:attributes :segmented-weighted-reduction-schedule
+                             :membership-traversal])))
     (is (str/includes? (:source artifact) "page_indices[page_begin + logical_page]"))
     (is (str/includes? (:source artifact) "routed_page_count == 0"))))
 
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}
         (route/route! (problem :visibility (csr-visibility)) intel-desc)]
-    (is reference?)
-    (is (= :score-reuse-visibility-unsupported (get-in declines [0 :reason])))
+    (is (false? reference?))
+    (is (empty? declines))
     (is (= :dense-paged (get-in artifact [:attributes :route-kind])))
     (is (= :csr (get-in artifact [:attributes :visibility-kind])))
     (is (= '[q q-row-offsets q-positions k-pages v-pages
@@ -220,6 +237,9 @@
            (:arguments artifact)))
     (is (= ["attention_row_offsets" "attention_key_indices"]
            (subvec (mapv :c-name (:abi artifact)) 8 10)))
+    (is (= :csr-row
+           (get-in artifact [:attributes :segmented-weighted-reduction-schedule
+                             :membership-traversal])))
     (is (str/includes? (:source artifact)
                        "for (int edge = attention_begin; edge < attention_end; ++edge)"))
     (is (str/includes? (:source artifact)
@@ -252,22 +272,32 @@
     (is (str/includes? source
                        "output[out_base + d0] = denominator == 0.0f ? 0.0f"))))
 
-(deftest pinned-cooperative-policy-declines-instead-of-silently-changing-schedule
+(deftest pinned-cooperative-policy-selects-csr-membership-without-changing-semantics
   (let [result (route/route
                 (problem :visibility (csr-visibility))
                 {:device-type :gpu :vendor "Intel" :subgroup-size 16
                  :max-workgroup-size 256
                  :segmented-weighted-reduction-schedule :subgroup-score-reuse})]
-    (is (nil? (:strategy result)))
-    (is (= :score-reuse-visibility-unsupported (get-in result [:declines 0 :reason])))
-    (is (= :attention-no-kernel-route
-           (try
-             (route/route!
-              (problem :visibility (csr-visibility))
-              {:device-type :gpu :vendor "Intel" :subgroup-size 16
-               :max-workgroup-size 256
-               :segmented-weighted-reduction-schedule :subgroup-score-reuse})
-             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))))
+    (is (= :routed-paged-subgroup-online-score-reuse (:strategy result)))
+    (is (empty? (:declines result)))
+    (is (= :csr-row
+           (get-in result [:artifact :attributes :segmented-weighted-reduction-schedule
+                           :membership-traversal])))))
+
+(deftest physical-routing-and-logical-membership-vary-independently
+  (doseq [[physical-route visibility traversal]
+          [[(dense-route) (attention/visibility) :contiguous-interval]
+           [(dense-route) (csr-visibility) :csr-row]
+           [(csr-route) (attention/visibility) :contiguous-interval]
+           [(csr-route) (csr-visibility) :csr-row]]]
+    (let [{:keys [strategy reference? declines artifact]}
+          (route/route! (problem :route physical-route :visibility visibility) intel-desc)]
+      (is (= :routed-paged-subgroup-online-score-reuse strategy))
+      (is (false? reference?))
+      (is (empty? declines))
+      (is (= traversal
+             (get-in artifact [:attributes :segmented-weighted-reduction-schedule
+                               :membership-traversal]))))))
 
 (deftest unsupported-representations-return-machine-readable-declines
   (testing "quantization declines before generic dtype routing"

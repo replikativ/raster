@@ -2,9 +2,10 @@
   "FP16-KV leaves for logical attention over dense or CSR paged KV routes.
 
    The direct one-work-item/component leaf remains the executable semantic oracle.  A separately
-   validated SegmentedWeightedReductionSchedule emits one subgroup/query-head for dense routed
-   interval attention, sharing each QK score across lane-strided value accumulators without
-   changing the semantic plan, ordered ABI, storage ownership or graph effects."
+   validated SegmentedWeightedReductionSchedule emits one subgroup/query-head across dense/CSR
+   routes and interval/CSR membership, sharing each QK score across lane-strided value
+   accumulators without changing the semantic plan, ordered ABI, storage ownership or graph
+   effects."
   (:require [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -195,14 +196,31 @@
 
 (defn- visibility-initialization
   [visibility invalid-result]
-  (when (attention/csr-visibility? visibility)
+  (if (attention/csr-visibility? visibility)
     (str "  const int attention_begin = attention_row_offsets[q_token];\n"
          "  const int attention_end = attention_row_offsets[q_token + 1];\n"
          "  if (attention_row_offsets[0] != 0 || attention_begin < 0\n"
          "      || attention_end < attention_begin || attention_end > "
          (:key-index-capacity visibility) ") {\n"
          invalid-result
-         "  }\n")))
+         "  }\n")
+    (let [{:keys [causal? window-left window-right]} visibility]
+      (str "  long attention_begin = 0L;\n"
+           "  long attention_end = (long)length;\n"
+           (when (some? window-left)
+             (str "  attention_begin = max(0L, (long)q_position - " window-left
+                  "L - (long)kv_start_position);\n"
+                  "  attention_begin = min(attention_begin, (long)length);\n"))
+           (cond
+             causal?
+             (str "  attention_end = min(attention_end, (long)q_position"
+                  " - (long)kv_start_position + 1L);\n"
+                  "  attention_end = max(attention_end, 0L);\n")
+
+             (some? window-right)
+             (str "  attention_end = min(attention_end, (long)q_position + " window-right
+                  "L - (long)kv_start_position + 1L);\n"
+                  "  attention_end = max(attention_end, 0L);\n"))))))
 
 (defn- visibility-loop-start
   [visibility invalid-result]
@@ -212,7 +230,7 @@
          "    if (token < 0 || token >= length) {\n"
          invalid-result
          "    }\n")
-    "  for (int token = 0; token < length; ++token) {\n"))
+    "  for (int token = (int)attention_begin; token < (int)attention_end; ++token) {\n"))
 
 (defn- reference-source
   [problem name]
@@ -311,11 +329,15 @@
                       (get-in schedule [:numerical-mode :score-accumulate]))
                    (= (:accumulator-dtype plan)
                       (get-in schedule [:numerical-mode :state-accumulate]))
-                   (= :dense-paged (attention/route-kind (:route problem)))
-                   (= :interval (attention/visibility-kind (:visibility problem)))
                    (= :routed-paged-kv (get-in schedule [:attributes :storage-kind]))
-                   (= :dense-paged (get-in schedule [:attributes :route-kind]))
-                   (= :interval (get-in schedule [:attributes :visibility-kind])))
+                   (= (attention/route-kind (:route problem))
+                      (get-in schedule [:attributes :route-kind]))
+                   (= (attention/visibility-kind (:visibility problem))
+                      (get-in schedule [:attributes :visibility-kind]))
+                   (= (if (attention/csr-visibility? (:visibility problem))
+                        :csr-row
+                        :contiguous-interval)
+                      (:membership-traversal schedule)))
       (throw (ex-info "cooperative attention schedule does not describe this reduction plan"
                       {:reason :attention-cooperative-schedule-plan-mismatch
                        :schedule schedule :plan-id (:id plan)})))
@@ -377,6 +399,7 @@
          "    __global const half* k_pages,\n"
          "    __global const half* v_pages,\n"
          (route-signature route)
+         (visibility-signature visibility)
          "    __global " (opencl-type output-dtype) "* output) {\n"
          "  const long lane = (long)get_sub_group_local_id();\n"
          "  const int q_head = (int)get_group_id(0);\n"
@@ -399,15 +422,17 @@
          invalid-result
          "  }\n"
          (route-initialization problem invalid-result)
-         "  if (length == 0) {\n"
-         empty-result
-         "  }\n"
+         (visibility-initialization visibility invalid-result)
+         (when (attention/interval-visibility? visibility)
+           (str "  if (attention_begin == attention_end) {\n"
+                empty-result
+                "  }\n"))
          "  const int kv_head = q_head / " gqa-ratio ";\n"
          "  const long q_base = ((long)q_token * " q-heads
          " + q_head) * " qk-head-dim ";\n"
          "  float maximum = -3.402823466e+38f;\n"
          "  float denominator = 0.0f;\n"
-         "  for (int token = 0; token < length; ++token) {\n"
+         (visibility-loop-start visibility invalid-result)
          "    const long kv_position = (long)kv_start_position + token;\n"
          "    int visible = 1;\n"
          (visibility-statements (attention/position-filter visibility))
@@ -528,7 +553,7 @@
                    :complexity :quadratic-in-qk-head-dim}})))
 
 (defn emit-fp16-cooperative
-  "Emit one subgroup per query segment for dense routed FP16 K/V attention.
+  "Emit one subgroup per query segment for routed FP16 K/V attention.
 
    The artifact preserves the reference leaf's complete ordered ABI and logical effects.  Only
    its target-neutral SegmentedWeightedReductionSchedule, launch mapping and target body differ."

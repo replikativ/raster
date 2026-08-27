@@ -11,8 +11,9 @@
 (defn plan-subgroup-online
   "Plan one subgroup per segment with one shared score and lane-strided value accumulators.
 
-   The first executable storage row is dense paged FP16 KV with interval visibility.  Those are
-   legality constraints of this schedule, not new semantic operation kinds."
+   The first executable storage rows are dense or CSR paged FP16 KV with either contiguous
+   interval or explicitly indexed CSR membership. Those are legality constraints of this
+   schedule, not new semantic operation kinds."
   ([plan] (plan-subgroup-online plan nil))
   ([plan desc]
    (let [{:keys [membership storage score value operands output accumulator-dtype] :as plan}
@@ -44,14 +45,14 @@
        (not= :logical-attention-visibility (:kind membership))
        (decline :score-reuse-membership-unsupported {:membership (:kind membership)})
 
-       (not= :interval (:visibility-kind membership))
+       (not (contains? #{:interval :csr} (:visibility-kind membership)))
        (decline :score-reuse-visibility-unsupported
                 {:visibility-kind (:visibility-kind membership)})
 
        (not= :routed-paged-kv (:kind storage))
        (decline :score-reuse-storage-unsupported {:storage (:kind storage)})
 
-       (not= :dense-paged (:route-kind storage))
+       (not (contains? #{:dense-paged :csr-paged} (:route-kind storage)))
        (decline :score-reuse-route-unsupported {:route-kind (:route-kind storage)})
 
        (or (not= :none (get-in storage [:k-format :quantization]))
@@ -62,11 +63,17 @@
        (not= :float accumulator-dtype)
        (decline :score-reuse-accumulator-unsupported {:actual accumulator-dtype})
 
-       (not (and (= 8 (count operand-dtypes))
-                 (contains? #{:half :float} (first operand-dtypes))
-                 (= [:int :int :half :half :int :int :int]
-                    (subvec operand-dtypes 1 8))
-                 (contains? #{:half :float} (:dtype output))))
+       (let [route-operands (case (:route-kind storage)
+                              :dense-paged 3
+                              :csr-paged 4)
+             visibility-operands (if (= :csr (:visibility-kind membership)) 2 0)
+             expected-count (+ 5 route-operands visibility-operands)]
+         (not (and (= expected-count (count operand-dtypes))
+                   (contains? #{:half :float} (first operand-dtypes))
+                   (= [:int :int :half :half]
+                      (subvec operand-dtypes 1 5))
+                   (every? #(= :int %) (subvec operand-dtypes 5))
+                   (contains? #{:half :float} (:dtype output)))))
        (decline :score-reuse-storage-dtypes-unsupported
                 {:operand-dtypes operand-dtypes :output-dtype (:dtype output)})
 
@@ -92,7 +99,9 @@
          {:strategy :subgroup-online-score-reuse
           :workgroup-size (long subgroup-size)
           :segment-mapping :one-workgroup-per-segment
-          :membership-traversal :sequential
+          :membership-traversal (case (:visibility-kind membership)
+                                  :interval :contiguous-interval
+                                  :csr :csr-row)
           :score-reduction {:kind :subgroup :width (long subgroup-size)
                             :axis (get-in score [:axis :name])}
           :value-mapping {:kind :lane-strided
