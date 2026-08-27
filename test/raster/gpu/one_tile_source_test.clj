@@ -81,6 +81,23 @@
                (:workgroup-size emitted)))
         (is (re-find #"__global float\* restrict C" (:source emitted)))))))
 
+(deftest resident-grid-z-sources-use-the-scheduled-body
+  (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
+        emit-split (ns-resolve ze 'emit-scheduled-split-k-gemm)
+        emit-batched (ns-resolve ze 'emit-scheduled-batched-gemm)
+        tile (hw/gemm-tile-for nil)]
+    (with-redefs [opencl-codegen/emit-gemm-tiled
+                  (fn [& _]
+                    (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+      (let [split (emit-split "resident_split_body" tile)
+            batched (emit-batched "resident_batched_body" tile)]
+        (is (= [256 1 1] (:workgroup-size split)))
+        (is (= 1 (count (get-in split [:kernel-body :views]))))
+        (is (re-find #"int KC, int splits" (:source split)))
+        (is (= [256 1 1] (:workgroup-size batched)))
+        (is (= 3 (count (get-in batched [:kernel-body :views]))))
+        (is (re-find #"int batch" (:source batched)))))))
+
 (deftest split-k-policy-is-unchanged-on-this-device
   (testing "the emitted schedule expression reads block-m/block-n/block-k rather than independent
             literals and preserves the established policy"

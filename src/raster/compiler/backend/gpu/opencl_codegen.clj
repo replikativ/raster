@@ -650,11 +650,11 @@
 ;; ================================================================
 
 (defn emit-gemm-tiled
-  "Legacy tile-parametric XMX GEMM oracle and specialized grid-Z generator.
+  "Legacy tile-parametric XMX GEMM oracle and opaque-epilogue generator.
 
-   Ordinary direct/tiled GEMM lowers from a verified KernelBody. This independent generator stays
-   executable for source-equivalence checks and for split-K, batched, and opaque-helper epilogues
-   until those schedules have explicit KernelBody operations.
+   Ordinary direct/tiled, split-K, and batched GEMM lower from a verified KernelBody. This
+   independent generator stays executable for source-equivalence checks and opaque-helper
+   epilogues until those helpers become typed scalar regions.
 
    Computes C = A·B with FP16 inputs and FP32 accumulation. The tile geometry
    (workgroup BLOCK_M×BLOCK_N, per-subgroup SG_M×SG_N, K-step BLOCK_K, prefetch depth) is COMPUTED,

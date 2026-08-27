@@ -42,16 +42,21 @@
          (zero? (mod block-k k)))))
 
 (defn- matrix-parameters
-  [row col out M N K dimension-parameters row-layout col-layout out-layout result-dtype epilogue]
+  [row col out M N K dimension-parameters row-layout col-layout out-layout result-dtype epilogue
+   buffer-shapes additional-parameters]
   (let [[m-parameter n-parameter k-parameter] dimension-parameters]
     (vec
      (concat
-      [(body/->KernelParameter row :input :half [M K] :global row-layout :lhs)
-       (body/->KernelParameter col :input :half [K N] :global col-layout :rhs)
-       (body/->KernelParameter out :output result-dtype [M N] :global out-layout :result)
+      [(body/->KernelParameter row :input :half (get buffer-shapes row [M K])
+                               :global row-layout :lhs)
+       (body/->KernelParameter col :input :half (get buffer-shapes col [K N])
+                               :global col-layout :rhs)
+       (body/->KernelParameter out :output result-dtype (get buffer-shapes out [M N])
+                               :global out-layout :result)
        (body/->KernelParameter m-parameter :scalar :int [] nil nil :dimension)
        (body/->KernelParameter n-parameter :scalar :int [] nil nil :dimension)
        (body/->KernelParameter k-parameter :scalar :int [] nil nil :dimension)]
+      additional-parameters
       (for [{:keys [sym dtype map] :or {dtype :float}} (:operands epilogue)]
         (let [shape (axis-map/shape map)]
           (body/->KernelParameter sym :input dtype shape :global
@@ -80,11 +85,18 @@
   symbolic resident graphs share one body without renaming caller values.  The current matrix
   instruction is f16×f16→f32; `result-dtype` controls only the final store representation."
   [{:keys [id row col out dimensions dimension-parameters axis-symbols tile bindings epilogue
-           result-dtype provenance]
+           result-dtype provenance additional-parameters additional-indices buffer-shapes
+           buffer-views operation-buffers k-range launch-group-count attributes]
     :or {dimension-parameters ['M 'N 'K]
          axis-symbols ['i 'j 'k]
          result-dtype :half
-         provenance {}}}]
+         provenance {}
+         additional-parameters []
+         additional-indices []
+         buffer-shapes {}
+         buffer-views []
+         operation-buffers {}
+         attributes {}}}]
   (let [tile (assoc tile :num-stages (or (:num-stages tile) 3))
         _ (when-not (and (= 3 (count dimension-parameters))
                          (every? compiler-id? dimension-parameters)
@@ -94,6 +106,10 @@
                              :dimension-parameters dimension-parameters})))
         [M N K] dimensions
         [m-parameter n-parameter k-parameter] dimension-parameters
+        [k-lower k-upper] (or k-range [0 k-parameter])
+        row-buffer (get operation-buffers row row)
+        col-buffer (get operation-buffers col col)
+        out-buffer (get operation-buffers out out)
         [i j k-sym] axis-symbols
         matrix (:matrix tile)
         desc {:matrix matrix :subgroup-size (:subgroup matrix)}
@@ -105,6 +121,15 @@
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
         out-layout (layout/row-major [M N] result-dtype)
+        buffer-layouts {row row-layout col col-layout out out-layout}
+        buffer-views (mapv (fn [view]
+                             (if (instance? raster.compiler.ir.kernel_body.BufferView view)
+                               view
+                               (body/->BufferView (:id view) (:buffer view)
+                                                  (:element-offset view) (:shape view)
+                                                  (or (:layout view)
+                                                      (get buffer-layouts (:buffer view))))))
+                           buffer-views)
         {:keys [block-m block-n block-k sg-m sg-n num-stages]} tile
         {matrix-m :m matrix-n :n matrix-k :k subgroup :subgroup} matrix
         subgroup-rows (quot block-m sg-m)
@@ -142,12 +167,14 @@
         (vec
          (concat
           [(body/->Mask :tile-active
-                        [(body/predicate :lt m-base m-parameter)
-                         (body/predicate :lt (n-base 0) n-parameter)])
-           (body/->Mask :k-active [(body/predicate :lt 'k-fragment k-parameter)])
+                        (cond-> [(body/predicate :lt m-base m-parameter)
+                                 (body/predicate :lt (n-base 0) n-parameter)]
+                          (not= [0 k-parameter] [k-lower k-upper])
+                          (conj (body/predicate :lt k-lower k-upper))))
+           (body/->Mask :k-active [(body/predicate :lt 'k-fragment k-upper)])
            (body/->Mask :prefetch-active
                         [(body/predicate :lt
-                                         (add 'k-fragment (* num-stages matrix-k)) k-parameter)])]
+                                         (add 'k-fragment (* num-stages matrix-k)) k-upper)])]
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->Mask
              (fragment-id "store" mm nn)
@@ -172,14 +199,14 @@
          (concat
           (for [mm (range m-fragments)]
             (body/->TilePrefetch
-             row [(add m-base (* mm matrix-m))
-                  (add k-fragment (* num-stages matrix-k))]
+             row-buffer [(add m-base (* mm matrix-m))
+                         (add k-fragment (* num-stages matrix-k))]
              [matrix-m matrix-k] row-layout :prefetch-active num-stages))
           (for [nn (range n-fragments)]
-            (body/->TileLoad (fragment-id "rhs" nn) col
+            (body/->TileLoad (fragment-id "rhs" nn) col-buffer
                              [k-fragment (n-base nn)] :k-active :cached))
           (for [mm (range m-fragments)]
-            (body/->TileLoad (fragment-id "lhs" mm) row
+            (body/->TileLoad (fragment-id "lhs" mm) row-buffer
                              [(add m-base (* mm matrix-m)) k-fragment] :k-active :cached))
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->MatrixMad (fragment-id "acc" mm nn)
@@ -188,10 +215,10 @@
                               matrix))))
         init-ops (mapv #(body/->FragmentInit % 0.0) accumulator-ids)
         fragment-loop (body/->Loop k-fragment 'k-block
-                                   (body/expression :min (add 'k-block block-k) k-parameter)
+                                   (body/expression :min (add 'k-block block-k) k-upper)
                                    matrix-k one-k-step
                                    {:unroll true :matrix-step matrix-k})
-        k-loop (body/->Loop 'k-block 0 k-parameter block-k [fragment-loop]
+        k-loop (body/->Loop 'k-block k-lower k-upper block-k [fragment-loop]
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
@@ -199,31 +226,41 @@
         stores (vec
                 (for [mm (range m-fragments) nn (range n-fragments)]
                   (body/->TileStore
-                   out (fragment-id "acc" mm nn)
+                   out-buffer (fragment-id "acc" mm nn)
                    [(add m-base (* mm matrix-m)) (n-base nn)]
                    (fragment-id "store" mm nn) region)))
-        workgroup-size (* subgroup-rows subgroup-cols subgroup)]
+        workgroup-size (* subgroup-rows subgroup-cols subgroup)
+        group-count (or launch-group-count
+                        [(body/expression :ceil-div n-parameter block-n)
+                         (body/expression :ceil-div m-parameter block-m)])]
     (body/make
      {:id id
       :parameters (matrix-parameters row col out M N K dimension-parameters
-                                     row-layout col-layout out-layout result-dtype epilogue)
-      :indices indices
+                                     row-layout col-layout out-layout result-dtype epilogue
+                                     buffer-shapes additional-parameters)
+      :views (vec buffer-views)
+      :indices (into (vec additional-indices) indices)
       :masks masks
       :fragments fragments
       :operations [(body/->Guard :tile-active (vec (concat init-ops [k-loop] stores)))]
       :schedule tile
-      :launch {:workgroup-size [workgroup-size 1]
-               :group-count [(body/expression :ceil-div n-parameter block-n)
-                             (body/expression :ceil-div m-parameter block-m)]}
+      :launch {:workgroup-size (into [workgroup-size] (repeat (dec (count group-count)) 1))
+               :group-count group-count}
       :provenance provenance
-      :attributes {:kind :matrix-contraction
-                   :instruction-family (:family matrix)
-                   :dims [M N K]
-                   :dimension-parameters {:m m-parameter :n n-parameter :k k-parameter}
-                   :axis-symbols [i j k-sym]
-                   :bindings bindings
-                   :boundary-policy {:m :masked :n :masked :k :exact-fragments}
-                   :epilogue epilogue}})))
+      :attributes (merge
+                   {:kind :matrix-contraction
+                    :instruction-family (:family matrix)
+                    :dims [M N K]
+                    :dimension-parameters {:m m-parameter :n n-parameter :k k-parameter}
+                    :axis-symbols [i j k-sym]
+                    :bindings bindings
+                    :operation-buffers {:row row-buffer :col col-buffer :out out-buffer}
+                    :iteration-range {:k [k-lower k-upper]}
+                    :boundary-policy {:m :masked :n :masked
+                                      :k (if (= [0 k-parameter] [k-lower k-upper])
+                                           :exact-fragments :sliced-fragments)}
+                    :epilogue epilogue}
+                   attributes)})))
 
 (defn plan-matrix-body
   "Apply `tile` to verified contraction facts.

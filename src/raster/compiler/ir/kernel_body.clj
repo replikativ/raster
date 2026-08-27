@@ -7,6 +7,7 @@
   these values to their own dialect; they must not recover a schedule by inspecting source text.")
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
+(defrecord BufferView [id buffer element-offset shape layout])
 (defrecord IndexBinding [id source axis])
 (defrecord IndexCompute [id expression])
 (defrecord IndexExpr [op arguments])
@@ -24,7 +25,7 @@
 (defrecord TileStore [buffer fragment coordinates mask value-region])
 
 (defrecord KernelBody
-           [id parameters indices masks fragments operations schedule launch provenance attributes])
+           [id parameters views indices masks fragments operations schedule launch provenance attributes])
 
 (def ^:private parameter-kinds #{:input :output :scalar})
 (def ^:private index-sources #{:group :subgroup :lane})
@@ -115,9 +116,9 @@
 (declare validate-operations!)
 
 (defn- validate-operation!
-  [operation parameters fragments masks scope]
+  [operation storage fragments masks scope]
   (let [parameter (fn [id]
-                    (or (get parameters id)
+                    (or (get storage id)
                         (throw (ex-info "kernel operation references an undeclared parameter"
                                         {:parameter id :operation operation}))))
         fragment (fn [id]
@@ -215,13 +216,13 @@
         (when (contains? scope (:index operation))
           (throw (ex-info "kernel loop induction value shadows an existing value"
                           {:index (:index operation) :scope scope})))
-        (validate-operations! (:operations operation) parameters fragments masks
+        (validate-operations! (:operations operation) storage fragments masks
                               (conj scope (:index operation))))
 
       (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
       (do
         (mask (:mask operation))
-        (validate-operations! (:operations operation) parameters fragments masks scope))
+        (validate-operations! (:operations operation) storage fragments masks scope))
 
       (record-kind? "raster.compiler.ir.kernel_body.TileStore" operation)
       (let [p (parameter (:buffer operation))
@@ -243,13 +244,13 @@
       (throw (ex-info "kernel body contains an unsupported operation"
                       {:operation operation :actual (type operation)})))))
 
-(defn- validate-operations! [operations parameters fragments masks scope]
+(defn- validate-operations! [operations storage fragments masks scope]
   (when-not (vector? operations)
     (throw (ex-info "kernel operations must be an ordered vector" {:operations operations})))
   (doseq [operation operations]
     (when-not (operation? operation)
       (throw (ex-info "kernel body contains a non-operation value" {:operation operation})))
-    (validate-operation! operation parameters fragments masks scope)))
+    (validate-operation! operation storage fragments masks scope)))
 
 (defn validate!
   "Verify a scheduled KernelBody and return it unchanged."
@@ -257,16 +258,17 @@
   (when-not (kernel-body? body)
     (throw (ex-info "kernel body must be a KernelBody value"
                     {:body body :actual (type body)})))
-  (let [{:keys [id parameters indices masks fragments operations schedule launch provenance
+  (let [{:keys [id parameters views indices masks fragments operations schedule launch provenance
                 attributes]} body]
     (when (nil? id)
       (throw (ex-info "kernel body requires a stable identity" {:body body})))
-    (doseq [[field values] [[:parameters parameters] [:indices indices] [:masks masks]
+    (doseq [[field values] [[:parameters parameters] [:views views] [:indices indices] [:masks masks]
                             [:fragments fragments] [:operations operations]]]
       (when-not (vector? values)
         (throw (ex-info "kernel body sections must be ordered vectors"
                         {:field field :value values}))))
     (unique-ids! "kernel parameters" parameters)
+    (unique-ids! "kernel buffer views" views)
     (unique-ids! "kernel indices" indices)
     (unique-ids! "kernel masks" masks)
     (unique-ids! "kernel fragments" fragments)
@@ -286,7 +288,8 @@
             (when-not (keyword? (:memory-space p))
               (throw (ex-info "kernel buffer parameter requires a memory space"
                               {:parameter p}))))))
-    (let [scalar-ids (set (map :id (filter #(= :scalar (:kind %)) parameters)))
+    (let [parameter-map (into {} (map (juxt :id identity)) parameters)
+          scalar-ids (set (map :id (filter #(= :scalar (:kind %)) parameters)))
           index-scope
           (reduce
            (fn [scope idx]
@@ -308,7 +311,64 @@
                :else
                (throw (ex-info "kernel body contains an unsupported index value" {:index idx})))
              (conj scope (:id idx)))
-           scalar-ids indices)]
+           scalar-ids indices)
+          group-axes (into {} (keep #(when (and (record-kind?
+                                                 "raster.compiler.ir.kernel_body.IndexBinding" %)
+                                                (= :group (:source %)))
+                                       [(:id %) (:axis %)]))
+                           indices)
+          view-map
+          (reduce
+           (fn [resolved view]
+             (when-not (record-kind? "raster.compiler.ir.kernel_body.BufferView" view)
+               (throw (ex-info "kernel body contains an unsupported buffer view" {:view view})))
+             (when (or (contains? parameter-map (:id view)) (contains? resolved (:id view)))
+               (throw (ex-info "kernel buffer view identity collides with storage"
+                               {:view (:id view)})))
+             (let [parent (or (get parameter-map (:buffer view))
+                              (throw (ex-info "kernel buffer view references undeclared storage"
+                                              {:view view :buffer (:buffer view)})))]
+               (when (= :scalar (:kind parent))
+                 (throw (ex-info "kernel buffer view cannot derive from scalar storage"
+                                 {:view view :buffer parent})))
+               (when-not (expression? (:element-offset view))
+                 (throw (ex-info "kernel buffer view requires an explicit element offset"
+                                 {:view view})))
+               (let [outside (remove index-scope
+                                     (expression-references (:element-offset view)))]
+                 (when (seq outside)
+                   (throw (ex-info "kernel buffer view offset references values outside its scope"
+                                   {:view view :references (vec outside) :scope index-scope}))))
+               (shape! "kernel buffer view" (:shape view))
+               (layout! "kernel buffer view" (:layout view))
+               (let [parent-shape (:shape parent)
+                     view-shape (:shape view)
+                     prefix-rank (- (count parent-shape) (count view-shape))
+                     offset (:element-offset view)
+                     offset-arguments (when (and (record-kind?
+                                                  "raster.compiler.ir.kernel_body.IndexExpr" offset)
+                                                 (= :mul (:op offset)))
+                                        (:arguments offset))
+                     slice-index (first offset-arguments)
+                     group-axis (get group-axes slice-index)]
+                 (when-not (and (= 1 prefix-rank)
+                                (= view-shape (subvec (vec parent-shape) 1))
+                                (= (vec offset-arguments) (into [slice-index] view-shape))
+                                (integer? group-axis)
+                                (< group-axis (count (:group-count launch)))
+                                (= (first parent-shape)
+                                   (nth (:group-count launch) group-axis)))
+                   (throw (ex-info
+                           "kernel buffer view is not a launch-bounded contiguous leading slice"
+                           {:view view :parent parent :launch launch
+                            :required {:parent-shape '[extent & view-shape]
+                                       :element-offset '[group-index & view-shape]
+                                       :group-count 'extent}}))))
+               (assoc resolved (:id view)
+                      (assoc parent :id (:id view) :shape (:shape view)
+                             :layout (:layout view) :view view))))
+           {} views)
+          storage (merge parameter-map view-map)]
       (doseq [m masks]
         (when-not (and (record-kind? "raster.compiler.ir.kernel_body.Mask" m)
                        (vector? (:predicates m)) (seq (:predicates m))
@@ -325,7 +385,7 @@
           (throw (ex-info "kernel body descriptive sections must be maps"
                           {:field field :value value}))))
       (validate-operations! operations
-                            (into {} (map (juxt :id identity)) parameters)
+                            storage
                             (into {} (map (juxt :id identity)) fragments)
                             (into {} (map (juxt :id identity)) masks)
                             index-scope)))
@@ -333,8 +393,8 @@
 
 (defn make
   "Construct and verify a target-neutral scheduled kernel body."
-  [{:keys [id parameters indices masks fragments operations schedule launch provenance attributes]
-    :or {parameters [] indices [] masks [] fragments [] operations [] schedule {} launch {}
+  [{:keys [id parameters views indices masks fragments operations schedule launch provenance attributes]
+    :or {parameters [] views [] indices [] masks [] fragments [] operations [] schedule {} launch {}
          provenance {} attributes {}}}]
-  (validate! (->KernelBody id parameters indices masks fragments operations schedule launch
+  (validate! (->KernelBody id parameters views indices masks fragments operations schedule launch
                            provenance attributes)))

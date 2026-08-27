@@ -67,3 +67,28 @@
           bad (assoc-in kernel [:operations 0 :operations 2 :mask] :missing)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared mask"
                             (body/validate! bad))))))
+
+(deftest buffer-views-retain-parent-ownership-and-explicit-offsets
+  (let [kernel (minimal-body)
+        kernel (-> kernel
+                   (assoc-in [:parameters 0 :shape] [16 16 16])
+                   (assoc-in [:launch :group-count] [16]))
+        view (body/->BufferView 'A-slab 'A
+                                (body/expression :mul 'group-x 16 16)
+                                [16 16] (:layout (first (:parameters kernel))))
+        viewed (-> kernel
+                   (assoc :views [view])
+                   (assoc-in [:operations 0 :operations 1 :operations 0 :buffer] 'A-slab))]
+    (is (= viewed (body/validate! viewed)))
+    (testing "a view may only reference declared storage"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"undeclared storage"
+                            (body/validate! (assoc viewed :views [(assoc view :buffer 'missing)])))))
+    (testing "its offset is checked in the scalar/index scope"
+      (let [unknown-offset (assoc view :element-offset
+                                  (body/expression :mul 'unknown 256))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"outside its scope"
+                              (body/validate!
+                               (assoc viewed :views [unknown-offset]))))))
+    (testing "the parent extent is tied to the hardware axis launch bound"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"launch-bounded"
+                            (body/validate! (assoc-in viewed [:launch :group-count 0] 15)))))))

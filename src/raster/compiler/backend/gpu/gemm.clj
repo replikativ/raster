@@ -12,6 +12,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
+            [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
@@ -127,18 +128,17 @@
                     :group-count [(klaunch/ceil-div elements 256)]})
      phase {:layout :transpose :dtype :half :cacheable-transform? true})))
 
-(defn- matrix-workgroup-size
-  [{:keys [block-m block-n sg-m sg-n matrix]}]
-  (* (quot block-m sg-m) (quot block-n sg-n) (:subgroup matrix 16)))
-
 (defn emit-scheduled-matrix-kernel
   "Build and directly lower one canonical f16 matrix contraction.
 
   This is the shared compiler entry for graph-owned, legacy-plan, and resident direct/tiled GEMM
-  front doors.  Caller identities remain the KernelBody ABI identities; OpenCL M/N/K spelling is
-  solely a target concern.  Split-K, batched grid-Z, and opaque source epilogues are not accepted
-  here until their scheduling operations are explicit in KernelBody."
-  [{:keys [kernel-name id a b c m n k tile result-dtype provenance]
+  front doors. Caller identities remain the KernelBody ABI identities; OpenCL parameter spelling
+  is solely a target concern. Optional views, hardware indices, and K bounds are explicit schedule
+  values used by the split-K and batched wrappers below. Opaque source epilogues remain outside
+  this route until their scalar regions are typed."
+  [{:keys [kernel-name id a b c m n k tile result-dtype provenance
+           additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
+           k-range launch-group-count attributes parameter-names]
     :or {result-dtype :float provenance {}}}]
   (let [kernel-body
         (contraction-schedule/matrix-body
@@ -150,23 +150,74 @@
           :tile tile
           :bindings {:row a :col b}
           :result-dtype result-dtype
+          :additional-parameters additional-parameters
+          :additional-indices additional-indices
+          :buffer-shapes buffer-shapes
+          :buffer-views buffer-views
+          :operation-buffers operation-buffers
+          :k-range k-range
+          :launch-group-count launch-group-count
+          :attributes attributes
           :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})]
-    {:source (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body nil)
+    {:source (kernel-body-opencl/emit-matrix-kernel
+              kernel-name kernel-body {:parameter-names parameter-names})
      :kernel-body kernel-body
      :workgroup-size (get-in kernel-body [:launch :workgroup-size])}))
+
+(defn emit-scheduled-split-k-kernel
+  "Lower a grid-Z partition of the K reduction into disjoint f32 output views."
+  [{:keys [kernel-name id a b c m n k kc splits tile provenance]}]
+  (let [z 'k-slice
+        c-view 'split-result-view
+        k-lower (kbody/expression :mul z kc)
+        k-upper (kbody/expression :min (kbody/expression :add k-lower kc) k)]
+    (emit-scheduled-matrix-kernel
+     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+      :tile tile :result-dtype :float :provenance provenance
+      :additional-parameters [(kbody/->KernelParameter kc :scalar :int [] nil nil :schedule)
+                              (kbody/->KernelParameter splits :scalar :int [] nil nil :schedule)]
+      :additional-indices [(kbody/->IndexBinding z :group 2)]
+      :buffer-shapes {c [splits m n]}
+      :buffer-views [{:id c-view :buffer c
+                      :element-offset (kbody/expression :mul z m n)
+                      :shape [m n]}]
+      :operation-buffers {c c-view}
+      :k-range [k-lower k-upper]
+      :launch-group-count [(kbody/expression :ceil-div n (:block-n tile))
+                           (kbody/expression :ceil-div m (:block-m tile))
+                           splits]
+      :attributes {:grid-z {:index z :extent splits :purpose :reduction-partition}}
+      :parameter-names {kc "KC" splits "splits"}})))
+
+(defn emit-scheduled-batched-matrix-kernel
+  "Lower independent dense matrix slabs as grid-Z-selected contiguous buffer views."
+  [{:keys [kernel-name id a b c m n k batch tile provenance]}]
+  (let [z 'slab
+        a-view 'batch-lhs-view
+        b-view 'batch-rhs-view
+        c-view 'batch-result-view]
+    (emit-scheduled-matrix-kernel
+     {:kernel-name kernel-name :id id :a a :b b :c c :m m :n n :k k
+      :tile tile :result-dtype :float :provenance provenance
+      :additional-parameters [(kbody/->KernelParameter batch :scalar :int [] nil nil :schedule)]
+      :additional-indices [(kbody/->IndexBinding z :group 2)]
+      :buffer-shapes {a [batch m k] b [batch k n] c [batch m n]}
+      :buffer-views [{:id a-view :buffer a
+                      :element-offset (kbody/expression :mul z m k) :shape [m k]}
+                     {:id b-view :buffer b
+                      :element-offset (kbody/expression :mul z k n) :shape [k n]}
+                     {:id c-view :buffer c
+                      :element-offset (kbody/expression :mul z m n) :shape [m n]}]
+      :operation-buffers {a a-view b b-view c c-view}
+      :launch-group-count [(kbody/expression :ceil-div n (:block-n tile))
+                           (kbody/expression :ceil-div m (:block-m tile))
+                           batch]
+      :attributes {:grid-z {:index z :extent batch :purpose :independent-slices}}
+      :parameter-names {batch "batch"}})))
 
 (defn- gemm-artifact
   [{:keys [id m n k tile]} kernel-name a b c split-k? kc splits phase]
   (let [{:keys [block-m block-n]} tile
-        source-args (concat [:c-dtype :float :split-k? split-k?
-                             :schedule-splits-arg? split-k?]
-                            (mapcat identity
-                                    (select-keys tile
-                                                 [:block-m :block-n :sg-m :sg-n :block-k
-                                                  :matrix :num-stages])))
-        source-args (vec (mapcat (fn [[key value]]
-                                   [(if (= :num-stages key) :prefetch key) value])
-                                 (partition 2 source-args)))
         abi (cond-> [(kabi/slot a :input :half :c-name "A")
                      (kabi/slot b :input :half :c-name "B")
                      (kabi/slot c :output :float :c-name "C")
@@ -179,21 +230,19 @@
         group-count (cond-> [(klaunch/ceil-div n block-n)
                              (klaunch/ceil-div m block-m)]
                       split-k? (conj (klaunch/runtime-value splits)))
-        scheduled (when-not split-k?
-                    (emit-scheduled-matrix-kernel
-                     {:kernel-name kernel-name
-                      :id [:gemm id phase]
-                      :a a :b b :c c :m m :n n :k k
-                      :tile tile :result-dtype :float
-                      :provenance {:operation-id id :phase phase}}))]
+        emit-args {:kernel-name kernel-name
+                   :id [:gemm id phase]
+                   :a a :b b :c c :m m :n n :k k
+                   :tile tile :result-dtype :float
+                   :provenance {:operation-id id :phase phase}}
+        scheduled (if split-k?
+                    (emit-scheduled-split-k-kernel
+                     (assoc emit-args :kc :k-chunk :splits :splits))
+                    (emit-scheduled-matrix-kernel emit-args))]
     (artifact
-     kernel-name (if scheduled
-                   (:source scheduled)
-                   (apply codegen/emit-gemm-tiled kernel-name source-args))
+     kernel-name (:source scheduled)
      abi arguments
-     (klaunch/spec {:workgroup-size (if scheduled
-                                      (:workgroup-size scheduled)
-                                      [(matrix-workgroup-size tile) 1 1])
+     (klaunch/spec {:workgroup-size (:workgroup-size scheduled)
                     :group-count group-count})
      phase (cond-> {:tile tile :split-k? split-k? :accumulator-dtype :float}
              scheduled (assoc :kernel-body (:kernel-body scheduled))))))
