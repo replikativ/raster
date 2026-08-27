@@ -2,7 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
-            [raster.compiler.ir.kernel-body :as body]))
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]))
 
 (def ^:private matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16})
 (def ^:private acc-layout (layout/mma-frag matrix :float))
@@ -34,7 +35,7 @@
                     {:unroll true})
                    (body/->TileStore 'C :acc ['group-x 0] :in-bounds nil)])]
     :schedule {:matrix matrix}
-    :launch {:workgroup-size [16] :group-count [1]}
+    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
     :provenance {:dialect :test}
     :attributes {:kind :matrix-contraction}}))
 
@@ -123,3 +124,334 @@
                              (assoc-in kernel [:operations 0 :operations 2 :value-region
                                                :operands 0 :map]
                                        (axis-map/of-axes [['group-x 8]]))))))))
+
+(defn- scalar-body
+  [operations & {:keys [masks schedule]
+                 :or {masks [] schedule {:subgroup-size 16}}}]
+  (body/make
+   {:id :scalar
+    :parameters [(body/->KernelParameter
+                  'x :input :float [16] :global
+                  (layout/row-major [16] :float) :input)
+                 (body/->KernelParameter
+                  'y :output :float [1] :global
+                  (layout/row-major [1] :float) :result)]
+    :indices [(body/->IndexBinding 'group :group 0)
+              (body/->IndexBinding 'lane :lane 0)]
+    :masks masks
+    :operations operations
+    :schedule schedule
+    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+    :provenance {:dialect :test}
+    :attributes {:kind :scalar}}))
+
+(defn- load-x
+  ([] (load-x (body/value 'x-value :float)))
+  ([result]
+   (body/->ScalarLoad result 'x ['lane] nil nil :cached)))
+
+(defn- reduce-x
+  [input]
+  (body/->Collective
+   (body/value 'sum :float) :reduce :subgroup 16 input :+ nil
+   (body/full-participation) :implementation-defined))
+
+(deftest typed-scalar-memory-control-and-collectives-share-one-body
+  (let [predicate (body/->ScalarCompute
+                   (body/value 'negative? :predicate)
+                   (body/scalar-expression :lt :predicate
+                                           ['x-value (body/literal 0.0 :float)]))
+        choose (body/->IfRegion
+                'negative?
+                [(body/->ScalarCompute
+                  (body/value 'negated :float)
+                  (body/scalar-expression :- :float
+                                          [(body/literal 0.0 :float) 'x-value]))
+                 (body/->Yield ['negated])]
+                [(body/->Yield ['x-value])]
+                [(body/value 'magnitude :float)])
+        loop-op (body/->ForLoop
+                 (body/value 'iteration :int) 0 4 1
+                 [(body/->LoopArg (body/value 'acc :float) 'magnitude)]
+                 [(body/->ScalarCompute
+                   (body/value 'next-acc :float)
+                   (body/scalar-expression :+ :float
+                                           ['acc (body/literal 1.0 :float)]))
+                  (body/->Yield ['next-acc])]
+                 [(body/value 'loop-result :float)]
+                 {:unroll true})
+        kernel (scalar-body
+                [(load-x) predicate choose loop-op
+                 (reduce-x 'loop-result)
+                 (body/->ScalarStore 'y ['group] 'sum nil)])]
+    (is (body/kernel-body? kernel))
+    (is (= :predicate (get-in kernel [:operations 1 :result :type])))
+    (is (= :full (get-in kernel [:operations 4 :participation :kind])))
+    (is (launch/launch-spec? (:launch kernel)))))
+
+(deftest scalar-ssa-and-conversion-policies-fail-loudly
+  (testing "SSA values cannot be used before definition"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"before it is defined"
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'result :float)
+            (body/scalar-expression :+ :float
+                                    ['missing (body/literal 1.0 :float)]))]))))
+  (testing "result identities are globally unique"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not globally unique"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'x-value :float)
+            (body/scalar-expression :+ :float
+                                    ['x-value (body/literal 1.0 :float)]))]))))
+  (testing "comparisons produce predicates"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"comparison intrinsic must produce a predicate"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :float)
+            (body/scalar-expression :lt :float
+                                    ['x-value (body/literal 0.0 :float)]))]))))
+  (testing "casts cannot leave rounding and overflow behavior implicit"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"rounding and overflow"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :int)
+            (body/scalar-expression :cast :int ['x-value]))]))))
+  (testing "a fully specified cast is legal"
+    (is (body/kernel-body?
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'converted :int)
+            (body/cast-expression 'x-value :int :toward-zero :saturate))]))))
+  (testing "integral sources do not accept a fictitious rounding direction"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"policies disagree"
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'bad :long)
+            (body/cast-expression (body/literal 1 :int) :long :up :exact))]))))
+  (testing "floating conversions cannot silently request integer wrapping"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"policies disagree"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :int)
+            (body/cast-expression 'x-value :int :toward-zero :wrap))])))))
+
+(deftest scalar-memory-is-ranked-masked-and-typed
+  (testing "a load cannot silently reinterpret or widen storage"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"buffer element type"
+         (scalar-body [(load-x (body/value 'x-value :int))]))))
+  (testing "coordinates are element coordinates with the buffer rank"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"match the buffer rank"
+         (scalar-body
+          [(body/->ScalarLoad (body/value 'x-value :float) 'x ['group 'lane]
+                              nil nil :cached)]))))
+  (testing "a false load predicate always has a defined SSA value"
+    (let [active (body/->Mask :active [(body/predicate :lt 'lane 8)])]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"explicit other value"
+           (scalar-body
+            [(body/->ScalarLoad (body/value 'x-value :float) 'x ['lane]
+                                :active nil :cached)]
+            :masks [active])))))
+  (testing "an unmasked load cannot retain a meaningless fallback value"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"ignored other"
+         (scalar-body
+          [(body/->ScalarLoad (body/value 'x-value :float) 'x ['lane]
+                              nil (body/literal 0.0 :float) :cached)]))))
+  (testing "input-only storage cannot be written"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"writable output storage"
+         (scalar-body
+          [(load-x) (body/->ScalarStore 'x ['lane] 'x-value nil)])))))
+
+(deftest structured-regions-prove-yields-and-collective-convergence
+  (testing "both if branches terminate with typed yields"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"must terminate in Yield"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'condition :predicate)
+            (body/scalar-expression :lt :predicate
+                                    ['x-value (body/literal 0.0 :float)]))
+           (body/->IfRegion 'condition [] [(body/->Yield [])] [])]))))
+  (testing "loop-carried yields match the declared result product"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"yield arity or types"
+         (scalar-body
+          [(load-x)
+           (body/->ForLoop
+            (body/value 'i :int) 0 4 1
+            [(body/->LoopArg (body/value 'acc :float) 'x-value)]
+            [(body/->Yield [(body/literal 1 :int)])]
+            [(body/value 'result :float)] {})]))))
+  (testing "full-subgroup collectives cannot execute under lane-varying control"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"lane-divergent"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'condition :predicate)
+            (body/scalar-expression :lt :predicate
+                                    ['x-value (body/literal 0.0 :float)]))
+           (body/->IfRegion
+            'condition
+            [(reduce-x 'x-value) (body/->Yield [])]
+            [(body/->Yield [])]
+            [])]))))
+  (testing "collective width agrees with the static launch and schedule"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"subgroup geometry"
+         (scalar-body
+          [(load-x)
+           (body/->Collective
+            (body/value 'sum :float) :reduce :subgroup 8 'x-value :+ nil
+            (body/full-participation) :implementation-defined)]))))
+  (testing "broadcast source lanes are statically in range"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"statically in range"
+         (scalar-body
+          [(load-x)
+           (body/->Collective
+            (body/value 'shared :float) :broadcast :subgroup 16 'x-value nil 16
+            (body/full-participation) nil)]))))
+  (testing "broadcasts do not claim a reduction association"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"no reduction association"
+         (scalar-body
+          [(load-x)
+           (body/->Collective
+            (body/value 'shared :float) :broadcast :subgroup 16 'x-value nil 0
+            (body/full-participation) :implementation-defined)])))))
+
+(deftest memory-loads-cannot-prove-convergence-without-alias-facts
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"lane-divergent"
+       (scalar-body
+        [(body/->ScalarLoad (body/value 'shared-load :float) 'x ['group]
+                            nil nil :cached)
+         (body/->ScalarCompute
+          (body/value 'condition :predicate)
+          (body/scalar-expression :lt :predicate
+                                  ['shared-load (body/literal 0.0 :float)]))
+         (body/->IfRegion
+          'condition
+          [(reduce-x 'shared-load) (body/->Yield [])]
+          [(body/->Yield [])]
+          [])]))))
+
+(deftest kernel-storage-and-fragments-require-canonical-dtype-facts
+  (let [kernel (minimal-body)]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"known dtype"
+         (body/validate! (assoc-in kernel [:parameters 0 :dtype] :mystery))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"known dtype"
+         (body/validate! (assoc-in kernel [:fragments 0 :dtype] :mystery))))))
+
+(deftest loop-uniformity-is-safe-across-backedges-and-zero-trips
+  (testing "a uniform initial carry cannot prove later iterations uniform"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"lane-divergent"
+         (scalar-body
+          [(load-x)
+           (body/->ForLoop
+            (body/value 'i :int) 0 4 1
+            [(body/->LoopArg (body/value 'continue? :predicate)
+                             (body/literal true :predicate))]
+            [(body/->IfRegion
+              'continue?
+              [(reduce-x 'x-value) (body/->Yield [])]
+              [(body/->Yield [])]
+              [])
+             (body/->ScalarCompute
+              (body/value 'next? :predicate)
+              (body/scalar-expression :lt :predicate
+                                      ['x-value (body/literal 0.0 :float)]))
+             (body/->Yield ['next?])]
+            [(body/value 'finished? :predicate)] {})]))))
+  (testing "a zero-trip loop result retains its initial value's variation"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"lane-divergent"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'initial? :predicate)
+            (body/scalar-expression :lt :predicate
+                                    ['x-value (body/literal 0.0 :float)]))
+           (body/->ForLoop
+            (body/value 'i :int) 0 0 1
+            [(body/->LoopArg (body/value 'carry? :predicate) 'initial?)]
+            [(body/->Yield [(body/literal true :predicate)])]
+            [(body/value 'result? :predicate)] {})
+           (body/->IfRegion
+            'result?
+            [(reduce-x 'x-value) (body/->Yield [])]
+            [(body/->Yield [])]
+            [])])))))
+
+(deftest scalar-and-collective-operators-have-semantic-dtype-domains
+  (testing "floating intrinsics do not accept integers"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not defined for its operand dtype"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'integer :int)
+            (body/cast-expression 'x-value :int :toward-zero :saturate))
+           (body/->ScalarCompute
+            (body/value 'bad :int)
+            (body/scalar-expression :sqrt :int ['integer]))]))))
+  (testing "bitwise intrinsics do not accept floats"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not defined for its operand dtype"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :float)
+            (body/scalar-expression :bit-and :float
+                                    ['x-value (body/literal 1.0 :float)]))]))))
+  (testing "collective operator legality includes its input dtype"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not associative for its input dtype"
+         (scalar-body
+          [(load-x)
+           (body/->Collective
+            (body/value 'bad :float) :reduce :subgroup 16 'x-value :bit-and nil
+            (body/full-participation) :implementation-defined)])))))
+
+(deftest scalar-ssa-cannot-shadow-legacy-loop-indices
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"not globally unique"
+       (scalar-body
+        [(body/->Loop
+          'legacy-index 0 1 1
+          [(body/->ScalarCompute
+            (body/value 'legacy-index :float)
+            (body/scalar-expression :+ :float
+                                    [(body/literal 1.0 :float)
+                                     (body/literal 2.0 :float)]))]
+          {})]))))
+
+(deftest hardware-index-axes-must-exist-in-the-launch-contract
+  (let [kernel (scalar-body [])]
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"invalid hardware source"
+         (body/validate! (assoc-in kernel [:indices 0 :axis] 1))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"invalid hardware source"
+         (body/validate! (assoc-in kernel [:indices 1 :axis] 1))))))
