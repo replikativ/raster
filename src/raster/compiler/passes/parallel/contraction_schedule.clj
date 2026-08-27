@@ -330,9 +330,8 @@
        (not (zero? (mod (long K) (long matrix-k))))
        (decline :partial-matrix-k-fragment {:K K :matrix-k matrix-k})
 
-      ;; Helpers are target source pasted above the kernel.  Keeping them out is what makes the
-      ;; KernelBody store region typed rather than an opaque C escape hatch.  Existing emission
-      ;; remains available while helper expressions are promoted into the scalar expression IR.
+      ;; Helper strings are target source pasted above a kernel and have no KernelBody meaning.
+      ;; Refuse them so callers express the computation in the typed scalar expression instead.
        (seq (:helpers epilogue))
        (decline :opaque-epilogue-helper)
 

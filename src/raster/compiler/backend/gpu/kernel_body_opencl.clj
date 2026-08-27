@@ -5,7 +5,13 @@
   target spellings: Intel subgroup builtins, OpenCL declarations and a pipelined loop form.  Tile
   geometry and fragment topology are recovered from explicit index/operation IR, never from the
   source contraction or a second schedule registry."
-  (:require [clojure.string :as str]
+  (:require [clojure.set :as set]
+            [clojure.string :as str]
+            [clojure.walk :as walk]
+            [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]))
 
 (defn- record-kind? [simple-name value]
@@ -55,6 +61,104 @@
     (str/join " * " (map #(str "(long)" (emit-index-expression % env))
                          (:arguments expression)))
     (str "(long)" (emit-index-expression expression env))))
+
+(defn- nested-operations [operations]
+  (mapcat (fn [operation]
+            (cons operation
+                  (when-let [nested (:operations operation)]
+                    (nested-operations nested))))
+          operations))
+
+(def ^:private scalar-builtins
+  (into #{"float" "double" "half" "int" "long" "short" "char"
+          "uint" "ulong" "ushort" "uchar" "if"}
+        (comp (filter string?) (filter #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" %)))
+        (vals ce/op-map)))
+
+(defn- validate-emitted-scalar-calls!
+  [region emitted]
+  (let [calls (into #{} (map second) (re-seq #"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(" emitted))
+        ;; rstr_dp4a is accompanied by a helper in general kernels, but matrix store regions do not
+        ;; inject helper source. Keep the scalar-region target vocabulary self-contained.
+        unsupported (set/difference calls (disj scalar-builtins "rstr_dp4a"))]
+    (when (seq unsupported)
+      (throw (ex-info "OpenCL scalar region contains calls without a typed target lowering"
+                      {:reason :scalar-region-opencl-call-unsupported
+                       :calls (vec (sort unsupported)) :region region})))
+    emitted))
+
+(defn- scalar-tag [dtype]
+  (symbol (name dtype)))
+
+(defn- array-tag [dtype]
+  (symbol (str (name dtype) "s")))
+
+(defn- lower-scalar-region
+  [kernel-body region]
+  (let [parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
+        operand-ids (set (map :sym (:operands region)))
+        scalar-ids (remove operand-ids (rest (:parameters region)))
+        free-syms (subvec (vec (get-in kernel-body [:attributes :axis-symbols])) 0 2)
+        [i-sym j-sym] free-syms
+        ctype (dtype/ctype :opencl (:result-dtype region))
+        array-syms (set (map (comp #(symbol (name %)) :sym) (:operands region)))
+        int-vars (into #{} (map #(symbol (name %))) free-syms)
+        indices (into {} (map (juxt :sym (comp axis-map/index-expr :map)))
+                      (:operands region))
+        expression (descriptor/rewrite-aget-indices (:expression region) indices)
+        accumulator (first (:parameters region))
+        accumulator-token (str "__acc_" (name (gensym "")))
+        typed-parameters
+        (into {}
+              (for [id (rest (:parameters region))
+                    :let [parameter (get parameters id)]]
+                [id (with-meta (symbol (name id))
+                      {:raster.type/tag (if (= :scalar (:kind parameter))
+                                          (scalar-tag (:dtype parameter))
+                                          (array-tag (:dtype parameter)))})]))
+        replacements (assoc typed-parameters accumulator
+                            (with-meta (symbol accumulator-token)
+                              {:raster.type/tag (scalar-tag (:result-dtype region))}))
+        emitted (validate-emitted-scalar-calls!
+                 region
+                 (binding [ce/*emit-config* ce/opencl-config
+                           ce/*scalar-type* ctype
+                           ce/*int-vars* (into ce/*int-vars* int-vars)]
+                   (ce/emit-expr
+                    (walk/postwalk-replace replacements expression)
+                    (gensym "z__") array-syms)))
+        params (apply str
+                      (concat
+                       (for [{:keys [sym dtype] :or {dtype :float}} (:operands region)]
+                         (str ", __global const " (dtype/ctype :opencl dtype)
+                              "* restrict " (ce/c-symbol sym)))
+                       (for [id scalar-ids
+                             :let [parameter (get parameters id)]]
+                         (str ", " (dtype/ctype :opencl (:dtype parameter))
+                              " " (ce/c-symbol id)))))]
+    {:epilogue (fn [accumulator-expression row col]
+                 (-> emitted
+                     (str/replace accumulator-token (str "(" accumulator-expression ")"))
+                     (str/replace (re-pattern (str "\\b" (ce/c-symbol i-sym) "\\b")) row)
+                     (str/replace (re-pattern (str "\\b" (ce/c-symbol j-sym) "\\b")) col)))
+     :epilogue-params params
+     :region region}))
+
+(defn lower-store-region
+  "Lower the one verified ScalarRegion shared by all matrix stores to OpenCL scalar syntax.
+
+  Returns nil for identity stores. This is a target lowering of typed KernelBody data: callers
+  never supply source callbacks, parameter declaration strings, or helper source."
+  [kernel-body]
+  (let [kernel-body (body/validate! kernel-body)
+        stores (filter #(record-kind? "TileStore" %)
+                       (nested-operations (:operations kernel-body)))
+        regions (distinct (map :value-region stores))]
+    (when-not (= 1 (count regions))
+      (throw (ex-info "all matrix tile stores must carry the same scalar region"
+                      {:reason :raster/bug :regions (vec regions)})))
+    (when-let [region (first regions)]
+      (lower-scalar-region kernel-body region))))
 
 (defn- only!
   [owner values]
@@ -564,7 +668,11 @@
 (defn emit-matrix-kernel
   "Lower a verified f16 DPAS KernelBody directly to OpenCL C.
 
-  `target-store` is the already type-checked scalar-region target spelling
-  `{:epilogue fn :epilogue-params string}`.  It is nil for an identity store."
-  [kernel-name kernel-body target-store]
-  (emit-plan kernel-name (matrix-plan kernel-body) (or target-store {})))
+  ScalarRegion stores are lowered as part of this boundary. The optional target map contains only
+  target naming policy; it cannot inject source or replace the store expression."
+  ([kernel-name kernel-body]
+   (emit-matrix-kernel kernel-name kernel-body {}))
+  ([kernel-name kernel-body {:keys [parameter-names]}]
+   (emit-plan kernel-name (matrix-plan kernel-body)
+              (assoc (or (lower-store-region kernel-body) {})
+                     :parameter-names parameter-names))))

@@ -3,6 +3,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-artifact :as artifact]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
@@ -102,6 +103,43 @@
       (is (re-find #"__global float\* restrict C" (:source emitted)))
       (is (= (get-in emitted [:kernel-body :launch :workgroup-size])
              (:workgroup-size emitted))))))
+
+(deftest typed-epilogue-is-lowered-from-the-shared-body
+  (with-redefs [opencl-codegen/emit-gemm-tiled
+                (fn [& _]
+                  (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+    (let [emitted (gemm/emit-scheduled-matrix-kernel
+                   {:kernel-name "body_epilogue"
+                    :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
+                    :tile (hardware/derive-gemm-tile {})
+                    :result-dtype :float
+                    :epilogue {:acc 'acc
+                               :expr '(raster.numeric/*
+                                       (raster.numeric/+ acc (aget bias j)) scale)
+                               :operands [{:sym 'bias
+                                           :map (axis-map/of-axes [['j 'n]])
+                                           :dtype :half}]
+                               :scalars [{:sym 'scale :dtype :float}]}})
+          kernel-body (:kernel-body emitted)
+          epilogue-parameters (filterv #(= :epilogue (:role %)) (:parameters kernel-body))
+          region (:value-region
+                  (first (filter #(instance? raster.compiler.ir.kernel_body.TileStore %)
+                                 (tree-seq coll? seq kernel-body))))]
+      (is (= [['bias :input :half] ['scale :scalar :float]]
+             (mapv (juxt :id :kind :dtype) epilogue-parameters)))
+      (is (= ['acc 'bias 'scale] (:parameters region)))
+      (is (re-find #"restrict bias, float scale" (:source emitted)))
+      (is (re-find #"bias\[col\].*scale" (:source emitted))))))
+
+(deftest unresolved-source-helper-calls-are-not-scalar-ir
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"without a typed target lowering"
+       (gemm/emit-scheduled-matrix-kernel
+        {:kernel-name "body_undefined_helper"
+         :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
+         :tile (hardware/derive-gemm-tile {})
+         :result-dtype :float
+         :epilogue {:acc 'acc :expr '(source_helper acc)}}))))
 
 (deftest grid-z-matrix-emission-does-not-call-the-legacy-template
   (let [tile (hardware/derive-gemm-tile {})]

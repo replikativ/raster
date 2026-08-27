@@ -650,11 +650,11 @@
 ;; ================================================================
 
 (defn emit-gemm-tiled
-  "Legacy tile-parametric XMX GEMM oracle and opaque-epilogue generator.
+  "Independent tile-parametric XMX GEMM source oracle.
 
    Ordinary direct/tiled, split-K, and batched GEMM lower from a verified KernelBody. This
-   independent generator stays executable for source-equivalence checks and opaque-helper
-   epilogues until those helpers become typed scalar regions.
+   independent generator stays executable for source-equivalence checks. Production compiler and
+   resident routes lower verified KernelBody values instead.
 
    Computes C = A·B with FP16 inputs and FP32 accumulation. The tile geometry
    (workgroup BLOCK_M×BLOCK_N, per-subgroup SG_M×SG_N, K-step BLOCK_K, prefetch depth) is COMPUTED,
@@ -667,7 +667,7 @@
    full boundary checking; supports alpha/beta, c-dtype, split-k? (grid-z partials) and batched?
    (grid-z slabs)."
   [kernel-name & {:keys [block-m block-n sg-m sg-n block-k matrix alpha beta c-dtype split-k? schedule-splits-arg? batched? prefetch
-                         epilogue epilogue-params epilogue-helpers]
+                         epilogue epilogue-params]
                   :or {block-m 128 block-n 128 sg-m 32 sg-n 32 block-k 32
                        matrix {:m 8 :n 16 :k 16 :subgroup 16}
                        alpha 1.0 beta 0.0 c-dtype :half split-k? false batched? false prefetch 3}}]
@@ -675,9 +675,8 @@
   ;; transforms the accumulator value into the stored value — a bias/activation/residual/dequant
   ;; folded into the store slot (which already has row/col in scope), eliminating a separate
   ;; elementwise kernel + a DRAM round-trip of C. `epilogue-params` is a C param-decl string for the
-  ;; epilogue's operand arrays (e.g. ", __global const float* restrict bias"); `epilogue-helpers` is
-  ;; C source prepended (e.g. a silu_f definition). When `epilogue` is nil the emitted string is
-  ;; byte-identical to the plain GEMM. Mutually exclusive with beta≠0 (an accumulating store).
+  ;; epilogue's operand arrays (e.g. ", __global const float* restrict bias"). When `epilogue` is nil
+  ;; the emitted string is byte-identical to the plain GEMM. Mutually exclusive with beta≠0.
   (let [{mi :m ni :n ki :k sg :subgroup} matrix]
     (doseq [[nm a b] [["sg-m/M_i" sg-m mi] ["sg-n/N_i" sg-n ni] ["block-m/sg-m" block-m sg-m]
                       ["block-n/sg-n" block-n sg-n] ["block-k/K_i" block-k ki]]]
@@ -713,7 +712,6 @@
       (str
        "#pragma OPENCL EXTENSION cl_intel_subgroup_matrix_multiply_accumulate : enable\n"
        "#pragma OPENCL EXTENSION cl_intel_subgroup_2d_block_io : enable\n\n"
-       (when epilogue-helpers (str epilogue-helpers "\n"))
        "// Tiled GEMM (parametric): WG " block-m "x" block-n ", SG " sg-m "x" sg-n ", K " block-k
        ", DPAS " mi "x" ni "x" ki ", sg " sg "\n"
        "__attribute__((intel_reqd_sub_group_size(" sg ")))\n"

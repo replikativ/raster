@@ -13,7 +13,6 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.core.dtype :as dt]
-            [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.hardware :as hw]
             [raster.compiler.ir.axis-map :as am]
             [raster.compiler.ir.contract-stages :as cstage]
@@ -1206,15 +1205,6 @@
         (catch clojure.lang.ExceptionInfo e
           {:ok false :reason :not-a-contraction :msg (.getMessage e)})))))
 
-(def ^:private epilogue-forbidden-ops
-  "Ops that cannot appear in a store-spliced epilogue because they force a distribution/layout
-   change of the accumulator (Triton's blocked-only / anchor set): a scan, a NON-associative
-   reduction, a permuting reshape, or an atomic. An associative reduction is not forbidden outright
-   — it is a RE-TILING decision (distribute the accumulator so the reduction is warp-local) which
-   we do not implement yet, so it is refused here with its own reason."
-  '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
-     raster.par/reduce raster.par/reduce-into raster.par/contract})
-
 (defn epilogue-legal?
   "Legality of splicing `expr` into the contraction's STORE slot. Returns {:ok true} or
    {:ok false :reason kw}. Distilled from Halide / XLA / Triton / MLIR-linalg:
@@ -1229,19 +1219,8 @@
        with :reduction-in-epilogue rather than silently miscompiled.
      • the accumulator must appear exactly ONCE: more than one use duplicates the reduction result
        through the epilogue expression, which is the recompute case the ceilings guard against."
-  [{:keys [acc expr]}]
-  (let [nodes (tree-seq coll? seq expr)
-        heads (into #{} (keep #(when (seq? %) (first %))) nodes)
-        acc-uses (count (filter #(= acc %) nodes))]
-    (cond
-      (zero? acc-uses)                     {:ok false :reason :epilogue-ignores-accumulator}
-      (> acc-uses 1)                       {:ok false :reason :accumulator-used-more-than-once}
-      (some #{'raster.par/reduce 'raster.par/reduce-into} heads)
-      {:ok false :reason :reduction-in-epilogue}
-      (seq (clojure.set/intersection heads epilogue-forbidden-ops))
-      {:ok false :reason :layout-changing-op-in-epilogue
-       :ops (clojure.set/intersection heads epilogue-forbidden-ops)}
-      :else {:ok true})))
+  [epilogue]
+  (kbody/scalar-region-legal? epilogue))
 
 (defn epilogue-cost
   "Byte-traffic model for splicing an epilogue into the contraction's store, and the register
@@ -1293,13 +1272,15 @@
      {:acc  acc            ;; symbol standing for the contraction's accumulator
       :expr <s-expr>       ;; e.g. (raster.numeric/* (raster.numeric/+ acc (aget bias j)) s)
       :operands [{:sym bias :map <axis-map over the FREE axes> :dtype :float}]
-      :scalars  [{:sym s :dtype :float}]      ;; optional uniform scalars
-      :helpers  <C source string>}  ;; optional, prepended (e.g. a silu_f definition)
+      :scalars  [{:sym s :dtype :float}]}      ;; optional uniform scalars
 
    `free-syms` are the contraction's two free-axis symbols, bound to the store slot's `row`/`col`
    C variables — so an operand's axis-map generates its index exactly as in the kernel body.
-   Returns {:epilogue fn :epilogue-params str :epilogue-helpers str|nil}."
+   Returns {:epilogue fn :epilogue-params str}. Raw target helper source is not an IR."
   [{:keys [acc expr operands scalars helpers] :as spec} [i-sym j-sym] dtype]
+  (when (seq helpers)
+    (throw (ex-info "epilogue helper source has no typed scalar-region representation"
+                    {:reason :opaque-epilogue-helper})))
   (let [legal (epilogue-legal? spec)
         _ (when-not (:ok legal)
             (throw (ex-info (str "epilogue-splice: illegal epilogue (" (:reason legal) ")")
@@ -1330,50 +1311,11 @@
                      (str/replace acc-token (str "(" acc-expr ")"))
                      (str/replace (re-pattern (str "\\b" (ce/c-symbol i-sym) "\\b")) row)
                      (str/replace (re-pattern (str "\\b" (ce/c-symbol j-sym) "\\b")) col)))
-     :epilogue-params params
-     :epilogue-helpers helpers}))
-
-(defn- nested-kernel-operations [operations]
-  (mapcat (fn [operation]
-            (cons operation
-                  (when-let [nested (:operations operation)]
-                    (nested-kernel-operations nested))))
-          operations))
-
-(defn- kernel-body-store-splice
-  "Lower the typed ScalarRegion attached to KernelBody stores into the existing OpenCL scalar
-  expression vocabulary.  Matrix emission itself never sees the source contraction or epilogue
-  descriptor; its only target-specific input is this spelling of the store region."
-  [kernel-body]
-  (let [stores (filter #(instance? raster.compiler.ir.kernel_body.TileStore %)
-                       (nested-kernel-operations (:operations kernel-body)))
-        regions (distinct (map :value-region stores))]
-    (when-not (= 1 (count regions))
-      (throw (ex-info "all matrix tile stores must carry the same scalar region"
-                      {:reason :raster/bug :regions (vec regions)})))
-    (when-let [region (first regions)]
-      (let [operand-ids (set (map :sym (:operands region)))
-            scalar-ids (remove operand-ids (rest (:parameters region)))
-            parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
-            scalars (mapv (fn [id]
-                            (let [parameter (or (get parameters id)
-                                                (throw (ex-info "scalar region parameter is absent from the kernel ABI"
-                                                                {:reason :raster/bug
-                                                                 :parameter id})))]
-                              {:sym id :dtype (:dtype parameter)}))
-                          scalar-ids)
-            spec {:acc (first (:parameters region))
-                  :expr (:expression region)
-                  :operands (:operands region)
-                  :scalars scalars}
-            target (epilogue-splice spec
-                                    (subvec (vec (get-in kernel-body [:attributes :axis-symbols])) 0 2)
-                                    (:result-dtype region))]
-        (assoc target :spec spec)))))
+     :epilogue-params params}))
 
 (defn- emit-dpas-plan
-  "Lower one already-checked DPAS plan.  A KernelBody takes the direct operation lowerer; nil uses
-  the legacy template solely for the independent oracle and opaque-helper compatibility path."
+  "Lower one already-checked DPAS plan. A KernelBody takes the direct operation lowerer; nil is
+  reserved for the independent source oracle."
   [kernel-name row-arr col-arr out-sym [M N L] [i-sym j-sym] tile epilogue kernel-body]
   (let [effective-tile (if kernel-body (:schedule kernel-body) tile)
         result-dtype (if kernel-body
@@ -1382,12 +1324,12 @@
                        :half)
         sg (long (get-in effective-tile [:matrix :subgroup] 16))
         ep (if kernel-body
-             (kernel-body-store-splice kernel-body)
+             (kernel-body-opencl/lower-store-region kernel-body)
              (when epilogue
                (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float))))
-        effective-epilogue (or (:spec ep) epilogue)
+        effective-epilogue (or epilogue (get-in kernel-body [:attributes :epilogue]))
         source (if kernel-body
-                 (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body ep)
+                 (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body)
                  (apply codegen/emit-gemm-tiled kernel-name
                         (concat [:c-dtype :half
                                  :block-m (:block-m effective-tile)
@@ -1396,8 +1338,7 @@
                                  :block-k (:block-k effective-tile) :matrix (:matrix effective-tile)
                                  :prefetch (:num-stages effective-tile 3)]
                                 (when ep [:epilogue (:epilogue ep)
-                                          :epilogue-params (:epilogue-params ep)
-                                          :epilogue-helpers (:epilogue-helpers ep)]))))]
+                                          :epilogue-params (:epilogue-params ep)]))))]
     (cond->
      {:kernel-name kernel-name
       :source source
@@ -1450,8 +1391,8 @@
   "Legacy direct entry to the proven DPAS/XMX OpenCL emitter.
 
    Production canonical f16 contractions now travel through ContractionFacts and a scheduled
-   KernelBody before reaching `generate-dpas-kernel-body`.  This entry remains as the source oracle
-   for the direct operation lowerer and for opaque epilogue helpers that have not yet become typed scalar IR.
+   KernelBody before reaching `generate-dpas-kernel-body`. This entry remains only as the
+   independent source oracle for the direct operation lowerer.
    Its legality analysis determines operand orientation and launch dimensions; the emitted body is
    f16 input, f32 accumulation and f16 output with a tile-parametric K16 matrix instruction.
 
@@ -1740,7 +1681,6 @@
                  ;; registry-driven, not `(intrinsics/descriptor 'dp4a)`: define every intrinsic
                  ;; helper this body actually calls — the same scan every other emitter uses
              (ce/intrinsic-helper-sources nest)
-             (when ep (:epilogue-helpers ep))
              "__kernel void " kernel-name "(" params ") {\n"
              "    int seg = get_global_id(0);\n"
              "    if (seg >= _nseg) return;\n"

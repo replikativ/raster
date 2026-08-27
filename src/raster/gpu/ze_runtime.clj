@@ -1308,12 +1308,12 @@
 
 (defn- emit-scheduled-gemm
   "Ask the compiler for the shared scheduled matrix body and its direct OpenCL lowering."
-  [kernel-name c-dtype tile]
+  [kernel-name c-dtype tile epilogue]
   ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-matrix-kernel)
    {:kernel-name kernel-name
     :id [:resident-gemm kernel-name]
     :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
-    :tile tile :result-dtype c-dtype
+    :tile tile :result-dtype c-dtype :epilogue epilogue
     :provenance {:dialect :resident-runtime}}))
 
 (defn- emit-scheduled-split-k-gemm
@@ -1351,7 +1351,7 @@
   (or (get @gemm-cache c-dtype)
       (let [kname (str "gemm_nonsquare_" (name c-dtype))
             tile (gemm-tile)
-            emitted (emit-scheduled-gemm kname c-dtype tile)
+            emitted (emit-scheduled-gemm kname c-dtype tile nil)
             cl-src (:source emitted)
             device-hex (:device-id-hex @state)
             spv (do (require 'raster.compiler.support.spirv-cache)
@@ -2203,7 +2203,7 @@
   (ensure-init!)
   (or (get @gemm-tiled-cache [c-dtype tile])
       (let [kname (str "gemm_tiled_" (name c-dtype) "_" (tile-signature tile))
-            emitted (emit-scheduled-gemm kname c-dtype tile)
+            emitted (emit-scheduled-gemm kname c-dtype tile nil)
             cl-src (:source emitted)
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
@@ -2236,50 +2236,99 @@
     (.set gc I32 8 (int 1))
     bnd))
 
-;; ── FUSED-EPILOGUE GEMM (feature 4 — C = epilogue(A·B, row, col)) ───────────────
-;; One kernel for GEMM + a same-position elementwise consumer (bias/act/residual), the
-;; training-M win (~15-18% at M≥512, measured). The epilogue is BAKED into the kernel at
-;; emit time (emit-gemm-tiled :epilogue) and its operand buffers appended to the launch args.
+;; ── FUSED-EPILOGUE GEMM (C = ScalarRegion(A·B, row, col)) ──────────────────────
+;; One typed KernelBody for GEMM + a same-position elementwise consumer (bias/act/residual), the
+;; training-M win (~15-18% at M≥512, measured). Runtime bindings remain separate from the scalar
+;; program so cache identity and ABI order come from compiler data rather than source strings.
 (def ^:private gemm-epilogue-cache (atom {}))
 
+(defn- resident-epilogue-program
+  [epilogue]
+  (let [allowed #{:acc :expr :operands :scalars :dtype :bindings}
+        unsupported (seq (remove allowed (keys epilogue)))]
+    (when unsupported
+      (throw (ex-info "resident GEMM epilogue contains unsupported fields"
+                      {:unsupported (vec unsupported) :allowed allowed})))
+    (when-not (map? (:bindings epilogue))
+      (throw (ex-info "resident GEMM epilogue requires explicit runtime bindings"
+                      {:epilogue epilogue})))
+    (dissoc epilogue :bindings)))
+
 (defn- ensure-gemm-epilogue-kernel!
-  "Compile + cache a GEMM kernel with a fused epilogue, keyed by [c-dtype tile epi-key].
-   `epilogue` is {:key :params :fn :helpers} (the emit-gemm-tiled :epilogue* args)."
-  [c-dtype tile {:keys [key params fn helpers]}]
+  "Compile and cache a typed ScalarRegion GEMM by its structural program, output dtype and tile."
+  [c-dtype tile epilogue]
   (ensure-init!)
-  (or (get @gemm-epilogue-cache [c-dtype tile key])
-      (let [kname (str "gemm_epi_" (name key) "_" (name c-dtype) "_" (tile-signature tile))
-            emit  (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                      (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled))
-            cl-src (apply emit kname :c-dtype c-dtype :prefetch (:num-stages tile 3)
-                          :epilogue fn :epilogue-params params :epilogue-helpers helpers
-                          (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
-            spv (do (require 'raster.compiler.support.spirv-cache)
-                    ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
-                     cl-src :device (:device-id-hex @state)))
-            module (load-module! spv)
-            entry {:module module :kernel-name kname}]
-        (swap! gemm-epilogue-cache assoc [c-dtype tile key] entry)
-        entry)))
+  (let [program (resident-epilogue-program epilogue)
+        cache-key [c-dtype tile program]]
+    (or (get @gemm-epilogue-cache cache-key)
+        (let [program-id (Integer/toUnsignedString (hash program) 16)
+              kname (str "gemm_epi_" program-id "_" (name c-dtype) "_" (tile-signature tile))
+              emitted (emit-scheduled-gemm kname c-dtype tile program)
+              cl-src (:source emitted)
+              spv (do (require 'raster.compiler.support.spirv-cache)
+                      ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
+                       cl-src :device (:device-id-hex @state)))
+              module (load-module! spv)
+              entry {:module module :kernel-name kname :tile tile :program program
+                     :kernel-body (:kernel-body emitted)
+                     :workgroup (:workgroup-size emitted)}]
+          (swap! gemm-epilogue-cache assoc cache-key entry)
+          entry))))
+
+(defn- resident-epilogue-argument
+  [parameter value]
+  (case (:kind parameter)
+    :input
+    (do
+      (when-not (instance? DeviceBuffer value)
+        (throw (ex-info "resident epilogue buffer binding is not a DeviceBuffer"
+                        {:parameter parameter :actual (type value)})))
+      (when-not (= (dt/canon (:dtype parameter)) (dt/canon (:dtype value)))
+        (throw (ex-info "resident epilogue buffer dtype differs from its KernelBody ABI"
+                        {:parameter parameter :actual (:dtype value)})))
+      (:segment value))
+
+    :scalar
+    {:type (case (dt/canon (:dtype parameter))
+             :int8 :byte
+             :byte :byte
+             :half :half
+             :float :float
+             :double :double
+             :int :int
+             :long :long
+             (throw (ex-info "resident epilogue scalar dtype is unsupported"
+                             {:parameter parameter})))
+     :value value}
+
+    (throw (ex-info "resident epilogue ABI slot must be input or scalar"
+                    {:parameter parameter}))))
 
 (defn bind-registered-gemm-epilogue!
-  "Bind a fused-epilogue GEMM: C = epilogue(A·B, row, col). `epilogue` is {:key :params :fn :helpers
-   :operands [buffers]} — the operand buffers (bias/residual) are appended to the launch args after
-   (A B C M N K), matching :params. Same launch geometry as bind-registered-gemm-tiled!."
+  "Bind C = ScalarRegion(A·B) using the same typed epilogue descriptor as the compiler.
+
+   `epilogue` contains :acc, :expr, ordered :operands/:scalars, and a :bindings map from each
+   operand/scalar identity to its resident buffer or scalar value. KernelBody owns the physical
+   ABI and launch geometry; target source callbacks and declaration strings are not accepted."
   [a b c m n k c-dtype tile epilogue]
   (when-let [bd (:dtype c)]
     (when (not= bd c-dtype)
       (throw (ex-info (str "bind-registered-gemm-epilogue!: output buffer dtype " bd " ≠ kernel dtype " c-dtype) {}))))
-  (let [{:keys [module kernel-name]} (ensure-gemm-epilogue-kernel! c-dtype tile epilogue)
-        {:keys [block-m block-n sg-m sg-n matrix]} tile
-        sg   (long (:subgroup matrix 16))
-        n-subgroups (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)))
-        wg   (* n-subgroups sg)
+  (let [{:keys [module kernel-name kernel-body workgroup]}
+        (ensure-gemm-epilogue-kernel! c-dtype tile epilogue)
+        {:keys [block-m block-n]} tile
+        parameters (filterv #(= :epilogue (:role %)) (:parameters kernel-body))
+        expected (mapv :id parameters)
+        bindings (:bindings epilogue)
+        provided (set (keys bindings))
+        _ (when-not (= (set expected) provided)
+            (throw (ex-info "resident epilogue bindings differ from the KernelBody ABI"
+                            {:expected expected :provided (vec (keys bindings))})))
         kh   (create-kernel-fresh module kernel-name)
         args (vec (concat [(:segment a) (:segment b) (:segment c)
                            {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-                          (map :segment (:operands epilogue))))
-        bnd  (bind-kernel! kh [wg 1] args)
+                          (map #(resident-epilogue-argument % (get bindings (:id %))) parameters)))
+        bnd  (bind-kernel! kh workgroup args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))
     (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))

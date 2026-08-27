@@ -16,6 +16,7 @@
             [raster.compiler.backend.gpu.gemm :as gemm]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]))
 
@@ -73,13 +74,39 @@
     (with-redefs [opencl-codegen/emit-gemm-tiled
                   (fn [& _]
                     (throw (ex-info "legacy template was called" {:reason :test/failure})))]
-      (let [emitted (emit-resident "resident_body" :float tile)]
+      (let [emitted (emit-resident "resident_body" :float tile nil)]
         (is (body/kernel-body? (:kernel-body emitted)))
         (is (= :float (:dtype (first (filter #(= :result (:role %))
                                              (get-in emitted [:kernel-body :parameters]))))))
         (is (= (get-in emitted [:kernel-body :launch :workgroup-size])
                (:workgroup-size emitted)))
         (is (re-find #"__global float\* restrict C" (:source emitted)))))))
+
+(deftest resident-epilogues-use-typed-programs-and-body-owned-abi
+  (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))
+        emit-resident (ns-resolve ze 'emit-scheduled-gemm)
+        resident-program (ns-resolve ze 'resident-epilogue-program)
+        tile (hw/gemm-tile-for nil)
+        program {:acc 'acc
+                 :expr '(raster.numeric/+ acc (aget bias j))
+                 :operands [{:sym 'bias
+                             :map (axis-map/of-axes [['j 'N]])
+                             :dtype :half}]}
+        descriptor (assoc program :bindings {'bias :resident-buffer})]
+    (with-redefs [opencl-codegen/emit-gemm-tiled
+                  (fn [& _]
+                    (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+      (let [emitted (emit-resident "resident_typed_epilogue" :float tile program)]
+        (is (= program (resident-program descriptor)))
+        (is (= [['bias :input :half :epilogue]]
+               (mapv (juxt :id :kind :dtype :role)
+                     (filter #(= :epilogue (:role %))
+                             (get-in emitted [:kernel-body :parameters])))))
+        (is (re-find #"restrict bias" (:source emitted)))
+        (is (re-find #"bias\[col\]" (:source emitted)))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported fields"
+                          (resident-program {:key :bias :fn identity :params "raw"
+                                             :bindings {}})))))
 
 (deftest resident-grid-z-sources-use-the-scheduled-body
   (let [ze (do (require 'raster.gpu.ze-runtime) (find-ns 'raster.gpu.ze-runtime))

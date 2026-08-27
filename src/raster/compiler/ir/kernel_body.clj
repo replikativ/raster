@@ -4,7 +4,9 @@
   SegOps retain algorithmic semantics.  A KernelBody is the result of applying a concrete
   schedule: hardware indices, named layouts, masks, fragment operations and loop structure are
   explicit, but target spellings such as Intel DPAS, CUDA WMMA or AMD MFMA are not.  Backends lower
-  these values to their own dialect; they must not recover a schedule by inspecting source text.")
+  these values to their own dialect; they must not recover a schedule by inspecting source text."
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.axis-map :as axis-map]))
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
@@ -57,6 +59,36 @@
     (throw (ex-info "kernel predicate has an unsupported operation"
                     {:operation op :arguments arguments})))
   (->Predicate op (vec arguments)))
+
+(def ^:private scalar-region-forbidden-ops
+  '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
+     raster.par/reduce raster.par/reduce-into raster.par/contract})
+
+(defn scalar-region-legal?
+  "Check whether a scalar expression can execute once in a tile store without changing layout.
+
+  Accepts either a ScalarRegion or the source epilogue descriptor used before scheduling."
+  [region]
+  (let [accumulator (or (:acc region) (first (:parameters region)))
+        expression (or (:expr region) (:expression region))
+        nodes (tree-seq coll? seq expression)
+        heads (into #{} (keep #(when (seq? %) (first %))) nodes)
+        accumulator-uses (count (filter #(= accumulator %) nodes))]
+    (cond
+      (zero? accumulator-uses)
+      {:ok false :reason :epilogue-ignores-accumulator}
+
+      (> accumulator-uses 1)
+      {:ok false :reason :accumulator-used-more-than-once}
+
+      (some #{'raster.par/reduce 'raster.par/reduce-into} heads)
+      {:ok false :reason :reduction-in-epilogue}
+
+      (seq (set/intersection heads scalar-region-forbidden-ops))
+      {:ok false :reason :layout-changing-op-in-epilogue
+       :ops (set/intersection heads scalar-region-forbidden-ops)}
+
+      :else {:ok true})))
 
 (defn- expression? [value]
   (cond
@@ -115,8 +147,76 @@
 
 (declare validate-operations!)
 
+(defn- axis-map!
+  [operand]
+  (let [groups (get-in operand [:map :groups])]
+    (when-not (and (vector? groups) (seq groups)
+                   (every? #(and (vector? %) (seq %)
+                                 (every? (fn [pair]
+                                           (and (vector? pair) (= 2 (count pair))
+                                                (value-id? (first pair))
+                                                (or (value-id? (second pair))
+                                                    (and (integer? (second pair))
+                                                         (pos? (second pair))))))
+                                         %))
+                           groups))
+      (throw (ex-info "scalar-region operand requires a structured axis map"
+                      {:operand operand})))
+    (axis-map/shape (:map operand))))
+
+(defn- validate-scalar-region!
+  [region storage epilogue-abi]
+  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarRegion" region)
+    (throw (ex-info "tile-store value region must be a ScalarRegion" {:region region})))
+  (let [parameters (:parameters region)
+        operands (:operands region)
+        operand-ids (when (vector? operands) (mapv :sym operands))]
+    (when-not (and (vector? parameters) (seq parameters)
+                   (every? symbol? parameters)
+                   (= (count parameters) (count (set parameters)))
+                   (vector? operands)
+                   (<= (inc (count operand-ids)) (count parameters))
+                   (some? (:expression region))
+                   (keyword? (:result-dtype region)))
+      (throw (ex-info "tile-store scalar region is incomplete or has ambiguous parameters"
+                      {:region region})))
+    (let [accumulator (first parameters)
+          scalar-ids (subvec parameters (inc (count operand-ids)))]
+      (when-not (and (= operand-ids (subvec parameters 1 (inc (count operand-ids))))
+                     (= (count operand-ids) (count (set operand-ids))))
+        (throw (ex-info "scalar-region operands must be an ordered prefix of its ABI parameters"
+                        {:region region :operand-ids operand-ids})))
+      (when (contains? storage accumulator)
+        (throw (ex-info "scalar-region accumulator must be region-local"
+                        {:accumulator accumulator})))
+      (when-not (= epilogue-abi (vec (rest parameters)))
+        (throw (ex-info "scalar-region parameters and the epilogue ABI disagree"
+                        {:parameters (vec (rest parameters))
+                         :epilogue-abi epilogue-abi})))
+      (doseq [operand operands]
+        (let [id (:sym operand)
+              parameter (get storage id)
+              shape (axis-map! operand)]
+          (when-not (and parameter (= :input (:kind parameter))
+                         (= :epilogue (:role parameter))
+                         (= (:dtype operand :float) (:dtype parameter))
+                         (= shape (:shape parameter)))
+            (throw (ex-info "scalar-region operand and its kernel ABI slot disagree"
+                            {:operand operand :parameter parameter :shape shape})))))
+      (doseq [id scalar-ids]
+        (let [parameter (get storage id)]
+          (when-not (and parameter (= :scalar (:kind parameter))
+                         (= :epilogue (:role parameter)))
+            (throw (ex-info "scalar-region scalar and its kernel ABI slot disagree"
+                            {:scalar id :parameter parameter})))))
+      (let [legal (scalar-region-legal? region)]
+        (when-not (:ok legal)
+          (throw (ex-info "tile-store scalar region is not store-local"
+                          (assoc legal :region region)))))
+      region)))
+
 (defn- validate-operation!
-  [operation storage fragments masks scope]
+  [operation storage fragments masks scope epilogue-abi]
   (let [parameter (fn [id]
                     (or (get storage id)
                         (throw (ex-info "kernel operation references an undeclared parameter"
@@ -217,12 +317,12 @@
           (throw (ex-info "kernel loop induction value shadows an existing value"
                           {:index (:index operation) :scope scope})))
         (validate-operations! (:operations operation) storage fragments masks
-                              (conj scope (:index operation))))
+                              (conj scope (:index operation)) epilogue-abi))
 
       (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
       (do
         (mask (:mask operation))
-        (validate-operations! (:operations operation) storage fragments masks scope))
+        (validate-operations! (:operations operation) storage fragments masks scope epilogue-abi))
 
       (record-kind? "raster.compiler.ir.kernel_body.TileStore" operation)
       (let [p (parameter (:buffer operation))
@@ -234,23 +334,19 @@
         (coordinates! "tile-store" (:coordinates operation))
         (mask (:mask operation))
         (when-let [region (:value-region operation)]
-          (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarRegion" region)
-            (throw (ex-info "tile-store value region must be a ScalarRegion" {:region region})))
-          (when-not (and (vector? (:parameters region)) (seq (:parameters region))
-                         (some? (:expression region)) (keyword? (:result-dtype region)))
-            (throw (ex-info "tile-store scalar region is incomplete" {:region region})))))
+          (validate-scalar-region! region storage epilogue-abi)))
 
       :else
       (throw (ex-info "kernel body contains an unsupported operation"
                       {:operation operation :actual (type operation)})))))
 
-(defn- validate-operations! [operations storage fragments masks scope]
+(defn- validate-operations! [operations storage fragments masks scope epilogue-abi]
   (when-not (vector? operations)
     (throw (ex-info "kernel operations must be an ordered vector" {:operations operations})))
   (doseq [operation operations]
     (when-not (operation? operation)
       (throw (ex-info "kernel body contains a non-operation value" {:operation operation})))
-    (validate-operation! operation storage fragments masks scope)))
+    (validate-operation! operation storage fragments masks scope epilogue-abi)))
 
 (defn validate!
   "Verify a scheduled KernelBody and return it unchanged."
@@ -388,7 +484,8 @@
                             storage
                             (into {} (map (juxt :id identity)) fragments)
                             (into {} (map (juxt :id identity)) masks)
-                            index-scope)))
+                            index-scope
+                            (mapv :id (filter #(= :epilogue (:role %)) parameters)))))
   body)
 
 (defn make

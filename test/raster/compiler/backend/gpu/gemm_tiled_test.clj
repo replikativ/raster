@@ -15,6 +15,7 @@
    The old string generator remains an independent cross-tile oracle in this test. Device-free
    body/source checks live in raster.compiler.backend.gpu.gemm-test."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.dl.gpu-grad-parity :as gp]))
 
 (defn- cpu-gemm-ref
@@ -98,14 +99,18 @@
           mk (fn [s] (let [a (float-array s)] (dotimes [i s] (aset a i (float (* 0.1 (.nextGaussian rng))))) a))
           A (mk (* m k)) B (mk (* k n)) bias (mk n)
           a16 (f16 A) b16 (f16 B) biasbuf (f16 bias) c (MB (* m n) :float)
-          epi {:key :bias :params ", __global const half* restrict bias"
-               :fn (fn [acc _row col] (str acc " + (float)bias[" col "]")) :operands [biasbuf]}]
+          epi {:acc 'acc
+               :expr '(raster.numeric/* (raster.numeric/+ acc (aget bias j)) scale)
+               :operands [{:sym 'bias :map (axis-map/of-axes [['j n]]) :dtype :half}]
+               :scalars [{:sym 'scale :dtype :float}]
+               :bindings {'bias biasbuf 'scale 0.5}}]
       (try
         (RP (RG [{:bound (bind a16 b16 c m n k :float tile epi) :kernel-name "gemm_epi_bias_float"}]))
         (let [gpu (BA c) h (fn [x] (Float/float16ToFloat (Float/floatToFloat16 (float x)))) ref (float-array (* m n))]
           (dotimes [i m] (dotimes [j n]
                            (let [s (loop [p 0 acc 0.0] (if (< p k) (recur (inc p) (+ acc (* (double (h (aget A (+ (* i k) p)))) (double (h (aget B (+ (* p n) j))))))) acc))]
-                             (aset ref (+ (* i n) j) (float (+ s (double (h (aget bias j)))))))))
+                             (aset ref (+ (* i n) j)
+                                   (float (* 0.5 (+ s (double (h (aget bias j))))))))))
           (let [maxrel (reduce max 0.0 (map (fn [a b] (/ (Math/abs (- (double a) (double b))) (+ 0.05 (Math/abs (double b))))) gpu ref))]
             (is (< maxrel 1.0e-3) (str "fused C=A·B+bias must match CPU ref within f16 tol (max-rel " maxrel ")"))))
         (finally (FB a16) (FB b16) (FB biasbuf) (FB c))))))
