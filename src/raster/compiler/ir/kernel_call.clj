@@ -4,9 +4,11 @@
    KernelArtifact owns target code, ABI and symbolic launch. KernelCall adds runtime values in the
    identical ABI order and a concrete 1-3D LaunchGeometry. Backends consume this value instead of
    reconstructing arguments or launch dimensions from a convention-specific marker."
-  (:require [raster.compiler.ir.kernel-abi :as kabi]
+  (:require [raster.compiler.ir.buffer-view :as bview]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch])
+  (:import [java.lang.foreign MemorySegment]))
 
 (defrecord KernelCall [artifact arguments geometry])
 
@@ -104,6 +106,43 @@
                      :value value})))
   value)
 
+(defn- resident-view
+  [value]
+  (cond
+    (bview/buffer-view? value) value
+    (and (map? value) (bview/buffer-view? (:view value))) (:view value)
+    :else nil))
+
+(defn- resident-segment
+  [value]
+  (cond
+    (instance? MemorySegment value) value
+    (and (map? value) (instance? MemorySegment (:segment value))) (:segment value)
+    :else nil))
+
+(defn- segment-overlaps?
+  [^MemorySegment left ^MemorySegment right]
+  (try
+    (let [left-start (.address left)
+          right-start (.address right)
+          left-end (+ left-start (.byteSize left))
+          right-end (+ right-start (.byteSize right))]
+      (and (< left-start right-end) (< right-start left-end)))
+    (catch UnsupportedOperationException _
+      (identical? left right))))
+
+(defn- pointer-overlaps?
+  [left right]
+  (let [left-view (resident-view left)
+        right-view (resident-view right)
+        left-segment (resident-segment left)
+        right-segment (resident-segment right)]
+    (cond
+      (identical? left right) true
+      (and left-view right-view) (bview/overlaps? left-view right-view)
+      (and left-segment right-segment) (segment-overlaps? left-segment right-segment)
+      :else (= left right))))
+
 (defn validate!
   "Validate and return a KernelCall. This is driver-independent: a backend subsequently checks
    that pointer values are its resident buffer representation and match ABI storage dtypes."
@@ -115,6 +154,7 @@
         artifact (kart/validate! artifact)
         abi (:abi artifact)
         arguments (kabi/validate-arguments! abi arguments)
+        _ (kabi/validate-alias-contracts! abi arguments pointer-overlaps?)
         geometry (klaunch/validate-geometry! geometry)
         spec (:launch artifact)]
     (when-not (= (klaunch/dimensions spec) (klaunch/dimensions geometry))

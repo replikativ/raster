@@ -126,8 +126,8 @@
                                        (axis-map/of-axes [['group-x 8]]))))))))
 
 (defn- scalar-body
-  [operations & {:keys [masks schedule]
-                 :or {masks [] schedule {:subgroup-size 16}}}]
+  [operations & {:keys [masks stable-reads schedule]
+                 :or {masks [] stable-reads [] schedule {:subgroup-size 16}}}]
   (body/make
    {:id :scalar
     :parameters [(body/->KernelParameter
@@ -139,6 +139,7 @@
     :indices [(body/->IndexBinding 'group :group 0)
               (body/->IndexBinding 'lane :lane 0)]
     :masks masks
+    :stable-reads stable-reads
     :operations operations
     :schedule schedule
     :launch (launch/spec {:workgroup-size [16] :group-count [1]})
@@ -245,7 +246,44 @@
           [(load-x)
            (body/->ScalarCompute
             (body/value 'bad :int)
-            (body/cast-expression 'x-value :int :toward-zero :wrap))])))))
+            (body/cast-expression 'x-value :int :toward-zero :wrap))]))))
+  (testing "FP narrowing states IEEE overflow and nearest-even rounding"
+    (is (body/kernel-body?
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'narrowed :half)
+            (body/cast-expression 'x-value :half :nearest-even :ieee))]))))
+  (testing "IEEE overflow is not an integer conversion policy"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"policies disagree"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :int)
+            (body/cast-expression 'x-value :int :toward-zero :ieee))]))))
+  (testing "same-width floating casts are exact rather than fictitious narrowing"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"policies disagree"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :float)
+            (body/cast-expression 'x-value :float :nearest-even :ieee))]))))
+  (testing "floating widening is exact"
+    (is (body/kernel-body?
+         (scalar-body
+          [(body/->ScalarCompute
+            (body/value 'widened :float)
+            (body/cast-expression (body/literal 1.0 :half) :float :exact :exact))]))))
+  (testing "floating narrowing cannot borrow integer saturation semantics"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"policies disagree"
+         (scalar-body
+          [(load-x)
+           (body/->ScalarCompute
+            (body/value 'bad :half)
+            (body/cast-expression 'x-value :half :nearest-even :saturate))])))))
 
 (deftest scalar-memory-is-ranked-masked-and-typed
   (testing "a load cannot silently reinterpret or widen storage"
@@ -353,6 +391,43 @@
           [(reduce-x 'shared-load) (body/->Yield [])]
           [(body/->Yield [])]
           [])]))))
+
+(deftest stable-input-loads-prove-only-their-coordinate-uniformity
+  (let [stable [(body/stable-read 'x)]
+        uniform-branch
+        [(body/->ScalarLoad (body/value 'shared-load :float) 'x ['group]
+                            nil nil :cached)
+         (body/->ScalarCompute
+          (body/value 'condition :predicate)
+          (body/scalar-expression :lt :predicate
+                                  ['shared-load (body/literal 0.0 :float)]))
+         (body/->IfRegion
+          'condition
+          [(reduce-x 'shared-load) (body/->Yield [])]
+          [(body/->Yield [])]
+          [])]]
+    (is (= stable (:stable-reads (scalar-body uniform-branch :stable-reads stable))))
+    (testing "a lane-varying address remains lane-varying"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"lane-divergent"
+           (scalar-body
+            [(load-x)
+             (body/->ScalarCompute
+              (body/value 'condition :predicate)
+              (body/scalar-expression :lt :predicate
+                                      ['x-value (body/literal 0.0 :float)]))
+             (body/->IfRegion
+              'condition
+              [(reduce-x 'x-value) (body/->Yield [])]
+              [(body/->Yield [])]
+              [])]
+            :stable-reads stable))))
+    (testing "the contract names unique input parameters"
+      (doseq [requirements [[(body/stable-read 'y)]
+                            [(body/stable-read 'missing)]
+                            [(body/stable-read 'x) (body/stable-read 'x)]]]
+        (is (thrown? clojure.lang.ExceptionInfo
+                     (scalar-body [] :stable-reads requirements)))))))
 
 (deftest kernel-storage-and-fragments-require-canonical-dtype-facts
   (let [kernel (minimal-body)]

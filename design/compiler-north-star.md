@@ -103,7 +103,12 @@ loop-carried regions, and full-participation subgroup reductions/broadcasts. Bra
 are typed products; use-before-definition, identity collisions, divergent collectives, implicit
 masked-load values, conversion policy gaps, and launch/subgroup mismatches fail verification. Body
 launches use the shared `LaunchSpec`, keeping host launch expressions separate from in-kernel index
-arithmetic. Local allocation, barriers, masked collectives, and asynchronous copies remain absent
+arithmetic. Uniform memory facts require an explicit body-level stable-read contract; the checked
+KernelBody-to-ABI seam projects it to a no-write-alias precondition, artifacts reject equal compiler
+bindings, direct calls check resident ranges, and graph/link binding retains its stronger
+overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from integral
+wrap/saturate/trap policies. Local allocation,
+barriers, masked collectives, and asynchronous copies remain absent
 until a concrete schedule supplies enough information to verify lifetime, alignment, execution and
 memory scopes, memory semantics, participation, and shared-byte accounting. The next production
 vertical is scheduled routed `SegmentedWeightedReduction -> KernelBody` with an invariant external

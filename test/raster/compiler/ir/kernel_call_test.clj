@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.kernel-call-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.buffer-view :as bview]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -22,6 +23,33 @@
 
 (def ^:private args
   [:resident-x :resident-out {:type :float :value 2.0} {:type :int :value 513}])
+
+(def ^:private stable-artifact
+  (kart/make (assoc-in artifact [:abi 0 :aliasing] :no-write-alias)))
+
+(deftest calls-enforce-stable-input-ranges-without-forbidding-in-place-by-default
+  (let [allocation (bview/allocation {:id :call-alias :byte-size 64 :memory-space :device
+                                      :ownership :borrowed})
+        left (bview/view allocation {:id :left :dtype :float :shape [8]})
+        overlap (bview/view allocation {:id :overlap :byte-offset 16
+                                        :dtype :float :shape [8]})
+        right (bview/view allocation {:id :right :byte-offset 32
+                                      :dtype :float :shape [8]})
+        scalars [{:type :float :value 1.0} {:type :int :value 8}]]
+    (is (kcall/kernel-call? (kcall/make stable-artifact (into [left right] scalars))))
+    (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
+                          (kcall/make stable-artifact (into [left overlap] scalars))))
+    (is (kcall/kernel-call? (kcall/make artifact (into [left left] scalars)))))
+  (testing "raw resident segments are checked by byte range"
+    (let [segment (java.lang.foreign.MemorySegment/ofArray (float-array 16))
+          left (.asSlice segment 0 32)
+          overlap (.asSlice segment 16 32)
+          right (.asSlice segment 32 32)
+          scalars [{:type :float :value 1.0} {:type :int :value 8}]]
+      (is (kcall/kernel-call? (kcall/make stable-artifact (into [left right] scalars))))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"stable input overlaps"
+                            (kcall/make stable-artifact
+                                        (into [left overlap] scalars)))))))
 
 (deftest call-realizes-artifact-launch-from-ordered-values
   (let [call (kcall/make artifact args)

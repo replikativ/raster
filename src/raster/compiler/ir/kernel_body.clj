@@ -13,6 +13,7 @@
 
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
+(defrecord StableRead [buffer])
 (defrecord IndexBinding [id source axis])
 (defrecord IndexCompute [id expression])
 (defrecord IndexExpr [op arguments])
@@ -47,7 +48,8 @@
 (defrecord TileStore [buffer fragment coordinates mask value-region])
 
 (defrecord KernelBody
-           [id parameters views indices masks fragments operations schedule launch provenance attributes])
+           [id parameters views stable-reads indices masks fragments operations schedule launch
+            provenance attributes])
 
 (def ^:private parameter-kinds #{:input :output :scalar})
 (def ^:private index-sources #{:group :subgroup :lane})
@@ -57,7 +59,7 @@
 (def ^:private internal-types #{:predicate})
 (def ^:private special-scalar-ops #{:cast :select :isnan})
 (def ^:private cast-rounding-policies #{:toward-zero :nearest-even :up :down :exact})
-(def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact})
+(def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact :ieee})
 (def ^:private collective-kinds #{:reduce :broadcast})
 
 (defn- record-kind? [class-name value]
@@ -116,6 +118,12 @@
   "Every lane in the collective's statically selected subgroup participates."
   []
   (->Participation :full))
+
+(defn stable-read
+  "Require an input buffer to remain disjoint from every writable buffer for the complete kernel
+  execution. This is an external binding precondition, not a load-local optimization hint."
+  [buffer]
+  (->StableRead buffer))
 
 (def ^:private scalar-region-forbidden-ops
   '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
@@ -640,6 +648,9 @@
       (let [source-type (:type (first infos))
             source-integral? (contains? #{:byte :int :long} source-type)
             result-integral? (contains? #{:byte :int :long} result-type)
+            both-floating? (and (dtype/fp-dtype? source-type) (dtype/fp-dtype? result-type))
+            narrowing? (and both-floating?
+                            (> (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
             rounding (:rounding options)
             overflow (:overflow options)]
         (when-not (= 1 (count infos))
@@ -655,11 +666,17 @@
           (throw (ex-info "numeric casts cannot create or consume predicates"
                           {:expression expression})))
         ;; Rounding has no meaning when the source is already integral. Wrapping is a
-        ;; representation operation only between integral types; floating conversions must
-        ;; choose an explicit exact, checked, or saturating contract.
+        ;; representation operation only between integral types. FP same-width/widening casts are
+        ;; exact; FP narrowing states an IEEE overflow and directional rounding contract.
         (when-not (and (or (not source-integral?) (= :exact rounding))
                        (or (not= :wrap overflow)
-                           (and source-integral? result-integral?)))
+                           (and source-integral? result-integral?))
+                       (if both-floating?
+                         (if narrowing?
+                           (and (= :ieee overflow)
+                                (contains? #{:nearest-even :toward-zero :up :down} rounding))
+                           (and (= :exact rounding) (= :exact overflow)))
+                         (not= :ieee overflow)))
           (throw (ex-info "scalar cast policies disagree with its source and result dtypes"
                           {:reason :kernel-body-cast-policy
                            :source-type source-type :result-type result-type
@@ -803,7 +820,8 @@
     (reduce * workgroup)))
 
 (defn- validate-dataflow-operation!
-  [operation values {:keys [storage masks claimed reserved control-uniformity launch schedule]
+  [operation values {:keys [storage stable-reads masks claimed reserved control-uniformity launch
+                            schedule]
                      :as context}]
   (cond
     (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
@@ -820,8 +838,10 @@
           buffer (get storage (:buffer operation))
           result-type (canonical-type (:type result))
           buffer-type (canonical-type (:dtype buffer))
-          _ (doseq [coordinate (:coordinates operation)]
-              (expression-uniformity coordinate values))
+          coordinate-uniformity
+          (join-uniformity
+           (map #(hash-map :uniformity (expression-uniformity % values))
+                (:coordinates operation)))
           predicate-uniformity (mask-uniformity (:predicate operation) masks values)
           other-info (when (:predicate operation)
                        (scalar-value-info! (:other operation) values))]
@@ -834,11 +854,12 @@
                          :expected result-type :actual (:type other-info)})))
       (assoc values (:id result)
              {:type result-type
-              ;; ABI slots may alias for in-place programs. Neither an :input role nor identical
-              ;; coordinates prove immutability, so loads cannot establish uniform control until
-              ;; the body/ABI seam carries a checked readonly/noalias fact.
-              :uniformity (reduce set/intersection lane-varying
-                                  (cond-> [predicate-uniformity]
+              ;; Only a body-level StableRead contract can establish memory uniformity. Its
+              ;; corresponding ABI slot requires no write alias for the whole parallel launch.
+              :uniformity (reduce set/intersection
+                                  (if (contains? stable-reads (:buffer operation))
+                                    all-uniform lane-varying)
+                                  (cond-> [coordinate-uniformity predicate-uniformity]
                                     other-info (conj (:uniformity other-info))))}))
 
     (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation)
@@ -1000,12 +1021,13 @@
   (when-not (kernel-body? body)
     (throw (ex-info "kernel body must be a KernelBody value"
                     {:body body :actual (type body)})))
-  (let [{:keys [id parameters views indices masks fragments operations schedule launch provenance
-                attributes]} body]
+  (let [{:keys [id parameters views stable-reads indices masks fragments operations schedule launch
+                provenance attributes]} body]
     (when (nil? id)
       (throw (ex-info "kernel body requires a stable identity" {:body body})))
-    (doseq [[field values] [[:parameters parameters] [:views views] [:indices indices] [:masks masks]
-                            [:fragments fragments] [:operations operations]]]
+    (doseq [[field values] [[:parameters parameters] [:views views] [:stable-reads stable-reads]
+                            [:indices indices] [:masks masks] [:fragments fragments]
+                            [:operations operations]]]
       (when-not (vector? values)
         (throw (ex-info "kernel body sections must be ordered vectors"
                         {:field field :value values}))))
@@ -1118,6 +1140,18 @@
                              :layout (:layout view) :view view))))
            {} views)
           storage (merge parameter-map view-map)]
+      (let [stable-buffers (mapv :buffer stable-reads)]
+        (when-not (= (count stable-buffers) (count (set stable-buffers)))
+          (throw (ex-info "kernel stable-read requirements must name unique buffers"
+                          {:reason :kernel-body-stable-read-duplicate
+                           :buffers stable-buffers})))
+        (doseq [requirement stable-reads]
+          (let [buffer (get parameter-map (:buffer requirement))]
+            (when-not (and (record-kind? "raster.compiler.ir.kernel_body.StableRead" requirement)
+                           buffer (= :input (:kind buffer)))
+              (throw (ex-info "kernel stable-read requirement must name an input parameter"
+                              {:reason :kernel-body-stable-read-invalid
+                               :requirement requirement :parameter buffer}))))))
       (let [section-ids (vec (concat (map :id parameters) (map :id views) (map :id indices)
                                      (map :id masks) (map :id fragments)))]
         (when-not (= (count section-ids) (count (set section-ids)))
@@ -1167,6 +1201,7 @@
             reserved (set (concat (keys storage) (map :id indices) (map :id masks)
                                   (map :id fragments)))
             context {:storage storage
+                     :stable-reads (set (map :buffer stable-reads))
                      :masks (into {} (map (juxt :id identity)) masks)
                      :claimed (atom #{})
                      :reserved reserved
@@ -1178,8 +1213,9 @@
 
 (defn make
   "Construct and verify a target-neutral scheduled kernel body."
-  [{:keys [id parameters views indices masks fragments operations schedule launch provenance attributes]
-    :or {parameters [] views [] indices [] masks [] fragments [] operations [] schedule {} launch {}
-         provenance {} attributes {}}}]
-  (validate! (->KernelBody id parameters views indices masks fragments operations schedule launch
-                           provenance attributes)))
+  [{:keys [id parameters views stable-reads indices masks fragments operations schedule launch
+           provenance attributes]
+    :or {parameters [] views [] stable-reads [] indices [] masks [] fragments [] operations []
+         schedule {} launch {} provenance {} attributes {}}}]
+  (validate! (->KernelBody id parameters views stable-reads indices masks fragments operations
+                           schedule launch provenance attributes)))
