@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.attention-route
   "Structured routing for backend-neutral attention problems."
   (:require [raster.compiler.backend.gpu.attention :as emit]
+            [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.passes.parallel.attention-lower :as lower]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as swr-schedule]))
@@ -78,13 +79,19 @@
 
            (or (= :auto policy) (contains? cooperative-policies policy))
            (let [{:keys [ok schedule reason] :as scheduled}
-                 (swr-schedule/plan-subgroup-online plan desc)]
-             (if ok
+                 (swr-schedule/plan-subgroup-online plan desc)
+                 emitter-supported? (gpu-target/intel-opencl-subgroup-dialect? desc)]
+             (if (and ok emitter-supported?)
                (success problem plan (emit/emit-fp16-cooperative plan schedule) [])
                (let [cooperative-decline
                      {:leaf :routed-paged-subgroup-online-score-reuse
-                      :reason reason
-                      :data (dissoc scheduled :ok :reason)}]
+                      :reason (if ok
+                                :score-reuse-requires-intel-subgroup-dialect
+                                reason)
+                      :data (if ok
+                              {:vendor (:vendor desc)
+                               :matrix-family (get-in desc [:matrix :family])}
+                              (dissoc scheduled :ok :reason))}]
                  (if (= :auto policy)
                    (success problem plan (emit/emit-fp16-reference plan desc)
                             [cooperative-decline])

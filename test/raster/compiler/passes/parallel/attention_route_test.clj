@@ -51,6 +51,10 @@
                         {:causal? true :window-left 2 :window-right 0})}
           (apply hash-map overrides))))
 
+(def ^:private intel-desc
+  {:device-type :gpu :vendor "Intel" :subgroup-size 16
+   :max-workgroup-size 256})
+
 (deftest dense-reference-is-a-complete-packed-attention-compiler-value
   (let [{:keys [strategy reference? declines plan artifact graph schedule]}
         (route/route! (problem)
@@ -151,18 +155,47 @@
              (attention-emit/emit-fp16-cooperative
               plan (assoc-in schedule [:score-reduction :axis] :wrong-axis))
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
-    (is (= :score-reuse-requires-intel-subgroup-dialect
+    (let [nvidia-desc {:device-type :gpu :vendor "NVIDIA" :subgroup-size 32
+                       :max-workgroup-size 1024}
+          nvidia-schedule (schedule-pass/plan-subgroup-online plan nvidia-desc)
+          nvidia-route (route/route (problem) nvidia-desc)]
+      (is (:ok nvidia-schedule)
+          "the schedule is portable even while the current optimized emitter is not")
+      (is (= 32 (get-in nvidia-schedule [:schedule :workgroup-size])))
+      (is (:reference? nvidia-route))
+      (is (= :score-reuse-requires-intel-subgroup-dialect
+             (get-in nvidia-route [:declines 0 :reason]))))
+    (let [spoofed-intel {:device-type :gpu :backend :cuda :vendor "Intel"
+                         :subgroup-size 32 :max-workgroup-size 1024
+                         :matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 32}}
+          routed (route/route (problem) spoofed-intel)]
+      (is (:reference? routed))
+      (is (= :score-reuse-requires-intel-subgroup-dialect
+             (get-in routed [:declines 0 :reason]))))
+    (is (= :score-reuse-missing-execution-capability
+           (:reason (schedule-pass/plan-subgroup-online plan nil)))
+        "an absent descriptor cannot prove a cooperative schedule")
+    (is (= :score-reuse-missing-execution-capability
            (:reason
             (schedule-pass/plan-subgroup-online
-             plan {:device-type :gpu :vendor "NVIDIA" :subgroup-size 32
-                   :max-workgroup-size 1024}))))
+             plan {:device-type :gpu :vendor "Intel"
+                   :execution {:subgroup-sizes #{}
+                               :preferred-subgroup-size nil
+                               :max-workgroup-size 256}}))))
+    (is (= :score-reuse-subgroup-width-unsupported
+           (:reason
+            (schedule-pass/plan-subgroup-online
+             plan {:device-type :gpu :vendor "Intel"
+                   :execution {:subgroup-sizes #{32}
+                               :preferred-subgroup-size 16
+                               :max-workgroup-size 256}}))))
     (is (:reference? too-wide))
     (is (= :score-reuse-register-state-too-wide
            (get-in too-wide [:declines 0 :reason])))))
 
 (deftest csr-route-has-native-compact-page-abi
   (let [{:keys [artifact reference? declines]}
-        (route/route! (problem :route (csr-route)))]
+        (route/route! (problem :route (csr-route)) intel-desc)]
     (is reference?)
     (is (= :score-reuse-route-unsupported (get-in declines [0 :reason])))
     (is (= :csr-paged (get-in artifact [:attributes :route-kind])))
@@ -176,7 +209,7 @@
 
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}
-        (route/route! (problem :visibility (csr-visibility)))]
+        (route/route! (problem :visibility (csr-visibility)) intel-desc)]
     (is reference?)
     (is (= :score-reuse-visibility-unsupported (get-in declines [0 :reason])))
     (is (= :dense-paged (get-in artifact [:attributes :route-kind])))
@@ -202,9 +235,10 @@
                        "((long)physical_page * 2 + page_token) * 2 + kv_head) * 6"))))
 
 (deftest fp32-query-and-output-compose-with-fp16-kv-storage
-  (let [fp16-artifact (:artifact (route/route! (problem)))
+  (let [fp16-artifact (:artifact (route/route! (problem) intel-desc))
         artifact (:artifact (route/route!
-                             (problem :q-dtype :float :output-dtype :float)))
+                             (problem :q-dtype :float :output-dtype :float)
+                             intel-desc))
         source (:source artifact)]
     (is (not= (:kernel-name fp16-artifact) (:kernel-name artifact)))
     (is (= [:float :int :int :half :half :int :int :int :float]

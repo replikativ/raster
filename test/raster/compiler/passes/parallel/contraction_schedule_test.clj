@@ -72,6 +72,17 @@
       (is (= :regtiled (:strategy routed)))
       (is (= :matrix-instruction-not-lowered (:fallback-reason routed))))))
 
+(deftest authoritative-targets-without-matrix-capabilities-do-not-inherit-dpas
+  (let [desc {:device-type :gpu :backend :ocl
+              :execution {:subgroup-sizes #{}
+                          :preferred-subgroup-size nil
+                          :max-workgroup-size 256}}
+        planned (schedule/plan-matrix-body
+                 (facts/contraction-facts (matrix-form 128 128 128) :dtype :half)
+                 desc nil)]
+    (is (false? (:ok planned)))
+    (is (= :matrix-capability-unavailable (:reason planned)))))
+
 (deftest the-production-route-carries-the-body-into-the-executable-artifact
   (let [routed (route/route-contraction (matrix-form 128 128 128) :dtype :half)
         kernel (:kernel-body routed)]

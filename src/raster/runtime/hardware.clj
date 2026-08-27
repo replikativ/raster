@@ -246,12 +246,14 @@
           (mapv (fn [idx dev-info]
                   (let [dev-name (:name dev-info)
                         catalogue-spec (catalogue/find-gpu-spec dev-name)
-                        probed (select-keys dev-info
-                                            [:total-eus :threads-per-eu :simd-width
-                                             :subgroup-sizes :max-workgroup-size
-                                             :shared-local-memory :global-memory-bytes
-                                             :memory-bandwidth-gb-s :core-clock-mhz
-                                             :device-id-hex :integrated?])
+                        probed (into {}
+                                     (remove (comp nil? val))
+                                     (select-keys dev-info
+                                                  [:total-eus :threads-per-eu :simd-width
+                                                   :subgroup-sizes :max-workgroup-size
+                                                   :shared-local-memory :global-memory-bytes
+                                                   :memory-bandwidth-gb-s :core-clock-mhz
+                                                   :device-id-hex :integrated?]))
                         caps (merge (when catalogue-spec catalogue-spec) probed)
                         ;; PER-FIELD provenance. This used to stamp {:all :detected} over the
                         ;; whole map, which was false for every catalogued field (bandwidth,
@@ -288,19 +290,27 @@
           (mapv (fn [idx dev-info]
                   (let [dev-name (:name dev-info)
                         catalogue-spec (catalogue/find-gpu-spec dev-name)
-                        caps (merge
-                              (when catalogue-spec catalogue-spec)
-                              (select-keys dev-info
-                                           [:max-compute-units :max-work-group-size
-                                            :global-mem-bytes :max-clock-mhz
-                                            :extensions :vendor :version
-                                            :integrated?]))]
+                        probed (into {}
+                                     (remove (comp nil? val))
+                                     (select-keys dev-info
+                                                  [:max-compute-units :max-work-group-size
+                                                   :max-workgroup-size :subgroup-sizes :simd-width
+                                                   :global-mem-bytes :global-memory-bytes
+                                                   :shared-local-memory :local-memory-bytes
+                                                   :max-clock-mhz :extensions :vendor :version
+                                                   :integrated?]))
+                        caps (merge (when catalogue-spec catalogue-spec) probed)
+                        source (merge
+                                (into {} (map (fn [k] [k :catalogued]))
+                                      (keys catalogue-spec))
+                                (into {} (map (fn [k] [k :detected]))
+                                      (keys probed)))]
                     {:id (keyword (str "ocl:" idx))
                      :type :ocl
                      :index idx
                      :name dev-name
                      :capabilities caps
-                     :source {:all :detected}}))
+                     :source source}))
                 (range) devices))))
     (catch Exception e
       (when (System/getenv "ROMEO_DEBUG")
@@ -380,24 +390,36 @@
   Capabilities are merged with catalogue data if available."
   [device-id spec]
   (ensure-init!)
-  (let [dev-name (:name spec)
+  (let [target-type (device-type device-id)
+        claimed-type (:type spec)
+        _ (when (and claimed-type (not= target-type claimed-type))
+            (throw (ex-info "target device type disagrees with its device id"
+                            {:reason :target-device-type-mismatch
+                             :device-id device-id :id-type target-type
+                             :claimed-type claimed-type})))
+        dev-name (:name spec)
         catalogue-spec (when dev-name (catalogue/find-gpu-spec dev-name))
         idx (or (:index spec)
                 (when-let [m (re-find #":(\d+)$" (name device-id))]
                   (Long/parseLong (second m)))
                 0)
-        ;; Merge capabilities: catalogue provides defaults, user spec overrides
-        merged-caps (merge (or catalogue-spec {})
-                           (or (:capabilities spec) {}))
+        user-caps (or (:capabilities spec) {})
+        ;; Merge capabilities: catalogue provides defaults, user spec overrides. Provenance is
+        ;; recorded per field so a cross-compiler can distinguish an observed/user constraint
+        ;; from a catalogue estimate instead of treating the entire merged row as `:user`.
+        merged-caps (merge (or catalogue-spec {}) user-caps)
+        source (merge
+                (into {} (map (fn [k] [k :catalogued])) (keys catalogue-spec))
+                (into {} (map (fn [k] [k :user])) (keys user-caps)))
         device (merge
+                ;; User descriptive fields remain extensible, but identity, normalized type,
+                ;; provenance, and the merged capability row are owned by this boundary.
+                (dissoc spec :id :type :index :source :capabilities)
                 {:id device-id
-                 :type (device-type device-id)
+                 :type target-type
                  :index idx
-                 :source {:all :user}}
-                 ;; User spec (without :capabilities, which we merge separately)
-                (dissoc spec :capabilities)
-                 ;; Merged capabilities
-                {:capabilities merged-caps})]
+                 :source source
+                 :capabilities merged-caps})]
     (swap! device-registry assoc device-id device)
     device))
 

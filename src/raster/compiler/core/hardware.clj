@@ -70,18 +70,250 @@
 (defn- amd-cdna? [caps]
   (let [a (gpu-arch-str caps)]
     (or (= :mfma (get-in caps [:matrix :family]))
-        (.startsWith a "gfx9")            ;; CDNA: gfx908 (MI100), gfx90a (MI200), gfx942 (MI300)
-        (.startsWith a "gfx94"))))
+        (.startsWith a "gfx908")          ;; MI100
+        (.startsWith a "gfx90a")          ;; MI200
+        (.startsWith a "gfx94")           ;; MI300
+        (.startsWith a "gfx95"))))        ;; later CDNA
+
+(defn- amd-rdna? [caps]
+  (let [a (gpu-arch-str caps)]
+    (or (.startsWith a "gfx10")
+        (.startsWith a "gfx11")
+        (.startsWith a "gfx12"))))
+
+(defn- matrix-capability
+  "Finalize the current single matrix-operation capability before execution validation.
+   This remains one record for compatibility; the portable descriptor will grow this into a
+   collection when operand distributions and warp-group operations land."
+  [caps]
+  (or (:matrix caps)
+      (when (and (:compute-capability caps)
+                 (>= (long (first (:compute-capability caps))) 7))
+        {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
+      (when (amd-cdna? caps)
+        {:family :mfma :m 16 :n 16 :k 16 :subgroup 64})))
+
+(defn- supported-widths
+  [value]
+  (let [values (cond
+                 (nil? value) []
+                 (coll? value) value
+                 :else [value])]
+    (when-not (every? #(and (integer? %) (pos? (long %))) values)
+      (throw (ex-info "subgroup widths must be positive integers"
+                      {:reason :hardware-subgroup-width-invalid :value value})))
+    (set (map long values))))
+
+(defn- preferred-width
+  [value]
+  (when (some? value)
+    (when-not (and (integer? value) (pos? (long value)))
+      (throw (ex-info "preferred subgroup width must be one positive integer"
+                      {:reason :hardware-preferred-subgroup-invalid :value value})))
+    (long value)))
+
+(defn- positive-limit
+  [field value]
+  (when-not (and (integer? value) (pos? (long value)))
+    (throw (ex-info "hardware execution limit must be a positive integer"
+                    {:reason :hardware-execution-limit-invalid
+                     :field field :value value})))
+  (long value))
+
+(defn- positive-dimensions
+  [value]
+  (when (some? value)
+    (when-not (and (coll? value)
+                   (seq value)
+                   (every? #(and (integer? %) (pos? (long %))) value))
+      (throw (ex-info "maximum workgroup dimensions must be positive integers"
+                      {:reason :hardware-workgroup-dimensions-invalid :value value})))
+    (mapv long value)))
+
+(defn- source-of
+  [source capability default]
+  (or (get source capability) (:all source) default))
+
+(defn- provenance-rank
+  [provenance]
+  (case provenance
+    :measured 6
+    :user 5
+    (:observed :detected) 4
+    :catalogued 3
+    :derived 2
+    :unavailable 0
+    1))
+
+(defn- best-capability
+  "Select among equivalent backend-native keys by provenance, with candidate order breaking ties.
+   A detected/user alias must override a differently-spelled catalogue key."
+  [caps source candidates]
+  (reduce
+   (fn [best capability]
+     (if-some [value (get caps capability)]
+       (let [candidate [capability value]
+             candidate-rank (provenance-rank (source-of source capability :derived))
+             best-rank (if best
+                         (provenance-rank (source-of source (first best) :derived))
+                         -1)]
+         (cond
+           (> candidate-rank best-rank) candidate
+           (and (= candidate-rank best-rank)
+                (not= value (second best)))
+           (throw (ex-info "equivalent hardware capability keys disagree"
+                           {:reason :hardware-capability-alias-conflict
+                            :capabilities [(first best) capability]
+                            :values [(second best) value]
+                            :provenance (source-of source capability :derived)}))
+           :else best))
+       best))
+   nil candidates))
+
+(defn- execution-capabilities
+  "Normalize backend-specific execution hierarchy keys at the runtime/compiler boundary.
+
+   Runtime probes and catalogues retain their native vocabulary (`:warp-size`,
+   `:wavefront-size`, `:simd-width`, and three workgroup-limit spellings). Schedulers consume this
+   one facet: a SET of legal cooperative widths plus a distinct preferred width. A preference is
+   not a hardware invariant and a schedule must still record the concrete width it selected."
+  [target-type caps source]
+  (let [[widths-key widths-value]
+        (best-capability caps source [:subgroup-sizes :supported-subgroup-sizes
+                                      :wavefront-sizes :wave-sizes])
+        [preferred-key preferred-value]
+        (best-capability
+         caps source
+         (case target-type
+           :cuda [:preferred-subgroup-size :warp-size]
+           :hip [:preferred-subgroup-size :wavefront-size :wave-size]
+           [:preferred-subgroup-size :simd-width]))
+        derived-widths
+        (case target-type
+          :cuda #{32}
+          :hip (cond
+                 (amd-cdna? caps) #{64}
+                 (amd-rdna? caps) #{32 64}
+                 :else #{})
+          #{})
+        explicit-widths (supported-widths widths-value)
+        explicit-preferred (preferred-width preferred-value)
+        subgroup-sizes (cond-> (if (seq explicit-widths)
+                                 explicit-widths
+                                 derived-widths)
+                         (and (empty? explicit-widths) explicit-preferred)
+                         (conj explicit-preferred))
+        preferred-subgroup-size
+        (or explicit-preferred
+            (case target-type
+              :cuda (when (contains? subgroup-sizes 32) 32)
+              :hip (cond
+                     (and (amd-cdna? caps) (contains? subgroup-sizes 64)) 64
+                     (contains? subgroup-sizes 32) 32
+                     :else (first (sort subgroup-sizes)))
+              (first (sort subgroup-sizes))))
+        [maximum-key maximum-value]
+        (best-capability caps source [:max-workgroup-size :max-work-group-size
+                                      :max-threads-per-block])
+        maximum-workgroup-size
+        (positive-limit
+         :max-workgroup-size
+         (or maximum-value
+             (case target-type
+               (:cuda :hip) 1024
+               256)))
+        [dimensions-key dimensions]
+        (best-capability caps source [:max-workgroup-dims :max-work-group-dims
+                                      :max-work-item-sizes])
+        dimensions (positive-dimensions dimensions)
+        [scratchpad-key scratchpad]
+        (best-capability caps source [:shared-local-memory :shared-memory-per-block
+                                      :local-memory-bytes :local-mem-bytes])
+        preferred-source (if preferred-key
+                           (source-of source preferred-key :derived)
+                           :derived)
+        widths-source (cond
+                        widths-key (source-of source widths-key :derived)
+                        preferred-key preferred-source
+                        (seq derived-widths) :derived
+                        :else :unavailable)
+        provenance (cond->
+                    {:subgroup-sizes widths-source
+                     :preferred-subgroup-size preferred-source
+                     :max-workgroup-size (if maximum-key
+                                           (source-of source maximum-key :derived)
+                                           :derived)}
+                     dimensions-key
+                     (assoc :max-workgroup-dims
+                            (source-of source dimensions-key :derived))
+                     scratchpad-key
+                     (assoc :scratchpad-bytes
+                            (source-of source scratchpad-key :derived)))
+        execution (cond->
+                   {:subgroup-kind (case target-type
+                                     :cuda :warp
+                                     :hip :wavefront
+                                     :subgroup)
+                    :subgroup-sizes subgroup-sizes
+                    :preferred-subgroup-size preferred-subgroup-size
+                    :max-workgroup-size maximum-workgroup-size
+                    :provenance provenance}
+                    dimensions (assoc :max-workgroup-dims dimensions)
+                    scratchpad (assoc :scratchpad-bytes
+                                      (positive-limit :scratchpad-bytes scratchpad)))]
+    (when (and preferred-subgroup-size
+               (not (contains? subgroup-sizes preferred-subgroup-size)))
+      (throw (ex-info "preferred subgroup width is not a supported hardware width"
+                      {:reason :hardware-preferred-subgroup-unsupported
+                       :preferred preferred-subgroup-size
+                       :supported subgroup-sizes})))
+    (when (and preferred-subgroup-size
+               (> preferred-subgroup-size maximum-workgroup-size))
+      (throw (ex-info "preferred subgroup exceeds the maximum workgroup size"
+                      {:reason :hardware-subgroup-exceeds-workgroup
+                       :preferred preferred-subgroup-size
+                       :maximum maximum-workgroup-size})))
+    (when-let [matrix-width (get-in caps [:matrix :subgroup])]
+      (when (and (seq subgroup-sizes)
+                 (not (contains? subgroup-sizes (long matrix-width))))
+        (throw (ex-info "matrix operation requires an unsupported subgroup width"
+                        {:reason :hardware-matrix-subgroup-unsupported
+                         :matrix (:matrix caps)
+                         :supported subgroup-sizes})))
+      (when (> (long matrix-width) maximum-workgroup-size)
+        (throw (ex-info "matrix operation scope exceeds the maximum workgroup size"
+                        {:reason :hardware-matrix-subgroup-exceeds-workgroup
+                         :matrix (:matrix caps)
+                         :maximum maximum-workgroup-size}))))
+    execution))
+
+(defn preferred-subgroup-size
+  "The descriptor's preferred cooperative width, including the temporary flat compatibility key."
+  [desc]
+  (or (get-in desc [:execution :preferred-subgroup-size])
+      (:subgroup-size desc)))
+
+(defn supported-subgroup-sizes
+  "The set of cooperative widths the descriptor reports as legal."
+  [desc]
+  (or (get-in desc [:execution :subgroup-sizes])
+      (:subgroup-sizes desc)))
+
+(defn maximum-workgroup-size
+  "The descriptor's normalized maximum number of work-items in one workgroup/block."
+  [desc]
+  (or (get-in desc [:execution :max-workgroup-size])
+      (:max-workgroup-size desc)))
 
 (defn- gpu-reg-budget-per-lane
   "Per-lane register-file budget the schedule/tile GRF gate charges against — vendor-specific
    (differ ~4×, so a single formula mis-sizes tiles cross-vendor). Intel Xe grf128 = 128 regs × 32 B
    / subgroup; NVIDIA = 255 regs × 4 B (per-thread WMMA fragment); AMD CDNA = 256 VGPRs × 4 B. Keyed
    off probed caps (compute-capability → NVIDIA; a gfx9 arch / :mfma matrix → AMD; else Intel)."
-  [caps flanes]
+  [target-type caps flanes]
   (cond
-    (:compute-capability caps) 1020
-    (amd-cdna? caps)           1024
+    (or (= :cuda target-type) (:compute-capability caps)) 1020
+    (or (= :hip target-type) (amd-cdna? caps) (amd-rdna? caps)) 1024
     :else (long (quot (* 128 32) (max 1 flanes)))))
 
 (defn- build-descriptor
@@ -93,11 +325,17 @@
    GPU global mem); balance uses Halide-style defaults. The :measured layer is overlaid by
    descriptor-for (below)."
   [device-id]
-  (let [caps   (:capabilities (rt/device device-id))
-        gpu?   (not= (rt/device-type device-id) :cpu)
-        flanes (long (if gpu? (rt/subgroup-size device-id)
-                         (rt/simd-lanes device-id :float)))   ;; f32 lanes / subgroup
-        vbits  (* flanes 32)
+  (let [device (rt/device device-id)
+        raw-caps (:capabilities device)
+        target-type (or (:type device) (rt/device-type device-id))
+        gpu?   (not= target-type :cpu)
+        matrix (when gpu? (matrix-capability raw-caps))
+        caps (cond-> raw-caps matrix (assoc :matrix matrix))
+        execution (when gpu? (execution-capabilities target-type caps (:source device)))
+        gpu-width (:preferred-subgroup-size execution)
+        flanes (if gpu? gpu-width
+                   (long (rt/simd-lanes device-id :float)))   ;; f32 lanes / subgroup
+        vbits  (when flanes (* (long flanes) 32))
         ;; PERFORMANCE quantities — bandwidth / per-dtype peak-flops / cache hierarchy — projected
         ;; from whatever the probe or the shipped catalogue supplied (runtime.hardware merges the
         ;; catalogue into caps). These are the roofline inputs (balance-for / roofline-time-ns).
@@ -105,26 +343,29 @@
         ;; ABSENT here and the analytic fns fall back to :balance; the :measured layer (Phase 1)
         ;; fills them from a microbenchmark and OVERWRITES the analytic guess.
         bw-gb  (:memory-bandwidth-gb-s caps)
+        global-memory-bytes (or (:global-memory-bytes caps) (:global-mem-bytes caps))
+        compute-units (or (:compute-units caps) (:max-compute-units caps))
         peak-flops (into {} (remove (comp nil? val))
                          {:f32 (:peak-flops-sp caps) :float (:peak-flops-sp caps)
                           :f64 (:peak-flops-dp caps) :double (:peak-flops-dp caps)
                           :f16 (:peak-flops-hp caps) :half (:peak-flops-hp caps)})
         cache  (into {} (remove (comp nil? val))
                      {:l1 (:cache-l1 caps) :l2 (:cache-l2 caps) :l3 (:cache-l3 caps)
-                      :slm (when gpu? (:shared-local-memory caps))})
+                      :slm (when gpu? (:scratchpad-bytes execution))})
         ;; GPU occupancy inputs the launch-geometry derivations (workgroup-size / group-count /
         ;; block-size / grid-size) read — present-only, projected from caps. Intel Level-Zero uses
         ;; :total-eus/:threads-per-eu; NVIDIA CUDA uses :sm-count/:max-warps-per-sm/:max-blocks-per-sm.
         gpu-geo (when gpu?
                   (into {} (remove (comp nil? val))
                         {:total-eus (:total-eus caps) :threads-per-eu (:threads-per-eu caps)
+                         :compute-units compute-units
                          :sm-count (:sm-count caps) :fpus-per-core (:fpus-per-core caps)
                          :max-warps-per-sm (:max-warps-per-sm caps) :max-blocks-per-sm (:max-blocks-per-sm caps)
                          :registers-per-block (:registers-per-block caps)
-                         :shared-memory-per-block (:shared-memory-per-block caps)}))]
+                         :shared-memory-per-block (:scratchpad-bytes execution)}))]
     (cond-> {:device-type (if gpu? :gpu :cpu)
              :device-id   device-id
-             :vector-bits vbits
+             :backend     target-type
              :has-native-dot-reduce
              (if gpu? true
                  ;; x86 has a widening int-dot-reduce ONLY with AVX-VNNI (vpdpbusd). Prefer the
@@ -135,18 +376,21 @@
                    (if feats
                      (boolean (some feats [:avx-vnni :avx512-vnni :vnni]))
                      (boolean (or (.contains a "amd64") (.contains a "x86"))))))
-             :num-vector-registers (if gpu? 128 (if (>= vbits 512) 32 16))
+             :num-vector-registers (if gpu? 128 (if (>= (long vbits) 512) 32 16))
              :llc-bytes   (or (:cache-l3 caps)
-                              (when gpu? (:global-memory-bytes caps))
+                              (when gpu? global-memory-bytes)
                               (* 16 1024 1024))
              :balance     (if gpu? 60 40)}
+      vbits (assoc :vector-bits vbits)
       (:vendor caps)  (assoc :vendor (:vendor caps))
       (:arch caps)    (assoc :arch (:arch caps))
       bw-gb           (assoc :bandwidth-bytes-s (* (double bw-gb) 1e9))
       (seq peak-flops) (assoc :peak-flops peak-flops)
       (seq cache)     (assoc :cache cache)
+      (and gpu? global-memory-bytes) (assoc :global-memory-bytes global-memory-bytes)
       gpu? (assoc :integrated? (boolean (:integrated? caps))
-                  :subgroup-size flanes
+                  :execution execution
+                  :subgroup-sizes (:subgroup-sizes execution)
                   ;; GRF budget per LANE = grf-regs/thread × reg-bytes / subgroup-size. INTEL Xe/Xe2
                   ;; grf128 model: 128 GRF registers/thread of 32 B (256-bit); per SIMD lane that is
                   ;; 128×32/subgroup. Arc 140V (subgroup 16): 256 B/lane — the budget the schedule
@@ -157,23 +401,17 @@
                   ;; the tile cross-vendor (the budgets differ ~4×), so derive-gemm-tile GRF-bounds
                   ;; against the right register file per family. (Supersedes the earlier Intel-only
                   ;; 128×32 placeholder that #75's HIP/CUDA NOTE flagged for exactly this follow-up.)
-                  :grf-bytes-per-lane (gpu-reg-budget-per-lane caps flanes)
-                  :max-workgroup-size (long (or (:max-workgroup-size caps) 256)))
+                  :max-workgroup-size (:max-workgroup-size execution)
+                  :capability-provenance (:source device))
+      (and gpu? flanes)
+      (assoc :subgroup-size (long flanes)
+             :grf-bytes-per-lane
+             (gpu-reg-budget-per-lane target-type caps (long flanes)))
       ;; MATRIX UNIT (systolic array) — the hardware matrix-multiply shape {:family :m :n :k
       ;; :subgroup}, e.g. Intel XMX DPAS 8×16×16. A catalogue fact (not always probeable); the
       ;; GEMM tile generator (derive-gemm-tile) reads it to size the accumulator tile + K-unroll,
       ;; and the emitter keys its instruction family off :family (:dpas vs a WGMMA/MFMA fork).
-      (and gpu? (:matrix caps)) (assoc :matrix (:matrix caps))
-      ;; NVIDIA: derive the WMMA matrix shape from compute capability — every cc≥7.0 part has Tensor
-      ;; Cores with the universal 16×16×16 f16 WMMA fragment (warp 32), so it need not be catalogued
-      ;; per-part. (An explicit :matrix in caps wins — this only fills the gap.)
-      (and gpu? (nil? (:matrix caps)) (:compute-capability caps)
-           (>= (long (first (:compute-capability caps))) 7))
-      (assoc :matrix {:family :mma :m 16 :n 16 :k 16 :subgroup 32})
-      ;; AMD CDNA (gfx9): Matrix Cores with the f16 16×16×16 MFMA (v_mfma_f32_16x16x16f16),
-      ;; wavefront 64. Derived from the gfx arch when not explicitly catalogued.
-      (and gpu? (nil? (:matrix caps)) (amd-cdna? caps))
-      (assoc :matrix {:family :mfma :m 16 :n 16 :k 16 :subgroup 64})
+      matrix (assoc :matrix matrix)
       (seq gpu-geo) (merge gpu-geo)
       ;; MACHINE WIDTH — work-items in flight when the device is full: EUs x hw threads per
       ;; EU x SIMD lanes. Every GPU launch geometry is a function of this and the problem
@@ -184,11 +422,10 @@
       ;; to 1 would silently yield machine-lanes=16 — split-k would never fire and every
       ;; elementwise kernel would mis-vectorize, with no error anywhere. A missing value
       ;; leaves the key ABSENT, and the derivations below fall back to a documented default.
-      (and gpu? (:total-eus caps) (:threads-per-eu caps)
-           (or (:simd-width caps) (rt/subgroup-size device-id)))
+      (and gpu? (:total-eus caps) (:threads-per-eu caps) gpu-width)
       (assoc :machine-lanes (* (long (:total-eus caps))
                                (long (:threads-per-eu caps))
-                               (long (or (:simd-width caps) (rt/subgroup-size device-id))))))))
+                               (long gpu-width))))))
 
 (defn descriptor-for
   "The HardwareDescriptor for `device-id`: the probed/analytic model (build-descriptor) with the
@@ -488,7 +725,8 @@
      - per-subgroup accumulator tile (sg-m×sg-n) is GRF-BOUND: it holds sg-m·sg-n/subgroup f32
        accumulators per lane, so sg-m·sg-n ≤ grf-bytes-per-lane·subgroup/4. Take the largest square
        tile under that cap, rounded DOWN to the matrix M_i/N_i granularity.
-     - workgroup tile is `wg-subgroups` (default 16 = a 4×4 subgroup grid) copies of the sg-tile.
+     - workgroup tile is `wg-subgroups` (default 16 = a 4×4 subgroup grid) copies of the sg-tile,
+       capped by the target's maximum workgroup size.
      - K-unroll is 2× the matrix K (double-buffered DPAS depth).
 
    On the Arc 140V descriptor (matrix 8×16×16, GRF 256 B/lane, subgroup 16) this yields exactly the
@@ -511,7 +749,9 @@
                       (* 4 (max (long m) (long n))))
          sg-m    (* m (max 1 (quot side m)))         ;; round down to M_i multiple
          sg-n    (* n (max 1 (quot side n)))         ;; round down to N_i multiple
-         wg-sub  (long (:wg-subgroups opts 16))
+         max-wg (long (:max-workgroup-size desc 1024))
+         max-wg-subgroups (max 1 (quot max-wg sg))
+         wg-sub  (min (long (:wg-subgroups opts 16)) max-wg-subgroups)
          side-sg (max 1 (long (Math/sqrt (double wg-sub))))]
      {:block-m (* sg-m side-sg)
       :block-n (* sg-n side-sg)

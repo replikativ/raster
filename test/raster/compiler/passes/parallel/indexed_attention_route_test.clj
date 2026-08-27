@@ -111,6 +111,7 @@
         {:keys [leaf strategy reference? artifact graph]}
         (swr-route/route-dynamic!
          generic-plan {:device-type :gpu
+                       :vendor "Intel"
                        :subgroup-size 16
                        :max-workgroup-size 256
                        :segmented-weighted-reduction-schedule :subgroup-score-reuse})
@@ -144,6 +145,7 @@
   (let [{:keys [leaf strategy]}
         (swr-route/route-dynamic!
          (plan) {:device-type :gpu
+                 :vendor "Intel"
                  :subgroup-size 16
                  :max-workgroup-size 0
                  :segmented-weighted-reduction-schedule :subgroup-score-reuse})]
@@ -174,6 +176,7 @@
       (let [source (get-in
                     (swr-route/route-dynamic!
                      (plan) {:device-type :gpu
+                             :vendor "Intel"
                              :subgroup-size 16
                              :max-workgroup-size 256
                              :segmented-weighted-reduction-schedule :subgroup-score-reuse})
