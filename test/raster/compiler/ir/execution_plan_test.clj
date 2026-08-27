@@ -73,3 +73,10 @@
     (is (= :compute (get-in operation [:queue :class])))
     (is (empty? (:waits operation)))
     (is (= [(:completion operation)] (:outputs plan)))))
+
+(deftest logical-transfer-queue-is-backend-neutral
+  (let [queue (execution/transfer-queue)]
+    (is (execution/logical-queue? queue))
+    (is (= :transfer (:class queue)))
+    (is (= :in-order (:ordering queue)))
+    (is (not= queue (execution/compute-queue)))))

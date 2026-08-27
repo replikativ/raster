@@ -968,8 +968,19 @@
      (:src-element src-spec) (:dst-element dst-spec) elements)
     dst))
 
+(defn- plan-transfer-ranges
+  "Resolve and validate every range before either synchronous or asynchronous execution."
+  [sess entries direction]
+  (let [device-id (:device-id @sess)
+        plan (rt-resolve device-id "plan-range")]
+    (mapv (fn [[key-or-view host spec]]
+            (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
+                  spec (checked-view-range-spec buffer view spec direction)]
+              [buffer (plan buffer host spec direction) host]))
+          entries)))
+
 (defn- transfer-ranges!
-  "The batched core. VALIDATES EVERY entry (`plan-range`) before EXECUTING ANY. A batch is how a
+  "The synchronous batched core. VALIDATES EVERY entry (`plan-range`) before EXECUTING ANY. A batch is how a
    whole KV cache moves — 36 per-layer buffers for gemma-270m — and a batched API newly makes a
    partial state possible: a bad spec in the 30th entry leaving 29 layers written. All-or-nothing
    on validation removes that class; nothing is copied until every range has been proved in
@@ -977,14 +988,8 @@
    class and is not promised here.)"
   [sess entries direction]
   (let [device-id (:device-id @sess)
-        plan (rt-resolve device-id "plan-range")
         exec (rt-resolve device-id "execute-range!")
-        ;; phase 1: resolve + validate everything, collecting plans in order
-        plans (mapv (fn [[key-or-view host spec]]
-                      (let [{:keys [buffer view]} (resolve-resident-binding sess key-or-view)
-                            spec (checked-view-range-spec buffer view spec direction)]
-                        [buffer (plan buffer host spec direction) host]))
-                    entries)]
+        plans (plan-transfer-ranges sess entries direction)]
     ;; phase 2: execute in order
     (mapv (fn [[buf p host]] (exec buf p direction) (if (= :upload direction) buf host)) plans)))
 
@@ -1025,6 +1030,56 @@
 
 (defn gpu-event? [x]
   (and x (= "raster.gpu.core.GPUEvent" (.getName (class x)))))
+
+(defn- submit-transfer-ranges!
+  [sess entries direction]
+  (locking sess
+    (let [{:keys [device-id session-id closed?]} @sess]
+      (when closed?
+        (throw (ex-info "cannot submit a transfer to a closed GPU session"
+                        {:direction direction})))
+      ;; Validation and host-side upload staging both complete before the event becomes visible.
+      ;; The backend owns any native staging until await/release consumes its completion token.
+      (let [plans (plan-transfer-ranges sess entries direction)
+            values (mapv (fn [[buffer _ host]]
+                           (if (= :upload direction) buffer host))
+                         plans)
+            submitted-ns (System/nanoTime)
+            backend-event ((rt-resolve device-id "submit-range-batch!")
+                           (mapv (fn [[buffer plan _]] [buffer plan]) plans)
+                           direction)
+            submit-return-ns (System/nanoTime)
+            event-id (random-uuid)
+            event (->GPUEvent session-id event-id (execution/transfer-queue))]
+        (swap! sess assoc-in [:events event-id]
+               {:event event
+                :kind :transfer
+                :direction direction
+                :status :pending
+                :backend-event backend-event
+                :submitted-ns submitted-ns
+                :submit-return-ns submit-return-ns
+                :value values})
+        event))))
+
+(defn submit-upload-ranges!
+  "Validate and submit a batch of host-to-resident ranges without waiting.
+
+   Returns a session-owned `GPUEvent` on the logical transfer queue. OpenCL owns an immutable
+   native staging copy until the event is awaited/released, so callers may reuse their source after
+   submission. Level Zero shared allocations may complete inline; that distinction is reported by
+   `event-measurement`, not exposed as a different API."
+  [sess entries]
+  (submit-transfer-ranges! sess entries :upload))
+
+(defn submit-download-ranges!
+  "Validate and submit a batch of resident-to-host ranges without waiting.
+
+   Host destinations become observable only after `await-event!`, even if `event-complete?` reports
+   device completion. Returns a session-owned `GPUEvent`; read its measured byte/time provenance
+   with `event-measurement` after awaiting it."
+  [sess entries]
+  (submit-transfer-ranges! sess entries :download))
 
 (defn- external-graph-buffer-ids
   [graph]
@@ -1169,17 +1224,23 @@
 (defn- await-event-under-lock!
   [sess event]
   (let [{:keys [device-id closed?]} @sess
-        {:keys [status backend-event] :as entry} (resolve-event-entry sess event)]
+        {:keys [status backend-event kind submitted-ns submit-return-ns] :as entry}
+        (resolve-event-entry sess event)]
     (when closed?
       (throw (ex-info "cannot use an event from a closed GPU session" {:event event})))
     (if (= :complete status)
       entry
-      (do
-        ;; A successful status query is not necessarily a host memory-synchronization point
-        ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
-        ((rt-resolve device-id "await-event!") backend-event)
+      ;; A successful status query is not necessarily a host memory-synchronization point
+      ;; (notably in OpenCL). Await always calls the backend wait before releasing the token.
+      (let [backend-completion ((rt-resolve device-id "await-event!") backend-event)
+            completed-ns (System/nanoTime)
+            measurement (when (= :transfer kind)
+                          (merge (when (map? backend-completion) backend-completion)
+                                 {:host-wall-ns (- completed-ns submitted-ns)
+                                  :submit-host-ns (- submit-return-ns submitted-ns)}))]
         ((rt-resolve device-id "release-event!") backend-event)
-        (let [completed (assoc entry :status :complete :backend-event nil)]
+        (let [completed (cond-> (assoc entry :status :complete :backend-event nil)
+                          measurement (assoc :measurement measurement))]
           (swap! sess assoc-in [:events (:id event)] completed)
           completed)))))
 
@@ -1202,6 +1263,23 @@
   [sess event]
   (locking sess
     (:value (await-event-under-lock! sess event))))
+
+(defn event-measurement
+  "Return a completed transfer event's timing and byte-count measurement.
+
+   The event must first be awaited: a nonblocking completion observation does not establish host
+   visibility or finalize download staging. Kernel-graph events do not carry this one-shot transfer
+   measurement; graph profiling remains available through `measure-graph!`."
+  [sess event]
+  (locking sess
+    (let [{:keys [status kind measurement]} (resolve-event-entry sess event)]
+      (when-not (= :transfer kind)
+        (throw (ex-info "event does not describe a transfer submission"
+                        {:event event :kind kind})))
+      (when-not (= :complete status)
+        (throw (ex-info "transfer event must be awaited before reading its measurement"
+                        {:event event :status status})))
+      measurement)))
 
 (defn release-event!
   "Establish completion and remove a session-owned GPUEvent. This is deliberately safe rather
