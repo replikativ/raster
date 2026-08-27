@@ -6,12 +6,14 @@
    split-K combination. All mixed-precision scratch and derived scheduling scalars are private to
    the graph; callers never bind them and runtimes never reconstruct the algorithm from `:gemm`."
   (:require [clojure.string :as str]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kgraph]
-            [raster.compiler.ir.kernel-launch :as klaunch]))
+            [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
 
 (def ^:private default-min-split-chunk 1024)
 (def ^:private default-max-splits 64)
@@ -129,8 +131,32 @@
   [{:keys [block-m block-n sg-m sg-n matrix]}]
   (* (quot block-m sg-m) (quot block-n sg-n) (:subgroup matrix 16)))
 
+(defn emit-scheduled-matrix-kernel
+  "Build and directly lower one canonical f16 matrix contraction.
+
+  This is the shared compiler entry for graph-owned, legacy-plan, and resident direct/tiled GEMM
+  front doors.  Caller identities remain the KernelBody ABI identities; OpenCL M/N/K spelling is
+  solely a target concern.  Split-K, batched grid-Z, and opaque source epilogues are not accepted
+  here until their scheduling operations are explicit in KernelBody."
+  [{:keys [kernel-name id a b c m n k tile result-dtype provenance]
+    :or {result-dtype :float provenance {}}}]
+  (let [kernel-body
+        (contraction-schedule/matrix-body
+         {:id (or id [:gemm kernel-name])
+          :row a :col b :out c
+          :dimensions [m n k]
+          :dimension-parameters [m n k]
+          :axis-symbols ['i 'j 'l]
+          :tile tile
+          :bindings {:row a :col b}
+          :result-dtype result-dtype
+          :provenance (merge {:dialect :gemm :lowering :scheduled-matrix} provenance)})]
+    {:source (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body nil)
+     :kernel-body kernel-body
+     :workgroup-size (get-in kernel-body [:launch :workgroup-size])}))
+
 (defn- gemm-artifact
-  [{:keys [m n k tile]} kernel-name a b c split-k? kc splits phase]
+  [{:keys [id m n k tile]} kernel-name a b c split-k? kc splits phase]
   (let [{:keys [block-m block-n]} tile
         source-args (concat [:c-dtype :float :split-k? split-k?
                              :schedule-splits-arg? split-k?]
@@ -152,15 +178,25 @@
         arguments (cond-> [a b c m n k] split-k? (conj kc splits))
         group-count (cond-> [(klaunch/ceil-div n block-n)
                              (klaunch/ceil-div m block-m)]
-                      split-k? (conj (klaunch/runtime-value splits)))]
+                      split-k? (conj (klaunch/runtime-value splits)))
+        scheduled (when-not split-k?
+                    (emit-scheduled-matrix-kernel
+                     {:kernel-name kernel-name
+                      :id [:gemm id phase]
+                      :a a :b b :c c :m m :n n :k k
+                      :tile tile :result-dtype :float
+                      :provenance {:operation-id id :phase phase}}))]
     (artifact
-     kernel-name (apply codegen/emit-gemm-tiled kernel-name source-args)
+     kernel-name (if scheduled
+                   (:source scheduled)
+                   (apply codegen/emit-gemm-tiled kernel-name source-args))
      abi arguments
-     (klaunch/spec {:workgroup-size (if split-k?
-                                      [(matrix-workgroup-size tile) 1 1]
-                                      [(matrix-workgroup-size tile) 1])
+     (klaunch/spec {:workgroup-size (if scheduled
+                                      (:workgroup-size scheduled)
+                                      [(matrix-workgroup-size tile) 1 1])
                     :group-count group-count})
-     phase {:tile tile :split-k? split-k? :accumulator-dtype :float})))
+     phase (cond-> {:tile tile :split-k? split-k? :accumulator-dtype :float}
+             scheduled (assoc :kernel-body (:kernel-body scheduled))))))
 
 (defn- combine-artifact
   [kernel-name partials c mn splits]

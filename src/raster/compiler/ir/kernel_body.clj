@@ -38,6 +38,9 @@
 (defn kernel-body? [value]
   (record-kind? "raster.compiler.ir.kernel_body.KernelBody" value))
 
+(defn- value-id? [value]
+  (or (symbol? value) (keyword? value)))
+
 (defn expression
   "Construct explicit target-neutral integer index arithmetic."
   [op & arguments]
@@ -56,7 +59,7 @@
 
 (defn- expression? [value]
   (cond
-    (or (number? value) (symbol? value)) true
+    (or (number? value) (value-id? value)) true
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (and (contains? index-ops (:op value))
          (seq (:arguments value))
@@ -65,7 +68,7 @@
 
 (defn- expression-references [value]
   (cond
-    (symbol? value) #{value}
+    (value-id? value) #{value}
     (number? value) #{}
     (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)
     (reduce into #{} (map expression-references (:arguments value)))
@@ -86,7 +89,7 @@
 
 (defn- shape! [owner shape]
   (when-not (and (vector? shape) (seq shape)
-                 (every? #(or (symbol? %) (and (integer? %) (pos? %))) shape))
+                 (every? #(or (value-id? %) (and (integer? %) (pos? %))) shape))
     (throw (ex-info (str owner " requires a non-empty shape of positive extents")
                     {:shape shape}))))
 

@@ -650,7 +650,13 @@
 ;; ================================================================
 
 (defn emit-gemm-tiled
-  "Tile-PARAMETRIC XMX GEMM generator (C = A·B, FP16 in, FP32 accumulate). The tile geometry
+  "Legacy tile-parametric XMX GEMM oracle and specialized grid-Z generator.
+
+   Ordinary direct/tiled GEMM lowers from a verified KernelBody. This independent generator stays
+   executable for source-equivalence checks and for split-K, batched, and opaque-helper epilogues
+   until those schedules have explicit KernelBody operations.
+
+   Computes C = A·B with FP16 inputs and FP32 accumulation. The tile geometry
    (workgroup BLOCK_M×BLOCK_N, per-subgroup SG_M×SG_N, K-step BLOCK_K, prefetch depth) is COMPUTED,
    not hardcoded; the DPAS instruction shape (M_i×N_i×K_i) + subgroup size come from the :matrix
    descriptor. The Arc default (128×128, 32×32, K 32, DPAS 8×16×16, subgroup 16) reproduces the

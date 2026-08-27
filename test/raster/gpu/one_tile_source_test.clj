@@ -14,7 +14,9 @@
    produced from its own constants."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hw]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]))
 
 (defn- split-schedule
@@ -63,6 +65,21 @@
       ;; the pre-unification literal and the derived value agree on THIS device, which is what
       ;; makes the change safe here and correct elsewhere
       (is (= (gc 4096 128) (gc 4096 block-n))))))
+
+(deftest resident-direct-and-autotune-sources-use-the-scheduled-body
+  (let [emit-resident (do (require 'raster.gpu.ze-runtime)
+                          (ns-resolve 'raster.gpu.ze-runtime 'emit-scheduled-gemm))
+        tile (hw/gemm-tile-for nil)]
+    (with-redefs [opencl-codegen/emit-gemm-tiled
+                  (fn [& _]
+                    (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+      (let [emitted (emit-resident "resident_body" :float tile)]
+        (is (body/kernel-body? (:kernel-body emitted)))
+        (is (= :float (:dtype (first (filter #(= :result (:role %))
+                                             (get-in emitted [:kernel-body :parameters]))))))
+        (is (= (get-in emitted [:kernel-body :launch :workgroup-size])
+               (:workgroup-size emitted)))
+        (is (re-find #"__global float\* restrict C" (:source emitted)))))))
 
 (deftest split-k-policy-is-unchanged-on-this-device
   (testing "the emitted schedule expression reads block-m/block-n/block-k rather than independent
