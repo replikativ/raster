@@ -1316,6 +1316,26 @@
     :tile tile :result-dtype c-dtype
     :provenance {:dialect :resident-runtime}}))
 
+(defn- emit-scheduled-split-k-gemm
+  "Ask the compiler for a grid-Z sliced K reduction over resident buffers."
+  [kernel-name tile]
+  ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-split-k-kernel)
+   {:kernel-name kernel-name
+    :id [:resident-gemm kernel-name]
+    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K :kc 'KC :splits 'splits
+    :tile tile
+    :provenance {:dialect :resident-runtime}}))
+
+(defn- emit-scheduled-batched-gemm
+  "Ask the compiler for grid-Z-selected independent resident matrix views."
+  [kernel-name tile]
+  ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-batched-matrix-kernel)
+   {:kernel-name kernel-name
+    :id [:resident-gemm kernel-name]
+    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K :batch 'batch
+    :tile tile
+    :provenance {:dialect :resident-runtime}}))
+
 (declare gemm-tile)
 
 (def ^:private gemm-cache
@@ -2285,16 +2305,18 @@
   (ensure-init!)
   (when (nil? @gemm-splitk-cache)
     (let [kname "gemm_nonsquare_splitk"
-          cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
-                      kname :c-dtype :float :split-k? true))
+          tile (gemm-tile)
+          emitted (emit-scheduled-split-k-gemm kname tile)
+          cl-src (:source emitted)
           spv (do (require 'raster.compiler.support.spirv-cache)
                   ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                    cl-src :device (:device-id-hex @state)))
           module (load-module! spv)
           kernel (create-kernel module kname)]
       (clojure.core/reset! gemm-splitk-cache
-                           {:module module :kernel kernel :kernel-name kname})))
+                           {:module module :kernel kernel :kernel-name kname :tile tile
+                            :kernel-body (:kernel-body emitted)
+                            :workgroup (:workgroup-size emitted)})))
   @gemm-splitk-cache)
 
 (defn- ensure-splitk-reduce-kernel!
@@ -2322,16 +2344,18 @@
   z-slice reduces (must be a multiple of 32 so no interior chunk hits the k-remainder
   path; the LAST chunk clamps to k). Pair with bind-registered-splitk-reduce!."
   [a b partials m n k kc splits]
-  (let [{:keys [module kernel-name]} (ensure-gemm-splitk-kernel!)
+  (let [{:keys [module kernel-name tile workgroup]} (ensure-gemm-splitk-kernel!)
+        {:keys [block-m block-n]} tile
         kh (create-kernel-fresh module kernel-name)
         m (long m) n (long n) k (long k) kc (long kc) splits (long splits)
         args [(:segment a) (:segment b) (:segment partials)
               {:type :int :value (int m)} {:type :int :value (int n)}
-              {:type :int :value (int k)} {:type :int :value (int kc)}]
-        bnd (bind-kernel! kh [256 1] args)
+              {:type :int :value (int k)} {:type :int :value (int kc)}
+              {:type :int :value (int splits)}]
+        bnd (bind-kernel! kh workgroup args)
         gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
-    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n))))) ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m))))) ;; Y = gc-m
     (.set gc I32 8 (int splits))                             ;; Z = k-chunks
     bnd))
 
@@ -2368,16 +2392,18 @@
   (ensure-init!)
   (when (nil? @gemm-batched-cache)
     (let [kname "gemm_nonsquare_batched"
-          cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                     ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
-                      kname :c-dtype :float :batched? true))
+          tile (gemm-tile)
+          emitted (emit-scheduled-batched-gemm kname tile)
+          cl-src (:source emitted)
           spv (do (require 'raster.compiler.support.spirv-cache)
                   ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                    cl-src :device (:device-id-hex @state)))
           module (load-module! spv)
           kernel (create-kernel module kname)]
       (clojure.core/reset! gemm-batched-cache
-                           {:module module :kernel kernel :kernel-name kname})))
+                           {:module module :kernel kernel :kernel-name kname :tile tile
+                            :kernel-body (:kernel-body emitted)
+                            :workgroup (:workgroup-size emitted)})))
   @gemm-batched-cache)
 
 (defn bind-registered-gemm-batched!
@@ -2387,16 +2413,17 @@
   f32, all contiguous. Fresh kernel handle per bind (LZ kernel args are mutable
   handle state)."
   [a b c m n k batch]
-  (let [{:keys [module kernel-name]} (ensure-gemm-batched-kernel!)
+  (let [{:keys [module kernel-name tile workgroup]} (ensure-gemm-batched-kernel!)
+        {:keys [block-m block-n]} tile
         kh (create-kernel-fresh module kernel-name)
         m (long m) n (long n) k (long k) batch (long batch)
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)}
-              {:type :int :value (int k)}]
-        bnd (bind-kernel! kh [256 1] args)
+              {:type :int :value (int k)} {:type :int :value (int batch)}]
+        bnd (bind-kernel! kh workgroup args)
         gc ^MemorySegment (:gc-seg bnd)]
-    (.set gc I32 0 (int (Math/ceil (/ (double n) 128.0))))   ;; X = gc-n
-    (.set gc I32 4 (int (Math/ceil (/ (double m) 128.0))))   ;; Y = gc-m
+    (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n))))) ;; X = gc-n
+    (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m))))) ;; Y = gc-m
     (.set gc I32 8 (int batch))                              ;; Z = slabs
     bnd))
 

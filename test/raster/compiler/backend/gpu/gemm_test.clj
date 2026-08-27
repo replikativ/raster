@@ -51,7 +51,10 @@
         temporary-specs (graph-call/temporary-specs graph scalar-values)
         partial-spec (some (fn [[id spec]] (when (= :partials (last id)) spec))
                            temporary-specs)
-        contract (matrix-contract graph)]
+        contract (matrix-contract graph)
+        kernel-body (artifact/attribute contract :kernel-body)
+        outer-loop (first (filter #(instance? raster.compiler.ir.kernel_body.Loop %)
+                                  (get-in kernel-body [:operations 0 :operations])))]
     (is (= :xmx-split-k (executable/strategy graph)))
     (is (= #{'a 'b 'c} (set (keys buffers))))
     (is (= [:float (* 26 13 640) nil] partial-spec))
@@ -59,7 +62,13 @@
            (:group-count
             (launch/realize (:launch contract)
                             #(graph-call/resolve-integer scalar-values %)))))
-    (is (= 4 (count (:nodes graph))))))
+    (is (= 4 (count (:nodes graph))))
+    (is (body/kernel-body? kernel-body))
+    (is (= 1 (count (:views kernel-body))))
+    (is (= [:splits :m :n] (:shape (first (filter #(= :result (:role %))
+                                                  (:parameters kernel-body))))))
+    (is (= 3 (count (get-in kernel-body [:launch :group-count]))))
+    (is (not= 0 (:lower outer-loop)) "the K partition is an explicit loop bound")))
 
 (deftest direct-xmx-graphs-carry-the-shared-scheduled-body
   (let [tile (hardware/derive-gemm-tile {})
@@ -93,6 +102,28 @@
       (is (re-find #"__global float\* restrict C" (:source emitted)))
       (is (= (get-in emitted [:kernel-body :launch :workgroup-size])
              (:workgroup-size emitted))))))
+
+(deftest grid-z-matrix-emission-does-not-call-the-legacy-template
+  (let [tile (hardware/derive-gemm-tile {})]
+    (with-redefs [opencl-codegen/emit-gemm-tiled
+                  (fn [& _]
+                    (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+      (let [split (gemm/emit-scheduled-split-k-kernel
+                   {:kernel-name "body_split"
+                    :a 'a :b 'b :c 'partials :m 'm :n 'n :k 'k
+                    :kc 'kc :splits 'splits :tile tile})
+            batched (gemm/emit-scheduled-batched-matrix-kernel
+                     {:kernel-name "body_batched"
+                      :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
+                      :batch 'batch :tile tile})]
+        (is (body/kernel-body? (:kernel-body split)))
+        (is (= 1 (count (get-in split [:kernel-body :views]))))
+        (is (re-find #"int KC, int splits" (:source split)))
+        (is (re-find #"int k_begin" (:source split)))
+        (is (= 3 (count (get-in batched [:kernel-body :views]))))
+        (is (re-find #"int batch" (:source batched)))
+        (is (every? #(re-find (re-pattern (str % " \\+= ")) (:source batched))
+                    ["A" "B" "C"]))))))
 
 (deftest layout-variants-are-graph-topology-not-runtime-conventions
   (doseq [[variant expected-node-count transpose-phase]

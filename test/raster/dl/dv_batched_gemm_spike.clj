@@ -11,8 +11,8 @@
    tiles = 128 workgroups, which FILL the ~32-workgroup iGPU where one slab (2 wg)
    starves it.
 
-   Kernel: raster.gpu.ze-runtime/bind-registered-gemm-batched! (emit-gemm-tiled
-   :batched? true). This is the batched NN primitive C[b]=A[b]·B[b]; the -tn layout
+   Kernel: raster.gpu.ze-runtime/bind-registered-gemm-batched!, lowered from three explicit
+   grid-Z-selected KernelBody buffer views. This is the batched NN primitive C[b]=A[b]·B[b]; the -tn layout
    (Wᵀ) is staged host-side here (transpose each W slab → A) to isolate the GEMM lever
    the GATE measures.
 
