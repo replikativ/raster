@@ -73,8 +73,9 @@
             :start-positions 'kv-start-positions :page-index-capacity 7}))
         visibility-values
         (when (= :csr visibility-kind)
-          {:row-offsets (int-array [0 2 3 5 8])
-           :key-indices (int-array [1 3, 2, 0 2, 2 3 4, -1])})
+          ;; The third query belongs to batch row 1, whose routed KV length is zero.
+          {:row-offsets (int-array [0 2 3 3 6])
+           :key-indices (int-array [1 3, 2, 2 3 4, -1 -1 -1])})
         attention-visibility
         (case visibility-kind
           :interval

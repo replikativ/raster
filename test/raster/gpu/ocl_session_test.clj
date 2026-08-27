@@ -22,8 +22,15 @@
               true
               (catch Throwable _ false))))
 
+(deftest opencl-max-work-group-size-selector
+  (require 'raster.gpu.ocl-runtime)
+  (is (= 0x1004
+         (var-get
+          (ns-resolve 'raster.gpu.ocl-runtime 'CL_DEVICE_MAX_WORK_GROUP_SIZE)))
+      "CL_DEVICE_MAX_WORK_GROUP_SIZE must not regress to the dimensions selector 0x1003"))
+
 (deftm ocl-session-ax! (All [T] [x :- (Array T) y :- (Array T) a :- T n :- Long] :- Void
-  (raster.par/map-void! i n (ra/aset y i (* a (ra/aget x i))))))
+                            (raster.par/map-void! i n (ra/aset y i (* a (ra/aget x i))))))
 
 (deftm ocl-session-map
   [x :- (Array float) y :- (Array float) a :- Float n :- Long] :- (Array float)
@@ -33,17 +40,17 @@
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
     (raster.par/contract C [[i 8] [j 8]] [[l 8]]
-      (clojure.core/*
-       (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
-       (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
+                         (clojure.core/*
+                          (ra/aget A (clojure.core/+ (clojure.core/* i 8) l))
+                          (ra/aget B (clojure.core/+ (clojure.core/* l 8) j))))
     C))
 
 (deftm ocl-session-reduce
   [x :- (Array float) out :- (Array float) scale :- Double n :- Long] :- Void
   (let [s (raster.par/reduce acc 0.0 i n
-            (clojure.core/+ acc (clojure.core/* scale (ra/aget x i))))]
+                             (clojure.core/+ acc (clojure.core/* scale (ra/aget x i))))]
     (raster.par/map-void! j n
-      (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
+                          (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
 
 (deftest ocl-map-void-mixed-storage-abi-roundtrip
   (if-not @ocl-available?
@@ -53,7 +60,7 @@
           out (int-array n)
           kernel (par-opencl/generate-par-map-void-kernel
                   '(raster.par/map-void! i n
-                     (aset out i (+ (int (aget q i)) limit)))
+                                         (aset out i (+ (int (aget q i)) limit)))
                   :dtype :float
                   :array-types {'out :int 'q :byte}
                   :scalar-types {'limit :int})
@@ -139,7 +146,7 @@
               result (get (fixture/run! program [x y (float 2.0) n]) 'y)]
           (is (= [:map] (mapv :convention (:steps descriptor))))
           (is (every? (fn [i] (< (Math/abs (- (aget ^floats result (int i)) (* 2.0 i)))
-                                  1e-3))
+                                 1e-3))
                       (range n))))
         (finally (gpu/close-session! s))))))
 

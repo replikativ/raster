@@ -110,9 +110,15 @@ overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from
 wrap/saturate/trap policies. Local allocation,
 barriers, masked collectives, and asynchronous copies remain absent
 until a concrete schedule supplies enough information to verify lifetime, alignment, execution and
-memory scopes, memory semantics, participation, and shared-byte accounting. The next production
-vertical is scheduled routed `SegmentedWeightedReduction -> KernelBody` with an invariant external
-ABI; it must not introduce an attention operation into this vocabulary.
+memory scopes, memory semantics, participation, and shared-byte accounting. An implemented OpenCL
+target spelling now lowers this general scalar/control vocabulary directly: dense ranked loads and
+stores (including contiguous leading-slice views), SSA expressions, structured branch/loop yields,
+explicit numerical casts, and full-subgroup reductions/broadcasts, without recovering an algorithm
+or schedule. Unsupported target semantics fail at this boundary instead of silently changing a
+cast, layout, collective, or reduction-association contract. It is not production-reachable until a
+semantic route constructs the body. The next production vertical is the scheduled routed
+`SegmentedWeightedReductionSchedule -> KernelBody` construction with an invariant external ABI; it
+must not introduce an attention operation into this vocabulary.
 
 ### 2.3 Executable steps and resident artifact values compose
 
