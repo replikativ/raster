@@ -1,15 +1,17 @@
 (ns raster.compiler.backend.gpu.attention
-  "Portable FP16-KV reference lowering for logical attention over dense or CSR paged KV routes.
+  "FP16-KV leaves for logical attention over dense or CSR paged KV routes.
 
-   One work-item owns one output component and recomputes QK. This intentionally slow schedule is
-   the executable semantic oracle for packed queries, GQA, independent K/V layouts and dimensions,
-   logical interval/CSR visibility, and physical page routing."
+   The direct one-work-item/component leaf remains the executable semantic oracle.  A separately
+   validated SegmentedWeightedReductionSchedule emits one subgroup/query-head for dense routed
+   interval attention, sharing each QK score across lane-strided value accumulators without
+   changing the semantic plan, ordered ABI, storage ownership or graph effects."
   (:require [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.ir.segmented-weighted-reduction :as swr]))
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
+            [raster.compiler.ir.segmented-weighted-reduction-schedule :as swr-schedule]))
 
 (defn- attention-problem
   [plan]
@@ -76,24 +78,26 @@
     (long (max 1 (min value-head-dim subgroup maximum)))))
 
 (defn- kernel-name
-  [problem]
-  (let [identity (select-keys problem
-                              [:batch-size :q-heads :kv-heads :qk-head-dim :value-head-dim
-                               :page-size :physical-pages :scale :k-format :v-format
-                               :k-layout :v-layout :q-dtype :output-dtype])
-        visibility (:visibility problem)
-        identity (assoc identity
-                        :route-kind (attention/route-kind (:route problem))
-                        :route-shape (select-keys (:route problem)
-                                                  [:pages-per-sequence
-                                                   :page-index-capacity])
-                        :visibility-kind (attention/visibility-kind visibility)
-                        :visibility-shape
-                        (cond-> {:position-filter (into {} (attention/position-filter visibility))}
-                          (attention/csr-visibility? visibility)
-                          (assoc :key-index-capacity (:key-index-capacity visibility)))
-                        :total-query-tokens (get-in problem [:query :total-tokens]))]
-    (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity))))))
+  ([problem] (kernel-name problem :reference))
+  ([problem schedule-identity]
+   (let [identity (assoc (select-keys problem
+                                      [:batch-size :q-heads :kv-heads :qk-head-dim :value-head-dim
+                                       :page-size :physical-pages :scale :k-format :v-format
+                                       :k-layout :v-layout :q-dtype :output-dtype])
+                         :schedule schedule-identity)
+         visibility (:visibility problem)
+         identity (assoc identity
+                         :route-kind (attention/route-kind (:route problem))
+                         :route-shape (select-keys (:route problem)
+                                                   [:pages-per-sequence
+                                                    :page-index-capacity])
+                         :visibility-kind (attention/visibility-kind visibility)
+                         :visibility-shape
+                         (cond-> {:position-filter (into {} (attention/position-filter visibility))}
+                           (attention/csr-visibility? visibility)
+                           (assoc :key-index-capacity (:key-index-capacity visibility)))
+                         :total-query-tokens (get-in problem [:query :total-tokens]))]
+     (format "raster_attention_fp16_%08x" (bit-and 0xffffffff (long (hash identity)))))))
 
 (defn- opencl-type
   [dtype]
@@ -141,7 +145,7 @@
          "    __global const int* attention_key_indices,\n")))
 
 (defn- route-initialization
-  [{:keys [route page-size output-dtype]}]
+  [{:keys [route page-size]} invalid-result]
   (if (attention/dense-paged-route? route)
     (let [capacity (* (:pages-per-sequence route) page-size)]
       (str "  const int length = kv_lengths[batch];\n"
@@ -149,8 +153,7 @@
            "  if (length < 0 || length > " capacity
            " || kv_start_position < 0\n"
            "      || (long)kv_start_position + (long)length > 2147483648L) {\n"
-           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-           "    return;\n"
+           invalid-result
            "  }\n"))
     (let [capacity (:page-index-capacity route)]
       (str "  const int page_begin = page_offsets[batch];\n"
@@ -159,21 +162,18 @@
            "  const int kv_start_position = kv_start_positions[batch];\n"
            "  if (page_offsets[0] != 0 || page_begin < 0 || page_end < page_begin\n"
            "      || page_end > " capacity " || kv_start_position < 0) {\n"
-           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-           "    return;\n"
+           invalid-result
            "  }\n"
            "  const int routed_page_count = page_end - page_begin;\n"
            "  if ((routed_page_count == 0 && final_page_length != 0)\n"
            "      || (routed_page_count > 0\n"
            "          && (final_page_length < 1 || final_page_length > " page-size "))) {\n"
-           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-           "    return;\n"
+           invalid-result
            "  }\n"
            "  const int length = routed_page_count == 0 ? 0\n"
            "      : (routed_page_count - 1) * " page-size " + final_page_length;\n"
            "  if ((long)kv_start_position + (long)length > 2147483648L) {\n"
-           "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-           "    return;\n"
+           invalid-result
            "  }\n"))))
 
 (defn- physical-page-expression
@@ -194,29 +194,27 @@
               window-right "L);\n"))))
 
 (defn- visibility-initialization
-  [visibility output-dtype]
+  [visibility invalid-result]
   (when (attention/csr-visibility? visibility)
     (str "  const int attention_begin = attention_row_offsets[q_token];\n"
          "  const int attention_end = attention_row_offsets[q_token + 1];\n"
          "  if (attention_row_offsets[0] != 0 || attention_begin < 0\n"
          "      || attention_end < attention_begin || attention_end > "
          (:key-index-capacity visibility) ") {\n"
-         "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
-         "    return;\n"
+         invalid-result
          "  }\n")))
 
 (defn- visibility-loop-start
-  [visibility output-dtype]
+  [visibility invalid-result]
   (if (attention/csr-visibility? visibility)
     (str "  for (int edge = attention_begin; edge < attention_end; ++edge) {\n"
          "    const int token = attention_key_indices[edge];\n"
          "    if (token < 0 || token >= length) {\n"
-         "      output[out_index] = " (store-float output-dtype "NAN") ";\n"
-         "      return;\n"
+         invalid-result
          "    }\n")
     "  for (int token = 0; token < length; ++token) {\n"))
 
-(defn- source
+(defn- reference-source
   [problem name]
   (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
                 page-size physical-pages scale k-layout v-layout visibility
@@ -224,7 +222,9 @@
         total-query-tokens (:total-tokens query)
         gqa-ratio (quot q-heads kv-heads)
         k-base (cache-base problem k-layout qk-head-dim)
-        v-base (cache-base problem v-layout value-head-dim)]
+        v-base (cache-base problem v-layout value-head-dim)
+        invalid-result (str "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
+                            "    return;\n")]
     (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
          "__kernel void " name "(\n"
          "    __global const " (opencl-type q-dtype) "* q,\n"
@@ -257,15 +257,15 @@
          "    output[out_index] = " (store-float output-dtype "NAN") ";\n"
          "    return;\n"
          "  }\n"
-         (route-initialization problem)
-         (visibility-initialization visibility output-dtype)
+         (route-initialization problem invalid-result)
+         (visibility-initialization visibility invalid-result)
          "  const int kv_head = q_head / " gqa-ratio ";\n"
          "  const long q_base = ((long)q_token * " q-heads
          " + q_head) * " qk-head-dim ";\n"
          "  float maximum = -3.402823466e+38f;\n"
          "  float denominator = 0.0f;\n"
          "  float accumulator = 0.0f;\n"
-         (visibility-loop-start visibility output-dtype)
+         (visibility-loop-start visibility invalid-result)
          "    const long kv_position = (long)kv_start_position + token;\n"
          "    int visible = 1;\n"
          (visibility-statements (attention/position-filter visibility))
@@ -296,6 +296,160 @@
          "  output[out_index] = denominator == 0.0f ? "
          (store-float output-dtype "0.0f") "\n"
          "      : " (store-float output-dtype "accumulator / denominator") ";\n"
+         "}\n")))
+
+(defn- cooperative-plan!
+  [plan schedule]
+  (let [plan (reference-plan! plan)
+        schedule (swr-schedule/validate! schedule)
+        problem (attention-problem plan)
+        components (:value-head-dim problem)]
+    (when-not (and (= components (get-in schedule [:value-mapping :components]))
+                   (= (get-in plan [:score :axis :name])
+                      (get-in schedule [:score-reduction :axis]))
+                   (= (:accumulator-dtype plan)
+                      (get-in schedule [:numerical-mode :score-accumulate]))
+                   (= (:accumulator-dtype plan)
+                      (get-in schedule [:numerical-mode :state-accumulate]))
+                   (= :dense-paged (attention/route-kind (:route problem)))
+                   (= :interval (attention/visibility-kind (:visibility problem)))
+                   (= :routed-paged-kv (get-in schedule [:attributes :storage-kind]))
+                   (= :dense-paged (get-in schedule [:attributes :route-kind]))
+                   (= :interval (get-in schedule [:attributes :visibility-kind])))
+      (throw (ex-info "cooperative attention schedule does not describe this reduction plan"
+                      {:reason :attention-cooperative-schedule-plan-mismatch
+                       :schedule schedule :plan-id (:id plan)})))
+    [plan schedule problem]))
+
+(defn- component-code
+  [schedule f]
+  (apply str (map f (range (get-in schedule [:value-mapping :components-per-lane])))))
+
+(defn- cooperative-component-declarations
+  [schedule]
+  (let [subgroup-size (:workgroup-size schedule)]
+    (component-code
+     schedule
+     (fn [slot]
+       (str "  const int d" slot " = (int)lane + " (* slot subgroup-size) ";\n"
+            "  float accumulator" slot " = 0.0f;\n")))))
+
+(defn- cooperative-component-write
+  [problem schedule expression]
+  (component-code
+   schedule
+   (fn [slot]
+     (str "    if (d" slot " < " (:value-head-dim problem) ")\n"
+          "      output[out_base + d" slot "] = "
+          (store-float (:output-dtype problem) (expression slot)) ";\n"))))
+
+(defn- cooperative-component-update
+  [problem schedule]
+  (component-code
+   schedule
+   (fn [slot]
+     (str "    if (d" slot " < " (:value-head-dim problem) ")\n"
+          "      accumulator" slot " = accumulator" slot " * old_weight\n"
+          "          + convert_float(v_pages[v_base + d" slot "]) * new_weight;\n"))))
+
+(defn- cooperative-source
+  [problem schedule name]
+  (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
+                page-size physical-pages scale k-layout v-layout visibility
+                q-dtype output-dtype]} problem
+        total-query-tokens (:total-tokens query)
+        gqa-ratio (quot q-heads kv-heads)
+        subgroup-size (:workgroup-size schedule)
+        k-base (cache-base problem k-layout qk-head-dim)
+        v-base (cache-base problem v-layout value-head-dim)
+        invalid-result
+        (str (cooperative-component-write problem schedule (constantly "NAN"))
+             "    return;\n")
+        empty-result
+        (str (cooperative-component-write problem schedule (constantly "0.0f"))
+             "    return;\n")]
+    (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
+         "__attribute__((intel_reqd_sub_group_size(" subgroup-size ")))\n"
+         "__kernel void " name "(\n"
+         "    __global const " (opencl-type q-dtype) "* q,\n"
+         "    __global const int* q_row_offsets,\n"
+         "    __global const int* q_positions,\n"
+         "    __global const half* k_pages,\n"
+         "    __global const half* v_pages,\n"
+         (route-signature route)
+         "    __global " (opencl-type output-dtype) "* output) {\n"
+         "  const long lane = (long)get_sub_group_local_id();\n"
+         "  const int q_head = (int)get_group_id(0);\n"
+         "  const int q_token = (int)get_group_id(1);\n"
+         "  const long out_base = ((long)q_token * " q-heads
+         " + q_head) * " value-head-dim ";\n"
+         (cooperative-component-declarations schedule)
+         "  int query_metadata_valid = q_row_offsets[0] == 0\n"
+         "      && q_row_offsets[" batch-size "] == " total-query-tokens ";\n"
+         "  int batch = -1;\n"
+         "  for (int b = 0; b < " batch-size "; ++b) {\n"
+         "    const int row_start = q_row_offsets[b];\n"
+         "    const int row_end = q_row_offsets[b + 1];\n"
+         "    query_metadata_valid = query_metadata_valid && row_start >= 0\n"
+         "        && row_end >= row_start && row_end <= " total-query-tokens ";\n"
+         "    if (q_token >= row_start && q_token < row_end) batch = b;\n"
+         "  }\n"
+         "  const int q_position = q_positions[q_token];\n"
+         "  if (!query_metadata_valid || batch < 0 || q_position < 0) {\n"
+         invalid-result
+         "  }\n"
+         (route-initialization problem invalid-result)
+         "  if (length == 0) {\n"
+         empty-result
+         "  }\n"
+         "  const int kv_head = q_head / " gqa-ratio ";\n"
+         "  const long q_base = ((long)q_token * " q-heads
+         " + q_head) * " qk-head-dim ";\n"
+         "  float maximum = -3.402823466e+38f;\n"
+         "  float denominator = 0.0f;\n"
+         "  for (int token = 0; token < length; ++token) {\n"
+         "    const long kv_position = (long)kv_start_position + token;\n"
+         "    int visible = 1;\n"
+         (visibility-statements (attention/position-filter visibility))
+         "    if (!visible) continue;\n"
+         "    const int logical_page = token / " page-size ";\n"
+         "    const int physical_page = " (physical-page-expression route) ";\n"
+         "    if (physical_page < 0 || physical_page >= " physical-pages ") {\n"
+         invalid-result
+         "    }\n"
+         "    const int page_token = token - logical_page * " page-size ";\n"
+         "    const long k_base = " k-base ";\n"
+         "    const long v_base = " v-base ";\n"
+         "    float partial_dot = 0.0f;\n"
+         "    for (int x = (int)lane; x < " qk-head-dim "; x += " subgroup-size ")\n"
+         "      partial_dot += " (load-float q-dtype "q[q_base + x]")
+         " * convert_float(k_pages[k_base + x]);\n"
+         "    const float dot = sub_group_reduce_add(partial_dot);\n"
+         "    const float logit = dot * " (Float/toString (float scale)) "f;\n"
+         "    float old_weight = 0.0f;\n"
+         "    float new_weight = 0.0f;\n"
+         "    if (lane == 0L) {\n"
+         "      if (isnan(maximum) || isnan(logit)) {\n"
+         "        maximum = NAN;\n"
+         "        old_weight = NAN;\n"
+         "        new_weight = NAN;\n"
+         "      } else {\n"
+         "        const float next_maximum = fmax(maximum, logit);\n"
+         "        old_weight = exp(maximum - next_maximum);\n"
+         "        new_weight = exp(logit - next_maximum);\n"
+         "        maximum = next_maximum;\n"
+         "      }\n"
+         "      denominator = denominator * old_weight + new_weight;\n"
+         "    }\n"
+         "    old_weight = sub_group_broadcast(old_weight, 0);\n"
+         "    new_weight = sub_group_broadcast(new_weight, 0);\n"
+         (cooperative-component-update problem schedule)
+         "  }\n"
+         "  denominator = sub_group_broadcast(denominator, 0);\n"
+         (cooperative-component-write
+          problem schedule
+          (fn [slot]
+            (str "denominator == 0.0f ? 0.0f : accumulator" slot " / denominator")))
          "}\n")))
 
 (defn- ordered-inputs
@@ -354,7 +508,7 @@
                                q-heads (:total-tokens query)]})]
     (kart/make
      {:kernel-name name
-      :source (source problem name)
+      :source (reference-source problem name)
       :abi (ordered-abi problem)
       :arguments arguments
       :launch launch
@@ -373,8 +527,47 @@
                    :layout (attention/layouts problem)
                    :complexity :quadratic-in-qk-head-dim}})))
 
+(defn emit-fp16-cooperative
+  "Emit one subgroup per query segment for dense routed FP16 K/V attention.
+
+   The artifact preserves the reference leaf's complete ordered ABI and logical effects.  Only
+   its target-neutral SegmentedWeightedReductionSchedule, launch mapping and target body differ."
+  [plan schedule]
+  (let [[plan schedule {:keys [query output q-heads route] :as problem}]
+        (cooperative-plan! plan schedule)
+        subgroup-size (:workgroup-size schedule)
+        name (kernel-name problem schedule)
+        inputs (ordered-inputs plan)
+        arguments (conj inputs output)]
+    (kart/make
+     {:kernel-name name
+      :source (cooperative-source problem schedule name)
+      :abi (ordered-abi problem)
+      :arguments arguments
+      :launch (klaunch/spec
+               {:workgroup-size [subgroup-size 1]
+                :group-count [q-heads (:total-tokens query)]})
+      :effects {:kind :attention :reads inputs :writes [output]}
+      :provenance {:operation-id (:id problem) :semantic-op :attention
+                   :algebra-plan-id (:id plan)
+                   :lowering :subgroup-online-score-reuse}
+      :attributes {:strategy :routed-paged-subgroup-online-score-reuse
+                   :optimization-tier :subgroup
+                   :algebra :segmented-weighted-reduction
+                   :algebra-key (swr/algebra-key plan)
+                   :segmented-weighted-reduction-schedule schedule
+                   :storage-dtype :half :q-dtype (:q-dtype problem)
+                   :output-dtype (:output-dtype problem) :accumulator-dtype :float
+                   :route-kind (attention/route-kind route)
+                   :visibility-kind (attention/visibility-kind (:visibility problem))
+                   :k-layout (:k-layout problem) :v-layout (:v-layout problem)
+                   :visibility (:visibility problem)
+                   :layout (attention/layouts problem)
+                   :materialized-intermediates []
+                   :complexity :query-head-token-dot-plus-value}})))
+
 (defn kernel-graph
-  "Wrap the reference artifact in an explicit one-node scheduled graph."
+  "Wrap either verified attention leaf in an explicit one-node scheduled graph."
   [plan artifact]
   (let [plan (reference-plan! plan)
         {:keys [output id] :as problem} (attention-problem plan)
@@ -386,7 +579,9 @@
                          (kgraph/buffer buffer-id dtype elements :device role)))
         uses (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
                           [(kgraph/->ValueUse output :write)]))
-        node-id [:attention id :fp16-reference]]
+        strategy (get-in artifact [:attributes :strategy])
+        reference? (= :reference (get-in artifact [:attributes :optimization-tier]))
+        node-id [:attention id strategy]]
     (kgraph/make
      {:inputs (mapv graph-buffer inputs)
       :outputs [(graph-buffer output)]
@@ -395,5 +590,5 @@
       :nodes [(kgraph/->ScheduledKernel node-id artifact uses [])]
       :effects {:kind :attention :logical-visibility true :ordered-page-routing true}
       :provenance {:operation-id id :semantic-op :attention}
-      :attributes {:strategy :fp16-reference :reference? true
+      :attributes {:strategy strategy :reference? reference?
                    :route-kind (attention/route-kind (:route problem))}})))
