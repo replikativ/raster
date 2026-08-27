@@ -14,6 +14,10 @@
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
+            [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.soac :as soac]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.runtime.hardware :as hw]))
 
 ;; ================================================================
@@ -173,19 +177,23 @@
 ;; ---- 1.7 Scan kernel structure ----
 
 (deftest codegen-scan-test
-  (testing "Scan kernel pair generated"
-    (try
-      (let [result (par-opencl/generate-par-scan-exclusive-kernel
-                    '(raster.par/scan-exclusive! out totals i n (clojure.core/+ acc (aget a i)) 0))]
-        (when result
-          (is (vector? result))
-          (is (>= (count result) 2) "Should produce at least 2 kernels (scan + carry)")
-          (doseq [k result]
-            (is (string? (:source k)))
-            (is (str/includes? (:source k) "__kernel")))))
-      (catch Exception e
-        ;; Scan kernel API may have different form structure
-        (println "  [SKIP] Scan kernel generation:" (.getMessage e))))))
+  (testing "the production SoacScan path emits its certified three-stage kernel graph"
+    (let [node (soac/par-form->soac
+                'out
+                '(raster.par/scan out acc 0.0 i n double
+                                  (clojure.core/+ acc (clojure.core/aget a i)))
+                0)
+          operations (soac-lower/lower-scan node nil)
+          scheduled (soac-lower/scan-kernel-graph node operations {})
+          emitted (segop-opencl/generate-scan-kernel-graph scheduled)
+          artifacts (mapv :operation (:nodes emitted))]
+      (is (kernel-graph/kernel-graph? emitted))
+      (is (= [:intra-block :block-scan :carry-in]
+             (mapv #(get-in % [:attributes :phase]) artifacts)))
+      (is (= [[] [(:id (first (:nodes emitted)))]
+              (mapv :id (take 2 (:nodes emitted)))]
+             (mapv :dependencies (:nodes emitted))))
+      (is (every? #(str/includes? (:source %) "__kernel") artifacts)))))
 
 ;; ---- 1.8 Mixed operations ----
 
@@ -248,7 +256,7 @@
            out (int-array n)
            kernel (par-opencl/generate-par-map-void-kernel
                    '(raster.par/map-void! i n
-                      (aset out i (+ (int (aget q i)) limit)))
+                                          (aset out i (+ (int (aget q i)) limit)))
                    :dtype :float
                    :array-types {'out :int 'q :byte}
                    :scalar-types {'limit :int})
