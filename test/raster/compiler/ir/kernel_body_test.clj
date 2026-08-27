@@ -1,6 +1,7 @@
 (ns raster.compiler.ir.kernel-body-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.core.layout :as layout]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]))
 
 (def ^:private matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16})
@@ -92,3 +93,33 @@
     (testing "the parent extent is tied to the hardware axis launch bound"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"launch-bounded"
                             (body/validate! (assoc-in viewed [:launch :group-count 0] 15)))))))
+
+(deftest scalar-regions-are-checked-against-the-ordered-kernel-abi
+  (let [region (body/->ScalarRegion
+                ['value 'bias 'scale]
+                '(raster.numeric/* (raster.numeric/+ value (aget bias group-x)) scale)
+                [{:sym 'bias :map (axis-map/of-axes [['group-x 16]]) :dtype :half}]
+                :float)
+        kernel (-> (minimal-body)
+                   (update :parameters into
+                           [(body/->KernelParameter
+                             'bias :input :half [16] :global
+                             (layout/row-major [16] :half) :epilogue)
+                            (body/->KernelParameter 'scale :scalar :float [] nil nil :epilogue)])
+                   (assoc-in [:operations 0 :operations 2 :value-region] region))]
+    (is (= kernel (body/validate! kernel)))
+    (testing "operand identities occupy the ordered prefix after the accumulator"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"ordered prefix"
+                            (body/validate!
+                             (assoc-in kernel [:operations 0 :operations 2 :value-region
+                                               :parameters]
+                                       ['value 'scale 'bias])))))
+    (testing "every region parameter has exactly one epilogue ABI slot"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"epilogue ABI disagree"
+                            (body/validate! (update kernel :parameters pop)))))
+    (testing "an operand map and physical ABI shape cannot drift"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"operand and its kernel ABI slot disagree"
+                            (body/validate!
+                             (assoc-in kernel [:operations 0 :operations 2 :value-region
+                                               :operands 0 :map]
+                                       (axis-map/of-axes [['group-x 8]]))))))))

@@ -134,11 +134,11 @@
   This is the shared compiler entry for graph-owned, legacy-plan, and resident direct/tiled GEMM
   front doors. Caller identities remain the KernelBody ABI identities; OpenCL parameter spelling
   is solely a target concern. Optional views, hardware indices, and K bounds are explicit schedule
-  values used by the split-K and batched wrappers below. Opaque source epilogues remain outside
-  this route until their scalar regions are typed."
+  values used by the split-K and batched wrappers below. An optional epilogue becomes a typed
+  ScalarRegion on every store and is lowered as part of the body."
   [{:keys [kernel-name id a b c m n k tile result-dtype provenance
            additional-parameters additional-indices buffer-shapes buffer-views operation-buffers
-           k-range launch-group-count attributes parameter-names]
+           k-range launch-group-count attributes parameter-names epilogue]
     :or {result-dtype :float provenance {}}}]
   (let [kernel-body
         (contraction-schedule/matrix-body
@@ -149,6 +149,7 @@
           :axis-symbols ['i 'j 'l]
           :tile tile
           :bindings {:row a :col b}
+          :epilogue epilogue
           :result-dtype result-dtype
           :additional-parameters additional-parameters
           :additional-indices additional-indices

@@ -69,7 +69,7 @@
           {:keys [store]} (store-line (:form f))]
       (is (str/includes? store "rs[row]"))))
   (testing "an activation-only body still fuses, with no operands"
-    (let [f (fuse (list 'silu_f (list 'aget 'C 't)))
+    (let [f (fuse (list 'raster.math/exp (list 'aget 'C 't)))
           {:keys [epi-ops]} (store-line (:form f))]
       (is (empty? (:operands (:epilogue f))))
       (is (empty? epi-ops)))))

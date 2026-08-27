@@ -477,15 +477,9 @@
       (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype))
             scheduled (contraction-schedule/plan-matrix-body contract-facts desc tile
                                                              {:operation-id operation-id})
-         ;; Existing epilogues may still carry an opaque target helper.  They retain the proven
-         ;; emitter until that helper is represented as typed scalar IR; all ordinary expressions
-         ;; take the scheduled KernelBody route now.
-            dpas (if (= :opaque-epilogue-helper (:reason scheduled))
-                   (sco/generate-dpas-contraction-kernel @sr out-sym :dtype dtype :desc desc :tile tile
-                                                         :epilogue epilogue)
-                   (if (:ok scheduled)
-                     (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
-                     {:tensorized false :reason (:reason scheduled) :detail scheduled}))]
+            dpas (if (:ok scheduled)
+                   (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
+                   {:tensorized false :reason (:reason scheduled) :detail scheduled})]
         (when-not (:tensorized dpas)
           (note! (decline :dpas (:reason dpas) nil (dissoc dpas :tensorized :reason))))
         (if (:tensorized dpas)

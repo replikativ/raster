@@ -7,6 +7,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.passes.parallel.contract-lower :as cl]
+            [raster.compiler.passes.parallel.contract-route :as route]
             [raster.compiler.backend.gpu.segop-opencl :as sco])
   (:import [java.lang.foreign MemorySegment]))
 
@@ -145,11 +146,13 @@
           Ad (double-array (map #(* 0.05 (- (double (mod % 7)) 3.0)) (range (* M K))))
           Bd (double-array (map #(* 0.05 (- (double (mod % 5)) 2.0)) (range (* K N))))
           biasd (float-array (map #(float (* 0.01 (- (mod % 9) 4))) (range N)))
-          sr (cl/contract-form->segred (matmul-form M N K) :dtype :half)
           ep {:acc 'acc
-              :expr (list 'silu_f (list 'raster.numeric/+ 'acc (list 'aget 'bias 'j)))
-              :operands [{:sym 'bias :map (am [['j N]]) :dtype :float}]
-              :helpers "inline float silu_f(float x){ return x / (1.0f + native_exp(-x)); }"}
+              :expr '(let [x (raster.numeric/+ acc (aget bias j))]
+                       (raster.numeric//
+                        x
+                        (raster.numeric/+ 1.0
+                                          (raster.math/exp (raster.numeric/* -1.0 x)))))
+              :operands [{:sym 'bias :map (am [['j N]]) :dtype :float}]}
           run (fn [k extra-args out]
                 (register! (:kernel-name k) {:source (:source k) :dtype :half})
                 (let [{:keys [kernel-handle]} (ensure! (:kernel-name k))
@@ -163,15 +166,18 @@
                                (long (Math/ceil (/ (double M) (:block-m (:tile k)))))]
                               args)
                   (vec (buf->d out))))
-          plain-k (sco/generate-dpas-contraction-kernel sr 'C)
-          fused-k (sco/generate-dpas-contraction-kernel sr 'C :epilogue ep)
+          plain-route (route/route-contraction (matmul-form M N K) :dtype :half)
+          plain-k (assoc plain-route :workgroup (:wg plain-route))
+          fused-route (route/route-contraction
+                       (concat (matmul-form M N K) [:epilogue ep]) :dtype :half)
+          fused-k (assoc fused-route :workgroup (:wg fused-route))
           bias-buf (arr->buf! (make-buffer N :float) biasd)
           unfused (run plain-k [] (make-buffer (* M N) :half))
           fused   (run fused-k [(:segment bias-buf)] (make-buffer (* M N) :half))]
-      (testing "the fused kernel gains the operand param and the helper"
+      (testing "the fused KernelBody gains the operand ABI and a typed scalar region"
         (is (str/includes? (:source fused-k) "restrict bias"))
-        (is (str/includes? (:source fused-k) "silu_f(float x)"))
-        (is (str/includes? (:source fused-k) "silu_f(((acc00.s0) + bias[col]))")
+        (is (not (str/includes? (:source fused-k) "silu_f")))
+        (is (str/includes? (:source fused-k) "float x = ((acc00.s0) + bias[col])")
             "the axis-map's j must bind to the store slot's col"))
       (testing "fused result == unfused GEMM followed by a separate bias+silu pass"
         ;; the two-pass reference: read C back, then apply the epilogue on the host
@@ -202,7 +208,7 @@
              (:reason (sco/epilogue-legal? {:acc 'acc :expr (list 'raster.par/scan 'o 'a 0.0 'i 8 nil 'acc)})))))
     (testing "epilogue-splice itself enforces legality (fails loud, never silently miscompiles)"
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"illegal epilogue"
-            (sco/epilogue-splice {:acc 'acc :expr (list 'raster.numeric/* 'acc 'acc)} '[i j] :float))))))
+                            (sco/epilogue-splice {:acc 'acc :expr (list 'raster.numeric/* 'acc 'acc)} '[i j] :float))))))
 
 (deftest epilogue-cost-reflects-the-eliminated-round-trip
   (let [hw (requiring-resolve 'raster.compiler.core.hardware/derive-gemm-tile)
@@ -230,7 +236,7 @@
                        (list 'aget 'B (list '+ (list '* 'l N) 'j))))
         bindings ['C mm
                   'out (list 'raster.par/map! 'out 't (* M N) nil
-                             (list 'silu_f (list 'aget 'C 't)))]]
+                             (list 'raster.math/exp (list 'aget 'C 't)))]]
     (testing "contract + elementwise map collapse into ONE contract carrying an :epilogue"
       (let [r (pf bindings [])
             fused (second (:bindings r))
@@ -240,13 +246,13 @@
         (is (= 'raster.par/contract (first fused)))
         (is (= 'out (second fused)) "the fused contraction writes the map's target directly")
         (is (some? (:epilogue opts)))
-        (is (= (list 'silu_f (:acc (:epilogue opts))) (:expr (:epilogue opts)))
+        (is (= (list 'raster.math/exp (:acc (:epilogue opts))) (:expr (:epilogue opts)))
             "the map body becomes the epilogue, with (aget C t) → the accumulator")))
     (testing "the routed descriptor reports the fusion and splices it into the store"
       (let [fused (second (:bindings (pf bindings [])))
             r (route fused :dtype :half)]
         (is (:fused-epilogue r))
-        (is (str/includes? (:source r) "silu_f((acc00.s0))")
+        (is (re-find #"exp\(.*acc00\.s0" (:source r))
             "the epilogue must appear in the STORE slot, not a second kernel")))
     (testing "a body reading OTHER arrays now fuses too (flat-index→free-axis decomposition)"
       ;; This assertion previously required a REFUSAL. That limitation is gone: an operand's flat

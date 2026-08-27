@@ -130,6 +130,20 @@
       (is (re-find #"intel_sub_group_f16_f16_matrix_mad_k16" (:source routed)))
       (is (body/kernel-body? (:kernel-body routed))))))
 
+(deftest raw-epilogue-helper-source-never-enters-production-lowering
+  (let [epilogue {:acc 'acc
+                  :expr '(silu_f acc)
+                  :helpers "inline float silu_f(float x) { return x; }"}
+        form (concat (matrix-form 128 128 128) [:epilogue epilogue])
+        scheduled (schedule/plan-matrix-body
+                   (facts/contraction-facts form :dtype :half) nil nil)]
+    (is (= {:ok false :reason :opaque-epilogue-helper} scheduled))
+    (with-redefs [opencl-codegen/emit-gemm-tiled
+                  (fn [& _]
+                    (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"has no store splice"
+                            (route/route-contraction form :dtype :half))))))
+
 (deftest direct-lowering-refuses-an-operation-coordinate-that-disagrees-with-the-schedule
   (let [kernel (:body (schedule/plan-matrix-body
                        (facts/contraction-facts (matrix-form 128 128 128) :dtype :half)
