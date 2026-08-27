@@ -1,17 +1,26 @@
 (ns raster.compiler.backend.gpu.gemm-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.gemm :as gemm]
+            [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.ir.kernel-artifact :as artifact]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-dispatch :as dispatch]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.kernel-graph-call :as graph-call]
             [raster.compiler.ir.kernel-launch :as launch]))
 
+(defn- matrix-contract
+  [graph]
+  (some #(when (= :matrix-contract (get-in % [:operation :attributes :strategy]))
+           (:operation %))
+        (:nodes graph)))
+
 (defn- emitted
   [variant]
   (gemm/emit-executable
    {:id (str "gemm-test-" (name variant))
-    :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
+    :a 'a :b 'b :c 'c :m :m :n :n :k :k
     :variant variant :precision :f16-xmx
     :tile (hardware/derive-gemm-tile {})
     :fill-workgroups 32}))
@@ -42,9 +51,7 @@
         temporary-specs (graph-call/temporary-specs graph scalar-values)
         partial-spec (some (fn [[id spec]] (when (= :partials (last id)) spec))
                            temporary-specs)
-        contract (some #(when (= :matrix-contract (get-in % [:operation :attributes :strategy]))
-                          (:operation %))
-                       (:nodes graph))]
+        contract (matrix-contract graph)]
     (is (= :xmx-split-k (executable/strategy graph)))
     (is (= #{'a 'b 'c} (set (keys buffers))))
     (is (= [:float (* 26 13 640) nil] partial-spec))
@@ -53,6 +60,39 @@
             (launch/realize (:launch contract)
                             #(graph-call/resolve-integer scalar-values %)))))
     (is (= 4 (count (:nodes graph))))))
+
+(deftest direct-xmx-graphs-carry-the-shared-scheduled-body
+  (let [tile (hardware/derive-gemm-tile {})
+        graph (dispatch/alternative (emitted :nn) :xmx-direct)
+        contract (matrix-contract graph)
+        kernel-body (artifact/attribute contract :kernel-body)
+        dimensions (filter #(= :dimension (:role %)) (:parameters kernel-body))
+        result (first (filter #(= :result (:role %)) (:parameters kernel-body)))
+        oracle (apply opencl-codegen/emit-gemm-tiled (:kernel-name contract)
+                      :c-dtype :float :prefetch (:num-stages tile)
+                      (mapcat identity
+                              (select-keys tile
+                                           [:block-m :block-n :sg-m :sg-n :block-k :matrix])))]
+    (is (body/kernel-body? kernel-body))
+    (is (= [:m :n :k] (mapv :id dimensions))
+        "the body retains graph ABI identities instead of a parallel M/N/K convention")
+    (is (= :float (:dtype result)))
+    (is (= (:source contract) oracle)
+        "direct KernelBody lowering preserves the proven f32 GEMM source exactly")))
+
+(deftest shared-direct-emission-does-not-call-the-legacy-template
+  (with-redefs [opencl-codegen/emit-gemm-tiled
+                (fn [& _]
+                  (throw (ex-info "legacy template was called" {:reason :test/failure})))]
+    (let [emitted (gemm/emit-scheduled-matrix-kernel
+                   {:kernel-name "body_direct"
+                    :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k
+                    :tile (hardware/derive-gemm-tile {})
+                    :result-dtype :float})]
+      (is (body/kernel-body? (:kernel-body emitted)))
+      (is (re-find #"__global float\* restrict C" (:source emitted)))
+      (is (= (get-in emitted [:kernel-body :launch :workgroup-size])
+             (:workgroup-size emitted))))))
 
 (deftest layout-variants-are-graph-topology-not-runtime-conventions
   (doseq [[variant expected-node-count transpose-phase]

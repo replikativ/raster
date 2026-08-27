@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.gpu-plan-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.passes.parallel.gpu-plan :as gpu-plan]
             [raster.compiler.passes.parallel.patterns :as patterns]))
 
@@ -57,10 +58,14 @@
                                              (recur (+ acc (* (aget A (+ (* i k) p)) (aget B (+ (* p n) j)))) (inc p))
                                              acc)))))
                                C)]
-                  out)
+                      out)
           {:keys [form kernels stats]} (gpu-plan/gpu-plan-pass form :dtype :float)]
       (is (= 1 (:gemm-rewrites stats)) "the redomap counts as a GEMM rewrite, like a BLAS call")
       (is (= 1 (count kernels)))
+      (is (body/kernel-body? (:kernel-body (first kernels)))
+          "the legacy plan front door retains the same scheduled body as graph GEMM")
+      (is (= :float (:dtype (first (filter #(= :result (:role %))
+                                           (get-in kernels [0 :kernel-body :parameters]))))))
       (is (re-find #"invoke-registered-gemm!" (pr-str form))
           "emits the same registered-GEMM invocation the BLAS path uses"))))
 
@@ -75,6 +80,6 @@
                                              (recur (+ acc (aget A (+ (* i k) p))) (inc p))
                                              acc)))))
                                C)]
-                  out)
+                      out)
           {:keys [stats]} (gpu-plan/gpu-plan-pass form :dtype :float)]
       (is (= 0 (:gemm-rewrites stats)) "not a matmul → no GEMM offload (sound)"))))

@@ -1,6 +1,5 @@
 (ns raster.compiler.backend.gpu.gemm-tiled-test
-  "Correctness of the tile-parametric XMX GEMM generator (raster...opencl-codegen/emit-gemm-tiled),
-   which replaced the hand-unrolled kernel. Two guards:
+  "Correctness of tile-parametric scheduled XMX GEMM lowering. Two guards:
 
      (1) ABSOLUTE correctness — the resident GEMM (default Arc tile, launched through the production
          bind-registered-gemm! path) matches an independent CPU f32-accumulate reference over
@@ -13,7 +12,8 @@
          generator is bit-invariant across tile geometry. This is the guard the T2/T3 autotune work
          (which VARIES the tile) rests on — a tile bug that changes results at all trips it.
 
-   Device-free structural checks live in raster.dl.gsdm-test/gemm-tiled-kernel-test."
+   The old string generator remains an independent cross-tile oracle in this test. Device-free
+   body/source checks live in raster.compiler.backend.gpu.gemm-test."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.gpu-grad-parity :as gp]))
 
@@ -104,8 +104,8 @@
         (RP (RG [{:bound (bind a16 b16 c m n k :float tile epi) :kernel-name "gemm_epi_bias_float"}]))
         (let [gpu (BA c) h (fn [x] (Float/float16ToFloat (Float/floatToFloat16 (float x)))) ref (float-array (* m n))]
           (dotimes [i m] (dotimes [j n]
-            (let [s (loop [p 0 acc 0.0] (if (< p k) (recur (inc p) (+ acc (* (double (h (aget A (+ (* i k) p)))) (double (h (aget B (+ (* p n) j))))))) acc))]
-              (aset ref (+ (* i n) j) (float (+ s (double (h (aget bias j)))))))))
+                           (let [s (loop [p 0 acc 0.0] (if (< p k) (recur (inc p) (+ acc (* (double (h (aget A (+ (* i k) p)))) (double (h (aget B (+ (* p n) j))))))) acc))]
+                             (aset ref (+ (* i n) j) (float (+ s (double (h (aget bias j)))))))))
           (let [maxrel (reduce max 0.0 (map (fn [a b] (/ (Math/abs (- (double a) (double b))) (+ 0.05 (Math/abs (double b))))) gpu ref))]
             (is (< maxrel 1.0e-3) (str "fused C=A·B+bias must match CPU ref within f16 tol (max-rel " maxrel ")"))))
         (finally (FB a16) (FB b16) (FB biasbuf) (FB c))))))

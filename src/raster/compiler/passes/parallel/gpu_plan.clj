@@ -17,7 +17,9 @@
      :stats {:gemm-rewrites :map-rewrites :reduce-rewrites ...}}"
   (:require
    [clojure.set :as set]
+   [raster.compiler.backend.gpu.gemm :as gpu-gemm]
    [raster.compiler.core.op-descriptor :as op]
+   [raster.compiler.core.hardware :as hardware]
    [raster.compiler.passes.parallel.device :as device]
    [raster.compiler.passes.parallel.patterns :as patterns]
    [raster.compiler.passes.parallel.gemm-recognize :as gemm-recognize]
@@ -136,11 +138,21 @@
   Returns {:kernel-name :source :launch-config-fn :dtype}."
   [gemm-info dtype kernel-counter]
   (let [kname (str "gemm_" (name (:variant gemm-info)) "_" (swap! kernel-counter inc))
-        ;; Tile-parametric XMX GEMM (handles arbitrary M,N,K)
-        ;; XMX GEMM takes FP16 in, FP32 accum. Output dtype matches storage.
-        source (codegen/emit-gemm-tiled kname :c-dtype :float)]
+        tile (hardware/gemm-tile-for nil)
+        emitted (gpu-gemm/emit-scheduled-matrix-kernel
+                 {:kernel-name kname
+                  :id [:gpu-plan kname]
+                  :a (:A gemm-info) :b (:B gemm-info) :c (:C gemm-info)
+                  ;; This legacy registry entry binds dimensions positionally at invocation, so
+                  ;; its scheduled body owns stable internal ABI identities independent of whether
+                  ;; the caller supplies symbols, literals, or scalar expressions.
+                  :m 'M :n 'N :k 'K
+                  :tile tile :result-dtype :float
+                  :provenance {:dialect :gpu-plan :variant (:variant gemm-info)}})]
     {:kernel-name kname
-     :source source
+     :source (:source emitted)
+     :kernel-body (:kernel-body emitted)
+     :workgroup-size (first (:workgroup-size emitted))
      :dtype dtype
      :type :gemm
      :variant (:variant gemm-info)}))
@@ -177,8 +189,9 @@
       :tn
       ;; A^T @ B: transpose A first, then nn-GEMM
       (let [t-kernel (gen-transpose-kernel dtype kernel-counter)
-            gemm-kernel (gen-gemm-kernel (assoc gemm-info :variant :nn) dtype kernel-counter)
-            At-sym (with-meta (gensym "At_buf__") {:raster.buffer/hoistable true})]
+            At-sym (with-meta (gensym "At_buf__") {:raster.buffer/hoistable true})
+            gemm-kernel (gen-gemm-kernel (assoc gemm-info :variant :nn :A At-sym)
+                                         dtype kernel-counter)]
         {:bindings
          [[At-sym (device/alloc-expr dtype (list '* m k))]
           [(gensym "_gpu_") (list 'raster.gpu.ze-runtime/invoke-registered-transpose!
@@ -192,8 +205,9 @@
       :nt
       ;; A @ B^T: transpose B first, then nn-GEMM
       (let [t-kernel (gen-transpose-kernel dtype kernel-counter)
-            gemm-kernel (gen-gemm-kernel (assoc gemm-info :variant :nn) dtype kernel-counter)
-            Bt-sym (with-meta (gensym "Bt_buf__") {:raster.buffer/hoistable true})]
+            Bt-sym (with-meta (gensym "Bt_buf__") {:raster.buffer/hoistable true})
+            gemm-kernel (gen-gemm-kernel (assoc gemm-info :variant :nn :B Bt-sym)
+                                         dtype kernel-counter)]
         {:bindings
          [[Bt-sym (device/alloc-expr dtype (list '* k n))]
           [(gensym "_gpu_") (list 'raster.gpu.ze-runtime/invoke-registered-transpose!
@@ -267,7 +281,7 @@
                  (conj acc [sym expr]))
 
                 ;; GEMM REDOMAP (matmul written in the raster language, no BLAS call) →
-                ;; the SAME rewrite-gemm/emit-gemm-tiled path. #38: the redomap front door
+                ;; the SAME rewrite-gemm/scheduled-matrix-body path. #38: the redomap front door
                 ;; converges with the BLAS-name-match instead of falling through to the
                 ;; naive per-element SegOp kernel. gemm-info carries the identical
                 ;; {:variant :A :B :C :m :k :n :alpha :beta :result-sym} contract.

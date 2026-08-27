@@ -1376,6 +1376,10 @@
   the legacy template solely for the independent oracle and opaque-helper compatibility path."
   [kernel-name row-arr col-arr out-sym [M N L] [i-sym j-sym] tile epilogue kernel-body]
   (let [effective-tile (if kernel-body (:schedule kernel-body) tile)
+        result-dtype (if kernel-body
+                       (:dtype (first (filter #(= :result (:role %))
+                                              (:parameters kernel-body))))
+                       :half)
         sg (long (get-in effective-tile [:matrix :subgroup] 16))
         ep (if kernel-body
              (kernel-body-store-splice kernel-body)
@@ -1402,7 +1406,7 @@
             (vec (concat
                   [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
                    (kabi/slot col-arr :input :half :c-name "B" :role :operand)
-                   (kabi/slot out-sym :output :half :c-name "C" :role :result)
+                   (kabi/slot out-sym :output result-dtype :c-name "C" :role :result)
                    (kabi/slot 'M :scalar :int :role :dimension)
                    (kabi/slot 'N :scalar :int :role :dimension)
                    (kabi/slot 'K :scalar :int :role :dimension)]
@@ -1411,7 +1415,7 @@
                   (for [{:keys [sym dtype] :or {dtype :float}} (:scalars effective-epilogue)]
                     (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
       :dims [M N L]
-      :dtype :half
+      :dtype result-dtype
       :tile effective-tile
       :epilogue-params (when ep (:epilogue-params ep))
       :epilogue-operands (when ep (mapv :sym (:operands effective-epilogue)))

@@ -12,6 +12,9 @@
   (= (str "raster.compiler.ir.kernel_body." simple-name)
      (some-> value class .getName)))
 
+(defn- value-id? [value]
+  (or (symbol? value) (keyword? value)))
+
 (defn- only!
   [owner values]
   (let [values (vec values)]
@@ -27,7 +30,7 @@
 
 (defn- expression-references [expression]
   (cond
-    (symbol? expression) #{expression}
+    (value-id? expression) #{expression}
     (number? expression) #{}
     (record-kind? "IndexExpr" expression)
     (reduce into #{} (map expression-references (:arguments expression)))
@@ -39,7 +42,7 @@
   [expression needle]
   (cond
     (= expression needle) 1
-    (or (number? expression) (symbol? expression)) 0
+    (or (number? expression) (value-id? expression)) 0
     (not (record-kind? "IndexExpr" expression)) nil
     (not (contains? (expression-references expression) needle)) 0
     (= :add (:op expression))
@@ -72,7 +75,7 @@
   [expression]
   (cond
     (number? expression) {:constant expression :coefficients {}}
-    (symbol? expression) {:constant 0 :coefficients {expression 1}}
+    (value-id? expression) {:constant 0 :coefficients {expression 1}}
     (not (record-kind? "IndexExpr" expression)) nil
     (= :add (:op expression))
     (let [parts (map affine-form (:arguments expression))]
@@ -124,17 +127,30 @@
   its indices, fragments and operations.  Every field that affects generated code has an IR witness."
   [kernel-body]
   (let [kernel-body (body/validate! kernel-body)
-        {:keys [parameters indices masks fragments operations]} kernel-body
+        {:keys [parameters indices masks fragments operations attributes]} kernel-body
         parameters-by-role (group-by :role parameters)
         lhs-param (only! "lhs parameter" (:lhs parameters-by-role))
         rhs-param (only! "rhs parameter" (:rhs parameters-by-role))
         out-param (only! "result parameter" (:result parameters-by-role))
-        [[M K] [K' N] [M' N']] (map :shape [lhs-param rhs-param out-param])
-        _ (require! (= [M K N] [M' K' N'])
+        [[m-extent k-extent] [k-extent' n-extent] [m-extent' n-extent']]
+        (map :shape [lhs-param rhs-param out-param])
+        _ (require! (= [m-extent k-extent n-extent]
+                       [m-extent' k-extent' n-extent'])
                     "matrix parameter shapes do not compose" {:parameters parameters})
-        _ (require! (= #{'M 'N 'K} (set (map :id (:dimension parameters-by-role))))
-                    "matrix body requires the ordered M/N/K dimension ABI"
-                    {:dimensions (:dimension parameters-by-role)})
+        dimension-parameters (:dimension-parameters attributes)
+        m-parameter (:m dimension-parameters)
+        n-parameter (:n dimension-parameters)
+        k-parameter (:k dimension-parameters)
+        _ (require! (= #{m-parameter n-parameter k-parameter}
+                       (set (map :id (:dimension parameters-by-role))))
+                    "matrix body dimension roles and parameter identities disagree"
+                    {:dimension-parameters dimension-parameters
+                     :parameters (:dimension parameters-by-role)})
+        _ (require! (and (= :half (:dtype lhs-param)) (= :half (:dtype rhs-param))
+                         (contains? #{:half :float} (:dtype out-param)))
+                    "Intel matrix lowering requires f16 inputs and an f16 or f32 result"
+                    {:lhs-dtype (:dtype lhs-param) :rhs-dtype (:dtype rhs-param)
+                     :result-dtype (:dtype out-param)})
         fragment-map (into {} (map (juxt :id identity)) fragments)
         guard (only! "top-level guard" operations)
         _ (require! (record-kind? "Guard" guard)
@@ -182,12 +198,12 @@
         block-k (:step outer-loop)
         outer-index (:index outer-loop)
         inner-index (:index inner-loop)
-        _ (require! (and (= 0 (:lower outer-loop)) (= 'K (:upper outer-loop))
+        _ (require! (and (= 0 (:lower outer-loop)) (= k-parameter (:upper outer-loop))
                          (= outer-index (:lower inner-loop))
                          (= :min (get-in inner-loop [:upper :op]))
                          (affine= (first (get-in inner-loop [:upper :arguments]))
                                   block-k {outer-index 1})
-                         (= 'K (second (get-in inner-loop [:upper :arguments]))))
+                         (= k-parameter (second (get-in inner-loop [:upper :arguments]))))
                     "matrix K loops do not describe blocked exact-fragment traversal"
                     {:outer outer-loop :inner inner-loop})
         _ (require! (and (seq lhs-loads) (seq rhs-loads)
@@ -291,22 +307,22 @@
         predicates-of (fn [mask-id] (:predicates (get mask-map mask-id)))
         guard-predicates (predicates-of (:mask guard))
         _ (require! (and (= 2 (count guard-predicates))
-                         (some #(lt-affine? % 0 {m-base-id 1} 'M) guard-predicates)
-                         (some #(lt-affine? % 0 {(first n-base-ids) 1} 'N)
+                         (some #(lt-affine? % 0 {m-base-id 1} m-parameter) guard-predicates)
+                         (some #(lt-affine? % 0 {(first n-base-ids) 1} n-parameter)
                                guard-predicates))
                     "tile guard mask does not cover the M/N tile origins"
                     {:guard guard :mask (get mask-map (:mask guard))})
         load-mask (only! "matrix-load mask" (distinct (map :mask loads)))
         load-predicates (predicates-of load-mask)
         _ (require! (and (= 1 (count load-predicates))
-                         (lt-affine? (first load-predicates) 0 {inner-index 1} 'K))
+                         (lt-affine? (first load-predicates) 0 {inner-index 1} k-parameter))
                     "matrix loads require the fragment-index K mask"
                     {:mask (get mask-map load-mask)})
         prefetch-mask (only! "matrix-prefetch mask" (distinct (map :mask prefetches)))
         prefetch-predicates (predicates-of prefetch-mask)
         _ (require! (and (= 1 (count prefetch-predicates))
                          (lt-affine? (first prefetch-predicates)
-                                     (* prefetch-distance ki) {inner-index 1} 'K))
+                                     (* prefetch-distance ki) {inner-index 1} k-parameter))
                     "matrix prefetch mask and pipeline distance disagree"
                     {:mask (get mask-map prefetch-mask) :distance prefetch-distance})
         _ (require!
@@ -318,19 +334,19 @@
                         store (get store-by-fragment accumulator)
                         predicates (predicates-of (:mask store))]]
               (and (= 2 (count predicates))
-                   (some #(lt-affine? % (* m mi) {m-base-id 1} 'M) predicates)
-                   (some #(lt-affine? % 0 {(nth n-base-ids n) 1 lane-id 1} 'N)
+                   (some #(lt-affine? % (* m mi) {m-base-id 1} m-parameter) predicates)
+                   (some #(lt-affine? % 0 {(nth n-base-ids n) 1 lane-id 1} n-parameter)
                          predicates))))
            "tile-store masks do not match their fragment coordinates"
            {:stores stores :masks masks})]
     {:mi mi :ni ni :ki ki :subgroup subgroup
      :block-m block-m :block-n block-n :block-k block-k :sg-m sg-m :sg-n sg-n
      :ncols ncols :lhs-ids lhs-ids :rhs-ids rhs-ids :mad-by-operands mad-by-operands
-     :stores stores :prefetch prefetch-distance}))
+     :stores stores :prefetch prefetch-distance :result-dtype (:dtype out-param)}))
 
 (defn- emit-plan
   [kernel-name {:keys [mi ni ki subgroup block-m block-n block-k sg-m sg-n
-                       ncols lhs-ids rhs-ids mad-by-operands stores prefetch]}
+                       ncols lhs-ids rhs-ids mad-by-operands stores prefetch result-dtype]}
    {:keys [epilogue epilogue-params]}]
   (let [nms (count lhs-ids)
         nns (count rhs-ids)
@@ -341,6 +357,8 @@
         ms (range nms)
         ns (range nns)
         amul (fn [m] (if (zero? m) "m_base" (str "m_base+" (* m mi))))
+        c-type (case result-dtype :float "float" :half "half")
+        store-cast (if (= :half result-dtype) "(half)" "")
         kstep (fn [kpos]
                 (str "        { int pk = " kpos " + " (* prefetch ki) ";\n"
                      "          if (pk < K) {\n"
@@ -370,7 +388,7 @@
      "__attribute__((intel_reqd_sub_group_size(" subgroup ")))\n"
      "__kernel void " kernel-name "(\n"
      "    __global const half* restrict A,\n    __global const half* restrict B,\n"
-     "    __global half* restrict C,\n    int M, int N, int K"
+     "    __global " c-type "* restrict C,\n    int M, int N, int K"
      epilogue-params
      ") {\n"
      "    int sg_id = get_sub_group_id();\n    int sg_lid = get_sub_group_local_id();\n"
@@ -413,9 +431,9 @@
                             (let [acc-expr (str "acc" m n ".s" i)]
                               (str "        { int col = n_base" n " + sg_lid;\n          if (col < N) "
                                    (if epilogue
-                                     (str "C[row*N+col] = (half)("
+                                     (str "C[row*N+col] = " store-cast "("
                                           (epilogue acc-expr "row" "col") ");\n")
-                                     (str "C[row*N+col] = (half)(" acc-expr ");\n"))
+                                     (str "C[row*N+col] = " store-cast "(" acc-expr ");\n"))
                                    "        }\n"))))
                    "      }\n    }\n")))
      "}\n")))

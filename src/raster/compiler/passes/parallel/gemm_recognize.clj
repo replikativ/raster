@@ -3,7 +3,7 @@
    language as a nested map over C[i,j] with an inner k-reduction of the product
    of two array reads. It extracts the SAME descriptor the BLAS-name-match
    (gpu-plan/match-gemm-call) emits — {:variant :A :B :C :m :k :n :alpha :beta} —
-   so both front doors converge on ONE emission path (emit-gemm-tiled) instead of
+   so both front doors converge on ONE scheduled KernelBody emission path instead of
    the redomap falling through to the naive per-element SegOp kernel.
 
    This is Futhark's `isTileableRedomap`: the register-tiling precondition is that
@@ -196,7 +196,8 @@
    never a false positive). CONSERVATIVE proven-or-nil: a false positive would emit a
    tiled XMX kernel for a non-GEMM SoacMap (a silent miscompile). The descriptor is the
    GEMM *schedule payload* — the resident pass attaches it as a `:gemm` facet on this
-   SoacMap (Design S), which then dispatches to emit-gemm-tiled while staying a SOAC."
+   SoacMap (Design S), which then dispatches through the shared matrix-body scheduler while staying
+   a SOAC."
   [node]
   (when (and (instance? raster.compiler.ir.soac.SoacMap node)
              (= 1 (count (:outputs node))))

@@ -49,7 +49,7 @@
 (defn schedule-neighbors
   "The moves coordinate-descent explores over an S6 Schedule. Two WIRED axes:
      :tile — the GEMM tile (T2/T3), a CURATED per-descriptor candidate list
-             (hw/gemm-tile-candidates) that drives emit-gemm-tiled +
+             (hw/gemm-tile-candidates) that drives scheduled KernelBody emission +
              bind-registered-gemm-tiled! (real, priced kernels).
 
    Precision is deliberately NOT a default search axis: it changes numerical mode and therefore

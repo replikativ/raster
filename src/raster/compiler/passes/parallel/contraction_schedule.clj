@@ -21,6 +21,9 @@
 (defn- zero-init? [init]
   (and (number? init) (zero? init)))
 
+(defn- compiler-id? [value]
+  (or (symbol? value) (keyword? value)))
+
 (defn- lowered-dpas-instruction?
   [{:keys [family m n k subgroup]}]
   (and (= :dpas family) (= 8 m) (= 16 k)
@@ -39,21 +42,22 @@
          (zero? (mod block-k k)))))
 
 (defn- matrix-parameters
-  [row col out M N K row-layout col-layout out-layout epilogue]
-  (vec
-   (concat
-    [(body/->KernelParameter row :input :half [M K] :global row-layout :lhs)
-     (body/->KernelParameter col :input :half [K N] :global col-layout :rhs)
-     (body/->KernelParameter out :output :half [M N] :global out-layout :result)
-     (body/->KernelParameter 'M :scalar :int [] nil nil :dimension)
-     (body/->KernelParameter 'N :scalar :int [] nil nil :dimension)
-     (body/->KernelParameter 'K :scalar :int [] nil nil :dimension)]
-    (for [{:keys [sym dtype map] :or {dtype :float}} (:operands epilogue)]
-      (let [shape (axis-map/shape map)]
-        (body/->KernelParameter sym :input dtype shape :global
-                                (layout/row-major shape dtype) :epilogue)))
-    (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
-      (body/->KernelParameter sym :scalar dtype [] nil nil :epilogue)))))
+  [row col out M N K dimension-parameters row-layout col-layout out-layout result-dtype epilogue]
+  (let [[m-parameter n-parameter k-parameter] dimension-parameters]
+    (vec
+     (concat
+      [(body/->KernelParameter row :input :half [M K] :global row-layout :lhs)
+       (body/->KernelParameter col :input :half [K N] :global col-layout :rhs)
+       (body/->KernelParameter out :output result-dtype [M N] :global out-layout :result)
+       (body/->KernelParameter m-parameter :scalar :int [] nil nil :dimension)
+       (body/->KernelParameter n-parameter :scalar :int [] nil nil :dimension)
+       (body/->KernelParameter k-parameter :scalar :int [] nil nil :dimension)]
+      (for [{:keys [sym dtype map] :or {dtype :float}} (:operands epilogue)]
+        (let [shape (axis-map/shape map)]
+          (body/->KernelParameter sym :input dtype shape :global
+                                  (layout/row-major shape dtype) :epilogue)))
+      (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+        (body/->KernelParameter sym :scalar dtype [] nil nil :epilogue))))))
 
 (defn- scalar-region [epilogue]
   (when epilogue
@@ -68,13 +72,29 @@
 (defn- fragment-id [prefix a & [b]]
   (keyword (str prefix "-" a (when (some? b) (str "-" b)))))
 
-(defn- build-matrix-body
-  [contract-facts tile bindings epilogue operation-id]
-  (let [{:keys [out free-axes contract-axes]} contract-facts
-        [[i M] [j N]] free-axes
-        [[k-sym K]] contract-axes
-        row (:row bindings)
-        col (:col bindings)
+(defn matrix-body
+  "Construct one target-neutral scheduled matrix body from an already chosen canonical layout.
+
+  `dimensions` are semantic tensor extents while `dimension-parameters` are the ordered compiler
+  identities bound to the emitted M/N/K ABI.  Keeping both makes static contraction facts and
+  symbolic resident graphs share one body without renaming caller values.  The current matrix
+  instruction is f16×f16→f32; `result-dtype` controls only the final store representation."
+  [{:keys [id row col out dimensions dimension-parameters axis-symbols tile bindings epilogue
+           result-dtype provenance]
+    :or {dimension-parameters ['M 'N 'K]
+         axis-symbols ['i 'j 'k]
+         result-dtype :half
+         provenance {}}}]
+  (let [tile (assoc tile :num-stages (or (:num-stages tile) 3))
+        _ (when-not (and (= 3 (count dimension-parameters))
+                         (every? compiler-id? dimension-parameters)
+                         (= 3 (count (set dimension-parameters))))
+            (throw (ex-info "matrix body requires three distinct compiler dimension identities"
+                            {:reason :raster/bug
+                             :dimension-parameters dimension-parameters})))
+        [M N K] dimensions
+        [m-parameter n-parameter k-parameter] dimension-parameters
+        [i j k-sym] axis-symbols
         matrix (:matrix tile)
         desc {:matrix matrix :subgroup-size (:subgroup matrix)}
         acc-layout (layout/derive-layout :mma-acc :float desc)
@@ -84,7 +104,7 @@
         k-width (max 1 (quot 32 (layout/dtype-bits :half)))
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
-        out-layout (layout/row-major [M N] :half)
+        out-layout (layout/row-major [M N] result-dtype)
         {:keys [block-m block-n block-k sg-m sg-n num-stages]} tile
         {matrix-m :m matrix-n :n matrix-k :k subgroup :subgroup} matrix
         subgroup-rows (quot block-m sg-m)
@@ -122,17 +142,17 @@
         (vec
          (concat
           [(body/->Mask :tile-active
-                        [(body/predicate :lt m-base 'M)
-                         (body/predicate :lt (n-base 0) 'N)])
-           (body/->Mask :k-active [(body/predicate :lt 'k-fragment 'K)])
+                        [(body/predicate :lt m-base m-parameter)
+                         (body/predicate :lt (n-base 0) n-parameter)])
+           (body/->Mask :k-active [(body/predicate :lt 'k-fragment k-parameter)])
            (body/->Mask :prefetch-active
                         [(body/predicate :lt
-                                         (add 'k-fragment (* num-stages matrix-k)) 'K)])]
+                                         (add 'k-fragment (* num-stages matrix-k)) k-parameter)])]
           (for [mm (range m-fragments) nn (range n-fragments)]
             (body/->Mask
              (fragment-id "store" mm nn)
-             [(body/predicate :lt (add m-base (* mm matrix-m)) 'M)
-              (body/predicate :lt (add (n-base nn) lane-id) 'N)]))))
+             [(body/predicate :lt (add m-base (* mm matrix-m)) m-parameter)
+              (body/predicate :lt (add (n-base nn) lane-id) n-parameter)]))))
         accumulator-ids (vec (for [mm (range m-fragments) nn (range n-fragments)]
                                (fragment-id "acc" mm nn)))
         row-fragment-ids (vec (for [mm (range m-fragments)] (fragment-id "lhs" mm)))
@@ -168,10 +188,10 @@
                               matrix))))
         init-ops (mapv #(body/->FragmentInit % 0.0) accumulator-ids)
         fragment-loop (body/->Loop k-fragment 'k-block
-                                   (body/expression :min (add 'k-block block-k) 'K)
+                                   (body/expression :min (add 'k-block block-k) k-parameter)
                                    matrix-k one-k-step
                                    {:unroll true :matrix-step matrix-k})
-        k-loop (body/->Loop 'k-block 0 'K block-k [fragment-loop]
+        k-loop (body/->Loop 'k-block 0 k-parameter block-k [fragment-loop]
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
@@ -184,20 +204,22 @@
                    (fragment-id "store" mm nn) region)))
         workgroup-size (* subgroup-rows subgroup-cols subgroup)]
     (body/make
-     {:id [:contraction (or operation-id out)]
-      :parameters (matrix-parameters row col out M N K row-layout col-layout out-layout epilogue)
+     {:id id
+      :parameters (matrix-parameters row col out M N K dimension-parameters
+                                     row-layout col-layout out-layout result-dtype epilogue)
       :indices indices
       :masks masks
       :fragments fragments
       :operations [(body/->Guard :tile-active (vec (concat init-ops [k-loop] stores)))]
       :schedule tile
       :launch {:workgroup-size [workgroup-size 1]
-               :group-count [(body/expression :ceil-div 'N block-n)
-                             (body/expression :ceil-div 'M block-m)]}
-      :provenance {:dialect :segcontract :operation-id operation-id}
+               :group-count [(body/expression :ceil-div n-parameter block-n)
+                             (body/expression :ceil-div m-parameter block-m)]}
+      :provenance provenance
       :attributes {:kind :matrix-contraction
                    :instruction-family (:family matrix)
                    :dims [M N K]
+                   :dimension-parameters {:m m-parameter :n n-parameter :k k-parameter}
                    :axis-symbols [i j k-sym]
                    :bindings bindings
                    :boundary-policy {:m :masked :n :masked :k :exact-fragments}
@@ -281,4 +303,15 @@
        {:ok true
         :bindings bindings
         :tile tile
-        :body (build-matrix-body contract-facts tile bindings epilogue operation-id)}))))
+        :body (matrix-body
+               {:id [:contraction (or operation-id (:out contract-facts))]
+                :row (:row bindings)
+                :col (:col bindings)
+                :out (:out contract-facts)
+                :dimensions [M N K]
+                :axis-symbols (vec (concat (map first free-axes)
+                                           (map first contract-axes)))
+                :tile tile
+                :bindings bindings
+                :epilogue epilogue
+                :provenance {:dialect :segcontract :operation-id operation-id}})}))))

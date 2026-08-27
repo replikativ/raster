@@ -885,14 +885,14 @@
   [what have-elements offset elements elem-size other-bytes]
   (let [have-elements (long have-elements) offset (long offset) elements (long elements)
         elem-size (long elem-size) other-bytes (long other-bytes)]
-  (when (or (neg? offset) (neg? elements))
-    (throw (ex-info (str what ": negative offset or length") {:offset offset :elements elements})))
-  (when (> (+ offset elements) have-elements)
-    (throw (ex-info (str what ": range exceeds the buffer")
-                    {:offset offset :elements elements :buffer-elements have-elements})))
-  (when (> (* elements elem-size) other-bytes)
-    (throw (ex-info (str what ": range exceeds the host-side array/segment")
-                    {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
+    (when (or (neg? offset) (neg? elements))
+      (throw (ex-info (str what ": negative offset or length") {:offset offset :elements elements})))
+    (when (> (+ offset elements) have-elements)
+      (throw (ex-info (str what ": range exceeds the buffer")
+                      {:offset offset :elements elements :buffer-elements have-elements})))
+    (when (> (* elements elem-size) other-bytes)
+      (throw (ex-info (str what ": range exceeds the host-side array/segment")
+                      {:needed-bytes (* elements elem-size) :available-bytes other-bytes})))))
 
 (defn plan-range
   "Validate one ranged transfer and return its byte-level PLAN, without copying anything:
@@ -1306,6 +1306,18 @@
 ;; GPU GEMM (non-square XMX)
 ;; ================================================================
 
+(defn- emit-scheduled-gemm
+  "Ask the compiler for the shared scheduled matrix body and its direct OpenCL lowering."
+  [kernel-name c-dtype tile]
+  ((requiring-resolve 'raster.compiler.backend.gpu.gemm/emit-scheduled-matrix-kernel)
+   {:kernel-name kernel-name
+    :id [:resident-gemm kernel-name]
+    :a 'A :b 'B :c 'C :m 'M :n 'N :k 'K
+    :tile tile :result-dtype c-dtype
+    :provenance {:dialect :resident-runtime}}))
+
+(declare gemm-tile)
+
 (def ^:private gemm-cache
   "Cache for compiled GEMM kernels, keyed by C-output dtype (:half | :float).
    Each entry is {:module :kernel :kernel-name}. (A/B are always fp16 in.)"
@@ -1318,16 +1330,18 @@
   (ensure-init!)
   (or (get @gemm-cache c-dtype)
       (let [kname (str "gemm_nonsquare_" (name c-dtype))
-            cl-src (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                       ((resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled)
-                        kname :c-dtype c-dtype))
+            tile (gemm-tile)
+            emitted (emit-scheduled-gemm kname c-dtype tile)
+            cl-src (:source emitted)
             device-hex (:device-id-hex @state)
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                      cl-src :device device-hex))
             module (load-module! spv)
             kernel (create-kernel module kname)
-            entry {:module module :kernel kernel :kernel-name kname}]
+            entry {:module module :kernel kernel :kernel-name kname
+                   :tile tile :kernel-body (:kernel-body emitted)
+                   :workgroup (:workgroup-size emitted)}]
         (swap! gemm-cache assoc c-dtype entry)
         entry)))
 
@@ -1350,16 +1364,15 @@
 
   Returns C."
   [a b c m n k]
-  (let [{:keys [kernel]} (ensure-gemm-kernel! :half)
-        {:keys [block-m block-n]} (gemm-tile)
+  (let [{:keys [kernel tile workgroup]} (ensure-gemm-kernel! :half)
+        {:keys [block-m block-n]} tile
         gc-m (int (Math/ceil (/ (double m) (double block-m))))
         gc-n (int (Math/ceil (/ (double n) (double block-n))))
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)}
               {:type :int :value (int n)}
               {:type :int :value (int k)}]]
-    ;; 256 work-items per workgroup (16 subgroups × 16 lanes)
-    (launch-2d! kernel [256 1] [gc-n gc-m] args)
+    (launch-2d! kernel workgroup [gc-n gc-m] args)
     c))
 
 ;; ================================================================
@@ -2137,24 +2150,23 @@
                             " — a mismatched write reads back as garbage. Allocate C as " c-dtype
                             " or pass the matching c-dtype.")
                        {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
-   (let [{:keys [module kernel-name]} (ensure-gemm-kernel! c-dtype)
+   (let [{:keys [module kernel-name tile workgroup]} (ensure-gemm-kernel! c-dtype)
          kh (create-kernel-fresh module kernel-name)
          m (long m) n (long n) k (long k)
          args [(:segment a) (:segment b) (:segment c)
                {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-         bnd (bind-kernel! kh [256 1] args)
+         bnd (bind-kernel! kh workgroup args)
          gc ^MemorySegment (:gc-seg bnd)]
-     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n (gemm-tile)))))))   ;; X = gc-n
-     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m (gemm-tile)))))))   ;; Y = gc-m
+     (.set gc I32 0 (int (Math/ceil (/ (double n) (double (:block-n tile))))))   ;; X = gc-n
+     (.set gc I32 4 (int (Math/ceil (/ (double m) (double (:block-m tile))))))   ;; Y = gc-m
      (.set gc I32 8 (int 1))
      bnd)))
 
 ;; ── TILE-PARAMETRIC GEMM (autotune-facing) ─────────────────────────────────────
-;; The default bind-registered-gemm! above emits the derived-default tile (hardcoded 128/256
-;; launch). This path takes an EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune
-;; candidate) and DERIVES the launch geometry from it — the regular form: workgroup = subgroups ×
-;; subgroup-size, grid = ceil(n/block-n) × ceil(m/block-m). At the derived-default tile it produces
-;; the identical launch, so this is a strict generalization of the hardcoded path.
+;; The default bind-registered-gemm! above schedules the device-derived default tile. This path
+;; takes an EXPLICIT tile map (from schedule/derive-gemm-tile or an autotune candidate) through the
+;; same KernelBody scheduler and derives launch geometry from that body. At the default tile it
+;; produces identical source and launch geometry.
 
 (def ^:private gemm-tiled-cache
   "Compiled tile-parametric GEMM kernels, keyed by [c-dtype tile-map]. Distinct tiles are distinct
@@ -2171,15 +2183,15 @@
   (ensure-init!)
   (or (get @gemm-tiled-cache [c-dtype tile])
       (let [kname (str "gemm_tiled_" (name c-dtype) "_" (tile-signature tile))
-            emit  (do (require 'raster.compiler.backend.gpu.opencl-codegen)
-                      (resolve 'raster.compiler.backend.gpu.opencl-codegen/emit-gemm-tiled))
-            cl-src (apply emit kname :c-dtype c-dtype :prefetch (:num-stages tile 3)
-                          (mapcat identity (select-keys tile [:block-m :block-n :sg-m :sg-n :block-k :matrix])))
+            emitted (emit-scheduled-gemm kname c-dtype tile)
+            cl-src (:source emitted)
             spv (do (require 'raster.compiler.support.spirv-cache)
                     ((resolve 'raster.compiler.support.spirv-cache/compile-opencl-to-spirv)
                      cl-src :device (:device-id-hex @state)))
             module (load-module! spv)
-            entry {:module module :kernel-name kname :tile tile}]
+            entry {:module module :kernel-name kname :tile tile
+                   :kernel-body (:kernel-body emitted)
+                   :workgroup (:workgroup-size emitted)}]
         (swap! gemm-tiled-cache assoc [c-dtype tile] entry)
         entry)))
 
@@ -2192,15 +2204,12 @@
     (when (not= bd c-dtype)
       (throw (ex-info (str "bind-registered-gemm-tiled!: output buffer dtype " bd " ≠ kernel dtype " c-dtype)
                       {:buffer-dtype bd :kernel-c-dtype c-dtype}))))
-  (let [{:keys [module kernel-name]} (ensure-gemm-kernel-tiled! c-dtype tile)
-        {:keys [block-m block-n sg-m sg-n matrix]} tile
-        sg   (long (:subgroup matrix 16))
-        n-subgroups (* (quot (long block-m) (long sg-m)) (quot (long block-n) (long sg-n)))
-        wg   (* n-subgroups sg)
+  (let [{:keys [module kernel-name workgroup]} (ensure-gemm-kernel-tiled! c-dtype tile)
+        {:keys [block-m block-n]} tile
         kh   (create-kernel-fresh module kernel-name)
         args [(:segment a) (:segment b) (:segment c)
               {:type :int :value (int m)} {:type :int :value (int n)} {:type :int :value (int k)}]
-        bnd  (bind-kernel! kh [wg 1] args)
+        bnd  (bind-kernel! kh workgroup args)
         gc ^MemorySegment (:gc-seg bnd)]
     (.set gc I32 0 (int (Math/ceil (/ (double n) (double block-n)))))   ;; X = gc-n
     (.set gc I32 4 (int (Math/ceil (/ (double m) (double block-m)))))   ;; Y = gc-m
@@ -3477,29 +3486,29 @@
   [kernel-name k], converting to f16 when `half?`. Returns the MemorySegment."
   ^MemorySegment [^String kernel-name k arr nel half? esize]
   (let [nel (long nel) esize (long esize)]
-   (if half?
-    (let [shorts (ensure-arr kernel-name (keyword (str (name k) "-sh")) nel)
-          seg (ensure-seg kernel-name k (* nel 2))]
-      (if (instance? (Class/forName "[F") arr)
-        (let [^floats af arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (aget af i))))))
-        (let [^doubles ad arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (float (aget ad i))))))))
-      (MemorySegment/copy (MemorySegment/ofArray shorts) 0 seg 0 (* nel 2))
-      seg)
-    (let [seg (ensure-seg kernel-name k (* nel esize))]
-      (MemorySegment/copy (MemorySegment/ofArray arr) 0 seg 0 (* nel esize))
-      seg))))
+    (if half?
+      (let [shorts (ensure-arr kernel-name (keyword (str (name k) "-sh")) nel)
+            seg (ensure-seg kernel-name k (* nel 2))]
+        (if (instance? (Class/forName "[F") arr)
+          (let [^floats af arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (aget af i))))))
+          (let [^doubles ad arr] (dotimes [i nel] (aset shorts i (short (Float/floatToFloat16 (float (aget ad i))))))))
+        (MemorySegment/copy (MemorySegment/ofArray shorts) 0 seg 0 (* nel 2))
+        seg)
+      (let [seg (ensure-seg kernel-name k (* nel esize))]
+        (MemorySegment/copy (MemorySegment/ofArray arr) 0 seg 0 (* nel esize))
+        seg))))
 
 (defn- readback-operand!
   "Copy `nel` elements from shared segment `seg` back into host array `out`, converting from
   f16 when `half?`."
   [^MemorySegment seg out nel half? esize]
   (let [nel (long nel) esize (long esize)]
-   (if half?
-    (if (instance? (Class/forName "[F") out)
-      (let [^floats of out] (dotimes [i nel] (aset of i (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))
-      (let [^doubles od out] (dotimes [i nel] (aset od i (double (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))))
-    (MemorySegment/copy seg 0 (MemorySegment/ofArray out) 0 (* nel esize)))
-  out))
+    (if half?
+      (if (instance? (Class/forName "[F") out)
+        (let [^floats of out] (dotimes [i nel] (aset of i (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))
+        (let [^doubles od out] (dotimes [i nel] (aset od i (double (Float/float16ToFloat (.get seg ValueLayout/JAVA_SHORT (long (* i 2)))))))))
+      (MemorySegment/copy seg 0 (MemorySegment/ofArray out) 0 (* nel esize)))
+    out))
 
 (defn invoke-registered-contraction!
   "Launch a routed contraction by its registered executable artifact.
