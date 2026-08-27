@@ -10,17 +10,10 @@
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.tuning-cache :as cache])
   (:import [java.nio.file Files]))
-
-(def ^:private opencl-available?
-  (delay
-    (try
-      (require 'raster.gpu.ocl-runtime)
-      ((resolve 'raster.gpu.ocl-runtime/init!))
-      true
-      (catch Throwable _ false))))
 
 (def ^:private abi
   [(kabi/slot 'x :input :float :role :operand)
@@ -162,8 +155,8 @@
     (assert-device-tuning! :ze:0)))
 
 (deftest opencl-validates-and-measures-emitted-dispatch-alternatives
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "validated KernelDispatch benchmark")
     (assert-device-tuning! :ocl:0)))
 
 (deftest level-zero-validates-and-measures-a-multi-kernel-dispatch-alternative
@@ -172,6 +165,6 @@
     (assert-graph-tuning! :ze:0)))
 
 (deftest opencl-validates-and-measures-a-multi-kernel-dispatch-alternative
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "validated multi-kernel dispatch benchmark")
     (assert-graph-tuning! :ocl:0)))

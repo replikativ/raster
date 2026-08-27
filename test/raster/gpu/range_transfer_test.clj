@@ -13,20 +13,14 @@
    `(min buf src)` bytes, which is fine for a whole-buffer copy and exactly wrong for a range."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as g])
+            [raster.gpu.core :as g]
+            [raster.gpu.device-probe :as device-probe])
   (:import [java.lang.foreign Arena MemorySegment ValueLayout]))
 
 ;; gemma-270m's real KV shape: 2048 positions x (1 kv-head x 256 head-dim)
 (def ^:private maxpos 2048)
 (def ^:private kvrow 256)
 (def ^:private N (* maxpos kvrow))
-
-(def ^:private opencl-available?
-  (delay
-    (try
-      ((requiring-resolve 'raster.gpu.ocl-runtime/init!))
-      true
-      (catch Throwable _ false))))
 
 (defn- with-filled-session
   "A session whose :kc0 buffer holds value=index at every element, so any disturbance is visible."
@@ -111,8 +105,8 @@
           (g/close-session! session))))))
 
 (deftest opencl-resident-range-copy-uses-the-device-buffer-path
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident range copy")
     (let [session (g/make-session :ocl:0)]
       (try
         (g/alloc! session {:source [:float 6 (float-array [1 2 3 4 5 6])]

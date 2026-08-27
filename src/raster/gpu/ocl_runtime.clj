@@ -87,6 +87,8 @@
 ;; ================================================================
 
 (def ^:private CL_SUCCESS 0)
+(def ^:private CL_DEVICE_NOT_FOUND -1)
+(def ^:private CL_PLATFORM_NOT_FOUND_KHR -1001)
 (def ^:private CL_DEVICE_TYPE_GPU (long 4))
 (def ^:private CL_DEVICE_TYPE_CPU (long 2))
 (def ^:private CL_DEVICE_TYPE_ALL (long 0xFFFFFFFF))
@@ -228,6 +230,13 @@
                       {:function name :error ret})))
     ret))
 
+(defn- check-cl-result!
+  [^String name ret]
+  (when (not= CL_SUCCESS ret)
+    (throw (ex-info (str "OpenCL " name " failed with error " ret)
+                    {:function name :error ret})))
+  ret)
+
 ;; ================================================================
 ;; State management
 ;; ================================================================
@@ -240,6 +249,7 @@
          :queue nil          ;; MemorySegment (cl_command_queue)
          :arena nil          ;; Arena for long-lived allocations
          :device-name nil
+         :device-info nil
          :unified-memory? false
          :buffer-offset-alignment nil ;; bytes; CL_DEVICE_MEM_BASE_ADDR_ALIGN is reported in bits
          :programs {}        ;; source-hash -> cl_program handle
@@ -268,13 +278,14 @@
   (let [arena (Arena/ofConfined)
         size-ret (.allocate arena I64)]
     (try
-      (.invokeWithArguments ^MethodHandle @h-clGetDeviceInfo
-                            (into-array Object [device (int param-name) (long 0)
-                                                MemorySegment/NULL size-ret]))
+      (cl-call! "clGetDeviceInfo"
+                @h-clGetDeviceInfo
+                [device (int param-name) (long 0) MemorySegment/NULL size-ret])
       (let [size (long (.get size-ret I64 0))
             buf (.allocate arena size)]
-        (.invokeWithArguments ^MethodHandle @h-clGetDeviceInfo
-                              (into-array Object [device (int param-name) size buf size-ret]))
+        (cl-call! "clGetDeviceInfo"
+                  @h-clGetDeviceInfo
+                  [device (int param-name) size buf size-ret])
         (let [s (.getString buf 0)]
           (.trim s)))
       (finally (.close arena)))))
@@ -285,8 +296,9 @@
   (let [arena (Arena/ofConfined)
         buf (.allocate arena I32)]
     (try
-      (.invokeWithArguments ^MethodHandle @h-clGetDeviceInfo
-                            (into-array Object [device (int param-name) (long 4) buf MemorySegment/NULL]))
+      (cl-call! "clGetDeviceInfo"
+                @h-clGetDeviceInfo
+                [device (int param-name) (long 4) buf MemorySegment/NULL])
       (long (.get buf I32 0))
       (finally (.close arena)))))
 
@@ -296,8 +308,9 @@
   (let [arena (Arena/ofConfined)
         buf (.allocate arena I64)]
     (try
-      (.invokeWithArguments ^MethodHandle @h-clGetDeviceInfo
-                            (into-array Object [device (int param-name) (long 8) buf MemorySegment/NULL]))
+      (cl-call! "clGetDeviceInfo"
+                @h-clGetDeviceInfo
+                [device (int param-name) (long 8) buf MemorySegment/NULL])
       (long (.get buf I64 0))
       (finally (.close arena)))))
 
@@ -318,6 +331,21 @@
       (throw (ex-info "OpenCL reported an invalid buffer base-address alignment"
                       {:alignment-bits bits})))
     (quot bits 8)))
+
+(defn- device-info
+  [device]
+  {:name (query-device-info-string device CL_DEVICE_NAME)
+   :vendor (query-device-info-string device CL_DEVICE_VENDOR)
+   :version (query-device-info-string device CL_DEVICE_VERSION)
+   :max-compute-units (query-device-info-uint device CL_DEVICE_MAX_COMPUTE_UNITS)
+   :max-work-group-size (query-device-info-size-t device CL_DEVICE_MAX_WORK_GROUP_SIZE)
+   :max-clock-mhz (query-device-info-uint device CL_DEVICE_MAX_CLOCK_FREQUENCY)
+   :global-mem-bytes (query-device-info-ulong device CL_DEVICE_GLOBAL_MEM_SIZE)
+   :buffer-offset-alignment (device-buffer-offset-alignment device)
+   :extensions (query-device-info-string device CL_DEVICE_EXTENSIONS)
+   :integrated? (try
+                  (== 1 (query-device-info-uint device CL_DEVICE_HOST_UNIFIED_MEMORY))
+                  (catch Exception _ false))})
 
 ;; ================================================================
 ;; Initialization
@@ -356,7 +384,10 @@
                        ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
                                                       (into-array Object [plat (long (requested-device-type))
                                                                           (int 0) MemorySegment/NULL num-dev-seg])))]
-                   (when (== CL_SUCCESS ret)
+                   (cond
+                     (= CL_DEVICE_NOT_FOUND ret) nil
+                     (not= CL_SUCCESS ret) (check-cl-result! "clGetDeviceIDs" ret)
+                     :else
                      (let [num-dev (read-int num-dev-seg)]
                        (when (> num-dev 0)
                          (let [dev-buf (.allocate arena 8)
@@ -366,6 +397,13 @@
                            [plat dev]))))))
                (range num-plat))
               (throw (ex-info "No OpenCL GPU devices found" {:num-platforms num-plat})))
+
+          ;; Complete all fallible capability queries before allocating a context/queue.  A broken
+          ;; clGetDeviceInfo must not leave native execution resources unreachable.
+          device-info (device-info device)
+          dev-name (:name device-info)
+          unified? (:integrated? device-info)
+          buffer-offset-alignment (:buffer-offset-alignment device-info)
 
           ;; Create context
           err-seg (.allocate arena I32)
@@ -380,12 +418,7 @@
           queue (.invokeWithArguments ^MethodHandle @h-clCreateCommandQueue
                                       (into-array Object [ctx device (long 0) err-seg]))
           _ (when (not= CL_SUCCESS (read-int err-seg))
-              (throw (ex-info "clCreateCommandQueue failed" {:error (read-int err-seg)})))
-
-          dev-name (query-device-info-string device CL_DEVICE_NAME)
-          unified? (try (== 1 (query-device-info-uint device CL_DEVICE_HOST_UNIFIED_MEMORY))
-                        (catch Exception _ false))
-          buffer-offset-alignment (device-buffer-offset-alignment device)]
+              (throw (ex-info "clCreateCommandQueue failed" {:error (read-int err-seg)})))]
 
       (swap! state assoc
              :initialized? true
@@ -395,58 +428,70 @@
              :queue queue
              :arena arena
              :device-name dev-name
+             :device-info device-info
              :unified-memory? unified?
              :buffer-offset-alignment buffer-offset-alignment)
       (println (str "[ocl-runtime] Initialized: " dev-name
                     (when unified? " (unified memory)"))))))
 
 (defn query-devices
-  "Query all OpenCL GPU devices across all platforms.
-  Returns a vector of device info maps."
+  "Query all requested OpenCL devices across all platforms.
+
+   A clean CL_PLATFORM_NOT_FOUND_KHR or per-platform CL_DEVICE_NOT_FOUND is represented by an
+   empty vector. Loader, FFM, driver, and device-info failures propagate: callers must not confuse
+   a broken runtime with an absent device."
   []
-  (try
-    @ocl-lib ;; Force library load
-    (let [arena (Arena/ofConfined)]
-      (try
-        (let [num-plat-seg (.allocate arena I32)
-              _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
-                          [(int 0) MemorySegment/NULL num-plat-seg])
-              num-plat (read-int num-plat-seg)
-              plat-buf (.allocate arena (* num-plat 8))
-              _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
-                          [(int num-plat) plat-buf num-plat-seg])]
-          (vec
-           (mapcat
-            (fn [plat-idx]
-              (let [plat (.get plat-buf PTR (* plat-idx 8))
-                    num-dev-seg (.allocate arena I32)
-                    ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
-                                                   (into-array Object [plat (long (requested-device-type))
-                                                                       (int 0) MemorySegment/NULL num-dev-seg])))]
-                (when (== CL_SUCCESS ret)
-                  (let [num-dev (read-int num-dev-seg)
-                        dev-buf (.allocate arena (* num-dev 8))
-                        _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
-                                    [plat (long (requested-device-type)) (int num-dev) dev-buf num-dev-seg])]
-                    (mapv
-                     (fn [dev-idx]
-                       (let [dev (.get dev-buf PTR (* dev-idx 8))]
-                         {:name (query-device-info-string dev CL_DEVICE_NAME)
-                          :vendor (query-device-info-string dev CL_DEVICE_VENDOR)
-                          :version (query-device-info-string dev CL_DEVICE_VERSION)
-                          :max-compute-units (query-device-info-uint dev CL_DEVICE_MAX_COMPUTE_UNITS)
-                          :max-work-group-size (query-device-info-size-t dev CL_DEVICE_MAX_WORK_GROUP_SIZE)
-                          :max-clock-mhz (query-device-info-uint dev CL_DEVICE_MAX_CLOCK_FREQUENCY)
-                          :global-mem-bytes (query-device-info-ulong dev CL_DEVICE_GLOBAL_MEM_SIZE)
-                          :buffer-offset-alignment (device-buffer-offset-alignment dev)
-                          :extensions (query-device-info-string dev CL_DEVICE_EXTENSIONS)
-                          :integrated? (try (== 1 (query-device-info-uint dev CL_DEVICE_HOST_UNIFIED_MEMORY))
-                                            (catch Exception _ false))}))
-                     (range num-dev))))))
-            (range num-plat))))
-        (finally (.close arena))))
-    (catch Exception _
-      [])))
+  @ocl-lib
+  (let [arena (Arena/ofConfined)]
+    (try
+      (let [num-plat-seg (.allocate arena I32)
+            platform-ret
+            (int (.invokeWithArguments ^MethodHandle @h-clGetPlatformIDs
+                                       (into-array Object [(int 0) MemorySegment/NULL num-plat-seg])))]
+        (if (= CL_PLATFORM_NOT_FOUND_KHR platform-ret)
+          []
+          (let [_ (check-cl-result! "clGetPlatformIDs" platform-ret)
+                num-plat (read-int num-plat-seg)]
+            (if (zero? num-plat)
+              []
+              (let [plat-buf (.allocate arena (* num-plat 8))
+                    _ (cl-call! "clGetPlatformIDs" @h-clGetPlatformIDs
+                                [(int num-plat) plat-buf num-plat-seg])]
+                (vec
+                 (mapcat
+                  (fn [plat-idx]
+                    (let [plat (.get plat-buf PTR (* plat-idx 8))
+                          num-dev-seg (.allocate arena I32)
+                          ret (int (.invokeWithArguments ^MethodHandle @h-clGetDeviceIDs
+                                                         (into-array
+                                                          Object
+                                                          [plat (long (requested-device-type))
+                                                           (int 0) MemorySegment/NULL num-dev-seg])))]
+                      (cond
+                        (= CL_DEVICE_NOT_FOUND ret) []
+                        (not= CL_SUCCESS ret) (check-cl-result! "clGetDeviceIDs" ret)
+                        :else
+                        (let [num-dev (read-int num-dev-seg)]
+                          (if (zero? num-dev)
+                            []
+                            (let [dev-buf (.allocate arena (* num-dev 8))
+                                  _ (cl-call! "clGetDeviceIDs" @h-clGetDeviceIDs
+                                              [plat (long (requested-device-type))
+                                               (int num-dev) dev-buf num-dev-seg])]
+                              (mapv (fn [dev-idx]
+                                      (device-info (.get dev-buf PTR (* dev-idx 8))))
+                                    (range num-dev))))))))
+                  (range num-plat))))))))
+      (finally (.close arena)))))
+
+(defn selected-device-info
+  "Return the exact OpenCL device bound by this singleton runtime.
+
+   Capability gates must use this value rather than searching `query-devices`: the latter may
+   contain devices with capabilities that the initialized context and queue do not have."
+  []
+  (ensure-init!)
+  (:device-info @state))
 
 ;; ================================================================
 ;; DeviceBuffer (OpenCL cl_mem backed)
@@ -1626,7 +1671,8 @@
         (.close ^Arena arena))
       (clojure.core/reset! state
                            {:initialized? false :platform nil :device nil :context nil
-                            :queue nil :arena nil :device-name nil :unified-memory? false
+                            :queue nil :arena nil :device-name nil :device-info nil
+                            :unified-memory? false
                             :buffer-offset-alignment nil
                             :programs {} :kernels {}}))))
 
@@ -1638,7 +1684,8 @@
       (.close ^Arena arena)))
   (clojure.core/reset! state
                        {:initialized? false :platform nil :device nil :context nil
-                        :queue nil :arena nil :device-name nil :unified-memory? false
+                        :queue nil :arena nil :device-name nil :device-info nil
+                        :unified-memory? false
                         :buffer-offset-alignment nil
                         :programs {} :kernels {}})
   (clojure.core/reset! kernel-registry {})

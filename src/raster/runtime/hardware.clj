@@ -279,8 +279,11 @@
 ;; ================================================================
 
 (defn- detect-opencl-devices
-  "Detect OpenCL GPU devices via raster.gpu.ocl-runtime.
-  Returns seq of device maps or empty seq."
+  "Detect the OpenCL device the singleton runtime can actually bind.
+
+   `ocl-runtime/query-devices` may enumerate several devices, but the current runtime owns one
+   context/queue and selects the first requested device.  Advertising :ocl:1+ would promise device
+   selection that `gpu.core` cannot preserve."
   []
   (try
     (require 'raster.gpu.ocl-runtime)
@@ -311,7 +314,7 @@
                      :name dev-name
                      :capabilities caps
                      :source source}))
-                (range) devices))))
+                (range) (take 1 devices)))))
     (catch Exception e
       (when (System/getenv "ROMEO_DEBUG")
         (println "OpenCL detection failed:" (.getMessage e)))
