@@ -11,19 +11,12 @@
             [raster.dl.array-ops :as array-ops]
             [raster.dl.gpu-grad-parity :as gp]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]
             [raster.gpu.dispatch-benchmark :as benchmark]
             [raster.gpu.link :as link]
             [raster.gpu.tuning-cache :as cache]
             [raster.numeric])
   (:import [java.nio.file Files]))
-
-(def ^:private opencl-available?
-  (delay
-    (try
-      (require 'raster.gpu.ocl-runtime)
-      ((resolve 'raster.gpu.ocl-runtime/init!))
-      true
-      (catch Throwable _ false))))
 
 (defn- chain
   []
@@ -121,8 +114,8 @@
     (run-case :ze:0)))
 
 (deftest opencl-indexed-attention-matches-independent-plan-oracle
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "indexed attention plan oracle")
     (run-case :ocl:0)))
 
 (defn- production-case
@@ -177,8 +170,8 @@
             (make-array java.nio.file.attribute.FileAttribute 0))))
 
 (deftest compiled-resident-dispatch-tunes-and-returns-a-baked-schedule
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "compiled resident dispatch tuning")
     (let [{:keys [buffers]} (test-case)
           args [(get buffers 'Q) (get buffers 'K) (get buffers 'V)
                 (get buffers 'dst) (get buffers 'src) 3 4 5 2]
@@ -227,8 +220,8 @@
                 (link/close! executable)))))))))
 
 (deftest resident-compiler-selects-from-runtime-component-width
-  (if-not @opencl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "runtime component-width dispatch")
     (let [descriptor (pipeline/compile-gpu-program
                       #'resident-indexed-attention-probe :ocl:0 :dtype :float)
           small (production-case descriptor 4)

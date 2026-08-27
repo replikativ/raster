@@ -1,20 +1,10 @@
 (ns raster.gpu.paged-kv-append-device-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.paged-kv-append :as append]
             [raster.compiler.passes.parallel.paged-kv-append-route :as route]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as gpu]))
-
-(def ^:private ocl-fp16-available?
-  (delay
-    (try
-      (require 'raster.gpu.ocl-runtime)
-      ((resolve 'raster.gpu.ocl-runtime/init!))
-      (boolean
-       (some #(str/includes? (or (:extensions %) "") "cl_khr_fp16")
-             ((resolve 'raster.gpu.ocl-runtime/query-devices))))
-      (catch Throwable _ false))))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]))
 
 (defn- half-bits
   [value]
@@ -86,6 +76,6 @@
     (run-case :ze:0)))
 
 (deftest opencl-paged-kv-append-assigns-rte-halfs
-  (if-not @ocl-fp16-available?
-    (is true "OpenCL FP16 device unavailable")
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "paged K/V assignment" :fp16)
     (run-case :ocl:0)))

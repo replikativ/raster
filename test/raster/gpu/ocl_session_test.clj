@@ -14,13 +14,8 @@
             [raster.core :refer [deftm]]
             [raster.dl.array-ops :as ops]
             [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]
             [raster.gpu.descriptor-fixture :as fixture]))
-
-(def ^:private ocl-available?
-  (delay (try (require 'raster.gpu.ocl-runtime)
-              ((resolve 'raster.gpu.ocl-runtime/init!))
-              true
-              (catch Throwable _ false))))
 
 (deftest opencl-max-work-group-size-selector
   (require 'raster.gpu.ocl-runtime)
@@ -53,8 +48,8 @@
                           (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
 
 (deftest ocl-map-void-mixed-storage-abi-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl mixed-storage map-void (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "mixed-storage map-void")
     (let [n 64
           q (byte-array (map #(byte (- (mod % 31) 15)) (range n)))
           out (int-array n)
@@ -71,8 +66,8 @@
       (is (every? true? (map-indexed (fn [i v] (= v (+ 7 (aget q i)))) out))))))
 
 (deftest ocl-resident-session-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl-session test (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident session")
     (let [p (pl/compile-gpu-program #'ocl-session-ax! :ocl:0 :dtype :float)
           n 4096
           x (float-array (map float (range n)))
@@ -93,8 +88,8 @@
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-indexed-row-reduction-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl indexed row reduction (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "indexed row reduction")
     (let [nrows 3
           width 513
           values (float-array (* nrows width) (float -10.0))
@@ -115,8 +110,8 @@
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-row-gather-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl row gather (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "row gather")
     (let [nrows 3
           width 4
           table (float-array (map float (range 32)))
@@ -134,8 +129,8 @@
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-segmap-artifact-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl resident SegMap artifact (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident SegMap artifact")
     (let [descriptor (pl/compile-gpu-program #'ocl-session-map :ocl:0 :dtype :float)
           n 4096
           x (float-array (map float (range n)))
@@ -151,8 +146,8 @@
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-contraction-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl resident contraction (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident contraction")
     (let [descriptor (pl/compile-gpu-program #'ocl-session-contract :ocl:0 :dtype :float)
           A (float-array (map float (range 64)))
           B (float-array (repeat 64 (float 1.0)))
@@ -168,8 +163,8 @@
         (finally (gpu/close-session! s))))))
 
 (deftest ocl-resident-reduction-ordered-abi-roundtrip
-  (if-not @ocl-available?
-    (println "SKIP ocl resident reduction (no OpenCL device)")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident reduction")
     (let [descriptor (pl/compile-gpu-program #'ocl-session-reduce :ocl:0 :dtype :float)
           n 1024
           scale 0.75

@@ -4,15 +4,8 @@
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-lower :as lower]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as gpu]))
-
-(def ^:private ocl-available?
-  (delay
-    (try
-      (require 'raster.gpu.ocl-runtime)
-      ((resolve 'raster.gpu.ocl-runtime/init!))
-      true
-      (catch Throwable _ false))))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]))
 
 (defn- emitted-graph []
   (let [node (soac/par-form->soac
@@ -85,13 +78,13 @@
               (gpu/release-kernel-graph! sess handle))))))))
 
 (deftest opencl-kernel-graph-inclusive-scan
-  (if-not @ocl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "OpenCL KernelGraph inclusive scan")
     (assert-prefix! :ocl:0)))
 
 (deftest opencl-kernel-graph-binds-aligned-disjoint-views-of-one-allocation
-  (if-not @ocl-available?
-    (is true "OpenCL device unavailable")
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "OpenCL KernelGraph BufferView aliases")
     (let [n 1025
           n-bytes (* 4 n)
           alignment ((resolve 'raster.gpu.ocl-runtime/buffer-offset-alignment))

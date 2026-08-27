@@ -1,20 +1,11 @@
 (ns raster.gpu.attention-device-test
-  (:require [clojure.string :as str]
-            [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is]]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.passes.parallel.attention-route :as route]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.gpu.core :as gpu]))
-
-(def ^:private ocl-fp16-available?
-  (delay
-    (try
-      (require 'raster.gpu.ocl-runtime)
-      ((resolve 'raster.gpu.ocl-runtime/init!))
-      (boolean
-       (some #(str/includes? (or (:extensions %) "") "cl_khr_fp16")
-             ((resolve 'raster.gpu.ocl-runtime/query-devices))))
-      (catch Throwable _ false))))
+            [raster.gpu.core :as gpu]
+            [raster.gpu.device-probe :as device-probe]))
 
 (defn- encode-halfs
   [values]
@@ -249,12 +240,15 @@
               (:key-indices (:visibility problem)) :attention-key-indices}))))
 
 (defn- run-case
-  [device-id route-kind visibility-kind]
+  [device-id route-kind visibility-kind policy expected-strategy]
   (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
         (make-case route-kind visibility-kind)
-        graph (:graph (route/route!
-                       problem {:device-type :gpu :subgroup-size 16
-                                :max-workgroup-size 256}))
+        descriptor (assoc (hardware/descriptor-for device-id)
+                          :segmented-weighted-reduction-schedule policy)
+        routed (route/route! problem descriptor)
+        _ (is (= expected-strategy (:strategy routed))
+              "the device test must execute the intended attention leaf")
+        graph (:graph routed)
         expected (reference test-case)
         specs (attention/buffer-specs problem)
         allocations
@@ -283,14 +277,17 @@
             (gpu/release-kernel-graph! session handle)))))))
 
 (defn- run-mixed-io-case
-  [device-id]
+  [device-id policy expected-strategy]
   (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
         (make-case :dense-paged :interval)
         expected (reference test-case)
         problem (assoc problem :q-dtype :float :output-dtype :float)
-        graph (:graph (route/route!
-                       problem {:device-type :gpu :subgroup-size 16
-                                :max-workgroup-size 256}))
+        descriptor (assoc (hardware/descriptor-for device-id)
+                          :segmented-weighted-reduction-schedule policy)
+        routed (route/route! problem descriptor)
+        _ (is (= expected-strategy (:strategy routed))
+              "the device test must execute the intended attention leaf")
+        graph (:graph routed)
         specs (attention/buffer-specs problem)
         float-q (float-array (map decode-half q))
         allocations
@@ -319,19 +316,23 @@
 (deftest level-zero-packed-dense-attention-matches-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "packed dense-routed FP16 attention on Level Zero")
-    (run-case :ze:0 :dense-paged :interval)))
+    (do
+      (run-case :ze:0 :dense-paged :interval :reference :fp16-reference)
+      (run-case :ze:0 :dense-paged :interval :subgroup-score-reuse
+                :routed-paged-subgroup-online-score-reuse))))
 
 (deftest level-zero-fp32-query-and-output-with-fp16-kv-matches-reference
   (if-not @gp/gpu-available?
     (gp/gpu-skip! "FP32-I/O packed attention over FP16 KV on Level Zero")
-    (run-mixed-io-case :ze:0)))
+    (run-mixed-io-case :ze:0 :subgroup-score-reuse
+                       :routed-paged-subgroup-online-score-reuse)))
 
 (deftest opencl-packed-csr-attention-matches-reference
-  (if-not @ocl-fp16-available?
-    (is true "OpenCL FP16 device unavailable")
-    (run-case :ocl:0 :csr-paged :interval)))
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "packed CSR attention" :fp16)
+    (run-case :ocl:0 :csr-paged :interval :auto :fp16-reference)))
 
 (deftest opencl-logical-csr-visibility-over-dense-pages-matches-reference
-  (if-not @ocl-fp16-available?
-    (is true "OpenCL FP16 device unavailable")
-    (run-case :ocl:0 :dense-paged :csr)))
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "logical CSR visibility over dense pages" :fp16)
+    (run-case :ocl:0 :dense-paged :csr :auto :fp16-reference)))
