@@ -110,7 +110,7 @@
 
 ;; clGetDeviceInfo param_name constants
 (def ^:private CL_DEVICE_MAX_COMPUTE_UNITS 0x1002)
-(def ^:private CL_DEVICE_MAX_WORK_GROUP_SIZE 0x1003)
+(def ^:private CL_DEVICE_MAX_WORK_GROUP_SIZE 0x1004)
 (def ^:private CL_DEVICE_MAX_CLOCK_FREQUENCY 0x100C)
 (def ^:private CL_DEVICE_GLOBAL_MEM_SIZE 0x101F)
 (def ^:private CL_DEVICE_HOST_UNIFIED_MEMORY 0x1035)

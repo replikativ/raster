@@ -116,7 +116,7 @@
     (let [session (g/make-session :ocl:0)]
       (try
         (g/alloc! session {:source [:float 6 (float-array [1 2 3 4 5 6])]
-                           :destination [:float 6 nil]})
+                           :destination [:float 6 (float-array 6)]})
         (g/copy-range! session :source :destination
                        {:src-element 2 :dst-element 1 :elements 3})
         (is (= [0.0 3.0 4.0 5.0 0.0 0.0]

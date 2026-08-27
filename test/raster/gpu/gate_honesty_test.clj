@@ -21,11 +21,17 @@
    clojure.test report event types it emits WITHOUT touching the outer suite counters.
    Returns a vector of :pass/:fail/:error keywords."
   [status-map]
-  (let [events (atom [])]
-    (with-redefs [gp/gpu-status (delay status-map)
-                  clojure.test/report (fn [m] (swap! events conj (:type m)))]
-      (gp/gpu-skip! "gate-honesty-probe"))
-    @events))
+  (let [events (atom [])
+        skip-log (var-get (ns-resolve 'raster.dl.gpu-grad-parity 'gpu-skip-log))
+        prior-log @skip-log]
+    (try
+      (with-redefs [gp/gpu-status (delay status-map)
+                    clojure.test/report (fn [m] (swap! events conj (:type m)))]
+        (gp/gpu-skip! "gate-honesty-probe"))
+      @events
+      (finally
+        ;; These are simulated states.  Do not publish them as actual suite skips.
+        (reset! skip-log prior-log)))))
 
 (deftest load-failure-fails-loud
   (testing "a THROWN ze-runtime load registers a FAILING assertion, not a silent skip"
