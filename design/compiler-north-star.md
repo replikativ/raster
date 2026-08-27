@@ -191,11 +191,18 @@ contains only values, output indices, row count and width; ties select the lowes
 NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
 multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
 
-Row selection remains a separate generic operation. `gather-rows!` consumes shared row-major source
-storage and `int[B]` indices, writes caller-owned dense `[B,width]` output, and maps every output
-element independently. Consequently greedy decode composes indexed reduction and row gather as
-ordinary graph dataflow; top-k, sampling, beam search, or external token policy can replace the
-producer without changing embedding storage or introducing a decoder-tail compiler primitive.
+Indexed storage movement remains a separate generic operation. Allocation-free `gather-blocks!`
+and `scatter-blocks!` move contiguous typed blocks between dense staging and routed resident
+storage with one ordinary SOAC map per direction. Routing is an `int[nblocks]` buffer; it does not
+encode pages, attention, cache policy, or quantization. Gather permits repeated sources, while the
+non-reducing scatter contract requires unique destinations. Host validation proves active extents,
+index bounds, non-aliasing and the current 32-bit device-index limit; emitted kernels retain bounds
+guards. FP16 is a bit-preserving short-array storage overload whose physical ABI is `half*`, while
+index arithmetic remains in the ordinary scalar compiler domain. `gather-rows!` remains the
+row-oriented compatibility spelling. Consequently greedy decode composes indexed reduction and
+row gather as ordinary graph dataflow, while chunked paged prefill and cache persistence can compose
+bulk host/device staging with block scatter/gather. Neither path introduces a decoder, attention,
+page-manager, or quantization primitive into the compiler.
 
 Artifact linking and value rebinding are not runtime conveniences. They are
 compiler primitives required for competitive model execution.
