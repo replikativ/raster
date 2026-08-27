@@ -39,7 +39,9 @@
            (map #(* 0.05 (- (mod (+ (* 5 %) 2) 17) 8)) (range k-elements)))
         v (encode-halfs
            (map #(* 0.04 (- (mod (+ (* 7 %) 3) 19) 9)) (range v-elements)))
-        q-offsets (int-array [0 2 2 4])
+        ;; Batch row 1 owns a query but has no resident KV tokens.  This exercises the cooperative
+        ;; schedule's zero-length early exit independently from packed rows 0 and 2.
+        q-offsets (int-array [0 2 3 4])
         q-positions (int-array [3 4 10 12])
         starts (int-array [0 0 8])
         query (attention/packed-query-batch

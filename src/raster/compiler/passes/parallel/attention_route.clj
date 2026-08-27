@@ -2,7 +2,8 @@
   "Structured routing for backend-neutral attention problems."
   (:require [raster.compiler.backend.gpu.attention :as emit]
             [raster.compiler.ir.attention :as attention]
-            [raster.compiler.passes.parallel.attention-lower :as lower]))
+            [raster.compiler.passes.parallel.attention-lower :as lower]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as swr-schedule]))
 
 (defn- decline
   [problem reason data]
@@ -11,11 +12,33 @@
    :reference? false
    :declines [{:leaf :fp16-reference :reason reason :data data}]})
 
+(def ^:private cooperative-policies
+  #{:subgroup-score-reuse :subgroup-online-score-reuse})
+
+(defn- requested-policy
+  [desc]
+  (or (:segmented-weighted-reduction-schedule desc) :auto))
+
+(defn- success
+  [problem plan artifact declines]
+  (let [strategy (get-in artifact [:attributes :strategy])
+        reference? (= :reference (get-in artifact [:attributes :optimization-tier]))]
+    {:operation problem
+     :plan plan
+     :strategy strategy
+     :reference? reference?
+     :declines declines
+     :artifact artifact
+     :graph (emit/kernel-graph plan artifact)
+     :schedule {:workgroup-size (:workgroup-size (:launch artifact))
+                :group-count (:group-count (:launch artifact))}}))
+
 (defn route
-  "Try the executable packed/routed attention reference or return a structured decline.
+  "Route packed/routed attention through a cooperative schedule or its semantic oracle.
 
    Quantized K/V formats stay semantic values but decline until their scale/group operands are
-   explicit. Dense and CSR routing are both reference leaves with deliberately distinct ABIs."
+   explicit. Dense and CSR routing are both reference leaves with deliberately distinct ABIs;
+   dense interval visibility additionally admits a one-subgroup online-softmax schedule."
   ([problem] (route problem nil))
   ([problem desc]
    (let [{:keys [q-dtype k-dtype v-dtype output-dtype accumulator-dtype
@@ -48,16 +71,38 @@
 
        :else
        (let [plan (lower/lower problem)
-             artifact (emit/emit-fp16-reference plan desc)]
-         {:operation problem
-          :plan plan
-          :strategy :fp16-reference
-          :reference? true
-          :declines []
-          :artifact artifact
-          :graph (emit/kernel-graph plan artifact)
-          :schedule {:workgroup-size (:workgroup-size (:launch artifact))
-                     :group-count (:group-count (:launch artifact))}})))))
+             policy (requested-policy desc)]
+         (cond
+           (= :reference policy)
+           (success problem plan (emit/emit-fp16-reference plan desc) [])
+
+           (or (= :auto policy) (contains? cooperative-policies policy))
+           (let [{:keys [ok schedule reason] :as scheduled}
+                 (swr-schedule/plan-subgroup-online plan desc)]
+             (if ok
+               (success problem plan (emit/emit-fp16-cooperative plan schedule) [])
+               (let [cooperative-decline
+                     {:leaf :routed-paged-subgroup-online-score-reuse
+                      :reason reason
+                      :data (dissoc scheduled :ok :reason)}]
+                 (if (= :auto policy)
+                   (success problem plan (emit/emit-fp16-reference plan desc)
+                            [cooperative-decline])
+                   {:operation problem
+                    :plan plan
+                    :strategy nil
+                    :reference? false
+                    :declines [cooperative-decline]}))))
+
+           :else
+           {:operation problem
+            :plan plan
+            :strategy nil
+            :reference? false
+            :declines [{:leaf :attention-schedule-policy
+                        :reason :attention-schedule-policy-unsupported
+                        :data {:requested policy
+                               :supported (into [:auto :reference] cooperative-policies)}}]}))))))
 
 (defn route!
   "Route attention or fail with the complete machine-readable decline trail."
