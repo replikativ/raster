@@ -12,6 +12,20 @@
   (ops/argmax-rows! logits token-indices nrows vocab)
   (ops/gather-rows! table token-indices rows nrows width))
 
+(deftm block-transfer-roundtrip!
+  [src :- (Array float), block-indices :- (Array int), paged :- (Array float),
+   restored :- (Array float), nblocks :- Long, block-width :- Long,
+   paged-blocks :- Long] :- Void
+  (ops/scatter-blocks! src block-indices paged nblocks block-width paged-blocks)
+  (ops/gather-blocks! paged block-indices restored nblocks block-width paged-blocks))
+
+(deftm block-transfer-half-roundtrip!
+  [src :- (Array short), block-indices :- (Array int), paged :- (Array short),
+   restored :- (Array short), nblocks :- Long, block-width :- Long,
+   paged-blocks :- Long] :- Void
+  (ops/scatter-blocks! src block-indices paged nblocks block-width paged-blocks)
+  (ops/gather-blocks! paged block-indices restored nblocks block-width paged-blocks))
+
 (deftest gather-rows-test
   (let [width 4
         table (float-array [0 1 2 3
@@ -26,6 +40,85 @@
               0.0 1.0 2.0 3.0
               20.0 21.0 22.0 23.0]
              (vec rows))))))
+
+(deftest generic-block-gather-and-scatter-test
+  (let [width 3
+        nblocks 3
+        indexed-blocks 6
+        indices (int-array [4 1 5])
+        dense (float-array [10 11 12, 20 21 22, 30 31 32])
+        paged (float-array (* indexed-blocks width) (float -1.0))
+        restored (float-array (* nblocks width))]
+    (ops/validate-block-transfer! :scatter dense indices paged
+                                  nblocks width indexed-blocks)
+    (ops/scatter-blocks! dense indices paged nblocks width indexed-blocks)
+    (ops/validate-block-transfer! :gather paged indices restored
+                                  nblocks width indexed-blocks)
+    (ops/gather-blocks! paged indices restored nblocks width indexed-blocks)
+    (testing "scatter changes only unique selected destination blocks"
+      (is (= [-1.0 -1.0 -1.0, 20.0 21.0 22.0,
+              -1.0 -1.0 -1.0, -1.0 -1.0 -1.0,
+              10.0 11.0 12.0, 30.0 31.0 32.0]
+             (vec paged))))
+    (testing "gather is the inverse for the same block route"
+      (is (= (vec dense) (vec restored))))))
+
+(deftest block-index-contract-test
+  (let [repeated (int-array [2 0 2])]
+    (is (identical? repeated
+                    (ops/validate-block-indices! repeated 3 4 :allow)))
+    (is (= :block-index-duplicate-destination
+           (try
+             (ops/validate-block-indices! repeated 3 4 :unique)
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :block-index-out-of-bounds
+           (try
+             (ops/validate-block-indices! (int-array [0 4]) 2 4 :unique)
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :block-index-count
+           (try
+             (ops/validate-block-indices! (int-array [0]) 2 4 :unique)
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :block-transfer-buffer-size
+           (try
+             (ops/validate-block-transfer! :scatter
+                                           (float-array 5) (int-array [0 1]) (float-array 12)
+                                           2 3 4)
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [same (float-array 12)]
+      (is (= :block-transfer-overlap
+             (try
+               (ops/validate-block-transfer! :gather
+                                             same (int-array [0 1]) same 2 3 4)
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))))
+
+(deftest block-transfer-resident-lowering-test
+  (let [descriptors (into {}
+                          (map (fn [target]
+                                 [target (pipeline/compile-gpu-program
+                                          #'block-transfer-roundtrip! target :dtype :float)]))
+                          [:ocl:0 :ze:0])
+        descriptor (get descriptors :ocl:0)]
+    (testing "both directions are ordinary allocation-free SOAC maps"
+      (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
+      (is (empty? (:allocs descriptor)))
+      (is (= '[src block-indices paged restored nblocks block-width paged-blocks]
+             (:all-params descriptor)))
+      (is (= #{'paged 'restored}
+             (set (mapcat #(get-in % [:artifact :attributes :written-arrays])
+                          (:steps descriptor))))))
+    (testing "OpenCL and Level Zero preserve the same physical ABI"
+      (is (apply = (map (fn [[_ compiled]]
+                          (mapv (comp #(mapv (juxt :kind :dtype :kernel-dtype) %) :abi)
+                                (:steps compiled)))
+                        descriptors))))
+    (testing "FP16 storage is selected from short-array types, independently of scalar arithmetic"
+      (doseq [target [:ocl:0 :ze:0]]
+        (let [compiled (pipeline/compile-gpu-program
+                        #'block-transfer-half-roundtrip! target :dtype :float)]
+          (is (= [:map-void :map-void] (mapv :convention (:steps compiled))))
+          (is (= #{:int :half}
+                 (set (mapcat #(map :dtype (:abi %)) (:steps compiled))))))))))
 
 (deftest gather-rows-resident-lowering-test
   (let [descriptors (into {}

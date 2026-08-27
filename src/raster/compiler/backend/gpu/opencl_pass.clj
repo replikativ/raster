@@ -43,7 +43,10 @@
 
 (def array-tag->dtype
   "Deftm array tag (the Java array-class symbol) → element dtype keyword."
-  {'doubles :double 'floats :float 'longs :long 'ints :int 'bytes :byte})
+  {'doubles :double 'floats :float 'longs :long 'ints :int 'bytes :byte
+   ;; JVM short[] is Raster's bit-preserving FP16 storage carrier. Kernels see `half*`; the
+   ;; semantic pipeline still performs scalar/index arithmetic at a JVM-supported dtype.
+   'shorts :half})
 
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags

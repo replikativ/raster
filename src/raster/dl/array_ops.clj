@@ -7,7 +7,9 @@
 
   Core primitives:
     argmax-rows!     - deterministic indexed row reduction into caller-owned storage
-    gather-rows!     - copy int-indexed rows into caller-owned dense storage
+    gather-blocks!   - gather indexed contiguous blocks into dense storage
+    scatter-blocks!  - scatter dense contiguous blocks to unique destinations
+    gather-rows!     - row-oriented compatibility spelling of gather-blocks!
     scatter-add      - scatter values to indexed destinations (adjoint of gather)
     gather           - gather values from indexed sources (adjoint of scatter-add)
     indexed-dot      - batched indexed dot product (multi-head aware)
@@ -140,14 +142,134 @@
    {:associative? true :commutative? true
     :order {:nan :highest :tie :lowest-index}}))
 
-(deftm gather-rows!
-  "Copy rows selected by `indices[nrows]` from row-major `src[*,width]` into caller-owned
-  `out[nrows,width]`. Every output element has one writer, and rows of `src` may be selected
-  repeatedly. The operation is a generic indexed layout transform; embedding lookup is one use.
+(defn validate-block-indices!
+  "Validate the active prefix of an int block-index buffer before resident execution.
 
-  Indices are intentionally `int`, matching routed attention and indexed reductions. Callers own
-  bounds validation: every index must name a complete source row. `out` must not overlap `src`;
-  parallel output writes are not ordered against source reads."
+  `indexed-blocks` is the source capacity for gather or destination capacity for scatter.
+  `duplicate-policy` is `:allow` for gather or `:unique` for non-reducing scatter. The compiled
+  kernels additionally guard every index to preserve device memory safety, but invalid metadata is
+  a host contract error and should be rejected here rather than silently ignored by a kernel."
+  [indices nblocks indexed-blocks duplicate-policy]
+  (when-not (and (integer? nblocks) (not (neg? nblocks))
+                 (integer? indexed-blocks) (not (neg? indexed-blocks))
+                 (contains? #{:allow :unique} duplicate-policy))
+    (throw (ex-info "block-index validation requires nonnegative extents and a duplicate policy"
+                    {:reason :block-index-contract
+                     :nblocks nblocks :indexed-blocks indexed-blocks
+                     :duplicate-policy duplicate-policy})))
+  (when (> nblocks (count indices))
+    (throw (ex-info "block-index buffer is shorter than its active prefix"
+                    {:reason :block-index-count :required nblocks :actual (count indices)})))
+  (let [active (mapv #(long (nth indices %)) (range nblocks))]
+    (when-not (every? #(and (<= 0 %) (< % indexed-blocks) (<= % Integer/MAX_VALUE)) active)
+      (throw (ex-info "block index is outside the indexed block capacity"
+                      {:reason :block-index-out-of-bounds
+                       :indexed-blocks indexed-blocks :indices active})))
+    (when (and (= :unique duplicate-policy)
+               (not= (count active) (count (distinct active))))
+      (throw (ex-info "non-reducing block scatter requires unique destinations"
+                      {:reason :block-index-duplicate-destination :indices active}))))
+  indices)
+
+(defn validate-block-transfer!
+  "Validate host-visible storage and route metadata for a resident block transfer.
+
+  `direction` is `:gather` (`indexed -> dense`) or `:scatter` (`dense -> indexed`). The active
+  buffer extents must fit the supplied primitive arrays and the current 32-bit GPU launch/index
+  ABI. Gather permits repeated source blocks; non-reducing scatter requires unique destinations.
+  The source and destination must be distinct storage. Returns `indices`."
+  [direction src indices out nblocks block-width indexed-blocks]
+  (when-not (and (contains? #{:gather :scatter} direction)
+                 (integer? nblocks) (not (neg? nblocks))
+                 (integer? block-width) (not (neg? block-width))
+                 (integer? indexed-blocks) (not (neg? indexed-blocks)))
+    (throw (ex-info "block transfer requires a direction and nonnegative integral extents"
+                    {:reason :block-transfer-contract :direction direction
+                     :nblocks nblocks :block-width block-width
+                     :indexed-blocks indexed-blocks})))
+  (let [dense-elements (*' nblocks block-width)
+        indexed-elements (*' indexed-blocks block-width)]
+    (when-not (every? #(<= % Integer/MAX_VALUE)
+                      [nblocks block-width indexed-blocks dense-elements indexed-elements])
+      (throw (ex-info "block transfer exceeds the current 32-bit GPU index ABI"
+                      {:reason :block-transfer-index-width :direction direction
+                       :nblocks nblocks :block-width block-width
+                       :indexed-blocks indexed-blocks})))
+    (when (identical? src out)
+      (throw (ex-info "block transfer source and destination must not overlap"
+                      {:reason :block-transfer-overlap :direction direction})))
+    (let [[required-src required-out]
+          (if (= :gather direction)
+            [indexed-elements dense-elements]
+            [dense-elements indexed-elements])]
+      (when (or (< (count src) required-src) (< (count out) required-out))
+        (throw (ex-info "block transfer storage is shorter than its declared extent"
+                        {:reason :block-transfer-buffer-size :direction direction
+                         :required-src required-src :actual-src (count src)
+                         :required-out required-out :actual-out (count out)})))))
+  (validate-block-indices! indices nblocks indexed-blocks
+                           (if (= :scatter direction) :unique :allow)))
+
+(deftm gather-blocks!
+  "Copy blocks selected by `indices[nblocks]` from `src[indexed-blocks,block-width]` into
+  caller-owned dense `out[nblocks,block-width]`. Source blocks may repeat. Every output element
+  has one writer; invalid indices are guarded on device and must be rejected with
+  `validate-block-transfer!` before execution. `out` must not overlap `src`."
+  (All [T] [src :- (Array T), indices :- (Array int), out :- (Array T),
+            nblocks :- Long, block-width :- Long, indexed-blocks :- Long] :- Void
+       (par/map-void! i (* nblocks block-width)
+                      (let [block (quot i block-width)
+                            element (rem i block-width)
+                            source-block (aget indices block)]
+                        (when (and (>= source-block 0) (< source-block indexed-blocks))
+                          (aset out i
+                                (aget src (+ (* source-block block-width) element))))))))
+
+(deftm scatter-blocks!
+  "Copy dense `src[nblocks,block-width]` blocks to indexed locations in
+  `out[indexed-blocks,block-width]`. This is a non-reducing permutation/scatter: active destination
+  indices must be unique, as certified by `validate-block-transfer!`. Invalid indices are guarded
+  on device. `out` must not overlap `src`; unselected destination blocks are unchanged."
+  (All [T] [src :- (Array T), indices :- (Array int), out :- (Array T),
+            nblocks :- Long, block-width :- Long, indexed-blocks :- Long] :- Void
+       (par/map-void! i (* nblocks block-width)
+                      (let [source-block (quot i block-width)
+                            element (rem i block-width)
+                            destination-block (aget indices source-block)]
+                        (when (and (>= destination-block 0)
+                                   (< destination-block indexed-blocks))
+                          (aset out (+ (* destination-block block-width) element)
+                                (aget src i)))))))
+
+;; Float16 is a physical storage type without a JVM primitive scalar. Its arrays are short[] on
+;; the host, so give the bit-preserving layout transforms an explicit storage overload rather than
+;; pretending :half is a semantic arithmetic specialization of `All [T]`.
+(deftm gather-blocks!
+  [src :- (Array short), indices :- (Array int), out :- (Array short),
+   nblocks :- Long, block-width :- Long, indexed-blocks :- Long] :- Void
+  (par/map-void! i (* nblocks block-width)
+                 (let [block (quot i block-width)
+                       element (rem i block-width)
+                       source-block (aget indices block)]
+                   (when (and (>= source-block 0) (< source-block indexed-blocks))
+                     (aset out i
+                           (aget src (+ (* source-block block-width) element)))))))
+
+(deftm scatter-blocks!
+  [src :- (Array short), indices :- (Array int), out :- (Array short),
+   nblocks :- Long, block-width :- Long, indexed-blocks :- Long] :- Void
+  (par/map-void! i (* nblocks block-width)
+                 (let [source-block (quot i block-width)
+                       element (rem i block-width)
+                       destination-block (aget indices source-block)]
+                   (when (and (>= destination-block 0)
+                              (< destination-block indexed-blocks))
+                     (aset out (+ (* destination-block block-width) element)
+                           (aget src i))))))
+
+(deftm gather-rows!
+  "Compatibility spelling for dense row gathering. New layout code should use `gather-blocks!`,
+  whose explicit source-block capacity also provides a device bounds guard."
   (All [T] [src :- (Array T), indices :- (Array int), out :- (Array T),
             nrows :- Long, width :- Long] :- Void
        (par/map-void! i (* nrows width)
