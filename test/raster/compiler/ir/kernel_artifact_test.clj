@@ -40,6 +40,13 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"argument count mismatch"
          (kart/make (assoc base :arguments '[x out])))))
+  (testing "a stable compiler input cannot also bind a writable output"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"stable input overlaps"
+         (kart/make
+          (-> base
+              (assoc-in [:abi 0 :aliasing] :no-write-alias)
+              (assoc :arguments '[same same n]))))))
   (testing "an entry without executable launch geometry is not a kernel artifact"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"invalid launch contract"

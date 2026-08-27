@@ -48,6 +48,7 @@
       (throw (ex-info "kernel artifact requires a non-blank target module"
                       {:kernel-name kernel-name :target target})))
     (kabi/validate-arguments! abi arguments)
+    (kabi/validate-alias-contracts! abi arguments #(or (identical? %1 %2) (= %1 %2)))
     (case target
       :opencl-c (kabi/validate-source-signature! kernel-name source abi)
       (throw (ex-info "kernel artifact target has no module verifier"

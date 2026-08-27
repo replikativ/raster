@@ -11,13 +11,16 @@
 (def ^:private kinds #{:input :output :scalar})
 
 (defn slot
-  "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, and :field.
+  "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, :field, and
+  :aliasing.
 
    `:binding` names the logical caller value that supplies a physical pointer slot. It is
    normally absent (and therefore identical to `:name`), but an SoA argument has one physical
    slot per field and all of those slots share the same logical binding.
-   `:field` identifies this physical leaf within a composite logical binding."
-  [nm kind dtype & {:keys [c-name kernel-dtype role binding field]}]
+   `:field` identifies this physical leaf within a composite logical binding.
+   `:aliasing :no-write-alias` is an input-pointer precondition: its complete bound range must be
+   disjoint from every output pointer range for the duration of the launch."
+  [nm kind dtype & {:keys [c-name kernel-dtype role binding field aliasing]}]
   (cond-> {:name nm
            :c-name (or c-name (name nm))
            :kind kind
@@ -25,7 +28,8 @@
            :kernel-dtype (dt/canon (or kernel-dtype dtype))}
     role (assoc :role role)
     binding (assoc :binding binding)
-    field (assoc :field field)))
+    field (assoc :field field)
+    aliasing (assoc :aliasing aliasing)))
 
 (defn validate!
   "Validate an ordered ABI and return it unchanged.  A kernel has at least one output;
@@ -54,7 +58,12 @@
                       {:index i :slot s :abi abi})))
     (when (and (:field s) (nil? (:binding s)))
       (throw (ex-info "kernel ABI composite field requires an explicit logical binding"
-                      {:index i :slot s :abi abi}))))
+                      {:index i :slot s :abi abi})))
+    (when (and (:aliasing s)
+               (not (and (= :input (:kind s)) (= :no-write-alias (:aliasing s)))))
+      (throw (ex-info "kernel ABI aliasing contract is unsupported for this slot"
+                      {:index i :slot s :abi abi
+                       :supported {:kind :input :aliasing :no-write-alias}}))))
   (when-not (= (count abi) (count (distinct (map :c-name abi))))
     (throw (ex-info "kernel ABI parameter names must be unique" {:abi abi})))
   (let [pointers (vec (remove #(= :scalar (:kind %)) abi))]
@@ -119,6 +128,30 @@
     (when-not (= (count abi) (count arguments))
       (throw (ex-info "kernel ABI argument count mismatch"
                       {:expected (count abi) :actual (count arguments) :abi abi})))
+    arguments))
+
+(defn validate-alias-contracts!
+  "Enforce ABI no-write-alias requirements for complete ordered arguments.
+
+  `overlaps?` receives two pointer values and must conservatively report whether their physical
+  ranges overlap. Compiler-symbol validation may use equality; runtime call validation supplies
+  resident-view/range awareness."
+  [abi arguments overlaps?]
+  (when-not (ifn? overlaps?)
+    (throw (ex-info "kernel ABI alias validation requires an overlap predicate"
+                    {:overlaps? overlaps?})))
+  (let [abi (validate! abi)
+        arguments (validate-arguments! abi arguments)
+        pairs (mapv vector abi arguments)
+        stable-inputs (filterv (fn [[slot _]]
+                                 (= :no-write-alias (:aliasing slot))) pairs)
+        outputs (filterv (fn [[slot _]] (= :output (:kind slot))) pairs)]
+    (doseq [[input-slot input] stable-inputs
+            [output-slot output] outputs
+            :when (overlaps? input output)]
+      (throw (ex-info "kernel stable input overlaps a writable output"
+                      {:reason :kernel-abi-no-write-alias
+                       :input-slot input-slot :output-slot output-slot})))
     arguments))
 
 (defn validate-split-binding!

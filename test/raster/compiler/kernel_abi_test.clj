@@ -1,6 +1,10 @@
 (ns raster.compiler.kernel-abi-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-abi :as kabi]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-body-abi :as body-abi]
+            [raster.compiler.ir.kernel-launch :as launch]
             [raster.gpu.core]
             [raster.gpu.ocl-runtime :as ocl]
             [raster.gpu.ze-runtime :as ze]))
@@ -10,6 +14,48 @@
    (kabi/slot 'out :output :float :role :result)
    (kabi/slot 'scale :scalar :float :role :parameter)
    (kabi/slot '_n_bound :scalar :int :role :bound)])
+
+(defn- stable-body []
+  (body/make
+   {:id :stable-abi
+    :parameters [(body/->KernelParameter 'x :input :float [1] :global
+                                         (layout/row-major [1] :float) :operand)
+                 (body/->KernelParameter 'out :output :float [1] :global
+                                         (layout/row-major [1] :float) :result)]
+    :stable-reads [(body/stable-read 'x)]
+    :launch (launch/spec {:workgroup-size [1] :group-count [1]})}))
+
+(deftest stable-read-contracts-project-to-one-target-input
+  (let [projected (body-abi/project-contracts
+                   [(kabi/slot 'x :input :float :c-name "source")
+                    (kabi/slot 'out :output :float :c-name "destination")]
+                   (stable-body))]
+    (is (= :no-write-alias (get-in projected [0 :aliasing])))
+    (is (nil? (get-in projected [1 :aliasing])))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"exactly one target ABI input"
+         (body-abi/project-contracts
+          [(kabi/slot 'renamed :input :float)
+           (kabi/slot 'out :output :float)]
+          (stable-body)))))
+  (testing "the contract is only legal on input pointers"
+    (doseq [slot [(kabi/slot 'out :output :float :aliasing :no-write-alias)
+                  (kabi/slot 'n :scalar :int :aliasing :no-write-alias)
+                  (kabi/slot 'x :input :float :aliasing :unknown)]]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"aliasing contract"
+                            (kabi/validate! [slot (kabi/slot 'out :output :float)]))))))
+
+(deftest stable-input-aliases-are-checked-against-every-output
+  (let [abi [(kabi/slot 'x :input :float :aliasing :no-write-alias)
+             (kabi/slot 'side :output :float)
+             (kabi/slot 'out :output :float)]]
+    (is (= [:x :side :out]
+           (kabi/validate-alias-contracts! abi [:x :side :out] =)))
+    (let [e (try
+              (kabi/validate-alias-contracts! abi [:same :side :same] =)
+              nil
+              (catch clojure.lang.ExceptionInfo e e))]
+      (is (= :kernel-abi-no-write-alias (:reason (ex-data e)))))))
 
 (deftest generic-abi-allows-ordered-multi-output
   (let [abi [(kabi/slot 'x :input :float)
