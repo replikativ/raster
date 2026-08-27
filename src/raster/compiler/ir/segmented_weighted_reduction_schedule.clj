@@ -35,10 +35,11 @@
       (throw (ex-info "cooperative weighted reduction requires one workgroup per segment"
                       {:reason :segmented-weighted-reduction-segment-mapping
                        :segment-mapping segment-mapping})))
-    (when-not (= :sequential membership-traversal)
-      (throw (ex-info "initial cooperative weighted reduction requires sequential membership traversal"
+    (when-not (contains? #{:contiguous-interval :csr-row} membership-traversal)
+      (throw (ex-info "cooperative weighted reduction requires a bounded membership traversal"
                       {:reason :segmented-weighted-reduction-membership-traversal
-                       :membership-traversal membership-traversal})))
+                       :membership-traversal membership-traversal
+                       :supported #{:contiguous-interval :csr-row}})))
     (when-not (and (= :subgroup (:kind score-reduction))
                    (= workgroup-size (:width score-reduction))
                    (some? (:axis score-reduction)))

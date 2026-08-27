@@ -330,9 +330,17 @@
 (deftest opencl-packed-csr-attention-matches-reference
   (if-not @device-probe/opencl-fp16-available?
     (device-probe/opencl-skip! "packed CSR attention" :fp16)
-    (run-case :ocl:0 :csr-paged :interval :auto :fp16-reference)))
+    (run-case :ocl:0 :csr-paged :interval :auto
+              :routed-paged-subgroup-online-score-reuse)))
 
 (deftest opencl-logical-csr-visibility-over-dense-pages-matches-reference
   (if-not @device-probe/opencl-fp16-available?
     (device-probe/opencl-skip! "logical CSR visibility over dense pages" :fp16)
-    (run-case :ocl:0 :dense-paged :csr :auto :fp16-reference)))
+    (run-case :ocl:0 :dense-paged :csr :auto
+              :routed-paged-subgroup-online-score-reuse)))
+
+(deftest opencl-logical-csr-visibility-over-csr-pages-matches-reference
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "logical CSR visibility over CSR pages" :fp16)
+    (run-case :ocl:0 :csr-paged :csr :auto
+              :routed-paged-subgroup-online-score-reuse)))

@@ -38,8 +38,8 @@
   "Route packed/routed attention through a cooperative schedule or its semantic oracle.
 
    Quantized K/V formats stay semantic values but decline until their scale/group operands are
-   explicit. Dense and CSR routing are both reference leaves with deliberately distinct ABIs;
-   dense interval visibility additionally admits a one-subgroup online-softmax schedule."
+   explicit. Dense and CSR physical routing retain deliberately distinct ABIs while interval and
+   CSR logical membership both admit the same one-subgroup online-softmax schedule."
   ([problem] (route problem nil))
   ([problem desc]
    (let [{:keys [q-dtype k-dtype v-dtype output-dtype accumulator-dtype

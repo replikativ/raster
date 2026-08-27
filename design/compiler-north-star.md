@@ -118,7 +118,10 @@ or schedule. Unsupported target semantics fail at this boundary instead of silen
 cast, layout, collective, or reduction-association contract. It is not production-reachable until a
 semantic route constructs the body. The next production vertical is the scheduled routed
 `SegmentedWeightedReductionSchedule -> KernelBody` construction with an invariant external ABI; it
-must not introduce an attention operation into this vocabulary.
+must not introduce an attention operation into this vocabulary. The current handwritten production
+leaf already keeps physical storage and logical membership independent: dense/CSR page routing can
+combine with either bounded contiguous intervals or bounded CSR rows under one cooperative schedule.
+That leaf is the executable behavior and ABI oracle which the KernelBody vertical must replace.
 
 ### 2.3 Executable steps and resident artifact values compose
 
