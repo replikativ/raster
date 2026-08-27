@@ -1,7 +1,8 @@
 (ns raster.compiler.passes.parallel.indexed-attention-route
   "Structured routing for recognized indexed graph-attention plans."
-  (:require [clojure.string :as str]
-            [raster.compiler.backend.gpu.indexed-attention :as emit]
+  (:require [raster.compiler.backend.gpu.indexed-attention :as emit]
+            [raster.compiler.backend.gpu.target :as gpu-target]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]))
 
 (defn- decline
@@ -115,21 +116,31 @@
      (try
        (let [{:keys [operands output accumulator-dtype] :as plan} (swr/validate! plan)
              storage-dtypes (mapv :dtype (conj operands output))
-             subgroup-size (long (or (:subgroup-size desc) 16))
-             max-workgroup-size (long (or (:max-workgroup-size desc) 256))
-             vendor (some-> (:vendor desc) str str/lower-case)
+             subgroup-size (hardware/preferred-subgroup-size desc)
+             max-workgroup-size (hardware/maximum-workgroup-size desc)
+             supported-widths (hardware/supported-subgroup-sizes desc)
              matrix-family (get-in desc [:matrix :family])
-             known-non-intel? (and (or vendor matrix-family)
-                                   (not (or (= :dpas matrix-family)
-                                            (and vendor (str/includes? vendor "intel")))))]
+             intel-dialect? (gpu-target/intel-opencl-subgroup-dialect? desc)]
          (cond
            (and desc (not= :gpu (:device-type desc)))
            (decline plan leaf :score-reuse-requires-gpu
                     {:device-type (:device-type desc)})
 
-           known-non-intel?
+           (not intel-dialect?)
            (decline plan leaf :score-reuse-requires-intel-subgroup-dialect
                     {:vendor (:vendor desc) :matrix-family matrix-family})
+
+           (or (not (integer? subgroup-size))
+               (not (integer? max-workgroup-size)))
+           (decline plan leaf :score-reuse-missing-execution-capability
+                    {:subgroup-size subgroup-size
+                     :max-workgroup-size max-workgroup-size})
+
+           (and (seq supported-widths)
+                (not (contains? (set supported-widths) subgroup-size)))
+           (decline plan leaf :score-reuse-subgroup-width-unsupported
+                    {:subgroup-size subgroup-size
+                     :supported-subgroup-sizes (set supported-widths)})
 
            (not (contains? #{:float :double} accumulator-dtype))
            (decline plan leaf :score-reuse-accumulator-unsupported
@@ -143,8 +154,8 @@
                                 :long :long accumulator-dtype]
                      :actual storage-dtypes})
 
-           (or (not (pos? subgroup-size))
-               (> subgroup-size max-workgroup-size))
+           (or (not (pos? (long subgroup-size)))
+               (> (long subgroup-size) (long max-workgroup-size)))
            (decline plan leaf :score-reuse-invalid-subgroup-geometry
                     {:subgroup-size subgroup-size
                      :max-workgroup-size max-workgroup-size})

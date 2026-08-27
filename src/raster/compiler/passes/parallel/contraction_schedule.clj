@@ -276,9 +276,15 @@
                      {:reason :raster/bug :facts contract-facts})))
    (let [{:keys [dtype free-axes contract-axes body combine init operands epilogue]}
          contract-facts
-         raw-tile (or tile (hardware/derive-gemm-tile (or desc {})))
-         matrix (assoc (:matrix raw-tile) :family (or (get-in raw-tile [:matrix :family]) :dpas))
-         tile (assoc raw-tile :matrix matrix :num-stages (or (:num-stages raw-tile) 3))
+         authoritative-desc? (and desc (or (:backend desc) (:execution desc)))
+         matrix-capability-unavailable? (and authoritative-desc? (nil? (:matrix desc)))
+         raw-tile (when-not matrix-capability-unavailable?
+                    (or tile (hardware/derive-gemm-tile (or desc {}))))
+         matrix (when raw-tile
+                  (assoc (:matrix raw-tile)
+                         :family (or (get-in raw-tile [:matrix :family]) :dpas)))
+         tile (when raw-tile
+                (assoc raw-tile :matrix matrix :num-stages (or (:num-stages raw-tile) 3)))
          layout-verdict (when (and (= 2 (count free-axes)) (= 1 (count contract-axes)))
                           (facts/check-layout contract-facts (:dpas facts/leaf-layouts)))
          bindings (:bindings layout-verdict)
@@ -287,6 +293,12 @@
          K (second (first contract-axes))
          matrix-k (:k matrix)]
      (cond
+       matrix-capability-unavailable?
+       (decline :matrix-capability-unavailable
+                {:backend (:backend desc)
+                 :supported-subgroup-sizes
+                 (hardware/supported-subgroup-sizes desc)})
+
        (or (not (dtype/known? dtype)) (not= :half (dtype/canon dtype)))
        (decline :dtype-not-dpas {:dtype dtype})
 

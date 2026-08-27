@@ -461,6 +461,13 @@ its isolated emitter test passes.
 ## 5. Hardware-aware compilation and autotuning
 
 Raster's existing hardware descriptor and schedule cache form the right base.
+Runtime probes and catalogues may retain backend-native names, but their compiler projection
+must normalize the execution hierarchy. In particular, the descriptor records a set of supported
+subgroup/warp/wave widths separately from its preferred width, maximum workgroup geometry, and
+per-field provenance. A schedule chooses one supported width; it must never inherit another
+vendor's default. Matrix-operation scope remains an independent capability because a device may
+support several subgroup widths while one DPAS, MMA, or MFMA operation requires exactly one.
+
 The closed loop is:
 
 ```text

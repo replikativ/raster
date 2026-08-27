@@ -77,6 +77,7 @@
         graph (:graph (route/route-dynamic!
                        plan
                        {:device-type :gpu
+                        :vendor "Intel"
                         :subgroup-size 16
                         :max-workgroup-size 256
                         :segmented-weighted-reduction-schedule :subgroup-score-reuse}))

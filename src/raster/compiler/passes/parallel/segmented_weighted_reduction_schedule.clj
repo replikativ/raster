@@ -1,6 +1,6 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-schedule
   "Apply cooperative hardware schedules to schedule-neutral segmented weighted reductions."
-  (:require [clojure.string :as str]
+  (:require [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segmented-weighted-reduction-schedule :as schedule]))
 
@@ -17,22 +17,26 @@
   ([plan desc]
    (let [{:keys [membership storage score value operands output accumulator-dtype] :as plan}
          (swr/validate! plan)
-         subgroup-size (long (or (:subgroup-size desc) 16))
-         max-workgroup-size (long (or (:max-workgroup-size desc) 256))
-         vendor (some-> (:vendor desc) str str/lower-case)
-         matrix-family (get-in desc [:matrix :family])
-         known-non-intel? (and (or vendor matrix-family)
-                               (not (or (= :dpas matrix-family)
-                                        (and vendor (str/includes? vendor "intel")))))
+         subgroup-size (hardware/preferred-subgroup-size desc)
+         max-workgroup-size (hardware/maximum-workgroup-size desc)
+         supported-widths (hardware/supported-subgroup-sizes desc)
          components (:components value)
          operand-dtypes (mapv :dtype operands)]
      (cond
        (and desc (not= :gpu (:device-type desc)))
        (decline :score-reuse-requires-gpu {:device-type (:device-type desc)})
 
-       known-non-intel?
-       (decline :score-reuse-requires-intel-subgroup-dialect
-                {:vendor (:vendor desc) :matrix-family matrix-family})
+       (or (not (integer? subgroup-size))
+           (not (integer? max-workgroup-size)))
+       (decline :score-reuse-missing-execution-capability
+                {:subgroup-size subgroup-size
+                 :max-workgroup-size max-workgroup-size})
+
+       (and (seq supported-widths)
+            (not (contains? (set supported-widths) subgroup-size)))
+       (decline :score-reuse-subgroup-width-unsupported
+                {:subgroup-size subgroup-size
+                 :supported-subgroup-sizes (set supported-widths)})
 
        (not (swr/online-softmax-algebra? plan))
        (decline :score-reuse-requires-online-softmax-algebra)
@@ -69,30 +73,33 @@
        (or (not (integer? components)) (not (pos? components)))
        (decline :score-reuse-static-value-width-required {:components components})
 
-       (or (not (pos? subgroup-size)) (> subgroup-size max-workgroup-size))
+       (or (not (pos? (long subgroup-size)))
+           (> (long subgroup-size) (long max-workgroup-size)))
        (decline :score-reuse-invalid-subgroup-geometry
                 {:subgroup-size subgroup-size :max-workgroup-size max-workgroup-size})
 
        ;; A static cap makes register-state feasibility explicit. Gemma D=256/SG16 uses 16.
-       (> (quot (+ components (dec subgroup-size)) subgroup-size) 32)
+       (> (quot (+ components (dec (long subgroup-size))) (long subgroup-size)) 32)
        (decline :score-reuse-register-state-too-wide
                 {:components components :subgroup-size subgroup-size
-                 :components-per-lane (quot (+ components (dec subgroup-size)) subgroup-size)})
+                 :components-per-lane
+                 (quot (+ components (dec (long subgroup-size))) (long subgroup-size))})
 
        :else
        {:ok true
         :schedule
         (schedule/make
          {:strategy :subgroup-online-score-reuse
-          :workgroup-size subgroup-size
+          :workgroup-size (long subgroup-size)
           :segment-mapping :one-workgroup-per-segment
           :membership-traversal :sequential
-          :score-reduction {:kind :subgroup :width subgroup-size
+          :score-reduction {:kind :subgroup :width (long subgroup-size)
                             :axis (get-in score [:axis :name])}
           :value-mapping {:kind :lane-strided
                           :components components
                           :components-per-lane
-                          (quot (+ components (dec subgroup-size)) subgroup-size)}
+                          (quot (+ components (dec (long subgroup-size)))
+                                (long subgroup-size))}
           :state {:kind :online-normalized-weighted-sum
                   :components [:maximum :denominator :weighted-values]}
           :numerical-mode {:score-accumulate accumulator-dtype
