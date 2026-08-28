@@ -21,6 +21,7 @@
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.core.util :as util]
             [clojure.set :as set]))
 
@@ -509,6 +510,33 @@
     (catch clojure.lang.ExceptionInfo e
       {:fail :segop-program :details (ex-data e) :message (.getMessage e)})))
 
+(defn valid-typed-soac-program?
+  [value]
+  (try
+    (and (= :typed-soac (:dialect value))
+         (parallel-program/validate!
+          value
+          (fn [operation]
+            (let [body (when (and (seq? operation) (= '= (first operation))
+                                  (= 4 (count operation)))
+                         (nth operation 3))]
+              (and (seq? body) (contains? #{'map 'reduce} (first body)))))
+          (fn [_ algorithm]
+            (= algorithm (soac-dialect/validate! algorithm))))
+         (valid-let*-ordered? (:source value))
+         true)
+    (catch clojure.lang.ExceptionInfo _ false)))
+
+(defn valid-source-or-typed-soac?
+  [value]
+  (or (valid-let*-ordered? value) (valid-typed-soac-program? value)))
+
+(defn validate-source-or-typed-soac
+  [value]
+  (if (valid-typed-soac-program? value)
+    :ok
+    (validate-let*-ordered value)))
+
 (def dialect-checkers
   "Map from dialect keyword to [valid? validate] function pairs.
   Used by run-passes to validate IR at pass boundaries."
@@ -531,10 +559,10 @@
    :loop-lifted      [valid-let*-ordered? validate-let*-ordered]
    :write-read-fused [valid-let*-ordered? validate-let*-ordered]
    :par-fused        [valid-let*-ordered? validate-let*-ordered]
-   :soac-fused       [valid-let*-ordered? validate-let*-ordered]
-   :materialized     [valid-let*-ordered? validate-let*-ordered]
+   :soac-fused       [valid-source-or-typed-soac? validate-source-or-typed-soac]
+   :materialized     [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :segop-lowered    [valid-segop-program? validate-segop-program]
-   :compound-detected [valid-let*-ordered? validate-let*-ordered]
+   :compound-detected [valid-source-or-typed-soac? validate-source-or-typed-soac]
    :gpu-planned      [valid-let*-ordered? validate-let*-ordered]
    :dtype-remapped   [valid-let*-ordered? validate-let*-ordered]
    :backend-applied  [valid-let*-ordered? validate-let*-ordered]

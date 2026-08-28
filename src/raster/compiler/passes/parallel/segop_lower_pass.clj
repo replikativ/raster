@@ -269,46 +269,78 @@
      :target-device — device for launch param computation
      :dtype — element type (:double or :float)"
   [form opts]
-  (if-not (form/binding-form? form)
-    {:form (build-program form [] [] (:target-device opts) (:dtype opts))
-     :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}
-    (let [[let-sym bindings-vec & body-exprs] form
-          pairs (partition 2 bindings-vec)
-          device-id (:target-device opts)
-          dtype (:dtype opts)
-          array-types (:array-types opts)
-          lowered (atom 0)
-          graphs-lowered (atom 0)
+  (if (and (program/parallel-program? form) (= :typed-soac (:dialect form)))
+    (let [device-id (or (:target-device opts) :cpu:0)
+          dtype (or (:dtype opts) :double)
+          equations
+          (mapv
+           (fn [equation]
+             (let [algorithm (:algorithm equation)
+                   kind (soac-dialect/operation-kind
+                         (first (soac-dialect/equations algorithm)))
+                   operations (case kind
+                                map (soac-lower/lower-typed-map algorithm device-id :dtype dtype)
+                                reduce (soac-lower/lower-typed-reduce algorithm device-id :dtype dtype))]
+               (-> equation
+                   (assoc :operations operations)
+                   (update :provenance assoc :target-dialect :segop)
+                   (update :attributes assoc :device device-id))))
+           (:equations form))
+          lowered (assoc form
+                         :dialect :segop
+                         :equations equations
+                         :provenance (assoc (:provenance form)
+                                            :pass :segop-lower :source-dialect :typed-soac
+                                            :device device-id :dtype dtype))]
+      {:form (program/validate!
+              lowered segop/segop-node?
+              (fn [equation algorithm]
+                (and (= algorithm (soac-dialect/validate! algorithm))
+                     (= (:operands equation) (:inputs (soac-dialect/facts algorithm)))
+                     (= (:results equation) (soac-dialect/outputs algorithm)))))
+       :stats {:segops-lowered (count equations)
+               :kernel-graphs-lowered 0
+               :typed-soac-reused (count equations)}})
+    (if-not (form/binding-form? form)
+      {:form (build-program form [] [] (:target-device opts) (:dtype opts))
+       :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}
+      (let [[let-sym bindings-vec & body-exprs] form
+            pairs (partition 2 bindings-vec)
+            device-id (:target-device opts)
+            dtype (:dtype opts)
+            array-types (:array-types opts)
+            lowered (atom 0)
+            graphs-lowered (atom 0)
           ;; Every par form the middle end could NOT represent, as data. Previously these went to
           ;; stderr as `WARNING: …` and vanished — invisible to stats, to explain-pipeline, and to
           ;; anyone diagnosing why a kernel took the legacy path.
-          declined (atom [])
-          attempt (fn [sym init]
-                    (let [r (lower-attempt sym init device-id dtype array-types)]
-                      (when-let [d (:declined r)] (swap! declined conj d))
-                      (when (:segops r) r)))
-          binding-equations
-          (keep-indexed
-           (fn [idx [sym init]]
-             (when-let [lowered-values (attempt sym init)]
-               (swap! lowered inc)
-               (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
-               (equation idx [:binding sym] sym init lowered-values dtype array-types)))
-           pairs)
-          ;; Also check body expressions for par forms
-          body-equations
-          (keep-indexed
-           (fn [idx expr]
-             (let [tmp-sym (symbol (str "body_parallel_" idx))]
-               (when-let [lowered-values (attempt tmp-sym expr)]
+            declined (atom [])
+            attempt (fn [sym init]
+                      (let [r (lower-attempt sym init device-id dtype array-types)]
+                        (when-let [d (:declined r)] (swap! declined conj d))
+                        (when (:segops r) r)))
+            binding-equations
+            (keep-indexed
+             (fn [idx [sym init]]
+               (when-let [lowered-values (attempt sym init)]
                  (swap! lowered inc)
                  (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
-                 (equation (+ (count pairs) idx) [:body idx] tmp-sym expr
-                           lowered-values dtype array-types))))
-           body-exprs)
-          equations (vec (concat binding-equations body-equations))]
-      {:form (build-program (list* let-sym bindings-vec body-exprs)
-                            equations @declined device-id dtype)
-       :stats (cond-> {:segops-lowered @lowered
-                       :kernel-graphs-lowered @graphs-lowered}
-                (seq @declined) (assoc :segops-declined @declined))})))
+                 (equation idx [:binding sym] sym init lowered-values dtype array-types)))
+             pairs)
+          ;; Also check body expressions for par forms
+            body-equations
+            (keep-indexed
+             (fn [idx expr]
+               (let [tmp-sym (symbol (str "body_parallel_" idx))]
+                 (when-let [lowered-values (attempt tmp-sym expr)]
+                   (swap! lowered inc)
+                   (when (:kernel-graph lowered-values) (swap! graphs-lowered inc))
+                   (equation (+ (count pairs) idx) [:body idx] tmp-sym expr
+                             lowered-values dtype array-types))))
+             body-exprs)
+            equations (vec (concat binding-equations body-equations))]
+        {:form (build-program (list* let-sym bindings-vec body-exprs)
+                              equations @declined device-id dtype)
+         :stats (cond-> {:segops-lowered @lowered
+                         :kernel-graphs-lowered @graphs-lowered}
+                  (seq @declined) (assoc :segops-declined @declined))}))))

@@ -41,6 +41,7 @@
             [raster.compiler.passes.parallel.par-fusion :as par-fusion]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.soac-graph :as soac-graph]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-soac-route]
             [raster.compiler.backend.gpu.entry :as gpu-entry]
             [raster.compiler.backend.gpu.par-opencl :as par-opencl]
             [raster.compiler.backend.gpu.c-emit :as c-emit]
@@ -759,10 +760,17 @@
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
-    (let [[let-sym bindings-vec & body-exprs] form
-          pairs (vec (partition 2 bindings-vec))
-          nodes (soac/let-bindings->nodes pairs)
-          graph (soac-graph/build-fusion-graph nodes)
+    (let [am (when (device/gpu-target? (:target-device opts))
+               (try (core-hw/abstract-machine (core-hw/descriptor-for (:target-device opts)))
+                    (catch Throwable _ nil)))]
+      (let [typed (when (not= false (:typed-soac-fusion? opts))
+                    (typed-soac-route/attempt form am (:dtype opts) (:array-types opts)))]
+        (if (:program typed)
+          {:form (:program typed) :stats (:stats typed)}
+          (let [[let-sym bindings-vec & body-exprs] form
+                pairs (vec (partition 2 bindings-vec))
+                nodes (soac/let-bindings->nodes pairs)
+                graph (soac-graph/build-fusion-graph nodes)
           ;; Hardware-GUIDED fusion: project the target to an Abstract Machine so the
           ;; vertical chooser can DECLINE unprofitable rematerialization (cost model,
           ;; not a device — see soac-graph/vertical-fusion-profitable?). Only for GPU
@@ -770,14 +778,12 @@
           ;; kernels is the documented failure mode; CPU/no-target → am nil → the
           ;; chooser is legality-only, byte-identical to before. Descriptor failure
           ;; degrades to nil (no decline), never breaks compilation.
-          am (when (device/gpu-target? (:target-device opts))
-               (try (core-hw/abstract-machine (core-hw/descriptor-for (:target-device opts)))
-                    (catch Throwable _ nil)))
-          [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
-          new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
-          new-bindings (vec (mapcat identity new-pairs))]
-      {:form (list* let-sym new-bindings body-exprs)
-       :stats stats})
+                [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
+                new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
+                new-bindings (vec (mapcat identity new-pairs))]
+            {:form (list* let-sym new-bindings body-exprs)
+             :stats (cond-> stats
+                      (:declined typed) (assoc :typed-soac-declined (:declined typed)))}))))
     ;; Not a let* form — fall back to par-fusion
     (par-fusion/par-fusion-pass form)))
 
@@ -849,7 +855,9 @@
   allocates output buffers and converts them to imperative par/map! forms.
   (=> :soac-fused :materialized)"
   [form opts]
-  (materialize/materialize-pass form opts))
+  (if (parallel-program/parallel-program? form)
+    {:form form :stats {:materialized 0 :typed-soac-preserved true}}
+    (materialize/materialize-pass form opts)))
 
 (defn- pass-segop-lower
   "Lower par forms to typed equations in a first-class SegOp ParallelProgram.
@@ -862,7 +870,9 @@
   and wraps them in raster.compiler/compound-kernel markers.
   Returns {:form :stats}."
   [form opts]
-  (compound-detect/compound-detect-pass form opts))
+  (if (parallel-program/parallel-program? form)
+    {:form form :stats {:compound-kernels 0 :typed-soac-preserved true}}
+    (compound-detect/compound-detect-pass form opts)))
 
 (defn- strip-compound-markers
   "Replace compound-kernel markers with their original dotimes form.
@@ -1704,7 +1714,11 @@
         value-reg   @types/soa-registry
         value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
-                          :active-params active-params :dtype effective-dtype}
+                          :active-params active-params :dtype effective-dtype
+                          ;; The resident split pipeline still performs reduce-result device
+                          ;; realization between its pre/post halves. Keep it on the compatibility
+                          ;; source route until that transform consumes TypedSOAC equations.
+                          :typed-soac-fusion? false}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))

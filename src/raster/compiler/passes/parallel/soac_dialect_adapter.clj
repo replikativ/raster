@@ -202,9 +202,10 @@
    - :outputs — logical program results (defaults to the last equation's results)
    - :dtype — fallback element dtype
    - :array-types — symbol-to-dtype overrides
-   - :values — authoritative additional AbstractValues"
-  [nodes {:keys [outputs dtype array-types values]
-          :or {dtype :double array-types {} values {}}}]
+   - :values — authoritative additional AbstractValues
+   - :preserve-scalar-bindings? — allow the caller to retain scalar nodes in a separate envelope"
+  [nodes {:keys [outputs dtype array-types values preserve-scalar-bindings?]
+          :or {dtype :double array-types {} values {} preserve-scalar-bindings? false}}]
   (let [nodes (ordered-nodes nodes)
         physical-outputs (reduce set/union #{}
                                  (keep #(when-not (legacy/scalar-binding? %)
@@ -212,7 +213,8 @@
                                        nodes))
         unsupported (remove #(or (legacy/soac-map? %)
                                  (legacy/soac-reduce? %)
-                                 (generated-scaffolding? % physical-outputs))
+                                 (generated-scaffolding? % physical-outputs)
+                                 (and preserve-scalar-bindings? (legacy/scalar-binding? %)))
                             nodes)]
     (when-let [node (first unsupported)]
       (fail! :unsupported-legacy-node
