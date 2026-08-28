@@ -1160,16 +1160,20 @@
         allocations
         [(body/->WorkgroupAllocation
           'pipeline-key-stage-a :half [(:qk-head-dim problem)]
-          (layout/row-major [(:qk-head-dim problem)] :half) 16)
+          (layout/shared-memory [(:qk-head-dim problem)] :half
+                                (:layout-swizzle staging)) 16)
          (body/->WorkgroupAllocation
           'pipeline-value-stage-a :half [(:value-head-dim problem)]
-          (layout/row-major [(:value-head-dim problem)] :half) 16)
+          (layout/shared-memory [(:value-head-dim problem)] :half
+                                (:layout-swizzle staging)) 16)
          (body/->WorkgroupAllocation
           'pipeline-key-stage-b :half [(:qk-head-dim problem)]
-          (layout/row-major [(:qk-head-dim problem)] :half) 16)
+          (layout/shared-memory [(:qk-head-dim problem)] :half
+                                (:layout-swizzle staging)) 16)
          (body/->WorkgroupAllocation
           'pipeline-value-stage-b :half [(:value-head-dim problem)]
-          (layout/row-major [(:value-head-dim problem)] :half) 16)]
+          (layout/shared-memory [(:value-head-dim problem)] :half
+                                (:layout-swizzle staging)) 16)]
         initial-ops
         (flatten-operations
          [query-ops

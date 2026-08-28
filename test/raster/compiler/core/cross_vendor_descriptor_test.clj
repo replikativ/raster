@@ -21,6 +21,9 @@
       (is (= #{32} (:subgroup-sizes nv)))
       (is (= 32 (:subgroup-size nv)))
       (is (= 1024 (:max-workgroup-size nv)))
+      (is (= {:count 32 :word-bytes 4 :provenance :derived
+              :family :cuda-shared-memory}
+             (hw/shared-memory-bank-model nv)))
       (is (= 1020 (:grf-bytes-per-lane nv))))
     (testing "AMD CDNA (gfx9): Matrix Cores :mfma 16×16×16 wavefront64; 256 VGPRs×4"
       (is (= {:family :mfma :m 16 :n 16 :k 16 :subgroup 64} (:matrix amd)))
@@ -28,6 +31,8 @@
       (is (= #{64} (:subgroup-sizes amd)))
       (is (= 64 (:subgroup-size amd)))
       (is (= 1024 (:max-workgroup-size amd)))
+      (is (= {:count 32 :word-bytes 4 :provenance :derived :family :amd-lds}
+             (hw/shared-memory-bank-model amd)))
       (is (= 1024 (:grf-bytes-per-lane amd))))
     (testing "the tile is sized against the vendor register file but CAPPED (not register-filling)"
       ;; both NVIDIA and AMD have ~4× Intel's register file; the cap keeps the warp tile at
@@ -62,6 +67,9 @@
     (testing "Intel retains several supported widths and a distinct preference"
       (is (= #{16 32} (get-in arc [:execution :subgroup-sizes])))
       (is (= 16 (get-in arc [:execution :preferred-subgroup-size])))
+      (is (= {:count 16 :word-bytes 4 :provenance :derived :family :intel-slm
+              :device-dependent? true}
+             (hw/shared-memory-bank-model arc)))
       (is (= :subgroup (get-in arc [:execution :subgroup-kind]))))))
 
 (deftest explicit-capabilities-override-catalogue-per-field
@@ -101,7 +109,20 @@
     (is (= #{8 16 32} (:subgroup-sizes opencl)))
     (is (= 16 (:subgroup-size opencl)))
     (is (= 512 (:max-workgroup-size opencl)))
-    (is (= 32768 (get-in opencl [:cache :slm])))))
+    (is (= 32768 (get-in opencl [:cache :slm])))
+    (is (nil? (hw/shared-memory-bank-model opencl))
+        "generic OpenCL does not inherit Intel/NVIDIA/AMD bank topology")))
+
+(deftest explicit-bank-topology-overrides-derived-vendor-defaults
+  (rt/register-target-device!
+   :cuda:explicit-banks
+   {:type :cuda :name "synthetic-future-nvidia"
+    :capabilities {:shared-memory-bank-count 64
+                   :shared-memory-bank-word-bytes 8}})
+  (let [desc (hw/descriptor-for :cuda:explicit-banks)]
+    (is (= {:count 64 :word-bytes 8 :provenance :user}
+           (hw/shared-memory-bank-model desc)))
+    (is (= :user (get-in desc [:execution :provenance :shared-memory-banks])))))
 
 (deftest authoritative-aliases-override-catalogue-spellings
   (let [device (rt/register-target-device!

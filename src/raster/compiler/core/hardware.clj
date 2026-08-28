@@ -170,6 +170,45 @@
        best))
    nil candidates))
 
+(defn- shared-memory-bank-capability
+  "Normalize an explicitly reported topology or derive the documented current vendor default.
+
+   CUDA shared memory and modern AMD LDS have 32 four-byte banks. Intel's current oneAPI guide
+   documents 16 four-byte SLM banks while warning that the count is device-dependent, so only the
+   Intel-specific Level Zero backend receives that derived value. Generic OpenCL abstains unless
+   its device reports both fields. Explicit probe/catalogue facts always override these defaults."
+  [target-type caps source]
+  (let [[count-key count-value]
+        (best-capability caps source [:shared-memory-bank-count :slm-bank-count :lds-bank-count])
+        [word-key word-value]
+        (best-capability caps source [:shared-memory-bank-word-bytes :slm-bank-word-bytes
+                                      :lds-bank-word-bytes])]
+    (when (not= (some? count-value) (some? word-value))
+      (throw (ex-info "shared-memory bank topology must report count and word width together"
+                      {:reason :hardware-shared-memory-bank-topology-incomplete
+                       :count count-value :word-bytes word-value})))
+    (cond
+      count-value
+      {:count (positive-limit :shared-memory-bank-count count-value)
+       :word-bytes (positive-limit :shared-memory-bank-word-bytes word-value)
+       :provenance (let [count-source (source-of source count-key :derived)
+                         word-source (source-of source word-key :derived)]
+                     ;; The tuple is only as authoritative as its weaker field.
+                     (if (<= (provenance-rank count-source) (provenance-rank word-source))
+                       count-source word-source))}
+
+      (= :cuda target-type)
+      {:count 32 :word-bytes 4 :provenance :derived :family :cuda-shared-memory}
+
+      (= :hip target-type)
+      {:count 32 :word-bytes 4 :provenance :derived :family :amd-lds}
+
+      (= :ze target-type)
+      {:count 16 :word-bytes 4 :provenance :derived :family :intel-slm
+       :device-dependent? true}
+
+      :else nil)))
+
 (defn- execution-capabilities
   "Normalize backend-specific execution hierarchy keys at the runtime/compiler boundary.
 
@@ -229,6 +268,7 @@
         [scratchpad-key scratchpad]
         (best-capability caps source [:shared-local-memory :shared-memory-per-block
                                       :local-memory-bytes :local-mem-bytes])
+        shared-memory-banks (shared-memory-bank-capability target-type caps source)
         preferred-source (if preferred-key
                            (source-of source preferred-key :derived)
                            :derived)
@@ -248,7 +288,9 @@
                             (source-of source dimensions-key :derived))
                      scratchpad-key
                      (assoc :scratchpad-bytes
-                            (source-of source scratchpad-key :derived)))
+                            (source-of source scratchpad-key :derived))
+                     shared-memory-banks
+                     (assoc :shared-memory-banks (:provenance shared-memory-banks)))
         execution (cond->
                    {:subgroup-kind (case target-type
                                      :cuda :warp
@@ -260,7 +302,8 @@
                     :provenance provenance}
                     dimensions (assoc :max-workgroup-dims dimensions)
                     scratchpad (assoc :scratchpad-bytes
-                                      (positive-limit :scratchpad-bytes scratchpad)))]
+                                      (positive-limit :scratchpad-bytes scratchpad))
+                    shared-memory-banks (assoc :shared-memory-banks shared-memory-banks))]
     (when (and preferred-subgroup-size
                (not (contains? subgroup-sizes preferred-subgroup-size)))
       (throw (ex-info "preferred subgroup width is not a supported hardware width"
@@ -304,6 +347,12 @@
   [desc]
   (or (get-in desc [:execution :max-workgroup-size])
       (:max-workgroup-size desc)))
+
+(defn shared-memory-bank-model
+  "Return the normalized workgroup-memory bank topology, or nil when the target cannot support a
+   trustworthy static conflict estimate."
+  [desc]
+  (get-in desc [:execution :shared-memory-banks]))
 
 (defn- gpu-reg-budget-per-lane
   "Per-lane register-file budget the schedule/tile GRF gate charges against — vendor-specific

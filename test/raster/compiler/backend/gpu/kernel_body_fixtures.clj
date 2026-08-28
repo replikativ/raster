@@ -34,6 +34,37 @@
     :provenance {:dialect :compile-gate}
     :attributes {:kind :workgroup-memory}}))
 
+(defn swizzled-workgroup-memory-body
+  "A 2-D XOR-layout fixture. Each lane accesses one logical column element; source compilation
+   proves that OpenCL/CUDA/HIP share the verified address transform without choosing a schedule."
+  [width]
+  (body/make
+   {:id :c-family-swizzled-workgroup-memory-gate
+    :parameters [(body/->KernelParameter
+                  'x :input :float [width] :global
+                  (layout/row-major [width] :float) :input)
+                 (body/->KernelParameter
+                  'y :output :float [width] :global
+                  (layout/row-major [width] :float) :result)]
+    :stable-reads [(body/stable-read 'x)]
+    :allocations [(body/->WorkgroupAllocation
+                   'scratch :float [width width]
+                   (layout/shared-memory [width width] :float :xor-32) 16)]
+    :indices [(body/->IndexBinding 'lane :local 0)]
+    :operations [(body/->ScalarLoad (body/value 'input-value :float)
+                                    'x ['lane] nil nil :cached)
+                 (body/->ScalarStore 'scratch ['lane 0] 'input-value nil)
+                 (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                                          (body/full-participation))
+                 (body/->ScalarLoad (body/value 'staged-value :float)
+                                    'scratch ['lane 0] nil nil :cached)
+                 (body/->ScalarStore 'y ['lane] 'staged-value nil)]
+    :schedule {:shared-memory-layout :xor-32}
+    :launch (launch/spec {:workgroup-size [width] :group-count [1]
+                          :shared-memory-bytes (* width width 4)})
+    :provenance {:dialect :compile-gate}
+    :attributes {:kind :swizzled-workgroup-memory}}))
+
 (defn async-staging-body
   "A workgroup stages one contiguous row, explicitly commits and waits, then consumes it."
   [width overlap]

@@ -75,6 +75,28 @@
                    :workgroup-memory-bytes
                    (get-in kernel-body [:launch :shared-memory-bytes])}})))
 
+(defn- swizzled-artifact
+  [width]
+  (let [kernel-body (fixtures/swizzled-workgroup-memory-body width)
+        abi (body-abi/project-contracts
+             [(kabi/slot 'x :input :float :c-name "rstr_x" :role :input)
+              (kabi/slot 'y :output :float :c-name "rstr_y" :role :result)]
+             kernel-body)]
+    (kart/make
+     {:kernel-name "kernel_body_swizzled_stage"
+      :target :opencl-c
+      :source (body-emit/emit-scalar-kernel
+               "kernel_body_swizzled_stage" kernel-body
+               {:target-dialect :opencl-portable})
+      :abi abi
+      :arguments '[x y]
+      :launch (:launch kernel-body)
+      :effects {:kind :swizzled-workgroup-stage}
+      :provenance {:kernel-body (:id kernel-body)}
+      :attributes {:shared-memory-layout :xor-32
+                   :workgroup-memory-bytes
+                   (get-in kernel-body [:launch :shared-memory-bytes])}})))
+
 (deftest workgroup-local-roundtrip-is-correct-on-opencl
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "KernelBody workgroup-local storage and barrier")
@@ -113,6 +135,30 @@
           width 32
           input (float-array (map float (range width)))
           compiled (async-artifact width)
+          x (buffer-of-array input :float)
+          y (make-buffer width :float)]
+      (try
+        (register! (:kernel-name compiled) compiled)
+        (launch! (bind-call (kcall/make compiled [x y])))
+        (is (= (vec input) (vec (buffer->array y))))
+        (finally
+          (free! y)
+          (free! x))))))
+
+(deftest swizzled-workgroup-stage-is-correct-on-opencl
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "KernelBody verified XOR workgroup layout")
+    (let [ocl (find-ns 'raster.gpu.ocl-runtime)
+          register! (ns-resolve ocl 'register-kernel!)
+          buffer-of-array (ns-resolve ocl 'buffer-of-array)
+          make-buffer (ns-resolve ocl 'make-buffer)
+          bind-call (ns-resolve ocl 'bind-kernel-call)
+          launch! (ns-resolve ocl 'launch-registered-bound!)
+          buffer->array (ns-resolve ocl 'buffer->array)
+          free! (ns-resolve ocl 'free-buffer!)
+          width 32
+          input (float-array (map float (range width)))
+          compiled (swizzled-artifact width)
           x (buffer-of-array input :float)
           y (make-buffer width :float)]
       (try

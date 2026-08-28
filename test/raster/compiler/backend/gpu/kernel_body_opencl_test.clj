@@ -94,6 +94,9 @@
   []
   (fixtures/workgroup-memory-body 16))
 
+(defn swizzled-workgroup-kernel-body []
+  (fixtures/swizzled-workgroup-memory-body 32))
+
 (defn async-staging-kernel-body
   ([] (async-staging-kernel-body :preferred))
   ([overlap] (fixtures/async-staging-body 32 overlap)))
@@ -245,6 +248,24 @@
   (testing "the portable OpenCL source remains valid OpenCL C"
     (let [source (opencl/emit-scalar-kernel
                   "workgroup_memory" (workgroup-kernel-body)
+                  {:target-dialect :opencl-portable})]
+      (if-not (command-available? "clang")
+        (is true "clang unavailable; source structure remains covered")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in source)]
+          (is (zero? exit) err))))))
+
+(deftest verified-xor-layout-shares-one-c-family-address-transform
+  (doseq [target [:opencl-portable :cuda :hip]]
+    (let [source (opencl/emit-scalar-kernel
+                  "swizzled_workgroup_memory" (swizzled-workgroup-kernel-body)
+                  {:target-dialect target})]
+      (is (str/includes? source
+                         "((long)(rstr_lane) * (long)(32) + ((long)(0) ^ ((long)(rstr_lane) & 31)))")
+          (name target))))
+  (testing "the portable source remains valid OpenCL C"
+    (let [source (opencl/emit-scalar-kernel
+                  "swizzled_workgroup_memory" (swizzled-workgroup-kernel-body)
                   {:target-dialect :opencl-portable})]
       (if-not (command-available? "clang")
         (is true "clang unavailable; source structure remains covered")

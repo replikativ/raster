@@ -153,10 +153,14 @@
     (is (= {:kind :double-buffered-membership-rows
             :stages 2 :members-per-iteration 2 :element-dtype :half
             :key-elements 8 :value-elements 8 :transfer-bytes 16
-            :overlap :preferred :tail-policy :separate-epilogue
+            :overlap :preferred :layout-swizzle :identity
+            :tail-policy :separate-epilogue
             :shared-memory-bytes 64}
            (:staging scheduled)))
     (is (= 4 (count (:allocations kernel-body))))
+    (is (every? #(= {:kind :shared-memory :swizzle :identity}
+                    (select-keys (:layout %) [:kind :swizzle]))
+                (:allocations kernel-body)))
     (is (= 64 (get-in kernel-body [:launch :shared-memory-bytes])))
     (is (= :scheduled-pipelined-kernel-body
            (get-in kernel-body [:provenance :lowering])))

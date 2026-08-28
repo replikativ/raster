@@ -174,10 +174,20 @@ overlaps each refill with consumption of the other row, and handles histories of
 through the prior sequential body and even/odd tails through an explicit drain/epilogue. It retains
 the semantic plan, ordered ABI and interval bounds; CSR membership, CSR physical routing and
 unaligned row widths decline to their prior verified schedules. The exact body runs against the
-reference algebra on Intel and compiles through nvcc and hipcc without target hardware. Local
-swizzles and measured stage-depth selection can now collapse more of the tiled graph toward a
-FlashAttention-like single kernel without changing the semantic plan or external ABI. The schedule
-remains opt-in until device measurements and the runtime cost path justify automatic selection.
+reference algebra on Intel and compiles through nvcc and hipcc without target hardware.
+Shared-memory layout is now an explicit verified KernelBody facet. Its finite family consists of
+identity and named 2/4/8/16/32-period row-XOR permutations; the verifier proves static shape,
+in-bounds bijection and exact byte charge, and the shared C-family emitter lowers the same physical
+address transform to OpenCL, CUDA and HIP. Contiguous async copy accepts only the identity member
+until an explicit scatter/tensor-copy operation exists. Hardware descriptors normalize explicit
+bank topology, derive documented CUDA/AMD values and Intel Level Zero's device-dependent current
+default, and abstain for generic OpenCL. The resource model reports allocation feasibility,
+broadcasts and per-bank transaction conflict degree. The current one-dimensional production row
+stages name the verified identity member; non-identity layouts are compiler/source fixtures, not an
+unmeasured performance claim. Measured swizzle and stage-depth selection can now collapse more of
+the tiled graph toward a FlashAttention-like single kernel without changing the semantic plan or
+external ABI. The schedule remains opt-in until device measurements and the runtime cost path
+justify automatic selection.
 
 ### 2.3 Executable steps and resident artifact values compose
 
@@ -743,7 +753,8 @@ The immediate continuation after the verified double-buffered weighted-reduction
 2. **Landed:** carry that dialect in the existing program/value envelope and route one ordinary
    fused reduction through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from
    source spelling.
-3. Add a finite verified shared-memory swizzle family and bank-conflict/resource model.
+3. **Landed:** add a finite verified shared-memory swizzle family and bank-conflict/resource model;
+   keep the current 1-D attention stages on its identity member until measured 2-D staging lands.
 4. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
    attention-provenance gate from the generic weighted-reduction matcher.
 5. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
