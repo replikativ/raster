@@ -10,12 +10,14 @@
     :dep     — consumer reads producer's array output (fusible)
     :inf-dep — consumer reads producer's scalar output (infusible)
     :cons    — consumer mutates array producer reads (anti-dep)"
-  (:require [raster.compiler.core.dtype :as dt]
+  (:require [clojure.set :as set]
+            [clojure.walk :as walk]
+            [raster.compiler.core.dtype :as dt]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.parallel.schedule-support :as schedule-support]
-            [raster.compiler.core.op-descriptor :as opd]
-            [clojure.set :as set]))
+            [raster.compiler.core.op-descriptor :as opd]))
 
 ;; ================================================================
 ;; FusionGraph record
@@ -202,7 +204,7 @@
   (let [;; First resolve aliases in all symbols
         alias-resolved (if (nil? alias-map)
                          bound-expr
-                         (clojure.walk/postwalk
+                         (walk/postwalk
                           (fn [form]
                             (if (and (symbol? form) (contains? alias-map form))
                               (get alias-map form)
@@ -386,6 +388,47 @@
             (<= (lambda-flops (:lambda producer))
                 (* (long eb) (double ridge)))))))
 
+(defn- reduction-fusion-expressions
+  [product]
+  (cond
+    (:step product) (:results (reduction/fold-region product))
+    (:element product) (:results (reduction/element-region product))
+    :else nil))
+
+(defn- assoc-reduction-fusion-expressions
+  [product expressions]
+  (cond
+    (:step product) (assoc-in product [:step :results] (vec expressions))
+    (:element product) (assoc-in product [:element :results] (vec expressions))
+    :else product))
+
+(defn- fusion-expressions
+  "Canonical scalar expressions into which a pointwise producer may be substituted."
+  [node]
+  (cond
+    (soac/soac-reduce? node) (reduction-fusion-expressions (:reduction node))
+    (soac/screma? node) (cond
+                          (:map-lambda node) [(:map-lambda node)]
+                          (= 1 (count (:reduces node)))
+                          (reduction-fusion-expressions (first (:reduces node)))
+                          :else nil)
+    (:lambda node) [(:lambda node)]
+    :else nil))
+
+(defn- assoc-fusion-expressions
+  [node expressions]
+  (cond
+    (soac/soac-reduce? node)
+    (update node :reduction assoc-reduction-fusion-expressions expressions)
+
+    (and (soac/screma? node) (:map-lambda node))
+    (assoc node :map-lambda (first expressions))
+
+    (and (soac/screma? node) (= 1 (count (:reduces node))))
+    (update-in node [:reduces 0] assoc-reduction-fusion-expressions expressions)
+
+    :else (assoc node :lambda (first expressions))))
+
 (defn can-fuse-vertically?
   "Check if producer can be vertically fused into consumer.
 
@@ -411,28 +454,36 @@
   ([graph producer-id consumer-id]
    (can-fuse-vertically? graph producer-id consumer-id nil nil))
   ([graph producer-id consumer-id am dtype]
-  (let [nodes (:nodes graph)
-        producer (get nodes producer-id)
-        consumer (get nodes consumer-id)
-        alias-map (:alias-map graph)]
-    (and
+   (let [nodes (:nodes graph)
+         producer (get nodes producer-id)
+         consumer (get nodes consumer-id)
+         alias-map (:alias-map graph)]
+     (and
       ;; 1. Both are SOACs
-     (soac/soac? producer)
-     (soac/soac? consumer)
+      (soac/soac? producer)
+      (soac/soac? consumer)
       ;; 2. :dep edge exists
-     (seq (dep-edges-between graph producer-id consumer-id))
+      (seq (dep-edges-between graph producer-id consumer-id))
       ;; 3. No :inf-dep edges between pair
-     (empty? (inf-dep-edges-between graph producer-id consumer-id))
+      (empty? (inf-dep-edges-between graph producer-id consumer-id))
       ;; 4. Same bound (after alias + size normalization)
-     (let [{:keys [array-equiv scalar-bound]} (build-size-equiv nodes alias-map)]
-       (= (normalize-bound (soac/soac-bound producer) alias-map array-equiv scalar-bound)
-          (normalize-bound (soac/soac-bound consumer) alias-map array-equiv scalar-bound)))
+      (let [{:keys [array-equiv scalar-bound]} (build-size-equiv nodes alias-map)]
+        (= (normalize-bound (soac/soac-bound producer) alias-map array-equiv scalar-bound)
+           (normalize-bound (soac/soac-bound consumer) alias-map array-equiv scalar-bound)))
       ;; 5. Producer is a Map or Scan (can inline its body)
       ;; Map→X: substitute aget with producer body (eliminates intermediate array)
       ;; Scan→Map: fold consumer body into scan loop as side-effect aset
-     (or (instance? raster.compiler.ir.soac.SoacMap producer)
-         (and (instance? raster.compiler.ir.soac.SoacScan producer)
-              (instance? raster.compiler.ir.soac.SoacMap consumer)))
+      (or (and (soac/soac-map? producer)
+              ;; Current dependency edges do not retain which output of a multi-result map was
+              ;; consumed. Choosing `(first outputs)` is unordered and can substitute the wrong
+              ;; value; decline until typed equation edges carry precise value identity.
+               (= 1 (count (soac/soac-outputs producer))))
+          (and (soac/soac-scan? producer)
+               (soac/soac-map? consumer)))
+      ;; The consumer must expose canonical scalar expressions. Associating a synthetic :lambda
+      ;; onto a reduction record does not update its ProductReduction and silently leaves a read of
+      ;; the eliminated intermediate behind.
+      (seq (fusion-expressions consumer))
       ;; 6. Value-flow ordering: the producer must PRECEDE the consumer in the
      ;; original program order (`:id` = the sequential let*-binding index). A
      ;; genuine read-after-write `:dep` (the consumer reads a value the producer
@@ -449,16 +500,16 @@
      ;; forward-reference that the :soac-fused dialect validator rejects loudly).
      ;; This guard is domain-agnostic — it queries only node identity/order, no
      ;; op names — and declines exactly the spurious backwards fusions.
-     (< (:id producer) (:id consumer))
+      (< (:id producer) (:id consumer))
       ;; 7. The producer must NOT be a reduce-broadcast node (see depends-on-reduce?).
       ;; Pinning it keeps the reduce→broadcast→map boundary materialized — without this,
       ;; introducing a par/reduce (matching the element bound) lets the broadcast map smear
       ;; the reduce-derived scalar across consumers and cascade into monster kernels.
-     (not (depends-on-reduce? graph producer-id))
+      (not (depends-on-reduce? graph producer-id))
       ;; 8. PROFITABILITY (decline-only): with an AM supplied, decline a legal fusion
       ;; the locality roofline says loses (expensive multi-consumer rematerialization).
       ;; Last conjunct → can only turn a true into false, never the reverse.
-     (vertical-fusion-profitable? graph producer-id consumer-id am dtype)))))
+      (vertical-fusion-profitable? graph producer-id consumer-id am dtype)))))
 
 (defn- fuse-vertical-scan-map
   "Fuse Scan producer into Map consumer by folding the map's body into
@@ -563,25 +614,31 @@
           prod-sym (:sym producer)
           others (other-consumers graph producer-id consumer-id)
           keep-producer? (seq others)
-        ;; Inline producer body into consumer lambda.
+        ;; Inline producer body into the consumer's canonical scalar region(s). A map cast is part
+        ;; of the materialized intermediate's semantics and must travel with the inlined value.
         ;; Try both the output buffer sym and the producer's binding sym
         ;; (alias), since consumers may read through either name.
         ;; E.g., producer: h = (par/map! out__ ...), consumer reads (aget h ...)
-          new-lambda (let [subst1 (fusion-support/substitute-aget
-                                   (:lambda consumer) prod-out
-                                   (:idx producer) (:idx consumer)
-                                   (:lambda producer))]
-                       (if (= subst1 (:lambda consumer))
-                       ;; First substitution was a no-op — try the alias sym
-                         (fusion-support/substitute-aget
-                          (:lambda consumer) prod-sym
-                          (:idx producer) (:idx consumer)
-                          (:lambda producer))
-                         subst1))
+          producer-expression (if-let [cast (:cast-fn producer)]
+                                (list cast (:lambda producer))
+                                (:lambda producer))
+          new-expressions
+          (mapv (fn [expression]
+                  (let [substituted (fusion-support/substitute-aget
+                                     expression prod-out
+                                     (:idx producer) (soac/soac-idx consumer)
+                                     producer-expression)]
+                    (if (= substituted expression)
+                      (fusion-support/substitute-aget
+                       expression prod-sym
+                       (:idx producer) (soac/soac-idx consumer)
+                       producer-expression)
+                      substituted)))
+                (fusion-expressions consumer))
         ;; Merge inputs: consumer inputs + producer inputs - producer output
-          new-inputs (set/union (disj (:inputs consumer) prod-out)
+          new-inputs (set/union (disj (:inputs consumer) prod-out prod-sym)
                                 (:inputs producer))
-          new-scalars (set/union (disj (:scalars consumer) prod-out)
+          new-scalars (set/union (disj (:scalars consumer) prod-out prod-sym)
                                  (:scalars producer))
         ;; When fusing a pure producer (no output buffer), the consumer's bound
         ;; may reference (alength prod-sym) which becomes dangling after removal.
@@ -593,11 +650,11 @@
                                          array-equiv scalar-bound))
                       (:bound consumer))
         ;; Create updated consumer
-          updated-consumer (assoc consumer
-                                  :lambda new-lambda
-                                  :inputs new-inputs
-                                  :scalars new-scalars
-                                  :bound new-bound)
+          updated-consumer (-> consumer
+                               (assoc-fusion-expressions new-expressions)
+                               (assoc :inputs new-inputs
+                                      :scalars new-scalars
+                                      :bound new-bound))
         ;; Update nodes
           new-nodes (if keep-producer?
                     ;; Multi-consumer: keep producer, update consumer
@@ -891,17 +948,17 @@
   independent same-bound maps and never duplicates compute."
   ([graph] (fusion-fixpoint graph nil nil))
   ([graph am dtype]
-  (loop [g graph
-         total-v 0
-         total-h 0
-         iters 0]
-    (let [[g1 v-count] (apply-vertical-fusions g am dtype)
-          [g2 h-count] (apply-horizontal-fusions g1)]
-      (if (and (zero? v-count) (zero? h-count))
-        [g2 {:vertical (+ total-v v-count)
-             :horizontal (+ total-h h-count)
-             :iterations (inc iters)}]
-        (recur g2
-               (+ total-v v-count)
-               (+ total-h h-count)
-               (inc iters)))))))
+   (loop [g graph
+          total-v 0
+          total-h 0
+          iters 0]
+     (let [[g1 v-count] (apply-vertical-fusions g am dtype)
+           [g2 h-count] (apply-horizontal-fusions g1)]
+       (if (and (zero? v-count) (zero? h-count))
+         [g2 {:vertical (+ total-v v-count)
+              :horizontal (+ total-h h-count)
+              :iterations (inc iters)}]
+         (recur g2
+                (+ total-v v-count)
+                (+ total-h h-count)
+                (inc iters)))))))
