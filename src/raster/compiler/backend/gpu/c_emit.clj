@@ -446,11 +446,7 @@
            tag (when (symbol? arr) (or (:raster.type/tag (meta arr)) (:tag (meta arr))))]
        (get tag->ctype tag "int"))
 
-     (and (seq? expr)
-          (contains? #{'inc 'dec 'clojure.core/inc 'clojure.core/dec
-                       'unchecked-inc-int 'unchecked-dec-int
-                       'clojure.core/unchecked-inc-int 'clojure.core/unchecked-dec-int}
-                     (first expr)))
+     (and (seq? expr) (contains? #{'inc 'dec 'clojure.core/inc 'clojure.core/dec} (first expr)))
      (let [inner-type (infer-c-type (second expr))]
        (if (= inner-type "int") "int" *scalar-type*))
 

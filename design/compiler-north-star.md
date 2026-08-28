@@ -423,7 +423,9 @@ queries, value-numbers `alength` of a produced tensor to its certified extent, a
 host spelling mechanically. Map/reduce captures also distinguish pointwise element operands,
 stable tensor reads and true scalar parameters. This lets the ordinary two-layer `predict-fn`
 retain typed dense→ReLU fusion without conflating weights or inner-reduction activations with the
-outer map shape, and preserves buffer versus scalar ABI roles through JVM/OpenCL lowering.
+outer map shape, and preserves buffer versus scalar ABI roles through JVM/OpenCL lowering. Scalar
+result dtypes come from retained walker/TypedClojure tags; `AbstractValue` transports those dtypes,
+while the scheduled operation—not tensor rank—declares whether an ABI value is a scalar or buffer.
 
 This representation is shared before backend selection. SOAC fusion changes the program consumed
 by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The scalar

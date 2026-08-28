@@ -142,27 +142,23 @@
   [program]
   (:source (validate! program)))
 
-(defn declared-parameter-types
-  "Project backend parameter dtypes from a validated program's value contracts.
+(defn declared-value-types
+  "Project declared dtypes for an explicit collection of value IDs.
 
-   Scalar tensors have shape `[]`; tensor values with one or more dimensions are buffers. Only
-   symbol IDs can name parameters in the compatibility host expression. Explicit backend options
-   may still override this projection, but a typed program never needs to rediscover an index dtype
-   from a spelling such as `cols`."
-  [program]
-  (let [values (:values (validate! program))
-        typed-symbols (keep (fn [[id value]]
-                              (when (and (symbol? id)
-                                         (= :tensor (:kind value))
-                                         (keyword? (:dtype value)))
-                                [id value]))
-                            values)]
-    {:scalar-types (into {} (keep (fn [[id value]]
-                                    (when (empty? (:shape value)) [id (:dtype value)])))
-                         typed-symbols)
-     :array-types (into {} (keep (fn [[id value]]
-                                   (when (seq (:shape value)) [id (:dtype value)])))
-                        typed-symbols)}))
+   The caller supplies ABI/storage roles from its scheduled operation. Logical rank is deliberately
+   not used to guess whether a value is passed by value or by buffer: a rank-zero tensor may later
+   be realized either way."
+  [program ids]
+  (let [values (:values (validate! program))]
+    (into {}
+          (map (fn [id]
+                 (let [value (get values id)]
+                   (when-not (and (symbol? id) value (keyword? (:dtype value)))
+                     (throw (ex-info "scheduled parameter lacks a declared symbolic value dtype"
+                                     {:reason :parallel-program-parameter-dtype
+                                      :id id :value value})))
+                   [id (:dtype value)])))
+          ids)))
 
 (defn equation-for-binding
   "Find the equation for a binding only when the current source still matches its certified source.

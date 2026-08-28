@@ -49,8 +49,17 @@
                       z)]
     (is (nil? (route/attempt source nil :float)))))
 
-(deftest semantic-alength-bounds-normalize-to-the-producing-extent
+(deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
+                       y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
+                       z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
+                      z)]
+    (is (= :unsupported-scalar-binding
+           (get-in (route/attempt source nil :float {'x :float}) [:declined :reason]))
+        "the compatibility adapter must not reconstruct a missing TypedClojure result type")))
+
+(deftest semantic-alength-bounds-normalize-to-the-producing-extent
+  (let [source '(let* [^long n (clojure.core/alength x)
                        y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        z (raster.par/pmap j (clojure.core/alength y) float
                                           (+ (clojure.core/aget y j) 1.0))]
@@ -75,8 +84,8 @@
 
 (deftest scalar-shapes-and-stable-tensor-captures-route-a-nested-reduction
   (let [source
-        '(let* [rows (clojure.core/alength b1)
-                cols (clojure.core/alength x)
+        '(let* [^long rows (clojure.core/alength b1)
+                ^long cols (clojure.core/alength x)
                 h (raster.par/pmap i rows double
                                    (+ (clojure.core/aget b1 i)
                                       (raster.par/reduce
@@ -85,8 +94,8 @@
                                                  (clojure.core/aget x j))))))
                 a (raster.par/pmap k (clojure.core/alength h) double
                                    (max 0.0 (clojure.core/aget h k)))
-                out-rows (clojure.core/alength b2)
-                reused-cols (clojure.core/alength a)
+                ^long out-rows (clojure.core/alength b2)
+                ^long reused-cols (clojure.core/alength a)
                 out (raster.par/pmap o out-rows double
                                      (+ (clojure.core/aget b2 o)
                                         (raster.par/reduce

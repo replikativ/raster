@@ -6,7 +6,9 @@
    produced by current horizontal fusion. Every unsupported legacy shape declines loudly so the
    bridge cannot silently erase compiler facts."
   (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.reduction :as reduction]
@@ -158,22 +160,23 @@
                         body-results))))))
 
 (defn- scalar-dtype
-  [expression scalar-dtypes scalar-types]
-  (cond
-    (and (seq? expression)
-         (descriptor/alength-op? (descriptor/semantic-op expression))) :long
-    (symbol? expression) (or (get scalar-dtypes expression) (get scalar-types expression))
-    (instance? Float expression) :float
-    (number? expression) (if (integer? expression) :long :double)
-    (boolean? expression) :boolean
-    :else nil))
+  [node scalar-dtypes scalar-types]
+  (let [result (:sym node)
+        expression (:expr node)
+        result-tag (types/sym-type-tag result)
+        expression-tag (when (instance? clojure.lang.IObj expression)
+                         (or (:raster.type/tag (meta expression)) (:tag (meta expression))))]
+    (or (get scalar-types result)
+        (when (symbol? expression) (get scalar-dtypes expression))
+        (dtype/dtype-for-scalar-tag result-tag)
+        (dtype/dtype-for-scalar-tag expression-tag))))
 
 (defn- scalar-equation
   [node scalar-dtypes scalar-types]
   (let [expression (:expr node)
         captures (vec (sort-by pr-str (util/free-syms expression)))
         parameters (capture-symbols (count captures))
-        dtype (scalar-dtype expression scalar-dtypes scalar-types)]
+        dtype (scalar-dtype node scalar-dtypes scalar-types)]
     (when-not dtype
       (fail! :unsupported-scalar-binding
              "typed scalar equations require a statically known result dtype"

@@ -7,8 +7,10 @@
 
    This is the GPU counterpart of simd-pass — both consume the same
    par form vocabulary but produce different target code."
-  (:require [raster.compiler.ir.par :as par]
+  (:require [clojure.set :as set]
+            [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
@@ -41,13 +43,6 @@
 ;; raster.gpu.core/compile-deftm-internal! and the pipeline's pass-backend).
 ;; ================================================================
 
-(def array-tag->dtype
-  "Deftm array tag (the Java array-class symbol) → element dtype keyword."
-  {'doubles :double 'floats :float 'longs :long 'ints :int 'bytes :byte
-   ;; JVM short[] is Raster's bit-preserving FP16 storage carrier. Kernels see `half*`; the
-   ;; semantic pipeline still performs scalar/index arithmetic at a JVM-supported dtype.
-   'shorts :half})
-
 (defn derive-param-types
   "Declared scalar + array element types for the GPU emitter, read from a deftm's params + tags
   (the typed-dispatch system already knows these — we read them instead of letting the emitter
@@ -59,13 +54,13 @@
   [params tags dtype]
   (when (and params tags)
     {:scalar-types (into {} (keep (fn [[p t]]
-                                    (case t
-                                      (long int) [p :int]
-                                      (double float) [p :float]
+                                    (case (dtype/dtype-for-scalar-tag t)
+                                      (:long :int) [p :int]
+                                      (:double :float) [p :float]
                                       nil))
                                   (map vector params tags)))
      :array-types (into {} (keep (fn [[p t]]
-                                   (when-let [dt (array-tag->dtype t)]
+                                   (when-let [dt (dtype/dtype-for-array-tag t)]
                                      [p (if (#{:float :double} dt) dtype dt)]))
                                  (map vector params tags)))}))
 
@@ -283,13 +278,22 @@
   (let [parallel-program (when (parallel-program/parallel-program? form)
                            (parallel-program/validate! form segop/segop-node?))
         source-form (if parallel-program (parallel-program/source-form parallel-program) form)
-        ;; The TypedSOAC route's AbstractValues are declared source facts. Compatibility SegOp
-        ;; envelopes still infer some host scalars at element dtype and must retain their existing
-        ;; metadata/name fallback until that adapter is retired.
-        program-types (when (and parallel-program
-                                 (= :typed-soac
-                                    (get-in parallel-program [:provenance :source-dialect])))
-                        (parallel-program/declared-parameter-types parallel-program))
+        ;; Typed values supply dtypes; scheduled SegOps supply ABI roles. Logical rank cannot choose
+        ;; pass-by-value versus buffer because a rank-zero result may be resident in either form.
+        program-types
+        (when (and parallel-program
+                   (= :typed-soac (get-in parallel-program [:provenance :source-dialect])))
+          (let [operations (mapcat :operations (:equations parallel-program))
+                arrays (set (mapcat #(concat (or (:inputs %) #{}) (or (:outputs %) #{}))
+                                    operations))
+                scalars (set (mapcat #(or (:scalars %) #{}) operations))
+                overlap (set/intersection arrays scalars)]
+            (when (seq overlap)
+              (throw (ex-info "scheduled values have contradictory buffer and scalar ABI roles"
+                              {:reason :parallel-program-parameter-role-conflict
+                               :values overlap})))
+            {:scalar-types (parallel-program/declared-value-types parallel-program scalars)
+             :array-types (parallel-program/declared-value-types parallel-program arrays)}))
         top-scalar-types (merge (or (:scalar-types program-types) {})
                                 (or (:scalar-types (meta source-form)) {})
                                 (or (:scalar-types (meta form)) {}) scalar-types)

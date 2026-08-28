@@ -25,9 +25,9 @@
     (is (every? av/abstract-value? (vals (:values p))))
     (is (= ['?] (:shape (get (:values p) 'values))))
     (is (= [] (:shape (get (:values p) [:binding 'total]))))
-    (is (= {:scalar-types {'n :int}
-            :array-types {'values :double}}
-           (program/declared-parameter-types (assoc-in p [:values 'n :dtype] :int))))
+    (is (= {'n :int 'values :double}
+           (program/declared-value-types (assoc-in p [:values 'n :dtype] :int)
+                                         ['n 'values])))
     (is (seq (:operations equation)))
     (is (soac-dialect/program-form? (:algorithm equation)))
     (is (= (:operands equation) (:inputs (soac-dialect/facts (:algorithm equation)))))
