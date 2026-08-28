@@ -7,6 +7,7 @@
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-body :as kbody]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
@@ -157,7 +158,8 @@
             :tail-policy :separate-epilogue
             :shared-memory-bytes 64}
            (:staging scheduled)))
-    (is (= 4 (count (:allocations kernel-body))))
+    (is (= 2 (count (:allocations kernel-body))))
+    (is (= [[2 8] [2 8]] (mapv :shape (:allocations kernel-body))))
     (is (every? #(= {:kind :shared-memory :swizzle :identity}
                     (select-keys (:layout %) [:kind :swizzle]))
                 (:allocations kernel-body)))
@@ -172,6 +174,66 @@
     (is (= :routed-paged-subgroup-online-score-reuse
            (:strategy (route/route! problem intel-desc)))
         "unmeasured double buffering remains opt-in")))
+
+(deftest staged-layout-axis-emits-every-verified-row-swizzle
+  (let [problem (problem :value-head-dim 8)
+        plan (:plan (route/route!
+                     problem
+                     (assoc intel-desc :segmented-weighted-reduction-schedule :reference)))
+        candidates (schedule-pass/measured-candidates plan intel-desc)]
+    (is (= [{:stage-count 0 :layout-swizzle :identity}
+            {:stage-count 2 :layout-swizzle :identity}
+            {:stage-count 2 :layout-swizzle :xor-2}
+            {:stage-count 2 :layout-swizzle :xor-4}
+            {:stage-count 2 :layout-swizzle :xor-8}]
+           (mapv #(select-keys % [:stage-count :layout-swizzle]) candidates)))
+    (let [descriptor (assoc intel-desc
+                            :segmented-weighted-reduction-schedule
+                            :subgroup-online-pipelined-history
+                            :segmented-weighted-reduction-layout-swizzle :xor-8)
+          artifact (:artifact (route/route! problem descriptor))
+          body (get-in artifact [:attributes :kernel-body])
+          source (:source artifact)]
+      (is (= [:xor-8 :xor-8]
+             (mapv #(get-in % [:layout :swizzle]) (:allocations body))))
+      (is (str/includes? source "^ ((long)(0) & 7)"))
+      (is (str/includes? source "get_local_id(0)"))
+      (is (not (str/includes? source "async_work_group_copy"))
+          "a swizzled logical row copy uses the honest cooperative scatter fallback"))))
+
+(deftest measured-attention-dispatch-carries-static-stage-and-layout-alternatives
+  (let [dispatch (route/measured-dispatch (problem :value-head-dim 8) intel-desc)
+        strategies (mapv kdispatch/alternative-strategy (:alternatives dispatch))]
+    (is (kdispatch/kernel-dispatch? dispatch))
+    (is (= :fp16-reference (:default-strategy dispatch)))
+    (is (= {:kind :fixed-strategy :strategy :fp16-reference} (:selector dispatch)))
+    (is (= [:fp16-reference
+            :routed-paged-subgroup-online-score-reuse
+            :routed-paged-subgroup-online-pipelined-history
+            :routed-paged-subgroup-online-pipelined-history-xor-2
+            :routed-paged-subgroup-online-pipelined-history-xor-4
+            :routed-paged-subgroup-online-pipelined-history-xor-8]
+           strategies))
+    (is (every? #(= (kexec/common-view (first (:alternatives dispatch)))
+                    (kexec/common-view %))
+                (rest (:alternatives dispatch))))
+    (is (= :offline-device-measurement
+           (get-in dispatch [:attributes :selection])))))
+
+(deftest routed-row-lowering-proves-structure-instead-of-requiring-attention-provenance
+  (let [plan (:plan (route/route!
+                     (problem :value-head-dim 8)
+                     (assoc intel-desc :segmented-weighted-reduction-schedule :reference)))
+        generic-plan (assoc plan :provenance {:semantic-op :functional-program
+                                              :operation-id :generic-weighted-reduction
+                                              :lowering :recognized-algebra})
+        scheduled (:schedule
+                   (schedule-pass/plan-subgroup-online-pipelined generic-plan intel-desc))
+        artifact (attention-emit/emit-fp16-pipelined generic-plan scheduled)]
+    (is (= :routed-paged-subgroup-online-pipelined-history
+           (get-in artifact [:attributes :strategy])))
+    (is (= (:id generic-plan)
+           (get-in artifact [:provenance :algebra-plan-id])))))
 
 (deftest pipelined-history-legality-is-storage-and-resource-explicit
   (let [aligned-problem (problem :value-head-dim 8)

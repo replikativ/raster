@@ -1,12 +1,15 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-schedule
   "Apply cooperative hardware schedules to schedule-neutral segmented weighted reductions."
   (:require [raster.compiler.core.hardware :as hardware]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segmented-weighted-reduction-schedule :as schedule]))
 
 (defn- decline
   [reason & [data]]
   (merge {:ok false :reason reason} data))
+
+(declare plan-subgroup-online)
 
 (defn- membership-capacity
   [{:keys [membership storage source-operation]}]
@@ -19,7 +22,7 @@
            :csr-paged (get-in storage [:route-shape :page-index-capacity]))))))
 
 (defn- schedule-value
-  [plan subgroup-size membership-tiling strategy]
+  [plan subgroup-size membership-tiling strategy layout-swizzle]
   (let [{:keys [membership storage score value accumulator-dtype]} plan
         components (:components value)
         pipelined? (= :subgroup-online-pipelined-history strategy)
@@ -54,10 +57,7 @@
                   :value-elements components
                   :transfer-bytes 16
                   :overlap :preferred
-                  ;; The finite layout member is explicit even before autotuning selects a
-                  ;; non-identity member. Current row stages are 1-D, so identity is the only
-                  ;; meaningful/copy-contiguous choice; swizzle search remains a later axis.
-                  :layout-swizzle :identity
+                  :layout-swizzle layout-swizzle
                   :tail-policy :separate-epilogue
                   :shared-memory-bytes shared-memory-bytes}
                  {:kind :none})
@@ -198,7 +198,18 @@
       (decline :score-reuse-invalid-history-tile-size {:tile-size tile-size})
 
       :else
-      (let [capacity (membership-capacity plan)
+      (let [layout-swizzle
+            (if (= :subgroup-online-pipelined-history strategy)
+              (or (:segmented-weighted-reduction-layout-swizzle desc) :identity)
+              :identity)
+            _ (when (= :subgroup-online-pipelined-history strategy)
+                ;; Constructing both rows proves the named layout is defined for the actual
+                ;; staged widths. Target emission may lower a non-contiguous member through the
+                ;; verified cooperative scatter fallback rather than pretending it is cp.async.
+                (layout/shared-memory [2 (get-in score [:axis :extent])]
+                                      :half layout-swizzle)
+                (layout/shared-memory [2 components] :half layout-swizzle))
+            capacity (membership-capacity plan)
             membership-tiling
             (if (= :subgroup-online-tiled-history strategy)
               {:kind :static-contiguous-tiles
@@ -208,7 +219,45 @@
                :merge-order :increasing-membership-tile}
               {:kind :sequential})]
         {:ok true
-         :schedule (schedule-value plan subgroup-size membership-tiling strategy)}))))
+         :schedule (schedule-value plan subgroup-size membership-tiling strategy
+                                   layout-swizzle)}))))
+
+(defn pipelined-layout-candidates
+  "Return every finite, statically legal layout member for the two-stage row pipeline.
+
+  Candidate construction is pure and target-neutral. Unsupported periods are removed by the same
+  layout verifier used by KernelBody; no measurement is spent on an un-emittable schedule."
+  [plan desc]
+  (let [plan (swr/validate! plan)]
+    (into []
+          (keep (fn [layout-swizzle]
+                  (try
+                    (let [result (plan-subgroup-online*
+                                  plan
+                                  (assoc desc
+                                         :segmented-weighted-reduction-layout-swizzle
+                                         layout-swizzle)
+                                  :subgroup-online-pipelined-history nil)]
+                      (when (:ok result) (:schedule result)))
+                    (catch clojure.lang.ExceptionInfo _ nil))))
+          (sort-by layout/swizzle-width layout/shared-memory-swizzles))))
+
+(defn measured-candidates
+  "Enumerate the executable stage-depth/layout schedule axes for offline measurement.
+
+  Stage depth zero is the unstaged subgroup schedule. Stage depth two contributes every verified
+  row swizzle. The result is ordered, finite schedule data; it neither benchmarks nor chooses."
+  [plan desc]
+  (let [unstaged (plan-subgroup-online plan desc)]
+    (cond-> []
+      (:ok unstaged) (conj {:stage-count 0
+                            :layout-swizzle :identity
+                            :schedule (:schedule unstaged)})
+      true (into (map (fn [scheduled]
+                        {:stage-count (get-in scheduled [:staging :stages])
+                         :layout-swizzle (get-in scheduled [:staging :layout-swizzle])
+                         :schedule scheduled})
+                      (pipelined-layout-candidates plan desc))))))
 
 (defn plan-subgroup-online
   "Plan one subgroup per segment with one shared score and lane-strided value accumulators."

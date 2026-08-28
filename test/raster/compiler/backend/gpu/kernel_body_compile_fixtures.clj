@@ -75,6 +75,10 @@
         cooperative-schedule (:schedule (schedule/plan-subgroup-online plan descriptor))
         pipelined-schedule (:schedule
                             (schedule/plan-subgroup-online-pipelined plan descriptor))
+        swizzled-pipelined-schedule
+        (:schedule
+         (schedule/plan-subgroup-online-pipelined
+          plan (assoc descriptor :segmented-weighted-reduction-layout-swizzle :xor-32)))
         tiled-schedule (:schedule
                         (schedule/plan-subgroup-online-tiled
                          plan (assoc descriptor
@@ -83,9 +87,13 @@
                      plan cooperative-schedule dialect)
         pipelined (attention-emit/emit-fp16-pipelined
                    plan pipelined-schedule dialect descriptor)
+        swizzled-pipelined (attention-emit/emit-fp16-pipelined
+                            plan swizzled-pipelined-schedule dialect descriptor)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
+           (write-artifact! directory suffix "swizzled-pipelined-attention"
+                            swizzled-pipelined)
            (write-artifact! directory suffix "workgroup-reduction"
                             (reduction-artifact dialect))
            (write-source! directory suffix "workgroup-memory"

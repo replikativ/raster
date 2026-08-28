@@ -3,6 +3,8 @@
   (:require [raster.compiler.backend.gpu.attention :as emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.passes.parallel.attention-lower :as lower]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as swr-schedule]))
 
@@ -54,6 +56,63 @@
                          :workgroup-size (get-in node [:operation :launch :workgroup-size])
                          :group-count (get-in node [:operation :launch :group-count])})
                       (:nodes graph))}}))
+
+(defn measured-dispatch
+  "Emit the finite stage-depth/shared-layout candidate set for explicit offline tuning.
+
+  Ordinary routing remains pure and keeps its analytic or explicit policy. These alternatives
+  preserve one ABI/effect contract and use a fixed selector because stage/layout are compile-time
+  axes, not synthetic runtime scalars."
+  [problem desc]
+  (let [problem (attention/validate! problem)
+        plan (lower/lower problem)
+        reference (emit/kernel-graph plan (emit/emit-fp16-reference plan desc))
+        dispatch-id
+        (fn [candidate-key]
+          (format "raster_segmented_weighted_reduction_static_%08x"
+                  (bit-and 0xffffffff (long (hash candidate-key)))))]
+    (if-not (gpu-target/intel-opencl-subgroup-dialect? desc)
+      (kdispatch/make
+       {:id (dispatch-id (swr/schedule-key plan))
+        :alternatives [reference]
+        :default-strategy :fp16-reference
+        :selector {:kind :fixed-strategy :strategy :fp16-reference}
+        :provenance {:algebra-plan-id (:id plan)}
+        :attributes {:algebra :segmented-weighted-reduction
+                     :selection :static-reference-only}})
+      (let [scheduled (swr-schedule/measured-candidates plan desc)
+            staged-executables
+            (mapv (fn [{:keys [stage-count schedule]}]
+                    (emit/kernel-graph
+                     plan
+                     (if (zero? stage-count)
+                       (emit/emit-fp16-cooperative plan schedule)
+                       (emit/emit-fp16-pipelined plan schedule))))
+                  scheduled)
+            alternatives (into [reference] staged-executables)
+            candidate-key [(swr/schedule-key plan)
+                           (mapv #(select-keys % [:stage-count :layout-swizzle]) scheduled)]
+            id (dispatch-id candidate-key)]
+        (kdispatch/make
+         {:id id
+          :alternatives alternatives
+          :default-strategy :fp16-reference
+          :selector {:kind :fixed-strategy :strategy :fp16-reference}
+          :provenance {:operation-id (:id problem) :algebra-plan-id (:id plan)}
+          :attributes
+          {:algebra :segmented-weighted-reduction
+           :selection :offline-device-measurement
+           :tuning {:schedule-path [:segmented-weighted-reduction :measured-selectors]
+                    :schedule-key id
+                    :numerical-mode {:query (:q-dtype problem)
+                                     :storage :half
+                                     :accumulate (:accumulator-dtype problem)
+                                     :output (:output-dtype problem)}
+                    :layout {:key (:k-layout problem)
+                             :value (:v-layout problem)
+                             :route (attention/route-kind (:route problem))
+                             :visibility (attention/visibility-kind
+                                          (:visibility problem))}}}})))))
 
 (defn route
   "Route packed/routed attention through a cooperative schedule or its semantic oracle.

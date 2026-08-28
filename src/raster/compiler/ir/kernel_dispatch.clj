@@ -43,7 +43,7 @@
 
 (defn- validate-selector!
   [dispatch strategies common]
-  (let [{:keys [kind argument expression threshold at-least otherwise ranges below]}
+  (let [{:keys [kind argument expression threshold at-least otherwise ranges below strategy]}
         (:selector dispatch)
         common-arguments (:arguments common)
         scalar-arguments (->> (map vector (:abi common) common-arguments)
@@ -86,6 +86,9 @@
                                            "kernel dispatch selector argument must name a scalar ABI slot"
                                            {:id (:id dispatch) :argument argument :slot slot}))))))]
     (case kind
+      :fixed-strategy
+      (validate-selector-strategy! dispatch strategies :fixed strategy)
+
       :runtime-scalar-threshold
       (do
         (validate-argument!)
@@ -246,7 +249,7 @@
    (let [dispatch (validate! dispatch)]
      (if (and override (not= :auto override))
        (alternative dispatch override)
-       (let [{:keys [kind argument expression threshold at-least otherwise ranges below]}
+       (let [{:keys [kind argument expression threshold at-least otherwise ranges below strategy]}
              (:selector dispatch)
              common-arguments (kexec/arguments (default-alternative dispatch))
              indexes (keep-indexed (fn [index value] (when (= argument value) index))
@@ -262,16 +265,20 @@
                               :indexes (vec indexes)}))))
          (let [environment (zipmap common-arguments (mapv runtime-number runtime-arguments))
                value (case kind
+                       :fixed-strategy nil
                        :runtime-expression-threshold
                        (klaunch/resolve-expression environment expression)
                        :runtime-expression-cases nil
                        (runtime-number (nth runtime-arguments (first indexes))))]
-           (when (and (not= :runtime-expression-cases kind) (not (number? value)))
+           (when (and (not (contains? #{:runtime-expression-cases :fixed-strategy} kind))
+                      (not (number? value)))
              (throw (ex-info "kernel dispatch selector requires a numeric runtime scalar"
                              {:id (:id dispatch) :argument argument :value value})))
            (alternative
             dispatch
             (case kind
+              :fixed-strategy strategy
+
               :runtime-scalar-threshold
               (if (>= (double value) (double threshold)) at-least otherwise)
 

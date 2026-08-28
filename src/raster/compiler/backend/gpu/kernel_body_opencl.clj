@@ -1008,7 +1008,27 @@
 (defn- async-group-events
   [context group]
   (or (:events group)
-      (mapv #(get-in context [:async-copies %]) (:copies group))))
+      (into [] (keep #(get-in context [:async-copies %])) (:copies group))))
+
+(defn- emit-layout-aware-cooperative-copy
+  [operation context source-storage destination-storage source-base destination-base copy-name]
+  (let [destination-layout (:layout destination-storage)
+        [row column] (:destination-coordinates operation)
+        row-source (emit-index-expression row (:names context))
+        column-source (emit-index-expression column (:names context))
+        source-index (emit-storage-index source-storage (:source-coordinates operation)
+                                         (:names context))
+        columns (second (:shape destination-layout))
+        mask (dec (layout/swizzle-width (:swizzle destination-layout)))
+        offset (str copy-name "_element_offset")
+        thread-id (c-dialect/workgroup-linear-thread-id
+                   *scalar-dialect* (:workgroup-shape context))]
+    (str "for (int " offset " = " thread-id "; " offset " < " (:elements operation)
+         "; " offset " += " (:workgroup-width context) ") {\n"
+         "  " destination-base "[((long)(" row-source ") * (long)(" columns ") + "
+         "((long)(" column-source ") + " offset ") ^ ((long)(" row-source ") & " mask
+         "))] = " source-base "[((long)(" source-index ") + " offset ")];\n"
+         "}")))
 
 (defn- emit-scalar-operation
   [operation context depth]
@@ -1332,15 +1352,19 @@
     [(indent-lines depth (c-dialect/workgroup-barrier *scalar-dialect*)) context]
 
     (record-kind? "AsyncWorkgroupCopy" operation)
-    (let [mode (c-dialect/async-copy-mode *scalar-dialect*)
+    (let [destination-storage (get-in context [:storage (:destination operation)])
+          layout-aware? (and (layout/shared-memory-layout? (:layout destination-storage))
+                             (not= :identity (get-in destination-storage [:layout :swizzle])))
+          mode (if layout-aware?
+                 :synchronous-layout-aware
+                 (c-dialect/async-copy-mode *scalar-dialect*))
           _ (when (and (= :required (:overlap operation))
-                       (= :synchronous-cooperative mode))
+                       (contains? #{:synchronous-cooperative :synchronous-layout-aware} mode))
               (throw (ex-info "target cannot preserve required async-copy overlap"
                               {:reason :kernel-body-c-async-overlap
                                :dialect (:id *scalar-dialect*)
                                :operation operation :lowering mode})))
           source-storage (get-in context [:storage (:source operation)])
-          destination-storage (get-in context [:storage (:destination operation)])
           source-base (get-in context [:names (or (some-> source-storage :view :buffer)
                                                   (:id source-storage))])
           destination-base (get-in context [:names (:id destination-storage)])
@@ -1352,17 +1376,21 @@
           copy-name (scalar-local-name (:id operation))
           source (str "(&" source-base "[" source-index "])")
           destination (str "(&" destination-base "[" destination-index "])")
-          source-code (c-dialect/async-copy
-                       *scalar-dialect*
-                       {:name copy-name :source source :destination destination
-                        :elements (:elements operation)
-                        :element-bytes (dtype/bytes-of (:dtype source-storage))
-                        :transfer-bytes (:transfer-bytes operation)
-                        :overlap (:overlap operation)
-                        :workgroup-width (:workgroup-width context)})]
+          source-code (if layout-aware?
+                        (emit-layout-aware-cooperative-copy
+                         operation context source-storage destination-storage
+                         source-base destination-base copy-name)
+                        (c-dialect/async-copy
+                         *scalar-dialect*
+                         {:name copy-name :source source :destination destination
+                          :elements (:elements operation)
+                          :element-bytes (dtype/bytes-of (:dtype source-storage))
+                          :transfer-bytes (:transfer-bytes operation)
+                          :overlap (:overlap operation)
+                          :workgroup-width (:workgroup-width context)}))]
       [(indent-lines depth source-code)
        (-> context
-           (assoc-in [:async-copies (:id operation)] copy-name)
+           (assoc-in [:async-copies (:id operation)] (when-not layout-aware? copy-name))
            (update :async-issued conj (:id operation)))])
 
     (record-kind? "AsyncCommit" operation)
@@ -1478,6 +1506,7 @@
         storage (scalar-storage-map kernel-body)
         masks (into {} (map (juxt :id identity)) (:masks kernel-body))
         context {:names names :types types :storage storage :masks masks
+                 :workgroup-shape (get-in kernel-body [:launch :workgroup-size])
                  :workgroup-width (reduce * (get-in kernel-body [:launch :workgroup-size]))
                  :async-copies {} :async-issued [] :async-groups []}
         allocation-plan (body/workgroup-memory-plan (:allocations kernel-body))

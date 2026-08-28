@@ -178,16 +178,22 @@ reference algebra on Intel and compiles through nvcc and hipcc without target ha
 Shared-memory layout is now an explicit verified KernelBody facet. Its finite family consists of
 identity and named 2/4/8/16/32-period row-XOR permutations; the verifier proves static shape,
 in-bounds bijection and exact byte charge, and the shared C-family emitter lowers the same physical
-address transform to OpenCL, CUDA and HIP. Contiguous async copy accepts only the identity member
-until an explicit scatter/tensor-copy operation exists. Hardware descriptors normalize explicit
+address transform to OpenCL, CUDA and HIP. Native contiguous async copy accepts only the identity
+member. Hardware descriptors normalize explicit
 bank topology, derive documented CUDA/AMD values and Intel Level Zero's device-dependent current
 default, and abstain for generic OpenCL. The resource model reports allocation feasibility,
-broadcasts and per-bank transaction conflict degree. The current one-dimensional production row
-stages name the verified identity member; non-identity layouts are compiler/source fixtures, not an
-unmeasured performance claim. Measured swizzle and stage-depth selection can now collapse more of
-the tiled graph toward a FlashAttention-like single kernel without changing the semantic plan or
-external ABI. The schedule remains opt-in until device measurements and the runtime cost path
-justify automatic selection.
+broadcasts and per-bank transaction conflict degree. The production row pipeline now represents
+its rotating storage as one typed two-dimensional stage ring. Stage depth zero and depth two crossed
+with every shape-legal finite swizzle form one emitted, ABI-compatible `KernelDispatch` candidate
+set. Identity retains native event/`cp.async` lowering; non-contiguous XOR rows use an honest
+cooperative layout-aware scatter until a native tensor-copy operation exists. Explicit offline
+tuning validates every candidate against an oracle, measures device events, caches the complete
+device/source/numerical/layout identity, and returns a fixed selector without adding a synthetic
+runtime scalar to the ABI. The old schedule-map coordinate-descent tuner is gone. Routed-row
+lowering proves algebra, membership, storage, shapes and dtypes instead of accepting an attention
+provenance label as a legality token. Automatic production selection remains deliberately separate
+from compilation: an untuned program keeps its analytic or explicit policy, while measured
+selectors are immutable artifacts that can be reapplied only after identity verification.
 
 ### 2.3 Executable steps and resident artifact values compose
 
@@ -755,8 +761,8 @@ The immediate continuation after the verified double-buffered weighted-reduction
    source spelling.
 3. **Landed:** add a finite verified shared-memory swizzle family and bank-conflict/resource model;
    keep the current 1-D attention stages on its identity member until measured 2-D staging lands.
-4. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
-   attention-provenance gate from the generic weighted-reduction matcher.
+4. **Landed:** make stage count and swizzle finite measured schedule axes, retire the legacy tuner,
+   and remove the attention-provenance gate from routed weighted-reduction lowering.
 5. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
    re-lowering for the covered forms.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a

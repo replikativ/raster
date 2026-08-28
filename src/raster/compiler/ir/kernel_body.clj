@@ -762,11 +762,20 @@
                        (= :global (:memory-space source))
                        (= :allocation (:kind destination))
                        (= :workgroup (:memory-space destination))
-                       ;; AsyncWorkgroupCopy denotes one contiguous transfer. A physical XOR
-                       ;; permutation needs an explicit scatter/tensor-copy operation; treating it
-                       ;; as contiguous would silently populate the wrong logical coordinates.
+                       ;; A non-identity destination is a logical row transfer, not a physically
+                       ;; contiguous copy. It is legal only as preferred overlap: the C-family
+                       ;; boundary then emits a cooperative layout-aware scatter. Required overlap
+                       ;; remains reserved for a native tensor/scatter-copy operation.
                        (or (not (layout/shared-memory-layout? (:layout destination)))
-                           (= :identity (get-in destination [:layout :swizzle])))
+                           (= :identity (get-in destination [:layout :swizzle]))
+                           (and (= :preferred (:overlap operation))
+                                (= 2 (get-in destination [:layout :rank]))
+                                (= 2 (count (:destination-coordinates operation)))
+                                (let [[row column] (:destination-coordinates operation)
+                                      [rows columns] (:shape destination)]
+                                  (and (nat-int? row) (< row rows)
+                                       (nat-int? column)
+                                       (<= (+ column elements) columns)))))
                        (= (dtype/canon (:dtype source)) (dtype/canon (:dtype destination)))
                        (= (count (:shape source)) (count (:source-coordinates operation)))
                        (= (count (:shape destination))
@@ -1425,9 +1434,28 @@
                   (seq (:consumed-stages state))))
             (queue-state [state]
               (select-keys state [:issued :committed :awaiting-barrier :readable-stages]))
+            (copy-stage [copy]
+              [(:destination copy) (:destination-coordinates copy)])
+            (memory-stage [operation]
+              [(:buffer operation) (:coordinates operation)])
+            (same-stage? [left right]
+              (let [[left-buffer left-coordinates] left
+                    [right-buffer right-coordinates] right]
+                (and (= left-buffer right-buffer)
+                     ;; Exact coordinate equality proves disjoint 2-D stage rows. Any dynamic or
+                     ;; differently ranked access remains conservatively allocation-wide.
+                     (or (= left-coordinates right-coordinates)
+                         (not (and (= 2 (count left-coordinates))
+                                   (= 2 (count right-coordinates))
+                                   (integer? (first left-coordinates))
+                                   (integer? (first right-coordinates))
+                                   (not= (first left-coordinates)
+                                         (first right-coordinates))))))))
+            (contains-stage? [stages stage]
+              (boolean (some #(same-stage? % stage) stages)))
             (group-signature [group]
               (mapv (fn [copy]
-                      [(:destination copy) (:elements copy) (:transfer-bytes copy)])
+                      [(copy-stage copy) (:elements copy) (:transfer-bytes copy)])
                     (:copies group)))
             (pipeline-state-compatible! [operation incoming outgoing]
               (let [incoming-widths (mapv (comp count :copies) incoming)
@@ -1451,25 +1479,28 @@
                    (let [id (:id operation)
                          source (get storage (:source operation))
                          source-root (or (some-> source :view :buffer) (:id source))
-                         destination (:destination operation)]
+                         destination (:destination operation)
+                         stage (copy-stage operation)]
                      (claim! id :copy operation)
                      (when-not (contains? stable-buffers source-root)
                        (throw (ex-info
                                "async copy source requires a whole-kernel stable-read contract"
                                {:reason :kernel-body-async-source-stability
                                 :copy id :source source-root})))
-                     (when (or (some #(= destination (:destination %)) issued)
+                     (when (or (some #(same-stage? stage (copy-stage %)) issued)
                                (some (fn [group]
-                                       (some #(= destination (:destination %))
+                                       (some #(same-stage? stage (copy-stage %))
                                              (:copies group)))
                                      committed)
-                               (contains? awaiting-barrier destination)
-                               (contains? consumed-stages destination))
+                               (contains-stage? awaiting-barrier stage)
+                               (contains-stage? consumed-stages stage))
                        (throw (ex-info "async copy destination is still live"
                                        {:reason :kernel-body-async-destination-live
                                         :copy id :destination destination})))
                      (-> state
-                         (update :readable-stages disj destination)
+                         (update :readable-stages
+                                 (fn [stages]
+                                   (into #{} (remove #(same-stage? % stage)) stages)))
                          (update :issued conj operation)))
 
                    (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
@@ -1504,7 +1535,7 @@
                      (-> state
                          (assoc :committed remaining)
                          (update :awaiting-barrier into
-                                 (map :destination (mapcat :copies waited)))))
+                                 (map copy-stage (mapcat :copies waited)))))
 
                    (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
                    (-> state
@@ -1514,20 +1545,21 @@
                    (or (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
                        (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation))
                    (let [buffer (:buffer operation)
-                         incomplete (into (set (map :destination issued))
-                                          (map :destination (mapcat :copies committed)))]
-                     (when (or (contains? incomplete buffer)
-                               (contains? awaiting-barrier buffer))
+                         stage (memory-stage operation)
+                         incomplete (into (set (map copy-stage issued))
+                                          (map copy-stage (mapcat :copies committed)))]
+                     (when (or (contains-stage? incomplete stage)
+                               (contains-stage? awaiting-barrier stage))
                        (throw (ex-info
-                               (if (contains? incomplete buffer)
+                               (if (contains-stage? incomplete stage)
                                  "staged workgroup memory is consumed before its async wait"
                                  "staged workgroup memory is consumed before a workgroup barrier")
                                {:reason (if (contains? incomplete buffer)
                                           :kernel-body-async-missing-wait
                                           :kernel-body-async-missing-barrier)
                                 :buffer buffer :operation operation})))
-                     (if (contains? (:readable-stages state) buffer)
-                       (update state :consumed-stages conj buffer)
+                     (if (contains-stage? (:readable-stages state) stage)
+                       (update state :consumed-stages conj stage)
                        state))
 
                    (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
