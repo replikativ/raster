@@ -115,13 +115,20 @@ target spelling now lowers this general scalar/control vocabulary directly: dens
 stores (including contiguous leading-slice views), SSA expressions, structured branch/loop yields,
 explicit numerical casts, and full-subgroup reductions/broadcasts, without recovering an algorithm
 or schedule. Unsupported target semantics fail at this boundary instead of silently changing a
-cast, layout, collective, or reduction-association contract. It is not production-reachable until a
-semantic route constructs the body. The next production vertical is the scheduled routed
-`SegmentedWeightedReductionSchedule -> KernelBody` construction with an invariant external ABI; it
-must not introduce an attention operation into this vocabulary. The current handwritten production
-leaf already keeps physical storage and logical membership independent: dense/CSR page routing can
-combine with either bounded contiguous intervals or bounded CSR rows under one cooperative schedule.
-That leaf is the executable behavior and ABI oracle which the KernelBody vertical must replace.
+cast, layout, collective, or reduction-association contract.
+
+The first production route now constructs
+`SegmentedWeightedReductionSchedule -> KernelBody -> OpenCL` and projects the body's stable reads
+onto the invariant ordered ABI. Attention contributes only the routed-paged storage descriptor used
+by this first lowering row; neither KernelBody nor the target emitter contains an attention
+operation. Dense/CSR physical page routing combines independently with bounded contiguous intervals
+or bounded CSR membership. The generated leaf has replaced the handwritten cooperative source and
+is checked against the reference algebra on a real device. Its subgroup builtin is recorded honestly
+as implementation-defined association rather than claiming a fixed tree. The next production work
+is to represent tiled membership traversal and mergeable online-reduction state, then lower subgroup
+collectives through portable OpenCL, CUDA and HIP target dialects. Verified local allocation,
+barriers and asynchronous copies can subsequently collapse a multi-kernel tiled graph into a
+FlashAttention-like single kernel without changing the semantic plan or external ABI.
 
 ### 2.3 Executable steps and resident artifact values compose
 

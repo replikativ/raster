@@ -531,6 +531,15 @@
                           {:loop operation})))
         (doseq [arg (:iter-args operation)]
           (value-spec! "loop carried binding" (:binding arg)))
+        (let [uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
+              bindings (set (map (comp :id :binding) (:iter-args operation)))]
+          (when-not (and (set? uniform-iter-args)
+                         (set/subset? uniform-iter-args bindings))
+            (throw (ex-info
+                    "kernel loop uniform-iter-args must name carried bindings"
+                    {:reason :kernel-body-loop-uniform-iter-args
+                     :uniform-iter-args uniform-iter-args
+                     :bindings bindings}))))
         (doseq [result (:results operation)] (value-spec! "loop result" result))
         (when (contains? scope (get-in operation [:index :id]))
           (throw (ex-info "kernel for-loop induction value shadows an existing value"
@@ -906,6 +915,7 @@
           loop-control (reduce set/intersection control-uniformity
                                [lower-uniformity upper-uniformity])
           iter-args (:iter-args operation)
+          uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
           results (:results operation)
           initials (mapv #(scalar-value-info! (:initial %) values) iter-args)]
       (when-not (= index-type (:type lower-info) (:type upper-info))
@@ -923,15 +933,26 @@
                                      {:type (canonical-type (:type index))
                                       :uniformity loop-control})
                               (map (fn [arg initial]
-                                     ;; Backedge values may become lane-varying after iteration
-                                     ;; one.  Until we compute a region fixed point, this is the
-                                     ;; conservative fact available inside the loop.
                                      [(:id (:binding arg))
-                                      (assoc initial :uniformity lane-varying)])
+                                      (if (contains? uniform-iter-args (:id (:binding arg)))
+                                        ;; This is an inductive claim, checked against the
+                                        ;; backedge yield below. Unclaimed carries remain
+                                        ;; conservative because a later iteration may diverge.
+                                        initial
+                                        (assoc initial :uniformity lane-varying))])
                                    iter-args initials))
             yielded (validate-region! "kernel for-loop body" (:operations operation)
                                       (mapv :binding iter-args) loop-values
                                       (assoc context :control-uniformity loop-control))]
+        (doseq [[arg initial yielded-info] (map vector iter-args initials yielded)
+                :when (contains? uniform-iter-args (:id (:binding arg)))]
+          (when-not (set/subset? (:uniformity initial) (:uniformity yielded-info))
+            (throw (ex-info
+                    "kernel loop uniform carried value is not preserved by its backedge"
+                    {:reason :kernel-body-loop-uniformity-invariant
+                     :binding (:binding arg)
+                     :initial-uniformity (:uniformity initial)
+                     :yielded-uniformity (:uniformity yielded-info)}))))
         (reduce (fn [env [result yielded-info initial-info]]
                   (claim-value! claimed reserved values result "kernel for-loop result")
                   (when-not (= (canonical-type (:type result)) (:type yielded-info))

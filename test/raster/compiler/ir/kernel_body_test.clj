@@ -459,6 +459,54 @@
                                       ['x-value (body/literal 0.0 :float)]))
              (body/->Yield ['next?])]
             [(body/value 'finished? :predicate)] {})]))))
+  (testing "an explicit inductive invariant admits a genuinely uniform carry"
+    (is (body/kernel-body?
+         (scalar-body
+          [(load-x)
+           (body/->ForLoop
+            (body/value 'i :int) 0 4 1
+            [(body/->LoopArg (body/value 'continue? :predicate)
+                             (body/literal true :predicate))]
+            [(body/->IfRegion
+              'continue?
+              [(reduce-x 'x-value) (body/->Yield [])]
+              [(body/->Yield [])]
+              [])
+             (body/->Yield [(body/literal true :predicate)])]
+            [(body/value 'finished? :predicate)]
+            {:uniform-iter-args #{'continue?}})]))))
+  (testing "the verifier checks rather than trusts the claimed backedge invariant"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"not preserved by its backedge"
+         (scalar-body
+          [(load-x)
+           (body/->ForLoop
+            (body/value 'i :int) 0 4 1
+            [(body/->LoopArg (body/value 'continue? :predicate)
+                             (body/literal true :predicate))]
+            [(body/->IfRegion
+              'continue?
+              [(reduce-x 'x-value) (body/->Yield [])]
+              [(body/->Yield [])]
+              [])
+             (body/->ScalarCompute
+              (body/value 'next? :predicate)
+              (body/scalar-expression :lt :predicate
+                                      ['x-value (body/literal 0.0 :float)]))
+             (body/->Yield ['next?])]
+            [(body/value 'finished? :predicate)]
+            {:uniform-iter-args #{'continue?}})]))))
+  (testing "uniformity annotations can name only carried bindings"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"must name carried bindings"
+         (scalar-body
+          [(body/->ForLoop
+            (body/value 'i :int) 0 1 1
+            [(body/->LoopArg (body/value 'carry :predicate)
+                             (body/literal true :predicate))]
+            [(body/->Yield [(body/literal true :predicate)])]
+            [(body/value 'result :predicate)]
+            {:uniform-iter-args #{'missing}})]))))
   (testing "a zero-trip loop result retains its initial value's variation"
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"lane-divergent"

@@ -66,7 +66,7 @@
     (when-not (and (map? numerical-mode)
                    (keyword? (:score-accumulate numerical-mode))
                    (keyword? (:state-accumulate numerical-mode))
-                   (= :subgroup-tree (:dot-order numerical-mode))
+                   (= :implementation-defined (:dot-order numerical-mode))
                    (true? (:online-rescale? numerical-mode))
                    (map? attributes))
       (throw (ex-info "segmented weighted-reduction numerical and attribute facets are incomplete"
