@@ -126,8 +126,9 @@
                                        (axis-map/of-axes [['group-x 8]]))))))))
 
 (defn- scalar-body
-  [operations & {:keys [masks stable-reads schedule]
-                 :or {masks [] stable-reads [] schedule {:subgroup-size 16}}}]
+  [operations & {:keys [masks stable-reads allocations schedule shared-memory-bytes]
+                 :or {masks [] stable-reads [] allocations [] schedule {:subgroup-size 16}
+                      shared-memory-bytes 0}}]
   (body/make
    {:id :scalar
     :parameters [(body/->KernelParameter
@@ -140,9 +141,11 @@
               (body/->IndexBinding 'lane :lane 0)]
     :masks masks
     :stable-reads stable-reads
+    :allocations allocations
     :operations operations
     :schedule schedule
-    :launch (launch/spec {:workgroup-size [16] :group-count [1]})
+    :launch (launch/spec {:workgroup-size [16] :group-count [1]
+                          :shared-memory-bytes shared-memory-bytes})
     :provenance {:dialect :test}
     :attributes {:kind :scalar}}))
 
@@ -578,3 +581,70 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"invalid hardware source"
          (body/validate! (assoc-in kernel [:indices 1 :axis] 1))))))
+
+(defn- scratch-allocation
+  ([] (scratch-allocation 'scratch :float [16] 16))
+  ([id dtype shape alignment]
+   (body/->WorkgroupAllocation id dtype shape (layout/row-major shape dtype) alignment)))
+
+(defn- workgroup-barrier []
+  (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                           (body/full-participation)))
+
+(deftest workgroup-storage-has-exact-static-resource-accounting
+  (let [allocations [(scratch-allocation 'bytes :byte [3] 1)
+                     (scratch-allocation 'values :float [4] 16)]
+        plan (body/workgroup-memory-plan allocations)
+        kernel (scalar-body
+                [(body/->ScalarStore 'values [0] (body/literal 1.0 :float) nil)
+                 (workgroup-barrier)
+                 (body/->ScalarLoad (body/value 'loaded :float) 'values [0] nil nil :cached)]
+                :allocations allocations :shared-memory-bytes 32)]
+    (is (= [{:allocation (first allocations) :byte-offset 0 :byte-size 3}
+            {:allocation (second allocations) :byte-offset 16 :byte-size 16}]
+           (:allocations plan)))
+    (is (= 32 (:bytes plan)))
+    (is (= 16 (:alignment plan)))
+    (is (body/kernel-body? kernel))
+    (testing "the launch charge cannot under- or over-state the packed arena"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"shared-memory charge disagree"
+           (scalar-body [] :allocations allocations :shared-memory-bytes 31))))
+    (testing "dynamic allocation shapes are rejected before target lowering"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"static shape"
+           (scalar-body []
+                        :allocations [(scratch-allocation 'dynamic :float ['n] 16)]
+                        :shared-memory-bytes 0))))
+    (testing "the allocation layout cannot drift from its storage contract"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"agree with its layout"
+           (scalar-body []
+                        :allocations [(assoc (scratch-allocation) :layout
+                                             (layout/row-major [8] :float))]
+                        :shared-memory-bytes 64))))))
+
+(deftest workgroup-barriers-require-full-convergent-participation
+  (let [barrier (workgroup-barrier)]
+    (is (body/kernel-body? (scalar-body [barrier])))
+    (testing "a lane-varying branch cannot contain a workgroup barrier"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"divergent control flow"
+           (scalar-body
+            [(load-x)
+             (body/->ScalarCompute
+              (body/value 'negative? :predicate)
+              (body/scalar-expression :lt :predicate
+                                      ['x-value (body/literal 0.0 :float)]))
+             (body/->IfRegion 'negative?
+                              [barrier (body/->Yield [])]
+                              [(body/->Yield [])]
+                              [])]))))
+    (testing "barrier scope, memory semantics, and participation are explicit"
+      (doseq [invalid [(assoc barrier :scope :subgroup)
+                       (assoc barrier :memory-spaces #{:global})
+                       (assoc barrier :semantics :relaxed)
+                       (assoc barrier :participation (body/->Participation :masked))]]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"unsupported synchronization contract"
+             (scalar-body [invalid])))))))

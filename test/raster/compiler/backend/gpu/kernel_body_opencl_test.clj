@@ -2,6 +2,7 @@
   (:require [clojure.java.shell :as shell]
             [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as opencl]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.kernel-body :as body]
@@ -87,6 +88,11 @@
       :launch (launch/spec {:workgroup-size [16] :group-count [2]})
       :provenance {:dialect :test}
       :attributes {:kind :scalar}})))
+
+(defn workgroup-kernel-body
+  "Small production-shaped fixture shared with the hardware-free vendor compiler gates."
+  []
+  (fixtures/workgroup-memory-body 16))
 
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
@@ -211,3 +217,29 @@
       (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
+
+(deftest workgroup-memory-and-barriers-share-one-c-family-lowering
+  (doseq [[target arena barrier pointer]
+          [[:opencl-intel "__local uint4 rstr_workgroup_memory[4]"
+            "barrier(CLK_LOCAL_MEM_FENCE);" "__local float* rstr_scratch"]
+           [:cuda "__shared__ __align__(16) unsigned char rstr_workgroup_memory[64]"
+            "__syncthreads();" "float* rstr_scratch = reinterpret_cast<float*>"]
+           [:hip "__shared__ __attribute__((aligned(16))) unsigned char rstr_workgroup_memory[64]"
+            "__syncthreads();" "float* rstr_scratch = reinterpret_cast<float*>"]]]
+    (testing (name target)
+      (let [source (opencl/emit-scalar-kernel
+                    "workgroup_memory" (workgroup-kernel-body)
+                    {:target-dialect target})]
+        (is (str/includes? source arena))
+        (is (str/includes? source pointer))
+        (is (str/includes? source barrier))
+        (is (str/includes? source "rstr_scratch[(((long)(rstr_lane) * (long)(1)))]")))))
+  (testing "the portable OpenCL source remains valid OpenCL C"
+    (let [source (opencl/emit-scalar-kernel
+                  "workgroup_memory" (workgroup-kernel-body)
+                  {:target-dialect :opencl-portable})]
+      (if-not (command-available? "clang")
+        (is true "clang unavailable; source structure remains covered")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in source)]
+          (is (zero? exit) err))))))
