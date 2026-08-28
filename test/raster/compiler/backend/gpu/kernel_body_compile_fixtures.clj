@@ -2,6 +2,8 @@
   "Generate production scheduled KernelBody sources for hardware-free CUDA/HIP CI gates."
   (:require [clojure.java.io :as io]
             [raster.compiler.backend.gpu.attention :as attention-emit]
+            [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-executable :as executable]
@@ -36,6 +38,12 @@
     (spit file (:source artifact))
     (.getAbsolutePath file)))
 
+(defn- write-source!
+  [directory suffix label source]
+  (let [file (io/file directory (str label suffix))]
+    (spit file source)
+    (.getAbsolutePath file)))
+
 (defn emit-target!
   [root target]
   (let [{:keys [suffix descriptor]} (get targets target)
@@ -56,7 +64,11 @@
         cooperative (attention-emit/emit-fp16-cooperative
                      plan cooperative-schedule dialect)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
-    (into [(write-artifact! directory suffix "cooperative" cooperative)]
+    (into [(write-artifact! directory suffix "cooperative" cooperative)
+           (write-source! directory suffix "workgroup-memory"
+                          (body-emit/emit-scalar-kernel
+                           "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
+                           {:target-dialect dialect}))]
           (map-indexed (fn [index artifact]
                          (write-artifact! directory suffix (str "tiled-" index) artifact))
                        (executable/artifacts tiled)))))

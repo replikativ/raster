@@ -685,7 +685,7 @@
 
 (def ^:private scalar-operation-kinds
   #{"ScalarCompute" "ScalarLoad" "ScalarStore" "Yield" "IfRegion" "ForLoop"
-    "Collective"})
+    "Collective" "WorkgroupBarrier"})
 
 (defn- scalar-body-operations
   [operations]
@@ -1194,6 +1194,9 @@
                                            *scalar-dialect* result-name 0 width) ";")))))))]
       [source next-context])
 
+    (record-kind? "WorkgroupBarrier" operation)
+    [(indent-lines depth (c-dialect/workgroup-barrier *scalar-dialect*)) context]
+
     (record-kind? "Yield" operation)
     (throw (ex-info "OpenCL scalar lowering found a misplaced Yield"
                     {:reason :raster/bug :operation operation}))
@@ -1211,13 +1214,19 @@
 
 (defn- scalar-storage-map
   [kernel-body]
-  (let [parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))]
+  (let [parameters (into {} (map (juxt :id identity)) (:parameters kernel-body))
+        allocations (into {}
+                          (map (fn [allocation]
+                                 [(:id allocation)
+                                  (assoc allocation :kind :allocation
+                                         :memory-space :workgroup)]))
+                          (:allocations kernel-body))]
     (reduce (fn [storage view]
               (let [parent (get parameters (:buffer view))]
                 (assoc storage (:id view)
                        (assoc parent :id (:id view) :shape (:shape view)
                               :layout (:layout view) :view view))))
-            parameters (:views kernel-body))))
+            (merge parameters allocations) (:views kernel-body))))
 
 (defn- emit-scalar-kernel*
   [kernel-name kernel-body {:keys [parameter-names]}]
@@ -1241,6 +1250,10 @@
                                       (or (get parameter-names (:id parameter))
                                           (scalar-local-name (:id parameter)))])
                                    parameters))
+        allocation-names (into {}
+                               (map (fn [allocation]
+                                      [(:id allocation) (scalar-local-name (:id allocation))]))
+                               (:allocations kernel-body))
         _ (when-not (every? #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" %)
                             (vals parameter-names))
             (throw (ex-info "C-family kernel parameter names must be C identifiers"
@@ -1250,7 +1263,7 @@
         indices (:indices kernel-body)
         names (reduce (fn [env index]
                         (assoc env (:id index) (scalar-local-name (:id index))))
-                      parameter-names indices)
+                      (merge parameter-names allocation-names) indices)
         types (reduce (fn [env index] (assoc env (:id index) :int))
                       (into {}
                             (map (fn [parameter]
@@ -1262,7 +1275,8 @@
             (throw (ex-info "C-family parameter and index names collide after target spelling"
                             {:reason :kernel-body-c-name-collision
                              :dialect (:id *scalar-dialect*) :names names})))
-        local-ids (concat (map :id indices) (scalar-defined-ids (:operations kernel-body)))
+        local-ids (concat (map :id (:allocations kernel-body))
+                          (map :id indices) (scalar-defined-ids (:operations kernel-body)))
         emitted-local-names (map scalar-local-name local-ids)
         all-emitted-names (concat (vals parameter-names) emitted-local-names)
         _ (when-not (= (count all-emitted-names) (count (set all-emitted-names)))
@@ -1273,6 +1287,20 @@
         storage (scalar-storage-map kernel-body)
         masks (into {} (map (juxt :id identity)) (:masks kernel-body))
         context {:names names :types types :storage storage :masks masks}
+        allocation-plan (body/workgroup-memory-plan (:allocations kernel-body))
+        arena-name "rstr_workgroup_memory"
+        allocation-source
+        (when (seq (:allocations kernel-body))
+          (str (indent-lines
+                1 (c-dialect/workgroup-arena-declaration
+                   *scalar-dialect* arena-name (:bytes allocation-plan)
+                   (:alignment allocation-plan)))
+               (apply str
+                      (for [{:keys [allocation byte-offset]} (:allocations allocation-plan)]
+                        (indent-lines
+                         1 (c-dialect/workgroup-pointer-declaration
+                            *scalar-dialect* (:dtype allocation)
+                            (get allocation-names (:id allocation)) arena-name byte-offset))))))
         index-source
         (apply str
                (for [index indices]
@@ -1289,8 +1317,9 @@
                       1 (str "int " name " = "
                              (emit-index-expression (:expression index) names) ";"))))))
         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
-        uses-half? (some #(= :half (dtype/canon (:dtype %))) parameters)
-        uses-double? (some #(= :double (dtype/canon (:dtype %))) parameters)
+        storage-declarations (concat parameters (:allocations kernel-body))
+        uses-half? (some #(= :half (dtype/canon (:dtype %))) storage-declarations)
+        uses-double? (some #(= :double (dtype/canon (:dtype %))) storage-declarations)
         collective (first (filter #(record-kind? "Collective" %) operations))
         uses-subgroups? (or collective
                             (some #(and (record-kind? "IndexBinding" %)
@@ -1310,7 +1339,7 @@
                           *scalar-dialect* % (get parameter-names (:id %)))
                         parameters))
          ") {\n"
-         index-source operation-source
+         allocation-source index-source operation-source
          "}\n")))
 
 (defn emit-scalar-kernel

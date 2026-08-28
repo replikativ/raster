@@ -14,6 +14,7 @@
 (defrecord KernelParameter [id kind dtype shape memory-space layout role])
 (defrecord BufferView [id buffer element-offset shape layout])
 (defrecord StableRead [buffer])
+(defrecord WorkgroupAllocation [id dtype shape layout alignment])
 (defrecord IndexBinding [id source axis])
 (defrecord IndexCompute [id expression])
 (defrecord IndexExpr [op arguments])
@@ -38,6 +39,7 @@
 (defrecord Participation [kind])
 (defrecord Collective
            [result kind scope width input operator source-lane participation association])
+(defrecord WorkgroupBarrier [scope memory-spaces semantics participation])
 
 (defrecord FragmentInit [fragment value])
 (defrecord TileLoad [fragment buffer coordinates mask cache])
@@ -48,11 +50,11 @@
 (defrecord TileStore [buffer fragment coordinates mask value-region])
 
 (defrecord KernelBody
-           [id parameters views stable-reads indices masks fragments operations schedule launch
-            provenance attributes])
+           [id parameters views stable-reads allocations indices masks fragments operations
+            schedule launch provenance attributes])
 
 (def ^:private parameter-kinds #{:input :output :scalar})
-(def ^:private index-sources #{:group :subgroup :lane})
+(def ^:private index-sources #{:group :local :subgroup :lane})
 (def ^:private index-ops #{:add :sub :mul :floor-div :ceil-div :mod :min :max})
 (def ^:private predicate-ops #{:lt :lte :eq :and :or :not})
 (def ^:private cache-policies #{:default :cached :streaming})
@@ -61,6 +63,8 @@
 (def ^:private cast-rounding-policies #{:toward-zero :nearest-even :up :down :exact})
 (def ^:private cast-overflow-policies #{:wrap :saturate :trap :exact :ieee})
 (def ^:private collective-kinds #{:reduce :broadcast})
+(def ^:private workgroup-memory-spaces #{:workgroup})
+(def ^:private barrier-semantics #{:acquire-release})
 
 (defn- record-kind? [class-name value]
   (and value (= class-name (.getName (class value)))))
@@ -124,6 +128,39 @@
   execution. This is an external binding precondition, not a load-local optimization hint."
   [buffer]
   (->StableRead buffer))
+
+(defn- align-up-static
+  [value alignment]
+  (* (quot (+ value (dec alignment)) alignment) alignment))
+
+(defn workgroup-memory-plan
+  "Deterministically pack statically shaped workgroup allocations.
+
+  Returns `{:allocations [{:allocation a :byte-offset n :byte-size n} ...]
+            :bytes n :alignment n}`. The verifier ties `:bytes` exactly to the launch resource
+  charge; C-family emitters consume this same plan instead of independently laying storage out."
+  [allocations]
+  (loop [remaining allocations offset 0 max-alignment 1 packed []]
+    (if-let [allocation (first remaining)]
+      (let [{:keys [dtype shape alignment]} allocation]
+        (when-not (and (record-kind?
+                        "raster.compiler.ir.kernel_body.WorkgroupAllocation" allocation)
+                       (dtype/known? dtype)
+                       (vector? shape) (seq shape) (every? pos-int? shape)
+                       (contains? #{1 2 4 8 16} alignment)
+                       (>= alignment (dtype/bytes-of dtype)))
+          (throw (ex-info
+                  "workgroup allocation requires a known dtype, static shape, and supported alignment"
+                  {:reason :kernel-body-workgroup-allocation :allocation allocation})))
+        (let [byte-offset (align-up-static offset alignment)
+              byte-size (* (reduce * shape) (dtype/bytes-of dtype))]
+          (recur (next remaining) (+ byte-offset byte-size) (max max-alignment alignment)
+                 (conj packed {:allocation allocation
+                               :byte-offset byte-offset
+                               :byte-size byte-size}))))
+      {:allocations packed
+       :bytes (align-up-static offset max-alignment)
+       :alignment max-alignment})))
 
 (def ^:private scalar-region-forbidden-ops
   '#{raster.par/scan raster.par/scan-exclusive raster.par/scatter! raster.par/reduce-by-key
@@ -262,7 +299,8 @@
                "raster.compiler.ir.kernel_body.Yield"
                "raster.compiler.ir.kernel_body.IfRegion"
                "raster.compiler.ir.kernel_body.ForLoop"
-               "raster.compiler.ir.kernel_body.Collective"}
+               "raster.compiler.ir.kernel_body.Collective"
+               "raster.compiler.ir.kernel_body.WorkgroupBarrier"}
              (some-> value class .getName)))
 
 (declare validate-operations!)
@@ -577,6 +615,18 @@
                          (expression? (:source-lane operation)))
             (throw (ex-info "subgroup broadcast requires a source lane and no reduction association"
                             {:operation operation})))))
+
+      (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
+      (when-not (and (= :workgroup (:scope operation))
+                     (set? (:memory-spaces operation))
+                     (seq (:memory-spaces operation))
+                     (set/subset? (:memory-spaces operation) workgroup-memory-spaces)
+                     (contains? barrier-semantics (:semantics operation))
+                     (record-kind? "raster.compiler.ir.kernel_body.Participation"
+                                   (:participation operation))
+                     (= :full (get-in operation [:participation :kind])))
+        (throw (ex-info "workgroup barrier has an unsupported synchronization contract"
+                        {:reason :kernel-body-workgroup-barrier :operation operation})))
 
       :else
       (throw (ex-info "kernel body contains an unsupported operation"
@@ -1006,6 +1056,14 @@
                              :source-lane lane :width width})))))
       (assoc values (:id result) {:type result-type :uniformity subgroup-uniform}))
 
+    (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
+    (do
+      (when-not (contains? control-uniformity :workgroup)
+        (throw (ex-info "workgroup barrier appears in divergent control flow"
+                        {:reason :kernel-body-divergent-workgroup-barrier
+                         :operation operation :control-uniformity control-uniformity})))
+      values)
+
     (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
     (let [guard-uniformity (mask-uniformity (:mask operation) masks values)]
       (validate-dataflow-operations!
@@ -1042,18 +1100,19 @@
   (when-not (kernel-body? body)
     (throw (ex-info "kernel body must be a KernelBody value"
                     {:body body :actual (type body)})))
-  (let [{:keys [id parameters views stable-reads indices masks fragments operations schedule launch
-                provenance attributes]} body]
+  (let [{:keys [id parameters views stable-reads allocations indices masks fragments operations
+                schedule launch provenance attributes]} body]
     (when (nil? id)
       (throw (ex-info "kernel body requires a stable identity" {:body body})))
     (doseq [[field values] [[:parameters parameters] [:views views] [:stable-reads stable-reads]
-                            [:indices indices] [:masks masks] [:fragments fragments]
-                            [:operations operations]]]
+                            [:allocations allocations] [:indices indices] [:masks masks]
+                            [:fragments fragments] [:operations operations]]]
       (when-not (vector? values)
         (throw (ex-info "kernel body sections must be ordered vectors"
                         {:field field :value values}))))
     (unique-ids! "kernel parameters" parameters)
     (unique-ids! "kernel buffer views" views)
+    (unique-ids! "kernel workgroup allocations" allocations)
     (unique-ids! "kernel indices" indices)
     (unique-ids! "kernel masks" masks)
     (unique-ids! "kernel fragments" fragments)
@@ -1076,6 +1135,13 @@
               (throw (ex-info "kernel buffer parameter requires a memory space"
                               {:parameter p}))))))
     (let [parameter-map (into {} (map (juxt :id identity)) parameters)
+          allocation-plan (workgroup-memory-plan allocations)
+          allocation-map (into {}
+                               (map (fn [allocation]
+                                      [(:id allocation)
+                                       (assoc allocation :kind :allocation
+                                              :memory-space :workgroup)]))
+                               allocations)
           scalar-ids (set (map :id (filter #(= :scalar (:kind %)) parameters)))
           launch-dimensions (launch/dimensions launch)
           index-scope
@@ -1086,7 +1152,7 @@
                (when-not (and (contains? index-sources (:source idx))
                               (integer? (:axis idx))
                               (case (:source idx)
-                                :group (< -1 (:axis idx) launch-dimensions)
+                                (:group :local) (< -1 (:axis idx) launch-dimensions)
                                 (:subgroup :lane) (zero? (:axis idx))))
                  (throw (ex-info "kernel index binding has an invalid hardware source" {:index idx})))
 
@@ -1160,7 +1226,21 @@
                       (assoc parent :id (:id view) :shape (:shape view)
                              :layout (:layout view) :view view))))
            {} views)
-          storage (merge parameter-map view-map)]
+          storage (merge parameter-map allocation-map view-map)]
+      (doseq [allocation allocations]
+        (layout! "workgroup allocation" (:layout allocation))
+        (when-not (and (= (:shape allocation) (get-in allocation [:layout :shape]))
+                       (= (dtype/canon (:dtype allocation))
+                          (dtype/canon (get-in allocation [:layout :dtype]))))
+          (throw (ex-info "workgroup allocation shape and dtype must agree with its layout"
+                          {:reason :kernel-body-workgroup-layout
+                           :allocation allocation}))))
+      (when (and (seq allocations)
+                 (not= (:bytes allocation-plan) (:shared-memory-bytes launch)))
+        (throw (ex-info "workgroup allocations and launch shared-memory charge disagree"
+                        {:reason :kernel-body-workgroup-byte-accounting
+                         :allocation-bytes (:bytes allocation-plan)
+                         :launch-shared-memory-bytes (:shared-memory-bytes launch)})))
       (let [stable-buffers (mapv :buffer stable-reads)]
         (when-not (= (count stable-buffers) (count (set stable-buffers)))
           (throw (ex-info "kernel stable-read requirements must name unique buffers"
@@ -1173,7 +1253,8 @@
               (throw (ex-info "kernel stable-read requirement must name an input parameter"
                               {:reason :kernel-body-stable-read-invalid
                                :requirement requirement :parameter buffer}))))))
-      (let [section-ids (vec (concat (map :id parameters) (map :id views) (map :id indices)
+      (let [section-ids (vec (concat (map :id parameters) (map :id views)
+                                     (map :id allocations) (map :id indices)
                                      (map :id masks) (map :id fragments)))]
         (when-not (= (count section-ids) (count (set section-ids)))
           (throw (ex-info "kernel storage, index, mask, and fragment identities must be globally unique"
@@ -1208,6 +1289,7 @@
                      (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                        (case (:source idx)
                          :group all-uniform
+                         :local lane-varying
                          :subgroup subgroup-uniform
                          :lane lane-varying)
                        (expression-uniformity (:expression idx) values))]
@@ -1234,9 +1316,9 @@
 
 (defn make
   "Construct and verify a target-neutral scheduled kernel body."
-  [{:keys [id parameters views stable-reads indices masks fragments operations schedule launch
-           provenance attributes]
-    :or {parameters [] views [] stable-reads [] indices [] masks [] fragments [] operations []
-         schedule {} launch {} provenance {} attributes {}}}]
-  (validate! (->KernelBody id parameters views stable-reads indices masks fragments operations
-                           schedule launch provenance attributes)))
+  [{:keys [id parameters views stable-reads allocations indices masks fragments operations schedule
+           launch provenance attributes]
+    :or {parameters [] views [] stable-reads [] allocations [] indices [] masks [] fragments []
+         operations [] schedule {} launch {} provenance {} attributes {}}}]
+  (validate! (->KernelBody id parameters views stable-reads allocations indices masks fragments
+                           operations schedule launch provenance attributes)))

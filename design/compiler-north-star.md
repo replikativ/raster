@@ -103,14 +103,18 @@ loop-carried regions, and full-participation subgroup reductions/broadcasts. Bra
 are typed products; use-before-definition, identity collisions, divergent collectives, implicit
 masked-load values, conversion policy gaps, and launch/subgroup mismatches fail verification. Body
 launches use the shared `LaunchSpec`, keeping host launch expressions separate from in-kernel index
-arithmetic. Uniform memory facts require an explicit body-level stable-read contract; the checked
+arithmetic. Group, 1–3D local-thread, subgroup, and subgroup-lane indices are distinct hardware
+sources. Uniform memory facts require an explicit body-level stable-read contract; the checked
 KernelBody-to-ABI seam projects it to a no-write-alias precondition, artifacts reject equal compiler
 bindings, direct calls check resident ranges, and graph/link binding retains its stronger
 overlapping-write rejection. Floating narrowing distinguishes IEEE overflow from integral
-wrap/saturate/trap policies. Local allocation,
-barriers, masked collectives, and asynchronous copies remain absent
-until a concrete schedule supplies enough information to verify lifetime, alignment, execution and
-memory scopes, memory semantics, participation, and shared-byte accounting. An implemented OpenCL
+wrap/saturate/trap policies. Whole-kernel workgroup allocations now have static typed shapes, named
+layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
+accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are
+rejected outside workgroup-uniform control flow and lower from the same operation to OpenCL,
+CUDA, and HIP. Masked collectives and asynchronous copies remain absent until a concrete schedule
+supplies enough information to verify their participation, issue/commit/wait lifetime, and target
+capability. An implemented OpenCL
 target spelling now lowers this general scalar/control vocabulary directly: dense ranked loads and
 stores (including contiguous leading-slice views), SSA expressions, structured branch/loop yields,
 explicit numerical casts, and full-subgroup reductions/broadcasts, without recovering an algorithm
@@ -135,10 +139,11 @@ CUDA and HIP spelling descriptors. The same scheduled cooperative and tiled-hist
 one ordered ABI while OpenCL uses subgroup builtins and CUDA/HIP select explicit shuffle-down trees;
 the emitted artifacts record that target association. CUDA is compiled to PTX and HIP to an RDNA3
 code object in mandatory hardware-free CI jobs, while real Intel execution remains the numerical
-oracle. CUDA/HIP runtime registration, launch and on-device numerical coverage remain deliberately
-separate from source legality. Verified local allocation, barriers and asynchronous copies can
-subsequently collapse a multi-kernel tiled graph into a FlashAttention-like single kernel without
-changing the semantic plan or external ABI.
+oracle. The compiler fixtures now also stage values through verified workgroup memory and a barrier;
+CUDA/HIP runtime registration, launch and on-device numerical coverage remain deliberately separate
+from source legality. Async copy/commit/wait operations and a schedule that uses the new staging
+substrate can subsequently collapse a multi-kernel tiled graph into a FlashAttention-like single
+kernel without changing the semantic plan or external ABI.
 
 ### 2.3 Executable steps and resident artifact values compose
 

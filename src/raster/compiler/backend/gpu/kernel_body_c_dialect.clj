@@ -71,10 +71,12 @@
   (if (opencl? dialect)
     (case source
       :group (str "get_group_id(" axis ")")
+      :local (str "get_local_id(" axis ")")
       :subgroup "get_sub_group_id()"
       :lane "get_sub_group_local_id()")
     (case source
       :group (str "blockIdx." (nth axis-name axis))
+      :local (str "threadIdx." (nth axis-name axis))
       :subgroup (str "(" (linear-thread-id) " / " subgroup-width ")")
       :lane (str "(" (linear-thread-id) " % " subgroup-width ")"))))
 
@@ -110,6 +112,34 @@
 (defn entry-prefix
   [dialect]
   (if (opencl? dialect) "__kernel void " "extern \"C\" __global__ void "))
+
+(defn workgroup-arena-declaration
+  "Spell one statically sized, explicitly aligned workgroup-memory arena."
+  [dialect name bytes alignment]
+  (case (:id dialect)
+    (:opencl-intel :opencl-portable)
+    (let [[backing-type backing-bytes]
+          ({1 ["uchar" 1] 2 ["ushort" 2] 4 ["uint" 4] 8 ["ulong" 8] 16 ["uint4" 16]}
+           alignment)]
+      (str "__local " backing-type " " name "[" (quot bytes backing-bytes) "];"))
+    :cuda
+    (str "__shared__ __align__(" alignment ") unsigned char " name "[" bytes "];")
+    :hip
+    (str "__shared__ __attribute__((aligned(" alignment "))) unsigned char " name "[" bytes "];")))
+
+(defn workgroup-pointer-declaration
+  "Spell a typed pointer into a verified byte offset of the workgroup arena."
+  [dialect type name arena byte-offset]
+  (if (opencl? dialect)
+    (str "__local " (type-name dialect type) "* " name " = (__local "
+         (type-name dialect type) "*)((__local uchar*)" arena " + " byte-offset ");")
+    (str (type-name dialect type) "* " name " = reinterpret_cast<"
+         (type-name dialect type) "*>(" arena " + " byte-offset ");")))
+
+(defn workgroup-barrier
+  "Spell the verified full-workgroup acquire/release barrier."
+  [dialect]
+  (if (opencl? dialect) "barrier(CLK_LOCAL_MEM_FENCE);" "__syncthreads();"))
 
 (defn broadcast-expression
   [dialect input source-lane width]
