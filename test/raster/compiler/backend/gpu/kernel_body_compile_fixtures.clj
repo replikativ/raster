@@ -27,6 +27,7 @@
 (def ^:private targets
   {:cuda {:suffix ".cu"
           :descriptor {:device-type :gpu :backend :cuda :vendor "NVIDIA"
+                       :compute-capability [8 0]
                        :subgroup-size 32 :max-workgroup-size 1024}}
    :hip {:suffix ".hip"
          :descriptor {:device-type :gpu :backend :hip :vendor "AMD"
@@ -68,7 +69,12 @@
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
-                           {:target-dialect dialect}))]
+                           {:target-dialect dialect}))
+           (write-source! directory suffix "async-staging"
+                          (body-emit/emit-scalar-kernel
+                           "async_staging"
+                           (body-fixtures/async-staging-body 32 :preferred)
+                           {:target-dialect dialect :target-features descriptor}))]
           (map-indexed (fn [index artifact]
                          (write-artifact! directory suffix (str "tiled-" index) artifact))
                        (executable/artifacts tiled)))))

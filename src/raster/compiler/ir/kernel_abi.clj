@@ -12,15 +12,16 @@
 
 (defn slot
   "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, :field, and
-  :aliasing.
+  :aliasing, and :alignment.
 
    `:binding` names the logical caller value that supplies a physical pointer slot. It is
    normally absent (and therefore identical to `:name`), but an SoA argument has one physical
    slot per field and all of those slots share the same logical binding.
    `:field` identifies this physical leaf within a composite logical binding.
    `:aliasing :no-write-alias` is an input-pointer precondition: its complete bound range must be
-   disjoint from every output pointer range for the duration of the launch."
-  [nm kind dtype & {:keys [c-name kernel-dtype role binding field aliasing]}]
+   disjoint from every output pointer range for the duration of the launch.
+   `:alignment` is a power-of-two byte alignment required of a pointer binding."
+  [nm kind dtype & {:keys [c-name kernel-dtype role binding field aliasing alignment]}]
   (cond-> {:name nm
            :c-name (or c-name (name nm))
            :kind kind
@@ -29,7 +30,8 @@
     role (assoc :role role)
     binding (assoc :binding binding)
     field (assoc :field field)
-    aliasing (assoc :aliasing aliasing)))
+    aliasing (assoc :aliasing aliasing)
+    alignment (assoc :alignment alignment)))
 
 (defn validate!
   "Validate an ordered ABI and return it unchanged.  A kernel has at least one output;
@@ -63,7 +65,13 @@
                (not (and (= :input (:kind s)) (= :no-write-alias (:aliasing s)))))
       (throw (ex-info "kernel ABI aliasing contract is unsupported for this slot"
                       {:index i :slot s :abi abi
-                       :supported {:kind :input :aliasing :no-write-alias}}))))
+                       :supported {:kind :input :aliasing :no-write-alias}})))
+    (when (and (:alignment s)
+               (not (and (not= :scalar (:kind s))
+                         (integer? (:alignment s)) (pos? (:alignment s))
+                         (zero? (bit-and (:alignment s) (dec (:alignment s)))))))
+      (throw (ex-info "kernel ABI pointer alignment must be a positive power of two"
+                      {:index i :slot s :abi abi}))))
   (when-not (= (count abi) (count (distinct (map :c-name abi))))
     (throw (ex-info "kernel ABI parameter names must be unique" {:abi abi})))
   (let [pointers (vec (remove #(= :scalar (:kind %)) abi))]

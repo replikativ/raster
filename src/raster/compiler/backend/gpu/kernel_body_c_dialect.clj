@@ -4,7 +4,8 @@
   A dialect never selects a schedule. It only spells verified storage types, hardware indices,
   entry points and subgroup shuffles for one target language. CUDA and HIP intentionally share
   the same structural lowering while retaining distinct collective intrinsics and module targets."
-  (:require [raster.compiler.core.dtype :as dtype]))
+  (:require [clojure.string :as str]
+            [raster.compiler.core.dtype :as dtype]))
 
 (def ^:private dialects
   {:opencl-intel {:id :opencl-intel :target :opencl-c :family :opencl
@@ -28,6 +29,17 @@
 (defn family [dialect] (:family dialect))
 (defn collective-association [dialect] (:association dialect))
 (defn opencl? [dialect] (= :opencl (family dialect)))
+
+(defn async-copy-mode
+  "Report the physical lowering used for the target-neutral async dependency contract."
+  [dialect]
+  (case (:id dialect)
+    (:opencl-intel :opencl-portable) :native-events
+    :cuda (if (and (vector? (:compute-capability dialect))
+                   (not (neg? (compare (:compute-capability dialect) [8 0]))))
+            :native-cp-async
+            :synchronous-cooperative)
+    :hip :synchronous-cooperative))
 
 (defn type-name
   [dialect type]
@@ -140,6 +152,68 @@
   "Spell the verified full-workgroup acquire/release barrier."
   [dialect]
   (if (opencl? dialect) "barrier(CLK_LOCAL_MEM_FENCE);" "__syncthreads();"))
+
+(defn async-copy
+  "Spell one workgroup-cooperative contiguous global-to-workgroup copy."
+  [dialect {:keys [name source destination elements element-bytes transfer-bytes workgroup-width
+                   overlap]}]
+  (case (async-copy-mode dialect)
+    :native-events
+    (str "event_t " name " = async_work_group_copy(" destination ", " source ", "
+         elements ", (event_t)0);")
+
+    :native-cp-async
+    (let [offset (str name "_byte_offset")
+          shared-address (str name "_shared_address")
+          native-copy
+          (str "for (int " offset " = (" (linear-thread-id) ") * " transfer-bytes
+               "; " offset " < " (* elements element-bytes) "; " offset " += "
+               workgroup-width " * " transfer-bytes ") {\n"
+               "  unsigned int " shared-address
+               " = (unsigned int)__cvta_generic_to_shared((void*)((unsigned char*)"
+               destination " + " offset "));\n"
+               "  asm volatile(\"cp.async.ca.shared.global [%0], [%1], " transfer-bytes
+               ";\\n\" :: \"r\"(" shared-address "), \"l\"((const unsigned char*)"
+               source " + " offset "));\n"
+               "}")
+          fallback-offset (str name "_fallback_element_offset")
+          fallback
+          (str "for (int " fallback-offset " = " (linear-thread-id) "; " fallback-offset
+               " < " elements "; " fallback-offset " += " workgroup-width ") {\n"
+               "  " destination "[" fallback-offset "] = " source "[" fallback-offset "];\n"
+               "}")]
+      (if (= :required overlap)
+        native-copy
+        (str "if ((((uintptr_t)" source " | (uintptr_t)" destination ") & "
+             (dec transfer-bytes) ") == 0) {\n"
+             (str/replace native-copy #"(?m)^" "  ") "\n} else {\n"
+             (str/replace fallback #"(?m)^" "  ") "\n}")))
+
+    :synchronous-cooperative
+    (let [offset (str name "_element_offset")]
+      (str "for (int " offset " = " (linear-thread-id) "; " offset " < " elements
+           "; " offset " += " workgroup-width ") {\n"
+           "  " destination "[" offset "] = " source "[" offset "];\n"
+           "}"))))
+
+(defn async-commit
+  [dialect group]
+  (case (async-copy-mode dialect)
+    :native-cp-async "asm volatile(\"cp.async.commit_group;\\n\" ::);"
+    :native-events (str "/* OpenCL event group " group " committed at issue. */")
+    :synchronous-cooperative (str "/* synchronous async group " group " committed. */")))
+
+(defn async-wait
+  [dialect event-names pending-groups]
+  (case (async-copy-mode dialect)
+    :native-events
+    (str/join "\n" (map #(str "wait_group_events(1, &" % ");") event-names))
+
+    :native-cp-async
+    (str "asm volatile(\"cp.async.wait_group " pending-groups ";\\n\" ::);")
+
+    :synchronous-cooperative
+    "/* synchronous cooperative copies are complete before this wait. */"))
 
 (defn broadcast-expression
   [dialect input source-lane width]

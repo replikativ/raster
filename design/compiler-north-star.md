@@ -112,9 +112,19 @@ wrap/saturate/trap policies. Whole-kernel workgroup allocations now have static 
 layouts, explicit 1–16-byte alignment, and one deterministic packed-memory plan; launch shared-byte
 accounting must match that plan exactly. Full-participation acquire/release workgroup barriers are
 rejected outside workgroup-uniform control flow and lower from the same operation to OpenCL,
-CUDA, and HIP. Masked collectives and asynchronous copies remain absent until a concrete schedule
-supplies enough information to verify their participation, issue/commit/wait lifetime, and target
-capability. An implemented OpenCL
+CUDA, and HIP. Workgroup-cooperative contiguous global-to-workgroup copies now carry explicit
+source/destination coordinates, element and transfer widths, cache intent, full participation, and
+preferred-versus-required overlap. Named commits close the exact copies issued since the previous
+commit; waits consume an oldest group prefix and state the remaining pipeline depth. The verifier
+rejects unstable sources, divergent base addresses, live destination reuse, lifetimes crossing a
+structured-region boundary, and staged-memory consumption before a separate workgroup barrier.
+Required overlap also proves coordinate alignment, projects its base-address alignment through the
+ordered ABI, and direct calls validate resident ranges before launch; preferred CUDA overlap keeps
+a uniform runtime-alignment fallback.
+OpenCL lowers the dependency graph to events, CUDA targets with compute capability 8.0 or newer to
+`cp.async` groups, and older/unknown CUDA or HIP targets report an honest synchronous cooperative
+lowering; those targets reject a schedule that requires overlap. Masked collectives
+remain absent until a concrete schedule supplies verifiable participation. An implemented OpenCL
 target spelling now lowers this general scalar/control vocabulary directly: dense ranked loads and
 stores (including contiguous leading-slice views), SSA expressions, structured branch/loop yields,
 explicit numerical casts, and full-subgroup reductions/broadcasts, without recovering an algorithm
@@ -139,11 +149,13 @@ CUDA and HIP spelling descriptors. The same scheduled cooperative and tiled-hist
 one ordered ABI while OpenCL uses subgroup builtins and CUDA/HIP select explicit shuffle-down trees;
 the emitted artifacts record that target association. CUDA is compiled to PTX and HIP to an RDNA3
 code object in mandatory hardware-free CI jobs, while real Intel execution remains the numerical
-oracle. The compiler fixtures now also stage values through verified workgroup memory and a barrier;
-CUDA/HIP runtime registration, launch and on-device numerical coverage remain deliberately separate
-from source legality. Async copy/commit/wait operations and a schedule that uses the new staging
-substrate can subsequently collapse a multi-kernel tiled graph into a FlashAttention-like single
-kernel without changing the semantic plan or external ABI.
+oracle. The compiler fixtures now stage values through both synchronous workgroup memory and the
+verified async issue/commit/wait contract; the exact async body is compiled to CUDA sm_80 PTX and
+an RDNA3 HIP code object in hardware-free CI. CUDA/HIP runtime registration, launch and on-device
+numerical coverage remain deliberately separate from source legality. The next production step is a
+double-buffered scheduled weighted-reduction body that uses this substrate, followed by local
+swizzles and measured stage-depth selection; this can collapse the tiled graph toward a
+FlashAttention-like single kernel without changing the semantic plan or external ABI.
 
 ### 2.3 Executable steps and resident artifact values compose
 
