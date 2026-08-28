@@ -113,7 +113,10 @@
                   :components [:maximum :denominator :weighted-values]}
           :numerical-mode {:score-accumulate accumulator-dtype
                            :state-accumulate accumulator-dtype
-                           :dot-order :subgroup-tree
+                           ;; The OpenCL subgroup builtin fixes neither its association tree nor
+                           ;; bitwise result. A target with an explicit shuffle tree may choose a
+                           ;; stricter schedule later; this row records exactly what it emits.
+                           :dot-order :implementation-defined
                            :online-rescale? true}
           :attributes {:storage-kind (:kind storage)
                        :route-kind (:route-kind storage)

@@ -5,11 +5,13 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-body :as kbody]
             [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
             [raster.compiler.ir.segmented-weighted-reduction-schedule :as swr-schedule]
             [raster.compiler.passes.parallel.attention-route :as route]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-body :as swr-body]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule
              :as schedule-pass]))
 
@@ -92,6 +94,7 @@
                                 (assoc desc :segmented-weighted-reduction-schedule :reference))
         {:keys [strategy reference? declines artifact graph schedule]} optimized
         swr-schedule (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
+        kernel-body (get-in artifact [:attributes :kernel-body])
         source (:source artifact)]
     (is (= :routed-paged-subgroup-online-score-reuse strategy))
     (is (false? reference?))
@@ -107,15 +110,18 @@
     (is (= (kexec/common-view (:artifact reference))
            (kexec/common-view artifact)))
     (is (not= (:kernel-name (:artifact reference)) (:kernel-name artifact)))
+    (is (kbody/kernel-body? kernel-body))
+    (is (= :scheduled-kernel-body (get-in kernel-body [:provenance :lowering])))
     (is (str/includes? source "intel_reqd_sub_group_size(16)"))
-    (is (str/includes? source "const float dot = sub_group_reduce_add(partial_dot)"))
-    (is (str/includes? source "old_weight = sub_group_broadcast(old_weight, 0)"))
-    (is (str/includes? source "const int kv_head = q_head / 2"))
-    (is (str/includes? source "if (attention_begin == attention_end)"))
     (is (str/includes? source
-                       "for (int token = (int)attention_begin; token < (int)attention_end"))
-    (is (str/includes? source "float maximum"))
-    (is (str/includes? source "accumulator0 = accumulator0 * old_weight"))))
+                       "float rstr_dot = sub_group_reduce_add(rstr_partial_dot)"))
+    (is (not (str/includes? source "sub_group_broadcast"))
+        "identical online state is computed by every lane")
+    (is (str/includes? source "int rstr_kv_head = (rstr_query_head / 2)"))
+    (is (str/includes? source
+                       "for (long rstr_membership_token = rstr_attention_begin"))
+    (is (str/includes? source "float rstr_final_maximum"))
+    (is (str/includes? source "float rstr_weighted_value_next_0"))))
 
 (deftest cooperative-attention-source-is-valid-opencl
   (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
@@ -135,9 +141,11 @@
                       [:artifact :source])
               result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                "-fsyntax-only" "-" :in source)]
-          (is (str/includes? source "const int d15 = (int)lane + 240;"))
-          (is (str/includes? source "float accumulator15 = 0.0f;"))
-          (is (not (str/includes? source "accumulator16")))
+          (is (str/includes? source
+                             "int rstr_value_component_15 = (rstr_lane + 240);"))
+          (is (str/includes? source
+                             "float rstr_weighted_value_result_15 = 0.0f;"))
+          (is (not (str/includes? source "rstr_value_component_16")))
           (is (zero? (:exit result)) (:err result)))))))
 
 (deftest cooperative-schedule-is-validated-and-target-legality-is-explicit
@@ -152,7 +160,7 @@
     (is (= {:kind :subgroup :width 16 :axis :qk-component}
            (:score-reduction schedule)))
     (is (= {:score-accumulate :float :state-accumulate :float
-            :dot-order :subgroup-tree :online-rescale? true}
+            :dot-order :implementation-defined :online-rescale? true}
            (:numerical-mode schedule)))
     (is (= :segmented-weighted-reduction-value-mapping
            (try
@@ -167,6 +175,11 @@
     (is (= :attention-cooperative-schedule-plan-mismatch
            (try
              (attention-emit/emit-fp16-cooperative
+              plan (assoc-in schedule [:score-reduction :axis] :wrong-axis))
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :segmented-weighted-reduction-body-plan-mismatch
+           (try
+             (swr-body/lower-routed-paged
               plan (assoc-in schedule [:score-reduction :axis] :wrong-axis))
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
     (let [nvidia-desc {:device-type :gpu :vendor "NVIDIA" :subgroup-size 32
@@ -221,8 +234,9 @@
     (is (= :contiguous-interval
            (get-in artifact [:attributes :segmented-weighted-reduction-schedule
                              :membership-traversal])))
-    (is (str/includes? (:source artifact) "page_indices[page_begin + logical_page]"))
-    (is (str/includes? (:source artifact) "routed_page_count == 0"))))
+    (is (str/includes? (:source artifact) "page_indices["))
+    (is (str/includes? (:source artifact)
+                       "rstr_empty_last_page_valid = (rstr_final_page_length == 0)"))))
 
 (deftest logical-csr-visibility-composes-with-physical-route-as-distinct-abi-slots
   (let [{:keys [artifact reference? declines]}
@@ -241,11 +255,12 @@
            (get-in artifact [:attributes :segmented-weighted-reduction-schedule
                              :membership-traversal])))
     (is (str/includes? (:source artifact)
-                       "for (int edge = attention_begin; edge < attention_end; ++edge)"))
+                       "for (int rstr_membership_edge = rstr_attention_begin"))
     (is (str/includes? (:source artifact)
-                       "const int token = attention_key_indices[edge]"))
-    (is (str/includes? (:source artifact) "token < 0 || token >= length"))
-    (is (str/includes? (:source artifact) "kv_position <= (long)q_position"))))
+                       "rstr_logical_token = attention_key_indices["))
+    (is (str/includes? (:source artifact) "rstr_logical_token_nonnegative"))
+    (is (str/includes? (:source artifact)
+                       "rstr_kv_position <= rstr_query_position_long"))))
 
 (deftest independent-k-and-v-layouts-are-lowered-without-repacking
   (let [source (:source (:artifact (route/route! (problem))))]
@@ -267,10 +282,11 @@
     (is (= :float (get-in artifact [:attributes :output-dtype])))
     (is (str/includes? source "__global const float* q"))
     (is (str/includes? source "__global float* output"))
-    (is (str/includes? source "dot += q[q_base + x] * convert_float(k_pages"))
-    (is (str/includes? source "output[out_base + d0] = NAN;"))
     (is (str/includes? source
-                       "output[out_base + d0] = denominator == 0.0f ? 0.0f"))))
+                       "float rstr_qk_product = (rstr_query_float * rstr_key_float)"))
+    (is (str/includes? source
+                       "rstr_valid_output_value_0 = (rstr_final_valid"))
+    (is (str/includes? source "output["))))
 
 (deftest pinned-cooperative-policy-selects-csr-membership-without-changing-semantics
   (let [result (route/route
@@ -297,7 +313,15 @@
       (is (empty? declines))
       (is (= traversal
              (get-in artifact [:attributes :segmented-weighted-reduction-schedule
-                               :membership-traversal]))))))
+                               :membership-traversal])))
+      (let [kernel-body (get-in artifact [:attributes :kernel-body])]
+        (is (kbody/kernel-body? kernel-body))
+        (is (= (:arguments artifact) (mapv :id (:parameters kernel-body))))
+        (is (= (vec (butlast (:arguments artifact)))
+               (mapv :buffer (:stable-reads kernel-body))))
+        (is (every? #(or (= :output (:kind %))
+                         (= :no-write-alias (:aliasing %)))
+                    (:abi artifact)))))))
 
 (deftest unsupported-representations-return-machine-readable-declines
   (testing "quantization declines before generic dtype routing"

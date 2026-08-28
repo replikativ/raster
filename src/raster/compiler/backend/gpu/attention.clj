@@ -6,13 +6,16 @@
    routes and interval/CSR membership, sharing each QK score across lane-strided value
    accumulators without changing the semantic plan, ordered ABI, storage ownership or graph
    effects."
-  (:require [raster.compiler.ir.attention :as attention]
+  (:require [raster.compiler.backend.gpu.kernel-body-opencl :as body-opencl]
+            [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.segmented-weighted-reduction :as swr]
-            [raster.compiler.ir.segmented-weighted-reduction-schedule :as swr-schedule]))
+            [raster.compiler.ir.segmented-weighted-reduction-schedule :as swr-schedule]
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-body :as swr-body]))
 
 (defn- attention-problem
   [plan]
@@ -343,140 +346,6 @@
                        :schedule schedule :plan-id (:id plan)})))
     [plan schedule problem]))
 
-(defn- component-code
-  [schedule f]
-  (apply str (map f (range (get-in schedule [:value-mapping :components-per-lane])))))
-
-(defn- cooperative-component-declarations
-  [schedule]
-  (let [subgroup-size (:workgroup-size schedule)]
-    (component-code
-     schedule
-     (fn [slot]
-       (str "  const int d" slot " = (int)lane + " (* slot subgroup-size) ";\n"
-            "  float accumulator" slot " = 0.0f;\n")))))
-
-(defn- cooperative-component-write
-  [problem schedule expression]
-  (component-code
-   schedule
-   (fn [slot]
-     (str "    if (d" slot " < " (:value-head-dim problem) ")\n"
-          "      output[out_base + d" slot "] = "
-          (store-float (:output-dtype problem) (expression slot)) ";\n"))))
-
-(defn- cooperative-component-update
-  [problem schedule]
-  (component-code
-   schedule
-   (fn [slot]
-     (str "    if (d" slot " < " (:value-head-dim problem) ")\n"
-          "      accumulator" slot " = accumulator" slot " * old_weight\n"
-          "          + convert_float(v_pages[v_base + d" slot "]) * new_weight;\n"))))
-
-(defn- cooperative-source
-  [problem schedule name]
-  (let [{:keys [query route batch-size q-heads kv-heads qk-head-dim value-head-dim
-                page-size physical-pages scale k-layout v-layout visibility
-                q-dtype output-dtype]} problem
-        total-query-tokens (:total-tokens query)
-        gqa-ratio (quot q-heads kv-heads)
-        subgroup-size (:workgroup-size schedule)
-        k-base (cache-base problem k-layout qk-head-dim)
-        v-base (cache-base problem v-layout value-head-dim)
-        invalid-result
-        (str (cooperative-component-write problem schedule (constantly "NAN"))
-             "    return;\n")
-        empty-result
-        (str (cooperative-component-write problem schedule (constantly "0.0f"))
-             "    return;\n")]
-    (str "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n"
-         "__attribute__((intel_reqd_sub_group_size(" subgroup-size ")))\n"
-         "__kernel void " name "(\n"
-         "    __global const " (opencl-type q-dtype) "* q,\n"
-         "    __global const int* q_row_offsets,\n"
-         "    __global const int* q_positions,\n"
-         "    __global const half* k_pages,\n"
-         "    __global const half* v_pages,\n"
-         (route-signature route)
-         (visibility-signature visibility)
-         "    __global " (opencl-type output-dtype) "* output) {\n"
-         "  const long lane = (long)get_sub_group_local_id();\n"
-         "  const int q_head = (int)get_group_id(0);\n"
-         "  const int q_token = (int)get_group_id(1);\n"
-         "  const long out_base = ((long)q_token * " q-heads
-         " + q_head) * " value-head-dim ";\n"
-         (cooperative-component-declarations schedule)
-         "  int query_metadata_valid = q_row_offsets[0] == 0\n"
-         "      && q_row_offsets[" batch-size "] == " total-query-tokens ";\n"
-         "  int batch = -1;\n"
-         "  for (int b = 0; b < " batch-size "; ++b) {\n"
-         "    const int row_start = q_row_offsets[b];\n"
-         "    const int row_end = q_row_offsets[b + 1];\n"
-         "    query_metadata_valid = query_metadata_valid && row_start >= 0\n"
-         "        && row_end >= row_start && row_end <= " total-query-tokens ";\n"
-         "    if (q_token >= row_start && q_token < row_end) batch = b;\n"
-         "  }\n"
-         "  const int q_position = q_positions[q_token];\n"
-         "  if (!query_metadata_valid || batch < 0 || q_position < 0) {\n"
-         invalid-result
-         "  }\n"
-         (route-initialization problem invalid-result)
-         (visibility-initialization visibility invalid-result)
-         (when (attention/interval-visibility? visibility)
-           (str "  if (attention_begin == attention_end) {\n"
-                empty-result
-                "  }\n"))
-         "  const int kv_head = q_head / " gqa-ratio ";\n"
-         "  const long q_base = ((long)q_token * " q-heads
-         " + q_head) * " qk-head-dim ";\n"
-         "  float maximum = -3.402823466e+38f;\n"
-         "  float denominator = 0.0f;\n"
-         (visibility-loop-start visibility invalid-result)
-         "    const long kv_position = (long)kv_start_position + token;\n"
-         "    int visible = 1;\n"
-         (visibility-statements (attention/position-filter visibility))
-         "    if (!visible) continue;\n"
-         "    const int logical_page = token / " page-size ";\n"
-         "    const int physical_page = " (physical-page-expression route) ";\n"
-         "    if (physical_page < 0 || physical_page >= " physical-pages ") {\n"
-         invalid-result
-         "    }\n"
-         "    const int page_token = token - logical_page * " page-size ";\n"
-         "    const long k_base = " k-base ";\n"
-         "    const long v_base = " v-base ";\n"
-         "    float partial_dot = 0.0f;\n"
-         "    for (int x = (int)lane; x < " qk-head-dim "; x += " subgroup-size ")\n"
-         "      partial_dot += " (load-float q-dtype "q[q_base + x]")
-         " * convert_float(k_pages[k_base + x]);\n"
-         "    const float dot = sub_group_reduce_add(partial_dot);\n"
-         "    const float logit = dot * " (Float/toString (float scale)) "f;\n"
-         "    float old_weight = 0.0f;\n"
-         "    float new_weight = 0.0f;\n"
-         "    if (lane == 0L) {\n"
-         "      if (isnan(maximum) || isnan(logit)) {\n"
-         "        maximum = NAN;\n"
-         "        old_weight = NAN;\n"
-         "        new_weight = NAN;\n"
-         "      } else {\n"
-         "        const float next_maximum = fmax(maximum, logit);\n"
-         "        old_weight = exp(maximum - next_maximum);\n"
-         "        new_weight = exp(logit - next_maximum);\n"
-         "        maximum = next_maximum;\n"
-         "      }\n"
-         "      denominator = denominator * old_weight + new_weight;\n"
-         "    }\n"
-         "    old_weight = sub_group_broadcast(old_weight, 0);\n"
-         "    new_weight = sub_group_broadcast(new_weight, 0);\n"
-         (cooperative-component-update problem schedule)
-         "  }\n"
-         "  denominator = sub_group_broadcast(denominator, 0);\n"
-         (cooperative-component-write
-          problem schedule
-          (fn [slot]
-            (str "denominator == 0.0f ? 0.0f : accumulator" slot " / denominator")))
-         "}\n")))
-
 (defn- ordered-inputs
   [plan]
   (swr/ordered-input-ids plan))
@@ -514,8 +383,12 @@
            (kabi/slot (:key-indices visibility) :input :int
                       :c-name "attention_key_indices" :role :attention-key-indices)])]
     (kabi/validate!
-     (conj (into (into common route-slots) visibility-slots)
-           (kabi/slot output :output output-dtype :c-name "output" :role :result)))))
+     (mapv #(if (= :input (:kind %))
+              (assoc % :aliasing :no-write-alias)
+              %)
+           (conj (into (into common route-slots) visibility-slots)
+                 (kabi/slot output :output output-dtype
+                            :c-name "output" :role :result))))))
 
 (defn emit-fp16-reference
   "Emit route-specialized attention with FP16 K/V storage as a verified KernelArtifact."
@@ -556,22 +429,27 @@
   "Emit one subgroup per query segment for routed FP16 K/V attention.
 
    The artifact preserves the reference leaf's complete ordered ABI and logical effects.  Only
-   its target-neutral SegmentedWeightedReductionSchedule, launch mapping and target body differ."
+   its target-neutral SegmentedWeightedReductionSchedule, launch mapping and target body differ.
+   The scheduled body is independently verified before this target-only lowering selects OpenCL
+   parameter spelling and Intel's required-subgroup attribute."
   [plan schedule]
-  (let [[plan schedule {:keys [query output q-heads route] :as problem}]
+  (let [[plan schedule {:keys [output route] :as problem}]
         (cooperative-plan! plan schedule)
-        subgroup-size (:workgroup-size schedule)
         name (kernel-name problem schedule)
         inputs (ordered-inputs plan)
-        arguments (conj inputs output)]
+        arguments (conj inputs output)
+        kernel-body (swr-body/lower-routed-paged plan schedule)
+        base-abi (ordered-abi problem)
+        parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+        abi (body-abi/project-contracts base-abi kernel-body)]
     (kart/make
      {:kernel-name name
-      :source (cooperative-source problem schedule name)
-      :abi (ordered-abi problem)
+      :source (body-opencl/emit-scalar-kernel
+               name kernel-body
+               {:parameter-names parameter-names :subgroup-attribute :intel})
+      :abi abi
       :arguments arguments
-      :launch (klaunch/spec
-               {:workgroup-size [subgroup-size 1]
-                :group-count [q-heads (:total-tokens query)]})
+      :launch (:launch kernel-body)
       :effects {:kind :attention :reads inputs :writes [output]}
       :provenance {:operation-id (:id problem) :semantic-op :attention
                    :algebra-plan-id (:id plan)
@@ -588,6 +466,7 @@
                    :k-layout (:k-layout problem) :v-layout (:v-layout problem)
                    :visibility (:visibility problem)
                    :layout (attention/layouts problem)
+                   :kernel-body kernel-body
                    :materialized-intermediates []
                    :complexity :query-head-token-dot-plus-value}})))
 
