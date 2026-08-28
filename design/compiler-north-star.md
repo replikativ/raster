@@ -1,6 +1,6 @@
 # Raster compiler north star
 
-Status: architectural direction, reconciled with the implementation on 2026-08-27.
+Status: architectural direction, reconciled with the implementation on 2026-08-28.
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -361,9 +361,15 @@ reconstructed from arbitrary source forms. Conceptually:
 (soac-program
   {:inputs [%x]
    :values {%x x-value %y y-value %z z-value}}
-  [(= %y (map {:index %i :extent %n} [%x]
-              (lambda [%xi] (* %xi %xi))))
-   (= %z (reduce {:operator + :identity 0.0} [%y]))]
+  [(= map-0 [%y]
+      (map {:index %i :extent %n} [%x] []
+           (lambda [%xi] [(* %xi %xi)])))
+   (= reduce-0 [%z]
+      (reduce {:index %i :extent %n
+               :accumulators [%acc] :identities [0.0]
+               :dtypes [:float] :algebra [{:associative? true}]}
+              [%y] []
+              (lambda [%acc %yi] [(+ %acc %yi)])))]
   [%z])
 ```
 
@@ -372,6 +378,13 @@ grammar and pass arrows; fusion rules match the compact SOAC equations directly.
 `ParallelProgram`-style envelope supplies stable value/equation IDs, `AbstractValue`s, effects,
 aliases, consumption, results, diagnostics and provenance. Essential facts are explicit fields or
 table entries keyed by IDs, not Clojure metadata that ordinary list reconstruction can drop.
+
+The first Pattern-declared dialect now makes this boundary executable for map and scalar/full
+reduce equations. It verifies ordered SSA definitions, exact typed input/output/effect boundaries,
+rank/extent/result contracts, explicit lexical capture binding (including compound stable value
+IDs), tuple-valued maps, and fact-preserving functional fusion. A guarded adapter differentially
+checks map→map, map→reduce and horizontal-map results against the current graph and declines every
+unsupported legacy node or unproved alias. It is intentionally not a backend route yet.
 
 This representation is shared before backend selection. SOAC fusion changes the program consumed
 by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The JVM
@@ -716,7 +729,7 @@ Each increment should be a thin vertical slice with a production-path test.
 
 The immediate continuation after the verified double-buffered weighted-reduction route is:
 
-1. Define a typed SOAC S-expression dialect with `../pattern` and differential-test
+1. **Landed:** define a typed SOAC S-expression dialect with `../pattern` and differential-test
    map→map, map→reduce and horizontal-map fusion against the current graph.
 2. Carry that dialect in the existing program/value envelope and route one ordinary fused reduction
    through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from source spelling.
