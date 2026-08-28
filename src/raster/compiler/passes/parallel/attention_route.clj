@@ -15,7 +15,7 @@
 
 (def ^:private cooperative-policies
   #{:subgroup-score-reuse :subgroup-online-score-reuse
-    :subgroup-online-tiled-history})
+    :subgroup-online-tiled-history :subgroup-online-pipelined-history})
 
 (defn- requested-policy
   [desc]
@@ -100,18 +100,36 @@
 
            (or (= :auto policy) (contains? cooperative-policies policy))
            (let [{:keys [ok schedule reason] :as scheduled}
-                 (if (= :subgroup-online-tiled-history policy)
+                 (cond
+                   (= :subgroup-online-tiled-history policy)
                    (swr-schedule/plan-subgroup-online-tiled plan desc)
+
+                   (= :subgroup-online-pipelined-history policy)
+                   (swr-schedule/plan-subgroup-online-pipelined plan desc)
+
+                   (= :auto policy)
+                   (swr-schedule/plan-subgroup-online plan desc)
+
+                   :else
                    (swr-schedule/plan-subgroup-online plan desc))
                  emitter-supported? (gpu-target/intel-opencl-subgroup-dialect? desc)]
              (if (and ok emitter-supported?)
-               (if (= :subgroup-online-tiled-history policy)
+               (cond
+                 (= :subgroup-online-tiled-history (:strategy schedule))
                  (success-graph problem plan
                                 (emit/emit-fp16-tiled-history plan schedule) [])
+
+                 (= :subgroup-online-pipelined-history (:strategy schedule))
+                 (success problem plan (emit/emit-fp16-pipelined plan schedule) [])
+
+                 :else
                  (success problem plan (emit/emit-fp16-cooperative plan schedule) []))
                (let [cooperative-decline
-                     {:leaf (if (= :subgroup-online-tiled-history policy)
+                     {:leaf (case policy
+                              :subgroup-online-tiled-history
                               :routed-paged-subgroup-online-tiled-history
+                              :subgroup-online-pipelined-history
+                              :routed-paged-subgroup-online-pipelined-history
                               :routed-paged-subgroup-online-score-reuse)
                       :reason (if ok
                                 :score-reuse-requires-intel-subgroup-dialect

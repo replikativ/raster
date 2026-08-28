@@ -478,6 +478,61 @@
                     :materialized-intermediates []
                     :complexity :query-head-token-dot-plus-value}}))))
 
+(defn emit-fp16-pipelined
+  "Emit the double-buffered membership-row schedule for routed FP16 K/V reduction.
+
+   Scheduling and KernelBody lowering remain target-neutral.  The target dialect only chooses
+   the verified asynchronous-copy spelling (including capability-gated CUDA cp.async)."
+  ([plan schedule]
+   (emit-fp16-pipelined plan schedule :opencl-intel {}))
+  ([plan schedule target-dialect]
+   (emit-fp16-pipelined plan schedule target-dialect {}))
+  ([plan schedule target-dialect target-features]
+   (let [dialect (c-dialect/resolve! target-dialect)
+         [plan schedule {:keys [output route] :as problem}]
+         (cooperative-plan! plan schedule)
+         name (kernel-name problem schedule)
+         inputs (ordered-inputs plan)
+         arguments (conj inputs output)
+         kernel-body (swr-body/lower-routed-paged-pipelined plan schedule)
+         base-abi (ordered-abi problem)
+         parameter-names (into {} (map (juxt :name :c-name)) base-abi)
+         abi (body-abi/project-contracts base-abi kernel-body)]
+     (kart/make
+      {:kernel-name name
+       :target (c-dialect/target dialect)
+       :source (body-opencl/emit-scalar-kernel
+                name kernel-body
+                {:parameter-names parameter-names
+                 :target-dialect target-dialect
+                 :target-features target-features})
+       :abi abi
+       :arguments arguments
+       :launch (:launch kernel-body)
+       :effects {:kind :attention :reads inputs :writes [output]}
+       :provenance {:operation-id (:id problem) :semantic-op :attention
+                    :algebra-plan-id (:id plan)
+                    :lowering :subgroup-online-pipelined-history}
+       :attributes {:strategy :routed-paged-subgroup-online-pipelined-history
+                    :optimization-tier :subgroup-pipelined
+                    :algebra :segmented-weighted-reduction
+                    :algebra-key (swr/algebra-key plan)
+                    :segmented-weighted-reduction-schedule schedule
+                    :storage-dtype :half :q-dtype (:q-dtype problem)
+                    :output-dtype (:output-dtype problem) :accumulator-dtype :float
+                    :route-kind (attention/route-kind route)
+                    :visibility-kind (attention/visibility-kind (:visibility problem))
+                    :k-layout (:k-layout problem) :v-layout (:v-layout problem)
+                    :visibility (:visibility problem)
+                    :layout (attention/layouts problem)
+                    :kernel-body kernel-body
+                    :target-dialect target-dialect
+                    :target-features target-features
+                    :target-collective-association
+                    (c-dialect/collective-association dialect)
+                    :materialized-intermediates []
+                    :complexity :pipelined-query-head-token-dot-plus-value}}))))
+
 (def ^:private partial-c-names
   {:partial-valid "partial_valid"
    :partial-maximum "partial_maximum"

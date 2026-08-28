@@ -129,7 +129,7 @@
           prefix [(get-in problem [:query :total-tokens]) (:q-heads problem) tile-count]
           scalar-elements (checked-elements :scalar-state prefix)
           weighted-elements (checked-elements :weighted-values
-                                               (conj prefix (:value-head-dim problem)))]
+                                              (conj prefix (:value-head-dim problem)))]
       [{:id (:valid ids) :dtype :int :shape prefix :elements scalar-elements
         :role :partial-valid}
        {:id (:maximum ids) :dtype :float :shape prefix :elements scalar-elements
@@ -612,26 +612,391 @@
   (body/->Mask :lane-zero [(body/predicate :eq 'lane 0)]))
 
 (defn- output-operations
-  [problem slots]
-  (flatten-operations
-   (concat
-    [(compute 'denominator-is-zero :predicate
-              (expr :eq :predicate 'final-denominator (lit 0.0 :float)))]
-    (mapcat
-     (fn [{:keys [slot id mask-id result-id]}]
-       (let [normalized (symbol (str "normalized-value-" slot))
-             valid-value (symbol (str "valid-output-value-" slot))
-             stored (symbol (str "stored-output-value-" slot))]
-         [(compute normalized :float
-                   (select-expr 'denominator-is-zero (lit 0.0 :float)
-                                (expr :div :float result-id 'final-denominator) :float))
-          (compute valid-value :float
-                   (select-expr 'final-valid normalized (lit Double/NaN :float) :float))
-          (compute stored (:output-dtype problem)
-                   (output-value valid-value (:output-dtype problem)))
-          (body/->ScalarStore (:output problem)
-                              ['query-token 'query-head id] stored mask-id)]))
-     slots))))
+  ([problem slots]
+   (output-operations
+    problem slots
+    {:valid 'final-valid
+     :denominator 'final-denominator
+     :weighted-values (mapv :result-id slots)}))
+  ([problem slots {:keys [valid denominator weighted-values]}]
+   (flatten-operations
+    (concat
+     [(compute 'denominator-is-zero :predicate
+               (expr :eq :predicate denominator (lit 0.0 :float)))]
+     (mapcat
+      (fn [{:keys [slot id mask-id]} weighted-value]
+        (let [normalized (symbol (str "normalized-value-" slot))
+              valid-value (symbol (str "valid-output-value-" slot))
+              stored (symbol (str "stored-output-value-" slot))]
+          [(compute normalized :float
+                    (select-expr 'denominator-is-zero (lit 0.0 :float)
+                                 (expr :div :float weighted-value denominator) :float))
+           (compute valid-value :float
+                    (select-expr valid normalized (lit Double/NaN :float) :float))
+           (compute stored (:output-dtype problem)
+                    (output-value valid-value (:output-dtype problem)))
+           (body/->ScalarStore (:output problem)
+                               ['query-token 'query-head id] stored mask-id)]))
+      slots weighted-values)))))
+
+(defn- tagged-id
+  [tag id]
+  (symbol (str (name tag) "-" (name id))))
+
+(defn- pipeline-state
+  [tag slots]
+  {:valid (tagged-id tag :valid)
+   :maximum (tagged-id tag :maximum)
+   :denominator (tagged-id tag :denominator)
+   :weighted-values (mapv #(tagged-id tag (keyword (str "weighted-" (:slot %)))) slots)})
+
+(defn- pipeline-state-values
+  [{:keys [valid maximum denominator weighted-values]}]
+  (vec (concat [valid maximum denominator] weighted-values)))
+
+(defn- pipeline-state-specs
+  [state]
+  (mapv body/value (pipeline-state-values state)
+        (concat [:predicate :float :float]
+                (repeat (count (:weighted-values state)) :float))))
+
+(defn- initial-online-state
+  [initial-valid slots]
+  (vec (concat [initial-valid
+                (lit -3.402823466e38 :float)
+                (lit 0.0 :float)]
+               (repeat (count slots) (lit 0.0 :float)))))
+
+(defn- workgroup-barrier
+  []
+  (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                           (body/full-participation)))
+
+(defn- dense-member-route
+  [problem tag member]
+  (let [logical-page (tagged-id tag :logical-page)
+        safe-logical-page (tagged-id tag :safe-logical-page)
+        physical-page (tagged-id tag :physical-page)
+        page-token (tagged-id tag :page-token)
+        physical-page-nonnegative (tagged-id tag :physical-page-nonnegative)
+        physical-page-bounded (tagged-id tag :physical-page-bounded)
+        physical-page-valid (tagged-id tag :physical-page-valid)
+        safe-physical-page (tagged-id tag :safe-physical-page)
+        page-size (:page-size problem)]
+    {:physical-page-valid physical-page-valid
+     :safe-physical-page safe-physical-page
+     :page-token page-token
+     :operations
+     [(compute logical-page :long
+               (expr :quot :long member (lit page-size :long)))
+      (compute safe-logical-page :long
+               (expr :min :long
+                     (expr :max :long logical-page (lit 0 :long))
+                     (lit (dec (get-in problem [:route :pages-per-sequence])) :long)))
+      (load-value physical-page :int (get-in problem [:route :page-table])
+                  ['safe-query-batch safe-logical-page])
+      (compute page-token :long
+               (expr :- :long member
+                     (expr :* :long safe-logical-page (lit page-size :long))))
+      (compute physical-page-nonnegative :predicate
+               (expr :ge :predicate physical-page (lit 0 :int)))
+      (compute physical-page-bounded :predicate
+               (expr :lt :predicate physical-page (lit (:physical-pages problem) :int)))
+      (compute physical-page-valid :predicate
+               (and-expr physical-page-nonnegative physical-page-bounded))
+      (compute safe-physical-page :int
+               (expr :min :int
+                     (expr :max :int physical-page (lit 0 :int))
+                     (lit (dec (:physical-pages problem)) :int)))]}))
+
+(defn- stage-member-row
+  [problem scheduled tag member {:keys [key value]}]
+  (let [{:keys [operations safe-physical-page page-token]}
+        (dense-member-route problem tag member)
+        staging (:staging scheduled)
+        key-copy (tagged-id tag :key-copy)
+        value-copy (tagged-id tag :value-copy)
+        group (tagged-id tag :group)
+        transfer-bytes (:transfer-bytes staging)
+        overlap (:overlap staging)]
+    {:group group
+     :operations
+     (vec
+      (concat
+       operations
+       [(body/->AsyncWorkgroupCopy
+         key-copy (:k-pages problem)
+         (cache-coordinates (:k-layout problem) 'kv-head safe-physical-page page-token 0)
+         key [0] (:qk-head-dim problem) transfer-bytes :cached overlap
+         (body/full-participation))
+        (body/->AsyncWorkgroupCopy
+         value-copy (:v-pages problem)
+         (cache-coordinates (:v-layout problem) 'kv-head safe-physical-page page-token 0)
+         value [0] (:value-head-dim problem) transfer-bytes :cached overlap
+         (body/full-participation))
+        (body/->AsyncCommit group [key-copy value-copy])]))}))
+
+(defn- staged-dot
+  [problem scheduled tag key-stage]
+  (let [component (tagged-id tag :qk-component)
+        partial-state (tagged-id tag :partial-dot-state)
+        query-element (tagged-id tag :query-element)
+        key-element (tagged-id tag :key-element)
+        query-float (tagged-id tag :query-float)
+        key-float (tagged-id tag :key-float)
+        product (tagged-id tag :qk-product)
+        partial-next (tagged-id tag :partial-dot-next)
+        partial-dot (tagged-id tag :partial-dot)
+        dot (tagged-id tag :dot)
+        logit (tagged-id tag :logit)]
+    {:logit logit
+     :operations
+     [(body/->ForLoop
+       (body/value component :int) 'lane (:qk-head-dim problem) (:workgroup-size scheduled)
+       [(body/->LoopArg (body/value partial-state :float) (lit 0.0 :float))]
+       [(load-value query-element (:q-dtype problem) (get-in problem [:query :values])
+                    ['query-token 'query-head component])
+        (load-value key-element :half key-stage [component])
+        (compute query-float :float
+                 (half-or-float->float query-element (:q-dtype problem)))
+        (compute key-float :float (half-or-float->float key-element :half))
+        (compute product :float (expr :* :float query-float key-float))
+        (compute partial-next :float (expr :+ :float partial-state product))
+        (body/->Yield [partial-next])]
+       [(body/value partial-dot :float)] {})
+      (body/->Collective
+       (body/value dot :float) :reduce :subgroup (:workgroup-size scheduled)
+       partial-dot :+ nil (body/full-participation) :implementation-defined)
+      (compute logit :float (expr :* :float dot (lit (:scale problem) :float)))]}))
+
+(defn- staged-values
+  [slots tag value-stage]
+  (let [values (mapv #(tagged-id tag (keyword (str "value-float-" (:slot %)))) slots)]
+    {:values values
+     :operations
+     (vec
+      (mapcat
+       (fn [{:keys [slot safe-id mask-id]} value-id]
+         (let [element (tagged-id tag (keyword (str "value-element-" slot)))]
+           [(load-value element :half value-stage [safe-id] mask-id (lit 0.0 :half))
+            (compute value-id :float (half-or-float->float element :half))]))
+       slots values))}))
+
+(defn- staged-online-update
+  [slots tag input-state output-state valid-next logit staged-value-ids]
+  (let [maximum-is-nan (tagged-id tag :maximum-is-nan)
+        logit-is-nan (tagged-id tag :logit-is-nan)
+        state-is-nan (tagged-id tag :state-is-nan)
+        maximum-valid (tagged-id tag :maximum-valid)
+        old-weight-valid (tagged-id tag :old-weight-valid)
+        new-weight-valid (tagged-id tag :new-weight-valid)
+        next-maximum (tagged-id tag :next-maximum)
+        old-weight (tagged-id tag :old-weight)
+        new-weight (tagged-id tag :new-weight)
+        next-denominator (tagged-id tag :next-denominator)
+        next-weighted (mapv #(tagged-id tag (keyword (str "next-weighted-" (:slot %))))
+                            slots)]
+    (flatten-operations
+     [(compute maximum-is-nan :predicate
+               (body/scalar-expression :isnan :predicate [(:maximum input-state)]))
+      (compute logit-is-nan :predicate
+               (body/scalar-expression :isnan :predicate [logit]))
+      (compute state-is-nan :predicate (or-expr maximum-is-nan logit-is-nan))
+      (body/->IfRegion
+       state-is-nan
+       [(body/->Yield [(lit Double/NaN :float)
+                       (lit Double/NaN :float)
+                       (lit Double/NaN :float)])]
+       [(compute maximum-valid :float (expr :max :float (:maximum input-state) logit))
+        (compute old-weight-valid :float
+                 (expr :exp :float (expr :- :float (:maximum input-state) maximum-valid)))
+        (compute new-weight-valid :float
+                 (expr :exp :float (expr :- :float logit maximum-valid)))
+        (body/->Yield [maximum-valid old-weight-valid new-weight-valid])]
+       [(body/value next-maximum :float)
+        (body/value old-weight :float)
+        (body/value new-weight :float)])
+      (compute next-denominator :float
+               (expr :+ :float
+                     (expr :* :float (:denominator input-state) old-weight)
+                     new-weight))
+      (vec
+       (map (fn [input-weight staged-value output-weight]
+              (compute output-weight :float
+                       (expr :+ :float
+                             (expr :* :float input-weight old-weight)
+                             (expr :* :float staged-value new-weight))))
+            (:weighted-values input-state) staged-value-ids next-weighted))
+      (body/->Yield
+       (pipeline-state-values
+        (assoc output-state
+               :valid valid-next
+               :maximum next-maximum
+               :denominator next-denominator
+               :weighted-values next-weighted)))])))
+
+(defn- consume-staged-member
+  [problem scheduled slots tag member stage input-state]
+  (let [{route-ops :operations physical-page-valid :physical-page-valid}
+        (dense-member-route problem (keyword (str (name tag) "-route")) member)
+        member-valid-next (tagged-id tag :member-valid-next)
+        member-applies (tagged-id tag :member-applies)
+        {dot-ops :operations logit :logit}
+        (staged-dot problem scheduled (keyword (str (name tag) "-dot")) (:key stage))
+        {value-ops :operations staged-value-ids :values}
+        (staged-values slots (keyword (str (name tag) "-value")) (:value stage))
+        output-state (pipeline-state (keyword (str (name tag) "-result")) slots)
+        update-ops (staged-online-update
+                    slots (keyword (str (name tag) "-online")) input-state output-state
+                    member-valid-next logit staged-value-ids)]
+    {:state output-state
+     :operations
+     (flatten-operations
+      [route-ops
+       (compute member-valid-next :predicate
+                (and-expr (:valid input-state) physical-page-valid))
+       (compute member-applies :predicate
+                (and-expr (:valid input-state) physical-page-valid))
+       dot-ops value-ops
+       (body/->IfRegion
+        member-applies
+        update-ops
+        [(body/->Yield
+          (pipeline-state-values
+           (assoc input-state :valid member-valid-next)))]
+        (pipeline-state-specs output-state))])}))
+
+(defn- pipelined-membership
+  [problem scheduled slots]
+  (let [stage-a {:key 'pipeline-key-stage-a :value 'pipeline-value-stage-a}
+        stage-b {:key 'pipeline-key-stage-b :value 'pipeline-value-stage-b}
+        initial-state (initial-online-state 'initial-valid slots)
+        loop-state (pipeline-state :pipeline-loop slots)
+        steady-state (pipeline-state :pipeline-steady slots)
+        final-state (pipeline-state :pipeline-final slots)
+        warm-a-member 'pipeline-warm-a-member
+        warm-b-member 'pipeline-warm-b-member
+        warm-a (stage-member-row problem scheduled :pipeline-warm-a warm-a-member stage-a)
+        warm-b (stage-member-row problem scheduled :pipeline-warm-b warm-b-member stage-b)
+        pair-index 'pipeline-pair
+        current-a 'pipeline-current-a-member
+        current-b 'pipeline-current-b-member
+        next-a 'pipeline-next-a-member
+        next-b 'pipeline-next-b-member
+        consume-a (consume-staged-member problem scheduled slots :pipeline-a current-a
+                                         stage-a loop-state)
+        refill-a (stage-member-row problem scheduled :pipeline-refill-a next-a stage-a)
+        consume-b (consume-staged-member problem scheduled slots :pipeline-b current-b
+                                         stage-b (:state consume-a))
+        refill-b (stage-member-row problem scheduled :pipeline-refill-b next-b stage-b)
+        epilogue-a-member 'pipeline-epilogue-a-member
+        epilogue-b-member 'pipeline-epilogue-b-member
+        epilogue-a (consume-staged-member problem scheduled slots :pipeline-epilogue-a
+                                          epilogue-a-member stage-a steady-state)
+        epilogue-b (consume-staged-member problem scheduled slots :pipeline-epilogue-b
+                                          epilogue-b-member stage-b (:state epilogue-a))
+        odd-member 'pipeline-odd-member
+        odd-stage (stage-member-row problem scheduled :pipeline-odd-stage odd-member stage-a)
+        odd-consume (consume-staged-member problem scheduled slots :pipeline-odd odd-member
+                                           stage-a (:state epilogue-b))
+        tail-state (pipeline-state :pipeline-tail slots)
+        pipeline
+        (body/->PipelinedFor
+         (body/value pair-index :long) 'pipeline-zero 'pipeline-refill-pairs 1
+         (mapv body/->LoopArg (pipeline-state-specs loop-state) initial-state)
+         [(body/->AsyncLoopArg 'pipeline-carry-a (:group warm-a))
+          (body/->AsyncLoopArg 'pipeline-carry-b (:group warm-b))]
+         (flatten-operations
+          [(compute current-a :long
+                    (expr :+ :long 'attention-begin
+                          (expr :* :long pair-index (lit 2 :long))))
+           (compute current-b :long (expr :+ :long current-a (lit 1 :long)))
+           (body/->AsyncWait ['pipeline-carry-a] 1 :acquire
+                             (body/full-participation))
+           (workgroup-barrier)
+           (:operations consume-a)
+           (workgroup-barrier)
+           (compute next-a :long (expr :+ :long current-a (lit 2 :long)))
+           (:operations refill-a)
+           (body/->AsyncWait ['pipeline-carry-b] 1 :acquire
+                             (body/full-participation))
+           (workgroup-barrier)
+           (:operations consume-b)
+           (workgroup-barrier)
+           (compute next-b :long (expr :+ :long current-b (lit 2 :long)))
+           (:operations refill-b)
+           (body/->PipelineYield (pipeline-state-values (:state consume-b))
+                                 [(:group refill-a) (:group refill-b)])])
+         (pipeline-state-specs steady-state)
+         ['pipeline-final-group-a 'pipeline-final-group-b]
+         {:tail-policy (get-in scheduled [:staging :tail-policy])})
+        fallback-loop (membership-loop problem scheduled slots 'attention-begin 'attention-end)
+        fallback-state {:valid 'final-valid
+                        :maximum 'final-maximum
+                        :denominator 'final-denominator
+                        :weighted-values (mapv :result-id slots)}]
+    {:state final-state
+     :operations
+     (flatten-operations
+      [(compute 'pipeline-membership-count :long
+                (expr :- :long 'attention-end 'attention-begin))
+       (compute 'pipeline-zero :long
+                (expr :- :long 'attention-begin 'attention-begin))
+       (compute 'pipeline-pair-count :long
+                (expr :quot :long 'pipeline-membership-count (lit 2 :long)))
+       (compute 'pipeline-refill-pairs :long
+                (expr :max :long
+                      (expr :- :long 'pipeline-pair-count (lit 1 :long))
+                      (lit 0 :long)))
+       (compute 'pipeline-has-pair :predicate
+                (expr :ge :predicate 'pipeline-membership-count (lit 2 :long)))
+       (body/->IfRegion
+        'pipeline-has-pair
+        (flatten-operations
+         [(compute warm-a-member :long
+                   (expr :+ :long 'attention-begin (lit 0 :long)))
+          (compute warm-b-member :long
+                   (expr :+ :long 'attention-begin (lit 1 :long)))
+          (:operations warm-a)
+          (:operations warm-b)
+          pipeline
+          (body/->AsyncWait ['pipeline-final-group-a 'pipeline-final-group-b]
+                            0 :acquire (body/full-participation))
+          (workgroup-barrier)
+          (compute 'pipeline-final-pair :long
+                   (expr :- :long 'pipeline-pair-count (lit 1 :long)))
+          (compute epilogue-a-member :long
+                   (expr :+ :long 'attention-begin
+                         (expr :* :long 'pipeline-final-pair (lit 2 :long))))
+          (compute epilogue-b-member :long
+                   (expr :+ :long epilogue-a-member (lit 1 :long)))
+          (:operations epilogue-a)
+          (:operations epilogue-b)
+          (compute 'pipeline-has-odd :predicate
+                   (expr :eq :predicate
+                         (expr :rem :long 'pipeline-membership-count (lit 2 :long))
+                         (lit 1 :long)))
+          (compute odd-member :long
+                   (expr :+ :long 'attention-begin
+                         (expr :* :long 'pipeline-pair-count (lit 2 :long))))
+          (body/->IfRegion
+           'pipeline-has-odd
+           (flatten-operations
+            [(workgroup-barrier)
+             (:operations odd-stage)
+             (body/->AsyncWait [(:group odd-stage)] 0 :acquire
+                               (body/full-participation))
+             (workgroup-barrier)
+             (:operations odd-consume)
+             (workgroup-barrier)
+             (body/->Yield (pipeline-state-values (:state odd-consume)))])
+           [(workgroup-barrier)
+            (body/->Yield (pipeline-state-values (:state epilogue-b)))]
+           (pipeline-state-specs tail-state))
+          (body/->Yield (pipeline-state-values tail-state))])
+        [fallback-loop
+         (body/->Yield (pipeline-state-values fallback-state))]
+        (pipeline-state-specs final-state))])}))
 
 (defn- lowering-row!
   [plan scheduled problem]
@@ -672,8 +1037,9 @@
 (defn- sequential-lowering-row!
   [plan scheduled problem]
   (lowering-row! plan scheduled problem)
-  (when (schedule/tiled? scheduled)
-    (throw (ex-info "single-body weighted reduction cannot consume a tiled schedule"
+  (when (or (schedule/tiled? scheduled)
+            (not= {:kind :none} (:staging scheduled)))
+    (throw (ex-info "sequential weighted-reduction body requires an unstaged, untiled schedule"
                     {:reason :segmented-weighted-reduction-body-schedule-phase
                      :expected :sequential :schedule scheduled})))
   [plan scheduled problem])
@@ -685,6 +1051,23 @@
     (throw (ex-info "partial/merge bodies require a tiled weighted-reduction schedule"
                     {:reason :segmented-weighted-reduction-body-schedule-phase
                      :expected :tiled :schedule scheduled})))
+  [plan scheduled problem])
+
+(defn- pipelined-lowering-row!
+  [plan scheduled problem]
+  (lowering-row! plan scheduled problem)
+  (let [staging (:staging scheduled)]
+    (when-not (and (= :subgroup-online-pipelined-history (:strategy scheduled))
+                   (= :dense-paged (attention/route-kind (:route problem)))
+                   (= :interval (attention/visibility-kind (:visibility problem)))
+                   (= :double-buffered-membership-rows (:kind staging))
+                   (= (:qk-head-dim problem) (:key-elements staging))
+                   (= (:value-head-dim problem) (:value-elements staging)))
+      (throw (ex-info "pipelined weighted-reduction body has no matching storage lowering"
+                      {:reason :segmented-weighted-reduction-pipelined-lowering
+                       :plan-id (:id plan) :schedule scheduled
+                       :route-kind (attention/route-kind (:route problem))
+                       :visibility-kind (attention/visibility-kind (:visibility problem))}))))
   [plan scheduled problem])
 
 (defn lower-routed-paged
@@ -755,6 +1138,91 @@
       :attributes {:storage-kind :routed-paged-kv
                    :route-kind (attention/route-kind (:route problem))
                    :visibility-kind (attention/visibility-kind (:visibility problem))}})))
+
+(defn lower-routed-paged-pipelined
+  "Construct a verified two-stage routed-row pipeline for an interval weighted reduction.
+
+  Histories of length zero or one use the scalar scheduled loop. Longer histories stage two
+  contiguous K/V rows, overlap each refill with useful work on the other row, and consume the last
+  staged pair in an explicit epilogue. Semantic order and the public ABI are unchanged."
+  [plan scheduled]
+  (let [plan (swr/validate! plan)
+        scheduled (schedule/validate! scheduled)
+        problem (attention/validate! (:source-operation plan))
+        _ (pipelined-lowering-row! plan scheduled problem)
+        subgroup-size (:workgroup-size scheduled)
+        slots (component-slots scheduled)
+        query-ops (query-metadata-operations problem)
+        route-ops (dense-route-operations problem)
+        membership-ops (interval-membership-operations problem)
+        staged (pipelined-membership problem scheduled slots)
+        staging (:staging scheduled)
+        allocations
+        [(body/->WorkgroupAllocation
+          'pipeline-key-stage-a :half [(:qk-head-dim problem)]
+          (layout/row-major [(:qk-head-dim problem)] :half) 16)
+         (body/->WorkgroupAllocation
+          'pipeline-value-stage-a :half [(:value-head-dim problem)]
+          (layout/row-major [(:value-head-dim problem)] :half) 16)
+         (body/->WorkgroupAllocation
+          'pipeline-key-stage-b :half [(:qk-head-dim problem)]
+          (layout/row-major [(:qk-head-dim problem)] :half) 16)
+         (body/->WorkgroupAllocation
+          'pipeline-value-stage-b :half [(:value-head-dim problem)]
+          (layout/row-major [(:value-head-dim problem)] :half) 16)]
+        initial-ops
+        (flatten-operations
+         [query-ops
+          (load-value 'query-position :int (get-in problem [:query :positions])
+                      ['query-token])
+          (compute 'query-position-valid :predicate
+                   (expr :ge :predicate 'query-position (lit 0 :int)))
+          (compute 'query-batch-valid :predicate
+                   (expr :ge :predicate 'query-batch (lit 0 :int)))
+          (compute 'safe-query-batch :int
+                   (expr :min :int
+                         (expr :max :int 'query-batch (lit 0 :int))
+                         (lit (dec (:batch-size problem)) :int)))
+          (compute 'query-position-long :long (cast-expr 'query-position :long))
+          route-ops membership-ops
+          (compute 'initial-valid :predicate
+                   (all-expr ['query-metadata-valid 'query-position-valid
+                              'query-batch-valid 'route-valid 'membership-valid]))
+          (compute 'kv-head :int
+                   (expr :quot :int 'query-head
+                         (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
+          (:operations staged)
+          (output-operations
+           problem slots
+           {:valid (get-in staged [:state :valid])
+            :denominator (get-in staged [:state :denominator])
+            :weighted-values (get-in staged [:state :weighted-values])})])
+        launch (launch/spec {:workgroup-size [subgroup-size 1]
+                             :group-count [(:q-heads problem)
+                                           (get-in problem [:query :total-tokens])]
+                             :shared-memory-bytes (:shared-memory-bytes staging)})]
+    (body/make
+     {:id [:segmented-weighted-reduction-pipelined-body (:id plan) scheduled]
+      :parameters (parameters plan problem)
+      :stable-reads (mapv body/stable-read (swr/ordered-input-ids plan))
+      :allocations allocations
+      :indices (vec (concat [(body/->IndexBinding 'query-head :group 0)
+                             (body/->IndexBinding 'query-token :group 1)
+                             (body/->IndexBinding 'lane :lane 0)]
+                            (slot-indices problem scheduled slots)))
+      :masks (slot-masks problem slots)
+      :operations initial-ops
+      :schedule (assoc scheduled :subgroup-size subgroup-size)
+      :launch launch
+      :provenance {:operation-id (:id problem)
+                   :semantic-op :segmented-weighted-reduction
+                   :algebra-plan-id (:id plan)
+                   :lowering :scheduled-pipelined-kernel-body}
+      :attributes {:storage-kind :routed-paged-kv
+                   :route-kind :dense-paged
+                   :visibility-kind :interval
+                   :pipeline-stages 2
+                   :tail-policy (:tail-policy staging)}})))
 
 (defn- tile-bound-operations
   [problem scheduled]
