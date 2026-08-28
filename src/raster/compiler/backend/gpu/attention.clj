@@ -20,13 +20,11 @@
 
 (defn- attention-problem
   [plan]
-  (let [{:keys [source-operation provenance]} (swr/validate! plan)]
-    (when-not (and (= :attention (:semantic-op provenance))
-                   (= :canonical-segmented-weighted-reduction (:lowering provenance)))
-      (throw (ex-info "FP16 attention emission requires an attention-derived reduction plan"
-                      {:reason :attention-emitter-wrong-plan-provenance
-                       :provenance provenance})))
-    (attention/validate! source-operation)))
+  ;; Provenance is diagnostic, not a legality token. The leaf is selected from the plan's algebra,
+  ;; storage and membership descriptors, then independently proves the complete routed-row shape
+  ;; below. A non-attention frontend may therefore construct the same legal reduction without
+  ;; forging an :attention origin label.
+  (attention/validate! (:source-operation (swr/validate! plan))))
 
 (defn- reference-plan!
   [plan]
@@ -491,6 +489,11 @@
    (let [dialect (c-dialect/resolve! target-dialect)
          [plan schedule {:keys [output route] :as problem}]
          (cooperative-plan! plan schedule)
+         layout-swizzle (get-in schedule [:staging :layout-swizzle])
+         strategy (if (= :identity layout-swizzle)
+                    :routed-paged-subgroup-online-pipelined-history
+                    (keyword (str "routed-paged-subgroup-online-pipelined-history-"
+                                  (name layout-swizzle))))
          name (kernel-name problem schedule)
          inputs (ordered-inputs plan)
          arguments (conj inputs output)
@@ -513,7 +516,7 @@
        :provenance {:operation-id (:id problem) :semantic-op :attention
                     :algebra-plan-id (:id plan)
                     :lowering :subgroup-online-pipelined-history}
-       :attributes {:strategy :routed-paged-subgroup-online-pipelined-history
+       :attributes {:strategy strategy
                     :optimization-tier :subgroup-pipelined
                     :algebra :segmented-weighted-reduction
                     :algebra-key (swr/algebra-key plan)

@@ -43,15 +43,17 @@
       (throw (ex-info "dispatch benchmark case argument count differs from the executable ABI"
                       {:runtime-value runtime-value
                        :expected (count (kexec/abi executable)) :actual (count arguments)})))
-    (when-not (= 1 (count indexes))
+    (when-not (or (= :fixed-strategy (get-in dispatch [:selector :kind]))
+                  (= 1 (count indexes)))
       (throw (ex-info "dispatch benchmark selector must have one artifact argument position"
                       {:runtime-value runtime-value :argument selector-argument
                        :indexes (vec indexes)})))
-    (let [actual (runtime-number (nth arguments (first indexes)))]
-      (when-not (= runtime-value actual)
-        (throw (ex-info "dispatch benchmark case does not bind its sampled runtime value"
-                        {:selector-argument selector-argument
-                         :sampled runtime-value :bound actual}))))
+    (when-not (= :fixed-strategy (get-in dispatch [:selector :kind]))
+      (let [actual (runtime-number (nth arguments (first indexes)))]
+        (when-not (= runtime-value actual)
+          (throw (ex-info "dispatch benchmark case does not bind its sampled runtime value"
+                          {:selector-argument selector-argument
+                           :sampled runtime-value :bound actual})))))
     (when-not (ifn? validate!)
       (throw (ex-info "dispatch benchmark case requires a :validate! oracle callback"
                       {:runtime-value runtime-value})))
@@ -158,6 +160,27 @@
    :layout layout
    :improvement-threshold improvement-threshold
    :force? force?))
+
+(defn tune-fixed-dispatch!
+  "Tune static emitted schedule alternatives without adding a synthetic scalar to their ABI.
+
+  `case` has the same arguments/oracle/reset/measurement fields as one benchmark case. Every
+  alternative is validated and device-event measured once; the result is a cached fixed selector."
+  [session dispatch descriptor case
+   & {:keys [numerical-mode layout improvement-threshold force? measurement]
+      :or {improvement-threshold 0.001 force? false}}]
+  (let [numerical-mode (or numerical-mode
+                           (get-in dispatch [:attributes :tuning :numerical-mode]))
+        layout (or layout (get-in dispatch [:attributes :tuning :layout]))]
+    (tuning/tune-fixed!
+     dispatch descriptor
+     (fn [executable]
+       (benchmark-candidate! session dispatch executable :fixed (constantly case)
+                             :measurement measurement))
+     :numerical-mode numerical-mode
+     :layout layout
+     :improvement-threshold improvement-threshold
+     :force? force?)))
 
 (defn tuning-schedule-override
   "Turn a measured selector into the compiler schedule override declared by its dispatch.

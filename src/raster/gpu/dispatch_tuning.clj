@@ -255,6 +255,39 @@
                 tuning (->DispatchTuning key identity selector rows)]
             (cache-put! tuning))))))
 
+(defn tune-fixed!
+  "Measure one static workload across every alternative and cache a fixed winning strategy.
+
+  This is the schedule mode for compile-time axes such as stage depth and shared-memory layout:
+  they do not require manufacturing a runtime ABI scalar. The same oracle, stationary device-event,
+  source-hash, device, numerical and layout gates used by sampled tuning remain mandatory."
+  [dispatch descriptor benchmark-fn
+   & {:keys [numerical-mode layout improvement-threshold force?]
+      :or {improvement-threshold 0.001 force? false}}]
+  (let [dispatch (kdispatch/validate! dispatch)]
+    (when-not (= :fixed-strategy (get-in dispatch [:selector :kind]))
+      (throw (ex-info "fixed dispatch tuning requires a fixed-strategy selector"
+                      {:reason :dispatch-tuning-fixed-selector
+                       :dispatch-id (:id dispatch) :selector (:selector dispatch)})))
+    (when-not (and (number? improvement-threshold)
+                   (<= 0.0 (double improvement-threshold))
+                   (< (double improvement-threshold) 1.0))
+      (throw (ex-info "dispatch improvement-threshold must be in [0,1)"
+                      {:improvement-threshold improvement-threshold})))
+    (let [identity (tuning-identity dispatch descriptor [] numerical-mode layout
+                                    improvement-threshold)
+          key (cache-key identity)]
+      (or (when-not force? (cache-get dispatch identity))
+          (let [rows (mapv (fn [executable]
+                             (validate-benchmark-result!
+                              executable :fixed (benchmark-fn executable)))
+                           (:alternatives dispatch))
+                winner (winner-at rows (:default-strategy dispatch) improvement-threshold)
+                selector {:kind :fixed-strategy :strategy winner}
+                _ (kdispatch/with-selector dispatch selector)
+                tuning (->DispatchTuning key identity selector rows)]
+            (cache-put! tuning))))))
+
 (defn apply-tuning
   "Bake a tuning selector into a dispatch after rechecking its complete target identity."
   [dispatch tuning descriptor numerical-mode layout]

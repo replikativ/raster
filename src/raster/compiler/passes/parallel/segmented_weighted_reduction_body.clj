@@ -710,7 +710,7 @@
                      (lit (dec (:physical-pages problem)) :int)))]}))
 
 (defn- stage-member-row
-  [problem scheduled tag member {:keys [key value]}]
+  [problem scheduled tag member {:keys [key value row]}]
   (let [{:keys [operations safe-physical-page page-token]}
         (dense-member-route problem tag member)
         staging (:staging scheduled)
@@ -727,17 +727,17 @@
        [(body/->AsyncWorkgroupCopy
          key-copy (:k-pages problem)
          (cache-coordinates (:k-layout problem) 'kv-head safe-physical-page page-token 0)
-         key [0] (:qk-head-dim problem) transfer-bytes :cached overlap
+         key [row 0] (:qk-head-dim problem) transfer-bytes :cached overlap
          (body/full-participation))
         (body/->AsyncWorkgroupCopy
          value-copy (:v-pages problem)
          (cache-coordinates (:v-layout problem) 'kv-head safe-physical-page page-token 0)
-         value [0] (:value-head-dim problem) transfer-bytes :cached overlap
+         value [row 0] (:value-head-dim problem) transfer-bytes :cached overlap
          (body/full-participation))
         (body/->AsyncCommit group [key-copy value-copy])]))}))
 
 (defn- staged-dot
-  [problem scheduled tag key-stage]
+  [problem scheduled tag {:keys [key row]}]
   (let [component (tagged-id tag :qk-component)
         partial-state (tagged-id tag :partial-dot-state)
         query-element (tagged-id tag :query-element)
@@ -756,7 +756,7 @@
        [(body/->LoopArg (body/value partial-state :float) (lit 0.0 :float))]
        [(load-value query-element (:q-dtype problem) (get-in problem [:query :values])
                     ['query-token 'query-head component])
-        (load-value key-element :half key-stage [component])
+        (load-value key-element :half key [row component])
         (compute query-float :float
                  (half-or-float->float query-element (:q-dtype problem)))
         (compute key-float :float (half-or-float->float key-element :half))
@@ -770,7 +770,7 @@
       (compute logit :float (expr :* :float dot (lit (:scale problem) :float)))]}))
 
 (defn- staged-values
-  [slots tag value-stage]
+  [slots tag {:keys [value row]}]
   (let [values (mapv #(tagged-id tag (keyword (str "value-float-" (:slot %)))) slots)]
     {:values values
      :operations
@@ -778,7 +778,7 @@
       (mapcat
        (fn [{:keys [slot safe-id mask-id]} value-id]
          (let [element (tagged-id tag (keyword (str "value-element-" slot)))]
-           [(load-value element :half value-stage [safe-id] mask-id (lit 0.0 :half))
+           [(load-value element :half value [row safe-id] mask-id (lit 0.0 :half))
             (compute value-id :float (half-or-float->float element :half))]))
        slots values))}))
 
@@ -842,9 +842,9 @@
         member-valid-next (tagged-id tag :member-valid-next)
         member-applies (tagged-id tag :member-applies)
         {dot-ops :operations logit :logit}
-        (staged-dot problem scheduled (keyword (str (name tag) "-dot")) (:key stage))
+        (staged-dot problem scheduled (keyword (str (name tag) "-dot")) stage)
         {value-ops :operations staged-value-ids :values}
-        (staged-values slots (keyword (str (name tag) "-value")) (:value stage))
+        (staged-values slots (keyword (str (name tag) "-value")) stage)
         output-state (pipeline-state (keyword (str (name tag) "-result")) slots)
         update-ops (staged-online-update
                     slots (keyword (str (name tag) "-online")) input-state output-state
@@ -868,8 +868,8 @@
 
 (defn- pipelined-membership
   [problem scheduled slots]
-  (let [stage-a {:key 'pipeline-key-stage-a :value 'pipeline-value-stage-a}
-        stage-b {:key 'pipeline-key-stage-b :value 'pipeline-value-stage-b}
+  (let [stage-a {:key 'pipeline-key-stages :value 'pipeline-value-stages :row 0}
+        stage-b {:key 'pipeline-key-stages :value 'pipeline-value-stages :row 1}
         initial-state (initial-online-state 'initial-valid slots)
         loop-state (pipeline-state :pipeline-loop slots)
         steady-state (pipeline-state :pipeline-steady slots)
@@ -1006,9 +1006,6 @@
                              :contiguous-interval)]
     (when-not
      (and (swr/online-softmax-algebra? plan)
-          (= :attention (get-in plan [:provenance :semantic-op]))
-          (= :canonical-segmented-weighted-reduction
-             (get-in plan [:provenance :lowering]))
           (= (attention/ordered-input-buffer-ids problem)
              (swr/ordered-input-ids plan))
           (= (:value-head-dim problem) (get-in plan [:value :components]))
@@ -1159,20 +1156,12 @@
         staging (:staging scheduled)
         allocations
         [(body/->WorkgroupAllocation
-          'pipeline-key-stage-a :half [(:qk-head-dim problem)]
-          (layout/shared-memory [(:qk-head-dim problem)] :half
+          'pipeline-key-stages :half [2 (:qk-head-dim problem)]
+          (layout/shared-memory [2 (:qk-head-dim problem)] :half
                                 (:layout-swizzle staging)) 16)
          (body/->WorkgroupAllocation
-          'pipeline-value-stage-a :half [(:value-head-dim problem)]
-          (layout/shared-memory [(:value-head-dim problem)] :half
-                                (:layout-swizzle staging)) 16)
-         (body/->WorkgroupAllocation
-          'pipeline-key-stage-b :half [(:qk-head-dim problem)]
-          (layout/shared-memory [(:qk-head-dim problem)] :half
-                                (:layout-swizzle staging)) 16)
-         (body/->WorkgroupAllocation
-          'pipeline-value-stage-b :half [(:value-head-dim problem)]
-          (layout/shared-memory [(:value-head-dim problem)] :half
+          'pipeline-value-stages :half [2 (:value-head-dim problem)]
+          (layout/shared-memory [2 (:value-head-dim problem)] :half
                                 (:layout-swizzle staging)) 16)]
         initial-ops
         (flatten-operations

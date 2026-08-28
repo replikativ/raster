@@ -634,16 +634,19 @@
            (body/validate!
             (assoc-in kernel [:parameters 0 :layout]
                       (layout/shared-memory [16] :float :identity)))))))
-  (testing "contiguous async copy does not pretend to implement a physical scatter"
+  (testing "a swizzled logical row copy is explicit and cannot promise native overlap"
     (let [kernel (-> (fixtures/async-staging-body 32 :preferred)
                      (assoc-in [:allocations 0 :shape] [32 32])
                      (assoc-in [:allocations 0 :layout]
                                (layout/shared-memory [32 32] :float :xor-32))
                      (assoc-in [:operations 0 :destination-coordinates] [0 0])
+                     (assoc-in [:operations 4 :coordinates] [0 'lane])
                      (assoc-in [:launch :shared-memory-bytes] 4096))]
+      (is (body/kernel-body? (body/validate! kernel)))
       (is (thrown-with-msg? clojure.lang.ExceptionInfo
                             #"contiguous global-to-workgroup transfer"
-                            (body/validate! kernel))))))
+                            (body/validate! (assoc-in kernel [:operations 0 :overlap]
+                                                      :required)))))))
 
 (deftest workgroup-barriers-require-full-convergent-participation
   (let [barrier (workgroup-barrier)]

@@ -78,6 +78,15 @@
 (defn- linear-thread-id []
   "((int)threadIdx.x + (int)blockDim.x * ((int)threadIdx.y + (int)blockDim.y * (int)threadIdx.z))")
 
+(defn workgroup-linear-thread-id
+  "Spell the target's linear local-thread identity for cooperative fallback loops."
+  [dialect workgroup-shape]
+  (if (opencl? dialect)
+    (let [[x y] (concat workgroup-shape [1 1])]
+      (str "((int)get_local_id(0) + " x
+           " * ((int)get_local_id(1) + " y " * (int)get_local_id(2)))"))
+    (linear-thread-id)))
+
 (defn index-binding
   [dialect source axis subgroup-width]
   (if (opencl? dialect)

@@ -41,6 +41,13 @@
                :at-least :subgroup
                :otherwise :reference}}))
 
+(def ^:private fixed-dispatch
+  (kdispatch/make
+   {:id "fixed-dispatch-tuning-test"
+    :alternatives [reference subgroup]
+    :default-strategy :reference
+    :selector {:kind :fixed-strategy :strategy :reference}}))
+
 (def ^:private descriptor
   {:device-id :ze:0 :vendor "Intel" :arch "xe2" :subgroup-size 16
    :machine-lanes 8192 :driver-version "test-driver"})
@@ -69,6 +76,25 @@
   []
   (.toFile (Files/createTempDirectory "raster-dispatch-tuning-"
                                       (make-array java.nio.file.attribute.FileAttribute 0))))
+
+(deftest static-schedule-axis-produces-a-fixed-measured-selector
+  (binding [cache/*cache-root* (temporary-cache-root)]
+    (let [calls (atom [])
+          result (tuning/tune-fixed!
+                  fixed-dispatch descriptor
+                  (fn [artifact]
+                    (let [strategy (kdispatch/alternative-strategy artifact)]
+                      (swap! calls conj strategy)
+                      (validated-result artifact (if (= :subgroup strategy) 4.0 10.0))))
+                  :numerical-mode numerical-mode :layout layout)
+          tuned (tuning/apply-tuning fixed-dispatch result descriptor numerical-mode layout)]
+      (is (= {:kind :fixed-strategy :strategy :subgroup} (:selector result)))
+      (is (= [:reference :subgroup] @calls))
+      (is (= :subgroup
+             (kdispatch/alternative-strategy
+              (kdispatch/select-alternative tuned [:x :out {:type :long :value 17}]))))
+      (is (= [] (get-in result [:identity :policy :runtime-values]))
+          "static tuning adds no synthetic value to the executable ABI"))))
 
 (deftest validated-device-measurements-produce-and-cache-piecewise-selection
   (binding [cache/*cache-root* (temporary-cache-root)]

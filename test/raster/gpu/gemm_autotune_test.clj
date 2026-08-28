@@ -1,5 +1,5 @@
 (ns raster.gpu.gemm-autotune-test
-  "The autotune loop end-to-end on REAL kernels: coordinate-descent (raster.gpu.autotune) driven by a
+  "The measurement loop end-to-end on REAL kernels: a finite emitted-candidate search driven by a
    real device-event GEMM benchmark finds the measured-optimal split-k factor on a deep-k,
    occupancy-bound shape — the axis with the largest proven win (~10×). This is the proof that the
    Phase-2 machinery tunes actual kernels, not a synthetic cost.
@@ -12,8 +12,7 @@
    factor is deliberately hardware-, driver-, and load-dependent."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.dl.gpu-grad-parity :as gp]
-            [raster.compiler.core.hardware :as hw]
-            [raster.gpu.autotune :as at]))
+            [raster.compiler.core.hardware :as hw]))
 
 ;; ── the real cost-fn: device-event time of the resident split-k XMX GEMM ─────────
 (defn- bench-splitk-ms
@@ -50,26 +49,27 @@
           m 16 n 512 k 131072                     ;; deep-k, small (m,n) grid → occupancy-bound
           gflops (fn [ms] (/ (* 2.0 m k n) (* ms 1.0e6)))
           measured (atom 0)
-          ;; the REAL cost the loop minimises: measured device ms of the actual kernel
-          cost (fn [cfg] (swap! measured inc) (bench-splitk-ms ze m n k (:splits cfg)))
-          baseline-ms (bench-splitk-ms ze m n k 1)
-          result (at/coordinate-descent {:splits 1}
-                                        {:splits (fn [s] [(* s 2) (max 1 (quot s 2))])}
-                                        cost)
-          tuned (:splits (:config result))
-          tuned-ms (:cost result)
+          candidates [1 2 4 8 16 32]
+          results (mapv (fn [splits]
+                          (swap! measured inc)
+                          {:splits splits :ms (bench-splitk-ms ze m n k splits)})
+                        candidates)
+          baseline-ms (:ms (first results))
+          winner (apply min-key :ms results)
+          tuned (:splits winner)
+          tuned-ms (:ms winner)
           speedup (/ baseline-ms tuned-ms)]
       (println (format (str "\n=== GEMM split-k autotune (m=%d n=%d k=%d) ===\n"
                             "  baseline splits=1 : %.2f GFLOPS\n"
                             "  autotuned splits=%d: %.2f GFLOPS  (%.1fx, %d kernels measured)\n")
                        m n k (gflops baseline-ms) tuned (gflops tuned-ms) speedup @measured))
-      (testing "coordinate-descent measures real kernels and finds a large occupancy win"
+      (testing "finite candidate measurement finds a large occupancy win"
         (is (> tuned 1) "the measured search must select a non-trivial split factor")
         (is (> speedup 2.0) (str "tuned split-k must beat the non-split baseline by >2× (got "
                                  (format "%.1fx" speedup) ")"))
-        (is (<= @measured 12) "the ×2/÷2 ladder from the seed keeps the search cheap")))))
+        (is (= (count candidates) @measured) "every emitted candidate is measured once")))))
 
-;; ── T3: the TILE axis — every candidate tile is correct; coordinate-descent prices real kernels ──
+;; ── T3: the TILE axis — every finite emitted candidate is correct and device-priced ──
 (defn- run-tiled-gemm
   "Run bind-registered-gemm-tiled! for `tile` at (m,n,k) over fixed A/B, returning [C median-ms]."
   [ze a16 b16 m n k tile]
@@ -110,11 +110,7 @@
           (testing "SAFETY: every candidate tile produces output bit-identical to the default"
             (doseq [{:keys [tile bit-identical?]} results]
               (is bit-identical? (str "tile " (select-keys tile [:block-m :block-n :block-k]) " must match default"))))
-          ;; coordinate-descent over the tile axis, priced by real device time
-          (let [cost (fn [cfg] (:ms (first (filter #(= (:tile %) (:tile cfg)) results))))
-                r (at/coordinate-descent {:tile default-tile}
-                                         {:tile (fn [_] cands)} cost)
-                winner (:tile (:config r))]
+          (let [winner (:tile (apply min-key :ms results))]
             (println (format "\n=== GEMM tile autotune (m=%d n=%d k=%d) ===" m n k))
             (doseq [{:keys [tile ms]} (sort-by :ms results)]
               (println (format "  %-22s %.3f ms%s" (str (:block-m tile) "x" (:block-n tile) " k" (:block-k tile))
