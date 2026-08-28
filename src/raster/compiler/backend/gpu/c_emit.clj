@@ -496,8 +496,6 @@
 ;; Side effect detection
 ;; ================================================================
 
-
-
 ;; ================================================================
 ;; Backend-specific helpers
 ;; ================================================================
@@ -1133,7 +1131,11 @@
            ;; value, not the first loop var (usually the int counter — assigning a
            ;; double accumulator into it would truncate).
            (let [result-var (str (c-symbol (first var-names)) "_res")
-                 result-type (remap-type (if terminal (infer-c-type terminal) *scalar-type*))
+                 ;; A terminal loop variable has the type declared by its initializer. Reusing
+                 ;; that fact avoids guessing the accumulator type from a bare symbol.
+                 result-type (or (get (zipmap var-names var-types) terminal)
+                                 (remap-type
+                                  (if terminal (infer-c-type terminal) *scalar-type*)))
                  loop-body (binding [*loop-result-var* result-var]
                              (emit-loop-body body var-names var-types idx-sym array-syms opencl-idx))]
              (str "({ " decls " " result-type " " result-var "; while (1) { " loop-body " } " result-var "; })"))
@@ -1205,11 +1207,15 @@
 
      ;; unchecked-inc / unchecked-dec as (x + 1) / (x - 1), NOT ++/--
      (and (seq? expr) (= 2 (count expr))
-          (contains? #{'clojure.core/unchecked-inc 'unchecked-inc} (first expr)))
+          (contains? #{'clojure.core/unchecked-inc 'unchecked-inc
+                       'clojure.core/unchecked-inc-int 'unchecked-inc-int}
+                     (first expr)))
      (str "((" (emit-expr (second expr) idx-sym array-syms opencl-idx) ") + 1)")
 
      (and (seq? expr) (= 2 (count expr))
-          (contains? #{'clojure.core/unchecked-dec 'unchecked-dec} (first expr)))
+          (contains? #{'clojure.core/unchecked-dec 'unchecked-dec
+                       'clojure.core/unchecked-dec-int 'unchecked-dec-int}
+                     (first expr)))
      (str "((" (emit-expr (second expr) idx-sym array-syms opencl-idx) ") - 1)")
 
      ;; unchecked-*-int as binary infix

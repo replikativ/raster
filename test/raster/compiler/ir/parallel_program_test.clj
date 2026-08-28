@@ -25,6 +25,9 @@
     (is (every? av/abstract-value? (vals (:values p))))
     (is (= ['?] (:shape (get (:values p) 'values))))
     (is (= [] (:shape (get (:values p) [:binding 'total]))))
+    (is (= {'n :int 'values :double}
+           (program/declared-value-types (assoc-in p [:values 'n :dtype] :int)
+                                         ['n 'values])))
     (is (seq (:operations equation)))
     (is (soac-dialect/program-form? (:algorithm equation)))
     (is (= (:operands equation) (:inputs (soac-dialect/facts (:algorithm equation)))))
@@ -53,9 +56,31 @@
         (is (= :segop (:target-dialect (ex-data e))))
         (is (= :none (:fallback (ex-data e))))))))
 
+(deftest host-only-equations-require-an-explicit-empty-schedule-contract
+  (let [p (lowered-program)
+        equation (first (:equations p))
+        host-only (assoc p :equations [(-> equation
+                                           (assoc :operations [])
+                                           (assoc-in [:attributes :host-only] true))])]
+    (is (= host-only (program/validate! host-only (constantly false))))
+    (testing "an empty schedule cannot arise accidentally"
+      (try
+        (program/validate! (assoc p :equations [(assoc equation :operations [])]))
+        (is false "empty operations without :host-only must be rejected")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :parallel-program-operations (:reason (ex-data exception)))))))
+    (testing "host-only equations cannot also claim scheduled operations"
+      (try
+        (program/validate! (assoc p :equations [(assoc-in equation
+                                                          [:attributes :host-only] true)]))
+        (is false "host-only plus scheduled operations is contradictory")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :parallel-program-host-only-operations
+                 (:reason (ex-data exception)))))))))
+
 (deftest source-shaped-bound-expressions-stay-on-the-compatibility-route
   (let [source '(raster.par/reduce acc 0.0 i (clojure.core/alength values)
-                                    (+ acc (clojure.core/aget values i)))
+                                   (+ acc (clojure.core/aget values i)))
         p (:form (segop-lower/segop-lower-pass
                   (list 'let* ['total source] 'total)
                   {:target-device :cpu:0 :dtype :double

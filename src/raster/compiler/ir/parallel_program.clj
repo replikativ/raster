@@ -83,9 +83,16 @@
              (throw (ex-info "equation references an unknown value"
                              {:reason :parallel-program-unknown-value
                               :equation (:id equation) :field field :id id})))))
-       (when-not (and (vector? (:operations equation)) (seq (:operations equation)))
-         (throw (ex-info "equation requires one or more ordered operations"
+       (when-not (and (vector? (:operations equation))
+                      (or (seq (:operations equation))
+                          (true? (get-in equation [:attributes :host-only]))))
+         (throw (ex-info "equation requires ordered operations or an explicit host-only contract"
                          {:reason :parallel-program-operations :equation (:id equation)})))
+       (when (and (true? (get-in equation [:attributes :host-only]))
+                  (seq (:operations equation)))
+         (throw (ex-info "host-only equations cannot carry scheduled operations"
+                         {:reason :parallel-program-host-only-operations
+                          :equation (:id equation)})))
        (doseq [operation (:operations equation)]
          (when-not (operation? operation)
            (throw (ex-info "an illegal operation remains after full dialect conversion"
@@ -134,6 +141,24 @@
   "The compatibility host expression surrounding the explicit parallel equations."
   [program]
   (:source (validate! program)))
+
+(defn declared-value-types
+  "Project declared dtypes for an explicit collection of value IDs.
+
+   The caller supplies ABI/storage roles from its scheduled operation. Logical rank is deliberately
+   not used to guess whether a value is passed by value or by buffer: a rank-zero tensor may later
+   be realized either way."
+  [program ids]
+  (let [values (:values (validate! program))]
+    (into {}
+          (map (fn [id]
+                 (let [value (get values id)]
+                   (when-not (and (symbol? id) value (keyword? (:dtype value)))
+                     (throw (ex-info "scheduled parameter lacks a declared symbolic value dtype"
+                                     {:reason :parallel-program-parameter-dtype
+                                      :id id :value value})))
+                   [id (:dtype value)])))
+          ids)))
 
 (defn equation-for-binding
   "Find the equation for a binding only when the current source still matches its certified source.

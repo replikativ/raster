@@ -10,6 +10,9 @@
 
      (soac-program facts
        [(= equation-id [result ...]
+           (scalar {:dtypes [:long ...]} [capture ...]
+             (lambda [capture-parameter ...] [result-expr ...])))
+        (= equation-id [result ...]
            (map {:index i :extent n} [array ...] [capture ...]
              (lambda [element ... capture-parameter ...] [result-expr ...])))
         (= equation-id [result ...]
@@ -85,6 +88,14 @@
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))))
 
+(defn scalar-attributes?
+  [value]
+  (and (map? value)
+       (vector? (:dtypes value))
+       (seq (:dtypes value))
+       (every? keyword? (:dtypes value))
+       (or (nil? (:attributes value)) (map? (:attributes value)))))
+
 (defn equation-facts?
   [value]
   (and (map? value)
@@ -113,6 +124,7 @@
              [eid equation-id?]
              [sym symbol?]
              [lit scalar-literal?]
+             [sa scalar-attributes?]
              [ma map-attributes?]
              [ra reduce-attributes?]
              [facts program-facts?])
@@ -130,6 +142,7 @@
           (lambda [(?:* ?sym:parameter)] [(?:+ s)]))
 
   (Operation [o :enforce]
+             (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
@@ -157,17 +170,31 @@
   "Ordered array and capture operands of an equation. Extent is a separate scalar operand."
   [equation]
   (let [operation (nth equation 3)]
-    (vec (concat (nth operation 2) (nth operation 3)))))
+    (if (= 'scalar (first operation))
+      (vec (nth operation 2))
+      (vec (concat (nth operation 2) (nth operation 3))))))
 
 (defn operation-extent
   [equation]
-  (:extent (second (nth equation 3))))
+  (let [operation (nth equation 3)]
+    (when-not (= 'scalar (first operation))
+      (:extent (second operation)))))
+
+(defn operation-parts
+  "Normalize one operation into semantic fields shared by validation and lowering."
+  [equation]
+  (let [operation (nth equation 3)
+        kind (first operation)]
+    (if (= 'scalar kind)
+      (let [[_ attributes captures lambda] operation]
+        {:kind kind :attributes attributes :arrays [] :captures captures :lambda lambda})
+      (let [[_ attributes arrays captures lambda] operation]
+        {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
 
 (defn parameter-layout
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]
-  (let [[_ _ _ operation] equation
-        [kind attributes arrays captures lambda] operation
+  (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
         parameters (vec (second lambda))
         accumulator-count (if (= 'reduce kind) (count (:accumulators attributes)) 0)
         array-count (count arrays)
@@ -188,9 +215,8 @@
 (defn- validate-equation!
   [equation]
   (let [[_ equation-id results operation] equation
-        [_ attributes arrays captures lambda] operation
+        {:keys [kind attributes arrays captures lambda]} (operation-parts equation)
         [_ parameters body-results] lambda
-        kind (first operation)
         result-count (count results)]
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"
@@ -202,6 +228,13 @@
     (when (seq (set/intersection (set arrays) (set captures)))
       (fail! :typed-soac-operand-role "one value cannot be both an element input and a capture"
              {:equation equation-id :arrays arrays :captures captures}))
+    (let [stable-array-captures (get-in attributes [:attributes :stable-array-captures] [])]
+      (when-not (and (distinct-vector? stable-array-captures)
+                     (set/subset? (set stable-array-captures) (set captures)))
+        (fail! :typed-soac-stable-array-captures
+               "stable array capture roles must be an ordered subset of captures"
+               {:equation equation-id :stable-array-captures stable-array-captures
+                :captures captures})))
     (when-not (distinct-vector? parameters)
       (fail! :typed-soac-lambda-parameters "SOAC lambda parameters must be distinct"
              {:equation equation-id :parameters parameters}))
@@ -225,12 +258,20 @@
                 :arrays arrays
                 :captures captures})))
     (doseq [body body-results
-            :let [unbound (util/free-syms body (set parameters))]
+            :let [bound (cond-> (set parameters)
+                          (contains? #{'map 'reduce} kind) (conj (:index attributes)))
+                  unbound (util/free-syms body bound)]
             :when (seq unbound)]
       (fail! :typed-soac-unbound-scalar
              "scalar regions may reference only their explicit lambda parameters"
              {:equation equation-id :unbound unbound :body body}))
     (case kind
+      scalar
+      (when-not (= result-count (count (:dtypes attributes)))
+        (fail! :typed-soac-scalar-results
+               "scalar result arity must equal its declared dtype arity"
+               {:equation equation-id :results results :dtypes (:dtypes attributes)}))
+
       map
       nil
 
@@ -251,9 +292,10 @@
 
 (defn- validate-equation-types!
   [values equation]
-  (let [[_ equation-id results operation] equation
-        [kind attributes arrays] operation
-        extent (:extent attributes)]
+  (let [[_ equation-id results] equation
+        {:keys [kind attributes arrays]} (operation-parts equation)
+        extent (:extent attributes)
+        stable-array-captures (get-in attributes [:attributes :stable-array-captures] [])]
     (doseq [id arrays]
       (let [value (get values id)]
         ;; Unknown IDs receive the more precise boundary diagnostic below.
@@ -262,7 +304,24 @@
           (fail! :typed-soac-array-type
                  "SOAC element operands must be rank-one tensors over the declared extent"
                  {:equation equation-id :id id :value value :extent extent}))))
+    (doseq [id stable-array-captures]
+      (let [value (get values id)]
+        (when (and value
+                   (not (and (= :tensor (:kind value)) (seq (:shape value)))))
+          (fail! :typed-soac-stable-array-type
+                 "stable array captures must have a non-scalar tensor contract"
+                 {:equation equation-id :id id :value value}))))
     (case kind
+      scalar
+      (doseq [[id dtype] (map vector results (:dtypes attributes))]
+        (let [value (get values id)]
+          (when (and value
+                     (not (and (= :tensor (:kind value)) (= [] (:shape value))
+                               (= dtype (:dtype value)))))
+            (fail! :typed-soac-scalar-result-type
+                   "scalar results must be scalar tensors with their declared dtype"
+                   {:equation equation-id :id id :value value :dtype dtype}))))
+
       map
       (doseq [id results]
         (let [value (get values id)]
@@ -387,9 +446,10 @@
             (let [id (rename dimension)]
               (if (symbol? id) id (list 'value id)))
 
-            (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension))
+            (and (seq? dimension) (contains? #{'value 'unknown-dimension} (first dimension))
+                 (= 2 (count dimension))
                  (contains? value-map (second dimension)))
-            (list 'value (rename (second dimension)))
+            (list (first dimension) (rename (second dimension)))
 
             :else dimension))
         rename-value (fn [value] (update value :shape #(mapv rename-dimension %)))
@@ -403,12 +463,19 @@
                               (assoc result id' (rename-value value))))
                           {} (:values source-facts))
         equation-forms
-        (mapv (fn [[equals equation-id results operation]]
-                (let [[kind attributes arrays captures lambda] operation]
-                  (list equals equation-id (mapv rename results)
-                        (list kind (update attributes :extent
-                                           #(if (value-id? %) (rename %) %))
-                              (mapv rename arrays) (mapv rename captures) lambda))))
+        (mapv (fn [[equals equation-id results :as equation]]
+                (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
+                      attributes (cond-> attributes
+                                   (seq (get-in attributes
+                                                [:attributes :stable-array-captures]))
+                                   (update-in [:attributes :stable-array-captures]
+                                              #(mapv rename %)))
+                      operation (if (= 'scalar kind)
+                                  (list kind attributes (mapv rename captures) lambda)
+                                  (list kind (update attributes :extent
+                                                     #(if (value-id? %) (rename %) %))
+                                        (mapv rename arrays) (mapv rename captures) lambda))]
+                  (list equals equation-id (mapv rename results) operation)))
               (equations program))
         rename-aliases
         (fn [aliases]

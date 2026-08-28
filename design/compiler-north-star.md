@@ -417,6 +417,16 @@ facts without backend re-analysis. Host-visible intermediates, unknown/effectful
 horizontal/multi-result fusion, and any disagreement with the temporary legacy shadow certificate
 decline explicitly.
 
+Pure host scalar dependencies now use the same ordered SSA spine through a typed `scalar` equation.
+The first production subset covers statically typed literals/aliases and semantic array-length
+queries, value-numbers `alength` of a produced tensor to its certified extent, and materializes the
+host spelling mechanically. Map/reduce captures also distinguish pointwise element operands,
+stable tensor reads and true scalar parameters. This lets the ordinary two-layer `predict-fn`
+retain typed dense→ReLU fusion without conflating weights or inner-reduction activations with the
+outer map shape, and preserves buffer versus scalar ABI roles through JVM/OpenCL lowering. Scalar
+result dtypes come from retained walker/TypedClojure tags; `AbstractValue` transports those dtypes,
+while the scheduled operation—not tensor rank—declares whether an ABI value is a scalar or buffer.
+
 This representation is shared before backend selection. SOAC fusion changes the program consumed
 by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The scalar
 spelling for the migrated subset is now generated from TypedSOAC rather than retained source, and
@@ -424,7 +434,9 @@ JVM SIMD/GPU reuse its certified SegOps. The resident split pipeline remains on 
 route because its reduce-result device-realization transform still operates between source-form
 pipeline halves. Migration is complete when that transform, horizontal/multi-consumer fusion and
 richer scalar equations operate on the typed envelope and the covered compatibility re-lowerings
-are deleted.
+are deleted. Nested reductions inside a retained map are typed and correctly classified, but the
+JVM SIMD leaf still lowers those inner regions through its established scalar fallback; this is an
+explicit scheduling boundary rather than a loss of semantic facts.
 
 ### 3.3 Schedule and transform IR
 
@@ -773,8 +785,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    and remove the attention-provenance gate from routed weighted-reduction lowering.
 5. **In progress:** migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove
    compatibility re-lowering for the covered forms. Single-consumer pure map→map/map→reduce now has
-   a production typed route shared by JVM SIMD and OpenCL; horizontal/multi-consumer fusion, typed
-   scalar equations and resident reduce-result realization remain.
+   a production typed route shared by JVM SIMD and OpenCL; typed scalar/shape equations and stable
+   tensor capture roles now carry realistic nested-reduction maps as well. Horizontal/multi-
+   consumer fusion, nested-region JVM scheduling and resident reduce-result realization remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

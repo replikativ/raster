@@ -99,11 +99,32 @@
 
 (defn array-tag-for-dtype
   "Primitive-array dispatch tag for a dtype (e.g. :float → 'floats). Throws on
-   an unknown dtype."
+  an unknown dtype."
   [dtype]
   (or (:array-tag (get dtype-info dtype))
       (throw (ex-info (str "array-tag-for-dtype: unknown dtype `" dtype "`.")
                       {:dtype dtype}))))
+
+(defn dtype-for-scalar-tag
+  "Compiler dtype declared by a JVM scalar dispatch tag, or nil when the tag is not a supported
+   primitive scalar. This is the reverse projection of the `:scalar-tag` facet, not a second type
+   table."
+  [tag]
+  ;; `:half` deliberately has no JVM primitive scalar tag.  An absent source
+  ;; fact must therefore remain absent, not compare equal to that nil facet.
+  (when tag
+    (some (fn [[dtype facets]]
+            (when (= tag (:scalar-tag facets)) dtype))
+          dtype-info)))
+
+(defn dtype-for-array-tag
+  "Compiler element dtype declared by a JVM primitive-array dispatch tag, or nil. This is the
+   reverse projection of the canonical `:array-tag` facet."
+  [tag]
+  (when tag
+    (some (fn [[dtype facets]]
+            (when (= tag (:array-tag facets)) dtype))
+          dtype-info)))
 
 (defn needs-pragma-for
   "The OpenCL extension pragma keyword this dtype requires (e.g. :half →
