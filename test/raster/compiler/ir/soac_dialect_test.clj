@@ -37,6 +37,66 @@
                                 (first (dialect/equations program)))))))
     (is (= '[x] (dialect/operation-inputs (first (dialect/equations program)))))))
 
+(deftest pure-scalar-shape-equations-are-ordered-typed-ssa
+  (let [program
+        (dialect/make
+         (dialect/default-program-facts
+          {:values {'x tensor 'n extent 'y tensor}
+           :inputs '[x]
+           :equations {'shape (dialect/default-equation-facts)
+                       'map-0 (dialect/default-equation-facts)}})
+         [(list '= 'shape '[n]
+                (list 'scalar {:dtypes [:long]} '[x]
+                      (list 'lambda '[array] '[(clojure.core/alength array)])))
+          (list '= 'map-0 '[y]
+                (list 'map {:index 'i :extent 'n} '[x] []
+                      (list 'lambda '[element] '[(* element 2.0)])))]
+         '[y])
+        scalar-equation (first (dialect/equations program))]
+    (is (= program (dialect/validate! program)))
+    (is (= 'scalar (dialect/operation-kind scalar-equation)))
+    (is (= '[x] (dialect/operation-inputs scalar-equation)))
+    (is (nil? (dialect/operation-extent scalar-equation)))
+    (is (= {:accumulators [] :elements [] :capture-parameters '[array]}
+           (dialect/parameter-layout scalar-equation)))))
+
+(deftest stable-array-capture-role-is-typed-and-validated
+  (let [weights (av/tensor {:dtype :float :shape '[(unknown-dimension weights)]})
+        program
+        (dialect/make
+         (dialect/default-program-facts
+          {:values {'x tensor 'weights weights 'n extent 'y tensor}
+           :inputs '[n weights x]
+           :equations {'map-0 (dialect/default-equation-facts)}})
+         [(list '= 'map-0 '[y]
+                (list 'map {:index 'i :extent 'n
+                            :attributes {:stable-array-captures '[weights]}}
+                      '[x] '[weights]
+                      (list 'lambda '[element weights-value]
+                            '[(+ element (clojure.core/aget weights-value i))])))]
+         '[y])
+        remapped (dialect/remap-values program
+                                       {'weights [:argument :weights]
+                                        'x [:argument :x]
+                                        'n [:shape :n]
+                                        'y [:result :y]})
+        remapped-equation (first (dialect/equations remapped))]
+    (is (= program (dialect/validate! program)))
+    (is (= [[:argument :weights]]
+           (get-in (dialect/operation-parts remapped-equation)
+                   [:attributes :attributes :stable-array-captures])))
+    (is (= [(list 'unknown-dimension [:argument :weights])]
+           (:shape (get-in (dialect/facts remapped)
+                           [:values [:argument :weights]]))))
+    (try
+      (dialect/make
+       (assoc-in (dialect/facts program) [:values 'weights]
+                 (av/tensor {:dtype :float :shape []}))
+       (dialect/equations program) (dialect/outputs program))
+      (is false "a scalar value cannot satisfy a stable tensor capture role")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-soac-stable-array-type (:reason (ex-data exception))))))))
+
 (deftest scalar-regions-are-recursively-validated
   (testing "walker-devirtualized scalar calls remain explicit functional expressions"
     (let [program (map-program

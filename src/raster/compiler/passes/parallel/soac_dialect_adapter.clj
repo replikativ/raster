@@ -63,6 +63,14 @@
                   (map vector arrays parameters)))
         expressions))
 
+(defn- pointwise-input?
+  [expressions array index]
+  (let [reads (filter (fn [{:keys [sym]}]
+                        (and (symbol? sym) (= (name array) (name sym))))
+                      (mapcat descriptor/aget-reads expressions))]
+    (and (seq reads)
+         (every? #(= index (descriptor/unwrap-int-cast (:idx %))) reads))))
+
 (defn- cast-result
   [cast expression]
   (if cast (list cast expression) expression))
@@ -97,15 +105,19 @@
 
 (defn- map-equation
   [node aliases]
-  (let [arrays (vec (sort-by pr-str (:inputs node)))
-        captures (vec (sort-by pr-str (:scalars node)))
+  (let [{:keys [results expressions]} (horizontal-map-parts node aliases)
+        [pointwise stable] ((juxt filter remove)
+                            #(pointwise-input? expressions % (:idx node))
+                            (:inputs node))
+        arrays (vec (sort-by pr-str pointwise))
+        captures (vec (sort-by pr-str (distinct (concat stable (:scalars node)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
-        {:keys [results expressions]} (horizontal-map-parts node aliases)
         body-results (->> (elementize expressions arrays parameters (:idx node))
                           (mapv #(util/subst-syms (zipmap captures capture-parameters) %)))]
     (list '= (:id node) results
-          (list 'map {:index (:idx node) :extent (:bound node)}
+          (list 'map {:index (:idx node) :extent (:bound node)
+                      :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
                 arrays captures
                 (list 'lambda (vec (concat parameters capture-parameters)) body-results)))))
 
@@ -121,15 +133,19 @@
              "legacy adapter covers one-component reductions only"
              {:node (:id node) :components (count (:components product))}))
     (let [component (first (:components product))
-          arrays (vec (sort-by pr-str (:inputs node)))
-          captures (vec (sort-by pr-str (:scalars node)))
+          expressions (:results (reduction/fold-region product))
+          [pointwise stable] ((juxt filter remove)
+                              #(pointwise-input? expressions % (:index product))
+                              (:inputs node))
+          arrays (vec (sort-by pr-str pointwise))
+          captures (vec (sort-by pr-str (distinct (concat stable (:scalars node)))))
           element-parameters (element-symbols (count arrays))
           capture-parameters (capture-symbols (count captures))
-          body-results (->> (elementize (:results (reduction/fold-region product))
-                                        arrays element-parameters (:index product))
+          body-results (->> (elementize expressions arrays element-parameters (:index product))
                             (mapv #(util/subst-syms (zipmap captures capture-parameters) %)))
           attributes {:index (:index product)
                       :extent (:bound node)
+                      :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
                       :accumulators [(:accumulator component)]
                       :identities [(:neutral component)]
                       :dtypes [(:dtype component)]
@@ -141,6 +157,32 @@
                                      element-parameters capture-parameters))
                         body-results))))))
 
+(defn- scalar-dtype
+  [expression scalar-dtypes scalar-types]
+  (cond
+    (and (seq? expression)
+         (descriptor/alength-op? (descriptor/semantic-op expression))) :long
+    (symbol? expression) (or (get scalar-dtypes expression) (get scalar-types expression))
+    (instance? Float expression) :float
+    (number? expression) (if (integer? expression) :long :double)
+    (boolean? expression) :boolean
+    :else nil))
+
+(defn- scalar-equation
+  [node scalar-dtypes scalar-types]
+  (let [expression (:expr node)
+        captures (vec (sort-by pr-str (util/free-syms expression)))
+        parameters (capture-symbols (count captures))
+        dtype (scalar-dtype expression scalar-dtypes scalar-types)]
+    (when-not dtype
+      (fail! :unsupported-scalar-binding
+             "typed scalar equations require a statically known result dtype"
+             {:node (:id node) :symbol (:sym node) :expression expression}))
+    (list '= (:id node) [(:sym node)]
+          (list 'scalar {:dtypes [dtype]} captures
+                (list 'lambda parameters
+                      [(util/subst-syms (zipmap captures parameters) expression)])))))
+
 (defn- operation-equation
   [node aliases]
   (cond
@@ -150,6 +192,20 @@
     (fail! :unsupported-legacy-soac
            "legacy adapter supports only map and scalar/full reduce nodes"
            {:node (:id node) :type (.getName (class node))})))
+
+(defn- selected-scalar-symbols
+  [nodes operation-equations outputs]
+  (let [by-symbol (into {} (keep #(when (legacy/scalar-binding? %) [(:sym %) %])) nodes)
+        roots (set (concat outputs
+                           (mapcat (fn [equation]
+                                     (cond-> (dialect/operation-inputs equation)
+                                       (dialect/value-id? (dialect/operation-extent equation))
+                                       (conj (dialect/operation-extent equation))))
+                                   operation-equations)))]
+    (loop [needed (set/intersection roots (set (keys by-symbol)))]
+      (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
+            needed' (set/union needed (set/intersection dependencies (set (keys by-symbol))))]
+        (if (= needed needed') needed (recur needed'))))))
 
 (defn- tensor-value
   [dtype shape]
@@ -163,25 +219,36 @@
       :double))
 
 (defn- equation-values
-  [equation default-dtype array-types]
+  [equation default-dtype array-types known-values]
   (let [[_ _ results operation] equation
-        [kind attributes arrays captures] operation
+        {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
         extent (:extent attributes)
-        result-dtypes (if (= 'reduce kind)
-                        (:dtypes attributes)
+        stable-array-captures (set (get-in attributes [:attributes :stable-array-captures]))
+        result-dtypes (case kind
+                        scalar (:dtypes attributes)
+                        reduce (:dtypes attributes)
                         (repeat (count results) default-dtype))]
     (merge
-     (if (dialect/value-id? extent) {extent (tensor-value :long [])} {})
+     (if (and extent (dialect/value-id? extent)) {extent (tensor-value :long [])} {})
      (into {} (map (fn [id]
                      [id (tensor-value (value-dtype id default-dtype array-types)
                                        (dialect/extent-shape extent))])
                    arrays))
-     (into {} (map (fn [id]
-                     [id (tensor-value (value-dtype id default-dtype array-types) [])])
-                   captures))
+     (if (= 'scalar kind)
+       {}
+       (into {} (map (fn [id]
+                       [id (or (get known-values id)
+                               (if (or (contains? stable-array-captures id)
+                                       (contains? array-types id)
+                                       (and (symbol? id)
+                                            (contains? array-types (symbol (name id)))))
+                                 (tensor-value (value-dtype id default-dtype array-types)
+                                               [(list 'unknown-dimension id)])
+                                 (tensor-value (value-dtype id default-dtype array-types) [])))])
+                     captures)))
      (into {} (map (fn [id dtype]
                      [id (tensor-value (or dtype default-dtype :double)
-                                       (if (= 'reduce kind) []
+                                       (if (contains? #{'scalar 'reduce} kind) []
                                            (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 
@@ -203,9 +270,13 @@
    - :dtype — fallback element dtype
    - :array-types — symbol-to-dtype overrides
    - :values — authoritative additional AbstractValues
-   - :preserve-scalar-bindings? — allow the caller to retain scalar nodes in a separate envelope"
-  [nodes {:keys [outputs dtype array-types values preserve-scalar-bindings?]
-          :or {dtype :double array-types {} values {} preserve-scalar-bindings? false}}]
+   - :scalar-types — symbol-to-dtype overrides for scalar equations
+   - :include-scalar-bindings? — emit needed pure scalar bindings as typed equations
+   - :preserve-scalar-bindings? — compatibility option that allows but omits scalar bindings"
+  [nodes {:keys [outputs dtype array-types scalar-types values include-scalar-bindings?
+                 preserve-scalar-bindings?]
+          :or {dtype :double array-types {} scalar-types {} values {}
+               include-scalar-bindings? false preserve-scalar-bindings? false}}]
   (let [nodes (ordered-nodes nodes)
         physical-outputs (reduce set/union #{}
                                  (keep #(when-not (legacy/scalar-binding? %)
@@ -214,7 +285,8 @@
         unsupported (remove #(or (legacy/soac-map? %)
                                  (legacy/soac-reduce? %)
                                  (generated-scaffolding? % physical-outputs)
-                                 (and preserve-scalar-bindings? (legacy/scalar-binding? %)))
+                                 (and (or include-scalar-bindings? preserve-scalar-bindings?)
+                                      (legacy/scalar-binding? %)))
                             nodes)]
     (when-let [node (first unsupported)]
       (fail! :unsupported-legacy-node
@@ -222,7 +294,32 @@
              {:node (:id node) :type (.getName (class node))}))
     (let [aliases (logical-aliases nodes)
           operation-nodes (filterv #(or (legacy/soac-map? %) (legacy/soac-reduce? %)) nodes)
-          equations (mapv #(operation-equation % aliases) operation-nodes)
+          operation-equations (mapv #(operation-equation % aliases) operation-nodes)
+          requested-outputs (vec (or outputs
+                                     (some-> operation-equations peek (nth 2)) []))
+          selected-scalars (if include-scalar-bindings?
+                             (selected-scalar-symbols nodes operation-equations requested-outputs)
+                             #{})
+          {:keys [equations equation-nodes]}
+          (reduce
+           (fn [{:keys [scalar-dtypes] :as state} node]
+             (cond
+               (and (legacy/scalar-binding? node) (contains? selected-scalars (:sym node)))
+               (let [equation (scalar-equation node scalar-dtypes scalar-types)
+                     dtype (first (:dtypes (second (nth equation 3))))]
+                 (-> state
+                     (update :equations conj equation)
+                     (update :equation-nodes conj node)
+                     (assoc-in [:scalar-dtypes (:sym node)] dtype)))
+
+               (or (legacy/soac-map? node) (legacy/soac-reduce? node))
+               (-> state
+                   (update :equations conj (operation-equation node aliases))
+                   (update :equation-nodes conj node))
+
+               :else state))
+           {:equations [] :equation-nodes [] :scalar-dtypes {}}
+           nodes)
           equation-infos (mapv (fn [equation]
                                  {:id (second equation)
                                   :results (nth equation 2)
@@ -231,13 +328,15 @@
                                equations)
           definitions (set (mapcat :results equation-infos))
           references (set (mapcat #(cond-> (:inputs %)
-                                     (dialect/value-id? (:extent %)) (conj (:extent %)))
+                                     (and (:extent %) (dialect/value-id? (:extent %)))
+                                     (conj (:extent %)))
                                   equation-infos))
           inputs (vec (sort-by pr-str (set/difference references definitions)))
-          outputs (vec (or outputs (:results (peek equation-infos)) []))
+          outputs requested-outputs
           inferred-values (reduce (fn [contracts equation]
                                     (reduce-kv merge-value contracts
-                                               (equation-values equation dtype array-types)))
+                                               (equation-values equation dtype array-types
+                                                                contracts)))
                                   {}
                                   equations)
           values (reduce-kv merge-value inferred-values values)
@@ -247,7 +346,7 @@
                                        (dialect/default-equation-facts
                                         {:adapter :legacy-soac
                                          :legacy-soac-id (:id node)})]))
-                               operation-nodes)
+                               equation-nodes)
           facts (dialect/default-program-facts
                  {:values values
                   :inputs inputs

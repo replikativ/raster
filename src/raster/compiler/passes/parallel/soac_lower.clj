@@ -18,6 +18,7 @@
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
+            [raster.compiler.ir.par :as par]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.ir.soac-dialect :as soac-dialect]
@@ -58,12 +59,17 @@
                 (map (fn [parameter array]
                        [parameter (list 'clojure.core/aget array index)])
                      elements arrays))
-          body (util/subst-syms substitutions (first body-results))
+          body (-> (util/subst-syms substitutions (first body-results))
+                   par/expand-par-forms)
           result (first results)
+          stable-array-captures (set (get-in attributes
+                                             [:attributes :stable-array-captures]))
+          scalar-captures (set (remove stable-array-captures captures))
           result-dtype (or (:dtype (get-in (soac-dialect/facts program) [:values result]))
                            dtype :double)
           node (assoc (soac/->SoacMap equation-id result index (:extent attributes) nil body
-                                      (set arrays) #{result} (set captures))
+                                      (into (set arrays) stable-array-captures)
+                                      #{result} scalar-captures)
                       :elem-type result-dtype :pure? true)]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
@@ -112,6 +118,9 @@
           result (first results)
           accumulator (first accumulators)
           accumulator-dtype (or (first (:dtypes attributes)) dtype :double)
+          stable-array-captures (set (get-in attributes
+                                             [:attributes :stable-array-captures]))
+          scalar-captures (set (remove stable-array-captures captures))
           operator (reduction/scalar
                     {:accumulator accumulator
                      :neutral (first (:identities attributes))
@@ -122,7 +131,9 @@
                      :algebra (or (first (:algebra attributes)) {})
                      :attributes {:source :typed-soac :equation equation-id}})
           node (cond-> (soac/->SoacReduce equation-id result operator []
-                                          (:extent attributes) (set arrays) results (set captures))
+                                          (:extent attributes)
+                                          (into (set arrays) stable-array-captures)
+                                          results scalar-captures)
                  accumulator-dtype (assoc :elem-type accumulator-dtype))]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)

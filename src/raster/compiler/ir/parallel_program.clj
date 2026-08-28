@@ -83,9 +83,16 @@
              (throw (ex-info "equation references an unknown value"
                              {:reason :parallel-program-unknown-value
                               :equation (:id equation) :field field :id id})))))
-       (when-not (and (vector? (:operations equation)) (seq (:operations equation)))
-         (throw (ex-info "equation requires one or more ordered operations"
+       (when-not (and (vector? (:operations equation))
+                      (or (seq (:operations equation))
+                          (true? (get-in equation [:attributes :host-only]))))
+         (throw (ex-info "equation requires ordered operations or an explicit host-only contract"
                          {:reason :parallel-program-operations :equation (:id equation)})))
+       (when (and (true? (get-in equation [:attributes :host-only]))
+                  (seq (:operations equation)))
+         (throw (ex-info "host-only equations cannot carry scheduled operations"
+                         {:reason :parallel-program-host-only-operations
+                          :equation (:id equation)})))
        (doseq [operation (:operations equation)]
          (when-not (operation? operation)
            (throw (ex-info "an illegal operation remains after full dialect conversion"
@@ -134,6 +141,28 @@
   "The compatibility host expression surrounding the explicit parallel equations."
   [program]
   (:source (validate! program)))
+
+(defn declared-parameter-types
+  "Project backend parameter dtypes from a validated program's value contracts.
+
+   Scalar tensors have shape `[]`; tensor values with one or more dimensions are buffers. Only
+   symbol IDs can name parameters in the compatibility host expression. Explicit backend options
+   may still override this projection, but a typed program never needs to rediscover an index dtype
+   from a spelling such as `cols`."
+  [program]
+  (let [values (:values (validate! program))
+        typed-symbols (keep (fn [[id value]]
+                              (when (and (symbol? id)
+                                         (= :tensor (:kind value))
+                                         (keyword? (:dtype value)))
+                                [id value]))
+                            values)]
+    {:scalar-types (into {} (keep (fn [[id value]]
+                                    (when (empty? (:shape value)) [id (:dtype value)])))
+                         typed-symbols)
+     :array-types (into {} (keep (fn [[id value]]
+                                   (when (seq (:shape value)) [id (:dtype value)])))
+                        typed-symbols)}))
 
 (defn equation-for-binding
   "Find the equation for a binding only when the current source still matches its certified source.

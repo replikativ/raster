@@ -283,9 +283,18 @@
   (let [parallel-program (when (parallel-program/parallel-program? form)
                            (parallel-program/validate! form segop/segop-node?))
         source-form (if parallel-program (parallel-program/source-form parallel-program) form)
-        top-scalar-types (merge (or (:scalar-types (meta source-form)) {})
+        ;; The TypedSOAC route's AbstractValues are declared source facts. Compatibility SegOp
+        ;; envelopes still infer some host scalars at element dtype and must retain their existing
+        ;; metadata/name fallback until that adapter is retired.
+        program-types (when (and parallel-program
+                                 (= :typed-soac
+                                    (get-in parallel-program [:provenance :source-dialect])))
+                        (parallel-program/declared-parameter-types parallel-program))
+        top-scalar-types (merge (or (:scalar-types program-types) {})
+                                (or (:scalar-types (meta source-form)) {})
                                 (or (:scalar-types (meta form)) {}) scalar-types)
-        top-array-types (merge (or (:array-types (meta source-form)) {})
+        top-array-types (merge (or (:array-types program-types) {})
+                               (or (:array-types (meta source-form)) {})
                                (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
                      :ze-structured-reductions 0 :fallback 0})

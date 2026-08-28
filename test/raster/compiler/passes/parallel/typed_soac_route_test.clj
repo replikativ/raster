@@ -56,11 +56,81 @@
                                           (+ (clojure.core/aget y j) 1.0))]
                       z)
         program (:program (route/attempt source nil :float {'x :double}))
-        algorithm (get-in program [:equations 0 :algorithm])]
+        scalar-equation (some #(when (= 'scalar
+                                        (dialect/operation-kind
+                                         (first (dialect/equations (:algorithm %))))) %)
+                              (:equations program))
+        map-equation (some #(when (= 'map
+                                     (dialect/operation-kind
+                                      (first (dialect/equations (:algorithm %))))) %)
+                           (:equations program))
+        algorithm (:algorithm map-equation)]
     (is (= :typed-soac (:dialect program)))
+    (is (= [:binding 'n] (:site scalar-equation)))
+    (is (= '(clojure.core/alength x)
+           (:source scalar-equation)))
     (is (= 'n (dialect/operation-extent (first (dialect/equations algorithm)))))
     (is (= :double (get-in (dialect/facts algorithm) [:values 'x :dtype])))
     (is (= :float (get-in (dialect/facts algorithm) [:values 'z :dtype])))))
+
+(deftest scalar-shapes-and-stable-tensor-captures-route-a-nested-reduction
+  (let [source
+        '(let* [rows (clojure.core/alength b1)
+                cols (clojure.core/alength x)
+                h (raster.par/pmap i rows double
+                                   (+ (clojure.core/aget b1 i)
+                                      (raster.par/reduce
+                                       acc 0.0 j cols
+                                       (+ acc (* (clojure.core/aget W1 (+ (* i cols) j))
+                                                 (clojure.core/aget x j))))))
+                a (raster.par/pmap k (clojure.core/alength h) double
+                                   (max 0.0 (clojure.core/aget h k)))
+                out-rows (clojure.core/alength b2)
+                reused-cols (clojure.core/alength a)
+                out (raster.par/pmap o out-rows double
+                                     (+ (clojure.core/aget b2 o)
+                                        (raster.par/reduce
+                                         acc 0.0 j reused-cols
+                                         (+ acc (* (clojure.core/aget W2
+                                                                      (+ (* o reused-cols) j))
+                                                   (clojure.core/aget a j))))))]
+               out)
+        {:keys [program stats]} (route/attempt
+                                 source nil :double
+                                 {'W1 :double 'W2 :double 'b1 :double 'b2 :double 'x :double})
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :double :target-device :ocl:0}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :double :min-elements 1)
+        equation-kinds (mapv #(dialect/operation-kind
+                               (first (dialect/equations (:algorithm %))))
+                             (:equations program))
+        scheduled-lambdas (->> (:equations scheduled)
+                               (mapcat :operations)
+                               (filter #(instance? raster.compiler.ir.segop.SegMap %))
+                               (map :lambda))
+        argument-kinds (mapv (fn [kernel]
+                               (into {} (map (juxt :name :kind)) (:abi kernel)))
+                             (:kernels emitted))
+        kernel-sources (mapv :source (:kernels emitted))]
+    (is (= :typed-soac (:route stats)))
+    (is (:shadow-certified stats))
+    (is (= 1 (:vertical stats)))
+    (is (= ['scalar 'scalar 'map 'scalar 'scalar 'map] equation-kinds))
+    (is (= 'rows (get-in program [:equations 4 :source]))
+        "alength of the produced activation is value-numbered to its certified extent")
+    (is (not-any? #{'raster.par/reduce} (mapcat flatten scheduled-lambdas))
+        "nested functional reductions become scalar-region control in the scheduled IR")
+    (is (some #{'loop*} (mapcat flatten scheduled-lambdas)))
+    (is (every? #(not (re-find #"unchecked_inc_int|raster\.par/reduce" %)) kernel-sources))
+    (is (every? #(re-find #"int (cols|reused_cols)" %) kernel-sources)
+        "typed scalar shape facts, rather than dtype/name heuristics, determine the kernel ABI")
+    (is (= 2 (get-in emitted [:stats :segop-reused])))
+    (is (= :input (get (first argument-kinds) 'W1)))
+    (is (= :input (get (first argument-kinds) 'x)))
+    (is (= :input (get (second argument-kinds) 'W2)))
+    (is (= :input (get (second argument-kinds) 'a)))
+    (is (= :scalar (get (second argument-kinds) 'reused-cols)))))
 
 (deftest typed-map-and-reduction-schedule-without-source-relowering
   (doseq [[label source operation-class stat]

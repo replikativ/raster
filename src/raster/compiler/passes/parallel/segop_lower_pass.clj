@@ -279,13 +279,18 @@
                    kind (soac-dialect/operation-kind
                          (first (soac-dialect/equations algorithm)))
                    operations (case kind
+                                scalar []
                                 map (soac-lower/lower-typed-map algorithm device-id :dtype dtype)
                                 reduce (soac-lower/lower-typed-reduce algorithm device-id :dtype dtype))]
                (-> equation
                    (assoc :operations operations)
                    (update :provenance assoc :target-dialect :segop)
-                   (update :attributes assoc :device device-id))))
+                   (update :attributes assoc :device device-id)
+                   (cond-> (= 'scalar kind)
+                     (update :attributes assoc :host-only true)))))
            (:equations form))
+          parallel-equation-count (count (remove #(get-in % [:attributes :host-only]) equations))
+          scalar-equation-count (- (count equations) parallel-equation-count)
           lowered (assoc form
                          :dialect :segop
                          :equations equations
@@ -298,9 +303,10 @@
                 (and (= algorithm (soac-dialect/validate! algorithm))
                      (= (:operands equation) (:inputs (soac-dialect/facts algorithm)))
                      (= (:results equation) (soac-dialect/outputs algorithm)))))
-       :stats {:segops-lowered (count equations)
+       :stats {:segops-lowered parallel-equation-count
                :kernel-graphs-lowered 0
-               :typed-soac-reused (count equations)}})
+               :typed-soac-reused parallel-equation-count
+               :typed-scalar-equations scalar-equation-count}})
     (if-not (form/binding-form? form)
       {:form (build-program form [] [] (:target-device opts) (:dtype opts))
        :stats {:segops-lowered 0 :kernel-graphs-lowered 0}}

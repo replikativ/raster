@@ -80,6 +80,9 @@
     (is (str/includes? (emit '(clojure.core// a b)) "/")))
   (testing "Unary negation"
     (is (str/includes? (emit '(clojure.core/- x)) "-")))
+  (testing "JVM integer increments remain arithmetic in C-family scalar regions"
+    (is (= "((idx) + 1)" (emit '(clojure.core/unchecked-inc-int i))))
+    (is (= "((idx) - 1)" (emit '(clojure.core/unchecked-dec-int i)))))
   (testing "Math functions → C math functions"
     (is (str/includes? (emit '(Math/sin x)) "sin("))
     (is (str/includes? (emit '(Math/cos x)) "cos("))

@@ -74,7 +74,11 @@
       (is (not (form-contains-name? (:fixpointed stages) "raster.nn/"))
           "All nn/ calls should be inlined in fixpointed stage")
       (is (pos? (:vertical (:soac-fused-stats stages)))
-          "SOAC should report vertical fusion (dense→relu)"))))
+          "SOAC should report vertical fusion (dense→relu)")
+      (is (= :typed-soac (get-in stages [:soac-fused-stats :route]))
+          "the realistic dense pipeline should retain its typed fusion program")
+      (is (= 4 (get-in stages [:segop-lowered-stats :typed-scalar-equations]))
+          "row/column alength dependencies should remain explicit scalar equations"))))
 
 ;; ================================================================
 ;; Bytecode quality — catches loop/comparison/checkcast regressions

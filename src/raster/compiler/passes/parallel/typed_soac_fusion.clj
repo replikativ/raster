@@ -38,14 +38,33 @@
                                 :parameters parameters
                                 :body-results body-results}))))
 
+(def ^:private scalar-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (scalar ?attributes [??captures]
+                                  (lambda [??parameters] [??body-results])))
+                      (success {:kind :scalar
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays []
+                                :captures captures
+                                :parameters parameters
+                                :body-results body-results}))))
+
 (defn equation-info
   "Return a normalized equation description, using Pattern as the dialect matcher."
   [equation]
-  (let [map-result (map-equation-rule equation)]
-    (if (map? map-result)
-      map-result
-      (let [reduce-result (reduce-equation-rule equation)]
-        (when (map? reduce-result) reduce-result)))))
+  (some #(when (map? %) %)
+        [(scalar-equation-rule equation)
+         (map-equation-rule equation)
+         (reduce-equation-rule equation)]))
+
+(defn- equation-references
+  [equation]
+  (let [{:keys [arrays captures attributes]} (equation-info equation)]
+    (cond-> (vec (concat arrays captures))
+      (:extent attributes) (conj (:extent attributes)))))
 
 (defn- element-symbols
   [n]
@@ -89,6 +108,15 @@
      :capture-parameters canonical-capture-parameters
      :body-results (mapv #(util/subst-syms substitutions %) body-results)}))
 
+(defn- stable-array-captures
+  [info]
+  (set (get-in info [:attributes :attributes :stable-array-captures])))
+
+(defn- with-stable-array-captures
+  [attributes captures stable]
+  (assoc-in attributes [:attributes :stable-array-captures]
+            (vec (filter stable captures))))
+
 (defn- freshen-parameters
   "Give one equation's element and capture binders private names before scopes are combined."
   [info prefix]
@@ -121,10 +149,7 @@
   [program]
   (frequencies
    (concat
-    (mapcat (fn [equation]
-              (let [{:keys [arrays captures attributes]} (equation-info equation)]
-                (concat arrays captures [(:extent attributes)])))
-            (dialect/equations program))
+    (mapcat equation-references (dialect/equations program))
     (dialect/outputs program))))
 
 (defn- merge-provenance
@@ -157,11 +182,7 @@
 (defn- rebuild-boundary
   [program facts equations]
   (let [definitions (set (mapcat #(nth % 2) equations))
-        references (set (mapcat (fn [equation]
-                                  (let [{:keys [arrays captures attributes]}
-                                        (equation-info equation)]
-                                    (concat arrays captures [(:extent attributes)])))
-                                equations))
+        references (set (mapcat equation-references equations))
         inputs (vec (sort-by pr-str (set/difference references definitions)))
         live-values (set/union definitions references (set (dialect/outputs program)))
         facts (-> facts
@@ -203,8 +224,12 @@
           consumed-index (.indexOf ^java.util.List (:arrays consumer) produced)
           consumer-elements (:elements consumer-parameters)
           consumed-parameter (nth consumer-elements consumed-index)
+          producer-expression (util/subst-syms
+                               {(get-in producer [:attributes :index])
+                                (get-in consumer [:attributes :index])}
+                               (first (:body-results producer)))
           inlined-body (mapv #(util/subst-syms
-                               {consumed-parameter (first (:body-results producer))} %)
+                               {consumed-parameter producer-expression} %)
                              (:body-results consumer))
           raw-arrays (vec (concat (subvec (vec (:arrays consumer)) 0 consumed-index)
                                   (:arrays producer)
@@ -218,7 +243,11 @@
                        (:capture-parameters consumer-parameters)))
           canonical (canonical-operands raw-arrays raw-elements
                                         raw-captures raw-capture-parameters inlined-body)
+          stable (set/union (stable-array-captures producer)
+                            (stable-array-captures consumer))
           updated (assoc consumer
+                         :attributes (with-stable-array-captures
+                                       (:attributes consumer) (:captures canonical) stable)
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)
                          :parameters (vec (concat (:accumulators consumer-parameters)
@@ -281,7 +310,10 @@
                      (vec (concat (:capture-parameters left-parameters)
                                   (:capture-parameters right-parameters)))
                      (vec (concat (:body-results left) (:body-results right))))
+          stable (set/union (stable-array-captures left) (stable-array-captures right))
           updated (assoc left
+                         :attributes (with-stable-array-captures
+                                       (:attributes left) (:captures canonical) stable)
                          :results (vec (concat (:results left) (:results right)))
                          :arrays (:arrays canonical)
                          :captures (:captures canonical)

@@ -41,43 +41,70 @@
            (empty? (:segment-axes node))
            (reduction/scalar? (:reduction node)))))
 
+(defn- alength-array
+  [expression]
+  (when (and (seq? expression)
+             (descriptor/alength-op? (descriptor/semantic-op expression))
+             (= 1 (count (descriptor/call-args expression))))
+    (first (descriptor/call-args expression))))
+
 (defn- normalize-node-extents
-  "Replace `(alength <earlier pure result>)` with that result's already-known typed extent."
+  "Value-number pure scalar extents and replace `alength` of a known result with its certified
+   producer extent. Scalar names remain distinct values; only their operation uses are canonical."
   [nodes]
   (:nodes
    (reduce
-    (fn [{:keys [extents] :as state} node]
-      (if (or (legacy/soac-map? node) (legacy/soac-reduce? node))
-        (let [bound (:bound node)
-              array (when (and (seq? bound)
-                               (descriptor/alength-op? (descriptor/semantic-op bound)))
-                      (first (descriptor/call-args bound)))
-              bound' (get extents array bound)
-              node' (assoc node :bound bound')
-              produced (if (legacy/soac-map? node') [(:sym node')] (:outputs node'))]
+    (fn [{:keys [extents scalar-representatives] :as state} node]
+      (cond
+        (legacy/scalar-binding? node)
+        (let [expression (:expr node)
+              array (alength-array expression)
+              representative (cond
+                               (and array (contains? extents array)) (get extents array)
+                               (symbol? expression)
+                               (get scalar-representatives expression expression)
+                               (integer? expression) expression
+                               :else (:sym node))
+              expression' (if (= representative (:sym node)) expression representative)]
           (-> state
-              (update :nodes conj node')
-              (update :extents into (map (fn [result] [result bound']) produced))))
+              (update :nodes conj (assoc node :expr expression'))
+              (assoc-in [:scalar-representatives (:sym node)] representative)))
+
+        (or (legacy/soac-map? node) (legacy/soac-reduce? node))
+        (let [bound (:bound node)
+              array (alength-array bound)
+              bound' (cond
+                       (and array (contains? extents array)) (get extents array)
+                       (symbol? bound) (get scalar-representatives bound bound)
+                       :else bound)
+              node' (assoc node :bound bound')]
+          (cond-> (update state :nodes conj node')
+            (legacy/soac-map? node') (assoc-in [:extents (:sym node')] bound')))
+
+        :else
         (update state :nodes conj node)))
-    {:nodes [] :extents {}}
+    {:nodes [] :extents {} :scalar-representatives {}}
     nodes)))
 
 (defn- terminal-results
   [nodes body]
   (let [operations (filterv #(or (legacy/soac-map? %) (legacy/soac-reduce? %)) nodes)
-        definitions (set (mapcat (fn [node]
-                                   (if (legacy/soac-map? node) [(:sym node)] (:outputs node)))
-                                 operations))
-        operation-uses (set (mapcat #(concat (or (:inputs %) #{}) (or (:scalars %) #{}))
-                                    operations))
-        host-uses (set/union
-                   (set (mapcat #(when (legacy/scalar-binding? %)
-                                   (util/free-syms (:expr %)))
-                                nodes))
-                   (set (mapcat util/free-syms body)))]
+        operation-definitions (set (mapcat (fn [node]
+                                             (if (legacy/soac-map? node)
+                                               [(:sym node)] (:outputs node)))
+                                           operations))
+        scalar-definitions (set (keep #(when (legacy/scalar-binding? %) (:sym %)) nodes))
+        all-definitions (set/union operation-definitions scalar-definitions)
+        operation-uses (set (concat
+                             (mapcat #(concat (or (:inputs %) #{}) (or (:scalars %) #{}))
+                                     operations)
+                             (mapcat #(when (legacy/scalar-binding? %)
+                                        (util/free-syms (:expr %)))
+                                     nodes)))
+        body-uses (set (mapcat util/free-syms body))]
     (vec (sort-by pr-str
-                  (set/union (set/difference definitions operation-uses)
-                             (set/intersection definitions host-uses))))))
+                  (set/union (set/difference operation-definitions operation-uses)
+                             (set/intersection all-definitions body-uses))))))
 
 (defn- equation-subprogram
   [program equation]
@@ -98,8 +125,7 @@
 
 (defn- scalar-region
   [equation]
-  (let [[_ _ _ operation] equation
-        [_ attributes arrays captures lambda] operation
+  (let [{:keys [attributes arrays captures lambda]} (dialect/operation-parts equation)
         [_ _ body-results] lambda
         {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
         substitutions
@@ -122,8 +148,8 @@
 
 (defn- realize-equation
   [program equation]
-  (let [[_ equation-id results operation] equation
-        [kind attributes _ _ _] operation
+  (let [[_ equation-id results] equation
+        {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
         bodies (scalar-region equation)
         placement-facts (get-in (dialect/facts program) [:equations equation-id])
@@ -131,6 +157,19 @@
                             #{(or (get-in placement-facts [:provenance :legacy-soac-id]) equation-id)})
         placement (apply max constituent-ids)]
     (case kind
+      scalar
+      (let [_ (when-not (= 1 (count results))
+                (throw (ex-info "the production scalar route requires one scalar result"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results})))
+            result (first results)
+            source (first bodies)]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[result source]]
+         :site [:binding result]
+         :source source})
+
       map
       (do
         (when-not (= 1 (count results))
@@ -163,20 +202,16 @@
          :source source}))))
 
 (defn- realize-source
-  [form nodes program]
+  [form program]
   (let [[let-head bindings & body] form
-        original-pairs (vec (partition 2 bindings))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
-        operation-id? (set (map :id (remove legacy/scalar-binding? nodes)))
         pairs
         (vec
          (mapcat
           (fn [id]
-            (concat
-             (when-not (contains? operation-id? id) [(nth original-pairs id)])
-             (mapcat :pairs (get by-placement id))))
-          (range (count original-pairs))))
+            (mapcat :pairs (get by-placement id)))
+          (range (count (partition 2 bindings)))))
         source (with-meta (list* let-head (vec (mapcat identity pairs)) body) (meta form))]
     {:source source :realized (into {} (map (juxt :equation-id identity)) realized)}))
 
@@ -236,14 +271,14 @@
                  typed-input (adapter/legacy-nodes->program
                               nodes {:outputs outputs :dtype dtype
                                      :array-types array-types
-                                     :preserve-scalar-bindings? true})
+                                     :include-scalar-bindings? true})
                  [typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
                  source-graph (graph/build-fusion-graph nodes)
                  [legacy-result _] (graph/fusion-fixpoint source-graph abstract-machine dtype)
                  shadow (adapter/legacy-nodes->program
                          (:nodes legacy-result) {:outputs outputs :dtype dtype
                                                  :array-types array-types
-                                                 :preserve-scalar-bindings? true})]
+                                                 :include-scalar-bindings? true})]
              (cond
                (not (pos? (:vertical typed-stats)))
                {:declined {:reason :no-certified-vertical-fusion :stats typed-stats}}
@@ -255,7 +290,7 @@
                {:declined {:reason :fusion-shadow-disagreement :stats typed-stats}}
 
                :else
-               (let [{:keys [source realized]} (realize-source form source-nodes typed-result)]
+               (let [{:keys [source realized]} (realize-source form typed-result)]
                  {:program (envelope typed-result source realized)
                   :stats (assoc typed-stats :route :typed-soac
                                 :shadow-certified true)})))))
