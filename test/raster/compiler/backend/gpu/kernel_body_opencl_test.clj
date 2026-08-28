@@ -98,6 +98,10 @@
   ([] (async-staging-kernel-body :preferred))
   ([overlap] (fixtures/async-staging-body 32 overlap)))
 
+(defn pipelined-staging-kernel-body
+  ([] (pipelined-staging-kernel-body :preferred))
+  ([overlap] (fixtures/pipelined-staging-body 32 overlap)))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -294,3 +298,37 @@
             {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                          "-fsyntax-only" "-" :in source)]
         (is (zero? exit) err)))))
+
+(deftest pipelined-for-lowers-loop-carried-async-groups-across-targets
+  (let [opencl-source (opencl/emit-scalar-kernel
+                       "pipelined_staging" (pipelined-staging-kernel-body)
+                       {:target-dialect :opencl-portable})
+        cuda-source (opencl/emit-scalar-kernel
+                     "pipelined_staging" (pipelined-staging-kernel-body)
+                     {:target-dialect :cuda
+                      :target-features {:compute-capability [8 0]}})
+        hip-source (opencl/emit-scalar-kernel
+                    "pipelined_staging" (pipelined-staging-kernel-body)
+                    {:target-dialect :hip})]
+    (testing "OpenCL materializes event-valued loop carries and parallel backedge copies"
+      (is (str/includes? opencl-source
+                         "event_t rstr_carry_a_event_0 = rstr_warm_a"))
+      (is (str/includes? opencl-source
+                         "event_t rstr_carry_a_next_event_0 = rstr_refill_a"))
+      (is (str/includes? opencl-source
+                         "rstr_carry_a_event_0 = rstr_carry_a_next_event_0"))
+      (is (str/includes? opencl-source
+                         "wait_group_events(1, &rstr_carry_a_event_0)")))
+    (testing "CUDA retains the same steady-state loop through native cp.async groups"
+      (is (str/includes? cuda-source "for (int rstr_pipeline_iteration = 0"))
+      (is (str/includes? cuda-source "cp.async.commit_group"))
+      (is (str/includes? cuda-source "cp.async.wait_group 1")))
+    (testing "HIP preserves correctness with an honest synchronous pipeline spelling"
+      (is (str/includes? hip-source "for (int rstr_pipeline_iteration = 0"))
+      (is (str/includes? hip-source "synchronous cooperative copies are complete"))
+      (is (not (str/includes? hip-source "cp.async"))))
+    (testing "the native event pipeline remains valid OpenCL C"
+      (when (command-available? "clang")
+        (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                           "-fsyntax-only" "-" :in opencl-source)]
+          (is (zero? exit) err))))))

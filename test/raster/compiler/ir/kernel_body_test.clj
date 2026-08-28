@@ -1,5 +1,6 @@
 (ns raster.compiler.ir.kernel-body-test
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.kernel-body-fixtures :as fixtures]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-body :as body]
@@ -711,3 +712,44 @@
            (apply scalar-body
                   (assoc (async-stage-operations) 0 (async-stage-copy ['lane]))
                   options))))))
+
+(deftest pipelined-for-carries-a-verified-rotating-async-queue
+  (let [kernel (fixtures/pipelined-staging-body 16 :preferred)
+        pipeline-index 4]
+    (is (body/kernel-body? kernel))
+    (is (= :exact (get-in kernel [:operations pipeline-index :attributes :tail-policy])))
+    (is (= ['pipeline-group-a 'pipeline-group-b]
+           (get-in kernel [:operations pipeline-index :async-results])))
+    (testing "the tail policy is part of the scheduled loop contract"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"explicit tail policy"
+           (body/validate! (assoc-in kernel
+                                     [:operations pipeline-index :attributes]
+                                     {})))))
+    (testing "every carried group is the complete ordered queue at loop entry"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"complete ordered async queue"
+           (body/validate!
+            (-> kernel
+                (assoc-in [:operations pipeline-index :async-iter-args]
+                          [(body/->AsyncLoopArg 'carry-a 'warm-group-a)])
+                (assoc-in [:operations pipeline-index :async-results]
+                          ['pipeline-group-a]))))))
+    (testing "a stage cannot be refilled before all workgroup readers finish"
+      (let [pipeline-operations (get-in kernel [:operations pipeline-index :operations])]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"destination is still live"
+             (body/validate!
+              (assoc-in kernel [:operations pipeline-index :operations]
+                        (vec (concat (subvec pipeline-operations 0 3)
+                                     (subvec pipeline-operations 4)))))))))
+    (testing "the backedge preserves each rotating stage position"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"preserve its rotating async stages"
+           (body/validate!
+            (assoc-in kernel [:operations pipeline-index :operations 4 :elements] 8)))))
+    (testing "pending pipeline results must be drained outside the loop"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"lifetime crosses a structured region boundary"
+           (body/validate! (assoc kernel :operations
+                                  (subvec (:operations kernel) 0 5))))))))
