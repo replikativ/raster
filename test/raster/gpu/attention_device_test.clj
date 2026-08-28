@@ -243,8 +243,10 @@
   [device-id route-kind visibility-kind policy expected-strategy]
   (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
         (make-case route-kind visibility-kind)
-        descriptor (assoc (hardware/descriptor-for device-id)
-                          :segmented-weighted-reduction-schedule policy)
+        descriptor (cond-> (assoc (hardware/descriptor-for device-id)
+                                  :segmented-weighted-reduction-schedule policy)
+                     (= :subgroup-online-tiled-history policy)
+                     (assoc :segmented-weighted-reduction-history-tile-size 2))
         routed (route/route! problem descriptor)
         _ (is (= expected-strategy (:strategy routed))
               "the device test must execute the intended attention leaf")
@@ -319,7 +321,9 @@
     (do
       (run-case :ze:0 :dense-paged :interval :reference :fp16-reference)
       (run-case :ze:0 :dense-paged :interval :subgroup-score-reuse
-                :routed-paged-subgroup-online-score-reuse))))
+                :routed-paged-subgroup-online-score-reuse)
+      (run-case :ze:0 :dense-paged :interval :subgroup-online-tiled-history
+                :routed-paged-subgroup-online-tiled-history))))
 
 (deftest level-zero-fp32-query-and-output-with-fp16-kv-matches-reference
   (if-not @gp/gpu-available?
@@ -344,3 +348,15 @@
     (device-probe/opencl-skip! "logical CSR visibility over CSR pages" :fp16)
     (run-case :ocl:0 :csr-paged :csr :auto
               :routed-paged-subgroup-online-score-reuse)))
+
+(deftest opencl-tiled-history-route-and-visibility-products-match-reference
+  (if-not @device-probe/opencl-fp16-available?
+    (device-probe/opencl-skip! "two-stage tiled routed attention" :fp16)
+    (doseq [[route-kind visibility-kind]
+            [[:dense-paged :interval]
+             [:dense-paged :csr]
+             [:csr-paged :interval]
+             [:csr-paged :csr]]]
+      (run-case :ocl:0 route-kind visibility-kind
+                :subgroup-online-tiled-history
+                :routed-paged-subgroup-online-tiled-history))))

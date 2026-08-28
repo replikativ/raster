@@ -1,5 +1,6 @@
 (ns raster.compiler.passes.parallel.attention-route-test
   (:require [clojure.string :as str]
+            [clojure.set :as set]
             [clojure.java.shell :as shell]
             [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.attention :as attention-emit]
@@ -148,6 +149,106 @@
           (is (not (str/includes? source "rstr_value_component_16")))
           (is (zero? (:exit result)) (:err result)))))))
 
+(deftest tiled-history-is-a-two-stage-kernel-graph-with-a-stable-external-abi
+  (let [desc (assoc intel-desc
+                    :segmented-weighted-reduction-schedule
+                    :subgroup-online-tiled-history
+                    :segmented-weighted-reduction-history-tile-size 2)
+        reference (route/route!
+                   (problem) (assoc intel-desc
+                                    :segmented-weighted-reduction-schedule :reference))
+        {:keys [strategy reference? artifact graph executable schedule]}
+        (route/route! (problem) desc)
+        other-graph (:graph (route/route! (problem :id :other-attention) desc))
+        scheduled (get-in graph [:attributes :segmented-weighted-reduction-schedule])
+        [partial merge] (:nodes graph)
+        partial-body (get-in partial [:operation :attributes :kernel-body])
+        merge-body (get-in merge [:operation :attributes :kernel-body])]
+    (is (= :routed-paged-subgroup-online-tiled-history strategy))
+    (is (false? reference?))
+    (is (nil? artifact) "a multi-kernel executable is not disguised as one artifact")
+    (is (identical? graph executable))
+    (is (= (kexec/common-view (:graph reference)) (kexec/common-view graph)))
+    (is (= {:kind :static-contiguous-tiles :tile-size 2 :tile-count 3
+            :membership-capacity 6 :merge-order :increasing-membership-tile}
+           (:membership-tiling scheduled)))
+    (is (= {:kind :maximum-rescale-sum
+            :order :increasing-membership-tile
+            :nan-policy :propagate :empty-policy :identity}
+           (get-in scheduled [:state :merge])))
+    (is (= :increasing-members-within-tile-then-increasing-tile-left-fold
+           (get-in scheduled [:numerical-mode :online-state-order])))
+    (is (= 2 (count (:nodes graph))))
+    (is (= 4 (count (:temporaries graph))))
+    (is (= (mapv :id (:temporaries graph))
+           (get-in graph [:attributes :materialized-intermediates])))
+    (is (empty? (set/intersection
+                 (set (map :id (:temporaries graph)))
+                 (set (map :id (:temporaries other-graph)))))
+        "linked tiled reductions retain disjoint graph-private identities")
+    (is (= #{:partial-valid :partial-maximum :partial-denominator
+             :partial-weighted-values}
+           (set (map :role (get-in graph [:attributes :private-online-state])))))
+    (is (= [4 4 3] (get-in partial [:operation :launch :group-count])))
+    (is (= [4 4] (get-in merge [:operation :launch :group-count])))
+    (is (= [(:id partial)] (:dependencies merge)))
+    (is (= {:stages
+            [{:id (:id partial) :workgroup-size [16 1 1] :group-count [4 4 3]}
+             {:id (:id merge) :workgroup-size [16 1] :group-count [4 4]}]}
+           schedule))
+    (is (kbody/kernel-body? partial-body))
+    (is (kbody/kernel-body? merge-body))
+    (is (= :scheduled-partial-kernel-body (get-in partial-body [:provenance :lowering])))
+    (is (= :scheduled-merge-kernel-body (get-in merge-body [:provenance :lowering])))
+    (is (= :partial (get-in partial-body [:schedule :phase])))
+    (is (= :merge (get-in merge-body [:schedule :phase])))
+    (is (every? #(str/includes? (get-in % [:operation :source])
+                                "intel_reqd_sub_group_size(16)")
+                [partial merge])
+        "lane-mapped merge kernels retain their required subgroup geometry without a collective")
+    (is (str/includes? (get-in partial [:operation :source])
+                       "rstr_tile_membership_begin"))
+    (is (str/includes? (get-in merge [:operation :source])
+                       "for (int rstr_merge_tile = 0; rstr_merge_tile < 3"))
+    (let [nvidia (route/route
+                  (problem)
+                  {:device-type :gpu :vendor "NVIDIA" :subgroup-size 32
+                   :max-workgroup-size 1024
+                   :segmented-weighted-reduction-schedule
+                   :subgroup-online-tiled-history})]
+      (is (nil? (:strategy nvidia)))
+      (is (= :routed-paged-subgroup-online-tiled-history
+             (get-in nvidia [:declines 0 :leaf])))
+      (is (= :score-reuse-requires-intel-subgroup-dialect
+             (get-in nvidia [:declines 0 :reason]))))
+    (is (= :score-reuse-invalid-history-tile-size
+           (get-in (route/route
+                    (problem)
+                    (assoc desc :segmented-weighted-reduction-history-tile-size 0))
+                   [:declines 0 :reason])))))
+
+(deftest tiled-history-sources-cover-route-and-visibility-products
+  (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
+        desc (assoc intel-desc
+                    :segmented-weighted-reduction-schedule
+                    :subgroup-online-tiled-history
+                    :segmented-weighted-reduction-history-tile-size 2)]
+    (if-not clang?
+      (is true "clang unavailable")
+      (doseq [[physical-route visibility]
+              [[(dense-route) (attention/visibility)]
+               [(dense-route) (csr-visibility)]
+               [(csr-route) (attention/visibility)]
+               [(csr-route) (csr-visibility)]]
+              node (get-in (route/route!
+                            (problem :route physical-route :visibility visibility)
+                            desc)
+                           [:graph :nodes])]
+        (let [source (get-in node [:operation :source])
+              result (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                               "-fsyntax-only" "-" :in source)]
+          (is (zero? (:exit result)) (:err result)))))))
+
 (deftest cooperative-schedule-is-validated-and-target-legality-is-explicit
   (let [desc {:device-type :gpu :vendor "Intel"
               :subgroup-size 16 :max-workgroup-size 256}
@@ -160,7 +261,9 @@
     (is (= {:kind :subgroup :width 16 :axis :qk-component}
            (:score-reduction schedule)))
     (is (= {:score-accumulate :float :state-accumulate :float
-            :dot-order :implementation-defined :online-rescale? true}
+            :dot-order :implementation-defined
+            :online-state-order :increasing-membership
+            :online-rescale? true}
            (:numerical-mode schedule)))
     (is (= :segmented-weighted-reduction-value-mapping
            (try
@@ -172,6 +275,18 @@
              (swr-schedule/validate!
               (assoc schedule :membership-traversal :sequential))
              (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (is (= :segmented-weighted-reduction-partial-schedule
+           (try
+             (swr-body/partial-buffer-specs plan schedule)
+             (catch clojure.lang.ExceptionInfo e (:reason (ex-data e))))))
+    (let [tiled (:schedule (schedule-pass/plan-subgroup-online-tiled
+                            plan (assoc desc
+                                        :segmented-weighted-reduction-history-tile-size 2)))]
+      (is (= :segmented-weighted-reduction-membership-tiling
+             (try
+               (swr-schedule/validate!
+                (assoc-in tiled [:membership-tiling :tile-count] 2))
+               (catch clojure.lang.ExceptionInfo e (:reason (ex-data e)))))))
     (is (= :attention-cooperative-schedule-plan-mismatch
            (try
              (attention-emit/emit-fp16-cooperative

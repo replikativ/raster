@@ -7,7 +7,50 @@
 
 (defrecord SegmentedWeightedReductionSchedule
            [strategy workgroup-size segment-mapping membership-traversal score-reduction
-            value-mapping state numerical-mode attributes])
+            membership-tiling value-mapping state numerical-mode attributes])
+
+(def ^:private online-state-components
+  [:maximum :denominator :weighted-values])
+
+(def ^:private online-state-merge
+  {:kind :maximum-rescale-sum
+   :order :increasing-membership-tile
+   :nan-policy :propagate
+   :empty-policy :identity})
+
+(defn online-state
+  "The explicit mergeable state carried by sequential and tiled online schedules.
+
+  This is scheduled reduction state, not an attention semantic.  Its merge law lets a later
+  lowering partition any normalized exponential weighted reduction without exposing partial
+  buffers through the source operation or public ABI."
+  []
+  {:kind :online-normalized-weighted-sum
+   :components online-state-components
+   :merge online-state-merge})
+
+(declare validate!)
+
+(defn tiled?
+  [schedule]
+  (= :static-contiguous-tiles (get-in (validate! schedule) [:membership-tiling :kind])))
+
+(defn- valid-membership-tiling?
+  [membership-tiling]
+  (case (:kind membership-tiling)
+    :sequential
+    (= {:kind :sequential} membership-tiling)
+
+    :static-contiguous-tiles
+    (let [{:keys [tile-size tile-count membership-capacity merge-order]} membership-tiling]
+      (and (pos-int? tile-size)
+           (<= tile-size Integer/MAX_VALUE)
+           (pos-int? tile-count)
+           (pos-int? membership-capacity)
+           (= tile-count (quot (+ membership-capacity (dec tile-size)) tile-size))
+           (= :increasing-membership-tile merge-order)))
+
+    false))
 
 (defn schedule?
   [value]
@@ -22,8 +65,10 @@
                     {:reason :segmented-weighted-reduction-schedule-type
                      :schedule schedule})))
   (let [{:keys [strategy workgroup-size segment-mapping membership-traversal score-reduction
-                value-mapping state numerical-mode attributes]} schedule]
-    (when-not (= :subgroup-online-score-reuse strategy)
+                membership-tiling value-mapping state numerical-mode attributes]} schedule]
+    (when-not (contains? #{:subgroup-online-score-reuse
+                           :subgroup-online-tiled-history}
+                         strategy)
       (throw (ex-info "segmented weighted-reduction schedule has an unsupported strategy"
                       {:reason :segmented-weighted-reduction-schedule-strategy
                        :strategy strategy})))
@@ -31,10 +76,15 @@
       (throw (ex-info "segmented weighted-reduction workgroup size must be positive"
                       {:reason :segmented-weighted-reduction-schedule-workgroup
                        :workgroup-size workgroup-size})))
-    (when-not (= :one-workgroup-per-segment segment-mapping)
-      (throw (ex-info "cooperative weighted reduction requires one workgroup per segment"
+    (let [expected-mapping (if (= :subgroup-online-tiled-history strategy)
+                             {:partial :one-workgroup-per-segment-tile
+                              :merge :one-workgroup-per-segment}
+                             :one-workgroup-per-segment)]
+      (when-not (= expected-mapping segment-mapping)
+        (throw (ex-info "cooperative weighted reduction has an invalid segment mapping"
                       {:reason :segmented-weighted-reduction-segment-mapping
-                       :segment-mapping segment-mapping})))
+                       :strategy strategy :segment-mapping segment-mapping
+                       :expected expected-mapping}))))
     (when-not (contains? #{:contiguous-interval :csr-row} membership-traversal)
       (throw (ex-info "cooperative weighted reduction requires a bounded membership traversal"
                       {:reason :segmented-weighted-reduction-membership-traversal
@@ -47,6 +97,12 @@
                       {:reason :segmented-weighted-reduction-score-reduction
                        :score-reduction score-reduction
                        :workgroup-size workgroup-size})))
+    (when-not (and (valid-membership-tiling? membership-tiling)
+                   (= (= :subgroup-online-tiled-history strategy)
+                      (= :static-contiguous-tiles (:kind membership-tiling))))
+      (throw (ex-info "weighted-reduction membership tiling is incomplete or inconsistent"
+                      {:reason :segmented-weighted-reduction-membership-tiling
+                       :strategy strategy :membership-tiling membership-tiling})))
     (when-not (and (= :lane-strided (:kind value-mapping))
                    (integer? (:components value-mapping))
                    (pos? (:components value-mapping))
@@ -58,9 +114,7 @@
                       {:reason :segmented-weighted-reduction-value-mapping
                        :value-mapping value-mapping
                        :workgroup-size workgroup-size})))
-    (when-not (= {:kind :online-normalized-weighted-sum
-                  :components [:maximum :denominator :weighted-values]}
-                 state)
+    (when-not (= (online-state) state)
       (throw (ex-info "cooperative weighted reduction requires explicit online softmax state"
                       {:reason :segmented-weighted-reduction-online-state :state state})))
     (when-not (and (map? numerical-mode)
@@ -68,6 +122,10 @@
                    (keyword? (:state-accumulate numerical-mode))
                    (= :implementation-defined (:dot-order numerical-mode))
                    (true? (:online-rescale? numerical-mode))
+                   (= (if (= :subgroup-online-tiled-history strategy)
+                        :increasing-members-within-tile-then-increasing-tile-left-fold
+                        :increasing-membership)
+                      (:online-state-order numerical-mode))
                    (map? attributes))
       (throw (ex-info "segmented weighted-reduction numerical and attribute facets are incomplete"
                       {:reason :segmented-weighted-reduction-schedule-facets
@@ -76,9 +134,9 @@
 
 (defn make
   [{:keys [strategy workgroup-size segment-mapping membership-traversal score-reduction
-           value-mapping state numerical-mode attributes]
+           membership-tiling value-mapping state numerical-mode attributes]
     :or {attributes {}}}]
   (validate!
    (->SegmentedWeightedReductionSchedule
-    strategy workgroup-size segment-mapping membership-traversal score-reduction value-mapping
-    state numerical-mode attributes)))
+    strategy workgroup-size segment-mapping membership-traversal score-reduction
+    membership-tiling value-mapping state numerical-mode attributes)))
