@@ -37,6 +37,11 @@
 (defrecord IfRegion [condition then-operations else-operations results])
 (defrecord LoopArg [binding initial])
 (defrecord ForLoop [index lower upper step iter-args operations results attributes])
+(defrecord AsyncLoopArg [binding initial])
+(defrecord PipelineYield [values groups])
+(defrecord PipelinedFor
+           [index lower upper step iter-args async-iter-args operations results async-results
+            attributes])
 (defrecord Participation [kind])
 (defrecord Collective
            [result kind scope width input operator source-lane participation association])
@@ -74,6 +79,7 @@
 (def ^:private async-wait-semantics #{:acquire})
 (def ^:private async-overlap-policies #{:preferred :required})
 (def ^:private async-transfer-widths #{4 8 16})
+(def ^:private pipeline-tail-policies #{:exact :separate-epilogue})
 
 (defn- record-kind? [class-name value]
   (and value (= class-name (.getName (class value)))))
@@ -344,6 +350,8 @@
                "raster.compiler.ir.kernel_body.Yield"
                "raster.compiler.ir.kernel_body.IfRegion"
                "raster.compiler.ir.kernel_body.ForLoop"
+               "raster.compiler.ir.kernel_body.PipelineYield"
+               "raster.compiler.ir.kernel_body.PipelinedFor"
                "raster.compiler.ir.kernel_body.Collective"
                "raster.compiler.ir.kernel_body.WorkgroupBarrier"
                "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy"
@@ -633,10 +641,67 @@
         (validate-operations! (:operations operation) storage fragments masks
                               (conj scope (:id index)) epilogue-abi))
 
+      (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
+      (let [index (:index operation)
+            async-args (:async-iter-args operation)
+            async-results (:async-results operation)
+            tail-policy (get-in operation [:attributes :tail-policy])]
+        (value-spec! "kernel pipelined-for index" index)
+        (when-not (contains? #{:int :long} (canonical-type (:type index)))
+          (throw (ex-info "kernel pipelined-for index must have an integral dtype"
+                          {:index index})))
+        (when-not (and (expression? (:lower operation)) (expression? (:upper operation))
+                       (integer? (:step operation)) (pos? (:step operation))
+                       (vector? (:iter-args operation))
+                       (every? #(record-kind? "raster.compiler.ir.kernel_body.LoopArg" %)
+                               (:iter-args operation))
+                       (vector? async-args) (seq async-args)
+                       (every? #(record-kind?
+                                 "raster.compiler.ir.kernel_body.AsyncLoopArg" %)
+                               async-args)
+                       (every? #(and (value-id? (:binding %)) (value-id? (:initial %)))
+                               async-args)
+                       (= (count async-args) (count async-results))
+                       (vector? async-results) (every? value-id? async-results)
+                       (= (count async-results) (count (set async-results)))
+                       (vector? (:results operation))
+                       (= (count (:iter-args operation)) (count (:results operation)))
+                       (map? (:attributes operation))
+                       (contains? pipeline-tail-policies tail-policy))
+          (throw (ex-info
+                  "kernel pipelined-for requires scalar and async carries with an explicit tail policy"
+                  {:reason :kernel-body-pipelined-for :loop operation
+                   :supported-tail-policies pipeline-tail-policies})))
+        (doseq [arg (:iter-args operation)]
+          (value-spec! "pipelined loop carried binding" (:binding arg)))
+        (let [uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
+              bindings (set (map (comp :id :binding) (:iter-args operation)))]
+          (when-not (and (set? uniform-iter-args)
+                         (set/subset? uniform-iter-args bindings))
+            (throw (ex-info
+                    "kernel pipelined-for uniform-iter-args must name scalar carried bindings"
+                    {:reason :kernel-body-loop-uniform-iter-args
+                     :uniform-iter-args uniform-iter-args :bindings bindings}))))
+        (doseq [result (:results operation)]
+          (value-spec! "pipelined loop result" result))
+        (when (contains? scope (:id index))
+          (throw (ex-info "kernel pipelined-for induction value shadows an existing value"
+                          {:index index :scope scope})))
+        (validate-operations! (:operations operation) storage fragments masks
+                              (conj scope (:id index)) epilogue-abi))
+
       (record-kind? "raster.compiler.ir.kernel_body.Yield" operation)
       (when-not (vector? (:values operation))
         (throw (ex-info "kernel region yield values must be an ordered vector"
                         {:operation operation})))
+
+      (record-kind? "raster.compiler.ir.kernel_body.PipelineYield" operation)
+      (when-not (and (vector? (:values operation))
+                     (vector? (:groups operation)) (seq (:groups operation))
+                     (every? value-id? (:groups operation))
+                     (= (count (:groups operation)) (count (set (:groups operation)))))
+        (throw (ex-info "pipelined region yield requires scalar values and async groups"
+                        {:reason :kernel-body-pipeline-yield :operation operation})))
 
       (record-kind? "raster.compiler.ir.kernel_body.Collective" operation)
       (do
@@ -956,6 +1021,19 @@
                     {:operations operations})))
   (peek operations))
 
+(defn- terminal-pipeline-yield!
+  [owner operations]
+  (when-not (and (vector? operations) (seq operations)
+                 (record-kind? "raster.compiler.ir.kernel_body.PipelineYield"
+                               (peek operations)))
+    (throw (ex-info (str owner " must terminate in PipelineYield")
+                    {:reason :kernel-body-pipeline-terminator :operations operations})))
+  (when (some #(record-kind? "raster.compiler.ir.kernel_body.PipelineYield" %)
+              (pop operations))
+    (throw (ex-info (str owner " may only pipeline-yield as its terminal operation")
+                    {:reason :kernel-body-pipeline-terminator :operations operations})))
+  (peek operations))
+
 (declare validate-dataflow-operations!)
 
 (defn- validate-region!
@@ -1122,6 +1200,73 @@
                                          (:uniformity yielded-info)]))))
                 values (map vector results yielded initials))))
 
+    (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
+    (let [index (:index operation)
+          lower-info (expression-info! (:lower operation) values)
+          upper-info (expression-info! (:upper operation) values)
+          index-type (canonical-type (:type index))
+          loop-control (reduce set/intersection control-uniformity
+                               [(:uniformity lower-info) (:uniformity upper-info)])
+          iter-args (:iter-args operation)
+          uniform-iter-args (get-in operation [:attributes :uniform-iter-args] #{})
+          results (:results operation)
+          initials (mapv #(scalar-value-info! (:initial %) values) iter-args)
+          pipeline-yield (terminal-pipeline-yield!
+                          "kernel pipelined-for body" (:operations operation))]
+      (when-not (= index-type (:type lower-info) (:type upper-info))
+        (throw (ex-info "kernel pipelined-for index and bounds must have one integral type"
+                        {:reason :kernel-body-loop-index-dtype :index index
+                         :lower-type (:type lower-info) :upper-type (:type upper-info)})))
+      (claim-value! claimed reserved values index "kernel pipelined-for index")
+      (doseq [[arg initial] (map vector iter-args initials)]
+        (let [binding (:binding arg)]
+          (claim-value! claimed reserved values binding "kernel pipelined loop-carried binding")
+          (when-not (= (canonical-type (:type binding)) (:type initial))
+            (throw (ex-info "kernel pipelined loop initial value disagrees with its binding"
+                            {:reason :kernel-body-loop-initial :arg arg :initial initial})))))
+      (let [loop-values (into (assoc values (:id index)
+                                     {:type index-type :uniformity loop-control})
+                              (map (fn [arg initial]
+                                     [(:id (:binding arg))
+                                      (if (contains? uniform-iter-args (:id (:binding arg)))
+                                        initial
+                                        (assoc initial :uniformity lane-varying))])
+                                   iter-args initials))
+            body-values (validate-dataflow-operations!
+                         (pop (:operations operation)) loop-values
+                         (assoc context :control-uniformity loop-control))
+            yielded (mapv #(scalar-value-info! % body-values)
+                          (:values pipeline-yield))
+            expected-types (mapv (comp canonical-type :type :binding) iter-args)
+            actual-types (mapv :type yielded)]
+        (when-not (= expected-types actual-types)
+          (throw (ex-info
+                  "kernel pipelined-for scalar yield disagrees with its carried values"
+                  {:reason :kernel-body-yield-mismatch
+                   :expected expected-types :actual actual-types})))
+        (doseq [[arg initial yielded-info] (map vector iter-args initials yielded)
+                :when (contains? uniform-iter-args (:id (:binding arg)))]
+          (when-not (set/subset? (:uniformity initial) (:uniformity yielded-info))
+            (throw (ex-info
+                    "kernel pipelined loop uniform carried value is not preserved by its backedge"
+                    {:reason :kernel-body-loop-uniformity-invariant
+                     :binding (:binding arg)
+                     :initial-uniformity (:uniformity initial)
+                     :yielded-uniformity (:uniformity yielded-info)}))))
+        (reduce (fn [env [result yielded-info initial-info]]
+                  (claim-value! claimed reserved values result "kernel pipelined-for result")
+                  (when-not (= (canonical-type (:type result)) (:type yielded-info))
+                    (throw (ex-info
+                            "kernel pipelined-for result type disagrees with its yielded value"
+                            {:reason :kernel-body-loop-result
+                             :result result :yielded yielded-info})))
+                  (assoc env (:id result)
+                         (assoc yielded-info :uniformity
+                                (reduce set/intersection loop-control
+                                        [(:uniformity initial-info)
+                                         (:uniformity yielded-info)]))))
+                values (map vector results yielded initials))))
+
     (record-kind? "raster.compiler.ir.kernel_body.Collective" operation)
     (let [result (claim-value! claimed reserved values (:result operation) "subgroup collective")
           input (scalar-value-info! (:input operation) values)
@@ -1214,6 +1359,10 @@
     (throw (ex-info "Yield is only legal as a structured region terminator"
                     {:reason :kernel-body-misplaced-yield :operation operation}))
 
+    (record-kind? "raster.compiler.ir.kernel_body.PipelineYield" operation)
+    (throw (ex-info "PipelineYield is only legal as a pipelined-for terminator"
+                    {:reason :kernel-body-misplaced-pipeline-yield :operation operation}))
+
     ;; Matrix fragment operations do not define scalar SSA values.
     :else values))
 
@@ -1233,6 +1382,7 @@
     [(:then-operations operation) (:else-operations operation)]
 
     (or (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
+        (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
         (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
         (record-kind? "raster.compiler.ir.kernel_body.Guard" operation))
     [(:operations operation)]
@@ -1254,100 +1404,179 @@
                 (throw (ex-info "async staging lifetime crosses a structured region boundary"
                                 {:reason :kernel-body-async-region-lifetime
                                  :owner owner :state state}))))
-            (validate-sequence! [owner operations]
-              (let [final-state
-                    (reduce
-                     (fn [{:keys [issued committed awaiting-barrier] :as state} operation]
-                       (cond
-                         (record-kind? "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
-                         (let [id (:id operation)
-                               source (get storage (:source operation))
-                               source-root (or (some-> source :view :buffer) (:id source))
-                               destination (:destination operation)]
-                           (claim! id :copy operation)
-                           (when-not (contains? stable-buffers source-root)
-                             (throw (ex-info
-                                     "async copy source requires a whole-kernel stable-read contract"
-                                     {:reason :kernel-body-async-source-stability
-                                      :copy id :source source-root})))
-                           (when (or (some #(= destination (:destination %)) issued)
-                                     (some (fn [group]
-                                             (some #(= destination (:destination %))
-                                                   (:copies group)))
-                                           committed)
-                                     (contains? awaiting-barrier destination))
-                             (throw (ex-info "async copy destination is still live"
-                                             {:reason :kernel-body-async-destination-live
-                                              :copy id :destination destination})))
-                           (update state :issued conj operation))
+            (group-signature [group]
+              (mapv (fn [copy]
+                      [(:destination copy) (:elements copy) (:transfer-bytes copy)])
+                    (:copies group)))
+            (pipeline-state-compatible! [operation incoming outgoing]
+              (let [incoming-widths (mapv (comp count :copies) incoming)
+                    outgoing-widths (mapv (comp count :copies) outgoing)
+                    incoming-stages (mapv group-signature incoming)
+                    outgoing-stages (mapv group-signature outgoing)]
+                (when-not (and (= incoming-widths outgoing-widths)
+                               (= incoming-stages outgoing-stages))
+                  (throw (ex-info
+                          "pipelined-for backedge must preserve its rotating async stages"
+                          {:reason :kernel-body-pipeline-stage-invariant
+                           :operation operation
+                           :incoming (mapv group-signature incoming)
+                           :outgoing (mapv group-signature outgoing)})))))
+            (validate-sequence-state! [owner operations initial-state]
+              (reduce
+               (fn [{:keys [issued committed awaiting-barrier consumed-stages]
+                     :as state} operation]
+                 (cond
+                   (record-kind? "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
+                   (let [id (:id operation)
+                         source (get storage (:source operation))
+                         source-root (or (some-> source :view :buffer) (:id source))
+                         destination (:destination operation)]
+                     (claim! id :copy operation)
+                     (when-not (contains? stable-buffers source-root)
+                       (throw (ex-info
+                               "async copy source requires a whole-kernel stable-read contract"
+                               {:reason :kernel-body-async-source-stability
+                                :copy id :source source-root})))
+                     (when (or (some #(= destination (:destination %)) issued)
+                               (some (fn [group]
+                                       (some #(= destination (:destination %))
+                                             (:copies group)))
+                                     committed)
+                               (contains? awaiting-barrier destination)
+                               (contains? consumed-stages destination))
+                       (throw (ex-info "async copy destination is still live"
+                                       {:reason :kernel-body-async-destination-live
+                                        :copy id :destination destination})))
+                     (-> state
+                         (update :readable-stages disj destination)
+                         (update :issued conj operation)))
 
-                         (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
-                         (let [group (:id operation)
-                               copy-ids (mapv :id issued)]
-                           (claim! group :group operation)
-                           (when-not (= copy-ids (:copies operation))
-                             (throw (ex-info
-                                     "async commit must close every copy issued since the prior commit"
-                                     {:reason :kernel-body-async-commit-order
-                                      :group group :issued copy-ids
-                                      :committed (:copies operation)})))
-                           (-> state
-                               (assoc :issued [])
-                               (update :committed conj {:id group :copies issued})))
+                   (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
+                   (let [group (:id operation)
+                         copy-ids (mapv :id issued)]
+                     (claim! group :group operation)
+                     (when-not (= copy-ids (:copies operation))
+                       (throw (ex-info
+                               "async commit must close every copy issued since the prior commit"
+                               {:reason :kernel-body-async-commit-order
+                                :group group :issued copy-ids
+                                :committed (:copies operation)})))
+                     (-> state
+                         (assoc :issued [])
+                         (update :committed conj {:id group :copies issued})))
 
-                         (record-kind? "raster.compiler.ir.kernel_body.AsyncWait" operation)
-                         (let [groups (:groups operation)
-                               committed-ids (mapv :id committed)
-                               group-count (count groups)
-                               enough-groups? (<= group-count (count committed))
-                               waited (when enough-groups? (subvec committed 0 group-count))
-                               remaining (when enough-groups? (subvec committed group-count))]
-                           (when-not (and enough-groups?
-                                          (= groups (subvec committed-ids 0 group-count))
-                                          (= (:pending-groups operation) (count remaining)))
-                             (throw (ex-info
-                                     "async wait must consume an oldest prefix and state the remainder"
-                                     {:reason :kernel-body-async-wait-order
-                                      :wait groups :committed committed-ids
-                                      :pending-groups (:pending-groups operation)})))
-                           (-> state
-                               (assoc :committed remaining)
-                               (update :awaiting-barrier into
-                                       (map :destination (mapcat :copies waited)))))
+                   (record-kind? "raster.compiler.ir.kernel_body.AsyncWait" operation)
+                   (let [groups (:groups operation)
+                         committed-ids (mapv :id committed)
+                         group-count (count groups)
+                         enough-groups? (<= group-count (count committed))
+                         waited (when enough-groups? (subvec committed 0 group-count))
+                         remaining (when enough-groups? (subvec committed group-count))]
+                     (when-not (and enough-groups?
+                                    (= groups (subvec committed-ids 0 group-count))
+                                    (= (:pending-groups operation) (count remaining)))
+                       (throw (ex-info
+                               "async wait must consume an oldest prefix and state the remainder"
+                               {:reason :kernel-body-async-wait-order
+                                :wait groups :committed committed-ids
+                                :pending-groups (:pending-groups operation)})))
+                     (-> state
+                         (assoc :committed remaining)
+                         (update :awaiting-barrier into
+                                 (map :destination (mapcat :copies waited)))))
 
-                         (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
-                         (assoc state :awaiting-barrier #{})
+                   (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
+                   (-> state
+                       (update :readable-stages into awaiting-barrier)
+                       (assoc :awaiting-barrier #{} :consumed-stages #{}))
 
-                         (or (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
-                             (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation))
-                         (let [buffer (:buffer operation)
-                               incomplete (into (set (map :destination issued))
-                                                (map :destination (mapcat :copies committed)))]
-                           (when (or (contains? incomplete buffer)
-                                     (contains? awaiting-barrier buffer))
-                             (throw (ex-info
-                                     (if (contains? incomplete buffer)
-                                       "staged workgroup memory is consumed before its async wait"
-                                       "staged workgroup memory is consumed before a workgroup barrier")
-                                     {:reason (if (contains? incomplete buffer)
-                                                :kernel-body-async-missing-wait
-                                                :kernel-body-async-missing-barrier)
-                                      :buffer buffer :operation operation})))
-                           state)
+                   (or (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
+                       (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation))
+                   (let [buffer (:buffer operation)
+                         incomplete (into (set (map :destination issued))
+                                          (map :destination (mapcat :copies committed)))]
+                     (when (or (contains? incomplete buffer)
+                               (contains? awaiting-barrier buffer))
+                       (throw (ex-info
+                               (if (contains? incomplete buffer)
+                                 "staged workgroup memory is consumed before its async wait"
+                                 "staged workgroup memory is consumed before a workgroup barrier")
+                               {:reason (if (contains? incomplete buffer)
+                                          :kernel-body-async-missing-wait
+                                          :kernel-body-async-missing-barrier)
+                                :buffer buffer :operation operation})))
+                     (if (contains? (:readable-stages state) buffer)
+                       (update state :consumed-stages conj buffer)
+                       state))
 
-                         (seq (nested-operation-regions operation))
-                         (do
-                           (clean-state! owner state)
-                           (doseq [[index region] (map-indexed vector
-                                                               (nested-operation-regions operation))]
-                             (validate-sequence! [owner index] region))
-                           state)
+                   (record-kind? "raster.compiler.ir.kernel_body.PipelinedFor" operation)
+                   (let [async-args (:async-iter-args operation)
+                         initial-groups (mapv :initial async-args)
+                         committed-ids (mapv :id committed)
+                         pipeline-yield (terminal-pipeline-yield!
+                                         "kernel pipelined-for body"
+                                         (:operations operation))]
+                     (when-not (and (empty? issued) (empty? awaiting-barrier)
+                                    (empty? consumed-stages)
+                                    (= initial-groups committed-ids))
+                       (throw (ex-info
+                               "pipelined-for must carry the complete ordered async queue"
+                               {:reason :kernel-body-pipeline-entry-state
+                                :operation operation :initial-groups initial-groups
+                                :state state})))
+                     (doseq [arg async-args]
+                       (claim! (:binding arg) :pipeline-binding operation))
+                     (doseq [result (:async-results operation)]
+                       (claim! result :pipeline-result operation))
+                     (let [body-incoming
+                           (mapv (fn [arg group] (assoc group :id (:binding arg)))
+                                 async-args committed)
+                           body-final
+                           (validate-sequence-state!
+                            [owner :pipeline-body]
+                            (pop (:operations operation))
+                            {:issued [] :committed body-incoming
+                             :awaiting-barrier #{}
+                             :readable-stages (:readable-stages state)
+                             :consumed-stages #{}})
+                           yielded-groups (:groups pipeline-yield)
+                           yielded-committed (:committed body-final)]
+                       (when-not (and (empty? (:issued body-final))
+                                      (empty? (:awaiting-barrier body-final))
+                                      (empty? (:consumed-stages body-final))
+                                      (= yielded-groups (mapv :id yielded-committed)))
+                         (throw (ex-info
+                                 "pipelined-for must yield its complete ordered async queue after a reuse barrier"
+                                 {:reason :kernel-body-pipeline-backedge-state
+                                  :operation operation :yielded yielded-groups
+                                  :state body-final})))
+                       (pipeline-state-compatible! operation body-incoming yielded-committed)
+                       (assoc body-final :committed
+                              (mapv (fn [result group] (assoc group :id result))
+                                    (:async-results operation) yielded-committed))))
 
-                         :else state))
-                     {:issued [] :committed [] :awaiting-barrier #{}}
-                     operations)]
-                (clean-state! owner final-state)))]
-      (validate-sequence! :kernel operations)
+                   (seq (nested-operation-regions operation))
+                   (do
+                     (clean-state! owner state)
+                     (doseq [[index region] (map-indexed vector
+                                                         (nested-operation-regions operation))]
+                       (let [nested-final
+                             (validate-sequence-state!
+                              [owner index] region
+                              {:issued [] :committed [] :awaiting-barrier #{}
+                               :readable-stages #{} :consumed-stages #{}})]
+                         (clean-state! [owner index] nested-final)))
+                     state)
+
+                   :else state))
+               initial-state
+               operations))]
+      (let [final-state
+            (validate-sequence-state!
+             :kernel operations
+             {:issued [] :committed [] :awaiting-barrier #{}
+              :readable-stages #{} :consumed-stages #{}})]
+        (clean-state! :kernel final-state))
       (set/difference @claimed reserved))))
 
 (defn validate!

@@ -1,6 +1,6 @@
 # Raster compiler north star
 
-Status: architectural direction, grounded in the implementation on 2026-07-30.
+Status: architectural direction, reconciled with the implementation on 2026-08-27.
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -67,9 +67,11 @@ operation/type legality check, and source equality invalidates an equation after
 rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
 path.
 
-The remaining nominal boundary is earlier: SOAC fusion still works over an S-expression-derived
-graph rather than a first-class typed program, and the scheduled operations do not yet contain a
-general target-neutral kernel body.
+The remaining nominal boundary is earlier: SOAC fusion still constructs records and a dependency
+graph from source-shaped S-expressions, rewrites them, and reconstructs `par` forms before the typed
+program boundary. The problem is not the use of S-expressions; it is that stable value identity,
+types, effects, aliases and dialect legality are recovered from source spelling instead of being
+explicit in a first-class typed SOAC program.
 
 The first architectural correction is therefore:
 
@@ -152,9 +154,14 @@ code object in mandatory hardware-free CI jobs, while real Intel execution remai
 oracle. The compiler fixtures now stage values through both synchronous workgroup memory and the
 verified async issue/commit/wait contract; the exact async body is compiled to CUDA sm_80 PTX and
 an RDNA3 HIP code object in hardware-free CI. CUDA/HIP runtime registration, launch and on-device
-numerical coverage remain deliberately separate from source legality. The next production step is a
-double-buffered scheduled weighted-reduction body that uses this substrate, followed by local
-swizzles and measured stage-depth selection; this can collapse the tiled graph toward a
+numerical coverage remain deliberately separate from source legality. The verifier still forbids
+pending asynchronous state and live staged storage from escaping an ordinary structured region,
+but `PipelinedFor` now carries a complete ordered async queue across loop iterations, verifies each
+rotating stage's layout and lifetime, and requires an explicit exact or separate-epilogue tail
+policy. OpenCL lowers the queue through native event variables; CUDA maps it to `cp.async` groups;
+HIP preserves the same verified schedule with an honest synchronous fallback. The next production
+step is a double-buffered scheduled weighted-reduction body using this representation. Local
+swizzles and measured stage-depth selection then let this collapse the tiled graph toward a
 FlashAttention-like single kernel without changing the semantic plan or external ABI.
 
 ### 2.3 Executable steps and resident artifact values compose
@@ -294,9 +301,9 @@ Every value has an `AbstractValue`:
  :effects      #{}}
 ```
 
-The exact representation may be records or validated maps. The invariant
-matters more than the container: all facets describe the same value identity,
-and a pass cannot update one without revalidation.
+The program envelope and fact tables may be records or validated maps, while operation and region
+syntax may remain compact S-expressions. The invariant matters more than the container: all facets
+describe the same explicit value identity, and a pass cannot update one without revalidation.
 
 Operations use one descriptor/interface system. In addition to the existing
 buffer, device, shape, placement, algebra, comparison, and result facets, an
@@ -337,6 +344,35 @@ Futhark's Haskell representation or uniqueness type system wholesale.
 
 This dialect is hardware-independent. Hardware facts may be supplied to a
 costing or scheduling pass, but must not change the meaning of an operation.
+
+#### 3.2.1 Representation and Pattern integration
+
+Raster keeps the small functional, Lisp-native character of the SOAC IR. The intended form is a
+typed, dialect-validated S-expression program rather than a tools.analyzer-style map AST or a graph
+reconstructed from arbitrary source forms. Conceptually:
+
+```clojure
+(soac-program
+  {:inputs [%x]
+   :values {%x x-value %y y-value %z z-value}}
+  [(= %y (map {:index %i :extent %n} [%x]
+              (lambda [%xi] (* %xi %xi))))
+   (= %z (reduce {:operator + :identity 0.0} [%y]))]
+  [%z])
+```
+
+`../pattern` remains the rewrite engine. Its nanopass dialects declare the accepted S-expression
+grammar and pass arrows; fusion rules match the compact SOAC equations directly. The surrounding
+`ParallelProgram`-style envelope supplies stable value/equation IDs, `AbstractValue`s, effects,
+aliases, consumption, results, diagnostics and provenance. Essential facts are explicit fields or
+table entries keyed by IDs, not Clojure metadata that ordinary list reconstruction can drop.
+
+This representation is shared before backend selection. SOAC fusion changes the program consumed
+by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The JVM
+SIMD backend already consumes certified SegOps from `ParallelProgram`, but current SOAC fusion first
+round-trips through `par` forms and the scalar fallback still expands retained source. Migration is
+complete when JVM SIMD, scalar/JVM and GPU routes consume the same typed SOAC/SegOp facts and no
+backend silently re-lowers an exact source form.
 
 ### 3.3 Schedule and transform IR
 
@@ -461,6 +497,16 @@ The vendor compiler continues to own register allocation, low-level instruction
 scheduling, and binary generation until measurements demonstrate that this
 boundary is the limiting factor.
 
+A direct PTX route, when justified by those measurements, is a late NVIDIA target dialect beneath
+`KernelBody`, not a second scheduling IR and never a shortcut from SOAC. Full conversion first
+legalizes a verified body to NVIDIA address spaces, predicates, cache policies, vector memory
+operations, `cp.async`/`mbarrier`/TMA dependencies, exact MMA/WGMMA operand tuples and resource
+directives; a separate renderer produces PTX and `ptxas` produces cubin. CUDA C remains a broad
+differential backend. PTX gives Raster tighter instruction selection and memory-ordering control,
+but physical registers, spills and final SASS scheduling remain vendor-compiler responsibilities.
+The artifact records `ptxas` register, spill, stack and shared-memory reports so feasibility and
+autotuning can use actual resource outcomes.
+
 ### 3.7 Executable artifact and runtime
 
 `Compiled` evolves from a whole-program wrapper into a composable executable
@@ -560,6 +606,16 @@ program + abstract values + hardware descriptor
     → versioned cache and Compiled artifact
 ```
 
+This is a staged JIT/runtime contract, not only an ahead-of-time compiler pipeline. Static analysis
+may leave symbolic shapes, strides, placement choices and schedule alternatives in a partially
+specialized artifact. At binding or execution time, Raster may propagate newly known shapes,
+residency, allocation/topology, backend capabilities and calibrated measurements back into
+specialization, candidate generation and tuning. Adaptation always returns or selects a newly
+verified immutable artifact; it never mutates a running kernel around type, effect, ownership,
+numerical or resource checks. Logical events, measurements, hardware descriptors, `Compiled`,
+`LinkPlan` and `ExecutionPlan` are the compiler/runtime seam to OpenCL, Level Zero, CUDA/HIP and
+future collective or cluster runtimes.
+
 The search state should include both kernel and graph choices. Per-kernel axes
 include tile, vector width, instruction family, workgroup geometry, layout,
 staging, pipeline depth, and reduction strategy. Graph axes include fusion,
@@ -602,10 +658,31 @@ latency, throughput, peak memory, transferred bytes,
 compile/tune budget, energy when measurable, and numerical error
 ```
 
-The first distributed target should be data-parallel training with explicit
-gradient all-reduce, followed by tensor/sequence sharding for a transformer
-block. Pipeline and expert parallelism should wait until the value, sharding,
-and communication IR can state them without runtime side protocols.
+The compiler hierarchy extends upward without making the single-device `LinkPlan` a cluster object:
+
+```text
+semantic program and AD
+    → verified mesh, topology, resource envelope and allocation
+    → distributed schedule with explicit sharding and communication
+    → certified DistributedPlan with shard-local programs and cross-device events
+    → one LinkPlan and ExecutionPlan per device
+    → KernelGraph / KernelBody / target artifacts
+```
+
+`DistributedPlan` is the missing bridge. It owns global-to-shard value mappings, collective groups,
+point-to-point routes, resource claims, per-device plans and a witness for shard coverage,
+replication, ownership, capabilities and collective agreement. Native communicators and event
+handles remain runtime resources. An outer `WorkloadPlan` may handle admission, continuous batching,
+deadlines, retries, checkpoints and safe reallocation for dynamic services; it selects certified
+compiled variants rather than injecting service policy into SOAC or kernel IR.
+
+The first distributed target should be data-parallel training with explicit gradient all-reduce,
+followed by tensor/sequence sharding for a transformer block and a scientific halo-exchange case.
+Pipeline and expert parallelism should wait until the value, sharding, communication and failure
+contracts can state them without runtime side protocols. MPI, NCCL/RCCL, oneCCL, UCX and eventually
+GPU-initiated transports such as NVSHMEM are interchangeable execution backends, not Raster's
+semantic memory model. Datahike may retain durable topology, plan, measurement and decision history;
+it does not replace hot-path allocation or communication.
 
 ## 7. Reflection, structural self-modification, and learning
 
@@ -630,6 +707,36 @@ the trusted verifier stays small.
 ## 8. Landing order
 
 Each increment should be a thin vertical slice with a production-path test.
+
+The immediate continuation after the verified pipelined-loop increment is:
+
+1. Use `PipelinedFor` for the double-buffered segmented weighted-reduction production route.
+2. In parallel, define a typed SOAC S-expression dialect with `../pattern` and differential-test
+   map→map, map→reduce and horizontal-map fusion against the current graph.
+3. Carry that dialect in the existing program/value envelope and route one ordinary fused reduction
+   through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from source spelling.
+4. Add a finite verified shared-memory swizzle family and bank-conflict/resource model.
+5. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
+   attention-provenance gate from the generic weighted-reduction matcher.
+6. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
+   re-lowering for the covered forms.
+7. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
+   read-only distributed track without interrupting the kernel and typed-middle-end verticals.
+
+The integrated roadmap has six cooperating tracks rather than one backend-only sequence:
+
+| Track | Near-term completion gate | Unlock |
+|---|---|---|
+| Verified device scheduling | Pipelined loop, double-buffered weighted reduction, tails and honest fallbacks | General staged reductions and FlashAttention-like schedules |
+| Typed functional middle end | Pattern-declared typed SOAC program; map/reduce fusion reaches JVM and GPU from one fact set | Reliable fusion, batching, AD and reflection across representations |
+| Portable peak kernels | Verified swizzles/layouts, unified matrix fragments and quant storage descriptors | Competitive GEMM, attention and scientific tiles across Intel/NVIDIA/AMD |
+| Measurement and selection | One tuner over coupled graph/kernel axes with numerical and resource gates | Hardware-aware schedule selection and selective autotuning |
+| Precise target lowering | Format-neutral target modules, differential PTX, later AMD-specific lowering | Exact async/matrix/cache control where portable source is insufficient |
+| Distributed/workload planning | Typed mesh/topology/sharding values, then certified `DistributedPlan` | End-to-end node, cluster and data-center optimization |
+
+The table below is the durable architectural dependency ledger, not a claim that every increment is
+unstarted. ABI, artifact composition and much of the kernel-IR foundation have landed; their stated
+completion gates remain useful for finding legacy paths that have not joined the common route.
 
 | Increment | Work | Completion gate |
 |---|---|---|
@@ -696,6 +803,9 @@ transfer boundaries, and numerical modes.
 | `llama.cpp-new` | quant layout oracle, golden formats, model-driven kernel cases | one bespoke compiler architecture per quant format |
 | JAX/XLA | abstract values, primitive transformation rules, effects, pytrees, donation, sharding contracts, layout constraints | Python retracing behavior or outsourcing Raster's programming model to XLA |
 | MLIR | conversion legality, operation interfaces/traits, pass invalidation, Transform and DataLayout discipline | compulsory native MLIR integration before a concrete backend requires it |
+| Mojo/MAX | one language spanning host and device, parametric low-level GPU libraries, explicit layouts/pipelines, heterogeneous cross-compilation | coupling Raster's semantics to a closed compiler stack or requiring imperative kernels as the main abstraction |
+| TVM Relax/Disco | graph-level tensor distribution, SPMD worker sessions, explicit collective runtime boundary | making a controller/runtime protocol the distributed semantic IR |
+| Legion/DaCe | correctness-independent mapping, topology-aware task/data placement, explicit data movement and transformations | adopting a second user programming model before Raster's value and schedule IRs are complete |
 
 Local source revisions studied for this direction:
 

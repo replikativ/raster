@@ -685,6 +685,7 @@
 
 (def ^:private scalar-operation-kinds
   #{"ScalarCompute" "ScalarLoad" "ScalarStore" "Yield" "IfRegion" "ForLoop"
+    "PipelineYield" "PipelinedFor"
     "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
 
 (defn- scalar-body-operations
@@ -695,7 +696,8 @@
              (when (record-kind? "IfRegion" operation)
                (concat (scalar-body-operations (:then-operations operation))
                        (scalar-body-operations (:else-operations operation))))
-             (when (record-kind? "ForLoop" operation)
+             (when (or (record-kind? "ForLoop" operation)
+                       (record-kind? "PipelinedFor" operation))
                (scalar-body-operations (:operations operation)))))
    operations))
 
@@ -714,6 +716,12 @@
                (scalar-defined-ids (:else-operations operation)))
 
        (record-kind? "ForLoop" operation)
+       (concat [(:id (:index operation))]
+               (map (comp :id :binding) (:iter-args operation))
+               (map :id (:results operation))
+               (scalar-defined-ids (:operations operation)))
+
+       (record-kind? "PipelinedFor" operation)
        (concat [(:id (:index operation))]
                (map (comp :id :binding) (:iter-args operation))
                (map :id (:results operation))
@@ -981,6 +989,11 @@
                                    (emit-scalar-value value context) ";")))
               results values)))
 
+(defn- async-group-events
+  [context group]
+  (or (:events group)
+      (mapv #(get-in context [:async-copies %]) (:copies group))))
+
 (defn- emit-scalar-operation
   [operation context depth]
   (cond
@@ -1113,6 +1126,111 @@
             (indent-lines depth "}"))
        result-context])
 
+    (record-kind? "PipelinedFor" operation)
+    (let [results (:results operation)
+          result-context (reduce add-value context results)
+          index (:index operation)
+          loop-context (add-value result-context index)
+          loop-context (reduce (fn [ctx arg] (add-value ctx (:binding arg)))
+                               loop-context (:iter-args operation))
+          initializers
+          (apply str
+                 (map (fn [result arg]
+                        (indent-lines depth
+                                      (str (target-type
+                                            (get-in result-context [:types (:id result)]))
+                                           " " (get-in result-context [:names (:id result)])
+                                           " = " (emit-scalar-value (:initial arg) context) ";")))
+                      results (:iter-args operation)))
+          initial-groups (:async-groups context)
+          native-events? (= :native-events (c-dialect/async-copy-mode *scalar-dialect*))
+          binding-groups
+          (mapv
+           (fn [arg group]
+             (let [binding (:binding arg)
+                   event-count (count (:copies group))
+                   events (mapv #(str (scalar-local-name binding) "_event_" %)
+                                (range event-count))]
+               {:id binding :copies (:copies group) :events events}))
+           (:async-iter-args operation) initial-groups)
+          event-initializers
+          (when native-events?
+            (apply str
+                   (mapcat
+                    (fn [binding-group initial-group]
+                      (map (fn [binding-event initial-event]
+                             (indent-lines depth
+                                           (str "event_t " binding-event " = " initial-event ";")))
+                           (:events binding-group)
+                           (async-group-events context initial-group)))
+                    binding-groups initial-groups)))
+          loop-context (assoc loop-context :async-groups binding-groups)
+          index-name (get-in loop-context [:names (:id index)])
+          scalar-bindings
+          (apply str
+                 (map (fn [arg result]
+                        (let [binding (:binding arg)]
+                          (indent-lines (inc depth)
+                                        (str (target-type
+                                              (get-in loop-context [:types (:id binding)]))
+                                             " " (get-in loop-context [:names (:id binding)])
+                                             " = " (get-in result-context [:names (:id result)])
+                                             ";"))))
+                      (:iter-args operation) results))
+          body-operations (pop (:operations operation))
+          yield-op (peek (:operations operation))
+          [body-source body-context] (emit-scalar-operations body-operations loop-context
+                                                             (inc depth))
+          yielded-by-id (into {} (map (juxt :id identity)) (:async-groups body-context))
+          yielded-groups (mapv yielded-by-id (:groups yield-op))
+          next-event-names
+          (when native-events?
+            (mapv (fn [binding-group group]
+                    (mapv (fn [event-index event]
+                            [(str (scalar-local-name (:id binding-group))
+                                  "_next_event_" event-index)
+                             event])
+                          (range) (async-group-events body-context group)))
+                  binding-groups yielded-groups))
+          event-backedge
+          (when native-events?
+            (str
+             (apply str
+                    (for [[temporary source-event] (mapcat identity next-event-names)]
+                      (indent-lines (inc depth)
+                                    (str "event_t " temporary " = " source-event ";"))))
+             (apply str
+                    (mapcat
+                     (fn [binding-group temporaries]
+                       (map (fn [binding-event [temporary _]]
+                              (indent-lines (inc depth)
+                                            (str binding-event " = " temporary ";")))
+                            (:events binding-group) temporaries))
+                     binding-groups next-event-names))))
+          loop-header (str "for (" (target-type (get-in loop-context [:types (:id index)]))
+                           " " index-name " = "
+                           (emit-index-expression (:lower operation) (:names context)) "; "
+                           index-name " < "
+                           (emit-index-expression (:upper operation) (:names context)) "; "
+                           index-name " += " (:step operation) ") {")
+          output-groups
+          (mapv (fn [result binding-group]
+                  (assoc binding-group :id result))
+                (:async-results operation) binding-groups)
+          next-context (assoc result-context :async-groups output-groups
+                              :async-issued [])]
+      [(str initializers event-initializers
+            (when (get-in operation [:attributes :unroll])
+              (indent-lines depth "#pragma unroll"))
+            (indent-lines depth loop-header)
+            scalar-bindings body-source
+            (emit-yield-assignments results (:values yield-op)
+                                    (update body-context :names merge (:names result-context))
+                                    (inc depth))
+            event-backedge
+            (indent-lines depth "}"))
+       next-context])
+
     (record-kind? "Collective" operation)
     (let [result (:result operation)
           next-context (add-value context result)
@@ -1240,7 +1358,7 @@
     (record-kind? "AsyncWait" operation)
     (let [group-count (count (:groups operation))
           waited (subvec (:async-groups context) 0 group-count)
-          event-names (mapv #(get-in context [:async-copies %]) (mapcat :copies waited))]
+          event-names (mapv identity (mapcat #(async-group-events context %) waited))]
       [(indent-lines depth
                      (c-dialect/async-wait *scalar-dialect* event-names
                                            (:pending-groups operation)))
@@ -1248,6 +1366,10 @@
 
     (record-kind? "Yield" operation)
     (throw (ex-info "OpenCL scalar lowering found a misplaced Yield"
+                    {:reason :raster/bug :operation operation}))
+
+    (record-kind? "PipelineYield" operation)
+    (throw (ex-info "OpenCL scalar lowering found a misplaced PipelineYield"
                     {:reason :raster/bug :operation operation}))
 
     :else

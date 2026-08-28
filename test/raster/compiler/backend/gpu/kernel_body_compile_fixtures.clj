@@ -74,6 +74,11 @@
                           (body-emit/emit-scalar-kernel
                            "async_staging"
                            (body-fixtures/async-staging-body 32 :preferred)
+                           {:target-dialect dialect :target-features descriptor}))
+           (write-source! directory suffix "pipelined-staging"
+                          (body-emit/emit-scalar-kernel
+                           "pipelined_staging"
+                           (body-fixtures/pipelined-staging-body 32 :preferred)
                            {:target-dialect dialect :target-features descriptor}))]
           (map-indexed (fn [index artifact]
                          (write-artifact! directory suffix (str "tiled-" index) artifact))
