@@ -236,35 +236,46 @@
         (validate! abi)))
 
 (defn source-signature-shape
-  "Extract ordered C parameter names and pointer/scalar shape for one OpenCL kernel."
-  [kernel-name source]
-  (let [pattern (re-pattern
-                 (str "(?s)__kernel\\s+void\\s+" (java.util.regex.Pattern/quote kernel-name)
-                      "\\s*\\(([^)]*)\\)"))
-        params (second (re-find pattern source))]
-    (when-not params
-      (throw (ex-info "kernel ABI could not find emitted OpenCL signature"
-                      {:kernel-name kernel-name})))
-    (if (str/blank? params)
-      []
-      (mapv (fn [param]
-              (let [param (str/trim param)
+  "Extract ordered C parameter names and pointer/scalar shape for one target kernel."
+  ([kernel-name source]
+   (source-signature-shape :opencl-c kernel-name source))
+  ([target kernel-name source]
+   (let [entry-pattern
+         (case target
+           :opencl-c "__kernel\\s+void\\s+"
+           (:cuda-c :hip-cpp) "extern\\s+\"C\"\\s+__global__\\s+void\\s+"
+           (throw (ex-info "kernel ABI target has no source signature grammar"
+                           {:reason :kernel-abi-source-target :target target})))
+         pattern (re-pattern
+                  (str "(?s)" entry-pattern (java.util.regex.Pattern/quote kernel-name)
+                       "\\s*\\(([^)]*)\\)"))
+         params (second (re-find pattern source))]
+     (when-not params
+       (throw (ex-info "kernel ABI could not find emitted target signature"
+                       {:kernel-name kernel-name :target target})))
+     (if (str/blank? params)
+       []
+       (mapv (fn [param]
+               (let [param (str/trim param)
                     ;; Clojure gensyms in emitted kernels may retain Unicode letters (for example
                     ;; the AD pipeline uses α). Capture the complete final non-whitespace token;
                     ;; an ASCII-only C-identifier regex silently reduced `y_α_42` to `_42`.
-                    c-name (second (re-find #"([^\s*]+)\s*$" param))]
-                (when-not c-name
-                  (throw (ex-info "kernel ABI could not parse emitted OpenCL parameter"
-                                  {:kernel-name kernel-name :parameter param})))
-                {:c-name c-name :pointer? (str/includes? param "*")}))
-            (str/split params #",")))))
+                     c-name (second (re-find #"([^\s*]+)\s*$" param))]
+                 (when-not c-name
+                   (throw (ex-info "kernel ABI could not parse emitted target parameter"
+                                   {:kernel-name kernel-name :target target :parameter param})))
+                 {:c-name c-name :pointer? (str/includes? param "*")}))
+             (str/split params #","))))))
 
 (defn validate-source-signature!
-  "Compare emitted OpenCL parameter order/shape with the ABI before registration."
-  [kernel-name source abi]
-  (let [expected (signature-shape abi)
-        actual (source-signature-shape kernel-name source)]
-    (when-not (= expected actual)
-      (throw (ex-info "emitted OpenCL signature does not match kernel ABI"
-                      {:kernel-name kernel-name :expected expected :actual actual :abi abi})))
-    abi))
+  "Compare emitted target parameter order/shape with the ABI before registration."
+  ([kernel-name source abi]
+   (validate-source-signature! :opencl-c kernel-name source abi))
+  ([target kernel-name source abi]
+   (let [expected (signature-shape abi)
+         actual (source-signature-shape target kernel-name source)]
+     (when-not (= expected actual)
+       (throw (ex-info "emitted target signature does not match kernel ABI"
+                       {:kernel-name kernel-name :target target
+                        :expected expected :actual actual :abi abi})))
+     abi)))

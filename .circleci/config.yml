@@ -23,6 +23,18 @@ executors:
     environment:
       JAVA_TOOL_OPTIONS: "-Xmx3200m"
 
+  cuda-compiler:
+    docker:
+      - image: nvidia/cuda:12.8.2-devel-ubuntu24.04
+    working_directory: ~/repo
+    resource_class: large
+
+  hip-compiler:
+    docker:
+      - image: rocm/dev-ubuntu-24.04:6.4.3
+    working_directory: ~/repo
+    resource_class: large
+
 jobs:
   setup:
     executor: clojure-java24
@@ -75,6 +87,53 @@ jobs:
       - run:
           name: Run tests
           command: clojure -X:test
+
+  emit-gpu-compile-fixtures:
+    executor: clojure-java24
+    steps:
+      - attach_workspace:
+          at: ~/
+      - install-clojure
+      - run:
+          name: Emit scheduled KernelBody CUDA and HIP sources
+          command: >-
+            clojure -M:gpu-compile-fixtures
+            -m raster.compiler.backend.gpu.kernel-body-compile-fixtures
+            gpu-compile-gates
+      - persist_to_workspace:
+          root: ~/
+          paths:
+            - repo/gpu-compile-gates
+
+  cuda-compile-gate:
+    executor: cuda-compiler
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Require the CUDA compiler
+          command: nvcc --version
+      - run:
+          name: Compile scheduled kernels to PTX without a GPU
+          command: |
+            for source in gpu-compile-gates/cuda/*.cu; do
+              nvcc -ptx -arch=sm_80 -o "${source}.ptx" "${source}"
+            done
+
+  hip-compile-gate:
+    executor: hip-compiler
+    steps:
+      - attach_workspace:
+          at: ~/
+      - run:
+          name: Require the HIP compiler
+          command: hipcc --version
+      - run:
+          name: Compile scheduled kernels to RDNA3 code objects without a GPU
+          command: |
+            for source in gpu-compile-gates/hip/*.hip; do
+              hipcc --offload-arch=gfx1100 --genco -o "${source}.hsaco" "${source}"
+            done
 
   deploy:
     executor: clojure-java24
@@ -130,6 +189,15 @@ workflows:
       - test:
           requires:
             - build
+      - emit-gpu-compile-fixtures:
+          requires:
+            - build
+      - cuda-compile-gate:
+          requires:
+            - emit-gpu-compile-fixtures
+      - hip-compile-gate:
+          requires:
+            - emit-gpu-compile-fixtures
       - deploy:
           context:
             - clojars-deploy
@@ -138,6 +206,8 @@ workflows:
               only: main
           requires:
             - test
+            - cuda-compile-gate
+            - hip-compile-gate
       - release:
           context:
             - github-token

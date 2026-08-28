@@ -13,7 +13,7 @@
 
 (defrecord KernelArtifact
            [kernel-name   ;; emitted entry-point string
-            target        ;; target module dialect, currently :opencl-c
+            target        ;; target module dialect (:opencl-c, :cuda-c, or :hip-cpp)
             source        ;; target module source containing kernel-name
             abi           ;; ordered physical signature
             arguments     ;; compiler values in the identical order
@@ -30,7 +30,7 @@
             (.getName (class x)))))
 
 (defn validate!
-  "Validate `artifact` and return it unchanged.  Validation includes the emitted OpenCL
+  "Validate `artifact` and return it unchanged. Validation includes the emitted target C-family
    signature, so no unverified KernelArtifact can enter a runtime registry."
   [artifact]
   (when-not (kernel-artifact? artifact)
@@ -50,7 +50,8 @@
     (kabi/validate-arguments! abi arguments)
     (kabi/validate-alias-contracts! abi arguments #(or (identical? %1 %2) (= %1 %2)))
     (case target
-      :opencl-c (kabi/validate-source-signature! kernel-name source abi)
+      (:opencl-c :cuda-c :hip-cpp)
+      (kabi/validate-source-signature! target kernel-name source abi)
       (throw (ex-info "kernel artifact target has no module verifier"
                       {:kernel-name kernel-name :target target})))
     (try

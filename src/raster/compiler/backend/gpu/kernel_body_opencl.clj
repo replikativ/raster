@@ -1,15 +1,15 @@
 (ns raster.compiler.backend.gpu.kernel-body-opencl
-  "Direct OpenCL lowering of verified scheduled KernelBody values.
+  "C-family lowering of verified scheduled KernelBody values.
 
-  This namespace is below semantic contraction analysis and hardware scheduling.  It chooses only
-  target spellings: Intel subgroup builtins, OpenCL declarations and a pipelined loop form.  Tile
-  geometry and fragment topology are recovered from explicit index/operation IR, never from the
-  source contraction or a second schedule registry."
+  Matrix fragments retain their Intel OpenCL leaf. The general scalar/control path is shared by
+  OpenCL, CUDA and HIP through thin target dialect descriptors; geometry is recovered from explicit
+  index/operation IR, never from the source algorithm or a second schedule registry."
   (:require [clojure.set :as set]
             [clojure.string :as str]
             [clojure.walk :as walk]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.backend.gpu.c-emit :as ce]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as c-dialect]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -725,8 +725,12 @@
 (defn- scalar-local-name [id]
   (str "rstr_" (target-name id)))
 
-(defn- opencl-type [type]
-  (if (= :predicate type) "bool" (dtype/ctype :opencl type)))
+(def ^:dynamic *scalar-dialect*
+  "Validated target spelling used by the shared scalar/control emitter."
+  (c-dialect/resolve! :opencl-intel))
+
+(defn- target-type [type]
+  (c-dialect/type-name *scalar-dialect* type))
 
 (defn- emit-floating-literal [value suffix]
   (cond
@@ -738,14 +742,17 @@
 (defn- emit-literal
   [{:keys [value type]}]
   (case (dtype/canon type)
-    :byte (str "(char)" value)
+    :byte (str "(" (target-type :byte) ")" value)
     :int (str value)
-    :long (str value "L")
-    :half (str "(half)(" (emit-floating-literal value "f") ")")
+    :long (str value (if (c-dialect/opencl? *scalar-dialect*) "L" "LL"))
+    :half (if (c-dialect/opencl? *scalar-dialect*)
+            (str "(half)(" (emit-floating-literal value "f") ")")
+            (str "__float2half_rn(" (emit-floating-literal value "f") ")"))
     :float (emit-floating-literal value "f")
     :double (emit-floating-literal value "")
-    (throw (ex-info "OpenCL scalar literal has no target spelling"
-                    {:reason :kernel-body-opencl-unimplemented :literal value :type type}))))
+    (throw (ex-info "C-family scalar literal has no target spelling"
+                    {:reason :kernel-body-c-unimplemented
+                     :dialect (:id *scalar-dialect*) :literal value :type type}))))
 
 (defn- scalar-value-type
   [value types]
@@ -786,28 +793,53 @@
       ;; Same-width and widening FP conversions are exact in the KernelBody contract.
       (and source-fp? result-fp? (not narrowing-fp?)
            (= [:exact :exact] [rounding overflow]))
-      (str "(" (opencl-type result-type) ")(" argument-source ")")
+      (cond
+        (and (not (c-dialect/opencl? *scalar-dialect*))
+             (= source-type :half) (= result-type :float))
+        (str "__half2float(" argument-source ")")
+
+        (and (not (c-dialect/opencl? *scalar-dialect*))
+             (= source-type :half) (= result-type :double))
+        (str "(double)(__half2float(" argument-source "))")
+
+        :else (str "(" (target-type result-type) ")(" argument-source ")"))
 
       ;; OpenCL conversion suffixes state the requested rounding of IEEE narrowing.
       (and narrowing-fp? (= :ieee overflow))
-      (str "convert_" (opencl-type result-type) (cast-suffix rounding overflow)
-           "(" argument-source ")")
+      (if (c-dialect/opencl? *scalar-dialect*)
+        (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
+             "(" argument-source ")")
+        (case [source-type result-type rounding]
+          [:float :half :nearest-even] (str "__float2half_rn(" argument-source ")")
+          [:double :float :nearest-even] (str "__double2float_rn(" argument-source ")")
+          (throw (ex-info "CUDA/HIP cannot preserve this floating narrowing policy"
+                          {:reason :kernel-body-c-cast-policy
+                           :dialect (:id *scalar-dialect*)
+                           :source-type source-type :result-type result-type
+                           :rounding rounding :overflow overflow}))))
 
       ;; Saturating FP->integer conversion and wrapping integral conversion have direct spellings.
       (or (and source-fp? (not result-fp?) (= :saturate overflow))
           (and (not source-fp?) (not result-fp?) (= :wrap overflow)))
-      (str "convert_" (opencl-type result-type) (cast-suffix rounding overflow)
-           "(" argument-source ")")
+      (if (c-dialect/opencl? *scalar-dialect*)
+        (str "convert_" (target-type result-type) (cast-suffix rounding overflow)
+             "(" argument-source ")")
+        (throw (ex-info "CUDA/HIP cannot preserve this saturating or wrapping cast policy"
+                        {:reason :kernel-body-c-cast-policy
+                         :dialect (:id *scalar-dialect*)
+                         :source-type source-type :result-type result-type
+                         :rounding rounding :overflow overflow})))
 
       ;; Integral widening is exact. Narrowing/exact and trapping conversions need a proof or
       ;; runtime check that this target layer does not currently carry.
       (and (not source-fp?) (not result-fp?) (= [:exact :exact] [rounding overflow])
            (<= (dtype/bytes-of source-type) (dtype/bytes-of result-type)))
-      (str "(" (opencl-type result-type) ")(" argument-source ")")
+      (str "(" (target-type result-type) ")(" argument-source ")")
 
       :else
-      (throw (ex-info "OpenCL cannot preserve this KernelBody cast policy"
-                      {:reason :kernel-body-opencl-cast-policy
+      (throw (ex-info "C-family target cannot preserve this KernelBody cast policy"
+                      {:reason :kernel-body-c-cast-policy
+                       :dialect (:id *scalar-dialect*)
                        :source-type source-type :result-type result-type
                        :rounding rounding :overflow overflow})))))
 
@@ -827,13 +859,13 @@
       ;; Signed right shift is not the target-neutral unsigned-shift contract.
       (= :ushr op)
       (let [[value amount] arguments
-            unsigned-type ({:byte "uchar" :int "uint" :long "ulong"} operand-type)]
-        (str "(" (opencl-type operand-type) ")((" unsigned-type ")(" value ") >> "
+            unsigned-type (c-dialect/unsigned-type-name *scalar-dialect* operand-type)]
+        (str "(" (target-type operand-type) ")((" unsigned-type ")(" value ") >> "
              amount ")"))
 
       ;; OpenCL's integral abs returns an unsigned type, while KernelBody currently declares a
       ;; same-signed-type result. Refuse the mismatch until the IR states that representation step.
-      (and integral? (= :abs op))
+      (and (c-dialect/opencl? *scalar-dialect*) integral? (= :abs op))
       (throw (ex-info "OpenCL integral abs disagrees with the KernelBody result type"
                       {:reason :kernel-body-opencl-intrinsic
                        :operation op :operand-type operand-type}))
@@ -956,7 +988,7 @@
     (let [result (:result operation)
           next-context (add-value context result)]
       [(indent-lines depth
-                     (str (opencl-type (get-in next-context [:types (:id result)])) " "
+                     (str (target-type (get-in next-context [:types (:id result)])) " "
                           (get-in next-context [:names (:id result)]) " = "
                           (emit-scalar-value (:expression operation) context) ";"))
        next-context])
@@ -974,7 +1006,7 @@
                         (emit-scalar-value (:other operation) context) ")")
                    load)]
       [(indent-lines depth
-                     (str (opencl-type (get-in next-context [:types (:id result)])) " "
+                     (str (target-type (get-in next-context [:types (:id result)])) " "
                           (get-in next-context [:names (:id result)]) " = " source ";"))
        next-context])
 
@@ -998,7 +1030,7 @@
           declarations (apply str
                               (for [result results]
                                 (indent-lines depth
-                                              (str (opencl-type
+                                              (str (target-type
                                                     (get-in result-context
                                                             [:types (:id result)]))
                                                    " "
@@ -1034,7 +1066,7 @@
           initializers (apply str
                               (map (fn [result arg]
                                      (indent-lines depth
-                                                   (str (opencl-type
+                                                   (str (target-type
                                                          (get-in result-context
                                                                  [:types (:id result)]))
                                                         " "
@@ -1049,7 +1081,7 @@
                           (map (fn [arg result]
                                  (let [binding (:binding arg)]
                                    (indent-lines (inc depth)
-                                                 (str (opencl-type
+                                                 (str (target-type
                                                        (get-in loop-context
                                                                [:types (:id binding)]))
                                                       " "
@@ -1064,7 +1096,7 @@
           yield-op (peek (:operations operation))
           [body-source body-context] (emit-scalar-operations body-operations loop-context
                                                              (inc depth))
-          loop-header (str "for (" (opencl-type (get-in loop-context [:types (:id index)]))
+          loop-header (str "for (" (target-type (get-in loop-context [:types (:id index)]))
                            " " index-name " = "
                            (emit-index-expression (:lower operation) (:names context)) "; "
                            index-name " < "
@@ -1085,29 +1117,82 @@
     (let [result (:result operation)
           next-context (add-value context result)
           input (emit-scalar-value (:input operation) context)
-          expression
+          result-name (get-in next-context [:names (:id result)])
+          result-type (get-in next-context [:types (:id result)])
+          width (:width operation)
+          source
           (case (:kind operation)
-            :broadcast (str "sub_group_broadcast(" input ", " (:source-lane operation) ")")
-            :reduce (let [_ (when-not (= :implementation-defined
-                                         (:association operation))
-                              (throw
-                               (ex-info
-                                "OpenCL subgroup builtin cannot preserve an explicit reduction tree"
-                                {:reason :kernel-body-opencl-collective-association
-                                 :association (:association operation)})))
-                          builtin ({:+ "sub_group_reduce_add"
-                                    :min "sub_group_reduce_min"
-                                    :max "sub_group_reduce_max"}
-                                   (intrinsics/canonical (:operator operation)))]
-                      (when-not builtin
-                        (throw (ex-info "OpenCL has no matching subgroup reduction builtin"
-                                        {:reason :kernel-body-opencl-collective
-                                         :operator (:operator operation)})))
-                      (str builtin "(" input ")")))]
-      [(indent-lines depth
-                     (str (opencl-type (get-in next-context [:types (:id result)])) " "
-                          (get-in next-context [:names (:id result)]) " = " expression ";"))
-       next-context])
+            :broadcast
+            (indent-lines depth
+                          (str (target-type result-type) " " result-name " = "
+                               (c-dialect/broadcast-expression
+                                *scalar-dialect* input (:source-lane operation) width) ";"))
+
+            :reduce
+            (let [operator (intrinsics/canonical (:operator operation))
+                  association (:association operation)]
+              (if (c-dialect/opencl? *scalar-dialect*)
+                (let [_ (when-not (= :implementation-defined association)
+                          (throw
+                           (ex-info
+                            "OpenCL subgroup builtin cannot preserve an explicit reduction tree"
+                            {:reason :kernel-body-opencl-collective-association
+                             :association association})))
+                      builtin (c-dialect/opencl-reduction-builtin operator)]
+                  (when-not builtin
+                    (throw (ex-info "OpenCL has no matching subgroup reduction builtin"
+                                    {:reason :kernel-body-opencl-collective
+                                     :operator (:operator operation)})))
+                  (indent-lines depth
+                                (str (target-type result-type) " " result-name " = "
+                                     builtin "(" input ");")))
+                (let [distances (if (= :implementation-defined association)
+                                  (when (zero? (bit-and width (dec width)))
+                                    (vec (take-while pos?
+                                                     (iterate #(quot % 2) (quot width 2)))))
+                                  (:distances association))
+                      _ (when-not (seq distances)
+                          (throw (ex-info "CUDA/HIP subgroup reduction requires a power-of-two tree"
+                                          {:reason :kernel-body-c-collective-association
+                                           :dialect (:id *scalar-dialect*)
+                                           :width width :association association})))
+                      combine (fn [rhs]
+                                (case operator
+                                  :+ (str result-name " += " rhs ";")
+                                  :* (str result-name " *= " rhs ";")
+                                  :bit-and (str result-name " &= " rhs ";")
+                                  :bit-or (str result-name " |= " rhs ";")
+                                  :bit-xor (str result-name " ^= " rhs ";")
+                                  (:min :max)
+                                  (let [fn-name (case [operator result-type]
+                                                  [:min :float] "fminf"
+                                                  [:max :float] "fmaxf"
+                                                  [:min :double] "fmin"
+                                                  [:max :double] "fmax"
+                                                  nil)]
+                                    (when-not fn-name
+                                      (throw (ex-info "CUDA/HIP min/max collective dtype is unsupported"
+                                                      {:reason :kernel-body-c-collective
+                                                       :dialect (:id *scalar-dialect*)
+                                                       :operator operator :dtype result-type})))
+                                    (str result-name " = " fn-name "(" result-name ", " rhs ");"))
+                                  (throw (ex-info "CUDA/HIP has no matching subgroup reduction"
+                                                  {:reason :kernel-body-c-collective
+                                                   :dialect (:id *scalar-dialect*)
+                                                   :operator operator}))))]
+                  (str (indent-lines depth
+                                     (str (target-type result-type) " " result-name " = " input ";"))
+                       (apply str
+                              (for [distance distances]
+                                (indent-lines depth
+                                              (combine
+                                               (c-dialect/shuffle-down-expression
+                                                *scalar-dialect* result-name distance width)))))
+                       (indent-lines depth
+                                     (str result-name " = "
+                                          (c-dialect/broadcast-expression
+                                           *scalar-dialect* result-name 0 width) ";")))))))]
+      [source next-context])
 
     (record-kind? "Yield" operation)
     (throw (ex-info "OpenCL scalar lowering found a misplaced Yield"
@@ -1134,121 +1219,114 @@
                               :layout (:layout view) :view view))))
             parameters (:views kernel-body))))
 
-(defn- scalar-parameter-declaration
-  [parameter c-name]
-  (if (= :scalar (:kind parameter))
-    (str (opencl-type (dtype/canon (:dtype parameter))) " " c-name)
-    (do
-      (when-not (= :global (:memory-space parameter))
-        (throw (ex-info "OpenCL scalar lowering only supports global kernel storage"
-                        {:reason :kernel-body-opencl-memory-space :parameter parameter})))
-      (str "__global " (when (= :input (:kind parameter)) "const ")
-           (opencl-type (dtype/canon (:dtype parameter))) "* " c-name))))
+(defn- emit-scalar-kernel*
+  [kernel-name kernel-body {:keys [parameter-names]}]
+  (let [kernel-body (body/validate! kernel-body)
+        operations (vec (scalar-body-operations (:operations kernel-body)))
+        unsupported (remove #(contains? scalar-operation-kinds
+                                        (some-> % class .getSimpleName))
+                            operations)
+        _ (when (seq (:fragments kernel-body))
+            (throw (ex-info "scalar OpenCL lowering cannot consume matrix fragments"
+                            {:reason :kernel-body-opencl-unimplemented
+                             :fragments (:fragments kernel-body)})))
+        _ (when (seq unsupported)
+            (throw (ex-info "scalar OpenCL lowering cannot consume legacy tile operations"
+                            {:reason :kernel-body-opencl-unimplemented
+                             :operations (vec unsupported)})))
+        parameters (:parameters kernel-body)
+        parameter-names (into {}
+                              (map (fn [parameter]
+                                     [(:id parameter)
+                                      (or (get parameter-names (:id parameter))
+                                          (scalar-local-name (:id parameter)))])
+                                   parameters))
+        _ (when-not (every? #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" %)
+                            (vals parameter-names))
+            (throw (ex-info "C-family kernel parameter names must be C identifiers"
+                            {:reason :kernel-body-c-parameter-name
+                             :dialect (:id *scalar-dialect*)
+                             :parameter-names parameter-names})))
+        indices (:indices kernel-body)
+        names (reduce (fn [env index]
+                        (assoc env (:id index) (scalar-local-name (:id index))))
+                      parameter-names indices)
+        types (reduce (fn [env index] (assoc env (:id index) :int))
+                      (into {}
+                            (map (fn [parameter]
+                                   [(:id parameter) (dtype/canon (:dtype parameter))])
+                                 (filter #(= :scalar (:kind %)) parameters)))
+                      indices)
+        all-names (vals names)
+        _ (when-not (= (count all-names) (count (set all-names)))
+            (throw (ex-info "C-family parameter and index names collide after target spelling"
+                            {:reason :kernel-body-c-name-collision
+                             :dialect (:id *scalar-dialect*) :names names})))
+        local-ids (concat (map :id indices) (scalar-defined-ids (:operations kernel-body)))
+        emitted-local-names (map scalar-local-name local-ids)
+        all-emitted-names (concat (vals parameter-names) emitted-local-names)
+        _ (when-not (= (count all-emitted-names) (count (set all-emitted-names)))
+            (throw (ex-info "C-family parameter or SSA names collide after target spelling"
+                            {:reason :kernel-body-c-name-collision
+                             :dialect (:id *scalar-dialect*)
+                             :ids (vec local-ids)})))
+        storage (scalar-storage-map kernel-body)
+        masks (into {} (map (juxt :id identity)) (:masks kernel-body))
+        context {:names names :types types :storage storage :masks masks}
+        index-source
+        (apply str
+               (for [index indices]
+                 (let [name (get names (:id index))]
+                   (if (record-kind? "IndexBinding" index)
+                     (indent-lines
+                      1
+                      (str "int " name " = (int)"
+                           (c-dialect/index-binding
+                            *scalar-dialect* (:source index) (:axis index)
+                            (get-in kernel-body [:schedule :subgroup-size]))
+                           ";"))
+                     (indent-lines
+                      1 (str "int " name " = "
+                             (emit-index-expression (:expression index) names) ";"))))))
+        [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
+        uses-half? (some #(= :half (dtype/canon (:dtype %))) parameters)
+        uses-double? (some #(= :double (dtype/canon (:dtype %))) parameters)
+        collective (first (filter #(record-kind? "Collective" %) operations))
+        uses-subgroups? (or collective
+                            (some #(and (record-kind? "IndexBinding" %)
+                                        (contains? #{:subgroup :lane} (:source %)))
+                                  indices))
+        subgroup-size (or (some-> collective :width)
+                          (get-in kernel-body [:schedule :subgroup-size]))
+        attribute (c-dialect/subgroup-attribute
+                   *scalar-dialect* subgroup-size uses-subgroups?)]
+    (str (c-dialect/preamble *scalar-dialect*
+                             {:uses-half? uses-half? :uses-double? uses-double?
+                              :uses-subgroups? uses-subgroups?})
+         attribute
+         (c-dialect/entry-prefix *scalar-dialect*) (target-name kernel-name) "(\n    "
+         (str/join ",\n    "
+                   (map #(c-dialect/parameter-declaration
+                          *scalar-dialect* % (get parameter-names (:id %)))
+                        parameters))
+         ") {\n"
+         index-source operation-source
+         "}\n")))
 
 (defn emit-scalar-kernel
-  "Lower a verified scalar/control KernelBody directly to OpenCL C.
+  "Lower a verified scalar/control KernelBody directly to a C-family target dialect.
 
   The body already fixes schedules, types, layouts, masks, convergence and numerical conversion
-  policies. `parameter-names` may only select target ABI spelling; it cannot inject source. Dense
-  global storage and the OpenCL subgroup builtins are the first implemented target row; a
-  production semantic route must still construct this body explicitly."
+  policies. `parameter-names` may only select ABI spelling; `target-dialect` defaults to the
+  production Intel OpenCL row and may select `:opencl-portable`, `:cuda`, or `:hip`. Target
+  selection cannot alter the scheduled body."
   ([kernel-name kernel-body]
    (emit-scalar-kernel kernel-name kernel-body {}))
-  ([kernel-name kernel-body {:keys [parameter-names subgroup-attribute]
-                             :or {subgroup-attribute :intel}}]
-   (let [kernel-body (body/validate! kernel-body)
-         operations (vec (scalar-body-operations (:operations kernel-body)))
-         unsupported (remove #(contains? scalar-operation-kinds
-                                         (some-> % class .getSimpleName))
-                             operations)
-         _ (when (seq (:fragments kernel-body))
-             (throw (ex-info "scalar OpenCL lowering cannot consume matrix fragments"
-                             {:reason :kernel-body-opencl-unimplemented
-                              :fragments (:fragments kernel-body)})))
-         _ (when (seq unsupported)
-             (throw (ex-info "scalar OpenCL lowering cannot consume legacy tile operations"
-                             {:reason :kernel-body-opencl-unimplemented
-                              :operations (vec unsupported)})))
-         parameters (:parameters kernel-body)
-         parameter-names (into {}
-                               (map (fn [parameter]
-                                      [(:id parameter)
-                                       (or (get parameter-names (:id parameter))
-                                           (scalar-local-name (:id parameter)))])
-                                    parameters))
-         _ (when-not (every? #(re-matches #"[A-Za-z_][A-Za-z0-9_]*" %)
-                             (vals parameter-names))
-             (throw (ex-info "OpenCL kernel parameter names must be C identifiers"
-                             {:reason :kernel-body-opencl-parameter-name
-                              :parameter-names parameter-names})))
-         indices (:indices kernel-body)
-         names (reduce (fn [env index]
-                         (assoc env (:id index) (scalar-local-name (:id index))))
-                       parameter-names indices)
-         types (reduce (fn [env index] (assoc env (:id index) :int))
-                       (into {}
-                             (map (fn [parameter]
-                                    [(:id parameter) (dtype/canon (:dtype parameter))])
-                                  (filter #(= :scalar (:kind %)) parameters)))
-                       indices)
-         all-names (vals names)
-         _ (when-not (= (count all-names) (count (set all-names)))
-             (throw (ex-info "OpenCL parameter and index names collide after target spelling"
-                             {:reason :kernel-body-opencl-name-collision :names names})))
-         local-ids (concat (map :id indices) (scalar-defined-ids (:operations kernel-body)))
-         emitted-local-names (map scalar-local-name local-ids)
-         all-emitted-names (concat (vals parameter-names) emitted-local-names)
-         _ (when-not (= (count all-emitted-names) (count (set all-emitted-names)))
-             (throw (ex-info "OpenCL parameter or SSA names collide after target spelling"
-                             {:reason :kernel-body-opencl-name-collision
-                              :ids (vec local-ids)})))
-         storage (scalar-storage-map kernel-body)
-         masks (into {} (map (juxt :id identity)) (:masks kernel-body))
-         context {:names names :types types :storage storage :masks masks}
-         index-source
-         (apply str
-                (for [index indices]
-                  (let [name (get names (:id index))]
-                    (if (record-kind? "IndexBinding" index)
-                      (indent-lines
-                       1
-                       (str "int " name " = (int)"
-                            (case (:source index)
-                              :group (str "get_group_id(" (:axis index) ")")
-                              :subgroup "get_sub_group_id()"
-                              :lane "get_sub_group_local_id()")
-                            ";"))
-                      (indent-lines
-                       1 (str "int " name " = "
-                              (emit-index-expression (:expression index) names) ";"))))))
-         [operation-source _] (emit-scalar-operations (:operations kernel-body) context 1)
-         uses-half? (some #(= :half (dtype/canon (:dtype %))) parameters)
-         uses-double? (some #(= :double (dtype/canon (:dtype %))) parameters)
-         collective (first (filter #(record-kind? "Collective" %) operations))
-         uses-subgroups? (or collective
-                             (some #(and (record-kind? "IndexBinding" %)
-                                         (contains? #{:subgroup :lane} (:source %)))
-                                   indices))
-         subgroup-size (or (some-> collective :width)
-                           (get-in kernel-body [:schedule :subgroup-size]))
-         attribute (when uses-subgroups?
-                     (case subgroup-attribute
-                       :intel (str "__attribute__((intel_reqd_sub_group_size("
-                                   subgroup-size ")))\n")
-                       :none ""
-                       (throw (ex-info "OpenCL subgroup attribute dialect is unsupported"
-                                       {:reason :kernel-body-opencl-subgroup-dialect
-                                        :dialect subgroup-attribute}))))]
-     (str (when uses-half? "#pragma OPENCL EXTENSION cl_khr_fp16 : enable\n")
-          (when uses-double? "#pragma OPENCL EXTENSION cl_khr_fp64 : enable\n")
-          (when uses-subgroups?
-            "#if defined(cl_khr_subgroups)\n#pragma OPENCL EXTENSION cl_khr_subgroups : enable\n#elif defined(cl_intel_subgroups)\n#pragma OPENCL EXTENSION cl_intel_subgroups : enable\n#endif\n")
-          (when (or uses-half? uses-double? uses-subgroups?) "\n")
-          attribute
-          "__kernel void " (target-name kernel-name) "(\n    "
-          (str/join ",\n    "
-                    (map #(scalar-parameter-declaration % (get parameter-names (:id %)))
-                         parameters))
-          ") {\n"
-          index-source operation-source
-          "}\n"))))
+  ([kernel-name kernel-body {:keys [target-dialect subgroup-attribute] :as options
+                             :or {target-dialect :opencl-intel subgroup-attribute :intel}}]
+   (let [target-dialect (if (and (= :opencl-intel target-dialect)
+                                 (= :none subgroup-attribute))
+                          :opencl-portable
+                          target-dialect)]
+     (binding [*scalar-dialect* (c-dialect/resolve! target-dialect)]
+       (emit-scalar-kernel* kernel-name kernel-body options)))))

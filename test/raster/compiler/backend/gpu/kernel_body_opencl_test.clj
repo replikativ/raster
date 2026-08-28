@@ -157,3 +157,57 @@
            (opencl/emit-scalar-kernel
             "colliding_names" (scalar-kernel-body)
             {:parameter-names {'x "same" 'bias "same"}}))))))
+
+(defn- command-available? [command]
+  (zero? (:exit (shell/sh "sh" "-c" (str "command -v " command)))))
+
+(defn- compile-c-family-source
+  [target source]
+  (let [suffix (case target :cuda ".cu" :hip ".hip")
+        source-file (java.io.File/createTempFile "raster-kernel-body-" suffix)
+        output-file (str (.getAbsolutePath source-file) ".ptx")]
+    (spit source-file source)
+    (case target
+      :cuda (shell/sh "nvcc" "-ptx" "-arch=sm_80" "-o" output-file
+                      (.getAbsolutePath source-file))
+      :hip (shell/sh "hipcc" "--offload-arch=gfx1100" "--genco"
+                     "-o" (str (.getAbsolutePath source-file) ".hsaco")
+                     (.getAbsolutePath source-file)))))
+
+(deftest one-scheduled-body-lowers-to-cuda-and-hip
+  (doseq [[target compiler shuffle broadcast]
+          [[:cuda "nvcc" "__shfl_down_sync(__activemask()"
+            "__shfl_sync(__activemask()"]
+           [:hip "hipcc" "__shfl_down(" "__shfl("]]]
+    (testing (str (name target) " uses only its thin target spelling")
+      (let [source (opencl/emit-scalar-kernel
+                    "scheduled_scalar" (scalar-kernel-body)
+                    {:target-dialect target
+                     :parameter-names {'x "input_rows" 'bias "row_bias"
+                                       'y "output_rows" 'scale "scale"}})]
+        (is (str/includes? source "extern \"C\" __global__ void scheduled_scalar"))
+        (is (str/includes? source "blockIdx.x"))
+        (is (str/includes? source "threadIdx.x"))
+        (is (str/includes? source shuffle))
+        (is (str/includes? source broadcast))
+        (is (str/includes? source "__half2float("))
+        (is (str/includes? source "__float2half_rn("))
+        (is (not (str/includes? source "get_group_id")))
+        (is (not (str/includes? source "sub_group_reduce")))
+        (testing "the installed host toolchain accepts the emitted device source"
+          (if-not (command-available? compiler)
+            (is true (str compiler " unavailable; source structure remains covered"))
+            (let [{:keys [exit err]} (compile-c-family-source target source)]
+              (is (zero? exit) err))))))))
+
+(deftest portable-opencl-keeps-the-scheduled-subgroup-width
+  (let [source (opencl/emit-scalar-kernel
+                "portable_scalar" (scalar-kernel-body)
+                {:target-dialect :opencl-portable})]
+    (is (str/includes? source "__attribute__((reqd_sub_group_size(16)))"))
+    (is (not (str/includes? source "intel_reqd_sub_group_size")))
+    (if-not (command-available? "clang")
+      (is true "clang unavailable; source structure remains covered")
+      (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+        (is (zero? exit) err)))))

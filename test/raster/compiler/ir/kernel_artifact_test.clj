@@ -51,3 +51,23 @@
     (is (thrown-with-msg?
          clojure.lang.ExceptionInfo #"invalid launch contract"
          (kart/make (assoc base :launch {:dimensions 1}))))))
+
+(deftest c-family-artifacts-share-one-ordered-abi-verifier
+  (doseq [[target source]
+          [[:cuda-c (str "extern \"C\" __global__ void reduce0("
+                         "const float* __restrict__ x, float* __restrict__ out, "
+                         "int _n_bound) {}")]
+           [:hip-cpp (str "extern \"C\" __global__ void reduce0("
+                          "const float* __restrict__ x, float* __restrict__ out, "
+                          "int _n_bound) {}")]]]
+    (let [artifact (kart/make (assoc base :target target :source source))]
+      (is (= target (:target artifact)))
+      (is (= abi (:abi artifact)))))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"signature does not match"
+       (kart/make
+        (assoc base
+               :target :cuda-c
+               :source (str "extern \"C\" __global__ void reduce0("
+                            "float* __restrict__ out, const float* __restrict__ x, "
+                            "int _n_bound) {}"))))))
