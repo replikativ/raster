@@ -209,7 +209,7 @@
 (deftest gpu-reduce-step-program-binds-and-replays
   ;; The former resident whole-program binder wired only :map/:map-void/:gemm/
   ;; :scatter step kinds; a program containing a par/reduce whose result stays resident
-  ;; (the #42 resident-reduce work: fuse-reduce-results gives it a device 1-elem out-buf)
+  ;; (the resident TypedSOAC realization gives it a device one-element output buffer)
   ;; threw at bind time even though bind-step! already handled :reduce. This pins the
   ;; wiring: scale*sum(a) (a captured reduction scalar) feeding an elementwise scale compiles to
   ;; [:reduce :map] steps, binds its full ordered ABI,

@@ -21,12 +21,17 @@
           total (raster.par/reduce acc 0.0 j n (+ acc (clojure.core/aget y j)))]
          total))
 
+(def ^:private horizontal-maps
+  '(let* [u (raster.par/pmap i n float (* (clojure.core/aget a i) 2.0))
+          v (raster.par/pmap j n float (+ (clojure.core/aget b j) 1.0))]
+         [u v]))
+
 (deftest pure-vertical-fusion-becomes-a-first-class-typed-program
-  (let [{:keys [program stats]} (route/attempt map-map nil :float)
+  (let [{:keys [program stats]} (route/attempt map-map :float)
         equation (first (:equations program))]
     (is (= :typed-soac (:dialect program)))
     (is (= :typed-soac (:route stats)))
-    (is (:shadow-certified stats))
+    (is (:typed-validated stats))
     (is (= 1 (:vertical stats)))
     (is (= 1 (count (:equations program))))
     (is (= (:algorithm equation) (dialect/validate! (:algorithm equation))))
@@ -34,20 +39,24 @@
     (is (not-any? #{'y} (flatten (:source program))))
     (is (some #{'clojure.core/float-array} (flatten (:source program))))))
 
-(deftest host-visible-intermediate-declines-the-single-consumer-subset
+(deftest host-visible-intermediate-remains-materialized-on-the-typed-route
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
-                      [y z])]
-    (is (= :typed-soac-unknown-value
-           (get-in (route/attempt source nil :float) [:declined :reason]))
-        "the typed route must not erase a value also consumed by scalar host control")))
+                      [y z])
+        {:keys [program stats]} (route/attempt source :float {'x :float})]
+    (is (= :typed-soac (:dialect program)))
+    (is (:typed-validated stats))
+    (is (zero? (:vertical stats)))
+    (is (= 2 (count (:equations program))))
+    (is (= '[y z] (:outputs program))
+        "a host-visible producer is retained, not erased by vertical fusion")))
 
 (deftest effectful-host-binding-keeps-the-compatibility-route
   (let [source '(let* [y (raster.par/pmap i n float (* (clojure.core/aget x i) 2.0))
                        side (println y)
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       z)]
-    (is (nil? (route/attempt source nil :float)))))
+    (is (nil? (route/attempt source :float)))))
 
 (deftest scalar-equations-require-retained-source-type-facts
   (let [source '(let* [n (clojure.core/alength x)
@@ -55,7 +64,7 @@
                        z (raster.par/pmap j n float (+ (clojure.core/aget y j) 1.0))]
                       z)]
     (is (= :unsupported-scalar-binding
-           (get-in (route/attempt source nil :float {'x :float}) [:declined :reason]))
+           (get-in (route/attempt source :float {'x :float}) [:declined :reason]))
         "the compatibility adapter must not reconstruct a missing TypedClojure result type")))
 
 (deftest semantic-alength-bounds-normalize-to-the-producing-extent
@@ -64,7 +73,7 @@
                        z (raster.par/pmap j (clojure.core/alength y) float
                                           (+ (clojure.core/aget y j) 1.0))]
                       z)
-        program (:program (route/attempt source nil :float {'x :double}))
+        program (:program (route/attempt source :float {'x :double}))
         scalar-equation (some #(when (= 'scalar
                                         (dialect/operation-kind
                                          (first (dialect/equations (:algorithm %))))) %)
@@ -105,7 +114,7 @@
                                                    (clojure.core/aget a j))))))]
                out)
         {:keys [program stats]} (route/attempt
-                                 source nil :double
+                                 source :double
                                  {'W1 :double 'W2 :double 'b1 :double 'b2 :double 'x :double})
         scheduled (:form (segop-lower/segop-lower-pass
                           program {:dtype :double :target-device :ocl:0}))
@@ -123,7 +132,7 @@
                              (:kernels emitted))
         kernel-sources (mapv :source (:kernels emitted))]
     (is (= :typed-soac (:route stats)))
-    (is (:shadow-certified stats))
+    (is (:typed-validated stats))
     (is (= 1 (:vertical stats)))
     (is (= ['scalar 'scalar 'map 'scalar 'scalar 'map] equation-kinds))
     (is (= 'rows (get-in program [:equations 4 :source]))
@@ -146,7 +155,7 @@
           [["map" map-map raster.compiler.ir.segop.SegMap :simd-maps]
            ["reduce" map-reduce raster.compiler.ir.segop.SegRed :simd-reduces]]]
     (testing label
-      (let [typed (:program (route/attempt source nil :float))
+      (let [typed (:program (route/attempt source :float))
             {:keys [form stats]} (segop-lower/segop-lower-pass typed {:dtype :float})
             simd (par-simd/simd-pass form :min-elements 1)]
         (is (= :segop (:dialect form)))
@@ -158,8 +167,43 @@
         (is (nil? (get-in simd [:stats :segop-relowered])))
         (parallel-program/validate! form segop/segop-node?)))))
 
+(deftest typed-horizontal-fusion-lowers-to-one-explicit-multi-output-segmap
+  (let [{:keys [program stats]} (route/attempt
+                                 horizontal-maps :float {'a :float 'b :float})
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :float :target-device :ocl:0}))
+        operation (first (:operations (first (:equations scheduled))))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        kernel (first (:kernels emitted))]
+    (is (= :typed-soac (:dialect program)))
+    (is (:typed-validated stats))
+    (is (= 1 (:horizontal stats)))
+    (is (= '[u v] (dialect/outputs (get-in program [:equations 0 :algorithm]))))
+    (is (= #{'u 'v} (:outputs operation)))
+    (is (= 'u (:out-sym operation)))
+    (is (some #{'clojure.core/aset} (flatten (:lambda operation))))
+    (is (nil? (get-in jvm [:stats :segop-relowered])))
+    (is (= [:input :input :output :output :scalar]
+           (mapv :kind (:abi kernel))))
+    (is (re-find #"__global float\* restrict [uv]" (:source kernel)))))
+
+(deftest unfused-map-also-uses-the-typed-production-route
+  (let [source '(let* [y (raster.par/pmap i n float
+                                          (* (clojure.core/aget x i) 2.0))]
+                      y)
+        {:keys [program stats]} (route/attempt source :float {'x :float})]
+    (is (= :typed-soac (:dialect program)))
+    (is (:typed-validated stats))
+    (is (zero? (:vertical stats)))
+    (is (zero? (:horizontal stats)))
+    (is (= 'map (dialect/operation-kind
+                 (first (dialect/equations
+                         (get-in program [:equations 0 :algorithm]))))))))
+
 (deftest gpu-emission-consumes-the-same-certified-segmap
-  (let [typed (:program (route/attempt map-map nil :float))
+  (let [typed (:program (route/attempt map-map :float))
         scheduled (:form (segop-lower/segop-lower-pass
                           typed {:dtype :float :target-device :ocl:0}))
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)]
@@ -167,6 +211,88 @@
     (is (= 1 (get-in emitted [:stats :segop-reused])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))
     (is (= 1 (count (:kernels emitted))))))
+
+(deftest resident-reduction-realization-stays-on-the-typed-spine
+  (let [source
+        '(let* [total (raster.par/reduce acc 0.0 i n
+                                         (+ acc (* ^double scale
+                                                   (clojure.core/aget a i))))
+                ^float scaled (* total ^float gain)
+                result (raster.par/map-void!
+                        j (long n)
+                        (clojure.core/aset out j
+                                           (float (* (clojure.core/aget a j)
+                                                     scaled))))]
+               result)
+        {:keys [program stats]} (route/attempt
+                                 source :float
+                                 {'a :float 'out :float}
+                                 {:resident-reductions? true})
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :float :target-device :ze:0}))
+        reductions (->> (:equations scheduled)
+                        (mapcat :operations)
+                        (filter #(instance? raster.compiler.ir.segop.SegRed %))
+                        vec)
+        phase-one (some #(when (= :block-local (:phase %)) %) reductions)
+        phase-two (some #(when (= :cross-block (:phase %)) %) reductions)
+        partial (first (:outputs phase-one))]
+    (is (= :typed-soac (:dialect program)))
+    (is (= :typed-soac (:route stats)))
+    (is (:typed-validated stats))
+    (is (= 1 (:resident-reductions stats)))
+    (is (= 1 (:inlined-scalars stats)))
+    (is (= [] (get-in program [:values 'total :shape])))
+    (is (= :resident-scalar-buffer
+           (get-in program [:values 'total :representation :kind])))
+    (is (some #{'raster.par/reduce-into} (flatten (:source program))))
+    (is (not-any? #{'scaled} (flatten (:source program))))
+    (is (= #{:memory/write}
+           (get-in (dialect/facts (get-in program [:equations 1 :algorithm]))
+                   [:equations 2 :effects])))
+    (is (= 'out
+           (get-in (dialect/facts (get-in program [:equations 1 :algorithm]))
+                   [:equations 2 :attributes :destination])))
+    (is (= 2 (count reductions)))
+    (is (= #{partial} (:inputs phase-two)))
+    (is (= :double (get-in scheduled [:values partial :dtype])))))
+
+(deftest host-visible-reduction-is-not-represented-as-resident-storage
+  (let [source
+        '(let* [y (raster.par/pmap i n float
+                                   (* (clojure.core/aget x i) 2.0))
+                total (raster.par/reduce acc 0.0 j n
+                                         (+ acc (clojure.core/aget y j)))]
+               total)
+        {:keys [program stats]} (route/attempt
+                                 source :float {'x :float}
+                                 {:resident-reductions? true})]
+    (is (= :typed-soac (:dialect program)))
+    (is (= 1 (:vertical stats)))
+    (is (zero? (:resident-reductions stats)))
+    (is (= :plain (get-in program [:values 'total :representation :kind])))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
+
+(deftest host-visible-dependent-scalar-blocks-its-resident-root
+  (let [source
+        '(let* [total (raster.par/reduce acc 0.0 i n
+                                         (+ acc (clojure.core/aget a i)))
+                ^double scaled (* total ^double gain)
+                result (raster.par/map-void!
+                        j n (clojure.core/aset out j
+                                               (float (* (clojure.core/aget a j)
+                                                         scaled))))]
+               [scaled result])
+        {:keys [program stats]} (route/attempt
+                                 source :float {'a :float 'out :float}
+                                 {:resident-reductions? true})]
+    (is (= :typed-soac (:dialect program)))
+    (is (zero? (:resident-reductions stats)))
+    (is (= :plain (get-in program [:values 'total :representation :kind])))
+    (is (= [:binding 'scaled] (get-in program [:equations 1 :site])))
+    (is (some #{'raster.par/reduce} (flatten (:source program))))
+    (is (not-any? #{'raster.par/reduce-into} (flatten (:source program))))))
 
 (deftest production-pass-chain-preserves-the-typed-envelope
   (let [scheduled (pipeline/run-passes

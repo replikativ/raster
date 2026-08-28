@@ -37,7 +37,12 @@
        (= 'map (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
 
 (defn lower-typed-map
-  "Lower one functional TypedSOAC map to SegMap from its explicit operands and lambda binders."
+  "Lower one functional TypedSOAC map to SegMap from its explicit operands and lambda binders.
+
+   A horizontally fused map has several logical results. SegMap keeps the first result in its
+   structural output slot and spells the remaining stores explicitly in the scalar region; all
+   results remain declared outputs, so the ABI and memory contracts do not infer writes from the
+   generated expression."
   [program device-id & {:keys [dtype] :or {dtype :double}}]
   (let [program (soac-dialect/validate! program)]
     (when-not (typed-map-program? program)
@@ -48,9 +53,10 @@
           [_ attributes arrays captures lambda] operation
           [_ _ body-results] lambda
           {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
-          _ (when-not (and (= 1 (count results)) (= 1 (count body-results))
-                           (symbol? (first results)))
-              (throw (ex-info "initial typed SegMap vertical supports one symbolic result"
+          _ (when-not (and (seq results)
+                           (= (count results) (count body-results))
+                           (every? symbol? results))
+              (throw (ex-info "typed SegMap requires one scalar body result per symbolic output"
                               {:reason :typed-soac-map-subset
                                :equation equation-id :results results})))
           index (:index attributes)
@@ -59,18 +65,34 @@
                 (map (fn [parameter array]
                        [parameter (list 'clojure.core/aget array index)])
                      elements arrays))
-          body (-> (util/subst-syms substitutions (first body-results))
-                   par/expand-par-forms)
+          bodies (mapv #(-> (util/subst-syms substitutions %)
+                            par/expand-par-forms)
+                       body-results)
           result (first results)
+          values (:values (soac-dialect/facts program))
+          secondary-stores
+          (mapv (fn [secondary-result secondary-body]
+                  (let [secondary-dtype (:dtype (get values secondary-result))
+                        cast (dtype/scalar-tag-for-dtype secondary-dtype)]
+                    (list 'clojure.core/aset secondary-result index
+                          (list cast secondary-body))))
+                (rest results) (rest bodies))
+          body (if (seq secondary-stores)
+                 (list* 'do (concat secondary-stores [(first bodies)]))
+                 (first bodies))
           stable-array-captures (set (get-in attributes
                                              [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable-array-captures captures))
-          result-dtype (or (:dtype (get-in (soac-dialect/facts program) [:values result]))
+          result-dtype (or (:dtype (get values result))
                            dtype :double)
+          destination (get-in (soac-dialect/facts program)
+                              [:equations equation-id :attributes :destination])
+          physical-result (or destination result)
           node (assoc (soac/->SoacMap equation-id result index (:extent attributes) nil body
                                       (into (set arrays) stable-array-captures)
-                                      #{result} scalar-captures)
-                      :elem-type result-dtype :pure? true)]
+                                      (if destination #{physical-result} (set results))
+                                      scalar-captures)
+                      :sym physical-result :elem-type result-dtype :pure? (nil? destination))]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
             (lower-map node device-id :dtype result-dtype)))))
@@ -302,14 +324,14 @@
 
         :two-phase
         (let [level-1 (segop/->SegLevel :block :virtual)
+              partials-sym (gensym "partials_")
               phase-1 (segop/->SegRed (:id soac) space level-1
                                       reduction map-lambda
                                       (:inputs soac)
-                                      (or (soac-outputs* soac) #{(:sym soac)})
+                                      #{partials-sym}
                                       (:scalars soac)
                                       grid-1 :block-local nil
                                       dtype)
-              partials-sym (gensym "partials_")
               phase-2-idx (gensym "j_")
               phase-2-space (segop/make-seg-space phase-2-idx (:num-blocks grid-1))
               grid-2 (single-block-grid grid-1)

@@ -1,19 +1,19 @@
 (ns raster.compiler.passes.parallel.typed-soac-route
-  "Production bridge for the first closed TypedSOAC fusion subset.
+  "Production route for the closed TypedSOAC map/scalar/reduction subset.
 
-   Pure maps and scalar/full reductions are fused in the typed dialect.  The resulting functional
-   equations are mechanically materialized into the compatibility host expression and retained as
-   first-class algorithms in a ParallelProgram.  A shadow comparison with the established graph
-   implementation is a temporary migration certificate: disagreement declines to the old route."
+   Supported programs are represented and fused in the typed dialect whether or not a fusion
+   fires. The resulting functional equations are mechanically projected into the surrounding host
+   control expression and retained as first-class algorithms in a ParallelProgram."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.scalar.effects :as effects]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
-            [raster.compiler.passes.parallel.soac-graph :as graph]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.core.util :as util]))
 
 (def ^:private dtype->allocation
@@ -25,7 +25,11 @@
 
 (defn- provably-pure-host-binding?
   [expression]
-  (or (not (seq? expression))
+  ;; Beichte is the general conservative purity authority. Array length is also a closed compiler
+  ;; intrinsic identified through the canonical semantic descriptor (including devirtualized
+  ;; `.invk` spellings), not through a function-name/type registry. Typed scalar equations retain
+  ;; the walker's result tag separately, so this effect verdict never infers a result type.
+  (or (effects/removable-expr? expression)
       (and (descriptor/alength-op? (descriptor/semantic-op expression))
            (= 1 (count (descriptor/call-args expression)))
            (symbol? (first (descriptor/call-args expression))))))
@@ -36,7 +40,9 @@
   ;; compiler's semantically identified array-length query; richer scalar equations belong in the
   ;; typed program itself.
   (or (and (legacy/scalar-binding? node) (provably-pure-host-binding? (:expr node)))
-      (and (legacy/soac-map? node) (:pure? node))
+      (and (legacy/soac-map? node)
+           (or (:pure? node)
+               (and (:void? node) (symbol? (:primary-out node)))))
       (and (legacy/soac-reduce? node)
            (empty? (:segment-axes node))
            (reduction/scalar? (:reduction node)))))
@@ -71,7 +77,7 @@
               (assoc-in [:scalar-representatives (:sym node)] representative)))
 
         (or (legacy/soac-map? node) (legacy/soac-reduce? node))
-        (let [bound (:bound node)
+        (let [bound (descriptor/unwrap-int-cast (:bound node))
               array (alength-array bound)
               bound' (cond
                        (and array (contains? extents array)) (get extents array)
@@ -172,34 +178,74 @@
 
       map
       (do
-        (when-not (= 1 (count results))
-          (throw (ex-info "the first production TypedSOAC route requires one map result"
+        (when-not (and (seq results) (= (count results) (count bodies)))
+          (throw (ex-info "the production TypedSOAC route requires one body per map result"
                           {:reason :typed-soac-production-subset
                            :equation equation-id :results results})))
         (let [result (first results)
-              dtype (:dtype (get values result))
-              [_ _ cast] (get dtype->allocation dtype)
+              result-dtypes (mapv #(:dtype (get values %)) results)
+              casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+              _ (when (some nil? casts)
+                  (throw (ex-info "TypedSOAC materialization has no scalar cast for map output"
+                                  {:reason :typed-soac-materialization-dtype
+                                   :results results :dtypes result-dtypes})))
+              cast (first casts)
+              destination (get-in placement-facts [:attributes :destination])
+              _ (when (and destination (not= 1 (count results)))
+                  (throw (ex-info "an effectful map destination cannot have fused logical outputs"
+                                  {:reason :typed-soac-production-subset
+                                   :equation equation-id :results results
+                                   :destination destination})))
+              secondary-stores
+              (mapv (fn [secondary secondary-cast body]
+                      (list 'clojure.core/aset secondary (:index attributes)
+                            (list secondary-cast body)))
+                    (rest results) (rest casts) (rest bodies))
+              body (if (seq secondary-stores)
+                     (list* 'do (concat secondary-stores [(first bodies)]))
+                     (first bodies))
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
-                       (list 'raster.par/map! result (:index attributes) (:extent attributes)
-                             cast (first bodies))
-                       {:raster.type/elem-type dtype})]
+                       (if destination
+                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                               (list 'clojure.core/aset destination (:index attributes)
+                                     (list cast body)))
+                         (list 'raster.par/map! result (:index attributes) (:extent attributes)
+                               cast body))
+                       {:raster.type/elem-type (first result-dtypes)})]
           {:equation-id equation-id
            :placement placement
-           :pairs [(allocation-pair values result (:extent attributes)) [effect source]]
-           :site [:binding effect]
+           :pairs (if destination
+                    [[result source]]
+                    (conj (mapv #(allocation-pair values % (:extent attributes)) results)
+                          [effect source]))
+           :site [:binding (if destination result effect)]
            :source source}))
 
       reduce
       (let [result (first results)
             accumulator (first (:accumulators attributes))
-            source (list 'raster.par/reduce accumulator (first (:identities attributes))
-                         (:index attributes) (:extent attributes) (first bodies))]
-        {:equation-id equation-id
-         :placement placement
-         :pairs [[result source]]
-         :site [:binding result]
-         :source source}))))
+            resident? (resident/resident-scalar-value? (get values result))
+            source (if resident?
+                     ;; reduce-into owns its explicit one-element destination first. The
+                     ;; functional reduction algorithm itself remains unchanged.
+                     (list 'raster.par/reduce-into result accumulator
+                           (first (:identities attributes)) (:index attributes)
+                           (:extent attributes) (first bodies))
+                     (list 'raster.par/reduce accumulator (first (:identities attributes))
+                           (:index attributes) (:extent attributes) (first bodies)))]
+        (if resident?
+          (let [effect (gensym (str "typed_soac_reduce_" equation-id "__"))]
+            {:equation-id equation-id
+             :placement placement
+             :pairs [(allocation-pair values result 1) [effect source]]
+             :site [:binding effect]
+             :source source})
+          {:equation-id equation-id
+           :placement placement
+           :pairs [[result source]]
+           :site [:binding result]
+           :source source})))))
 
 (defn- realize-source
   [form program]
@@ -255,11 +301,13 @@
 
 (defn attempt
   "Return a typed production ParallelProgram result, an explicit `:declined` result, or nil when
-   the form is outside this closed subset. The legacy graph is used only as a temporary
-   differential oracle during migration."
-  ([form abstract-machine dtype]
-   (attempt form abstract-machine dtype {}))
-  ([form abstract-machine dtype array-types]
+   the form is outside this closed subset."
+  ([form dtype]
+   (attempt form dtype {}))
+  ([form dtype array-types]
+   (attempt form dtype array-types {}))
+  ([form dtype array-types {:keys [resident-reductions?]
+                            :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (try
        (let [[_ bindings & body] form
@@ -273,27 +321,19 @@
                                      :array-types array-types
                                      :include-scalar-bindings? true})
                  [typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
-                 source-graph (graph/build-fusion-graph nodes)
-                 [legacy-result _] (graph/fusion-fixpoint source-graph abstract-machine dtype)
-                 shadow (adapter/legacy-nodes->program
-                         (:nodes legacy-result) {:outputs outputs :dtype dtype
-                                                 :array-types array-types
-                                                 :include-scalar-bindings? true})]
-             (cond
-               (not (pos? (:vertical typed-stats)))
-               {:declined {:reason :no-certified-vertical-fusion :stats typed-stats}}
-
-               (pos? (:horizontal typed-stats))
-               {:declined {:reason :typed-horizontal-materialization-pending :stats typed-stats}}
-
-               (not= (dialect/equations shadow) (dialect/equations typed-result))
-               {:declined {:reason :fusion-shadow-disagreement :stats typed-stats}}
-
-               :else
+                 [typed-result resident-stats]
+                 (if resident-reductions?
+                   (resident/realize typed-result)
+                   [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
+             (if (not-any? #(contains? #{:map :reduce}
+                                       (:kind (fusion/equation-info %)))
+                           (dialect/equations typed-result))
+               {:declined {:reason :no-certified-parallel-equation
+                           :stats (merge typed-stats resident-stats)}}
                (let [{:keys [source realized]} (realize-source form typed-result)]
                  {:program (envelope typed-result source realized)
-                  :stats (assoc typed-stats :route :typed-soac
-                                :shadow-certified true)})))))
+                  :stats (merge typed-stats resident-stats
+                                {:route :typed-soac :typed-validated true})})))))
        (catch clojure.lang.ExceptionInfo exception
          (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
            (throw exception))

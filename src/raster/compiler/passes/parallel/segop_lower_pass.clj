@@ -289,10 +289,67 @@
                    (cond-> (= 'scalar kind)
                      (update :attributes assoc :host-only true)))))
            (:equations form))
+          ;; A multi-phase schedule introduces physical SSA values that do not exist in the
+          ;; functional algorithm. They still require explicit contracts; an emitter must never
+          ;; infer their dtype or extent from a generated name.
+          scheduled-values
+          (reduce
+           (fn [values equation]
+             (reduce
+              (fn [values operation]
+                (if (and (instance? raster.compiler.ir.segop.SegRed operation)
+                         (= :block-local (:phase operation)))
+                  (reduce (fn [values id]
+                            (if (contains? values id)
+                              values
+                              (assoc values id
+                                     (av/tensor
+                                      {:dtype (:dtype operation)
+                                       :shape [(:num-blocks (:grid operation))]
+                                       :representation {:kind :plain}
+                                       :memory-space :device}))))
+                          values (:outputs operation))
+                  values))
+              values (:operations equation)))
+           (:values form) equations)
+          ;; Scheduled operations are not exempt from SSA validation merely because they are
+          ;; records nested inside an equation. Every physical operand/result—including generated
+          ;; partial arrays and aliased destinations—must have an AbstractValue contract.
+          _ (doseq [equation equations
+                    operation (:operations equation)
+                    id (set/union (or (:inputs operation) #{})
+                                  (or (:outputs operation) #{})
+                                  (or (:scalars operation) #{}))]
+              (when-not (contains? scheduled-values id)
+                (throw (ex-info "scheduled SegOp references an undeclared value"
+                                {:reason :segop-unknown-scheduled-value
+                                 :equation (:id equation)
+                                 :operation (:id operation)
+                                 :value id}))))
+          ;; A typed equation's alias facts define its physical output boundary. This is
+          ;; particularly load-bearing for map-void: the semantic result aliases the resident
+          ;; destination, and the scheduled store must name that destination explicitly.
+          _ (doseq [equation equations
+                    :when (seq (:operations equation))]
+              (let [algorithm (:algorithm equation)
+                    algorithm-equation (first (soac-dialect/equations algorithm))
+                    algorithm-id (second algorithm-equation)
+                    aliases (get-in (soac-dialect/facts algorithm)
+                                    [:equations algorithm-id :aliases])
+                    expected (set (map #(get aliases % %) (:results equation)))
+                    scheduled-outputs (apply set/union #{}
+                                             (map :outputs (:operations equation)))]
+                (when-not (set/subset? expected scheduled-outputs)
+                  (throw (ex-info "scheduled SegOp does not realize the typed output boundary"
+                                  {:reason :segop-output-boundary
+                                   :equation (:id equation)
+                                   :expected expected
+                                   :scheduled scheduled-outputs})))))
           parallel-equation-count (count (remove #(get-in % [:attributes :host-only]) equations))
           scalar-equation-count (- (count equations) parallel-equation-count)
           lowered (assoc form
                          :dialect :segop
+                         :values scheduled-values
                          :equations equations
                          :provenance (assoc (:provenance form)
                                             :pass :segop-lower :source-dialect :typed-soac

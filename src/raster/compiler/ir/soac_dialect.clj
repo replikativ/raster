@@ -308,9 +308,10 @@
       (let [value (get values id)]
         (when (and value
                    (not (and (= :tensor (:kind value)) (seq (:shape value)))))
-          (fail! :typed-soac-stable-array-type
-                 "stable array captures must have a non-scalar tensor contract"
-                 {:equation equation-id :id id :value value}))))
+          (when-not (= :resident-scalar-buffer (get-in value [:representation :kind]))
+            (fail! :typed-soac-stable-array-type
+                   "stable captures require tensor storage or an explicit resident scalar buffer"
+                   {:equation equation-id :id id :value value})))))
     (case kind
       scalar
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
