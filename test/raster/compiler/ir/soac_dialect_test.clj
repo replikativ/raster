@@ -38,6 +38,12 @@
     (is (= '[x] (dialect/operation-inputs (first (dialect/equations program)))))))
 
 (deftest scalar-regions-are-recursively-validated
+  (testing "walker-devirtualized scalar calls remain explicit functional expressions"
+    (let [program (map-program
+                   {:body '(.invk raster.numeric/_star__m_float_float-impl
+                                  x-element x-element)})]
+      (is (= program (dialect/validate! program)))))
+
   (testing "a non-language object cannot hide inside a scalar call"
     (let [bad-body (list '* 'x-element (Object.))]
       (try
@@ -130,3 +136,24 @@
          '[y])]
     (is (= [(list 'value extent-id)] (:shape (get-in (dialect/facts program)
                                                      [:values 'x]))))))
+
+(deftest alpha-remapping-preserves-static-extents-and-renames-value-facts
+  (let [static-tensor (av/tensor {:dtype :float :shape [8]})
+        program
+        (dialect/make
+         (dialect/default-program-facts
+          {:values {'x static-tensor 'y static-tensor}
+           :inputs '[x]
+           :equations {'map-0 (dialect/default-equation-facts)}})
+         [(list '= 'map-0 '[y]
+                (list 'map {:index 'i :extent 8} '[x] []
+                      (list 'lambda '[x-element] '[(* x-element 2.0)])))]
+         '[y])
+        remapped (dialect/remap-values program {'x [:argument 0] 'y [:result 0]})
+        equation (first (dialect/equations remapped))]
+    (is (= [[:argument 0]] (:inputs (dialect/facts remapped))))
+    (is (= [[:result 0]] (dialect/outputs remapped)))
+    (is (= 8 (dialect/operation-extent equation)))
+    (is (= [[:argument 0]] (dialect/operation-inputs equation)))
+    (is (= [8] (:shape (get-in (dialect/facts remapped)
+                               [:values [:result 0]]))))))

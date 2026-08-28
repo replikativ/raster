@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]))
 
 (def ^:private reduce-source
@@ -25,6 +26,12 @@
     (is (= ['?] (:shape (get (:values p) 'values))))
     (is (= [] (:shape (get (:values p) [:binding 'total]))))
     (is (seq (:operations equation)))
+    (is (soac-dialect/program-form? (:algorithm equation)))
+    (is (= (:operands equation) (:inputs (soac-dialect/facts (:algorithm equation)))))
+    (is (= (:results equation) (soac-dialect/outputs (:algorithm equation))))
+    (is (= '[n] (get-in (soac-dialect/facts (:algorithm equation))
+                        [:values 'values :shape])))
+    (is (= :typed-soac (:algorithm-dialect (first (:operations equation)))))
     (testing "the source binder is ordinary Clojure data, not an IR side channel"
       (is (nil? (meta (first (second (:source p)))))))))
 
@@ -45,3 +52,15 @@
         (is (= :illegal-op-remains (:reason (ex-data e))))
         (is (= :segop (:target-dialect (ex-data e))))
         (is (= :none (:fallback (ex-data e))))))))
+
+(deftest source-shaped-bound-expressions-stay-on-the-compatibility-route
+  (let [source '(raster.par/reduce acc 0.0 i (clojure.core/alength values)
+                                    (+ acc (clojure.core/aget values i)))
+        p (:form (segop-lower/segop-lower-pass
+                  (list 'let* ['total source] 'total)
+                  {:target-device :cpu:0 :dtype :double
+                   :array-types {'values :double}}))
+        equation (first (:equations p))]
+    (is (nil? (:algorithm equation)))
+    (is (seq (:operations equation)))
+    (is (= [:binding 'total] (:site equation)))))

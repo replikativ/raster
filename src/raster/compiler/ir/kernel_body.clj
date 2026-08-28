@@ -65,7 +65,7 @@
             schedule launch provenance attributes])
 
 (def ^:private parameter-kinds #{:input :output :scalar})
-(def ^:private index-sources #{:group :local :subgroup :lane})
+(def ^:private index-sources #{:group :group-count :local :subgroup :lane})
 (def ^:private index-ops #{:add :sub :mul :floor-div :ceil-div :mod :min :max})
 (def ^:private predicate-ops #{:lt :lte :eq :and :or :not})
 (def ^:private cache-policies #{:default :cached :streaming})
@@ -1673,7 +1673,7 @@
                (when-not (and (contains? index-sources (:source idx))
                               (integer? (:axis idx))
                               (case (:source idx)
-                                (:group :local) (< -1 (:axis idx) launch-dimensions)
+                                (:group :group-count :local) (< -1 (:axis idx) launch-dimensions)
                                 (:subgroup :lane) (zero? (:axis idx))))
                  (throw (ex-info "kernel index binding has an invalid hardware source" {:index idx})))
 
@@ -1813,7 +1813,7 @@
                (let [uniformity
                      (if (record-kind? "raster.compiler.ir.kernel_body.IndexBinding" idx)
                        (case (:source idx)
-                         :group all-uniform
+                         (:group :group-count) all-uniform
                          :local lane-varying
                          :subgroup subgroup-uniform
                          :lane lane-varying)

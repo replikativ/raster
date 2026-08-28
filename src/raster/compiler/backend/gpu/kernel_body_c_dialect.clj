@@ -83,11 +83,13 @@
   (if (opencl? dialect)
     (case source
       :group (str "get_group_id(" axis ")")
+      :group-count (str "get_num_groups(" axis ")")
       :local (str "get_local_id(" axis ")")
       :subgroup "get_sub_group_id()"
       :lane "get_sub_group_local_id()")
     (case source
       :group (str "blockIdx." (nth axis-name axis))
+      :group-count (str "gridDim." (nth axis-name axis))
       :local (str "threadIdx." (nth axis-name axis))
       :subgroup (str "(" (linear-thread-id) " / " subgroup-width ")")
       :lane (str "(" (linear-thread-id) " % " subgroup-width ")"))))

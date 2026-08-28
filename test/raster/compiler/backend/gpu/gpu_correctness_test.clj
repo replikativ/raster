@@ -172,7 +172,9 @@
         (is (str/includes? src "__local"))
         (is (str/includes? src "barrier"))
         (is (str/includes? src "get_local_id"))
-        (is (str/includes? src "get_local_size"))))))
+        (is (str/includes? src "rstr_tree_combined_"))
+        (is (not (str/includes? src "get_local_size"))
+            "the emitted target must not reconstruct the static KernelBody schedule")))))
 
 ;; ---- 1.7 Scan kernel structure ----
 

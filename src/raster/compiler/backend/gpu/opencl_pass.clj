@@ -429,7 +429,8 @@
             (let [{:keys [out-buf reduce-form]} (par/extract-par-reduce-into-info form)
                   segred (par->segred stats reduce-form dtype device-id)
                   kernel (segop-cl/generate-segred-kernel
-                          segred out-buf :dtype dtype :scalar-types top-scalar-types)
+                          segred out-buf :dtype dtype :scalar-types top-scalar-types
+                          :array-types top-array-types)
                   k (register-kernel! kernel :ze-reduces)]
               (emit-reduction-invocation k out-buf))
 
@@ -441,7 +442,8 @@
                     (par/expand-par-reduce form))
                 (let [segred (par->segred stats form dtype device-id)
                       kernel (segop-cl/generate-segred-kernel
-                              segred nil :dtype dtype :scalar-types top-scalar-types)
+                              segred nil :dtype dtype :scalar-types top-scalar-types
+                              :array-types top-array-types)
                       k (register-kernel! kernel :ze-reduces)]
                   (emit-reduction-invocation k nil))))
 

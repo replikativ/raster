@@ -3,8 +3,8 @@
 
    The expression spine is deliberately small and pattern-friendly.  Stable value/equation
    identity and compiler facts live in the explicit program envelope, never in Clojure metadata.
-   This namespace does not replace ParallelProgram yet; it is the verified dialect boundary that
-   the next vertical will carry in that existing envelope.
+   ParallelProgram equations retain this verified functional program as their semantic algorithm;
+   scheduled SegOps remain a separate ordered field.
 
    Canonical forms:
 
@@ -38,6 +38,10 @@
   [value]
   (or (integer? value) (value-id? value)))
 
+(defn extent?
+  [value]
+  (or (value-id? value) (and (integer? value) (not (neg? value)))))
+
 (defn scalar-literal?
   [value]
   (or (nil? value)
@@ -52,13 +56,16 @@
    AbstractValue dimensions already accept symbolic S-expressions. Compound stable IDs therefore
    use an explicit `(value id)` dimension instead of being confused with shape structure."
   [extent]
-  [(if (symbol? extent) extent (list 'value extent))])
+  [(cond
+     (integer? extent) extent
+     (symbol? extent) extent
+     :else (list 'value extent))])
 
 (defn map-attributes?
   [value]
   (and (map? value)
        (symbol? (:index value))
-       (value-id? (:extent value))
+       (extent? (:extent value))
        (or (nil? (:attributes value)) (map? (:attributes value)))))
 
 (defn reduce-attributes?
@@ -116,6 +123,7 @@
           (do (?:+ s))
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
           [(?:* s)]
+          (.invk ?sym:impl (?:* s:args))
           (& (?sym:f (?:* s:args)) (? _ seq?)))
 
   (Lambda [l :enforce]
@@ -318,8 +326,9 @@
     (let [definitions (mapcat #(nth % 2) equations)
           definition-set (set definitions)
           references (set (mapcat (fn [equation]
-                                    (conj (operation-inputs equation)
-                                          (operation-extent equation)))
+                                    (cond-> (operation-inputs equation)
+                                      (value-id? (operation-extent equation))
+                                      (conj (operation-extent equation))))
                                   equations))
           external (set/difference references definition-set)
           total-effects (reduce set/union #{}
@@ -340,8 +349,9 @@
              [equation & remaining] equations]
         (when equation
           (let [equation-id (second equation)
-                required (conj (set (operation-inputs equation))
-                               (operation-extent equation))
+                required (cond-> (set (operation-inputs equation))
+                           (value-id? (operation-extent equation))
+                           (conj (operation-extent equation)))
                 missing (set/difference required available)]
             (when (seq missing)
               (fail! :typed-soac-use-before-definition
@@ -360,6 +370,59 @@
   "Construct and validate a typed SOAC program."
   [program-facts equation-forms program-outputs]
   (validate! (list 'soac-program program-facts (vec equation-forms) (vec program-outputs))))
+
+(defn remap-values
+  "Alpha-rename stable value IDs throughout a TypedSOAC program.
+
+   Lambda parameters are lexical binders and are deliberately untouched. This is the bridge used
+   when a typed algorithm enters ParallelProgram's SSA envelope: logical source binders become the
+   envelope's authoritative value IDs without reparsing the scalar region or losing its facts."
+  [program value-map]
+  (let [program (validate! program)
+        rename #(get value-map % %)
+        rename-dimension
+        (fn [dimension]
+          (cond
+            (contains? value-map dimension)
+            (let [id (rename dimension)]
+              (if (symbol? id) id (list 'value id)))
+
+            (and (seq? dimension) (= 'value (first dimension)) (= 2 (count dimension))
+                 (contains? value-map (second dimension)))
+            (list 'value (rename (second dimension)))
+
+            :else dimension))
+        rename-value (fn [value] (update value :shape #(mapv rename-dimension %)))
+        source-facts (facts program)
+        values (reduce-kv (fn [result id value]
+                            (let [id' (rename id)]
+                              (when (contains? result id')
+                                (fail! :typed-soac-remap-collision
+                                       "value remapping collapses distinct TypedSOAC IDs"
+                                       {:target id' :mapping value-map}))
+                              (assoc result id' (rename-value value))))
+                          {} (:values source-facts))
+        equation-forms
+        (mapv (fn [[equals equation-id results operation]]
+                (let [[kind attributes arrays captures lambda] operation]
+                  (list equals equation-id (mapv rename results)
+                        (list kind (update attributes :extent
+                                           #(if (value-id? %) (rename %) %))
+                              (mapv rename arrays) (mapv rename captures) lambda))))
+              (equations program))
+        rename-aliases
+        (fn [aliases]
+          (into {} (map (fn [[left right]] [(rename left) (rename right)])) aliases))
+        equation-facts
+        (into {}
+              (map (fn [[id equation-facts]]
+                     [id (update equation-facts :aliases rename-aliases)]))
+              (:equations source-facts))
+        facts' (assoc source-facts
+                      :values values
+                      :inputs (mapv rename (:inputs source-facts))
+                      :equations equation-facts)]
+    (make facts' equation-forms (mapv rename (outputs program)))))
 
 (defn default-equation-facts
   ([] (default-equation-facts {}))

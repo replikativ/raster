@@ -52,8 +52,9 @@ Raster is not starting from a toy compiler:
   staged contraction and DP4A-related work.
 
 These pieces are the foundation. The SegOp boundary now uses a first-class typed
-`ParallelProgram`; remaining gaps are concentrated in the earlier SOAC program,
-the scheduled kernel-body representation, duplicated lowering, and string-template seams.
+`ParallelProgram`; its equations can retain a validated functional algorithm beside the ordered
+scheduled operations. Remaining gaps are concentrated in migrating the full earlier SOAC program,
+the remaining scheduled kernel-body representation, duplicated lowering, and string-template seams.
 
 ## 2. The load-bearing gaps
 
@@ -66,6 +67,14 @@ reconstruct scalar host control around them. The `:segop-lowered` validator perf
 operation/type legality check, and source equality invalidates an equation after a backend-local
 rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
 path.
+
+The first typed vertical is now production-routed for scalar/full reductions. A
+`ProgramEquation` owns the alpha-renamed TypedSOAC program and the SegRed mechanically derived from
+its explicit lambda parameters, operands, extent, result, dtype and algebra facts. JVM SIMD consumes
+that SegRed. The GPU schedules eligible scalar regions as one verified workgroup-tree `KernelBody`
+with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and an ordered result ABI;
+the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
+Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
 
 The remaining nominal boundary is earlier: SOAC fusion still constructs records and a dependency
 graph from source-shaped S-expressions, rewrites them, and reconstructs `par` forms before the typed
@@ -731,8 +740,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
 
 1. **Landed:** define a typed SOAC S-expression dialect with `../pattern` and differential-test
    map→map, map→reduce and horizontal-map fusion against the current graph.
-2. Carry that dialect in the existing program/value envelope and route one ordinary fused reduction
-   through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from source spelling.
+2. **Landed:** carry that dialect in the existing program/value envelope and route one ordinary
+   fused reduction through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from
+   source spelling.
 3. Add a finite verified shared-memory swizzle family and bank-conflict/resource model.
 4. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
    attention-provenance gate from the generic weighted-reduction matcher.
