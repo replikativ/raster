@@ -101,9 +101,9 @@ jobs:
             -m raster.compiler.backend.gpu.kernel-body-compile-fixtures
             gpu-compile-gates
       - persist_to_workspace:
-          root: ~/repo
+          root: ~/
           paths:
-            - gpu-compile-gates
+            - repo/gpu-compile-gates
 
   cuda-compile-gate:
     executor: cuda-compiler
