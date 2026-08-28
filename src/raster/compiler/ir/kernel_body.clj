@@ -449,10 +449,14 @@
                      (throw (ex-info "kernel mask references values outside the operation scope"
                                      {:mask id :references (vec outside)
                                       :scope scope :operation operation}))))))
+        coordinates-syntax! (fn [owner coordinates]
+                              (when-not (and (vector? coordinates)
+                                             (every? expression? coordinates))
+                                (throw (ex-info
+                                        (str owner " coordinates must use explicit index expressions")
+                                        {:coordinates coordinates}))))
         coordinates! (fn [owner coordinates]
-                       (when-not (and (vector? coordinates) (every? expression? coordinates))
-                         (throw (ex-info (str owner " coordinates must use explicit index expressions")
-                                         {:coordinates coordinates})))
+                       (coordinates-syntax! owner coordinates)
                        (let [outside (remove scope (mapcat expression-references coordinates))]
                          (when (seq outside)
                            (throw (ex-info (str owner " coordinates reference values outside the operation scope")
@@ -746,8 +750,11 @@
             destination (parameter (:destination operation))
             elements (:elements operation)
             transfer-bytes (:transfer-bytes operation)]
-        (coordinates! "async-copy source" (:source-coordinates operation))
-        (coordinates! "async-copy destination" (:destination-coordinates operation))
+        ;; Async-copy coordinates are scalar SSA expressions, unlike the legacy tile vocabulary
+        ;; whose coordinates are restricted to kernel index bindings.  Their references and
+        ;; workgroup uniformity are checked by the typed SSA verifier below.
+        (coordinates-syntax! "async-copy source" (:source-coordinates operation))
+        (coordinates-syntax! "async-copy destination" (:destination-coordinates operation))
         (when-not (and (value-id? (:id operation))
                        (= :input (:kind source))
                        (= :global (:memory-space source))
@@ -1404,6 +1411,13 @@
                 (throw (ex-info "async staging lifetime crosses a structured region boundary"
                                 {:reason :kernel-body-async-region-lifetime
                                  :owner owner :state state}))))
+            (active-staging? [state]
+              (or (seq (:issued state)) (seq (:committed state))
+                  (seq (:awaiting-barrier state))
+                  (seq (:readable-stages state))
+                  (seq (:consumed-stages state))))
+            (queue-state [state]
+              (select-keys state [:issued :committed :awaiting-barrier :readable-stages]))
             (group-signature [group]
               (mapv (fn [copy]
                       [(:destination copy) (:elements copy) (:transfer-bytes copy)])
@@ -1556,17 +1570,39 @@
                                     (:async-results operation) yielded-committed))))
 
                    (seq (nested-operation-regions operation))
-                   (do
-                     (clean-state! owner state)
-                     (doseq [[index region] (map-indexed vector
-                                                         (nested-operation-regions operation))]
-                       (let [nested-final
-                             (validate-sequence-state!
-                              [owner index] region
-                              {:issued [] :committed [] :awaiting-barrier #{}
-                               :readable-stages #{} :consumed-stages #{}})]
-                         (clean-state! [owner index] nested-final)))
-                     state)
+                   (let [regions (nested-operation-regions operation)]
+                     (if-not (active-staging? state)
+                       (do
+                         (clean-state! owner state)
+                         (doseq [[index region] (map-indexed vector regions)]
+                           (let [nested-final
+                                 (validate-sequence-state!
+                                  [owner index] region
+                                  {:issued [] :committed [] :awaiting-barrier #{}
+                                   :readable-stages #{} :consumed-stages #{}})]
+                             (clean-state! [owner index] nested-final)))
+                         state)
+                       (if (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
+                         (let [branch-states
+                               (mapv (fn [index region]
+                                       (validate-sequence-state! [owner index] region state))
+                                     (range) regions)]
+                           (when-not (apply = branch-states)
+                             (throw (ex-info
+                                     "structured branches disagree on live async staging state"
+                                     {:reason :kernel-body-async-branch-state
+                                      :owner owner :operation operation
+                                      :branch-states branch-states})))
+                           (first branch-states))
+                         (let [nested-final
+                               (validate-sequence-state! [owner 0] (first regions) state)]
+                           (when-not (= (queue-state state) (queue-state nested-final))
+                             (throw (ex-info
+                                     "ordinary structured loop changes live async queue state"
+                                     {:reason :kernel-body-async-loop-state
+                                      :owner owner :operation operation
+                                      :initial state :final nested-final})))
+                           nested-final))))
 
                    :else state))
                initial-state

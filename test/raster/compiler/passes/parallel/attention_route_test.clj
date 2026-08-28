@@ -58,6 +58,14 @@
   {:device-type :gpu :vendor "Intel" :subgroup-size 16
    :max-workgroup-size 256})
 
+(defn- operation-tree
+  [operations]
+  (letfn [(children [operation]
+            (vec (concat (:operations operation)
+                         (:then-operations operation)
+                         (:else-operations operation))))]
+    (mapcat #(tree-seq (comp seq children) children %) operations)))
+
 (deftest dense-reference-is-a-complete-packed-attention-compiler-value
   (let [{:keys [strategy reference? declines plan artifact graph schedule]}
         (route/route! (problem)
@@ -124,6 +132,76 @@
     (is (str/includes? source "float rstr_final_maximum"))
     (is (str/includes? source "float rstr_weighted_value_next_0"))))
 
+(deftest aligned-dense-history-selects-a-verified-double-buffered-schedule
+  (let [problem (problem :value-head-dim 8)
+        descriptor (assoc intel-desc
+                          :segmented-weighted-reduction-schedule
+                          :subgroup-online-pipelined-history)
+        reference (route/route!
+                   problem (assoc intel-desc
+                                  :segmented-weighted-reduction-schedule :reference))
+        {:keys [strategy reference? declines artifact]} (route/route! problem descriptor)
+        scheduled (get-in artifact [:attributes :segmented-weighted-reduction-schedule])
+        kernel-body (get-in artifact [:attributes :kernel-body])
+        operations (operation-tree (:operations kernel-body))
+        source (:source artifact)]
+    (is (= :routed-paged-subgroup-online-pipelined-history strategy))
+    (is (false? reference?))
+    (is (empty? declines))
+    (is (= (kexec/common-view (:artifact reference))
+           (kexec/common-view artifact)))
+    (is (= {:kind :double-buffered-membership-rows
+            :stages 2 :members-per-iteration 2 :element-dtype :half
+            :key-elements 8 :value-elements 8 :transfer-bytes 16
+            :overlap :preferred :tail-policy :separate-epilogue
+            :shared-memory-bytes 64}
+           (:staging scheduled)))
+    (is (= 4 (count (:allocations kernel-body))))
+    (is (= 64 (get-in kernel-body [:launch :shared-memory-bytes])))
+    (is (= :scheduled-pipelined-kernel-body
+           (get-in kernel-body [:provenance :lowering])))
+    (is (some #(instance? raster.compiler.ir.kernel_body.PipelinedFor %) operations))
+    (is (some #(instance? raster.compiler.ir.kernel_body.AsyncWorkgroupCopy %) operations))
+    (is (str/includes? source "async_work_group_copy"))
+    (is (str/includes? source "rstr_pipeline_has_odd"))
+    (is (str/includes? source "rstr_pipeline_membership_count >= 2"))
+    (is (= :routed-paged-subgroup-online-score-reuse
+           (:strategy (route/route! problem intel-desc)))
+        "unmeasured double buffering remains opt-in")))
+
+(deftest pipelined-history-legality-is-storage-and-resource-explicit
+  (let [aligned-problem (problem :value-head-dim 8)
+        plan (:plan (route/route!
+                     aligned-problem
+                     (assoc intel-desc
+                            :segmented-weighted-reduction-schedule :reference)))]
+    (is (= :pipelined-history-requires-dense-paged-route
+           (:reason
+            (schedule-pass/plan-subgroup-online-pipelined
+             (:plan (route/route!
+                     (problem :route (csr-route) :value-head-dim 8)
+                     (assoc intel-desc
+                            :segmented-weighted-reduction-schedule :reference)))
+             intel-desc))))
+    (is (= :pipelined-history-requires-interval-membership
+           (:reason
+            (schedule-pass/plan-subgroup-online-pipelined
+             (:plan (route/route!
+                     (problem :visibility (csr-visibility) :value-head-dim 8)
+                     (assoc intel-desc
+                            :segmented-weighted-reduction-schedule :reference)))
+             intel-desc))))
+    (is (= :pipelined-history-row-transfer-width-unsupported
+           (:reason (schedule-pass/plan-subgroup-online-pipelined
+                     (:plan (route/route!
+                             (problem)
+                             (assoc intel-desc
+                                    :segmented-weighted-reduction-schedule :reference)))
+                     intel-desc))))
+    (is (= :pipelined-history-shared-memory-exceeded
+           (:reason (schedule-pass/plan-subgroup-online-pipelined
+                     plan (assoc-in intel-desc [:cache :slm] 32)))))))
+
 (deftest cooperative-attention-source-is-valid-opencl
   (let [clang? (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))]
     (if-not clang?
@@ -169,6 +247,35 @@
                (get-in artifact [:attributes :target-collective-association])))
         (is (str/includes? (:source artifact) "extern \"C\" __global__ void"))
         (is (str/includes? (:source artifact) "__shfl_down"))))))
+
+(deftest pipelined-attention-preserves-one-body-and-abi-across-c-family-targets
+  (let [descriptor {:device-type :gpu :subgroup-size 32 :max-workgroup-size 1024}
+        plan (:plan (route/route!
+                     (problem :value-head-dim 8)
+                     (assoc descriptor :segmented-weighted-reduction-schedule :reference)))
+        scheduled (:schedule
+                   (schedule-pass/plan-subgroup-online-pipelined plan descriptor))
+        opencl (attention-emit/emit-fp16-pipelined
+                plan scheduled :opencl-portable)
+        cuda (attention-emit/emit-fp16-pipelined
+              plan scheduled :cuda {:compute-capability [8 0]})
+        hip (attention-emit/emit-fp16-pipelined plan scheduled :hip)]
+    (doseq [artifact [cuda hip]]
+      (is (= (:abi opencl) (:abi artifact)))
+      (is (= (:arguments opencl) (:arguments artifact)))
+      (is (= (:effects opencl) (:effects artifact)))
+      (is (= (select-keys (get-in opencl [:attributes :kernel-body])
+                          [:id :parameters :allocations :indices :schedule :launch
+                           :provenance :attributes])
+             (select-keys (get-in artifact [:attributes :kernel-body])
+                          [:id :parameters :allocations :indices :schedule :launch
+                           :provenance :attributes]))))
+    (is (= :cuda-c (:target cuda)))
+    (is (str/includes? (:source cuda) "cp.async.ca.shared.global"))
+    (is (str/includes? (:source cuda) "cp.async.wait_group 1"))
+    (is (= :hip-cpp (:target hip)))
+    (is (str/includes? (:source hip) "synchronous cooperative copies are complete"))
+    (is (not (str/includes? (:source hip) "cp.async")))))
 
 (deftest tiled-history-is-a-two-stage-kernel-graph-with-a-stable-external-abi
   (let [desc (assoc intel-desc

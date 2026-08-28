@@ -58,14 +58,19 @@
                      (problem)
                      (assoc descriptor :segmented-weighted-reduction-schedule :reference)))
         cooperative-schedule (:schedule (schedule/plan-subgroup-online plan descriptor))
+        pipelined-schedule (:schedule
+                            (schedule/plan-subgroup-online-pipelined plan descriptor))
         tiled-schedule (:schedule
                         (schedule/plan-subgroup-online-tiled
                          plan (assoc descriptor
                                      :segmented-weighted-reduction-history-tile-size 4)))
         cooperative (attention-emit/emit-fp16-cooperative
                      plan cooperative-schedule dialect)
+        pipelined (attention-emit/emit-fp16-pipelined
+                   plan pipelined-schedule dialect descriptor)
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
+           (write-artifact! directory suffix "pipelined-attention" pipelined)
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

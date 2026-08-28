@@ -711,6 +711,22 @@
            clojure.lang.ExceptionInfo #"issued uniformly"
            (apply scalar-body
                   (assoc (async-stage-operations) 0 (async-stage-copy ['lane]))
+                  options))))
+    (testing "async coordinates may use prior uniform scalar SSA values"
+      (is (body/kernel-body?
+           (apply scalar-body
+                  (into [(body/->ScalarCompute
+                          (body/value 'source-base :int)
+                          (body/scalar-expression
+                           :+ :int ['group (body/literal 0 :int)]))]
+                        (assoc (async-stage-operations) 0
+                               (async-stage-copy ['source-base])))
+                  options))))
+    (testing "undefined async coordinate SSA values still fail in the typed verifier"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"before it is defined"
+           (apply scalar-body
+                  (assoc (async-stage-operations) 0 (async-stage-copy ['missing-base]))
                   options))))))
 
 (deftest pipelined-for-carries-a-verified-rotating-async-queue

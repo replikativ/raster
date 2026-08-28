@@ -159,10 +159,16 @@ pending asynchronous state and live staged storage from escaping an ordinary str
 but `PipelinedFor` now carries a complete ordered async queue across loop iterations, verifies each
 rotating stage's layout and lifetime, and requires an explicit exact or separate-epilogue tail
 policy. OpenCL lowers the queue through native event variables; CUDA maps it to `cp.async` groups;
-HIP preserves the same verified schedule with an honest synchronous fallback. The next production
-step is a double-buffered scheduled weighted-reduction body using this representation. Local
-swizzles and measured stage-depth selection then let this collapse the tiled graph toward a
-FlashAttention-like single kernel without changing the semantic plan or external ABI.
+HIP preserves the same verified schedule with an honest synchronous fallback. A production
+double-buffered weighted-reduction schedule now stages two dense-paged FP16 K/V membership rows,
+overlaps each refill with consumption of the other row, and handles histories of length zero or one
+through the prior sequential body and even/odd tails through an explicit drain/epilogue. It retains
+the semantic plan, ordered ABI and interval bounds; CSR membership, CSR physical routing and
+unaligned row widths decline to their prior verified schedules. The exact body runs against the
+reference algebra on Intel and compiles through nvcc and hipcc without target hardware. Local
+swizzles and measured stage-depth selection can now collapse more of the tiled graph toward a
+FlashAttention-like single kernel without changing the semantic plan or external ABI. The schedule
+remains opt-in until device measurements and the runtime cost path justify automatic selection.
 
 ### 2.3 Executable steps and resident artifact values compose
 
@@ -708,26 +714,25 @@ the trusted verifier stays small.
 
 Each increment should be a thin vertical slice with a production-path test.
 
-The immediate continuation after the verified pipelined-loop increment is:
+The immediate continuation after the verified double-buffered weighted-reduction route is:
 
-1. Use `PipelinedFor` for the double-buffered segmented weighted-reduction production route.
-2. In parallel, define a typed SOAC S-expression dialect with `../pattern` and differential-test
+1. Define a typed SOAC S-expression dialect with `../pattern` and differential-test
    map→map, map→reduce and horizontal-map fusion against the current graph.
-3. Carry that dialect in the existing program/value envelope and route one ordinary fused reduction
+2. Carry that dialect in the existing program/value envelope and route one ordinary fused reduction
    through JVM SIMD and GPU `KernelBody` without reconstructing compiler facts from source spelling.
-4. Add a finite verified shared-memory swizzle family and bank-conflict/resource model.
-5. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
+3. Add a finite verified shared-memory swizzle family and bank-conflict/resource model.
+4. Make stage count and swizzle measured schedule axes, retire the legacy tuner, and remove the
    attention-provenance gate from the generic weighted-reduction matcher.
-6. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
+5. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
    re-lowering for the covered forms.
-7. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
+6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
 The integrated roadmap has six cooperating tracks rather than one backend-only sequence:
 
 | Track | Near-term completion gate | Unlock |
 |---|---|---|
-| Verified device scheduling | Pipelined loop, double-buffered weighted reduction, tails and honest fallbacks | General staged reductions and FlashAttention-like schedules |
+| Verified device scheduling | Add verified swizzles and measured stage depth to the landed double-buffered reduction | General staged reductions and FlashAttention-like schedules |
 | Typed functional middle end | Pattern-declared typed SOAC program; map/reduce fusion reaches JVM and GPU from one fact set | Reliable fusion, batching, AD and reflection across representations |
 | Portable peak kernels | Verified swizzles/layouts, unified matrix fragments and quant storage descriptors | Competitive GEMM, attention and scientific tiles across Intel/NVIDIA/AMD |
 | Measurement and selection | One tuner over coupled graph/kernel axes with numerical and resource gates | Hardware-aware schedule selection and selective autotuning |

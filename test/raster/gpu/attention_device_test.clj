@@ -16,11 +16,16 @@
   (double (Float/float16ToFloat (short value))))
 
 (defn- make-case
-  [route-kind visibility-kind]
-  (let [dims {:batch-size 3 :q-heads 4 :kv-heads 2 :qk-head-dim 8
-              :value-head-dim 6 :page-size 2 :physical-pages 7}
+  [route-kind visibility-kind & [options]]
+  (let [{:keys [value-head-dim query-offset-values query-position-values window-left]
+         :or {value-head-dim 6
+              query-offset-values [0 2 3 4]
+              query-position-values [3 4 10 12]
+              window-left 2}} (or options {})
+        dims {:batch-size 3 :q-heads 4 :kv-heads 2 :qk-head-dim 8
+              :value-head-dim value-head-dim :page-size 2 :physical-pages 7}
         {:keys [q-heads kv-heads qk-head-dim value-head-dim page-size physical-pages]} dims
-        total-query-tokens 4
+        total-query-tokens (count query-position-values)
         q-elements (* total-query-tokens q-heads qk-head-dim)
         k-elements (* kv-heads physical-pages page-size qk-head-dim)
         v-elements (* kv-heads physical-pages page-size value-head-dim)
@@ -32,8 +37,8 @@
            (map #(* 0.04 (- (mod (+ (* 7 %) 3) 19) 9)) (range v-elements)))
         ;; Batch row 1 owns a query but has no resident KV tokens.  This exercises the cooperative
         ;; schedule's zero-length early exit independently from packed rows 0 and 2.
-        q-offsets (int-array [0 2 3 4])
-        q-positions (int-array [3 4 10 12])
+        q-offsets (int-array query-offset-values)
+        q-positions (int-array query-position-values)
         starts (int-array [0 0 8])
         query (attention/packed-query-batch
                {:values 'q :row-offsets 'q-row-offsets :positions 'q-positions
@@ -70,7 +75,7 @@
         attention-visibility
         (case visibility-kind
           :interval
-          (attention/visibility {:causal? true :window-left 2 :window-right 0})
+          (attention/visibility {:causal? true :window-left window-left :window-right 0})
 
           :csr
           (attention/csr-visibility
@@ -240,9 +245,9 @@
               (:key-indices (:visibility problem)) :attention-key-indices}))))
 
 (defn- run-case
-  [device-id route-kind visibility-kind policy expected-strategy]
+  [device-id route-kind visibility-kind policy expected-strategy & [case-options]]
   (let [{:keys [problem q k v q-offsets q-positions] :as test-case}
-        (make-case route-kind visibility-kind)
+        (make-case route-kind visibility-kind (or case-options {}))
         descriptor (cond-> (assoc (hardware/descriptor-for device-id)
                                   :segmented-weighted-reduction-schedule policy)
                      (= :subgroup-online-tiled-history policy)
@@ -322,6 +327,13 @@
       (run-case :ze:0 :dense-paged :interval :reference :fp16-reference)
       (run-case :ze:0 :dense-paged :interval :subgroup-score-reuse
                 :routed-paged-subgroup-online-score-reuse)
+      (run-case :ze:0 :dense-paged :interval :subgroup-online-pipelined-history
+                :routed-paged-subgroup-online-pipelined-history
+                {:value-head-dim 8
+                 ;; Membership counts are 1, 2, 3, 4, 0, and 5 across these packed rows.
+                 :query-offset-values [0 4 5 6]
+                 :query-position-values [0 1 2 3 10 12]
+                 :window-left 100})
       (run-case :ze:0 :dense-paged :interval :subgroup-online-tiled-history
                 :routed-paged-subgroup-online-tiled-history))))
 

@@ -7,7 +7,7 @@
 
 (defrecord SegmentedWeightedReductionSchedule
            [strategy workgroup-size segment-mapping membership-traversal score-reduction
-            membership-tiling value-mapping state numerical-mode attributes])
+            membership-tiling value-mapping state staging numerical-mode attributes])
 
 (def ^:private online-state-components
   [:maximum :denominator :weighted-values])
@@ -52,6 +52,23 @@
 
     false))
 
+(defn- valid-staging?
+  [strategy staging]
+  (if (= :subgroup-online-pipelined-history strategy)
+    (and (= :double-buffered-membership-rows (:kind staging))
+         (= 2 (:stages staging))
+         (= 2 (:members-per-iteration staging))
+         (= :half (:element-dtype staging))
+         (pos-int? (:key-elements staging))
+         (pos-int? (:value-elements staging))
+         (contains? #{4 8 16} (:transfer-bytes staging))
+         (contains? #{:preferred :required} (:overlap staging))
+         (= :separate-epilogue (:tail-policy staging))
+         (pos-int? (:shared-memory-bytes staging))
+         (= (:shared-memory-bytes staging)
+            (* 2 (+ (:key-elements staging) (:value-elements staging)) 2)))
+    (= {:kind :none} staging)))
+
 (defn schedule?
   [value]
   (and value
@@ -65,8 +82,9 @@
                     {:reason :segmented-weighted-reduction-schedule-type
                      :schedule schedule})))
   (let [{:keys [strategy workgroup-size segment-mapping membership-traversal score-reduction
-                membership-tiling value-mapping state numerical-mode attributes]} schedule]
+                membership-tiling value-mapping state staging numerical-mode attributes]} schedule]
     (when-not (contains? #{:subgroup-online-score-reuse
+                           :subgroup-online-pipelined-history
                            :subgroup-online-tiled-history}
                          strategy)
       (throw (ex-info "segmented weighted-reduction schedule has an unsupported strategy"
@@ -82,9 +100,9 @@
                              :one-workgroup-per-segment)]
       (when-not (= expected-mapping segment-mapping)
         (throw (ex-info "cooperative weighted reduction has an invalid segment mapping"
-                      {:reason :segmented-weighted-reduction-segment-mapping
-                       :strategy strategy :segment-mapping segment-mapping
-                       :expected expected-mapping}))))
+                        {:reason :segmented-weighted-reduction-segment-mapping
+                         :strategy strategy :segment-mapping segment-mapping
+                         :expected expected-mapping}))))
     (when-not (contains? #{:contiguous-interval :csr-row} membership-traversal)
       (throw (ex-info "cooperative weighted reduction requires a bounded membership traversal"
                       {:reason :segmented-weighted-reduction-membership-traversal
@@ -117,6 +135,10 @@
     (when-not (= (online-state) state)
       (throw (ex-info "cooperative weighted reduction requires explicit online softmax state"
                       {:reason :segmented-weighted-reduction-online-state :state state})))
+    (when-not (valid-staging? strategy staging)
+      (throw (ex-info "cooperative weighted reduction has an invalid workgroup staging contract"
+                      {:reason :segmented-weighted-reduction-staging
+                       :strategy strategy :staging staging})))
     (when-not (and (map? numerical-mode)
                    (keyword? (:score-accumulate numerical-mode))
                    (keyword? (:state-accumulate numerical-mode))
@@ -134,9 +156,9 @@
 
 (defn make
   [{:keys [strategy workgroup-size segment-mapping membership-traversal score-reduction
-           membership-tiling value-mapping state numerical-mode attributes]
-    :or {attributes {}}}]
+           membership-tiling value-mapping state staging numerical-mode attributes]
+    :or {staging {:kind :none} attributes {}}}]
   (validate!
    (->SegmentedWeightedReductionSchedule
     strategy workgroup-size segment-mapping membership-traversal score-reduction
-    membership-tiling value-mapping state numerical-mode attributes)))
+    membership-tiling value-mapping state staging numerical-mode attributes)))
