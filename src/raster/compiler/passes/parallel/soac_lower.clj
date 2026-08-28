@@ -26,6 +26,48 @@
             [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
 
 (declare lower-reduce)
+(declare lower-map)
+
+(defn typed-map-program?
+  "Whether a validated one-equation TypedSOAC program is a map accepted by SegMap lowering."
+  [program]
+  (and (soac-dialect/program-form? program)
+       (= 1 (count (soac-dialect/equations program)))
+       (= 'map (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
+
+(defn lower-typed-map
+  "Lower one functional TypedSOAC map to SegMap from its explicit operands and lambda binders."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)]
+    (when-not (typed-map-program? program)
+      (throw (ex-info "typed SegMap lowering requires one map equation"
+                      {:reason :typed-soac-map-subset :program program})))
+    (let [equation (first (soac-dialect/equations program))
+          [_ equation-id results operation] equation
+          [_ attributes arrays captures lambda] operation
+          [_ _ body-results] lambda
+          {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
+          _ (when-not (and (= 1 (count results)) (= 1 (count body-results))
+                           (symbol? (first results)))
+              (throw (ex-info "initial typed SegMap vertical supports one symbolic result"
+                              {:reason :typed-soac-map-subset
+                               :equation equation-id :results results})))
+          index (:index attributes)
+          substitutions
+          (into (zipmap capture-parameters captures)
+                (map (fn [parameter array]
+                       [parameter (list 'clojure.core/aget array index)])
+                     elements arrays))
+          body (util/subst-syms substitutions (first body-results))
+          result (first results)
+          result-dtype (or (:dtype (get-in (soac-dialect/facts program) [:values result]))
+                           dtype :double)
+          node (assoc (soac/->SoacMap equation-id result index (:extent attributes) nil body
+                                      (set arrays) #{result} (set captures))
+                      :elem-type result-dtype :pure? true)]
+      (mapv #(assoc % :algorithm-dialect :typed-soac
+                    :algorithm-equation equation-id)
+            (lower-map node device-id :dtype result-dtype)))))
 
 (defn typed-reduce-program?
   "Whether a validated one-equation TypedSOAC program is the scalar reduction vertical currently

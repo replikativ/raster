@@ -409,14 +409,22 @@ reduce equations. It verifies ordered SSA definitions, exact typed input/output/
 rank/extent/result contracts, explicit lexical capture binding (including compound stable value
 IDs), tuple-valued maps, and fact-preserving functional fusion. A guarded adapter differentially
 checks map→map, map→reduce and horizontal-map results against the current graph and declines every
-unsupported legacy node or unproved alias. It is intentionally not a backend route yet.
+unsupported legacy node or unproved alias. The first production subset now routes single-consumer
+vertical fusion over pure maps and scalar/full reductions through a `:typed-soac` ParallelProgram.
+It mechanically materializes a compatibility host loop from the typed equation, then derives
+SegMap/SegRed directly from the retained algorithm. JVM SIMD and OpenCL therefore consume the same
+facts without backend re-analysis. Host-visible intermediates, unknown/effectful scalar equations,
+horizontal/multi-result fusion, and any disagreement with the temporary legacy shadow certificate
+decline explicitly.
 
 This representation is shared before backend selection. SOAC fusion changes the program consumed
-by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The JVM
-SIMD backend already consumes certified SegOps from `ParallelProgram`, but current SOAC fusion first
-round-trips through `par` forms and the scalar fallback still expands retained source. Migration is
-complete when JVM SIMD, scalar/JVM and GPU routes consume the same typed SOAC/SegOp facts and no
-backend silently re-lowers an exact source form.
+by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The scalar
+spelling for the migrated subset is now generated from TypedSOAC rather than retained source, and
+JVM SIMD/GPU reuse its certified SegOps. The resident split pipeline remains on the compatibility
+route because its reduce-result device-realization transform still operates between source-form
+pipeline halves. Migration is complete when that transform, horizontal/multi-consumer fusion and
+richer scalar equations operate on the typed envelope and the covered compatibility re-lowerings
+are deleted.
 
 ### 3.3 Schedule and transform IR
 
@@ -763,8 +771,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    keep the current 1-D attention stages on its identity member until measured 2-D staging lands.
 4. **Landed:** make stage count and swizzle finite measured schedule axes, retire the legacy tuner,
    and remove the attention-provenance gate from routed weighted-reduction lowering.
-5. Migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove compatibility
-   re-lowering for the covered forms.
+5. **In progress:** migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove
+   compatibility re-lowering for the covered forms. Single-consumer pure map→map/map→reduce now has
+   a production typed route shared by JVM SIMD and OpenCL; horizontal/multi-consumer fusion, typed
+   scalar equations and resident reduce-result realization remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
