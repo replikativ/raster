@@ -8,6 +8,7 @@
   (:require [clojure.set :as set]
             [raster.compiler.backend.intrinsics :as intrinsics]
             [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.layout :as layout]
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.kernel-launch :as launch]))
 
@@ -40,6 +41,11 @@
 (defrecord Collective
            [result kind scope width input operator source-lane participation association])
 (defrecord WorkgroupBarrier [scope memory-spaces semantics participation])
+(defrecord AsyncWorkgroupCopy
+           [id source source-coordinates destination destination-coordinates elements
+            transfer-bytes cache overlap participation])
+(defrecord AsyncCommit [id copies])
+(defrecord AsyncWait [groups pending-groups semantics participation])
 
 (defrecord FragmentInit [fragment value])
 (defrecord TileLoad [fragment buffer coordinates mask cache])
@@ -65,6 +71,9 @@
 (def ^:private collective-kinds #{:reduce :broadcast})
 (def ^:private workgroup-memory-spaces #{:workgroup})
 (def ^:private barrier-semantics #{:acquire-release})
+(def ^:private async-wait-semantics #{:acquire})
+(def ^:private async-overlap-policies #{:preferred :required})
+(def ^:private async-transfer-widths #{4 8 16})
 
 (defn- record-kind? [class-name value]
   (and value (= class-name (.getName (class value)))))
@@ -209,6 +218,42 @@
     (reduce into #{} (map expression-references (:arguments value)))
     :else #{}))
 
+(defn- gcd-static
+  [left right]
+  (loop [left (abs (long left)) right (abs (long right))]
+    (if (zero? right) left (recur right (mod left right)))))
+
+(defn- expression-divisible?
+  "Conservative proof that every realization of an index expression is divisible by divisor."
+  [value divisor]
+  (cond
+    (= 1 divisor) true
+    (integer? value) (zero? (mod value divisor))
+    (value-id? value) false
+    (not (record-kind? "raster.compiler.ir.kernel_body.IndexExpr" value)) false
+    (contains? #{:add :sub} (:op value))
+    (every? #(expression-divisible? % divisor) (:arguments value))
+    (= :mul (:op value))
+    (some #(expression-divisible? % divisor) (:arguments value))
+    :else false))
+
+(defn- storage-offset-aligned?
+  [storage coordinates alignment]
+  (let [element-bytes (dtype/bytes-of (:dtype storage))
+        strides (layout/resolve-strides (:layout storage))
+        terms (map vector coordinates strides)
+        aligned-term?
+        (fn [[coordinate stride]]
+          (and (integer? stride)
+               (let [coefficient (* element-bytes stride)
+                     remaining (quot alignment (gcd-static coefficient alignment))]
+                 (expression-divisible? coordinate remaining))))
+        view-offset (some-> storage :view :element-offset)]
+    (and (every? aligned-term? terms)
+         (or (nil? view-offset)
+             (expression-divisible?
+              view-offset (quot alignment (gcd-static element-bytes alignment)))))))
+
 (defn- predicate? [value]
   (and (record-kind? "raster.compiler.ir.kernel_body.Predicate" value)
        (contains? predicate-ops (:op value))
@@ -300,7 +345,10 @@
                "raster.compiler.ir.kernel_body.IfRegion"
                "raster.compiler.ir.kernel_body.ForLoop"
                "raster.compiler.ir.kernel_body.Collective"
-               "raster.compiler.ir.kernel_body.WorkgroupBarrier"}
+               "raster.compiler.ir.kernel_body.WorkgroupBarrier"
+               "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy"
+               "raster.compiler.ir.kernel_body.AsyncCommit"
+               "raster.compiler.ir.kernel_body.AsyncWait"}
              (some-> value class .getName)))
 
 (declare validate-operations!)
@@ -627,6 +675,62 @@
                      (= :full (get-in operation [:participation :kind])))
         (throw (ex-info "workgroup barrier has an unsupported synchronization contract"
                         {:reason :kernel-body-workgroup-barrier :operation operation})))
+
+      (record-kind? "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
+      (let [source (parameter (:source operation))
+            destination (parameter (:destination operation))
+            elements (:elements operation)
+            transfer-bytes (:transfer-bytes operation)]
+        (coordinates! "async-copy source" (:source-coordinates operation))
+        (coordinates! "async-copy destination" (:destination-coordinates operation))
+        (when-not (and (value-id? (:id operation))
+                       (= :input (:kind source))
+                       (= :global (:memory-space source))
+                       (= :allocation (:kind destination))
+                       (= :workgroup (:memory-space destination))
+                       (= (dtype/canon (:dtype source)) (dtype/canon (:dtype destination)))
+                       (= (count (:shape source)) (count (:source-coordinates operation)))
+                       (= (count (:shape destination))
+                          (count (:destination-coordinates operation)))
+                       (pos-int? elements)
+                       (contains? async-transfer-widths transfer-bytes)
+                       (zero? (mod (* elements (dtype/bytes-of (:dtype source))) transfer-bytes))
+                       (contains? cache-policies (:cache operation))
+                       (contains? async-overlap-policies (:overlap operation))
+                       (or (= :preferred (:overlap operation))
+                           (and (>= (:alignment destination) transfer-bytes)
+                                (storage-offset-aligned?
+                                 source (:source-coordinates operation) transfer-bytes)
+                                (storage-offset-aligned?
+                                 destination (:destination-coordinates operation)
+                                 transfer-bytes)))
+                       (record-kind? "raster.compiler.ir.kernel_body.Participation"
+                                     (:participation operation))
+                       (= :full (get-in operation [:participation :kind])))
+          (throw (ex-info
+                  "async workgroup copy requires a typed contiguous global-to-workgroup transfer"
+                  {:reason :kernel-body-async-copy :operation operation
+                   :source source :destination destination}))))
+
+      (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
+      (when-not (and (value-id? (:id operation))
+                     (vector? (:copies operation)) (seq (:copies operation))
+                     (every? value-id? (:copies operation))
+                     (= (count (:copies operation)) (count (set (:copies operation)))))
+        (throw (ex-info "async commit requires a named ordered set of issued copies"
+                        {:reason :kernel-body-async-commit :operation operation})))
+
+      (record-kind? "raster.compiler.ir.kernel_body.AsyncWait" operation)
+      (when-not (and (vector? (:groups operation)) (seq (:groups operation))
+                     (every? value-id? (:groups operation))
+                     (= (count (:groups operation)) (count (set (:groups operation))))
+                     (nat-int? (:pending-groups operation))
+                     (contains? async-wait-semantics (:semantics operation))
+                     (record-kind? "raster.compiler.ir.kernel_body.Participation"
+                                   (:participation operation))
+                     (= :full (get-in operation [:participation :kind])))
+        (throw (ex-info "async wait requires ordered groups and full workgroup participation"
+                        {:reason :kernel-body-async-wait :operation operation})))
 
       :else
       (throw (ex-info "kernel body contains an unsupported operation"
@@ -1064,6 +1168,31 @@
                          :operation operation :control-uniformity control-uniformity})))
       values)
 
+    (record-kind? "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
+    (let [_ (static-workgroup-width! launch)
+          coordinate-uniformity
+          (join-uniformity
+           (map #(hash-map :uniformity (expression-uniformity % values))
+                (concat (:source-coordinates operation)
+                        (:destination-coordinates operation))))]
+      (when-not (and (contains? control-uniformity :workgroup)
+                     (contains? coordinate-uniformity :workgroup))
+        (throw (ex-info "async workgroup copy must be issued uniformly by the workgroup"
+                        {:reason :kernel-body-divergent-async-copy
+                         :operation operation
+                         :control-uniformity control-uniformity
+                         :coordinate-uniformity coordinate-uniformity})))
+      values)
+
+    (or (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
+        (record-kind? "raster.compiler.ir.kernel_body.AsyncWait" operation))
+    (do
+      (when-not (contains? control-uniformity :workgroup)
+        (throw (ex-info "async commit/wait must execute uniformly across the workgroup"
+                        {:reason :kernel-body-divergent-async-control
+                         :operation operation :control-uniformity control-uniformity})))
+      values)
+
     (record-kind? "raster.compiler.ir.kernel_body.Guard" operation)
     (let [guard-uniformity (mask-uniformity (:mask operation) masks values)]
       (validate-dataflow-operations!
@@ -1093,6 +1222,133 @@
   (reduce (fn [env operation]
             (validate-dataflow-operation! operation env context))
           values operations))
+
+;; Async groups are symbolic schedule dependencies, not scalar SSA values.  Keep their lifetime
+;; verification separate from scalar dataflow so a target can lower the same dependency graph to
+;; OpenCL events, CUDA cp.async groups, or an honest synchronous implementation.
+(defn- nested-operation-regions
+  [operation]
+  (cond
+    (record-kind? "raster.compiler.ir.kernel_body.IfRegion" operation)
+    [(:then-operations operation) (:else-operations operation)]
+
+    (or (record-kind? "raster.compiler.ir.kernel_body.ForLoop" operation)
+        (record-kind? "raster.compiler.ir.kernel_body.Loop" operation)
+        (record-kind? "raster.compiler.ir.kernel_body.Guard" operation))
+    [(:operations operation)]
+
+    :else []))
+
+(defn- validate-async-protocol!
+  [operations storage stable-buffers reserved]
+  (let [claimed (atom reserved)]
+    (letfn [(claim! [id owner operation]
+              (when (contains? @claimed id)
+                (throw (ex-info "async copy/group identity is not globally unique"
+                                {:reason :kernel-body-async-id-collision
+                                 :id id :owner owner :operation operation})))
+              (swap! claimed conj id))
+            (clean-state! [owner state]
+              (when (or (seq (:issued state)) (seq (:committed state))
+                        (seq (:awaiting-barrier state)))
+                (throw (ex-info "async staging lifetime crosses a structured region boundary"
+                                {:reason :kernel-body-async-region-lifetime
+                                 :owner owner :state state}))))
+            (validate-sequence! [owner operations]
+              (let [final-state
+                    (reduce
+                     (fn [{:keys [issued committed awaiting-barrier] :as state} operation]
+                       (cond
+                         (record-kind? "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
+                         (let [id (:id operation)
+                               source (get storage (:source operation))
+                               source-root (or (some-> source :view :buffer) (:id source))
+                               destination (:destination operation)]
+                           (claim! id :copy operation)
+                           (when-not (contains? stable-buffers source-root)
+                             (throw (ex-info
+                                     "async copy source requires a whole-kernel stable-read contract"
+                                     {:reason :kernel-body-async-source-stability
+                                      :copy id :source source-root})))
+                           (when (or (some #(= destination (:destination %)) issued)
+                                     (some (fn [group]
+                                             (some #(= destination (:destination %))
+                                                   (:copies group)))
+                                           committed)
+                                     (contains? awaiting-barrier destination))
+                             (throw (ex-info "async copy destination is still live"
+                                             {:reason :kernel-body-async-destination-live
+                                              :copy id :destination destination})))
+                           (update state :issued conj operation))
+
+                         (record-kind? "raster.compiler.ir.kernel_body.AsyncCommit" operation)
+                         (let [group (:id operation)
+                               copy-ids (mapv :id issued)]
+                           (claim! group :group operation)
+                           (when-not (= copy-ids (:copies operation))
+                             (throw (ex-info
+                                     "async commit must close every copy issued since the prior commit"
+                                     {:reason :kernel-body-async-commit-order
+                                      :group group :issued copy-ids
+                                      :committed (:copies operation)})))
+                           (-> state
+                               (assoc :issued [])
+                               (update :committed conj {:id group :copies issued})))
+
+                         (record-kind? "raster.compiler.ir.kernel_body.AsyncWait" operation)
+                         (let [groups (:groups operation)
+                               committed-ids (mapv :id committed)
+                               group-count (count groups)
+                               enough-groups? (<= group-count (count committed))
+                               waited (when enough-groups? (subvec committed 0 group-count))
+                               remaining (when enough-groups? (subvec committed group-count))]
+                           (when-not (and enough-groups?
+                                          (= groups (subvec committed-ids 0 group-count))
+                                          (= (:pending-groups operation) (count remaining)))
+                             (throw (ex-info
+                                     "async wait must consume an oldest prefix and state the remainder"
+                                     {:reason :kernel-body-async-wait-order
+                                      :wait groups :committed committed-ids
+                                      :pending-groups (:pending-groups operation)})))
+                           (-> state
+                               (assoc :committed remaining)
+                               (update :awaiting-barrier into
+                                       (map :destination (mapcat :copies waited)))))
+
+                         (record-kind? "raster.compiler.ir.kernel_body.WorkgroupBarrier" operation)
+                         (assoc state :awaiting-barrier #{})
+
+                         (or (record-kind? "raster.compiler.ir.kernel_body.ScalarLoad" operation)
+                             (record-kind? "raster.compiler.ir.kernel_body.ScalarStore" operation))
+                         (let [buffer (:buffer operation)
+                               incomplete (into (set (map :destination issued))
+                                                (map :destination (mapcat :copies committed)))]
+                           (when (or (contains? incomplete buffer)
+                                     (contains? awaiting-barrier buffer))
+                             (throw (ex-info
+                                     (if (contains? incomplete buffer)
+                                       "staged workgroup memory is consumed before its async wait"
+                                       "staged workgroup memory is consumed before a workgroup barrier")
+                                     {:reason (if (contains? incomplete buffer)
+                                                :kernel-body-async-missing-wait
+                                                :kernel-body-async-missing-barrier)
+                                      :buffer buffer :operation operation})))
+                           state)
+
+                         (seq (nested-operation-regions operation))
+                         (do
+                           (clean-state! owner state)
+                           (doseq [[index region] (map-indexed vector
+                                                               (nested-operation-regions operation))]
+                             (validate-sequence! [owner index] region))
+                           state)
+
+                         :else state))
+                     {:issued [] :committed [] :awaiting-barrier #{}}
+                     operations)]
+                (clean-state! owner final-state)))]
+      (validate-sequence! :kernel operations)
+      (set/difference @claimed reserved))))
 
 (defn validate!
   "Verify a scheduled KernelBody and return it unchanged."
@@ -1282,7 +1538,11 @@
                             (into {} (map (juxt :id identity)) masks)
                             index-scope
                             (mapv :id (filter #(= :epilogue (:role %)) parameters)))
-      (let [initial-values
+      (let [section-reserved (set (concat (keys storage) (map :id indices) (map :id masks)
+                                          (map :id fragments)))
+            async-ids (validate-async-protocol!
+                       operations storage (set (map :buffer stable-reads)) section-reserved)
+            initial-values
             (reduce
              (fn [values idx]
                (let [uniformity
@@ -1301,8 +1561,7 @@
                             :uniformity all-uniform}])
                         (filter #(= :scalar (:kind %)) parameters)))
              indices)
-            reserved (set (concat (keys storage) (map :id indices) (map :id masks)
-                                  (map :id fragments)))
+            reserved (into section-reserved async-ids)
             context {:storage storage
                      :stable-reads (set (map :buffer stable-reads))
                      :masks (into {} (map (juxt :id identity)) masks)
@@ -1313,6 +1572,29 @@
                      :schedule schedule}]
         (validate-dataflow-operations! operations initial-values context))))
   body)
+
+(defn required-async-source-alignments
+  "Return external input alignment preconditions implied by overlap-required async copies.
+
+  Coordinate-offset alignment is proved inside `validate!`; this projection names the root ABI
+  buffer whose base address must satisfy the scheduled transfer width."
+  [kernel-body]
+  (let [kernel-body (validate! kernel-body)
+        view-roots (into {} (map (juxt :id :buffer)) (:views kernel-body))
+        operations (letfn [(walk [operations]
+                             (mapcat (fn [operation]
+                                       (cons operation
+                                             (mapcat walk (nested-operation-regions operation))))
+                                     operations))]
+                     (walk (:operations kernel-body)))]
+    (reduce (fn [requirements operation]
+              (if (and (record-kind?
+                        "raster.compiler.ir.kernel_body.AsyncWorkgroupCopy" operation)
+                       (= :required (:overlap operation)))
+                (update requirements (get view-roots (:source operation) (:source operation))
+                        (fnil max 1) (:transfer-bytes operation))
+                requirements))
+            {} operations)))
 
 (defn make
   "Construct and verify a target-neutral scheduled kernel body."

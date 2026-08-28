@@ -685,7 +685,7 @@
 
 (def ^:private scalar-operation-kinds
   #{"ScalarCompute" "ScalarLoad" "ScalarStore" "Yield" "IfRegion" "ForLoop"
-    "Collective" "WorkgroupBarrier"})
+    "Collective" "WorkgroupBarrier" "AsyncWorkgroupCopy" "AsyncCommit" "AsyncWait"})
 
 (defn- scalar-body-operations
   [operations]
@@ -1197,6 +1197,55 @@
     (record-kind? "WorkgroupBarrier" operation)
     [(indent-lines depth (c-dialect/workgroup-barrier *scalar-dialect*)) context]
 
+    (record-kind? "AsyncWorkgroupCopy" operation)
+    (let [mode (c-dialect/async-copy-mode *scalar-dialect*)
+          _ (when (and (= :required (:overlap operation))
+                       (= :synchronous-cooperative mode))
+              (throw (ex-info "target cannot preserve required async-copy overlap"
+                              {:reason :kernel-body-c-async-overlap
+                               :dialect (:id *scalar-dialect*)
+                               :operation operation :lowering mode})))
+          source-storage (get-in context [:storage (:source operation)])
+          destination-storage (get-in context [:storage (:destination operation)])
+          source-base (get-in context [:names (or (some-> source-storage :view :buffer)
+                                                  (:id source-storage))])
+          destination-base (get-in context [:names (:id destination-storage)])
+          source-index (emit-storage-index source-storage (:source-coordinates operation)
+                                           (:names context))
+          destination-index (emit-storage-index destination-storage
+                                                (:destination-coordinates operation)
+                                                (:names context))
+          copy-name (scalar-local-name (:id operation))
+          source (str "(&" source-base "[" source-index "])")
+          destination (str "(&" destination-base "[" destination-index "])")
+          source-code (c-dialect/async-copy
+                       *scalar-dialect*
+                       {:name copy-name :source source :destination destination
+                        :elements (:elements operation)
+                        :element-bytes (dtype/bytes-of (:dtype source-storage))
+                        :transfer-bytes (:transfer-bytes operation)
+                        :overlap (:overlap operation)
+                        :workgroup-width (:workgroup-width context)})]
+      [(indent-lines depth source-code)
+       (-> context
+           (assoc-in [:async-copies (:id operation)] copy-name)
+           (update :async-issued conj (:id operation)))])
+
+    (record-kind? "AsyncCommit" operation)
+    [(indent-lines depth (c-dialect/async-commit *scalar-dialect* (:id operation)))
+     (-> context
+         (assoc :async-issued [])
+         (update :async-groups conj {:id (:id operation) :copies (:copies operation)}))]
+
+    (record-kind? "AsyncWait" operation)
+    (let [group-count (count (:groups operation))
+          waited (subvec (:async-groups context) 0 group-count)
+          event-names (mapv #(get-in context [:async-copies %]) (mapcat :copies waited))]
+      [(indent-lines depth
+                     (c-dialect/async-wait *scalar-dialect* event-names
+                                           (:pending-groups operation)))
+       (assoc context :async-groups (subvec (:async-groups context) group-count))])
+
     (record-kind? "Yield" operation)
     (throw (ex-info "OpenCL scalar lowering found a misplaced Yield"
                     {:reason :raster/bug :operation operation}))
@@ -1276,7 +1325,11 @@
                             {:reason :kernel-body-c-name-collision
                              :dialect (:id *scalar-dialect*) :names names})))
         local-ids (concat (map :id (:allocations kernel-body))
-                          (map :id indices) (scalar-defined-ids (:operations kernel-body)))
+                          (map :id indices) (scalar-defined-ids (:operations kernel-body))
+                          (keep #(when (contains? #{"AsyncWorkgroupCopy" "AsyncCommit"}
+                                                  (some-> % class .getSimpleName))
+                                   (:id %))
+                                operations))
         emitted-local-names (map scalar-local-name local-ids)
         all-emitted-names (concat (vals parameter-names) emitted-local-names)
         _ (when-not (= (count all-emitted-names) (count (set all-emitted-names)))
@@ -1286,7 +1339,9 @@
                              :ids (vec local-ids)})))
         storage (scalar-storage-map kernel-body)
         masks (into {} (map (juxt :id identity)) (:masks kernel-body))
-        context {:names names :types types :storage storage :masks masks}
+        context {:names names :types types :storage storage :masks masks
+                 :workgroup-width (reduce * (get-in kernel-body [:launch :workgroup-size]))
+                 :async-copies {} :async-issued [] :async-groups []}
         allocation-plan (body/workgroup-memory-plan (:allocations kernel-body))
         arena-name "rstr_workgroup_memory"
         allocation-source
@@ -1348,14 +1403,17 @@
   The body already fixes schedules, types, layouts, masks, convergence and numerical conversion
   policies. `parameter-names` may only select ABI spelling; `target-dialect` defaults to the
   production Intel OpenCL row and may select `:opencl-portable`, `:cuda`, or `:hip`. Target
-  selection cannot alter the scheduled body."
+  selection cannot alter the scheduled body. `target-features` may only select a capability-gated
+  physical implementation (for example Ampere `cp.async`) with the same verified semantics."
   ([kernel-name kernel-body]
    (emit-scalar-kernel kernel-name kernel-body {}))
-  ([kernel-name kernel-body {:keys [target-dialect subgroup-attribute] :as options
+  ([kernel-name kernel-body {:keys [target-dialect subgroup-attribute target-features] :as options
                              :or {target-dialect :opencl-intel subgroup-attribute :intel}}]
    (let [target-dialect (if (and (= :opencl-intel target-dialect)
                                  (= :none subgroup-attribute))
                           :opencl-portable
                           target-dialect)]
-     (binding [*scalar-dialect* (c-dialect/resolve! target-dialect)]
+     (binding [*scalar-dialect*
+               (merge (c-dialect/resolve! target-dialect)
+                      (select-keys target-features [:compute-capability :architecture]))]
        (emit-scalar-kernel* kernel-name kernel-body options)))))

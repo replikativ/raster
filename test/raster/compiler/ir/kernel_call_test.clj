@@ -51,6 +51,21 @@
                             (kcall/make stable-artifact
                                         (into [left overlap] scalars)))))))
 
+(deftest calls-enforce-pointer-alignment-carried-by-the-abi
+  (let [aligned-artifact (kart/make (assoc-in artifact [:abi 0 :alignment] 16))
+        allocation (bview/allocation {:id :call-alignment :byte-size 64
+                                      :memory-space :device :alignment 16
+                                      :ownership :borrowed})
+        aligned (bview/view allocation {:id :aligned :byte-offset 0
+                                        :dtype :float :shape [4]})
+        misaligned (bview/view allocation {:id :misaligned :byte-offset 4
+                                           :dtype :float :shape [4]})
+        suffix [:resident-out {:type :float :value 1.0} {:type :int :value 4}]]
+    (is (kcall/kernel-call? (kcall/make aligned-artifact (into [aligned] suffix))))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"violates its ABI alignment contract"
+         (kcall/make aligned-artifact (into [misaligned] suffix))))))
+
 (deftest call-realizes-artifact-launch-from-ordered-values
   (let [call (kcall/make artifact args)
         plan (kcall/binding-plan call)]

@@ -143,6 +143,20 @@
       (and left-segment right-segment) (segment-overlaps? left-segment right-segment)
       :else (= left right))))
 
+(defn- pointer-aligned?
+  [value required]
+  (let [view (resident-view value)
+        segment (resident-segment value)]
+    (cond
+      view (and (>= (get-in view [:allocation :alignment]) required)
+                (zero? (mod (:byte-offset view) required)))
+      (and (map? value) (integer? (:alignment value)))
+      (>= (:alignment value) required)
+      segment (try
+                (zero? (mod (.address ^MemorySegment segment) required))
+                (catch UnsupportedOperationException _ false))
+      :else false)))
+
 (defn validate!
   "Validate and return a KernelCall. This is driver-independent: a backend subsequently checks
    that pointer values are its resident buffer representation and match ABI storage dtypes."
@@ -178,9 +192,16 @@
     (doseq [[slot value] (map vector abi arguments)]
       (if (= :scalar (:kind slot))
         (scalar-value! slot value)
-        (when (nil? value)
-          (throw (ex-info "kernel pointer argument cannot be nil"
-                          {:kernel-name (:kernel-name artifact) :slot slot})))))
+        (do
+          (when (nil? value)
+            (throw (ex-info "kernel pointer argument cannot be nil"
+                            {:kernel-name (:kernel-name artifact) :slot slot})))
+          (when (and (:alignment slot)
+                     (not (pointer-aligned? value (:alignment slot))))
+            (throw (ex-info "kernel pointer argument violates its ABI alignment contract"
+                            {:reason :kernel-abi-pointer-alignment
+                             :kernel-name (:kernel-name artifact) :slot slot
+                             :required-alignment (:alignment slot)}))))))
     call))
 
 (defn- runtime-number

@@ -45,6 +45,40 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"aliasing contract"
                             (kabi/validate! [slot (kabi/slot 'out :output :float)]))))))
 
+(deftest required-async-overlap-projects-pointer-alignment
+  (let [kernel-body
+        (body/make
+         {:id :async-alignment-abi
+          :parameters [(body/->KernelParameter 'x :input :float [16] :global
+                                               (layout/row-major [16] :float) :operand)
+                       (body/->KernelParameter 'out :output :float [16] :global
+                                               (layout/row-major [16] :float) :result)]
+          :stable-reads [(body/stable-read 'x)]
+          :allocations [(body/->WorkgroupAllocation
+                         'scratch :float [16] (layout/row-major [16] :float) 16)]
+          :operations [(body/->AsyncWorkgroupCopy
+                        'copy 'x [0] 'scratch [0] 16 16 :cached :required
+                        (body/full-participation))
+                       (body/->AsyncCommit 'group ['copy])
+                       (body/->AsyncWait ['group] 0 :acquire (body/full-participation))
+                       (body/->WorkgroupBarrier :workgroup #{:workgroup} :acquire-release
+                                                (body/full-participation))]
+          :launch (launch/spec {:workgroup-size [16] :group-count [1]
+                                :shared-memory-bytes 64})})
+        projected (body-abi/project-contracts
+                   [(kabi/slot 'x :input :float)
+                    (kabi/slot 'out :output :float)]
+                   kernel-body)]
+    (is (= 16 (get-in projected [0 :alignment])))
+    (is (= :no-write-alias (get-in projected [0 :aliasing])))
+    (is (nil? (get-in projected [1 :alignment])))
+    (testing "alignment is a pointer-only power-of-two ABI contract"
+      (doseq [slot [(kabi/slot 'n :scalar :int :alignment 16)
+                    (kabi/slot 'x :input :float :alignment 3)]]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"positive power of two"
+             (kabi/validate! [slot (kabi/slot 'out :output :float)])))))))
+
 (deftest stable-input-aliases-are-checked-against-every-output
   (let [abi [(kabi/slot 'x :input :float :aliasing :no-write-alias)
              (kabi/slot 'side :output :float)

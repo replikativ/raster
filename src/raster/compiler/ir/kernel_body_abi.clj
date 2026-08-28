@@ -16,7 +16,8 @@
   [abi kernel-body]
   (let [abi (kabi/validate! abi)
         kernel-body (kbody/validate! kernel-body)
-        stable-buffers (set (map :buffer (:stable-reads kernel-body)))]
+        stable-buffers (set (map :buffer (:stable-reads kernel-body)))
+        required-alignments (kbody/required-async-source-alignments kernel-body)]
     (doseq [buffer stable-buffers]
       (let [matches (filterv #(and (= :input (:kind %)) (= buffer (:name %))) abi)]
         (when-not (= 1 (count matches))
@@ -24,7 +25,11 @@
                           {:reason :kernel-body-stable-read-abi
                            :buffer buffer :matches matches :abi abi})))))
     (mapv (fn [slot]
-            (if (contains? stable-buffers (:name slot))
-              (assoc slot :aliasing :no-write-alias)
-              slot))
+            (cond-> slot
+              (contains? stable-buffers (:name slot))
+              (assoc :aliasing :no-write-alias)
+
+              (contains? required-alignments (:name slot))
+              (assoc :alignment (max (or (:alignment slot) 1)
+                                     (get required-alignments (:name slot))))))
           abi)))

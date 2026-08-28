@@ -94,6 +94,10 @@
   []
   (fixtures/workgroup-memory-body 16))
 
+(defn async-staging-kernel-body
+  ([] (async-staging-kernel-body :preferred))
+  ([overlap] (fixtures/async-staging-body 32 overlap)))
+
 (deftest scalar-kernel-body-lowers-without-recovering-a-schedule
   (let [source (opencl/emit-scalar-kernel
                 "scheduled_scalar"
@@ -243,3 +247,50 @@
         (let [{:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
                                            "-fsyntax-only" "-" :in source)]
           (is (zero? exit) err))))))
+
+(deftest async-staging-retains-one-dependency-contract-across-targets
+  (doseq [[target copy commit wait]
+          [[:opencl-portable "async_work_group_copy" "OpenCL event group"
+            "wait_group_events(1, &rstr_stage_x)"]
+           [:cuda "cp.async.ca.shared.global" "cp.async.commit_group"
+            "cp.async.wait_group 0"]
+           [:hip "rstr_stage_x_element_offset" "synchronous async group"
+            "synchronous cooperative copies are complete"]]]
+    (testing (name target)
+      (let [source (opencl/emit-scalar-kernel
+                    "async_staging" (async-staging-kernel-body)
+                    (cond-> {:target-dialect target}
+                      (= :cuda target)
+                      (assoc :target-features {:compute-capability [8 0]})))]
+        (is (str/includes? source copy))
+        (is (str/includes? source commit))
+        (is (str/includes? source wait))
+        (is (str/includes? source (if (= target :opencl-portable)
+                                    "barrier(CLK_LOCAL_MEM_FENCE)"
+                                    "__syncthreads()"))))))
+  (testing "required overlap fails honestly on a synchronous-only target"
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"cannot preserve required async-copy overlap"
+         (opencl/emit-scalar-kernel
+          "async_required" (async-staging-kernel-body :required)
+          {:target-dialect :hip}))))
+  (testing "CUDA async instructions are gated by the concrete architecture"
+    (let [source (opencl/emit-scalar-kernel
+                  "async_pre_ampere" (async-staging-kernel-body)
+                  {:target-dialect :cuda
+                   :target-features {:compute-capability [7 5]}})]
+      (is (not (str/includes? source "cp.async")))
+      (is (str/includes? source "synchronous cooperative copies are complete")))
+    (is (thrown-with-msg?
+         clojure.lang.ExceptionInfo #"cannot preserve required async-copy overlap"
+         (opencl/emit-scalar-kernel
+          "async_required_unknown_cuda" (async-staging-kernel-body :required)
+          {:target-dialect :cuda}))))
+  (testing "the native event lowering remains valid OpenCL C"
+    (when (command-available? "clang")
+      (let [source (opencl/emit-scalar-kernel
+                    "async_staging" (async-staging-kernel-body)
+                    {:target-dialect :opencl-portable})
+            {:keys [exit err]} (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                         "-fsyntax-only" "-" :in source)]
+        (is (zero? exit) err)))))

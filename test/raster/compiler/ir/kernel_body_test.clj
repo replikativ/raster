@@ -648,3 +648,66 @@
         (is (thrown-with-msg?
              clojure.lang.ExceptionInfo #"unsupported synchronization contract"
              (scalar-body [invalid])))))))
+
+(defn- async-stage-copy
+  ([] (async-stage-copy [0]))
+  ([source-coordinates]
+   (body/->AsyncWorkgroupCopy
+    'copy-x 'x source-coordinates 'scratch [0] 16 16 :cached :preferred
+    (body/full-participation))))
+
+(defn- async-stage-operations
+  []
+  [(async-stage-copy)
+   (body/->AsyncCommit 'copy-group ['copy-x])
+   (body/->AsyncWait ['copy-group] 0 :acquire (body/full-participation))
+   (workgroup-barrier)
+   (body/->ScalarLoad (body/value 'staged :float) 'scratch ['lane] nil nil :cached)])
+
+(deftest async-staging-has-verified-issue-commit-wait-lifetimes
+  (let [options [:stable-reads [(body/stable-read 'x)]
+                 :allocations [(scratch-allocation)]
+                 :shared-memory-bytes 64]]
+    (is (body/kernel-body? (apply scalar-body (async-stage-operations) options)))
+    (testing "the source must stay stable for the entire asynchronous lifetime"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"stable-read contract"
+           (scalar-body (async-stage-operations)
+                        :allocations [(scratch-allocation)]
+                        :shared-memory-bytes 64))))
+    (testing "a commit closes exactly the copies issued since the previous commit"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"close every copy"
+           (apply scalar-body
+                  (assoc (async-stage-operations) 1
+                         (body/->AsyncCommit 'copy-group ['different-copy]))
+                  options))))
+    (testing "waits consume the oldest group prefix and state remaining depth"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"consume an oldest prefix"
+           (apply scalar-body
+                  (assoc (async-stage-operations) 2
+                         (body/->AsyncWait ['copy-group] 1 :acquire
+                                           (body/full-participation)))
+                  options))))
+    (testing "wait completion does not silently imply cross-thread visibility"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"before a workgroup barrier"
+           (apply scalar-body
+                  (vec (concat (subvec (async-stage-operations) 0 3)
+                               (subvec (async-stage-operations) 4)))
+                  options))))
+    (testing "staged storage cannot be consumed while its copy group is incomplete"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"before its async wait"
+           (apply scalar-body
+                  [(async-stage-copy)
+                   (body/->ScalarLoad (body/value 'too-early :float)
+                                      'scratch ['lane] nil nil :cached)]
+                  options))))
+    (testing "the cooperative base address must be workgroup-uniform"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"issued uniformly"
+           (apply scalar-body
+                  (assoc (async-stage-operations) 0 (async-stage-copy ['lane]))
+                  options))))))
