@@ -130,10 +130,15 @@ KernelBody per segment/tile, and deterministically merges the explicit maximum/d
 value state in increasing tile order. The four typed partial buffers are operation-derived,
 graph-private temporaries; the source operation and external ABI are unchanged. This two-kernel
 schedule is opt-in until measured selection can account for dynamic history length and temporary
-traffic. The next production work is to lower subgroup collectives through portable OpenCL, CUDA
-and HIP target dialects. Verified local allocation,
-barriers and asynchronous copies can subsequently collapse a multi-kernel tiled graph into a
-FlashAttention-like single kernel without changing the semantic plan or external ABI.
+traffic. Scalar/control KernelBody now has one C-family lowering core with thin portable OpenCL,
+CUDA and HIP spelling descriptors. The same scheduled cooperative and tiled-history bodies retain
+one ordered ABI while OpenCL uses subgroup builtins and CUDA/HIP select explicit shuffle-down trees;
+the emitted artifacts record that target association. CUDA is compiled to PTX and HIP to an RDNA3
+code object in mandatory hardware-free CI jobs, while real Intel execution remains the numerical
+oracle. CUDA/HIP runtime registration, launch and on-device numerical coverage remain deliberately
+separate from source legality. Verified local allocation, barriers and asynchronous copies can
+subsequently collapse a multi-kernel tiled graph into a FlashAttention-like single kernel without
+changing the semantic plan or external ABI.
 
 ### 2.3 Executable steps and resident artifact values compose
 

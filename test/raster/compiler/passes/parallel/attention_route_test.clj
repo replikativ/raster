@@ -149,6 +149,27 @@
           (is (not (str/includes? source "rstr_value_component_16")))
           (is (zero? (:exit result)) (:err result)))))))
 
+(deftest scheduled-attention-artifacts-preserve-the-abi-across-c-family-targets
+  (let [descriptor {:device-type :gpu :subgroup-size 32 :max-workgroup-size 1024}
+        plan (:plan (route/route!
+                     (problem)
+                     (assoc descriptor :segmented-weighted-reduction-schedule :reference)))
+        scheduled (:schedule (schedule-pass/plan-subgroup-online plan descriptor))
+        opencl (attention-emit/emit-fp16-cooperative
+                plan scheduled :opencl-portable)]
+    (doseq [[dialect target]
+            [[:cuda :cuda-c] [:hip :hip-cpp]]]
+      (let [artifact (attention-emit/emit-fp16-cooperative plan scheduled dialect)]
+        (is (= target (:target artifact)))
+        (is (= (:abi opencl) (:abi artifact)))
+        (is (= (:arguments opencl) (:arguments artifact)))
+        (is (= (:effects opencl) (:effects artifact)))
+        (is (= dialect (get-in artifact [:attributes :target-dialect])))
+        (is (= :explicit-shuffle-down-tree
+               (get-in artifact [:attributes :target-collective-association])))
+        (is (str/includes? (:source artifact) "extern \"C\" __global__ void"))
+        (is (str/includes? (:source artifact) "__shfl_down"))))))
+
 (deftest tiled-history-is-a-two-stage-kernel-graph-with-a-stable-external-abi
   (let [desc (assoc intel-desc
                     :segmented-weighted-reduction-schedule
