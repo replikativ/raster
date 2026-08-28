@@ -329,7 +329,9 @@
 
 (defn- layout! [owner layout]
   (when-not (and (map? layout) (keyword? (:kind layout)))
-    (throw (ex-info (str owner " requires a named layout") {:layout layout}))))
+    (throw (ex-info (str owner " requires a named layout") {:layout layout})))
+  (when (layout/shared-memory-layout? layout)
+    (layout/validate-shared-memory! layout)))
 
 (defn- unique-ids! [owner values]
   (let [ids (mapv :id values)]
@@ -760,6 +762,11 @@
                        (= :global (:memory-space source))
                        (= :allocation (:kind destination))
                        (= :workgroup (:memory-space destination))
+                       ;; AsyncWorkgroupCopy denotes one contiguous transfer. A physical XOR
+                       ;; permutation needs an explicit scatter/tensor-copy operation; treating it
+                       ;; as contiguous would silently populate the wrong logical coordinates.
+                       (or (not (layout/shared-memory-layout? (:layout destination)))
+                           (= :identity (get-in destination [:layout :swizzle])))
                        (= (dtype/canon (:dtype source)) (dtype/canon (:dtype destination)))
                        (= (count (:shape source)) (count (:source-coordinates operation)))
                        (= (count (:shape destination))
@@ -1652,6 +1659,10 @@
                           {:parameter p})))
         (do (shape! "kernel buffer parameter" (:shape p))
             (layout! "kernel buffer parameter" (:layout p))
+            (when (layout/shared-memory-layout? (:layout p))
+              (throw (ex-info "shared-memory layouts are restricted to workgroup allocations"
+                              {:reason :kernel-body-shared-layout-memory-space
+                               :parameter p})))
             (when-not (keyword? (:memory-space p))
               (throw (ex-info "kernel buffer parameter requires a memory space"
                               {:parameter p}))))))
@@ -1719,6 +1730,10 @@
                                    {:view view :references (vec outside) :scope index-scope}))))
                (shape! "kernel buffer view" (:shape view))
                (layout! "kernel buffer view" (:layout view))
+               (when (layout/shared-memory-layout? (:layout view))
+                 (throw (ex-info "shared-memory layouts cannot decorate global buffer views"
+                                 {:reason :kernel-body-shared-layout-memory-space
+                                  :view view})))
                (let [parent-shape (:shape parent)
                      view-shape (:shape view)
                      prefix-rank (- (count parent-shape) (count view-shape))

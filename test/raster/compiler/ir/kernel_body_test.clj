@@ -625,6 +625,26 @@
                                              (layout/row-major [8] :float))]
                         :shared-memory-bytes 64))))))
 
+(deftest shared-memory-layouts-have-an-explicit-storage-and-copy-boundary
+  (is (body/kernel-body? (fixtures/swizzled-workgroup-memory-body 32)))
+  (testing "a shared layout cannot leak onto a global ABI parameter"
+    (let [kernel (scalar-body [])]
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"restricted to workgroup allocations"
+           (body/validate!
+            (assoc-in kernel [:parameters 0 :layout]
+                      (layout/shared-memory [16] :float :identity)))))))
+  (testing "contiguous async copy does not pretend to implement a physical scatter"
+    (let [kernel (-> (fixtures/async-staging-body 32 :preferred)
+                     (assoc-in [:allocations 0 :shape] [32 32])
+                     (assoc-in [:allocations 0 :layout]
+                               (layout/shared-memory [32 32] :float :xor-32))
+                     (assoc-in [:operations 0 :destination-coordinates] [0 0])
+                     (assoc-in [:launch :shared-memory-bytes] 4096))]
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                            #"contiguous global-to-workgroup transfer"
+                            (body/validate! kernel))))))
+
 (deftest workgroup-barriers-require-full-convergent-participation
   (let [barrier (workgroup-barrier)]
     (is (body/kernel-body? (scalar-body [barrier])))

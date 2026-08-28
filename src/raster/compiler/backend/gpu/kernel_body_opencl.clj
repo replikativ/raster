@@ -933,16 +933,32 @@
 (defn- emit-storage-index
   [storage coordinates names]
   (let [layout (:layout storage)
-        _ (when-not (contains? #{:row-major :col-major} (:kind layout))
-            (throw (ex-info "OpenCL scalar memory lowering requires a dense strided layout"
-                            {:reason :kernel-body-opencl-layout :storage (:id storage)
-                             :layout layout})))
-        strides (layout/resolve-strides layout)
-        terms (mapv (fn [coordinate stride]
-                      (str "((long)(" (emit-index-expression coordinate names) ") * (long)("
-                           (emit-layout-expression stride names) "))"))
-                    coordinates strides)
-        local-offset (if (seq terms) (str/join " + " terms) "0")
+        dense-offset
+        (fn [dense-layout]
+          (let [strides (layout/resolve-strides dense-layout)
+                terms (mapv (fn [coordinate stride]
+                              (str "((long)(" (emit-index-expression coordinate names)
+                                   ") * (long)(" (emit-layout-expression stride names) "))"))
+                            coordinates strides)]
+            (if (seq terms) (str/join " + " terms) "0")))
+        local-offset
+        (case (:kind layout)
+          (:row-major :col-major) (dense-offset layout)
+          :shared-memory
+          (do
+            (layout/validate-shared-memory! layout)
+            (if (= :identity (:swizzle layout))
+              (dense-offset layout)
+              (let [[row column] coordinates
+                    row-source (emit-index-expression row names)
+                    column-source (emit-index-expression column names)
+                    columns (second (:shape layout))
+                    mask (dec (layout/swizzle-width (:swizzle layout)))]
+                (str "((long)(" row-source ") * (long)(" columns ") + "
+                     "((long)(" column-source ") ^ ((long)(" row-source ") & " mask ")))"))))
+          (throw (ex-info "C-family scalar memory lowering requires a dense strided layout or verified shared layout"
+                          {:reason :kernel-body-opencl-layout :storage (:id storage)
+                           :layout layout})))
         view-offset (some-> storage :view :element-offset)]
     (if view-offset
       (str "((long)(" (emit-index-expression view-offset names) ") + " local-offset ")")

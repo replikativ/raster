@@ -3,7 +3,8 @@
 
    The semantic operation remains SegmentedWeightedReductionPlan.  This value records how one
    legal implementation maps segments, score components, visible members and value components to
-   cooperative hardware execution; it contains no attention buffer identities or target syntax.")
+   cooperative hardware execution; it contains no attention buffer identities or target syntax."
+  (:require [raster.compiler.core.layout :as layout]))
 
 (defrecord SegmentedWeightedReductionSchedule
            [strategy workgroup-size segment-mapping membership-traversal score-reduction
@@ -63,6 +64,7 @@
          (pos-int? (:value-elements staging))
          (contains? #{4 8 16} (:transfer-bytes staging))
          (contains? #{:preferred :required} (:overlap staging))
+         (layout/shared-memory-swizzle? (:layout-swizzle staging))
          (= :separate-epilogue (:tail-policy staging))
          (pos-int? (:shared-memory-bytes staging))
          (= (:shared-memory-bytes staging)

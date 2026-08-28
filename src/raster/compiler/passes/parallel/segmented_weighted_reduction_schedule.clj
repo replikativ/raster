@@ -54,6 +54,10 @@
                   :value-elements components
                   :transfer-bytes 16
                   :overlap :preferred
+                  ;; The finite layout member is explicit even before autotuning selects a
+                  ;; non-identity member. Current row stages are 1-D, so identity is the only
+                  ;; meaningful/copy-contiguous choice; swizzle search remains a later axis.
+                  :layout-swizzle :identity
                   :tail-policy :separate-epilogue
                   :shared-memory-bytes shared-memory-bytes}
                  {:kind :none})

@@ -102,6 +102,76 @@
 (defn col-major [shape dtype]
   (assoc (row-major shape dtype) :kind :col-major :perm (vec (reverse (range (count shape))))))
 
+;; --- verified workgroup/shared-memory layouts ---
+
+(def shared-memory-swizzles
+  "The complete, deliberately finite shared-memory swizzle dialect.  `:xor-N` permutes the
+   low log2(N) column bits by the low row bits.  Named members keep schedule search bounded and
+   make compiled artifacts/caches stable; adding a member is an IR change, not an arbitrary
+   user-supplied bit program."
+  #{:identity :xor-2 :xor-4 :xor-8 :xor-16 :xor-32})
+
+(defn shared-memory-swizzle?
+  [value]
+  (contains? shared-memory-swizzles value))
+
+(defn swizzle-width
+  "Return the named XOR period, or one for the identity member."
+  [swizzle]
+  (case swizzle
+    :identity 1
+    :xor-2 2
+    :xor-4 4
+    :xor-8 8
+    :xor-16 16
+    :xor-32 32
+    (throw (ex-info "unknown shared-memory swizzle"
+                    {:reason :shared-memory-swizzle-unknown :swizzle swizzle
+                     :supported shared-memory-swizzles}))))
+
+(defn validate-shared-memory!
+  "Verify the finite shared-memory layout family and return the descriptor unchanged.
+
+   Identity is legal for one- or two-dimensional static storage. XOR members are 2-D row-major
+   permutations whose column extent is a multiple of their period. That condition proves the
+   transform remains within every period-sized column block and is a bijection (XOR is its own
+   inverse); no padding or hidden resource charge is introduced."
+  [descriptor]
+  (let [{:keys [kind rank shape dtype base swizzle]} descriptor
+        width (swizzle-width swizzle)]
+    (when-not (and (= :shared-memory kind)
+                   (= :row-major base)
+                   (contains? #{1 2} rank)
+                   (= rank (count shape))
+                   (vector? shape)
+                   (every? pos-int? shape)
+                   (keyword? dtype)
+                   width
+                   (or (= :identity swizzle)
+                       (and (= 2 rank)
+                            (zero? (mod (long (second shape)) width)))))
+      (throw (ex-info "invalid shared-memory layout"
+                      {:reason :shared-memory-layout-invalid
+                       :layout descriptor
+                       :requirements {:rank #{1 2}
+                                      :static-positive-shape true
+                                      :base :row-major
+                                      :swizzles shared-memory-swizzles
+                                      :xor-column-multiple width}})))
+    descriptor))
+
+(defn shared-memory
+  "Construct a verified statically shaped workgroup/shared-memory layout."
+  ([shape dtype] (shared-memory shape dtype :identity))
+  ([shape dtype swizzle]
+   (validate-shared-memory!
+    {:kind :shared-memory :rank (count shape) :shape (vec shape) :dtype dtype
+     :base :row-major :swizzle swizzle})))
+
+(defn shared-memory-layout?
+  [descriptor]
+  (= :shared-memory (:kind descriptor)))
+
 (defn transpose-layout
   "A layout viewing `l` transposed — flip the physical major order (:perm). The ONLY thing a
    transpose changes; the data does not move (that's what makes a transpose potentially free)."
@@ -121,7 +191,12 @@
    the innermost physical axis (perm[n-1]) has stride 1, perm[k] has the product of physical
    extents after k. Numeric when shape is numeric, else an S-expression (clojure.core * — index
    arithmetic stays clojure.core per project convention). An explicit :strides overrides."
-  [{:keys [shape perm strides]}]
+  [{:keys [shape perm strides] :as descriptor}]
+  (when (shared-memory-layout? descriptor)
+    (validate-shared-memory! descriptor)
+    (when-not (= :identity (:swizzle descriptor))
+      (throw (ex-info "a non-identity shared-memory swizzle is not affine-strided"
+                      {:reason :shared-memory-layout-non-affine :layout descriptor}))))
   (or strides
       (let [n     (count shape)
             perm  (or perm (vec (range n)))
@@ -134,20 +209,63 @@
         (reduce (fn [m k] (assoc m (nth perm k) (nth pstr k)))
                 (vec (repeat n 1)) (range n)))))
 
+(defn- add-expression [left right]
+  (cond (= left 0) right
+        (= right 0) left
+        (and (number? left) (number? right)) (+ left right)
+        :else (list '+ left right)))
+
+(defn- multiply-expression [left right]
+  (cond (or (= left 0) (= right 0)) 0
+        (= left 1) right
+        (= right 1) left
+        (and (number? left) (number? right)) (* left right)
+        :else (list '* left right)))
+
+(defn- bit-and-expression [left right]
+  (if (and (integer? left) (integer? right))
+    (bit-and left right)
+    (list 'bit-and left right)))
+
+(defn- bit-xor-expression [left right]
+  (if (and (integer? left) (integer? right))
+    (bit-xor left right)
+    (list 'bit-xor left right)))
+
+(defn- shared-memory-offset
+  [descriptor coords]
+  (validate-shared-memory! descriptor)
+  (when-not (= (:rank descriptor) (count coords))
+    (throw (ex-info "shared-memory coordinates must match the layout rank"
+                    {:reason :shared-memory-layout-coordinate-rank
+                     :layout descriptor :coordinates coords})))
+  (if (= 1 (:rank descriptor))
+    (first coords)
+    (let [[row column] coords
+          columns (second (:shape descriptor))
+          width (swizzle-width (:swizzle descriptor))
+          physical-column (if (= 1 width)
+                            column
+                            (bit-xor-expression
+                             column (bit-and-expression row (dec width))))]
+      (add-expression (multiply-expression row columns) physical-column))))
+
 (defn layout->offset
   "Physical element offset of logical `coords` under `layout` — Σ coord_i · stride_i, as a numeric
    value or an S-expression. Zero-stride (broadcast) axes drop out; unit strides are bare."
   [layout coords]
-  (let [st (resolve-strides layout)
-        terms (keep (fn [[c s]]
-                      (cond (= s 0) nil (= s 1) c
-                            (and (number? c) (number? s)) (* c s)
-                            :else (list '* c s)))
-                    (map vector coords st))]
-    (case (count terms)
-      0 0
-      1 (first terms)
-      (reduce (fn [a b] (if (and (number? a) (number? b)) (+ a b) (list '+ a b))) terms))))
+  (if (shared-memory-layout? layout)
+    (shared-memory-offset layout coords)
+    (let [st (resolve-strides layout)
+          terms (keep (fn [[c s]]
+                        (cond (= s 0) nil (= s 1) c
+                              (and (number? c) (number? s)) (* c s)
+                              :else (list '* c s)))
+                      (map vector coords st))]
+      (case (count terms)
+        0 0
+        1 (first terms)
+        (reduce (fn [a b] (if (and (number? a) (number? b)) (+ a b) (list '+ a b))) terms)))))
 
 (defn offset->coords
   "Inverse of layout->offset for a DENSE strided layout (numeric strides) — recover logical coords
