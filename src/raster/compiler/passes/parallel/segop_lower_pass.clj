@@ -10,8 +10,12 @@
    - Backend translates SegOp to target code (SIMD, OpenCL, scalar)"
   (:require [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.parallel-program :as program]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.soac-dialect-adapter :as soac-adapter]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]
             [raster.compiler.ir.form :as form]
             [clojure.set :as set]))
@@ -79,15 +83,32 @@
                                           device-id dtype)})
 
         :else
-        (let [segops (attempt #(soac-lower/lower-soac (:ok soac) (or device-id :cpu:0)
-                                                      :dtype (or dtype :double)))]
+        (let [legacy-node (:ok soac)
+              typed? (and (soac/soac-reduce? legacy-node)
+                          (empty? (:segment-axes legacy-node))
+                          (reduction/scalar? (:reduction legacy-node))
+                          ;; TypedSOAC deliberately names extents with stable values (or static
+                          ;; literals). Older source-shaped bounds such as `(alength x)` remain on
+                          ;; the compatibility route until bound expressions have their own SSA
+                          ;; equation; do not smuggle executable host forms into the typed dialect.
+                          (soac-dialect/extent? (:bound legacy-node)))
+              algorithm (when typed?
+                          (soac-adapter/legacy-nodes->program
+                           [legacy-node] {:outputs (:outputs legacy-node)
+                                          :dtype (or dtype :double)
+                                          :array-types array-types}))
+              segops (attempt #(if algorithm
+                                 (soac-lower/lower-typed-reduce
+                                  algorithm (or device-id :cpu:0) :dtype (or dtype :double))
+                                 (soac-lower/lower-soac legacy-node (or device-id :cpu:0)
+                                                        :dtype (or dtype :double))))]
           (cond
             (:err segops) (decline :segop (:err segops))
-            (seq (:ok segops)) (cond-> {:soac (:ok soac) :segops (:ok segops)}
-                                 (soac-lower/scan-soac? (:ok soac))
+            (seq (:ok segops)) (cond-> {:soac legacy-node :algorithm algorithm :segops (:ok segops)}
+                                 (soac-lower/scan-soac? legacy-node)
                                  (assoc :kernel-graph
                                         (soac-lower/scan-kernel-graph
-                                         (:ok soac) (:ok segops) {:array-types array-types})))
+                                         legacy-node (:ok segops) {:array-types array-types})))
             :else (when par? {:declined (diagnostic sym form :segop
                                                     (ex-info "lower-soac produced no SegOps" {})
                                                     device-id dtype)})))))))
@@ -122,8 +143,11 @@
                 :effects #{}})))
 
 (defn- equation
-  [equation-id site sym source {:keys [soac segops kernel-graph]} dtype array-types]
-  (let [operands (-> (soac/node-all-free-syms soac) (disj sym) (->> (sort-by str) vec))
+  [equation-id site sym source {:keys [soac algorithm segops kernel-graph]} dtype array-types]
+  (let [;; Body-position equations currently have no ParallelProgram result ID; retain the typed
+        ;; algorithm only where its result has an authoritative envelope identity.
+        algorithm (when (= :binding (first site)) algorithm)
+        operands (-> (soac/node-all-free-syms soac) (disj sym) (->> (sort-by str) vec))
         result-ids (if (= :binding (first site)) [sym] [])
         effects (cond-> #{:memory/read}
                   (seq (soac/soac-outputs soac)) (conj :memory/write))
@@ -136,7 +160,7 @@
                                    [id (value-contract id soac dtype array-types true)]))
                             result-ids)
         eq (program/->ProgramEquation
-            equation-id site source operands result-ids (vec segops) effects
+            equation-id site source operands result-ids algorithm (vec segops) effects
             {:source-dialect :soac :target-dialect :segop :soac-id (:id soac)}
             (cond-> {:device (:device-id (first segops))}
               kernel-graph (assoc :kernel-graph kernel-graph)))]
@@ -195,8 +219,12 @@
                            (merge-values values {value-id (get result-values source-id)}))
                          values-with-operands
                          (map vector source-results results))
+                 value-remap (into (zipmap source-results results)
+                                   (map vector (:operands equation) operands))
+                 algorithm' (when-let [algorithm (:algorithm equation)]
+                              (soac-dialect/remap-values algorithm value-remap))
                  equation' (-> equation
-                               (assoc :operands operands :results results)
+                               (assoc :operands operands :results results :algorithm algorithm')
                                (update :attributes assoc :source-results source-results))]
              (-> state
                  (assoc :values values-with-results)
@@ -219,7 +247,13 @@
       :effects effects
       :diagnostics declined
       :provenance {:pass :segop-lower :device (or device-id :cpu:0) :dtype (or dtype :double)}
-      :attributes {:host-control :source-expression}})))
+      :attributes {:host-control :source-expression}
+      :operation? segop/segop-node?
+      :algorithm? (fn [equation algorithm]
+                    (and (soac-dialect/program-form? algorithm)
+                         (= algorithm (soac-dialect/validate! algorithm))
+                         (= (:operands equation) (:inputs (soac-dialect/facts algorithm)))
+                         (= (:results equation) (soac-dialect/outputs algorithm))))})))
 
 (defn segop-lower-pass
   "Pipeline pass: convert par forms in let* bindings to SegOp records.

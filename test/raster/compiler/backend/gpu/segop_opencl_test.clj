@@ -9,6 +9,7 @@
    emitted x[i] (decoder-gpu)."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as soac]
+            [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
@@ -99,7 +100,9 @@
          Exception #"only a binary \(op acc elem\) combine"
          (segred-source '(+ acc (clojure.core/aget a j) (clojure.core/aget b j))))))
   (testing "the ordinary binary combine still lowers unchanged"
-    (is (re-find #"val = " (segred-source '(+ acc (clojure.core/aget a j)))))))
+    (let [source (segred-source '(+ acc (clojure.core/aget a j)))]
+      (is (re-find #"tree_combined_.* = .* \+ " source))
+      (is (re-find #"output\[" source)))))
 
 (deftest segred-multistatement-lambda-rejected
   (testing "a reduce lambda with a multi-statement let body is rejected, not (last bdy)-dropped"
@@ -144,19 +147,38 @@
       (is (= [:float :float :float :int] (mapv :kernel-dtype (:abi k))))
       (is (= [:operand :result :parameter :bound] (mapv :role (:abi k))))
       (is (= '[a result-buffer scale n] (:arguments k)))
-      (is (re-find #"\(.*a,.*output, float scale, int _n_bound\)" (:source k))))
+      (is (= (kabi/signature-shape (:abi k))
+             (kabi/source-signature-shape (:kernel-name k) (:source k))))
+      (is (= :no-write-alias (get-in k [:abi 0 :aliasing]))))
     (testing "launch and semantic origin are part of the value"
       (is (klaunch/launch-spec? (:launch k)))
       (is (= [256] (get-in k [:launch :workgroup-size])))
       (is (= 1024 (get-in k [:launch :shared-memory-bytes])))
       (is (= {:dialect :segred :segop-id (:id segred)} (:provenance k)))
-      (is (= :float (get-in k [:attributes :dtype])))))
+      (is (= :float (get-in k [:attributes :dtype])))
+      (is (= :kernel-body (get-in k [:attributes :emission-route])))
+      (is (some? (get-in k [:attributes :kernel-body])))))
   (testing "host-scalar staging retains the result position as an explicit nil placeholder"
     (let [form '(raster.par/reduce acc 0.0 i n (+ acc (clojure.core/aget a i)))
           s (soac/par-form->soac 'result form 0)
           k (sg/generate-segred-kernel (first (lower/lower-reduce s nil)) nil :dtype :float)]
       (is (= '[a output _n_bound] (mapv :name (:abi k))))
       (is (= '[a nil n] (:arguments k))))))
+
+(deftest segred-kernel-body-decline-is-retained-in-the-fallback-artifact
+  (let [form '(raster.par/reduce acc 0.0 i n
+                                 (+ acc (clojure.core/aget a (+ i offset))))
+        node (soac/par-form->soac 'result form 22 :dtype :float)
+        operation (first (lower/lower-reduce node nil :dtype :float))
+        artifact (sg/generate-segred-kernel
+                  operation nil :dtype :float :scalar-types {'offset :int})]
+    (is (= :verified-segred-opencl (get-in artifact [:attributes :emission-route])))
+    (is (= :segred-kernel-body-declined
+           (get-in artifact [:attributes :kernel-body-decline :reason])))
+    (is (= :uniform-scalar-storage
+           (get-in artifact [:attributes :kernel-body-decline :missing-rule])))
+    (is (= :verified-segred-opencl
+           (get-in artifact [:attributes :kernel-body-decline :fallback])))))
 
 ;; ================================================================
 ;; Horizontally-fused multi-output SegMap: the SECONDARY output (written

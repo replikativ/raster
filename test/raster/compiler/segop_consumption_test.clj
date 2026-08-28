@@ -14,7 +14,8 @@
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.backend.gpu.opencl-pass :as op]
-            [raster.compiler.backend.jvm.par-simd :as par-simd]))
+            [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.passes.parallel.par-fusion :as par-fusion]))
 
 (def ^:private map-form
   '(let* [o (raster.par/map! O i 8192 nil (clojure.core/* (clojure.core/aget X i) 2.0))] o))
@@ -70,6 +71,18 @@
       (is (= 1 (:segop-reused st)) "consumed from the first-class equation")
       (is (nil? (:segop-relowered st))))))
 
+(deftest a-body-position-reduction-keeps-the-existing-resultless-envelope
+  (let [form '(let* [n 8192]
+                    (raster.par/reduce acc 0.0 i n
+                                       (+ acc (clojure.core/aget X i))))
+        program (lowered form)
+        equation (first (:equations program))
+        st (:stats (run program))]
+    (is (empty? (:results equation)))
+    (is (nil? (:algorithm equation)))
+    (is (= 1 (:segop-reused st)))
+    (is (= 1 (:ze-reduces st)))))
+
 (deftest jvm-simd-consumes-the-boundary-too
   (testing "matching map/reduce SegOps are reused rather than independently re-derived"
     (doseq [[label form stat-key]
@@ -108,3 +121,33 @@
                   (fn [& _] (throw (NullPointerException. "simulated SIMD lowering bug")))]
       (is (thrown-with-msg? NullPointerException #"simulated SIMD lowering bug"
                             (run-simd map-form))))))
+
+(deftest fused-reduction-crosses-typed-soac-and-both-scheduled-backends
+  (let [source '(let* [tmp (raster.par/map! TMP i n nil
+                                            (* (clojure.core/aget X i)
+                                               (clojure.core/aget X i)))
+                       total (raster.par/reduce acc 0.0 j n
+                                                (+ acc (clojure.core/aget TMP j)))]
+                      total)
+        fused (:form (par-fusion/par-fusion-pass source))
+        gpu-program (lowered fused)
+        cpu-program (lowered-cpu fused :double)
+        equation (first (:equations gpu-program))
+        gpu (run gpu-program)
+        simd (run-simd cpu-program)
+        artifact (first (:kernels gpu))]
+    (testing "fusion is preserved as a typed functional algorithm in the common envelope"
+      (is (= 1 (count (:equations gpu-program))))
+      (is (some? (:algorithm equation)))
+      (is (not-any? #{'TMP 'tmp} (flatten (:algorithm equation))))
+      (is (= :typed-soac (:algorithm-dialect (first (:operations equation))))))
+    (testing "JVM SIMD consumes the SegRed derived from that algorithm"
+      (is (= 1 (get-in simd [:stats :segop-reused])))
+      (is (= 1 (get-in simd [:stats :simd-reduces]))))
+    (testing "GPU emission consumes the same SegRed through verified KernelBody"
+      (is (= 1 (get-in gpu [:stats :segop-reused])))
+      (is (= :kernel-body (get-in artifact [:attributes :emission-route])))
+      (is (= :typed-soac (get-in artifact [:attributes :kernel-body
+                                           :provenance :algorithm-dialect])))
+      (is (re-find #"element_value_.* = .* \* " (:source artifact)))
+      (is (not (str/includes? (:source artifact) "TMP"))))))

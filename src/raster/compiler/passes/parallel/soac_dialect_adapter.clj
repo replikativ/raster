@@ -1,9 +1,10 @@
 (ns raster.compiler.passes.parallel.soac-dialect-adapter
   "Guarded compatibility projection from the current record SOAC graph to TypedSOAC.
 
-   This is a differential-testing bridge, not a backend route. It accepts only maps, scalar/full
-   reductions and the allocation/alias scaffolding produced by current horizontal fusion. Every
-  unsupported legacy shape declines loudly so the bridge cannot silently erase compiler facts."
+   This guarded bridge feeds both differential tests and the first production scalar-reduction
+   vertical. It accepts only maps, scalar/full reductions and the allocation/alias scaffolding
+   produced by current horizontal fusion. Every unsupported legacy shape declines loudly so the
+   bridge cannot silently erase compiler facts."
   (:require [clojure.set :as set]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
@@ -170,7 +171,7 @@
                         (:dtypes attributes)
                         (repeat (count results) default-dtype))]
     (merge
-     {extent (tensor-value :long [])}
+     (if (dialect/value-id? extent) {extent (tensor-value :long [])} {})
      (into {} (map (fn [id]
                      [id (tensor-value (value-dtype id default-dtype array-types)
                                        (dialect/extent-shape extent))])
@@ -227,7 +228,9 @@
                                   :extent (dialect/operation-extent equation)})
                                equations)
           definitions (set (mapcat :results equation-infos))
-          references (set (mapcat #(conj (:inputs %) (:extent %)) equation-infos))
+          references (set (mapcat #(cond-> (:inputs %)
+                                     (dialect/value-id? (:extent %)) (conj (:extent %)))
+                                  equation-infos))
           inputs (vec (sort-by pr-str (set/difference references definitions)))
           outputs (vec (or outputs (:results (peek equation-infos)) []))
           inferred-values (reduce (fn [contracts equation]

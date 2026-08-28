@@ -8,6 +8,7 @@
    This is the GPU counterpart to segop_simd.clj — both consume the
    same SegOp IR but produce different target code."
   (:require [raster.compiler.backend.gpu.kernel-body-opencl :as kernel-body-opencl]
+            [raster.compiler.backend.gpu.kernel-body-c-dialect :as kernel-body-c-dialect]
             [raster.compiler.backend.gpu.opencl-codegen :as codegen]
             [raster.compiler.backend.gpu.c-emit :as ce]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -24,6 +25,7 @@
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.passes.parallel.segred-body :as segred-body]
             [clojure.walk :as walk]
             [clojure.set]
             [raster.compiler.ir.segop :as segop]
@@ -388,6 +390,62 @@
                    :component-dtypes (reduction/dtypes operator)
                    :schedule schedule}})))
 
+(defn generate-segred-kernel-body
+  "Lower an eligible scalar SegRed through verified KernelBody and a thin C-family dialect.
+
+   This function is public so CUDA/HIP compiler fixtures can validate the exact same scheduled
+   body without a device. It throws only structured `:segred-kernel-body-declined` exceptions for
+   unsupported scalar regions; verified-body or emitter failures remain compiler errors."
+  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
+                     :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
+                          array-types {} target-dialect :opencl-intel}}]
+  (let [{:keys [kernel-body operator identity arrays scalars output bound]}
+        (segred-body/lower segred out-sym :dtype dtype :array-types array-types
+                           :scalar-types scalar-types)
+        dtype (or (:dtype segred) dtype)
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        parameter-names (into {output "output" '_n_bound "_n_bound"}
+                              (map (fn [id] [id (ce/c-symbol id)]))
+                              (concat arrays scalars))
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+        scalar-dtype (fn [id]
+                       (or (get scalar-types id)
+                           (get scalar-types (symbol (name id)))
+                           dtype))
+        result-name (or out-sym 'output)
+        abi (kabi/validate!
+             (vec (concat
+                   (map #(kabi/slot % :input dtype :c-name (ce/c-symbol %) :role :operand
+                                    :aliasing :no-write-alias)
+                        arrays)
+                   [(kabi/slot result-name :output dtype :c-name "output" :role :result)]
+                   (map #(kabi/slot % :scalar (scalar-dtype %)
+                                    :c-name (ce/c-symbol %) :role :parameter)
+                        scalars)
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
+        c-op ({:+ "+" :* "*" :min "fmin" :max "fmax"} operator)]
+    (kart/make
+     {:kernel-name kernel-name
+      :target (kernel-body-c-dialect/target (kernel-body-c-dialect/resolve! target-dialect))
+      :source source
+      :abi abi
+      :arguments (vec (concat arrays [out-sym] scalars [bound]))
+      :launch (:launch kernel-body)
+      :temporaries []
+      :effects {:kind :pure-reduction}
+      :provenance {:dialect :segred :segop-id (:id segred)}
+      :attributes {:array-params arrays
+                   :scalar-params scalars
+                   :dtype dtype
+                   :n-phases 2
+                   :identity-val identity
+                   :c-op c-op
+                   :kernel-body kernel-body
+                   :emission-route :kernel-body
+                   :target-dialect target-dialect}})))
+
 (defn generate-segred-kernel
   "Generate OpenCL C reduction kernels from a SegRed record.
 
@@ -402,9 +460,21 @@
    `out-sym` is nil for the host-scalar staging protocol: the ordered :arguments vector then
    carries nil at the single :result slot, which the runtime replaces with its partial-results
    buffer.  Resident reduce-into supplies the real output buffer symbol at that same ABI position."
-  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types]
-                     :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}}}]
-  (let [idx (seg-idx segred)
+  [segred out-sym & {:keys [dtype kernel-name-prefix scalar-types array-types target-dialect]
+                     :or {dtype :double kernel-name-prefix "par_reduce" scalar-types {}
+                          array-types {} target-dialect :opencl-intel}}]
+  (let [kernel-body-attempt
+        (try
+          {:artifact
+           (generate-segred-kernel-body
+            segred out-sym :dtype dtype :kernel-name-prefix kernel-name-prefix
+            :scalar-types scalar-types :array-types array-types :target-dialect target-dialect)}
+          (catch clojure.lang.ExceptionInfo exception
+            (when-not (segred-body/declined? exception) (throw exception))
+            {:decline (ex-data exception)}))]
+    (or
+     (:artifact kernel-body-attempt)
+     (let [idx (seg-idx segred)
         bound (seg-bound segred)
         {:keys [acc init lambda]} (segop/scalar-reduce-op segred)
         ;; #55 fix: normalize devirtualized array prims ((.invk aget-impl arr i)
@@ -580,7 +650,9 @@
                    :dtype dtype
                    :n-phases 2
                    :identity-val identity-val
-                   :c-op c-op}})))
+                   :c-op c-op
+                   :emission-route :verified-segred-opencl
+                   :kernel-body-decline (:decline kernel-body-attempt)}})))))
 
 ;; ================================================================
 ;; KernelGraph scan → OpenCL KernelArtifacts

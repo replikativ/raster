@@ -8,7 +8,7 @@
   (:require [raster.compiler.ir.abstract-value :as av]))
 
 (defrecord ProgramEquation
-           [id site source operands results operations effects provenance attributes])
+           [id site source operands results algorithm operations effects provenance attributes])
 
 (defrecord ParallelProgram
            [dialect source values inputs equations outputs effects diagnostics provenance attributes])
@@ -32,10 +32,13 @@
 (defn validate!
   "Validate a ParallelProgram and return it unchanged.
 
-   `operation?`, when supplied, defines full legality for the declared dialect.  Structural
-   validation remains independent of any concrete SOAC/SegOp namespace, avoiding an IR cycle."
-  ([program] (validate! program (constantly true)))
-  ([program operation?]
+   `operation?`, when supplied, defines full legality for the declared scheduled dialect.
+   `algorithm?` receives `[equation algorithm]`, so a caller can validate an optional semantic
+   dialect and its boundary. Structural validation remains independent of concrete SOAC/SegOp
+   namespaces, avoiding an IR cycle."
+  ([program] (validate! program (constantly true) (fn [_ _] true)))
+  ([program operation?] (validate! program operation? (fn [_ _] true)))
+  ([program operation? algorithm?]
    (when-not (parallel-program? program)
      (throw (ex-info "expected a ParallelProgram"
                      {:reason :parallel-program-type :actual (type program)})))
@@ -88,6 +91,13 @@
            (throw (ex-info "an illegal operation remains after full dialect conversion"
                            {:reason :illegal-op-remains :target-dialect dialect
                             :equation (:id equation) :operation operation :fallback :none}))))
+       (when (and (some? (:algorithm equation))
+                  (not (algorithm? equation (:algorithm equation))))
+         (throw (ex-info "equation contains an illegal algorithm value"
+                         {:reason :parallel-program-algorithm
+                          :target-dialect dialect
+                          :equation (:id equation)
+                          :algorithm (:algorithm equation)})))
        (when-not (set? (:effects equation))
          (throw (ex-info "equation effects must be an explicit set"
                          {:reason :parallel-program-effects :equation (:id equation)})))
@@ -112,11 +122,13 @@
    program))
 
 (defn make
-  [{:keys [dialect source values inputs equations outputs effects diagnostics provenance attributes]
+  [{:keys [dialect source values inputs equations outputs effects diagnostics provenance attributes
+           operation? algorithm?]
     :or {values {} inputs [] equations [] outputs [] effects #{} diagnostics []
-         provenance {} attributes {}}}]
+         provenance {} attributes {} operation? (constantly true) algorithm? (fn [_ _] true)}}]
   (validate! (->ParallelProgram dialect source values (vec inputs) (vec equations) (vec outputs)
-                                effects (vec diagnostics) provenance attributes)))
+                                effects (vec diagnostics) provenance attributes)
+             operation? algorithm?))
 
 (defn source-form
   "The compatibility host expression surrounding the explicit parallel equations."
@@ -141,6 +153,10 @@
   [program sym source]
   (:operations (equation-for-binding program sym source)))
 
+(defn algorithm-for-binding
+  [program sym source]
+  (:algorithm (equation-for-binding program sym source)))
+
 (defn result-id-for-binding
   "The explicit value ID produced by a binding equation, when it has one result."
   [program sym source]
@@ -149,6 +165,10 @@
 (defn operations-for-source
   [program source]
   (:operations (equation-for-source program source)))
+
+(defn algorithm-for-source
+  [program source]
+  (:algorithm (equation-for-source program source)))
 
 (defn kernel-graph-for-binding
   [program sym source]

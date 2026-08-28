@@ -138,15 +138,19 @@
       (is (string? (:source kernel)))
       ;; OpenCL-specific syntax
       (is (str/includes? (:source kernel) "__kernel void"))
-      (is (str/includes? (:source kernel) "__local double sdata"))
+      (is (str/includes? (:source kernel) "__local double* rstr_workgroup_reduction_scratch"))
       (is (str/includes? (:source kernel) "barrier(CLK_LOCAL_MEM_FENCE)"))
       (is (str/includes? (:source kernel) "get_group_id(0)"))
-      ;; Subgroup extension
-      (is (str/includes? (:source kernel) "cl_intel_subgroups"))
+      ;; The portable workgroup tree does not depend on a vendor subgroup dialect.
+      (is (not (str/includes? (:source kernel) "cl_intel_subgroups")))
       ;; Must NOT have CUDA
       (is (not (str/includes? (:source kernel) "__syncthreads()")))
       (is (= :segred (get-in kernel [:provenance :dialect])))
-      (is (= [256] (get-in kernel [:launch :workgroup-size]))))))
+      (is (= :kernel-body (get-in kernel [:attributes :emission-route])))
+      (let [workgroup-size (first (get-in kernel [:launch :workgroup-size]))]
+        (is (pos-int? workgroup-size))
+        (is (= (* workgroup-size 8)
+               (get-in kernel [:launch :shared-memory-bytes])))))))
 
 ;; ================================================================
 ;; Pipeline pass: opencl-pass

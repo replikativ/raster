@@ -4,11 +4,26 @@
             [raster.compiler.backend.gpu.attention :as attention-emit]
             [raster.compiler.backend.gpu.kernel-body-fixtures :as body-fixtures]
             [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-executable :as executable]
+            [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
-            [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]))
+            [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
+            [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
+
+(defn- reduction-artifact
+  [dialect]
+  (let [form (with-meta
+               '(raster.par/reduce acc 0.0 i n
+                                   (+ acc (* scale (clojure.core/aget values i))))
+               {:raster.type/elem-type :float})
+        node (soac/par-form->soac 'result form 901 :dtype :float)
+        operation (first (soac-lower/lower-reduce node nil :dtype :float))]
+    (segop-emit/generate-segred-kernel-body
+     operation nil :dtype :float :scalar-types {'scale :float}
+     :target-dialect dialect :kernel-name-prefix "workgroup_reduce")))
 
 (defn- problem []
   (attention/make
@@ -71,6 +86,8 @@
         tiled (attention-emit/emit-fp16-tiled-history plan tiled-schedule dialect)]
     (into [(write-artifact! directory suffix "cooperative" cooperative)
            (write-artifact! directory suffix "pipelined-attention" pipelined)
+           (write-artifact! directory suffix "workgroup-reduction"
+                            (reduction-artifact dialect))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)
