@@ -90,6 +90,76 @@
                id role dtype shape :global (layout/row-major shape dtype) (get roles id role))))
           ids)))
 
+(defn partial-buffer-ids
+  "Stable graph-local identities derived from the semantic reduction identity.
+
+  Derivation matters when several tiled reductions are linked into one larger program: private
+  buffers from distinct reductions must never become equal merely because they share a phase."
+  [plan]
+  (let [plan-id (:id (swr/validate! plan))]
+    {:valid [:segmented-weighted-reduction plan-id :partial-valid]
+     :maximum [:segmented-weighted-reduction plan-id :partial-maximum]
+     :denominator [:segmented-weighted-reduction plan-id :partial-denominator]
+     :weighted-values [:segmented-weighted-reduction plan-id :partial-weighted-values]}))
+
+(defn- checked-elements
+  [owner extents]
+  (try
+    (reduce (fn [result extent]
+              (Math/multiplyExact (long result) (long extent)))
+            1 extents)
+    (catch ArithmeticException cause
+      (throw (ex-info "tiled weighted-reduction temporary extent exceeds signed 64-bit capacity"
+                      {:reason :segmented-weighted-reduction-partial-extent-overflow
+                       :owner owner :extents (vec extents)}
+                      cause)))))
+
+(defn partial-buffer-specs
+  "Graph-private storage required by a tiled online weighted-reduction schedule."
+  [plan scheduled]
+  (let [plan (swr/validate! plan)
+        scheduled (schedule/validate! scheduled)
+        problem (attention/validate! (:source-operation plan))]
+    (when-not (schedule/tiled? scheduled)
+      (throw (ex-info "partial buffers require a tiled weighted-reduction schedule"
+                      {:reason :segmented-weighted-reduction-partial-schedule
+                       :schedule scheduled})))
+    (let [tile-count (get-in scheduled [:membership-tiling :tile-count])
+          ids (partial-buffer-ids plan)
+          prefix [(get-in problem [:query :total-tokens]) (:q-heads problem) tile-count]
+          scalar-elements (checked-elements :scalar-state prefix)
+          weighted-elements (checked-elements :weighted-values
+                                               (conj prefix (:value-head-dim problem)))]
+      [{:id (:valid ids) :dtype :int :shape prefix :elements scalar-elements
+        :role :partial-valid}
+       {:id (:maximum ids) :dtype :float :shape prefix :elements scalar-elements
+        :role :partial-maximum}
+       {:id (:denominator ids) :dtype :float :shape prefix :elements scalar-elements
+        :role :partial-denominator}
+       {:id (:weighted-values ids) :dtype :float
+        :shape (conj prefix (:value-head-dim problem))
+        :elements weighted-elements
+        :role :partial-weighted-values}])))
+
+(defn- partial-parameters
+  [plan problem scheduled]
+  (into (mapv #(assoc % :kind :input) (butlast (parameters plan problem)))
+        (map (fn [{:keys [id dtype shape role]}]
+               (body/->KernelParameter id :output dtype shape :global
+                                       (layout/row-major shape dtype) role)))
+        (partial-buffer-specs plan scheduled)))
+
+(defn- merge-parameters
+  [plan problem scheduled]
+  (let [{:keys [dtype shape role]} (get (attention/buffer-specs problem) (:output problem))]
+    (conj
+     (mapv (fn [{:keys [id dtype shape role]}]
+             (body/->KernelParameter id :input dtype shape :global
+                                     (layout/row-major shape dtype) role))
+           (partial-buffer-specs plan scheduled))
+     (body/->KernelParameter (:output problem) :output dtype shape :global
+                             (layout/row-major shape dtype) role))))
+
 (defn- query-metadata-operations
   [{:keys [query batch-size]}]
   (let [offsets (:row-offsets query)
@@ -442,7 +512,7 @@
   (vec (mapcat #(if (and (vector? %) (not (record? %))) % [%]) operations)))
 
 (defn- membership-loop
-  [problem schedule slots]
+  [problem schedule slots lower upper]
   (let [csr? (attention/csr-visibility? (:visibility problem))
         member (if csr? 'membership-edge 'membership-token)
         member-type (if csr? :int :long)
@@ -506,7 +576,7 @@
             (vec (concat ['member-valid-result 'maximum-result 'denominator-result]
                          (map :iteration-result-id slots))))]))]
     (body/->ForLoop
-     (body/value member member-type) 'attention-begin 'attention-end 1
+     (body/value member member-type) lower upper 1
      (mapv body/->LoopArg state-bindings state-initials)
      body-ops state-results {})))
 
@@ -522,6 +592,24 @@
            :iteration-result-id (symbol (str "weighted-value-iteration-" slot))
            :result-id (symbol (str "weighted-value-result-" slot))})
         (range (get-in schedule [:value-mapping :components-per-lane]))))
+
+(defn- slot-indices
+  [problem scheduled slots]
+  (mapcat (fn [{:keys [slot id safe-id]}]
+            [(body/->IndexCompute
+              id (body/expression :add 'lane (* slot (:workgroup-size scheduled))))
+             (body/->IndexCompute
+              safe-id (body/expression :min id (dec (:value-head-dim problem))))])
+          slots))
+
+(defn- slot-masks
+  [problem slots]
+  (mapv (fn [{:keys [id mask-id]}]
+          (body/->Mask mask-id [(body/predicate :lt id (:value-head-dim problem))]))
+        slots))
+
+(defn- lane-zero-mask []
+  (body/->Mask :lane-zero [(body/predicate :eq 'lane 0)]))
 
 (defn- output-operations
   [problem slots]
@@ -581,6 +669,24 @@
                :operation-id (:id problem)})))
     [plan scheduled problem]))
 
+(defn- sequential-lowering-row!
+  [plan scheduled problem]
+  (lowering-row! plan scheduled problem)
+  (when (schedule/tiled? scheduled)
+    (throw (ex-info "single-body weighted reduction cannot consume a tiled schedule"
+                    {:reason :segmented-weighted-reduction-body-schedule-phase
+                     :expected :sequential :schedule scheduled})))
+  [plan scheduled problem])
+
+(defn- tiled-lowering-row!
+  [plan scheduled problem]
+  (lowering-row! plan scheduled problem)
+  (when-not (schedule/tiled? scheduled)
+    (throw (ex-info "partial/merge bodies require a tiled weighted-reduction schedule"
+                    {:reason :segmented-weighted-reduction-body-schedule-phase
+                     :expected :tiled :schedule scheduled})))
+  [plan scheduled problem])
+
 (defn lower-routed-paged
   "Construct the verified KernelBody for the routed paged online schedule.
 
@@ -591,7 +697,7 @@
   (let [plan (swr/validate! plan)
         scheduled (schedule/validate! scheduled)
         problem (attention/validate! (:source-operation plan))
-        _ (lowering-row! plan scheduled problem)
+        _ (sequential-lowering-row! plan scheduled problem)
         subgroup-size (:workgroup-size scheduled)
         slots (component-slots scheduled)
         query-ops (query-metadata-operations problem)
@@ -601,17 +707,8 @@
         membership-ops (if (attention/interval-visibility? (:visibility problem))
                          (interval-membership-operations problem)
                          (csr-membership-operations problem))
-        slot-indices
-        (mapcat (fn [{:keys [slot id safe-id]}]
-                  [(body/->IndexCompute
-                    id (body/expression :add 'lane (* slot subgroup-size)))
-                   (body/->IndexCompute
-                    safe-id (body/expression :min id (dec (:value-head-dim problem))))])
-                slots)
-        masks (mapv (fn [{:keys [id mask-id]}]
-                      (body/->Mask mask-id
-                                   [(body/predicate :lt id (:value-head-dim problem))]))
-                    slots)
+        slot-indices (slot-indices problem scheduled slots)
+        masks (slot-masks problem slots)
         initial-ops
         (flatten-operations
          (concat
@@ -634,7 +731,7 @@
            (compute 'kv-head :int
                     (expr :quot :int 'query-head
                           (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
-           (membership-loop problem scheduled slots)]
+           (membership-loop problem scheduled slots 'attention-begin 'attention-end)]
           (output-operations problem slots)))
         launch (launch/spec {:workgroup-size [subgroup-size 1]
                              :group-count [(:q-heads problem)
@@ -658,3 +755,244 @@
       :attributes {:storage-kind :routed-paged-kv
                    :route-kind (attention/route-kind (:route problem))
                    :visibility-kind (attention/visibility-kind (:visibility problem))}})))
+
+(defn- tile-bound-operations
+  [problem scheduled]
+  (let [csr? (attention/csr-visibility? (:visibility problem))
+        type (if csr? :int :long)
+        tile-size (get-in scheduled [:membership-tiling :tile-size])
+        offset (if csr? 'history-tile-offset-int 'history-tile-offset)]
+    (vec
+     (concat
+      [(compute 'history-tile-offset-int :int
+                (expr :* :int 'history-tile (lit tile-size :int)))]
+      (when-not csr?
+        [(compute 'history-tile-offset :long
+                  (cast-expr 'history-tile-offset-int :long))])
+      [(compute 'membership-count type
+                (expr :- type 'attention-end 'attention-begin))
+       (compute 'tile-relative-begin type
+                (expr :min type 'membership-count offset))
+       (compute 'tile-membership-begin type
+                (expr :+ type 'attention-begin 'tile-relative-begin))
+       (compute 'tile-membership-remaining type
+                (expr :- type 'membership-count 'tile-relative-begin))
+       (compute 'tile-membership-width type
+                (expr :min type 'tile-membership-remaining (lit tile-size type)))
+       (compute 'tile-membership-end type
+                (expr :+ type 'tile-membership-begin 'tile-membership-width))]))))
+
+(defn- partial-store-operations
+  [partial-ids slots]
+  (flatten-operations
+   (concat
+    [(compute 'partial-valid-int :int
+              (select-expr 'final-valid (lit 1 :int) (lit 0 :int) :int))
+     (body/->ScalarStore (:valid partial-ids)
+                         ['query-token 'query-head 'history-tile]
+                         'partial-valid-int :lane-zero)
+     (body/->ScalarStore (:maximum partial-ids)
+                         ['query-token 'query-head 'history-tile]
+                         'final-maximum :lane-zero)
+     (body/->ScalarStore (:denominator partial-ids)
+                         ['query-token 'query-head 'history-tile]
+                         'final-denominator :lane-zero)]
+    (mapcat
+     (fn [{:keys [id mask-id result-id]}]
+       [(body/->ScalarStore (:weighted-values partial-ids)
+                            ['query-token 'query-head 'history-tile id]
+                            result-id mask-id)])
+     slots))))
+
+(defn lower-routed-paged-partial
+  "Lower each statically bounded membership tile to a private mergeable online state."
+  [plan scheduled]
+  (let [plan (swr/validate! plan)
+        scheduled (schedule/validate! scheduled)
+        problem (attention/validate! (:source-operation plan))
+        _ (tiled-lowering-row! plan scheduled problem)
+        subgroup-size (:workgroup-size scheduled)
+        tile-count (get-in scheduled [:membership-tiling :tile-count])
+        slots (component-slots scheduled)
+        partial-ids (partial-buffer-ids plan)
+        query-ops (query-metadata-operations problem)
+        route-ops (if (attention/dense-paged-route? (:route problem))
+                    (dense-route-operations problem)
+                    (csr-route-operations problem))
+        membership-ops (if (attention/interval-visibility? (:visibility problem))
+                         (interval-membership-operations problem)
+                         (csr-membership-operations problem))
+        initial-ops
+        (flatten-operations
+         (concat
+          query-ops
+          [(load-value 'query-position :int (get-in problem [:query :positions])
+                       ['query-token])
+           (compute 'query-position-valid :predicate
+                    (expr :ge :predicate 'query-position (lit 0 :int)))
+           (compute 'query-batch-valid :predicate
+                    (expr :ge :predicate 'query-batch (lit 0 :int)))
+           (compute 'safe-query-batch :int
+                    (expr :min :int
+                          (expr :max :int 'query-batch (lit 0 :int))
+                          (lit (dec (:batch-size problem)) :int)))
+           (compute 'query-position-long :long (cast-expr 'query-position :long))]
+          route-ops membership-ops (tile-bound-operations problem scheduled)
+          [(compute 'initial-valid :predicate
+                    (all-expr ['query-metadata-valid 'query-position-valid
+                               'query-batch-valid 'route-valid 'membership-valid]))
+           (compute 'kv-head :int
+                    (expr :quot :int 'query-head
+                          (lit (quot (:q-heads problem) (:kv-heads problem)) :int)))
+           (membership-loop problem scheduled slots
+                            'tile-membership-begin 'tile-membership-end)]
+          (partial-store-operations partial-ids slots)))
+        launch (launch/spec {:workgroup-size [subgroup-size 1 1]
+                             :group-count [(:q-heads problem)
+                                           (get-in problem [:query :total-tokens])
+                                           tile-count]})]
+    (body/make
+     {:id [:segmented-weighted-reduction-partial-body (:id plan) scheduled]
+      :parameters (partial-parameters plan problem scheduled)
+      :stable-reads (mapv body/stable-read (swr/ordered-input-ids plan))
+      :indices (vec (concat [(body/->IndexBinding 'query-head :group 0)
+                             (body/->IndexBinding 'query-token :group 1)
+                             (body/->IndexBinding 'history-tile :group 2)
+                             (body/->IndexBinding 'lane :lane 0)]
+                            (slot-indices problem scheduled slots)))
+      :masks (into [(lane-zero-mask)] (slot-masks problem slots))
+      :operations initial-ops
+      :schedule (assoc scheduled :subgroup-size subgroup-size :phase :partial)
+      :launch launch
+      :provenance {:operation-id (:id problem)
+                   :semantic-op :segmented-weighted-reduction
+                   :algebra-plan-id (:id plan)
+                   :lowering :scheduled-partial-kernel-body}
+      :attributes {:storage-kind :routed-paged-kv
+                   :route-kind (attention/route-kind (:route problem))
+                   :visibility-kind (attention/visibility-kind (:visibility problem))
+                   :history-tiles tile-count}})))
+
+(defn- merge-update-region
+  [slots]
+  (let [next-accs (mapv :next-id slots)]
+    [(compute 'merge-maximum-is-nan :predicate
+              (body/scalar-expression :isnan :predicate ['maximum-state]))
+     (compute 'tile-maximum-is-nan :predicate
+              (body/scalar-expression :isnan :predicate ['tile-maximum]))
+     (compute 'merge-state-is-nan :predicate
+              (or-expr 'merge-maximum-is-nan 'tile-maximum-is-nan))
+     (body/->IfRegion
+      'merge-state-is-nan
+      [(body/->Yield [(lit Double/NaN :float)
+                      (lit Double/NaN :float)
+                      (lit Double/NaN :float)])]
+      [(compute 'merged-maximum-valid :float
+                (expr :max :float 'maximum-state 'tile-maximum))
+       (compute 'old-state-weight-valid :float
+                (expr :exp :float
+                      (expr :- :float 'maximum-state 'merged-maximum-valid)))
+       (compute 'tile-state-weight-valid :float
+                (expr :exp :float
+                      (expr :- :float 'tile-maximum 'merged-maximum-valid)))
+       (body/->Yield ['merged-maximum-valid
+                      'old-state-weight-valid 'tile-state-weight-valid])]
+      [(body/value 'next-maximum :float)
+       (body/value 'old-weight :float)
+       (body/value 'new-weight :float)])
+     (compute 'next-denominator :float
+              (expr :+ :float
+                    (expr :* :float 'denominator-state 'old-weight)
+                    (expr :* :float 'tile-denominator 'new-weight)))
+     (vec
+      (mapcat
+       (fn [{:keys [binding-id next-id tile-value-id]}]
+         [(compute next-id :float
+                   (expr :+ :float
+                         (expr :* :float binding-id 'old-weight)
+                         (expr :* :float tile-value-id 'new-weight)))])
+       slots))
+     (body/->Yield
+      (vec (concat ['next-valid 'next-maximum 'next-denominator] next-accs)))]))
+
+(defn- merge-loop
+  [scheduled partial-ids slots]
+  (let [acc-bindings (mapv :binding-id slots)
+        acc-results (mapv :result-id slots)
+        state-bindings (vec (concat [(body/value 'merge-valid-state :predicate)
+                                     (body/value 'maximum-state :float)
+                                     (body/value 'denominator-state :float)]
+                                    (map #(body/value % :float) acc-bindings)))
+        state-initials (vec (concat [(true-expr)
+                                     (lit -3.402823466e38 :float)
+                                     (lit 0.0 :float)]
+                                    (repeat (count slots) (lit 0.0 :float))))
+        state-results (vec (concat [(body/value 'final-valid :predicate)
+                                    (body/value 'final-maximum :float)
+                                    (body/value 'final-denominator :float)]
+                                   (map #(body/value % :float) acc-results)))
+        tile-loads
+        (flatten-operations
+         (concat
+          [(load-value 'tile-valid-int :int (:valid partial-ids)
+                       ['query-token 'query-head 'merge-tile])
+           (load-value 'tile-maximum :float (:maximum partial-ids)
+                       ['query-token 'query-head 'merge-tile])
+           (load-value 'tile-denominator :float (:denominator partial-ids)
+                       ['query-token 'query-head 'merge-tile])
+           (compute 'tile-valid :predicate
+                    (expr :eq :predicate 'tile-valid-int (lit 1 :int)))
+           (compute 'next-valid :predicate
+                    (and-expr 'merge-valid-state 'tile-valid))]
+          (mapcat
+           (fn [{:keys [id mask-id tile-value-id]}]
+             [(load-value tile-value-id :float (:weighted-values partial-ids)
+                          ['query-token 'query-head 'merge-tile id]
+                          mask-id (lit 0.0 :float))])
+           slots)
+          (merge-update-region slots)))]
+    (body/->ForLoop
+     (body/value 'merge-tile :int) 0
+     (get-in scheduled [:membership-tiling :tile-count]) 1
+     (mapv body/->LoopArg state-bindings state-initials)
+     tile-loads state-results
+     {:uniform-iter-args #{'merge-valid-state 'maximum-state 'denominator-state}})))
+
+(defn lower-routed-paged-merge
+  "Merge private tile states in increasing tile order and materialize the semantic output."
+  [plan scheduled]
+  (let [plan (swr/validate! plan)
+        scheduled (schedule/validate! scheduled)
+        problem (attention/validate! (:source-operation plan))
+        _ (tiled-lowering-row! plan scheduled problem)
+        subgroup-size (:workgroup-size scheduled)
+        partial-ids (partial-buffer-ids plan)
+        slots (mapv #(assoc % :tile-value-id
+                            (symbol (str "tile-weighted-value-" (:slot %))))
+                    (component-slots scheduled))
+        launch (launch/spec {:workgroup-size [subgroup-size 1]
+                             :group-count [(:q-heads problem)
+                                           (get-in problem [:query :total-tokens])]})]
+    (body/make
+     {:id [:segmented-weighted-reduction-merge-body (:id plan) scheduled]
+      :parameters (merge-parameters plan problem scheduled)
+      :stable-reads (mapv (comp body/stable-read :id)
+                          (partial-buffer-specs plan scheduled))
+      :indices (vec (concat [(body/->IndexBinding 'query-head :group 0)
+                             (body/->IndexBinding 'query-token :group 1)
+                             (body/->IndexBinding 'lane :lane 0)]
+                            (slot-indices problem scheduled slots)))
+      :masks (slot-masks problem slots)
+      :operations (flatten-operations
+                   [(merge-loop scheduled partial-ids slots)
+                    (output-operations problem slots)])
+      :schedule (assoc scheduled :subgroup-size subgroup-size :phase :merge)
+      :launch launch
+      :provenance {:operation-id (:id problem)
+                   :semantic-op :segmented-weighted-reduction
+                   :algebra-plan-id (:id plan)
+                   :lowering :scheduled-merge-kernel-body}
+      :attributes {:storage-kind :private-online-state
+                   :merge-kind (get-in scheduled [:state :merge :kind])
+                   :merge-order (get-in scheduled [:state :merge :order])
+                   :history-tiles (get-in scheduled [:membership-tiling :tile-count])}})))

@@ -14,7 +14,8 @@
    :declines [{:leaf :fp16-reference :reason reason :data data}]})
 
 (def ^:private cooperative-policies
-  #{:subgroup-score-reuse :subgroup-online-score-reuse})
+  #{:subgroup-score-reuse :subgroup-online-score-reuse
+    :subgroup-online-tiled-history})
 
 (defn- requested-policy
   [desc]
@@ -23,23 +24,43 @@
 (defn- success
   [problem plan artifact declines]
   (let [strategy (get-in artifact [:attributes :strategy])
-        reference? (= :reference (get-in artifact [:attributes :optimization-tier]))]
+        reference? (= :reference (get-in artifact [:attributes :optimization-tier]))
+        graph (emit/kernel-graph plan artifact)]
     {:operation problem
      :plan plan
      :strategy strategy
      :reference? reference?
      :declines declines
      :artifact artifact
-     :graph (emit/kernel-graph plan artifact)
+     :graph graph
+     :executable graph
      :schedule {:workgroup-size (:workgroup-size (:launch artifact))
                 :group-count (:group-count (:launch artifact))}}))
+
+(defn- success-graph
+  [problem plan graph declines]
+  (let [strategy (get-in graph [:attributes :strategy])]
+    {:operation problem
+     :plan plan
+     :strategy strategy
+     :reference? false
+     :declines declines
+     :artifact nil
+     :graph graph
+     :executable graph
+     :schedule {:stages
+                (mapv (fn [node]
+                        {:id (:id node)
+                         :workgroup-size (get-in node [:operation :launch :workgroup-size])
+                         :group-count (get-in node [:operation :launch :group-count])})
+                      (:nodes graph))}}))
 
 (defn route
   "Route packed/routed attention through a cooperative schedule or its semantic oracle.
 
    Quantized K/V formats stay semantic values but decline until their scale/group operands are
    explicit. Dense and CSR physical routing retain deliberately distinct ABIs while interval and
-   CSR logical membership both admit the same one-subgroup online-softmax schedule."
+   CSR logical membership admit both the one-subgroup schedule and its opt-in tiled-history graph."
   ([problem] (route problem nil))
   ([problem desc]
    (let [{:keys [q-dtype k-dtype v-dtype output-dtype accumulator-dtype
@@ -79,12 +100,19 @@
 
            (or (= :auto policy) (contains? cooperative-policies policy))
            (let [{:keys [ok schedule reason] :as scheduled}
-                 (swr-schedule/plan-subgroup-online plan desc)
+                 (if (= :subgroup-online-tiled-history policy)
+                   (swr-schedule/plan-subgroup-online-tiled plan desc)
+                   (swr-schedule/plan-subgroup-online plan desc))
                  emitter-supported? (gpu-target/intel-opencl-subgroup-dialect? desc)]
              (if (and ok emitter-supported?)
-               (success problem plan (emit/emit-fp16-cooperative plan schedule) [])
+               (if (= :subgroup-online-tiled-history policy)
+                 (success-graph problem plan
+                                (emit/emit-fp16-tiled-history plan schedule) [])
+                 (success problem plan (emit/emit-fp16-cooperative plan schedule) []))
                (let [cooperative-decline
-                     {:leaf :routed-paged-subgroup-online-score-reuse
+                     {:leaf (if (= :subgroup-online-tiled-history policy)
+                              :routed-paged-subgroup-online-tiled-history
+                              :routed-paged-subgroup-online-score-reuse)
                       :reason (if ok
                                 :score-reuse-requires-intel-subgroup-dialect
                                 reason)

@@ -1231,7 +1231,7 @@
                                    indices))
          subgroup-size (or (some-> collective :width)
                            (get-in kernel-body [:schedule :subgroup-size]))
-         attribute (when collective
+         attribute (when uses-subgroups?
                      (case subgroup-attribute
                        :intel (str "__attribute__((intel_reqd_sub_group_size("
                                    subgroup-size ")))\n")

@@ -124,9 +124,14 @@ by this first lowering row; neither KernelBody nor the target emitter contains a
 operation. Dense/CSR physical page routing combines independently with bounded contiguous intervals
 or bounded CSR membership. The generated leaf has replaced the handwritten cooperative source and
 is checked against the reference algebra on a real device. Its subgroup builtin is recorded honestly
-as implementation-defined association rather than claiming a fixed tree. The next production work
-is to represent tiled membership traversal and mergeable online-reduction state, then lower subgroup
-collectives through portable OpenCL, CUDA and HIP target dialects. Verified local allocation,
+as implementation-defined association rather than claiming a fixed tree. A second production
+schedule now partitions bounded membership into static contiguous tiles, emits one partial
+KernelBody per segment/tile, and deterministically merges the explicit maximum/denominator/weighted
+value state in increasing tile order. The four typed partial buffers are operation-derived,
+graph-private temporaries; the source operation and external ABI are unchanged. This two-kernel
+schedule is opt-in until measured selection can account for dynamic history length and temporary
+traffic. The next production work is to lower subgroup collectives through portable OpenCL, CUDA
+and HIP target dialects. Verified local allocation,
 barriers and asynchronous copies can subsequently collapse a multi-kernel tiled graph into a
 FlashAttention-like single kernel without changing the semantic plan or external ABI.
 

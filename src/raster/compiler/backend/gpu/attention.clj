@@ -2,10 +2,10 @@
   "FP16-KV leaves for logical attention over dense or CSR paged KV routes.
 
    The direct one-work-item/component leaf remains the executable semantic oracle.  A separately
-   validated SegmentedWeightedReductionSchedule emits one subgroup/query-head across dense/CSR
-   routes and interval/CSR membership, sharing each QK score across lane-strided value
-   accumulators without changing the semantic plan, ordered ABI, storage ownership or graph
-   effects."
+   validated SegmentedWeightedReductionSchedule either emits one subgroup/query-head or partitions
+   bounded membership into partial online states and a deterministic merge graph. Both schedules
+   share each QK score across lane-strided value accumulators without changing the semantic plan,
+   ordered external ABI, storage ownership or graph effects."
   (:require [raster.compiler.backend.gpu.kernel-body-opencl :as body-opencl]
             [raster.compiler.ir.attention :as attention]
             [raster.compiler.ir.kernel-abi :as kabi]
@@ -469,6 +469,132 @@
                    :kernel-body kernel-body
                    :materialized-intermediates []
                    :complexity :query-head-token-dot-plus-value}})))
+
+(def ^:private partial-c-names
+  {:partial-valid "partial_valid"
+   :partial-maximum "partial_maximum"
+   :partial-denominator "partial_denominator"
+   :partial-weighted-values "partial_weighted_values"})
+
+(defn- private-state-slots
+  [kind partial-specs]
+  (mapv (fn [{:keys [id dtype role]}]
+          (kabi/slot id kind dtype :c-name (get partial-c-names role) :role role))
+        partial-specs))
+
+(defn- partial-abi
+  [problem partial-specs kernel-body]
+  (let [external-inputs (vec (butlast (ordered-abi problem)))
+        private-outputs (private-state-slots :output partial-specs)]
+    (body-abi/project-contracts (into external-inputs private-outputs) kernel-body)))
+
+(defn- merge-abi
+  [problem partial-specs kernel-body]
+  (let [private-inputs (private-state-slots :input partial-specs)
+        output-slot (peek (ordered-abi problem))]
+    (body-abi/project-contracts (conj private-inputs output-slot) kernel-body)))
+
+(defn- emitted-body-artifact
+  [problem plan scheduled phase kernel-body abi arguments reads writes]
+  (let [entry-name (str (kernel-name problem [scheduled phase]) "_" (name phase))
+        parameter-names (into {} (map (juxt :name :c-name)) abi)]
+    (kart/make
+     {:kernel-name entry-name
+      :source (body-opencl/emit-scalar-kernel
+               entry-name kernel-body
+               {:parameter-names parameter-names :subgroup-attribute :intel})
+      :abi abi
+      :arguments arguments
+      :launch (:launch kernel-body)
+      :effects {:kind :segmented-weighted-reduction-phase
+                :phase phase :reads reads :writes writes}
+      :provenance {:operation-id (:id problem)
+                   :semantic-op :attention
+                   :algebra-plan-id (:id plan)
+                   :lowering (keyword (str "subgroup-online-tiled-history-" (name phase)))}
+      :attributes {:strategy :routed-paged-subgroup-online-tiled-history
+                   :optimization-tier :subgroup-tiled
+                   :phase phase
+                   :segmented-weighted-reduction-schedule scheduled
+                   :kernel-body kernel-body}})))
+
+(defn emit-fp16-tiled-history
+  "Emit a two-kernel tiled-history graph with graph-owned mergeable online state.
+
+  The external ABI is exactly the original routed attention ABI. Partial states are typed graph
+  temporaries, so allocation, dependencies and ownership remain compiler-managed and invisible
+  to cache/page scheduling above this layer."
+  [plan scheduled]
+  (let [[plan scheduled {:keys [output id route] :as problem}]
+        (cooperative-plan! plan scheduled)
+        _ (when-not (swr-schedule/tiled? scheduled)
+            (throw (ex-info "tiled-history emission requires a tiled schedule"
+                            {:reason :attention-tiled-history-schedule
+                             :schedule scheduled})))
+        inputs (ordered-inputs plan)
+        partial-specs (swr-body/partial-buffer-specs plan scheduled)
+        partial-ids (mapv :id partial-specs)
+        partial-body (swr-body/lower-routed-paged-partial plan scheduled)
+        merge-body (swr-body/lower-routed-paged-merge plan scheduled)
+        partial-arguments (into inputs partial-ids)
+        merge-arguments (conj partial-ids output)
+        partial-artifact (emitted-body-artifact
+                          problem plan scheduled :partial partial-body
+                          (partial-abi problem partial-specs partial-body) partial-arguments
+                          inputs partial-ids)
+        merge-artifact (emitted-body-artifact
+                        problem plan scheduled :merge merge-body
+                        (merge-abi problem partial-specs merge-body) merge-arguments
+                        partial-ids [output])
+        specs (attention/buffer-specs problem)
+        graph-buffer (fn [buffer-id]
+                       (let [{:keys [dtype elements role]} (get specs buffer-id)]
+                         (kgraph/buffer buffer-id dtype elements :device role)))
+        partial-node [:attention id :tiled-history :partial]
+        merge-node [:attention id :tiled-history :merge]
+        external-abi (ordered-abi problem)]
+    (kgraph/make
+     {:inputs (mapv graph-buffer inputs)
+      :outputs [(graph-buffer output)]
+      :temporaries (mapv (fn [{:keys [id dtype elements]}]
+                           (kgraph/buffer id dtype elements :device :temporary))
+                         partial-specs)
+      :abi external-abi
+      :arguments (conj inputs output)
+      :nodes [(kgraph/->ScheduledKernel
+               partial-node partial-artifact
+               (vec (concat (map #(kgraph/->ValueUse % :read) inputs)
+                            (map #(kgraph/->ValueUse % :write) partial-ids)))
+               [])
+              (kgraph/->ScheduledKernel
+               merge-node merge-artifact
+               (vec (concat (map #(kgraph/->ValueUse % :read) partial-ids)
+                            [(kgraph/->ValueUse output :write)]))
+               [partial-node])]
+      :effects {:kind :attention :logical-visibility true :ordered-page-routing true}
+      :provenance {:operation-id id :semantic-op :attention
+                   :algebra-plan-id (:id plan)
+                   :lowering :subgroup-online-tiled-history}
+      :attributes {:strategy :routed-paged-subgroup-online-tiled-history
+                   :reference? false
+                   :optimization-tier :subgroup-tiled
+                   :algebra :segmented-weighted-reduction
+                   :algebra-key (swr/algebra-key plan)
+                   :storage-dtype :half
+                   :q-dtype (:q-dtype problem)
+                   :output-dtype (:output-dtype problem)
+                   :accumulator-dtype :float
+                   :route-kind (attention/route-kind route)
+                   :visibility-kind (attention/visibility-kind (:visibility problem))
+                   :k-layout (:k-layout problem)
+                   :v-layout (:v-layout problem)
+                   :visibility (:visibility problem)
+                   :layout (attention/layouts problem)
+                   :segmented-weighted-reduction-schedule scheduled
+                   :materialized-intermediates partial-ids
+                   :complexity :parallel-history-tiles-plus-online-state-merge
+                   :private-online-state (mapv #(select-keys % [:id :dtype :shape :role])
+                                               partial-specs)}})))
 
 (defn kernel-graph
   "Wrap either verified attention leaf in an explicit one-node scheduled graph."

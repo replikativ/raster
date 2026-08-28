@@ -8,15 +8,65 @@
   [reason & [data]]
   (merge {:ok false :reason reason} data))
 
-(defn plan-subgroup-online
+(defn- membership-capacity
+  [{:keys [membership storage source-operation]}]
+  (if (= :csr (:visibility-kind membership))
+    (get-in source-operation [:visibility :key-index-capacity])
+    (let [page-size (:page-size storage)]
+      (* page-size
+         (case (:route-kind storage)
+           :dense-paged (get-in storage [:route-shape :pages-per-sequence])
+           :csr-paged (get-in storage [:route-shape :page-index-capacity]))))))
+
+(defn- schedule-value
+  [plan subgroup-size membership-tiling strategy]
+  (let [{:keys [membership storage score value accumulator-dtype]} plan
+        components (:components value)]
+    (schedule/make
+     {:strategy strategy
+      :workgroup-size (long subgroup-size)
+      :segment-mapping (if (= :subgroup-online-tiled-history strategy)
+                         {:partial :one-workgroup-per-segment-tile
+                          :merge :one-workgroup-per-segment}
+                         :one-workgroup-per-segment)
+      :membership-traversal (case (:visibility-kind membership)
+                              :interval :contiguous-interval
+                              :csr :csr-row)
+      :score-reduction {:kind :subgroup :width (long subgroup-size)
+                        :axis (get-in score [:axis :name])}
+      :membership-tiling membership-tiling
+      :value-mapping {:kind :lane-strided
+                      :components components
+                      :components-per-lane
+                      (quot (+ components (dec (long subgroup-size)))
+                            (long subgroup-size))}
+      :state (schedule/online-state)
+      :numerical-mode {:score-accumulate accumulator-dtype
+                       :state-accumulate accumulator-dtype
+                       ;; The OpenCL subgroup builtin fixes neither its association tree nor
+                       ;; bitwise result. A target with an explicit shuffle tree may choose a
+                       ;; stricter schedule later; this row records exactly what it emits.
+                       :dot-order :implementation-defined
+                       ;; Tiling is a legal floating reduction reassociation, but not bitwise the
+                       ;; same association as the sequential online update. Record the exact order
+                       ;; so differential tests and future strict modes can distinguish them.
+                       :online-state-order
+                       (if (= :subgroup-online-tiled-history strategy)
+                         :increasing-members-within-tile-then-increasing-tile-left-fold
+                         :increasing-membership)
+                       :online-rescale? true}
+      :attributes {:storage-kind (:kind storage)
+                   :route-kind (:route-kind storage)
+                   :visibility-kind (:visibility-kind membership)}})))
+
+(defn- plan-subgroup-online*
   "Plan one subgroup per segment with one shared score and lane-strided value accumulators.
 
    The first executable storage rows are dense or CSR paged FP16 KV with either contiguous
    interval or explicitly indexed CSR membership. Those are legality constraints of this
    schedule, not new semantic operation kinds."
-  ([plan] (plan-subgroup-online plan nil))
-  ([plan desc]
-   (let [{:keys [membership storage score value operands output accumulator-dtype] :as plan}
+  [plan desc strategy tile-size]
+   (let [{:keys [membership storage value operands output accumulator-dtype] :as plan}
          (swr/validate! plan)
          subgroup-size (hardware/preferred-subgroup-size desc)
          max-workgroup-size (hardware/maximum-workgroup-size desc)
@@ -92,32 +142,36 @@
                  :components-per-lane
                  (quot (+ components (dec (long subgroup-size))) (long subgroup-size))})
 
+       (and (= :subgroup-online-tiled-history strategy)
+            (not (and (pos-int? tile-size) (<= tile-size Integer/MAX_VALUE))))
+       (decline :score-reuse-invalid-history-tile-size {:tile-size tile-size})
+
        :else
-       {:ok true
-        :schedule
-        (schedule/make
-         {:strategy :subgroup-online-score-reuse
-          :workgroup-size (long subgroup-size)
-          :segment-mapping :one-workgroup-per-segment
-          :membership-traversal (case (:visibility-kind membership)
-                                  :interval :contiguous-interval
-                                  :csr :csr-row)
-          :score-reduction {:kind :subgroup :width (long subgroup-size)
-                            :axis (get-in score [:axis :name])}
-          :value-mapping {:kind :lane-strided
-                          :components components
-                          :components-per-lane
-                          (quot (+ components (dec (long subgroup-size)))
-                                (long subgroup-size))}
-          :state {:kind :online-normalized-weighted-sum
-                  :components [:maximum :denominator :weighted-values]}
-          :numerical-mode {:score-accumulate accumulator-dtype
-                           :state-accumulate accumulator-dtype
-                           ;; The OpenCL subgroup builtin fixes neither its association tree nor
-                           ;; bitwise result. A target with an explicit shuffle tree may choose a
-                           ;; stricter schedule later; this row records exactly what it emits.
-                           :dot-order :implementation-defined
-                           :online-rescale? true}
-          :attributes {:storage-kind (:kind storage)
-                       :route-kind (:route-kind storage)
-                       :visibility-kind (:visibility-kind membership)}})}))))
+       (let [capacity (membership-capacity plan)
+             membership-tiling
+             (if (= :subgroup-online-tiled-history strategy)
+               {:kind :static-contiguous-tiles
+                :tile-size tile-size
+                :tile-count (quot (+ capacity (dec tile-size)) tile-size)
+                :membership-capacity capacity
+                :merge-order :increasing-membership-tile}
+               {:kind :sequential})]
+         {:ok true
+          :schedule (schedule-value plan subgroup-size membership-tiling strategy)}))))
+
+(defn plan-subgroup-online
+  "Plan one subgroup per segment with one shared score and lane-strided value accumulators."
+  ([plan] (plan-subgroup-online plan nil))
+  ([plan desc]
+   (plan-subgroup-online* plan desc :subgroup-online-score-reuse nil)))
+
+(defn plan-subgroup-online-tiled
+  "Plan independent, statically bounded history tiles followed by an ordered online-state merge.
+
+  The capacity is a compile-time storage/membership bound. Runtime visibility still clips every
+  tile, while the tile count makes graph-owned partial storage and launch geometry explicit."
+  ([plan] (plan-subgroup-online-tiled plan nil))
+  ([plan desc]
+   (plan-subgroup-online*
+    plan desc :subgroup-online-tiled-history
+    (or (:segmented-weighted-reduction-history-tile-size desc) 256))))
