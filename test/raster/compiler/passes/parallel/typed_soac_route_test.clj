@@ -31,6 +31,7 @@
         equation (first (:equations program))]
     (is (= :typed-soac (:dialect program)))
     (is (= :typed-soac (:route stats)))
+    (is (= :analyzed-source (:front-end stats)))
     (is (:typed-validated stats))
     (is (= 1 (:vertical stats)))
     (is (= 1 (count (:equations program))))
