@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend
-  "Direct analyzed-source to TypedSOAC construction for the closed map/scalar/reduce subset.
+  "Direct analyzed-source to TypedSOAC construction for the closed map/scalar/reduce/inclusive-scan subset.
 
    This is the production front door for TypedSOAC.  It consumes the retained source form and
    walker type metadata directly; it never constructs the older record graph.  Unsupported
@@ -15,6 +15,7 @@
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.scalar.effects :as effects]))
@@ -115,6 +116,22 @@
                          :attributes {:source :raster.par/reduce}})}
              io))
 
+    (par/par-scan-form? expression)
+    (let [{:keys [out acc init idx bound cast body elem-type]}
+          (par/extract-par-scan-info expression)
+          scan-dtype (or elem-type
+                         (dtype/dtype-for-scalar-tag cast)
+                         :double)]
+      ;; A source binder with the same spelling as the caller-owned destination needs an explicit
+      ;; value/view identity before it can be SSA. Keep that uncommon compatibility form outside
+      ;; the typed route instead of pretending the destination is both an input and a definition.
+      (when-not (= symbol out)
+        (let [algebra (scan/certify {:acc acc :init init :lambda body :out out} scan-dtype)]
+          (merge {:kind :scan :id id :sym symbol :index idx :extent bound
+                  :primary-out out :accumulator acc :identity init :dtype scan-dtype
+                  :algebra algebra :body body}
+                 (extract-io body idx [out] :accumulator acc)))))
+
     (par/par-map-void-form? expression)
     (let [{:keys [idx bound body elem-type]} (par/extract-par-map-void-info expression)]
       (when-let [{:keys [out value cast]} (pointwise-map-void body idx)]
@@ -168,7 +185,7 @@
                                                  expression representative)))
               (assoc-in [:scalar-representatives (:sym description)] representative)))
 
-        (:map :reduce)
+        (:map :reduce :scan)
         (let [extent (descriptor/unwrap-int-cast (:extent description))
               array (alength-array extent)
               extent' (cond
@@ -177,7 +194,8 @@
                         :else extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
-            (= :map (:kind description')) (assoc-in [:extents (:sym description')] extent')))
+            (contains? #{:map :scan} (:kind description'))
+            (assoc-in [:extents (:sym description')] extent')))
 
         (update state :descriptions conj description)))
     {:descriptions [] :extents {} :scalar-representatives {}}
@@ -195,7 +213,7 @@
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (reduce set/union #{}
-                                 (map #(if (contains? #{:map :reduce} (:kind %))
+                                 (map #(if (contains? #{:map :reduce :scan} (:kind %))
                                          (:outputs %) #{})
                                       descriptions))]
     (every? (fn [description]
@@ -205,6 +223,7 @@
                 :map (or (:pure? description)
                          (and (:void? description) (symbol? (:primary-out description))))
                 :reduce true
+                :scan (symbol? (:primary-out description))
                 false))
             descriptions)))
 
@@ -270,6 +289,31 @@
                       (vec (concat [(:accumulator component)] elements capture-parameters))
                       results)))))
 
+(defn- scan-equation
+  [{:keys [id sym index extent inputs scalars primary-out accumulator identity dtype body]}]
+  (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
+        arrays (vec (sort-by pr-str pointwise))
+        stable (conj (set stable) primary-out)
+        captures (vec (sort-by pr-str (distinct (concat stable scalars))))
+        elements (element-symbols (count arrays))
+        capture-parameters (capture-symbols (count captures))
+        result (util/subst-syms
+                (zipmap captures capture-parameters)
+                (first (elementize [body] arrays elements index)))
+        algebra (scan/certify {:acc accumulator :init identity :lambda result
+                               :out primary-out} dtype)]
+    (list '= id [sym]
+          (list 'scan {:mode :inclusive :index index :extent extent
+                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
+                       :accumulators [accumulator]
+                       :identities [identity]
+                       :dtypes [dtype]
+                       :algebra [algebra]}
+                arrays captures
+                (list 'lambda
+                      (vec (concat [accumulator] elements capture-parameters))
+                      [result])))))
+
 (defn- scalar-dtype
   [{:keys [sym expr]} scalar-dtypes scalar-types]
   (let [expression-tag (when (instance? clojure.lang.IObj expr)
@@ -296,9 +340,10 @@
 
 (defn- terminal-results
   [descriptions body]
-  (let [operations (filter #(contains? #{:map :reduce} (:kind %)) descriptions)
-        operation-definitions (set (mapcat #(if (= :map (:kind %))
-                                              [(:sym %)] (:outputs %))
+  (let [operations (filter #(contains? #{:map :reduce :scan} (:kind %)) descriptions)
+        operation-definitions (set (mapcat #(case (:kind %)
+                                              (:map :scan) [(:sym %)]
+                                              (:outputs %))
                                            operations))
         scalar-definitions (set (keep #(when (= :scalar (:kind %)) (:sym %)) descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
@@ -342,6 +387,7 @@
         result-dtypes (case kind
                         scalar (:dtypes attributes)
                         reduce (:dtypes attributes)
+                        scan (:dtypes attributes)
                         (repeat (count results) default-dtype))]
     (merge
      (if (and extent (dialect/value-id? extent)) {extent (tensor-value :long [])} {})
@@ -395,9 +441,10 @@
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (supported-descriptions? descriptions))
-        (let [operation-descriptions (filterv #(contains? #{:map :reduce} (:kind %)) descriptions)
+        (let [operation-descriptions (filterv #(contains? #{:map :reduce :scan} (:kind %)) descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
-                                               :reduce (reduce-equation %))
+                                               :reduce (reduce-equation %)
+                                               :scan (scan-equation %))
                                         operation-descriptions)
               outputs (terminal-results descriptions body)
               required-scalars (selected-scalars descriptions operation-equations outputs)
@@ -413,12 +460,13 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :reduce)
+                          (:map :reduce :scan)
                           (-> state
                               (update :equations conj
-                                      (if (= :map (:kind description))
-                                        (map-equation description)
-                                        (reduce-equation description)))
+                                      (case (:kind description)
+                                        :map (map-equation description)
+                                        :reduce (reduce-equation description)
+                                        :scan (scan-equation description)))
                               (update :equation-descriptions conj description))))
                       {:equations [] :equation-descriptions [] :scalar-dtypes {}}
                       descriptions)
@@ -441,7 +489,9 @@
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [destination (when (:void? description) (:primary-out description))]
+                           (let [destination (when (or (:void? description)
+                                                       (= :scan (:kind description)))
+                                               (:primary-out description))]
                              [(:id description)
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source

@@ -13,7 +13,9 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
+            [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.soac-lower :as lower]
+            [raster.compiler.passes.parallel.typed-soac-route :as typed-route]
             [raster.compiler.backend.gpu.segop-opencl :as sg]))
 
 (defn- segred-source [body-expr]
@@ -59,6 +61,23 @@
       (is (= [(:id intra-node)] (:dependencies block-node)))
       (is (= (mapv :id [intra-node block-node]) (:dependencies carry-node))
           "target lowering preserves the verified schedule"))))
+
+(deftest typed-scan-schedule-target-lowers-without-a-legacy-soac-node
+  (let [source '(let* [result (raster.par/scan out acc 0.0 i n float
+                                               (+ acc (clojure.core/aget values i)))]
+                      result)
+        typed (:program (typed-route/attempt source :float
+                                             {'values :float 'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0
+                                 :array-types {'values :float 'out :float}}))
+        graph (get-in scheduled [:equations 0 :attributes :kernel-graph])
+        emitted (sg/generate-scan-kernel-graph graph)]
+    (is (= :typed-soac (get-in scheduled [:provenance :source-dialect])))
+    (is (= 3 (count (:nodes emitted))))
+    (is (every? kart/kernel-artifact? (map :operation (:nodes emitted))))
+    (is (= [:intra-block :block-scan :carry-in]
+           (mapv #(get-in % [:operation :attributes :phase]) (:nodes emitted))))))
 
 (deftest segscan-artifact-abi-preserves-mixed-input-storage
   (let [emitted (emitted-scan-graph

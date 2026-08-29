@@ -20,7 +20,13 @@
                     :accumulators [acc ...] :identities [zero ...]
                     :dtypes [:float ...] :algebra [{} ...]}
              [array ...] [capture ...]
-             (lambda [acc ... element ... capture-parameter ...] [step-result ...])))]
+             (lambda [acc ... element ... capture-parameter ...] [step-result ...])))
+        (= equation-id [result]
+           (scan {:mode :inclusive :index i :extent n
+                  :accumulators [acc] :identities [zero]
+                  :dtypes [:float] :algebra [{}]}
+             [array ...] [capture ...]
+             (lambda [acc element ... capture-parameter ...] [step-result])))]
        [program-result ...])
 
    Map lambdas return tuples, so horizontal fusion remains functional rather than encoding
@@ -30,7 +36,8 @@
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.abstract-value :as av]))
+            [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.scan :as scan-ir]))
 
 (defn value-id?
   "Stable logical value IDs. Vector IDs are used by existing SSA-like program envelopes."
@@ -88,6 +95,16 @@
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))))
 
+(defn scan-attributes?
+  "Attributes for the certified inclusive scan dialect operation.
+
+   The explicit mode is intentionally load-bearing: exclusive scan is a distinct surface
+   primitive and must never enter this schedule by spelling accident."
+  [value]
+  (and (= :inclusive (:mode value))
+       (reduce-attributes? (dissoc value :mode))
+       (every? scan-ir/associative-scan? (:algebra value))))
+
 (defn scalar-attributes?
   [value]
   (and (map? value)
@@ -127,6 +144,7 @@
              [sa scalar-attributes?]
              [ma map-attributes?]
              [ra reduce-attributes?]
+             [ca scan-attributes?]
              [facts program-facts?])
 
   (Scalar [s :enforce]
@@ -144,7 +162,8 @@
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
-             (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
+             (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (scan ?ca [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
   (Equation [q :enforce]
             (= ?eid [(?:+ ?id:result)] ?o))
@@ -196,7 +215,8 @@
   [equation]
   (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
         parameters (vec (second lambda))
-        accumulator-count (if (= 'reduce kind) (count (:accumulators attributes)) 0)
+        accumulator-count (if (contains? #{'reduce 'scan} kind)
+                            (count (:accumulators attributes)) 0)
         array-count (count arrays)
         accumulator-end accumulator-count
         element-end (+ accumulator-end array-count)]
@@ -244,7 +264,7 @@
     (when-not (= result-count (count body-results))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
              {:equation equation-id :results result-count :body-results (count body-results)}))
-    (let [expected-parameter-count (+ (if (= 'reduce kind)
+    (let [expected-parameter-count (+ (if (contains? #{'reduce 'scan} kind)
                                         (count (:accumulators attributes))
                                         0)
                                       (count arrays)
@@ -259,7 +279,7 @@
                 :captures captures})))
     (doseq [body body-results
             :let [bound (cond-> (set parameters)
-                          (contains? #{'map 'reduce} kind) (conj (:index attributes)))
+                          (contains? #{'map 'reduce 'scan} kind) (conj (:index attributes)))
                   unbound (util/free-syms body bound)]
             :when (seq unbound)]
       (fail! :typed-soac-unbound-scalar
@@ -285,6 +305,25 @@
           (fail! :typed-soac-reduce-results
                  "reduce result arity must equal accumulator arity"
                  {:equation equation-id :results results :accumulators accumulators})))
+
+      scan
+      (let [accumulators (:accumulators attributes)]
+        (when-not (= accumulators (vec (take (count accumulators) parameters)))
+          (fail! :typed-soac-scan-accumulators
+                 "scan accumulator parameters must lead the lambda in declared order"
+                 {:equation equation-id :accumulators accumulators :parameters parameters}))
+        (when-not (= result-count (count accumulators))
+          (fail! :typed-soac-scan-results
+                 "scan result arity must equal accumulator arity"
+                 {:equation equation-id :results results :accumulators accumulators}))
+        (doseq [[accumulator identity dtype certificate result]
+                (map vector accumulators (:identities attributes) (:dtypes attributes)
+                     (:algebra attributes) body-results)]
+          (let [derived (scan-ir/certify {:acc accumulator :init identity :lambda result} dtype)]
+            (when-not (= certificate derived)
+              (fail! :typed-soac-scan-certificate
+                     "scan algebra certificate disagrees with its scalar region"
+                     {:equation equation-id :declared certificate :derived derived})))))
 
       (fail! :typed-soac-operation "unknown SOAC operation"
              {:equation equation-id :operation kind}))
@@ -342,6 +381,18 @@
             (fail! :typed-soac-reduce-result-type
                    "reduce results must be scalar tensors with their declared accumulator dtype"
                    {:equation equation-id :id id :value value :dtype dtype}))))
+
+      scan
+      (doseq [[id dtype] (map vector results (:dtypes attributes))]
+        (let [value (get values id)]
+          (when (and value
+                     (not (and (= :tensor (:kind value))
+                               (= (extent-shape extent) (:shape value))
+                               (= dtype (:dtype value)))))
+            (fail! :typed-soac-scan-result-type
+                   "scan results must be rank-one tensors over the declared extent"
+                   {:equation equation-id :id id :value value
+                    :extent extent :dtype dtype}))))
 
       nil)))
 

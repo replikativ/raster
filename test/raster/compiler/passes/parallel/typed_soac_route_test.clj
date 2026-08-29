@@ -26,6 +26,11 @@
           v (raster.par/pmap j n float (+ (clojure.core/aget b j) 1.0))]
          [u v]))
 
+(def ^:private inclusive-scan
+  '(let* [result (raster.par/scan out acc 0.0 i n float
+                                  (+ acc (clojure.core/aget x i)))]
+         result))
+
 (deftest pure-vertical-fusion-becomes-a-first-class-typed-program
   (let [{:keys [program stats]} (route/attempt map-map :float)
         equation (first (:equations program))]
@@ -167,6 +172,42 @@
         (is (= 1 (get-in simd [:stats :segop-reused])))
         (is (nil? (get-in simd [:stats :segop-relowered])))
         (parallel-program/validate! form segop/segop-node?)))))
+
+(deftest typed-inclusive-scan-owns-one-certified-scheduled-graph
+  (let [{:keys [program stats]} (route/attempt inclusive-scan :float
+                                               {'x :float 'out :float})
+        lowered (segop-lower/segop-lower-pass
+                 program {:dtype :float :target-device :ocl:0
+                          :array-types {'x :float 'out :float}})
+        scheduled (:form lowered)
+        equation (first (:equations scheduled))
+        graph (get-in equation [:attributes :kernel-graph])]
+    (is (= :typed-soac (:route stats)))
+    (is (= 'scan (dialect/operation-kind
+                  (first (dialect/equations (:algorithm equation))))))
+    (is (= #{:memory/write} (:effects equation)))
+    (is (= 1 (get-in lowered [:stats :typed-soac-reused])))
+    (is (= 1 (get-in lowered [:stats :kernel-graphs-lowered])))
+    (is (= [:intra-block :block-scan nil]
+           (mapv :phase (:operations equation))))
+    (is (= 3 (count (:nodes graph))))
+    (is (= :typed-soac (get-in (first (:operations equation)) [:algorithm-dialect])))
+    (is (= #{'out} (set (map :id (:outputs graph)))))
+    (is (= 1 (count (:temporaries graph))))
+    (parallel-program/validate! scheduled segop/segop-node?)))
+
+(deftest typed-inclusive-scan-preserves-exact-sequential-jvm-semantics
+  (let [typed (:program (route/attempt inclusive-scan :float
+                                       {'x :float 'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out x n] (:form jvm)))
+        out (float-array 5)
+        result (execute out (float-array [1.0 2.0 3.0 4.0 5.0]) 5)]
+    (is (identical? out result))
+    (is (= [1.0 3.0 6.0 10.0 15.0] (mapv double result)))
+    (is (nil? (get-in jvm [:stats :segop-relowered]))
+        "JVM keeps the exact inclusive recurrence until a certified vector scan schedule lands")))
 
 (deftest typed-horizontal-fusion-lowers-to-one-explicit-multi-output-segmap
   (let [{:keys [program stats]} (route/attempt

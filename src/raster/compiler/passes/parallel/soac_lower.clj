@@ -28,6 +28,8 @@
 
 (declare lower-reduce)
 (declare lower-map)
+(declare lower-scan-description)
+(declare scan-kernel-graph-description)
 
 (defn typed-map-program?
   "Whether a validated one-equation TypedSOAC program is a map accepted by SegMap lowering."
@@ -161,6 +163,75 @@
                     :algorithm-equation equation-id)
             (lower-reduce node device-id :dtype accumulator-dtype)))))
 
+(defn typed-scan-program?
+  "Whether a validated one-equation TypedSOAC program is a certified inclusive scan."
+  [program]
+  (and (soac-dialect/program-form? program)
+       (= 1 (count (soac-dialect/equations program)))
+       (= 'scan (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
+
+(defn- typed-scan-description
+  [program dtype]
+  (let [equation (first (soac-dialect/equations program))
+        [_ equation-id results operation] equation
+        [_ attributes arrays captures lambda] operation
+        [_ _ body-results] lambda
+        {:keys [accumulators elements capture-parameters]}
+        (soac-dialect/parameter-layout equation)
+        facts (soac-dialect/facts program)
+        destination (get-in facts [:equations equation-id :attributes :destination])
+        _ (when-not (and (= 1 (count results)) (= 1 (count accumulators))
+                         (= 1 (count body-results)) destination)
+            (throw (ex-info "typed inclusive scan requires one result, accumulator and destination"
+                            {:reason :typed-soac-scan-subset :equation equation-id
+                             :results results :accumulators accumulators
+                             :destination destination})))
+        index (:index attributes)
+        substitutions
+        (into (zipmap capture-parameters captures)
+              (map (fn [parameter array]
+                     [parameter (list 'clojure.core/aget array index)])
+                   elements arrays))
+        stable (set (get-in attributes [:attributes :stable-array-captures]))
+        scalar-captures (set (remove stable captures))
+        scan-dtype (or (first (:dtypes attributes)) dtype :double)
+        substitutions (assoc substitutions index index)
+        algebra (update (first (:algebra attributes)) :element
+                        #(util/subst-syms substitutions %))]
+    {:id equation-id
+     :sym destination
+     :out destination
+     :acc (first accumulators)
+     :init (first (:identities attributes))
+     :lambda (util/subst-syms substitutions (first body-results))
+     :algebra algebra
+     :bound (:extent attributes)
+     :idx index
+     :inputs (into (set arrays) (disj stable destination))
+     :outputs #{destination}
+     :scalars scalar-captures
+     :elem-type scan-dtype}))
+
+(defn lower-typed-scan
+  "Lower one certified TypedSOAC inclusive scan without reconstructing the legacy SOAC record IR.
+
+   Returns both ordered SegOps and their KernelGraph because temporary storage and dependencies are
+   properties of the selected schedule, not of the functional scan equation."
+  [program device-id & {:keys [dtype array-types]
+                        :or {dtype :double array-types {}}}]
+  (let [program (soac-dialect/validate! program)]
+    (when-not (typed-scan-program? program)
+      (throw (ex-info "typed SegScan lowering requires one scan equation"
+                      {:reason :typed-soac-scan-subset :program program})))
+    (let [description (typed-scan-description program dtype)
+          operations (mapv #(assoc % :algorithm-dialect :typed-soac
+                                   :algorithm-equation (:id description))
+                           (lower-scan-description description device-id
+                                                   :dtype (:elem-type description)))]
+      {:operations operations
+       :kernel-graph (scan-kernel-graph-description description operations
+                                                    {:array-types array-types})})))
+
 ;; ================================================================
 ;; Lowering helpers
 ;; ================================================================
@@ -234,6 +305,23 @@
     {:acc (:acc soac) :init (:init soac)
      :lambda (:lambda soac) :out (:out soac)}
     (first (:scans soac))))
+
+(defn- legacy-scan-description
+  [node]
+  (let [raw (scan-op-info node)]
+    {:id (:id node)
+     :sym (:sym node)
+     :out (:out raw)
+     :acc (:acc raw)
+     :init (:init raw)
+     :lambda (:lambda raw)
+     :bound (:bound node)
+     :idx (:idx node)
+     :inputs (or (:inputs node) #{})
+     :outputs (or (soac-outputs* node) #{})
+     :scalars (or (:scalars node) #{})
+     :elem-type (:elem-type node)
+     :map-lambda (screma-map-lambda node)}))
 
 ;; ================================================================
 ;; Map lowering
@@ -361,30 +449,34 @@
 
   Returns a vector of SegScan/SegMap records."
   [soac device-id & {:keys [dtype] :or {dtype :double}}]
-  (let [dtype (or (:elem-type soac) dtype)
-        bound (:bound soac)
-        idx (:idx soac)
-        raw-scan-op (scan-op-info soac)
-        map-lambda (screma-map-lambda soac)
+  (lower-scan-description (legacy-scan-description soac) device-id :dtype dtype))
+
+(defn- lower-scan-description
+  [description device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [dtype (or (:elem-type description) dtype)
+        bound (:bound description)
+        idx (:idx description)
+        raw-scan-op (select-keys description [:acc :init :lambda :out])
+        map-lambda (:map-lambda description)
         _ (when map-lambda
             (throw (ex-info "fused scan/map needs an explicit scheduled scan epilogue"
                             {:reason :scan-fused-map-unimplemented
                              :scan-op raw-scan-op :map-lambda map-lambda})))
-        scan-facts (scan/certify raw-scan-op dtype)
+        scan-facts (or (:algebra description) (scan/certify raw-scan-op dtype))
         scan-op (assoc raw-scan-op :algebra scan-facts)
         space (segop/make-seg-space idx bound)
         grid-1 (scan-grid device-id bound dtype)
         execution (execution-plan/scan-execution bound grid-1)]
     (case (:strategy execution)
       :single
-      [(segop/->SegScan (:id soac)
+      [(segop/->SegScan (:id description)
                         space
                         (segop/->SegLevel :block :none)
                         scan-op
                         map-lambda
-                        (:inputs soac)
-                        (soac-outputs* soac)
-                        (:scalars soac)
+                        (:inputs description)
+                        (:outputs description)
+                        (:scalars description)
                         (single-block-grid grid-1)
                         :single
                         dtype)]
@@ -392,18 +484,18 @@
       :three-stage
       (let [level-1 (segop/->SegLevel :block :virtual)
             totals-sym (gensym "block_totals_")
-            stage-1 (segop/->SegScan (:id soac) space level-1
+            stage-1 (segop/->SegScan (:id description) space level-1
                                      scan-op map-lambda
-                                     (:inputs soac)
-                                     (conj (soac-outputs* soac) totals-sym)
-                                     (:scalars soac)
+                                     (:inputs description)
+                                     (conj (:outputs description) totals-sym)
+                                     (:scalars description)
                                      grid-1 :intra-block
                                      dtype)
             stage-2-idx (gensym "k_")
             stage-2-space (segop/make-seg-space stage-2-idx (:num-blocks grid-1))
             grid-2 (single-block-grid grid-1)
             level-2 (segop/->SegLevel :block :none)
-            stage-2 (segop/->SegScan (+ (:id soac) 2000)
+            stage-2 (segop/->SegScan (+ (:id description) 2000)
                                      stage-2-space level-2
                                      scan-op nil
                                      #{totals-sym} #{totals-sym}
@@ -413,7 +505,7 @@
             carry-space (segop/make-seg-space carry-idx bound)
             grid-3 (phase-grid :map device-id bound dtype)
             level-3 (segop/->SegLevel :thread :virtual)
-            out-sym (or (:out scan-op) (first (soac-outputs* soac)))
+            out-sym (or (:out scan-op) (first (:outputs description)))
             block-idx-expr (list 'clojure.core/quot carry-idx (:block-size grid-1))
             combine (:combine scan-facts)
             carry-lambda (list 'if (list '> block-idx-expr 0)
@@ -422,7 +514,7 @@
                                            (list 'clojure.core/- block-idx-expr 1))
                                      (list 'aget out-sym carry-idx))
                                (list 'aget out-sym carry-idx))
-            stage-3 (segop/->SegMap (+ (:id soac) 3000)
+            stage-3 (segop/->SegMap (+ (:id description) 3000)
                                     carry-space level-3
                                     carry-lambda
                                     #{out-sym totals-sym}
@@ -439,39 +531,45 @@
   ([soac segops]
    (scan-kernel-graph soac segops {}))
   ([soac segops {:keys [array-types] :or {array-types {}}}]
-   (let [external (set/union (or (:inputs soac) #{}) (or (soac-outputs* soac) #{}))
-         used (reduce set/union #{}
-                      (map #(set/union (or (segop/segop-inputs %) #{})
-                                       (or (segop/segop-outputs %) #{}))
-                           segops))
-         temporary-ids (set/difference used external)
-         block-stage (some #(when (= :block-scan (:phase %)) %) segops)
-         temporary-elements (when block-stage
-                              (:bound (segop/seg-space-reduced-dim (:space block-stage))))
-         dtype (or (:elem-type soac) (:dtype (first segops)) :double)
-         temporaries (into {}
+   (scan-kernel-graph-description (legacy-scan-description soac) segops
+                                  {:array-types array-types})))
+
+(defn- scan-kernel-graph-description
+  [description segops {:keys [array-types] :or {array-types {}}}]
+  (let [external (set/union (or (:inputs description) #{})
+                            (or (:outputs description) #{}))
+        used (reduce set/union #{}
+                     (map #(set/union (or (segop/segop-inputs %) #{})
+                                      (or (segop/segop-outputs %) #{}))
+                          segops))
+        temporary-ids (set/difference used external)
+        block-stage (some #(when (= :block-scan (:phase %)) %) segops)
+        temporary-elements (when block-stage
+                             (:bound (segop/seg-space-reduced-dim (:space block-stage))))
+        dtype (or (:elem-type description) (:dtype (first segops)) :double)
+        temporaries (into {}
+                          (map (fn [id]
+                                 [id {:dtype dtype :elements temporary-elements
+                                      :memory-space :device}]))
+                          temporary-ids)
+        buffer-specs (into {}
                            (map (fn [id]
-                                  [id {:dtype dtype :elements temporary-elements
-                                       :memory-space :device}]))
-                           temporary-ids)
-         buffer-specs (into {}
-                            (map (fn [id]
-                                   [id {:dtype (or (get array-types id)
-                                                   (get array-types (symbol (name id)))
-                                                   dtype)
-                                        :elements (:bound soac)}]))
-                            external)]
-     (kernel-graph/from-segops
-      segops
-      {:inputs (or (:inputs soac) #{})
-       :outputs (or (soac-outputs* soac) #{})
-       :temporaries temporaries
-       :buffer-specs buffer-specs
-       :dtype dtype
-       :effects {:memory-order :dependency-ordered}
-       :provenance {:dialect :segop :algorithm :scan :soac-id (:id soac)}
-       :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)
-                    :scan-algebra (get-in (first segops) [:scan-op :algebra])}}))))
+                                  [id {:dtype (or (get array-types id)
+                                                  (get array-types (symbol (name id)))
+                                                  dtype)
+                                       :elements (:bound description)}]))
+                           external)]
+    (kernel-graph/from-segops
+     segops
+     {:inputs (or (:inputs description) #{})
+      :outputs (or (:outputs description) #{})
+      :temporaries temporaries
+      :buffer-specs buffer-specs
+      :dtype dtype
+      :effects {:memory-order :dependency-ordered}
+      :provenance {:dialect :segop :algorithm :scan :soac-id (:id description)}
+      :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)
+                   :scan-algebra (get-in (first segops) [:scan-op :algebra])}})))
 
 (defn scan-soac?
   "True when a SOAC/Screma node selects scan decomposition."

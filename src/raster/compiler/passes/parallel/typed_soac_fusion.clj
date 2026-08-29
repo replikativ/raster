@@ -52,13 +52,28 @@
                                 :parameters parameters
                                 :body-results body-results}))))
 
+(def ^:private scan-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (scan ?attributes [??arrays] [??captures]
+                                (lambda [??parameters] [??body-results])))
+                      (success {:kind :scan
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :parameters parameters
+                                :body-results body-results}))))
+
 (defn equation-info
   "Return a normalized equation description, using Pattern as the dialect matcher."
   [equation]
   (some #(when (map? %) %)
         [(scalar-equation-rule equation)
          (map-equation-rule equation)
-         (reduce-equation-rule equation)]))
+         (reduce-equation-rule equation)
+         (scan-equation-rule equation)]))
 
 (defn- equation-references
   [equation]
@@ -76,7 +91,7 @@
 
 (defn- parameter-parts
   [info]
-  (let [accumulator-count (if (= :reduce (:kind info))
+  (let [accumulator-count (if (contains? #{:reduce :scan} (:kind info))
                             (count (get-in info [:attributes :accumulators]))
                             0)
         array-count (count (:arrays info))

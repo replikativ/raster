@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [pattern.nanopass.dialect :as pattern-dialect]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.scan :as scan]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (def ^:private tensor
@@ -36,6 +37,49 @@
     (is (= :map (keyword (name (dialect/operation-kind
                                 (first (dialect/equations program)))))))
     (is (= '[x] (dialect/operation-inputs (first (dialect/equations program)))))))
+
+(deftest inclusive-scan-has-a-distinct-typed-and-effectful-contract
+  (let [out (av/tensor {:dtype :float :shape '[(unknown-dimension out)]})
+        algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(float 0.0) :float)
+        facts (dialect/default-program-facts
+               {:values {'n extent 'x tensor 'out out 'result tensor}
+                :inputs '[n out x]
+                :equations
+                {'scan-0 (assoc (dialect/default-equation-facts)
+                                :effects #{:memory/write}
+                                :aliases '{result out}
+                                :attributes {:destination 'out})}
+                :effects #{:memory/write}})
+        program (dialect/make
+                 facts
+                 [(list '= 'scan-0 '[result]
+                        (list 'scan
+                              {:mode :inclusive :index 'i :extent 'n
+                               :accumulators '[acc] :identities [0.0]
+                               :dtypes [:float] :algebra [algebra]
+                               :attributes {:stable-array-captures '[out]}}
+                              '[x] '[out]
+                              (list 'lambda '[acc element destination]
+                                    '[(+ acc element)])))]
+                 '[result])
+        equation (first (dialect/equations program))]
+    (is (= program (dialect/validate! program)))
+    (is (= 'scan (dialect/operation-kind equation)))
+    (is (= {:accumulators '[acc]
+            :elements '[element]
+            :capture-parameters '[destination]}
+           (dialect/parameter-layout equation)))
+    (is (= '[x out] (dialect/operation-inputs equation)))
+    (testing "exclusive semantics cannot enter by omitting or changing the mode"
+      (let [[_ attributes arrays captures lambda] (nth equation 3)
+            bad-equation (list '= 'scan-0 '[result]
+                               (list 'scan (assoc attributes :mode :exclusive)
+                                     arrays captures lambda))]
+        (try
+          (dialect/make facts [bad-equation] '[result])
+          (is false "exclusive mode must fail TypedSOAC syntax validation")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-syntax (:reason (ex-data exception))))))))))
 
 (deftest pure-scalar-shape-equations-are-ordered-typed-ssa
   (let [program

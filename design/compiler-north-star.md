@@ -77,12 +77,17 @@ with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and a
 the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
 Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
 
-The map/scalar/full-reduction front end now constructs TypedSOAC directly from closed analyzed
+The map/scalar/full-reduction/inclusive-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
 effects, aliases and placement provenance before fusion; no `ir.soac` record or record-to-dialect
 adapter participates in this production route. The old dependency-graph path remains only as an
-explicit fallback for unsupported parallel forms and as a differential oracle. Typed scan and the
-remaining parallel forms must join the direct front end before that fallback can be deleted.
+explicit fallback for unsupported parallel forms and as a differential oracle. Inclusive scan has
+a distinct `scan` equation with an explicit `:inclusive` mode and a checked `AssociativeScan`
+certificate; its caller-owned destination is an alias/effect fact, not part of the functional
+algebra. It lowers directly to a one- or three-node SegScan `KernelGraph` without constructing a
+legacy `SoacScan`. General recurrences and `scan-exclusive` remain outside this typed operation and
+must not borrow its reassociation proof. The remaining parallel forms must join the direct front
+end before the graph fallback can be deleted.
 
 The first architectural correction is therefore:
 
@@ -438,8 +443,10 @@ SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logic
 whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
 consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
 resident rewrite and typed-route opt-out are deleted. The analyzed front end now constructs this
-TypedSOAC subset directly; migration is complete when typed scan and hardware-costed multi-consumer
-fusion land and the covered graph/backend compatibility re-lowerings are deleted. Nested reductions
+TypedSOAC subset directly. Certified inclusive scan also crosses the same typed algorithm and
+scheduled-program boundary, retaining its explicit destination contract and graph-owned temporary
+storage. Migration is complete when hardware-costed multi-consumer fusion, the remaining parallel
+forms, and covered backend compatibility re-lowerings are deleted. Nested reductions
 inside a retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
 regions through its established scalar fallback; this is an explicit scheduling boundary rather
 than a loss of semantic facts.
@@ -792,9 +799,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
 5. **In progress:** finish typed parallel coverage and scalar JVM scheduling, then remove compatibility
    re-lowering. Supported map/reduce programs, including unfused and host-visible intermediates,
    horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
-   reduction results now share the direct analyzed-source→TypedSOAC→SegOp production route. Typed
-   scan, hardware-costed multi-consumer fusion, nested-region JVM scheduling, and deletion of the
-   remaining graph/backend fallbacks remain.
+   reduction results and certified inclusive scan now share the direct
+   analyzed-source→TypedSOAC→SegOp production route. Hardware-costed multi-consumer fusion,
+   nested-region JVM scheduling, the remaining parallel forms (including distinct exclusive-scan
+   semantics), and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
