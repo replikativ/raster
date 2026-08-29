@@ -760,17 +760,19 @@
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
-    (let [am (when (device/gpu-target? (:target-device opts))
-               (try (core-hw/abstract-machine (core-hw/descriptor-for (:target-device opts)))
-                    (catch Throwable _ nil)))]
-      (let [typed (when (not= false (:typed-soac-fusion? opts))
-                    (typed-soac-route/attempt form am (:dtype opts) (:array-types opts)))]
-        (if (:program typed)
-          {:form (:program typed) :stats (:stats typed)}
-          (let [[let-sym bindings-vec & body-exprs] form
-                pairs (vec (partition 2 bindings-vec))
-                nodes (soac/let-bindings->nodes pairs)
-                graph (soac-graph/build-fusion-graph nodes)
+    (let [typed (typed-soac-route/attempt
+                 form (:dtype opts) (:array-types opts)
+                 {:resident-reductions? (true? (:resident-reductions? opts))})]
+      (if (:program typed)
+        {:form (:program typed) :stats (:stats typed)}
+        (let [am (when (device/gpu-target? (:target-device opts))
+                   (try (core-hw/abstract-machine
+                         (core-hw/descriptor-for (:target-device opts)))
+                        (catch Throwable _ nil)))
+              [let-sym bindings-vec & body-exprs] form
+              pairs (vec (partition 2 bindings-vec))
+              nodes (soac/let-bindings->nodes pairs)
+              graph (soac-graph/build-fusion-graph nodes)
           ;; Hardware-GUIDED fusion: project the target to an Abstract Machine so the
           ;; vertical chooser can DECLINE unprofitable rematerialization (cost model,
           ;; not a device — see soac-graph/vertical-fusion-profitable?). Only for GPU
@@ -778,12 +780,12 @@
           ;; kernels is the documented failure mode; CPU/no-target → am nil → the
           ;; chooser is legality-only, byte-identical to before. Descriptor failure
           ;; degrades to nil (no decline), never breaks compilation.
-                [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
-                new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
-                new-bindings (vec (mapcat identity new-pairs))]
-            {:form (list* let-sym new-bindings body-exprs)
-             :stats (cond-> stats
-                      (:declined typed) (assoc :typed-soac-declined (:declined typed)))}))))
+              [fused-graph stats] (soac-graph/fusion-fixpoint graph am (:dtype opts))
+              new-pairs (soac/nodes->let-bindings (:nodes fused-graph))
+              new-bindings (vec (mapcat identity new-pairs))]
+          {:form (list* let-sym new-bindings body-exprs)
+           :stats (cond-> stats
+                    (:declined typed) (assoc :typed-soac-declined (:declined typed)))})))
     ;; Not a let* form — fall back to par-fusion
     (par-fusion/par-fusion-pass form)))
 
@@ -1284,76 +1286,6 @@
   [sym]
   (contains? array-tags (:tag (meta sym))))
 
-;; --- Stage A: functional reduce → resident-buffer fusion ------------------------------------
-;; A par/reduce result is a SCALAR in the materialized IR, but on the resident GPU path it must
-;; live in device memory (a 1-element buffer) so the per-token graph never syncs to host. This
-;; pass (Futhark's reduce→broadcast→map fusion) realizes each non-escaping reduce result as a
-;; 1-element buffer written by `par/reduce-into`, and FORWARD-INLINES the pure scalar chain that
-;; depends on it (e.g. rms-norm's `ms`/`inv`) into the consuming kernel bodies, with the reduce
-;; result read back as `(aget buf 0)`. The existing SegMap aget-array path (#37) then consumes
-;; the buffer with NO new machinery. Escape analysis is the accept predicate: a reduce result
-;; that reaches the host result (or any non-kernel binding — e.g. a buffer alloc size) is NOT
-;; realizable, so the whole form is left unchanged (host-roundtrip fallback path).
-
-(defn- pure-scalar-init?
-  "init is a pure scalar expr — a candidate to forward-inline into a consuming kernel body —
-   i.e. not a par form, a buffer alloc, or a kernel invoke."
-  [init]
-  (not (and (seq? init)
-            (or (par/par-form? init)
-                (and (symbol? (first init))
-                     (or (contains? gpu-array-alloc-heads (first init))
-                         (contains? gpu-invoke-heads (first init))))))))
-
-(defn- reduce-buffer-alloc-head [dtype]
-  (if (= dtype :double) 'clojure.core/double-array 'clojure.core/float-array))
-
-(defn fuse-reduce-results
-  "See block comment above. Returns the fused let* form, or the input form UNCHANGED when there
-   is no realizable reduce (no par/reduce, or a reduce result genuinely escapes to host). `dtype`
-   selects the 1-element buffer element type. Operates on the materialized IR (par/reduce +
-   par/map! still present), so it must run before the SegOp/backend lowering."
-  [form dtype]
-  (if-not (and (seq? form) (#{'let* 'let} (first form)))
-    form
-    (let [pairs      (vec (partition 2 (second form)))
-          body-forms (drop 2 form)
-          body-expr  (if (= 1 (count body-forms)) (first body-forms) (cons 'do body-forms))]
-      (loop [ps (seq pairs), subst {}, realized #{}, rbufs #{}, out []]
-        (if-not ps
-          (let [body' (util/subst-syms subst body-expr)
-                ;; Soundness guard: an (aget rbuf 0) may appear ONLY inside par-form bodies
-                ;; (device kernels). If a reduce buffer leaks into the host result or any
-                ;; non-par kept binding (e.g. an alloc size), the reduce result genuinely
-                ;; escapes — bail entirely (no fusion), preserving the host-roundtrip path.
-                leaks-at-host? (fn [e] (boolean (some #(contains? (mem/sexp-free-vars e) %) rbufs)))
-                leaked? (or (leaks-at-host? body')
-                            (some (fn [[_ i]] (and (not (par/par-form? i)) (leaks-at-host? i))) out))]
-            (if (or (empty? rbufs) leaked?)
-              form
-              (apply list (first form) (vec (mapcat identity out)) [body'])))
-          (let [[sym init] (first ps)
-                init' (util/subst-syms subst init)]
-            (cond
-              ;; reduce result → realize as a 1-element device buffer + a reduce-into step
-              (par/par-reduce-form? init')
-              (let [[_ acc init0 idx bound rbody] init'
-                    buf     (gensym (str (name sym) "__rbuf"))
-                    alloc-b [buf (list (reduce-buffer-alloc-head dtype) 1)]
-                    red-b   [(gensym "_red__")
-                             (list 'raster.par/reduce-into buf acc init0 idx bound rbody)]]
-                (recur (next ps)
-                       (assoc subst sym (list 'clojure.core/aget buf 0))
-                       (conj realized sym) (conj rbufs buf)
-                       (conj out alloc-b red-b)))
-              ;; pure scalar depending on a realized value → forward-inline (drop the binding)
-              (and (pure-scalar-init? init')
-                   (seq (set/intersection (mem/sexp-free-vars init) realized)))
-              (recur (next ps) (assoc subst sym init') (conj realized sym) rbufs out)
-              ;; everything else (allocs, par/map! consumers, kernels): keep, subst applied
-              :else
-              (recur (next ps) subst realized rbufs (conj out [sym init'])))))))))
-
 (defn- parse-gpu-step
   "One invoke-registered-* binding → a step record. Artifact-backed map/reduction steps retain a
    complete `:arguments` vector; specialized compatibility markers retain their explicit fields.
@@ -1715,10 +1647,10 @@
         value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
                           :active-params active-params :dtype effective-dtype
-                          ;; The resident split pipeline still performs reduce-result device
-                          ;; realization between its pre/post halves. Keep it on the compatibility
-                          ;; source route until that transform consumes TypedSOAC equations.
-                          :typed-soac-fusion? false}
+                          ;; Resident reduction realization is a TypedSOAC transform. The logical
+                          ;; scalar remains rank zero while its explicit representation and SegOp
+                          ;; roles keep the physical one-element buffer resident.
+                          :resident-reductions? true}
                    param-env (assoc :param-env param-env)
                    source-ns (assoc :source-ns source-ns))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
@@ -1740,15 +1672,6 @@
                     source-ns (assoc :source-ns source-ns)
                     gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
                                            :array-types (:array-types gpu-param-types)))
-        ;; Stage A: realize non-escaping par/reduce results as device-resident 1-elem buffers and
-        ;; fuse their dependent scalar chains into consuming kernels (before SegOp/backend lowering).
-        _pre-fuse form-soa
-        form-soa (fuse-reduce-results form-soa effective-dtype)
-        _ (when (System/getProperty "raster.debug.fuse")
-            (binding [*out* *err*]
-              (println "=== MATERIALIZED (pre-fuse) ===") (println (pr-str _pre-fuse))
-              (println "=== POST-FUSE ===") (println (pr-str form-soa))
-              (println "=== END-FUSE-DUMP ===")))
         form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
         ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
         ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes

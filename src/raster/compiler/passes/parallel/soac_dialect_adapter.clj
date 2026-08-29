@@ -108,10 +108,16 @@
 (defn- map-equation
   [node aliases]
   (let [{:keys [results expressions]} (horizontal-map-parts node aliases)
+        ;; Imperative map-void is represented as a functional map result plus an explicit
+        ;; equation-level destination contract.  The destination is an unused stable capture here
+        ;; so it participates in the typed boundary; scheduling, not the scalar lambda, owns the
+        ;; write.  This keeps mutation out of the functional body.
+        destination (when (:void? node) (:primary-out node))
         [pointwise stable] ((juxt filter remove)
                             #(pointwise-input? expressions % (:idx node))
                             (:inputs node))
         arrays (vec (sort-by pr-str pointwise))
+        stable (cond-> (set stable) destination (conj destination))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars node)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -238,7 +244,15 @@
                                        (dialect/extent-shape extent))])
                    arrays))
      (if (= 'scalar kind)
-       {}
+       (into {} (keep (fn [id]
+                        (when-let [value (or (get known-values id)
+                                             (when-let [declared
+                                                        (and (symbol? id)
+                                                             (dtype/dtype-for-scalar-tag
+                                                              (types/sym-type-tag id)))]
+                                               (tensor-value declared [])))]
+                          [id value])))
+             captures)
        (into {} (map (fn [id]
                        [id (or (get known-values id)
                                (if (or (contains? stable-array-captures id)
@@ -343,17 +357,25 @@
                                   {}
                                   equations)
           values (reduce-kv merge-value inferred-values values)
-          equation-facts (into {}
-                               (map (fn [node]
-                                      [(:id node)
-                                       (dialect/default-equation-facts
-                                        {:adapter :legacy-soac
-                                         :legacy-soac-id (:id node)})]))
-                               equation-nodes)
+          equation-facts
+          (into {}
+                (map (fn [node]
+                       (let [destination (when (and (legacy/soac-map? node) (:void? node))
+                                           (:primary-out node))]
+                         [(:id node)
+                          (cond-> (dialect/default-equation-facts
+                                   {:adapter :legacy-soac :legacy-soac-id (:id node)})
+                            destination
+                            (assoc :effects #{:memory/write}
+                                   :aliases {(:sym node) destination}
+                                   :attributes {:destination destination}))])))
+                equation-nodes)
+          total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
           facts (dialect/default-program-facts
                  {:values values
                   :inputs inputs
                   :equations equation-facts
+                  :effects total-effects
                   :provenance {:adapter :legacy-soac}
                   :attributes {:compatibility-view true}})]
       (dialect/make facts equations outputs))))

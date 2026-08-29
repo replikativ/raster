@@ -68,7 +68,8 @@ operation/type legality check, and source equality invalidates an equation after
 rewrite. Direct calls to a backend may still use the explicit, counted compatibility re-lowering
 path.
 
-The first typed vertical is now production-routed for scalar/full reductions. A
+The typed map/reduction vertical is now production-routed for supported programs whether or not a
+fusion fires. A
 `ProgramEquation` owns the alpha-renamed TypedSOAC program and the SegRed mechanically derived from
 its explicit lambda parameters, operands, extent, result, dtype and algebra facts. JVM SIMD consumes
 that SegRed. The GPU schedules eligible scalar regions as one verified workgroup-tree `KernelBody`
@@ -76,11 +77,12 @@ with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and a
 the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
 Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
 
-The remaining nominal boundary is earlier: SOAC fusion still constructs records and a dependency
-graph from source-shaped S-expressions, rewrites them, and reconstructs `par` forms before the typed
-program boundary. The problem is not the use of S-expressions; it is that stable value identity,
-types, effects, aliases and dialect legality are recovered from source spelling instead of being
-explicit in a first-class typed SOAC program.
+The remaining nominal boundary is earlier: the production adapter still constructs `ir.soac`
+records from source-shaped S-expressions before projecting them into TypedSOAC. Supported programs
+are optimized only as TypedSOAC—the old dependency-graph optimizer is no longer a production
+shadow authority—but unsupported forms still take that explicit fallback. The problem is not the
+use of S-expressions; it is that the front end should construct stable value identity, types,
+effects, aliases and dialect legality directly in the first-class typed program.
 
 The first architectural correction is therefore:
 
@@ -407,15 +409,17 @@ table entries keyed by IDs, not Clojure metadata that ordinary list reconstructi
 The first Pattern-declared dialect now makes this boundary executable for map and scalar/full
 reduce equations. It verifies ordered SSA definitions, exact typed input/output/effect boundaries,
 rank/extent/result contracts, explicit lexical capture binding (including compound stable value
-IDs), tuple-valued maps, and fact-preserving functional fusion. A guarded adapter differentially
-checks map→map, map→reduce and horizontal-map results against the current graph and declines every
-unsupported legacy node or unproved alias. The first production subset now routes single-consumer
-vertical fusion over pure maps and scalar/full reductions through a `:typed-soac` ParallelProgram.
-It mechanically materializes a compatibility host loop from the typed equation, then derives
-SegMap/SegRed directly from the retained algorithm. JVM SIMD and OpenCL therefore consume the same
-facts without backend re-analysis. Host-visible intermediates, unknown/effectful scalar equations,
-horizontal/multi-result fusion, and any disagreement with the temporary legacy shadow certificate
-decline explicitly.
+IDs), tuple-valued maps, and fact-preserving functional fusion. Differential tests compare
+map→map, map→reduce and horizontal-map transformations with the former graph over their overlap,
+but the graph is no longer a production certificate. Supported maps and scalar/full reductions
+route through a `:typed-soac` ParallelProgram even when no fusion fires; host-visible intermediates
+remain materialized typed equations. Horizontal fusion lowers tuple-valued maps to one SegMap whose
+declared outputs and ABI include every write. The route mechanically materializes host control from
+the typed equations, then derives SegMap/SegRed directly from the retained algorithm. JVM SIMD and
+OpenCL therefore consume the same facts without backend re-analysis. Unknown/effectful host scalar
+equations and unsupported parallel forms still decline explicitly at the front-end boundary.
+OpenCL emits the tuple-valued SegMap as one multi-output kernel; the current JVM SIMD leaf consumes
+the same scheduled equation without compatibility re-lowering but scalarizes the secondary store.
 
 Pure host scalar dependencies now use the same ordered SSA spine through a typed `scalar` equation.
 The first production subset covers statically typed literals/aliases and semantic array-length
@@ -429,14 +433,16 @@ while the scheduled operation—not tensor rank—declares whether an ABI value 
 
 This representation is shared before backend selection. SOAC fusion changes the program consumed
 by both JVM and accelerator lowerings; SegOp and schedule conversion then specialize it. The scalar
-spelling for the migrated subset is now generated from TypedSOAC rather than retained source, and
-JVM SIMD/GPU reuse its certified SegOps. The resident split pipeline remains on the compatibility
-route because its reduce-result device-realization transform still operates between source-form
-pipeline halves. Migration is complete when that transform, horizontal/multi-consumer fusion and
-richer scalar equations operate on the typed envelope and the covered compatibility re-lowerings
-are deleted. Nested reductions inside a retained map are typed and correctly classified, but the
-JVM SIMD leaf still lowers those inner regions through its established scalar fallback; this is an
-explicit scheduling boundary rather than a loss of semantic facts.
+spelling for the migrated subset is generated from TypedSOAC rather than retained source, and JVM
+SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logical rank-zero values
+whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
+consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
+resident rewrite and typed-route opt-out are deleted. Migration is complete when the analyzed front
+end constructs TypedSOAC directly, typed scan and hardware-costed multi-consumer fusion land, and
+the covered graph/backend compatibility re-lowerings are deleted. Nested reductions inside a
+retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
+regions through its established scalar fallback; this is an explicit scheduling boundary rather
+than a loss of semantic facts.
 
 ### 3.3 Schedule and transform IR
 
@@ -783,11 +789,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    keep the current 1-D attention stages on its identity member until measured 2-D staging lands.
 4. **Landed:** make stage count and swizzle finite measured schedule axes, retire the legacy tuner,
    and remove the attention-provenance gate from routed weighted-reduction lowering.
-5. **In progress:** migrate the remaining SOAC fusion rules and scalar JVM fallback, then remove
-   compatibility re-lowering for the covered forms. Single-consumer pure map→map/map→reduce now has
-   a production typed route shared by JVM SIMD and OpenCL; typed scalar/shape equations and stable
-   tensor capture roles now carry realistic nested-reduction maps as well. Horizontal/multi-
-   consumer fusion, nested-region JVM scheduling and resident reduce-result realization remain.
+5. **In progress:** finish the typed front end and scalar JVM scheduling, then remove compatibility
+   re-lowering. Supported map/reduce programs, including unfused and host-visible intermediates,
+   horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
+   reduction results now share the production TypedSOAC→SegOp route. Direct analyzed-source
+   construction, typed scan, hardware-costed multi-consumer fusion, nested-region JVM scheduling,
+   and deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
