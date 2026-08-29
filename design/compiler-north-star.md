@@ -77,12 +77,12 @@ with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and a
 the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
 Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
 
-The remaining nominal boundary is earlier: the production adapter still constructs `ir.soac`
-records from source-shaped S-expressions before projecting them into TypedSOAC. Supported programs
-are optimized only as TypedSOAC—the old dependency-graph optimizer is no longer a production
-shadow authority—but unsupported forms still take that explicit fallback. The problem is not the
-use of S-expressions; it is that the front end should construct stable value identity, types,
-effects, aliases and dialect legality directly in the first-class typed program.
+The map/scalar/full-reduction front end now constructs TypedSOAC directly from closed analyzed
+source and retained walker type metadata. It establishes stable equation/value identity, types,
+effects, aliases and placement provenance before fusion; no `ir.soac` record or record-to-dialect
+adapter participates in this production route. The old dependency-graph path remains only as an
+explicit fallback for unsupported parallel forms and as a differential oracle. Typed scan and the
+remaining parallel forms must join the direct front end before that fallback can be deleted.
 
 The first architectural correction is therefore:
 
@@ -437,10 +437,10 @@ spelling for the migrated subset is generated from TypedSOAC rather than retaine
 SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logical rank-zero values
 whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
 consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
-resident rewrite and typed-route opt-out are deleted. Migration is complete when the analyzed front
-end constructs TypedSOAC directly, typed scan and hardware-costed multi-consumer fusion land, and
-the covered graph/backend compatibility re-lowerings are deleted. Nested reductions inside a
-retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
+resident rewrite and typed-route opt-out are deleted. The analyzed front end now constructs this
+TypedSOAC subset directly; migration is complete when typed scan and hardware-costed multi-consumer
+fusion land and the covered graph/backend compatibility re-lowerings are deleted. Nested reductions
+inside a retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
 regions through its established scalar fallback; this is an explicit scheduling boundary rather
 than a loss of semantic facts.
 
@@ -789,12 +789,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    keep the current 1-D attention stages on its identity member until measured 2-D staging lands.
 4. **Landed:** make stage count and swizzle finite measured schedule axes, retire the legacy tuner,
    and remove the attention-provenance gate from routed weighted-reduction lowering.
-5. **In progress:** finish the typed front end and scalar JVM scheduling, then remove compatibility
+5. **In progress:** finish typed parallel coverage and scalar JVM scheduling, then remove compatibility
    re-lowering. Supported map/reduce programs, including unfused and host-visible intermediates,
    horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
-   reduction results now share the production TypedSOAC→SegOp route. Direct analyzed-source
-   construction, typed scan, hardware-costed multi-consumer fusion, nested-region JVM scheduling,
-   and deletion of the remaining graph/backend fallbacks remain.
+   reduction results now share the direct analyzed-source→TypedSOAC→SegOp production route. Typed
+   scan, hardware-costed multi-consumer fusion, nested-region JVM scheduling, and deletion of the
+   remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 
