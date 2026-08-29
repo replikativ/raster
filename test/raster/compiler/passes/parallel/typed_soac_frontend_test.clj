@@ -36,13 +36,34 @@
     (is (= :analyzed-source
            (get-in (route/attempt source :float {'x :float}) [:stats :front-end])))))
 
-(deftest unsupported-parallel-semantics-decline-before-typed-construction
-  (testing "scan needs a typed scan operation"
+(deftest parallel-semantics-enter-only-their-exact-typed-operation
+  (testing "a certified inclusive scan is represented directly, with destination facts"
+    (let [program (frontend/form->program
+                   '(let* [result (raster.par/scan target acc 0.0 i n float
+                                                   (+ acc (clojure.core/aget x i)))]
+                          result)
+                   {:dtype :float :array-types {'x :float 'target :float}})
+          equation (first (dialect/equations program))]
+      (is (= 'scan (dialect/operation-kind equation)))
+      (is (= :inclusive (get-in (dialect/operation-parts equation) [:attributes :mode])))
+      (is (= '{result target} (get-in (dialect/facts program) [:equations 0 :aliases])))
+      (is (= #{:memory/write} (:effects (dialect/facts program))))))
+  (testing "exclusive scan remains a distinct, unsupported semantic operation"
     (is (nil? (frontend/form->program
-               '(let* [out (raster.par/scan target acc 0.0 i n float
-                                            (+ acc (clojure.core/aget x i)))]
-                      out)
-               {:dtype :float :array-types {'x :float}}))))
+               '(let* [result (raster.par/scan-exclusive target acc 0.0 i n float
+                                                         (+ acc (clojure.core/aget x i)))]
+                      result)
+               {:dtype :float :array-types {'x :float 'target :float}}))))
+  (testing "a general recurrence cannot be mislabeled as an associative scan"
+    (try
+      (frontend/form->program
+       '(let* [result (raster.par/scan target h 0.0 i n float
+                                       (Math/tanh (+ h (clojure.core/aget x i))))]
+              result)
+       {:dtype :float :array-types {'x :float 'target :float}})
+      (is false "an uncertified recurrence must decline")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :scan-not-associative (:reason (ex-data exception)))))))
   (testing "imperative map output identity is not disguised as a functional result"
     (is (nil? (frontend/form->program
                '(let* [step (raster.par/map! target i n float

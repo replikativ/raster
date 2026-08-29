@@ -278,14 +278,22 @@
              (let [algorithm (:algorithm equation)
                    kind (soac-dialect/operation-kind
                          (first (soac-dialect/equations algorithm)))
-                   operations (case kind
-                                scalar []
-                                map (soac-lower/lower-typed-map algorithm device-id :dtype dtype)
-                                reduce (soac-lower/lower-typed-reduce algorithm device-id :dtype dtype))]
+                   lowered (case kind
+                             scalar {:operations []}
+                             map {:operations (soac-lower/lower-typed-map
+                                               algorithm device-id :dtype dtype)}
+                             reduce {:operations (soac-lower/lower-typed-reduce
+                                                  algorithm device-id :dtype dtype)}
+                             scan (soac-lower/lower-typed-scan
+                                   algorithm device-id :dtype dtype
+                                   :array-types (:array-types opts)))
+                   operations (:operations lowered)]
                (-> equation
                    (assoc :operations operations)
                    (update :provenance assoc :target-dialect :segop)
                    (update :attributes assoc :device device-id)
+                   (cond-> (:kernel-graph lowered)
+                     (update :attributes assoc :kernel-graph (:kernel-graph lowered)))
                    (cond-> (= 'scalar kind)
                      (update :attributes assoc :host-only true)))))
            (:equations form))
@@ -295,22 +303,36 @@
           scheduled-values
           (reduce
            (fn [values equation]
-             (reduce
-              (fn [values operation]
-                (if (and (instance? raster.compiler.ir.segop.SegRed operation)
-                         (= :block-local (:phase operation)))
-                  (reduce (fn [values id]
-                            (if (contains? values id)
-                              values
-                              (assoc values id
-                                     (av/tensor
-                                      {:dtype (:dtype operation)
-                                       :shape [(:num-blocks (:grid operation))]
-                                       :representation {:kind :plain}
-                                       :memory-space :device}))))
-                          values (:outputs operation))
-                  values))
-              values (:operations equation)))
+             (let [values
+                   (reduce (fn [values temporary]
+                             (let [id (:id temporary)]
+                               (if (contains? values id)
+                                 values
+                                 (assoc values id
+                                        (av/tensor
+                                         {:dtype (:dtype temporary)
+                                          :shape (soac-dialect/extent-shape
+                                                  (:elements temporary))
+                                          :representation {:kind :plain}
+                                          :memory-space (:memory-space temporary)})))))
+                           values
+                           (get-in equation [:attributes :kernel-graph :temporaries]))]
+               (reduce
+                (fn [values operation]
+                  (if (and (instance? raster.compiler.ir.segop.SegRed operation)
+                           (= :block-local (:phase operation)))
+                    (reduce (fn [values id]
+                              (if (contains? values id)
+                                values
+                                (assoc values id
+                                       (av/tensor
+                                        {:dtype (:dtype operation)
+                                         :shape [(:num-blocks (:grid operation))]
+                                         :representation {:kind :plain}
+                                         :memory-space :device}))))
+                            values (:outputs operation))
+                    values))
+                values (:operations equation))))
            (:values form) equations)
           ;; Scheduled operations are not exempt from SSA validation merely because they are
           ;; records nested inside an equation. Every physical operand/result—including generated
@@ -347,6 +369,7 @@
                                    :scheduled scheduled-outputs})))))
           parallel-equation-count (count (remove #(get-in % [:attributes :host-only]) equations))
           scalar-equation-count (- (count equations) parallel-equation-count)
+          kernel-graph-count (count (filter #(get-in % [:attributes :kernel-graph]) equations))
           lowered (assoc form
                          :dialect :segop
                          :values scheduled-values
@@ -361,7 +384,7 @@
                      (= (:operands equation) (:inputs (soac-dialect/facts algorithm)))
                      (= (:results equation) (soac-dialect/outputs algorithm)))))
        :stats {:segops-lowered parallel-equation-count
-               :kernel-graphs-lowered 0
+               :kernel-graphs-lowered kernel-graph-count
                :typed-soac-reused parallel-equation-count
                :typed-scalar-equations scalar-equation-count}})
     (if-not (form/binding-form? form)

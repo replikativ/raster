@@ -153,7 +153,29 @@
            :placement placement
            :pairs [[result source]]
            :site [:binding result]
-           :source source})))))
+           :source source}))
+
+      scan
+      (let [result (first results)
+            destination (get-in placement-facts [:attributes :destination])
+            _ (when-not (and (= 1 (count results)) destination)
+                (throw (ex-info "typed inclusive scan requires one caller-owned destination"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results
+                                 :destination destination})))
+            source (with-meta
+                     (list 'raster.par/scan destination
+                           (first (:accumulators attributes))
+                           (first (:identities attributes))
+                           (:index attributes) (:extent attributes)
+                           (nth (get dtype->allocation (first (:dtypes attributes))) 2 nil)
+                           (first bodies))
+                     {:raster.type/elem-type (first (:dtypes attributes))})]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[result source]]
+         :site [:binding result]
+         :source source}))))
 
 (defn- realize-source
   [form program]
@@ -225,7 +247,7 @@
                (if resident-reductions?
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :reduce}
+           (if (not-any? #(contains? #{:map :reduce :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

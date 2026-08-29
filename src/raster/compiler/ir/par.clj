@@ -433,6 +433,11 @@
   [form]
   (and (seq? form) (contains? #{'raster.par/reduce 'par/reduce} (first form))))
 
+(defn par-scan-form?
+  "Check if a form is Raster's inclusive, destination-writing parallel scan."
+  [form]
+  (and (seq? form) (contains? #{'raster.par/scan 'par/scan} (first form))))
+
 (defn par-product-reduce-form?
   "Check if a form is a typed segmented product reduction."
   [form]
@@ -837,6 +842,16 @@
     (let [[_ out-sym acc-sym init-expr idx-sym bound-expr cast-fn body-expr] form]
       {:out out-sym :acc acc-sym :init init-expr
        :idx idx-sym :bound bound-expr :cast cast-fn :body body-expr})))
+
+(defn extract-par-scan-info
+  "Extract structured information from an inclusive par/scan form."
+  [form]
+  (when (par-scan-form? form)
+    (let [[_ out-sym acc-sym init-expr idx-sym bound-expr cast-fn body-expr] form
+          elem-type (:raster.type/elem-type (meta form))]
+      (cond-> {:out out-sym :acc acc-sym :init init-expr
+               :idx idx-sym :bound bound-expr :cast cast-fn :body body-expr}
+        elem-type (assoc :elem-type elem-type)))))
 
 (defn extract-par-map-void-info
   "Extract structured info from a par/map-void! form.
