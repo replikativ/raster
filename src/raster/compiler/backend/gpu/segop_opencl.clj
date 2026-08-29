@@ -882,7 +882,11 @@
               (throw (ex-info "scan graph scalar has inconsistent emitted ABI dtypes"
                               {:argument argument :slots (mapv first pairs)}))))
         pointer-abi (mapv (fn [{:keys [id dtype role]}]
-                            (kabi/slot id (if (= :input role) :input :output) dtype))
+                            (kabi/slot id (if (= :input role) :input :output) dtype
+                                       :role (case role
+                                               :input :operand
+                                               :output :result
+                                               :inout :inout)))
                           external-buffers)
         scalar-arguments (vec (sort-by name (keys scalar-groups)))
         scalar-abi (mapv (fn [argument]
@@ -898,6 +902,25 @@
         (assoc-in [:provenance :target-dialect] :opencl-c)
         (assoc-in [:attributes :emitted?] true)
         kgraph/validate!)))
+
+(defn generate-kernel-graph
+  "Target-lower one scheduled KernelGraph through the backend's single graph-emission boundary.
+
+   Operation-family recognition is confined here and must be proved by graph attributes established
+   by scheduling. Unsupported graph families fail loudly; callers never fall back to reconstructing
+   an operation from source spelling or node names."
+  [graph & {:as opts}]
+  (let [graph (kgraph/validate! graph)]
+    (cond
+      (scan/associative-scan? (get-in graph [:attributes :scan-algebra]))
+      (apply generate-scan-kernel-graph graph (mapcat identity opts))
+
+      :else
+      (throw (ex-info "OpenCL backend has no target lowering for scheduled KernelGraph"
+                      {:reason :kernel-graph-target-lowering-missing
+                       :target :opencl-c
+                       :provenance (:provenance graph)
+                       :attributes (:attributes graph)})))))
 
 ;; ================================================================
 ;; Segmented reduction (contraction) → OpenCL — the multi-axis SegSpace path

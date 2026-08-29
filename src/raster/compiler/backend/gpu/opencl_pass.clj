@@ -15,6 +15,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
@@ -301,7 +302,8 @@
                                (or (:array-types (meta source-form)) {})
                                (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
-                     :ze-structured-reductions 0 :fallback 0})
+                     :ze-structured-reductions 0 :kernel-graphs 0
+                     :graph-staging-fallbacks 0 :fallback 0})
         kernels (atom [])
         dispatches (atom [])
         target-desc (delay
@@ -317,6 +319,40 @@
             (swap! stats update stat-key inc)
             (swap! kernels conj k)
             k))
+
+        emit-scheduled-graph!
+        (fn [scheduled source]
+          ;; KernelDispatch is already the verified selection value above both a single artifact
+          ;; and a graph.  A one-alternative dispatch therefore gives scheduled equations the same
+          ;; registry/selection seam as tuned GEMM without introducing a second graph registry.
+          ;; Scan is the first graph target-lowering; later graph families extend this backend
+          ;; dispatcher rather than adding source/runtime conventions per operation.
+          (let [emitted0 (segop-cl/generate-kernel-graph
+                          scheduled :scalar-types top-scalar-types)
+                emitted (-> emitted0
+                            (kgraph/map-operations
+                             (fn [node]
+                               (maybe-compile-spirv (:operation node)
+                                                    compile-spirv? device-id)))
+                            (assoc-in [:attributes :strategy] :scheduled-graph)
+                            kgraph/validate!)
+                dispatch (kdispatch/make
+                          {:id (str "scheduled-graph-"
+                                    (Integer/toUnsignedString (hash emitted) 16))
+                           :alternatives [emitted]
+                           :default-strategy :scheduled-graph
+                           :selector {:kind :fixed-strategy :strategy :scheduled-graph}
+                           :provenance {:pass :opencl :source-dialect :segop}
+                           :attributes {:operation-family :scheduled-graph}})]
+            (swap! kernels into (mapv :operation (:nodes emitted)))
+            (swap! dispatches conj dispatch)
+            (swap! stats update :kernel-graphs inc)
+            ;; The ordinary staged function still executes the exact source semantics until the
+            ;; generic staging graph runner lands.  Resident extraction recognizes this generic
+            ;; marker and binds the dispatch directly, so no graph node is reconstructed from it.
+            (swap! stats update :graph-staging-fallbacks inc)
+            (list 'raster.compiler.pipeline/invoke-scheduled-executable-fallback
+                  (:id dispatch) (vec (:arguments emitted)) source)))
 
         transform
         (fn transform [form]
@@ -597,11 +633,17 @@
             (let [[let-sym bindings & body-exprs] form
                   pairs (partition 2 bindings)
                   new-bindings (vec (mapcat (fn [[sym expr]]
-                                              [sym (binding [*bound-segops*
-                                                             (when parallel-program
-                                                               (parallel-program/operations-for-binding
-                                                                parallel-program sym expr))]
-                                                     (transform expr))])
+                                              (let [scheduled
+                                                    (when parallel-program
+                                                      (parallel-program/kernel-graph-for-binding
+                                                       parallel-program sym expr))]
+                                                [sym (if scheduled
+                                                       (emit-scheduled-graph! scheduled expr)
+                                                       (binding [*bound-segops*
+                                                                 (when parallel-program
+                                                                   (parallel-program/operations-for-binding
+                                                                    parallel-program sym expr))]
+                                                         (transform expr)))]))
                                             pairs))
                   new-body (mapv (fn [expr]
                                    (binding [*bound-segops*

@@ -13,6 +13,9 @@ The boundary has three layers:
 
 No attention, GEMM, quantization, or model-layer convention exists in the linker. A descriptor step
 may select a `KernelArtifact` or `KernelGraph`; both pass through the common executable-step binder.
+This is also the production route for certified inclusive scan: the compiler preserves its emitted
+multi-kernel graph as one descriptor step, while graph-private block totals remain invisible to the
+public LinkPlan value graph and are allocated by the executable binder.
 
 The resident-descriptor conversion is proof-carrying in the compiler sense. It returns a
 `CertifiedResidentPlan` containing the target plan and a `ResidentPlanCertificate`. The witness

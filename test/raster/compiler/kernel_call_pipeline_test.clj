@@ -3,6 +3,7 @@
             [raster.arrays :as ra]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
+            [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]))
 
@@ -21,6 +22,28 @@
   [x :- (Array float) out :- (Array float) scale :- Float n :- Long] :- Void
   (raster.par/map-void! i n
                         (ra/aset out i (* scale (ra/aget x i)))))
+
+(deftm resident-kernel-call-scan
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/scan out acc 0.0 i n float (+ acc (ra/aget x i))))
+
+(deftest resident-typed-scan-is-one-graph-backed-executable-step
+  (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-scan
+                                                 :ze:0 :dtype :float)
+        step (first (:steps descriptor))
+        executable (:artifact step)]
+    (is (= 1 (count (:steps descriptor))))
+    (is (= :executable (:convention step)))
+    (is (kernel-graph/kernel-graph? executable))
+    (is (= 3 (count (:nodes executable))))
+    (is (= 1 (count (:temporaries executable))))
+    (is (empty? (:allocs descriptor))
+        "graph-private scan storage must not leak into program allocations")
+    (is (= (:abi executable) (:abi step)))
+    (is (= (:arguments executable)
+           (mapv (fn [{:keys [kind sym expression]}]
+                   (if (= :scalar kind) expression sym))
+                 (:argument-specs step))))))
 
 (deftest resident-segmap-step-carries-one-executable-call-template
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map

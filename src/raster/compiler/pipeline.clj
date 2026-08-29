@@ -32,6 +32,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.backend.wasm.emit :as wasm-emit]
@@ -1232,12 +1233,20 @@
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
+     raster.compiler.pipeline/invoke-scheduled-executable-fallback
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
   '#{double-array float-array int-array long-array byte-array
      clojure.core/double-array clojure.core/float-array
      clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
+
+(defn invoke-scheduled-executable-fallback
+  "Preserve exact source semantics for a scheduled graph in the ordinary staging function until
+   that path has a generic graph runner. Resident extraction recognizes this compiler marker and
+   binds the registered KernelDispatch; this function is therefore not a runtime launch ABI."
+  [_dispatch-id _arguments fallback-value]
+  fallback-value)
 
 (def ^:private blas-gemm-ops
   "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
@@ -1329,6 +1338,14 @@
           (when (vector? arguments)
             {:dispatch-id dispatch-id :kernel-name default-kernel-name :arguments arguments
              :convention :contract :returns sym})))
+      (= head 'raster.compiler.pipeline/invoke-scheduled-executable-fallback)
+      ;; Generic scheduled-executable marker.  The third operand is the exact sequential source
+      ;; fallback used by non-resident staging and is deliberately not part of the resident ABI.
+      (when (= 4 argc)
+        (let [[_ dispatch-id arguments _fallback] expr]
+          (when (vector? arguments)
+            {:dispatch-id dispatch-id :arguments arguments
+             :convention :executable :returns sym})))
       (= head 'raster.gpu.ze-runtime/invoke-registered-scatter-kernel)
       ;; (invoke-registered-scatter-kernel kname out src index n [stride]). out is the
       ;; accumulator buffer (a zeros-like intermediate), written in-place via atomic +=.
@@ -1737,10 +1754,16 @@
                                    (if (= :gemm (:convention s))
                                      ;; a GEMM writes its C (out-buf) in place
                                      (conj acc (symbol (name (:out-buf s))))
-                                     (let [ki (reg-entry (:kernel-name s))]
+                                     (let [ki (if-let [dispatch-id (:dispatch-id s)]
+                                                (some-> (dispatch-entry dispatch-id)
+                                                        kdispatch/default-alternative)
+                                                (reg-entry (:kernel-name s)))]
                                        (into acc
                                              (map (comp symbol name)
-                                                  (if-let [abi (:abi ki)]
+                                                  (if-let [abi (when ki
+                                                                 (if (kexec/kernel-executable? ki)
+                                                                   (kexec/abi ki)
+                                                                   (:abi ki)))]
                                                     (map #(or (:binding %) (:name %))
                                                          (filter #(or (= :output (:kind %))
                                                                       (= :inout (:role %)))
@@ -1754,7 +1777,15 @@
                         (reduce (fn [m s]
                                   (if (= :gemm (:convention s))
                                     (assoc m (:C s) effective-dtype)
-                                    (if-let [abi (:abi (reg-entry (:kernel-name s)))]
+                                    (if-let [abi (if-let [dispatch-id (:dispatch-id s)]
+                                                   (some-> (dispatch-entry dispatch-id)
+                                                           kdispatch/default-alternative
+                                                           kexec/abi)
+                                                   (let [ki (reg-entry (:kernel-name s))]
+                                                     (when ki
+                                                       (if (kexec/kernel-executable? ki)
+                                                         (kexec/abi ki)
+                                                         (:abi ki)))))]
                                       (reduce (fn [m slot]
                                                 (if (or (= :output (:kind slot))
                                                         (= :inout (:role slot)))
@@ -1876,6 +1907,40 @@
                                      {:slot slot :kind (:kind slot) :role (:role slot)
                                       :dtype (:dtype slot) :sym value}))
                                  abi arguments)
+                           :phase (keyword (str "gpu-step-" i))})
+
+                        (= :executable (:convention step))
+                        (let [{:keys [dispatch-id arguments]} step
+                              dispatch (or (dispatch-entry dispatch-id)
+                                           (throw (ex-info "resident executable dispatch is not registered"
+                                                           {:dispatch-id dispatch-id})))
+                              dispatch (kdispatch/validate! dispatch)
+                              executable (kdispatch/default-alternative dispatch)
+                              executable (kexec/validate! executable)
+                              abi (kexec/abi executable)
+                              _ (kabi/validate-arguments! abi arguments)
+                              result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
+                                                    (map vector abi arguments))
+                              ;; A generic graph may be effect-only or multi-output. `:output` is
+                              ;; retained solely as compatibility sugar for the one-result case;
+                              ;; LinkPlan derives every write from the complete executable ABI.
+                              output (when (= 1 (count result-pairs))
+                                       (second (first result-pairs)))]
+                          {:convention :executable
+                           :dispatch-id dispatch-id
+                           :dispatch dispatch
+                           :artifact executable
+                           :abi abi
+                           :argument-specs
+                           (mapv (fn [slot value]
+                                   (if (= :scalar (:kind slot))
+                                     {:slot slot :kind :scalar :type (:kernel-dtype slot)
+                                      :expression value
+                                      :value-fn (expr->arg-fn all-params scalar-lets value)}
+                                     {:slot slot :kind (:kind slot) :role (:role slot)
+                                      :dtype (:dtype slot) :sym value}))
+                                 abi arguments)
+                           :output (when output (keyword (name output)))
                            :phase (keyword (str "gpu-step-" i))})
 
                         (= :map-void (:convention step))

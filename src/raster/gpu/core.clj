@@ -1648,7 +1648,7 @@
   (let [{:keys [kernel-name phase convention artifact argument-specs arrays n-fn scalar-specs]}
         step]
     (case convention
-      (:map :reduce :map-void :contract :gemm)
+      (:map :reduce :map-void :contract :gemm :executable)
       (let [logical-or-physical-args
             (mapv (fn [{:keys [kind sym type value-fn]}]
                     (if (= :scalar kind)
