@@ -93,7 +93,10 @@ ABI semantics. The ordinary per-call compiled function now invokes that same reg
 `KernelDispatch` through a backend-neutral staged `KernelExecutable` runner: its ordered ABI types
 scalars, preserves pointer identity, stages JVM arrays (or borrows resident buffers), owns graph
 temporaries, and copies back only declared writes. No duplicate sequential source implementation
-is embedded in the emitted form. General recurrences and `scan-exclusive` remain outside this
+is embedded in the emitted form. The public GPU-session compiler now crosses the same direct
+TypedSOAC and scheduled SegOp boundary instead of asking the OpenCL emitter to reconstruct generic
+maps and reductions from walked source. Destination-writing maps retain explicit destination,
+alias, effect and return facts. General recurrences and `scan-exclusive` remain outside this
 typed operation and must not borrow its reassociation proof. The remaining parallel forms must
 join the direct front end before the old dependency-graph fallback can be deleted.
 
@@ -809,8 +812,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
    reduction results and certified inclusive scan now share the direct
    analyzed-source→TypedSOAC→SegOp production route. Inclusive scan additionally reaches an emitted
-   graph-backed resident executable through ordinary dispatch, LinkPlan and binding. A generic
-   per-call staging graph runner, hardware-costed multi-consumer fusion, nested-region JVM
+   graph-backed resident executable through ordinary dispatch, LinkPlan and binding, and a generic
+   per-call staging graph runner executes the same registered dispatch. Hardware-costed
+   multi-consumer fusion, nested-region JVM
    scheduling, the remaining parallel forms (including distinct exclusive-scan semantics), and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a

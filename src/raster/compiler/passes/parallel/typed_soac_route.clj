@@ -112,12 +112,17 @@
               body (if (seq secondary-stores)
                      (list* 'do (concat secondary-stores [(first bodies)]))
                      (first bodies))
+              destination-return (get-in placement-facts
+                                         [:attributes :destination-return])
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
                        (if destination
-                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                               (list 'clojure.core/aset destination (:index attributes)
-                                     (list cast body)))
+                         (if (= :buffer destination-return)
+                           (list 'raster.par/map! destination (:index attributes)
+                                 (:extent attributes) cast body)
+                           (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                                 (list 'clojure.core/aset destination (:index attributes)
+                                       (list cast body))))
                          (list 'raster.par/map! result (:index attributes) (:extent attributes)
                                cast body))
                        {:raster.type/elem-type (first result-dtypes)})]
@@ -236,12 +241,13 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions?]
+  ([form dtype array-types {:keys [resident-reductions? scalar-types values]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (try
        (when-let [typed-input (frontend/form->program
-                               form {:dtype dtype :array-types array-types})]
+                               form {:dtype dtype :array-types array-types
+                                     :scalar-types scalar-types :values values})]
          (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
                [typed-result resident-stats]
                (if resident-reductions?

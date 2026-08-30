@@ -97,10 +97,12 @@
     (let [{:keys [out idx bound cast body elem-type offset]}
           (par/extract-par-map-info expression)]
       ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
-      ;; operation in the typed dialect.  Never silently describe one as an ordinary map.
-      (when-not offset
+      ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
+      ;; destination also needs distinct value/view identity before it can be SSA. Never silently
+      ;; describe either form as an ordinary functional result.
+      (when-not (or offset (= symbol out))
         (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body body
-                :elem-type elem-type}
+                :primary-out out :destination-return :buffer :elem-type elem-type}
                (extract-io body idx [out]))))
 
     (par/par-reduce-form? expression)
@@ -221,7 +223,7 @@
                 :scalar (or (provably-pure-scalar? (:expr description))
                             (generated-scaffolding? description physical-outputs))
                 :map (or (:pure? description)
-                         (and (:void? description) (symbol? (:primary-out description))))
+                         (symbol? (:primary-out description)))
                 :reduce true
                 :scan (symbol? (:primary-out description))
                 false))
@@ -248,11 +250,11 @@
 
 (defn- map-equation
   [description]
-  (let [{:keys [id sym index extent cast body inputs primary-out void?]} description
+  (let [{:keys [id sym index extent cast body inputs primary-out]} description
         expression (if cast (list cast body) body)
         [pointwise stable] ((juxt filter remove) #(pointwise-input? [expression] % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
-        stable (cond-> (set stable) void? (conj primary-out))
+        stable (cond-> (set stable) primary-out (conj primary-out))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -420,10 +422,17 @@
 (defn- merge-value
   [values id contract]
   (if-let [prior (get values id)]
-    (if (= prior contract) values
+    (let [unknown-shape? (fn [value]
+                           (= [(list 'unknown-dimension id)] (:shape value)))
+          same-nonshape-contract? (= (dissoc prior :shape) (dissoc contract :shape))]
+      (cond
+        (= prior contract) values
+        (and same-nonshape-contract? (unknown-shape? prior)) (assoc values id contract)
+        (and same-nonshape-contract? (unknown-shape? contract)) values
+        :else
         (fail! :source-value-conflict
                "source bindings imply incompatible AbstractValues for one logical value"
-               {:id id :first prior :second contract}))
+               {:id id :first prior :second contract})))
     (assoc values id contract)))
 
 (defn form->program
@@ -489,7 +498,7 @@
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [destination (when (or (:void? description)
+                           (let [destination (when (or (:primary-out description)
                                                        (= :scan (:kind description)))
                                                (:primary-out description))]
                              [(:id description)
@@ -499,7 +508,10 @@
                                 destination
                                 (assoc :effects #{:memory/write}
                                        :aliases {(:sym description) destination}
-                                       :attributes {:destination destination}))]))
+                                       :attributes (cond-> {:destination destination}
+                                                     (:destination-return description)
+                                                     (assoc :destination-return
+                                                            (:destination-return description)))))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
               facts (dialect/default-program-facts

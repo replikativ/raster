@@ -763,7 +763,8 @@
   (if (form/binding-form? form)
     (let [typed (typed-soac-route/attempt
                  form (:dtype opts) (:array-types opts)
-                 {:resident-reductions? (true? (:resident-reductions? opts))})]
+                 {:resident-reductions? (true? (:resident-reductions? opts))
+                  :scalar-types (:scalar-types opts)})]
       (if (:program typed)
         {:form (:program typed) :stats (:stats typed)}
         (let [am (when (device/gpu-target? (:target-device opts))
@@ -1022,6 +1023,45 @@
                 (validate-dialect! to f' pass-key opts)
                 [f' to]))
             [form start-dialect] passes))))
+
+(defn- top-level-binding-form
+  [source]
+  (cond
+    (form/binding-form? source)
+    source
+
+    (and (seq? source) (= 'do (first source)) (seq (rest source)))
+    (let [pairs (mapv (fn [expression]
+                        [(gensym "parallel_step_") expression])
+                      (rest source))]
+      (with-meta (list 'let* (vec (mapcat identity pairs)) (ffirst (rseq pairs)))
+        (meta source)))
+
+    :else
+    (let [result (gensym "parallel_result_")]
+      (with-meta (list 'let* [result source] result) (meta source)))))
+
+(defn schedule-parallel-form
+  "Construct the same TypedSOAC/SegOp boundary used by the ordinary compiler for an already
+   walked form whose caller needs scheduled kernels rather than a compiled host function.
+
+   GPU sessions use this entry to compile a `deftm`'s kernels without bypassing the functional
+   middle end. A top-level expression is given an explicit result binder so the analyzed-source
+   frontend sees the same ordered program shape as `compile-aot`. Unsupported parallel forms stay
+   in the counted compatibility `ParallelProgram`; supported map/reduce/scan forms retain their
+   validated TypedSOAC algorithm and are scheduled exactly once before backend emission."
+  [source {:keys [dtype array-types scalar-types target-device] :as opts}]
+  (let [source (top-level-binding-form source)
+        typed (typed-soac-route/attempt source dtype array-types
+                                        {:scalar-types scalar-types})
+        semantic (or (:program typed) source)
+        scheduled (segop-lower/segop-lower-pass
+                   semantic (assoc opts :dtype dtype :target-device target-device))]
+    (update scheduled :stats merge
+            (cond-> {:parallel-scheduling :shared}
+              (:program typed) (assoc :source-dialect :typed-soac
+                                      :typed-soac (:stats typed))
+              (:declined typed) (assoc :typed-soac-declined (:declined typed))))))
 
 ;; ================================================================
 ;; Mode configurations (declarative pass vectors)

@@ -33,6 +33,48 @@
                                   (+ acc (clojure.core/aget x i)))]
          result))
 
+(deftest gpu-session-scheduling-enters-the-shared-typed-boundary
+  (let [source '(raster.par/map! target i n float
+                                 (+ (clojure.core/aget x i) 1.0))
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'x :float 'target :float}})
+        equation (first (:equations form))
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                         :dtype :float :min-elements 0)
+        realized-expression (-> form :source second second)]
+    (testing "the top-level session expression has a typed algorithm and explicit destination"
+      (is (= :segop (:dialect form)))
+      (is (= :typed-soac (get-in form [:provenance :source-dialect])))
+      (is (= :typed-soac (:source-dialect stats)))
+      (is (= :typed-soac (get-in equation [:attributes :algorithm-dialect])))
+      (is (= 'target (get-in equation [:attributes :destination])))
+      (is (= :buffer (get-in equation [:attributes :destination-return])))
+      (is (= 'raster.par/map! (first realized-expression))
+          "materialization preserves map!'s destination-returning semantics"))
+    (testing "the emitter consumes the scheduled SegMap instead of reconstructing source"
+      (is (= 1 (get-in emitted [:stats :segop-reused])))
+      (is (nil? (get-in emitted [:stats :segop-relowered])))
+      (is (= 1 (get-in emitted [:stats :ze-maps]))))))
+
+(deftest gpu-session-scheduling-exposes-each-top-level-do-step
+  (let [{:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         '(do (raster.par/map! first-out i n float
+                               (+ (clojure.core/aget x i) 1.0))
+              (raster.par/map! second-out j n float
+                               (* (clojure.core/aget first-out j) 2.0)))
+         {:target-device :ocl:0 :dtype :float
+          :array-types {'x :float 'first-out :float 'second-out :float}})]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= :typed-soac (get-in form [:provenance :source-dialect])))
+    (is (every? #(= :typed-soac (get-in % [:attributes :algorithm-dialect]))
+                (:equations form)))
+    (is (not (some #(and (seq? %) (= 'do (first %)))
+                   (tree-seq coll? seq (:source form))))
+        "top-level do is an ordered binding spine before semantic analysis")))
+
 (deftest pure-vertical-fusion-becomes-a-first-class-typed-program
   (let [{:keys [program stats]} (route/attempt map-map :float)
         equation (first (:equations program))]

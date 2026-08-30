@@ -64,9 +64,32 @@
       (is false "an uncertified recurrence must decline")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :scan-not-associative (:reason (ex-data exception)))))))
-  (testing "imperative map output identity is not disguised as a functional result"
+  (testing "destination-writing map identity and effects are explicit compiler facts"
+    (let [program (frontend/form->program
+                   '(let* [step (raster.par/map! target i n float
+                                                 (+ (clojure.core/aget x i) 1.0))]
+                          step)
+                   {:dtype :float :array-types {'x :float 'target :float}})
+          facts (dialect/facts program)]
+      (is (= 'map (dialect/operation-kind (first (dialect/equations program)))))
+      (is (= '{step target} (get-in facts [:equations 0 :aliases])))
+      (is (= :buffer (get-in facts [:equations 0 :attributes :destination-return])))
+      (is (= #{:memory/write} (:effects facts)))))
+  (testing "a source binder and destination still require distinct SSA identities"
     (is (nil? (frontend/form->program
-               '(let* [step (raster.par/map! target i n float
-                                             (+ (clojure.core/aget x i) 1.0))]
-                      step)
+               '(let* [target (raster.par/map! target i n float
+                                               (+ (clojure.core/aget x i) 1.0))]
+                      target)
                {:dtype :float :array-types {'x :float 'target :float}})))))
+
+(deftest destination-shapes-refine-across-ordered-maps
+  (let [program (frontend/form->program
+                 '(let* [first-step (raster.par/map! first-out i n float
+                                                     (+ (clojure.core/aget x i) 1.0))
+                         second-step (raster.par/map! second-out j n float
+                                                      (* (clojure.core/aget first-out j) 2.0))]
+                        second-step)
+                 {:dtype :float
+                  :array-types {'x :float 'first-out :float 'second-out :float}})]
+    (is (= '[n] (get-in (dialect/facts program) [:values 'first-out :shape])))
+    (is (= 2 (count (dialect/equations program))))))
