@@ -134,9 +134,14 @@
                    f (if (seq scalar-types) (vary-meta f assoc :scalar-types scalar-types) f)
                    f (if (seq array-types)  (vary-meta f assoc :array-types array-types) f)]
                f)
+        scheduled (:form (pl/schedule-parallel-form
+                          form {:target-device device-id
+                                :dtype dtype
+                                :array-types array-types
+                                :scalar-types scalar-types}))
         par-opencl opencl-pass/opencl-pass
         register!  (rt-resolve device-id "register-kernel!")
-        result (par-opencl form
+        result (par-opencl scheduled
                            :device-id device-id
                            :dtype dtype
                            :min-elements min-elements)]

@@ -112,12 +112,17 @@
               body (if (seq secondary-stores)
                      (list* 'do (concat secondary-stores [(first bodies)]))
                      (first bodies))
+              destination-return (get-in placement-facts
+                                         [:attributes :destination-return])
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
                        (if destination
-                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                               (list 'clojure.core/aset destination (:index attributes)
-                                     (list cast body)))
+                         (if (= :buffer destination-return)
+                           (list 'raster.par/map! destination (:index attributes)
+                                 (:extent attributes) cast body)
+                           (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                                 (list 'clojure.core/aset destination (:index attributes)
+                                       (list cast body))))
                          (list 'raster.par/map! result (:index attributes) (:extent attributes)
                                cast body))
                        {:raster.type/elem-type (first result-dtypes)})]
@@ -180,14 +185,30 @@
 (defn- realize-source
   [form program]
   (let [[let-head bindings & body] form
+        original-pairs (vec (partition 2 bindings))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
+        physical-destinations
+        (into #{}
+              (keep (fn [[_ equation-facts]]
+                      (get-in equation-facts [:attributes :destination])))
+              (:equations (dialect/facts program)))
         pairs
         (vec
          (mapcat
           (fn [id]
-            (mapcat :pairs (get by-placement id)))
-          (range (count (partition 2 bindings)))))
+            (let [[symbol :as original-pair] (nth original-pairs id)]
+              (concat
+               ;; A destination may be a caller-owned input or a locally allocated buffer. The
+               ;; typed algorithm records the physical write boundary but does not own host-side
+               ;; allocation. Preserve a defining source binding when one exists; dropping it
+               ;; leaves CPU-C/JVM materialization with an unbound destination and also loses a
+               ;; resident scratch allocation before GPU extraction.
+               (when (and (contains? physical-destinations symbol)
+                          (empty? (get by-placement id)))
+                 [original-pair])
+               (mapcat :pairs (get by-placement id)))))
+          (range (count original-pairs))))
         source (with-meta (list* let-head (vec (mapcat identity pairs)) body) (meta form))]
     {:source source :realized (into {} (map (juxt :equation-id identity)) realized)}))
 
@@ -236,12 +257,13 @@
    (attempt form dtype {}))
   ([form dtype array-types]
    (attempt form dtype array-types {}))
-  ([form dtype array-types {:keys [resident-reductions?]
+  ([form dtype array-types {:keys [resident-reductions? scalar-types values]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
      (try
        (when-let [typed-input (frontend/form->program
-                               form {:dtype dtype :array-types array-types})]
+                               form {:dtype dtype :array-types array-types
+                                     :scalar-types scalar-types :values values})]
          (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
                [typed-result resident-stats]
                (if resident-reductions?
