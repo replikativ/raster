@@ -9,3 +9,11 @@
   (testing "an absent type fact remains absent"
     (is (nil? (dtype/dtype-for-scalar-tag nil)))
     (is (nil? (dtype/dtype-for-array-tag nil)))))
+
+(deftest jvm-array-storage-is-another-canonical-dtype-projection
+  (is (= [:double :float :half :int :long :byte]
+         (mapv dtype/dtype-for-jvm-array
+               [(double-array 0) (float-array 0) (short-array 0)
+                (int-array 0) (long-array 0) (byte-array 0)])))
+  (is (nil? (dtype/dtype-for-jvm-array (object-array 0))))
+  (is (nil? (dtype/dtype-for-jvm-array nil))))

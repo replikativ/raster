@@ -224,6 +224,77 @@
     (register! dispatch)
     (is (identical? dispatch (entry (:id dispatch))))))
 
+(deftest staged-executable-normalizes-the-abi-and-uses-the-common-graph-runner
+  (let [graph (staged-graph)
+        graph-dispatch (kdispatch/make
+                        {:id "staged-graph-dispatch"
+                         :alternatives [graph]
+                         :default-strategy :two-stage
+                         :selector {:kind :fixed-strategy :strategy :two-stage}})
+        x (float-array [1.0 2.0 3.0])
+        out (float-array 3)
+        calls (atom [])
+        session (atom {:device-id :probe})]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" #(when (= % "staged-graph-dispatch")
+                                                graph-dispatch)
+           "device-buffer?" (constantly false)
+           (throw (ex-info "unexpected runtime resolution" {:function function-name}))))
+       #'gpu/with-gpu-session*
+       (fn [device-id body]
+         (swap! calls conj [:session device-id])
+         (body session))
+       #'gpu/alloc!
+       (fn [_ specs] (swap! calls conj [:alloc specs]))
+       #'gpu/bind-kernel-executable!
+       (fn [_ key executable arguments]
+         (swap! calls conj [:bind key executable arguments])
+         :handle)
+       #'gpu/run-kernel-graph!
+       (fn [_ handle] (swap! calls conj [:run handle]))
+       #'gpu/download-range!
+       (fn [_ key dst spec]
+         (swap! calls conj [:download key dst spec])
+         (dotimes [i (alength ^floats dst)] (aset ^floats dst i (float (inc i))))
+         dst)}
+      (fn []
+        (is (identical? out
+                        (gpu/invoke-staged-executable!
+                         :probe "staged-graph-dispatch" [x out 3])))
+        (is (= [1.0 2.0 3.0] (mapv double out)))
+        (let [[_ _ bound-executable bound-arguments]
+              (first (filter #(= :bind (first %)) @calls))]
+          (is (identical? graph bound-executable))
+          (is (= [:staged-executable-pointer 0] (first bound-arguments)))
+          (is (= [:staged-executable-pointer 1] (second bound-arguments)))
+          (is (= {:type :long :value 3} (nth bound-arguments 2))))
+        (is (= 2 (count (filter #(= :alloc (first %)) @calls))))
+        (is (= 1 (count (filter #(= :download (first %)) @calls))))))))
+
+(deftest staged-executable-preserves-pointer-identity-for-in-place-calls
+  (let [same (float-array 3)
+        calls (atom [])]
+    (with-redefs-fn
+      {#'raster.gpu.core/rt-resolve
+       (fn [_ function-name]
+         (case function-name
+           "kernel-dispatch-registry-entry" (constantly dispatch)
+           "device-buffer?" (constantly false)))
+       #'gpu/with-gpu-session* (fn [_ body] (body (atom {:device-id :probe})))
+       #'gpu/alloc! (fn [_ specs] (swap! calls conj [:alloc specs]))
+       #'gpu/bind-kernel-executable!
+       (fn [_ _ _ arguments] (swap! calls conj [:arguments arguments]) :handle)
+       #'gpu/run-kernel-graph! (fn [_ _])
+       #'gpu/download-range! (fn [_ _ dst _] dst)}
+      (fn []
+        (gpu/invoke-staged-executable! :probe "dispatch-test" [same same 3])
+        (let [arguments (second (first (filter #(= :arguments (first %)) @calls)))]
+          (is (= (first arguments) (second arguments))))
+        (is (= 1 (count (filter #(= :alloc (first %)) @calls))))))))
+
 (deftest resident-step-selects-before-the-backend-binder
   (let [step {:kernel-name (:kernel-name reference)
               :phase :probe

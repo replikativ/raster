@@ -511,21 +511,11 @@
 (defn device-buffer? [x]
   (instance? OclBuffer x))
 
-(defn- jvm-array-dtype [x]
-  (cond
-    (instance? (Class/forName "[D") x) :double
-    (instance? (Class/forName "[F") x) :float
-    (instance? (Class/forName "[I") x) :int
-    (instance? (Class/forName "[J") x) :long
-    (instance? (Class/forName "[S") x) :half
-    (instance? (Class/forName "[B") x) :byte
-    :else nil))
-
 (defn- physical-pointer-dtypes [arrays]
   (mapv #(cond
            (device-buffer? %) (:dtype ^OclBuffer %)
            (instance? MemorySegment %) :opaque
-           :else (jvm-array-dtype %))
+           :else (dt/dtype-for-jvm-array %))
         arrays))
 
 (defn expand-pointer-binding

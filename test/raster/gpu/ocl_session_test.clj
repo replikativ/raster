@@ -111,6 +111,20 @@
                       [0 1 255 256 511 512 1024])))
         (finally (gpu/close-session! session))))))
 
+(deftest ocl-staged-typed-scan-runs-the-same-compiled-graph
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "staged typed scan graph")
+    (let [n 1025
+          execute (pl/compile-aot #'ocl-session-scan
+                                  :target-device :ocl:0 :dtype :float)
+          x (float-array (repeat n 1.0))
+          out (float-array n)
+          result (execute x out n)]
+      (is (identical? out result))
+      (is (= (float n) (aget out (dec n))))
+      (is (every? (fn [i] (= (float (inc i)) (aget out i)))
+                  [0 1 255 256 511 512 1024])))))
+
 (deftest ocl-resident-indexed-row-reduction-roundtrip
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "indexed row reduction")

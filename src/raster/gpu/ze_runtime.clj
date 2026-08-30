@@ -37,6 +37,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-executable :as kexec]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.gpu.resident-value :as resident-value]))
 
@@ -782,18 +783,6 @@
 (def ^:private dtype-byte-sizes
   {:double 8 :float 4 :float32 4 :int 4 :long 8 :half 2 :float16 2 :byte 1 :int8 1})
 
-(defn- jvm-array-dtype
-  "Canonical storage dtype of a supported JVM primitive array, or nil."
-  [x]
-  (cond
-    (instance? (Class/forName "[D") x) :double
-    (instance? (Class/forName "[F") x) :float
-    (instance? (Class/forName "[I") x) :int
-    (instance? (Class/forName "[J") x) :long
-    (instance? (Class/forName "[S") x) :half
-    (instance? (Class/forName "[B") x) :byte
-    :else nil))
-
 (defn make-buffer
   "Allocate a persistent shared-memory GPU buffer.
   Returns a DeviceBuffer that survives across kernel launches.
@@ -1188,7 +1177,7 @@
               (gpu-soa? arr) (into dtypes (mapv :dtype (:field-segs ^GpuSoA arr)))
               (device-buffer? arr) (conj dtypes (:dtype ^DeviceBuffer arr))
               (instance? MemorySegment arr) (conj dtypes :opaque)
-              :else (conj dtypes (jvm-array-dtype arr))))
+              :else (conj dtypes (dt/dtype-for-jvm-array arr))))
           [] arrays))
 
 (defn expand-pointer-binding
@@ -2011,7 +2000,7 @@
         _ (doseq [[slot value] pairs :when (not= :scalar (:kind slot))]
             (let [actual (if (device-buffer? value)
                            (dt/canon (:dtype ^DeviceBuffer value))
-                           (jvm-array-dtype value))]
+                           (dt/dtype-for-jvm-array value))]
               (when-not actual
                 (throw (ex-info "map kernel ABI pointer value is not a supported buffer/array"
                                 {:kernel-name kernel-name :slot slot :value-type (type value)})))
@@ -2083,7 +2072,7 @@
                               {:kernel-name kernel-name :slot slot})))
             (let [actual (if (device-buffer? value)
                            (dt/canon (:dtype ^DeviceBuffer value))
-                           (jvm-array-dtype value))]
+                           (dt/dtype-for-jvm-array value))]
               (when-not actual
                 (throw (ex-info "reduction ABI pointer value is not a supported buffer/array"
                                 {:kernel-name kernel-name :slot slot :value-type (type value)})))
@@ -3627,13 +3616,7 @@
                             {:kernel-name kernel-name :registered (keys @kernel-registry)})))
         artifact (kart/validate! registered)
         abi (:abi artifact)
-        arguments (kabi/validate-arguments! abi arguments)
-        typed-arguments
-        (mapv (fn [{:keys [kind kernel-dtype]} value]
-                (if (= :scalar kind)
-                  (if (map? value) value {:type kernel-dtype :value value})
-                  value))
-              abi arguments)
+        typed-arguments (kexec/typed-runtime-arguments artifact arguments)
         call (kcall/make artifact typed-arguments)
         out-elems-expr (kart/attribute artifact :out-elems)
         out-elems (long (if (number? out-elems-expr)

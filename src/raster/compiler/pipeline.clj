@@ -1233,7 +1233,7 @@
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
-     raster.compiler.pipeline/invoke-scheduled-executable-fallback
+     raster.compiler.pipeline/invoke-scheduled-executable!
      raster.gpu.ze-runtime/invoke-registered-scatter-kernel})
 
 (def ^:private gpu-array-alloc-heads
@@ -1241,12 +1241,14 @@
      clojure.core/double-array clojure.core/float-array
      clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
 
-(defn invoke-scheduled-executable-fallback
-  "Preserve exact source semantics for a scheduled graph in the ordinary staging function until
-   that path has a generic graph runner. Resident extraction recognizes this compiler marker and
-   binds the registered KernelDispatch; this function is therefore not a runtime launch ABI."
-  [_dispatch-id _arguments fallback-value]
-  fallback-value)
+(defn invoke-scheduled-executable!
+  "Ordinary compiled-function entry to the generic staged KernelExecutable runner.
+
+   The indirection avoids a static pipeline -> gpu.core dependency cycle; resident extraction
+   recognizes the same marker and binds its registered dispatch without staging."
+  [device-id dispatch-id arguments]
+  ((requiring-resolve 'raster.gpu.core/invoke-staged-executable!)
+   device-id dispatch-id arguments))
 
 (def ^:private blas-gemm-ops
   "BLAS GEMM ops the resident path recognizes (via :raster.op/original on the devirtualized
@@ -1338,11 +1340,11 @@
           (when (vector? arguments)
             {:dispatch-id dispatch-id :kernel-name default-kernel-name :arguments arguments
              :convention :contract :returns sym})))
-      (= head 'raster.compiler.pipeline/invoke-scheduled-executable-fallback)
-      ;; Generic scheduled-executable marker.  The third operand is the exact sequential source
-      ;; fallback used by non-resident staging and is deliberately not part of the resident ABI.
+      (= head 'raster.compiler.pipeline/invoke-scheduled-executable!)
+      ;; Generic scheduled-executable marker. Resident extraction consumes the same dispatch and
+      ;; ordered arguments as staging; the target device is carried for the staged runtime only.
       (when (= 4 argc)
-        (let [[_ dispatch-id arguments _fallback] expr]
+        (let [[_ _device-id dispatch-id arguments] expr]
           (when (vector? arguments)
             {:dispatch-id dispatch-id :arguments arguments
              :convention :executable :returns sym})))

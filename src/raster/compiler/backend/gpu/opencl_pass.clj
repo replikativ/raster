@@ -303,7 +303,7 @@
                                (or (:array-types (meta form)) {}) array-types)
         stats (atom {:ze-maps 0 :ze-reduces 0 :ze-compounds 0 :ze-contracts 0
                      :ze-structured-reductions 0 :kernel-graphs 0
-                     :graph-staging-fallbacks 0 :fallback 0})
+                     :fallback 0})
         kernels (atom [])
         dispatches (atom [])
         target-desc (delay
@@ -321,7 +321,7 @@
             k))
 
         emit-scheduled-graph!
-        (fn [scheduled source]
+        (fn [scheduled]
           ;; KernelDispatch is already the verified selection value above both a single artifact
           ;; and a graph.  A one-alternative dispatch therefore gives scheduled equations the same
           ;; registry/selection seam as tuned GEMM without introducing a second graph registry.
@@ -347,12 +347,11 @@
             (swap! kernels into (mapv :operation (:nodes emitted)))
             (swap! dispatches conj dispatch)
             (swap! stats update :kernel-graphs inc)
-            ;; The ordinary staged function still executes the exact source semantics until the
-            ;; generic staging graph runner lands.  Resident extraction recognizes this generic
-            ;; marker and binds the dispatch directly, so no graph node is reconstructed from it.
-            (swap! stats update :graph-staging-fallbacks inc)
-            (list 'raster.compiler.pipeline/invoke-scheduled-executable-fallback
-                  (:id dispatch) (vec (:arguments emitted)) source)))
+            ;; Staging and resident extraction consume the same registered dispatch and complete
+            ;; ordered executable ABI. The device id chooses only the runtime; it is not part of
+            ;; the executable's semantic call interface.
+            (list 'raster.compiler.pipeline/invoke-scheduled-executable!
+                  device-id (:id dispatch) (vec (:arguments emitted)))))
 
         transform
         (fn transform [form]
@@ -638,7 +637,7 @@
                                                       (parallel-program/kernel-graph-for-binding
                                                        parallel-program sym expr))]
                                                 [sym (if scheduled
-                                                       (emit-scheduled-graph! scheduled expr)
+                                                       (emit-scheduled-graph! scheduled)
                                                        (binding [*bound-segops*
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
