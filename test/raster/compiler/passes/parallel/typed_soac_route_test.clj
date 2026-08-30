@@ -2,6 +2,8 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.ir.kernel-dispatch :as kdispatch]
+            [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -195,6 +197,32 @@
     (is (= #{'out} (set (map :id (:outputs graph)))))
     (is (= 1 (count (:temporaries graph))))
     (parallel-program/validate! scheduled segop/segop-node?)))
+
+(deftest typed-inclusive-scan-target-lowers-to-one-executable-dispatch
+  (let [typed (:program (route/attempt inclusive-scan :float
+                                       {'x :float 'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0
+                                 :array-types {'x :float 'out :float}}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
+        dispatch (first (:dispatches emitted))
+        executable (kdispatch/default-alternative dispatch)
+        binding-expr (nth (second (:form emitted)) 1)
+        execute (eval (list 'fn '[out x n] (:form emitted)))
+        out (float-array 5)
+        fallback-result (execute out (float-array [1.0 2.0 3.0 4.0 5.0]) 5)]
+    (is (= 1 (get-in emitted [:stats :kernel-graphs])))
+    (is (= 1 (get-in emitted [:stats :graph-staging-fallbacks])))
+    (is (= 3 (count (:kernels emitted))))
+    (is (= 1 (count (:dispatches emitted))))
+    (is (kernel-graph/kernel-graph? executable))
+    (is (= executable (kdispatch/select-alternative dispatch [] :scheduled-graph)))
+    (is (= 'raster.compiler.pipeline/invoke-scheduled-executable-fallback
+           (first binding-expr)))
+    (is (= (:arguments executable) (nth binding-expr 2)))
+    (is (= (get-in scheduled [:equations 0 :source]) (nth binding-expr 3)))
+    (is (identical? out fallback-result))
+    (is (= [1.0 3.0 6.0 10.0 15.0] (mapv double fallback-result)))))
 
 (deftest typed-inclusive-scan-preserves-exact-sequential-jvm-semantics
   (let [typed (:program (route/attempt inclusive-scan :float

@@ -47,6 +47,11 @@
     (raster.par/map-void! j n
                           (ra/aset out j (clojure.core/* (ra/aget x j) s)))))
 
+(deftm ocl-session-scan
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/scan out acc 0.0 i n float
+                   (clojure.core/+ acc (ra/aget x i))))
+
 (deftest ocl-map-void-mixed-storage-abi-roundtrip
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "mixed-storage map-void")
@@ -86,6 +91,25 @@
                   ^floats yg (get r2 'y)]
               (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3)))))
         (finally (gpu/close-session! s))))))
+
+(deftest ocl-resident-typed-scan-runs-through-the-compiled-graph-step
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed scan graph")
+    (let [n 1025
+          descriptor (pl/compile-gpu-program #'ocl-session-scan :ocl:0 :dtype :float)
+          x (float-array (repeat n 1.0))
+          out (float-array n)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= [:executable] (mapv :convention (:steps descriptor))))
+        (let [program (fixture/instantiate! session descriptor [x out n]
+                                            {'x :input 'out :output})
+              result (fixture/run! program [x out n])
+              ^floats scanned (get result 'out)]
+          (is (= (float n) (aget scanned (dec n))))
+          (is (every? (fn [i] (= (float (inc i)) (aget scanned i)))
+                      [0 1 255 256 511 512 1024])))
+        (finally (gpu/close-session! session))))))
 
 (deftest ocl-resident-indexed-row-reduction-roundtrip
   (if-not @device-probe/opencl-available?

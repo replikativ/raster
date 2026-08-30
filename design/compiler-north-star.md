@@ -85,9 +85,14 @@ explicit fallback for unsupported parallel forms and as a differential oracle. I
 a distinct `scan` equation with an explicit `:inclusive` mode and a checked `AssociativeScan`
 certificate; its caller-owned destination is an alias/effect fact, not part of the functional
 algebra. It lowers directly to a one- or three-node SegScan `KernelGraph` without constructing a
-legacy `SoacScan`. General recurrences and `scan-exclusive` remain outside this typed operation and
-must not borrow its reassociation proof. The remaining parallel forms must join the direct front
-end before the graph fallback can be deleted.
+legacy `SoacScan`. The GPU backend now target-lowers that scheduled value through one fail-loud
+graph-emission boundary, wraps it in the same `KernelDispatch` value used by other selectable
+schedules, and resident descriptor extraction retains it as one executable step. LinkPlan and the
+runtime binder allocate its private temporary and flatten its nodes without reconstructing scan or
+ABI semantics. The ordinary per-call staging function still takes an explicitly counted exact
+sequential fallback until it has a generic graph runner. General recurrences and `scan-exclusive`
+remain outside this typed operation and must not borrow its reassociation proof. The remaining
+parallel forms must join the direct front end before the graph fallback can be deleted.
 
 The first architectural correction is therefore:
 
@@ -800,9 +805,11 @@ The immediate continuation after the verified double-buffered weighted-reduction
    re-lowering. Supported map/reduce programs, including unfused and host-visible intermediates,
    horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
    reduction results and certified inclusive scan now share the direct
-   analyzed-source→TypedSOAC→SegOp production route. Hardware-costed multi-consumer fusion,
-   nested-region JVM scheduling, the remaining parallel forms (including distinct exclusive-scan
-   semantics), and deletion of the remaining graph/backend fallbacks remain.
+   analyzed-source→TypedSOAC→SegOp production route. Inclusive scan additionally reaches an emitted
+   graph-backed resident executable through ordinary dispatch, LinkPlan and binding. A generic
+   per-call staging graph runner, hardware-costed multi-consumer fusion, nested-region JVM
+   scheduling, the remaining parallel forms (including distinct exclusive-scan semantics), and
+   deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.
 

@@ -72,7 +72,7 @@
                           typed {:dtype :float :target-device :ocl:0
                                  :array-types {'values :float 'out :float}}))
         graph (get-in scheduled [:equations 0 :attributes :kernel-graph])
-        emitted (sg/generate-scan-kernel-graph graph)]
+        emitted (sg/generate-kernel-graph graph)]
     (is (= :typed-soac (get-in scheduled [:provenance :source-dialect])))
     (is (= 3 (count (:nodes emitted))))
     (is (every? kart/kernel-artifact? (map :operation (:nodes emitted))))
