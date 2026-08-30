@@ -199,7 +199,13 @@
   (let [definitions (set (mapcat #(nth % 2) equations))
         references (set (mapcat equation-references equations))
         inputs (vec (sort-by pr-str (set/difference references definitions)))
-        live-values (set/union definitions references (set (dialect/outputs program)))
+        storage-destinations
+        (set (mapcat (fn [equation]
+                       (map :destination
+                            (or (dialect/result-storage facts (second equation)) [])))
+                     equations))
+        live-values (set/union definitions references storage-destinations
+                               (set (dialect/outputs program)))
         facts (-> facts
                   (assoc :inputs inputs)
                   (update :values select-keys live-values))]

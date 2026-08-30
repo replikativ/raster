@@ -38,6 +38,58 @@
                                 (first (dialect/equations program)))))))
     (is (= '[x] (dialect/operation-inputs (first (dialect/equations program)))))))
 
+(deftest tuple-map-storage-is-ordered-typed-and-effectful
+  (let [left [:effect-map 0 0]
+        right [:effect-map 0 1]
+        storage [{:destination 'a :access :write :host-return :effect}
+                 {:destination 'b :access :read-write :host-return :effect}]
+        equation (list '= 'map-0 [left right]
+                       (list 'map {:index 'i :extent 'n} '[x b] []
+                             (list 'lambda '[x-element b-element]
+                                   '[x-element (+ b-element 1.0)])))
+        equation-facts (assoc (dialect/default-equation-facts)
+                              :effects #{:memory/write}
+                              :aliases {left 'a right 'b}
+                              :attributes {:result-storage storage})
+        facts (dialect/default-program-facts
+               {:values {'n extent 'x tensor 'a tensor 'b tensor
+                         left tensor right tensor}
+                :inputs '[b n x]
+                :equations {'map-0 equation-facts}
+                :effects #{:memory/write}})
+        program (dialect/make facts [equation] [])
+        remapped (dialect/remap-values
+                  program
+                  {left [:logical :left]
+                   right [:logical :right]
+                   'a [:storage :a]
+                   'b [:storage :b]
+                   'x [:argument :x]
+                   'n [:shape :n]})
+        remapped-equation (first (dialect/equations remapped))]
+    (is (= ['a 'b] (dialect/physical-results program equation)))
+    (is (= storage (dialect/result-storage program 'map-0)))
+    (is (= [[:storage :a] [:storage :b]]
+           (dialect/physical-results remapped remapped-equation))
+        "value remapping retains the ordered physical storage identity")
+    (is (= {[:logical :left] [:storage :a]
+            [:logical :right] [:storage :b]}
+           (get-in (dialect/facts remapped) [:equations 'map-0 :aliases])))
+    (testing "storage cannot drift from result order"
+      (try
+        (dialect/make
+         (assoc-in facts [:equations 'map-0 :aliases right] 'a)
+         [equation] [])
+        (is false "misaligned storage aliases must fail")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-result-storage-alias (:reason (ex-data exception)))))))
+    (testing "storage destinations require their own AbstractValue"
+      (try
+        (dialect/make (update facts :values dissoc 'b) [equation] [])
+        (is false "unknown physical storage must fail")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-soac-result-storage-value (:reason (ex-data exception)))))))))
+
 (deftest scan-mode-has-a-distinct-typed-and-effectful-contract
   (let [out (av/tensor {:dtype :float :shape '[(unknown-dimension out)]})
         algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(float 0.0) :float)

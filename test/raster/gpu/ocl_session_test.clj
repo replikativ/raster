@@ -35,6 +35,21 @@
   [state :- (Array float) a :- Float n :- Long] :- (Array float)
   (raster.par/map! state i n float (* a (ra/aget state i))))
 
+(deftm ocl-session-map2
+  [x :- (Array float) y :- (Array float)
+   a :- (Array float) b :- (Array float) n :- Long] :- Void
+  (raster.par/map2! a b i n float
+                    (+ (ra/aget x i) 1.0)
+                    (* (ra/aget y i) 2.0)))
+
+(deftm ocl-session-effect-mixed
+  [x :- (Array float) q :- (Array byte)
+   y :- (Array float) labels :- (Array int) n :- Long] :- Void
+  (raster.par/map-void!
+   i n
+   (do (ra/aset y i (float (* (ra/aget x i) 2.0)))
+       (ra/aset labels i (int (+ (int (ra/aget q i)) 7))))))
+
 (deftm ocl-session-contract
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
@@ -100,6 +115,60 @@
                   ^floats yg (get r2 'y)]
               (is (< (Math/abs (- (aget yg 100) 200.0)) 1e-3)))))
         (finally (gpu/close-session! s))))))
+
+(deftest ocl-resident-typed-effect-tuple-map-roundtrip
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed effect tuple map")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-map2 :ocl:0 :dtype :float)
+          n 1024
+          x (float-array (map float (range n)))
+          y (float-array (map #(float (+ 10 %)) (range n)))
+          a (float-array n)
+          b (float-array n)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= [:map-void] (mapv :convention (:steps descriptor)))
+            "host control retains the nil-returning effect convention")
+        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect]))
+            "kernel generation consumes the scheduled TypedSOAC SegMap")
+        (is (= [:input :input :output :output :scalar]
+               (mapv :kind (get-in descriptor [:steps 0 :abi]))))
+        (let [program (fixture/instantiate! session descriptor [x y a b n]
+                                            {'x :input 'y :input
+                                             'a :output 'b :output})
+              result (fixture/run! program [x y a b n])
+              ^floats actual-a (get result 'a)
+              ^floats actual-b (get result 'b)]
+          (is (every? (fn [i] (= (float (inc i)) (aget actual-a i)))
+                      [0 1 255 256 1023]))
+          (is (every? (fn [i] (= (float (* 2.0 (+ 10 i))) (aget actual-b i)))
+                      [0 1 255 256 1023])))
+        (finally (gpu/close-session! session))))))
+
+(deftest ocl-resident-typed-effect-tuple-map-preserves-mixed-storage
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed mixed effect tuple map")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-effect-mixed
+                                             :ocl:0 :dtype :float)
+          n 257
+          x (float-array (map #(float (/ % 8.0)) (range n)))
+          q (byte-array (map #(byte (- (mod % 17) 8)) (range n)))
+          y (float-array n)
+          labels (int-array n)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
+        (is (= [:byte :float :int :float :int]
+               (mapv :dtype (get-in descriptor [:steps 0 :abi]))))
+        (let [program (fixture/instantiate! session descriptor [x q y labels n]
+                                            {'x :input 'q :input
+                                             'y :output 'labels :output})
+              result (fixture/run! program [x q y labels n])
+              ^floats actual-y (get result 'y)
+              ^ints actual-labels (get result 'labels)]
+          (is (= (float (* 2.0 (aget x 256))) (aget actual-y 256)))
+          (is (= (+ 7 (int (aget q 256))) (aget actual-labels 256))))
+        (finally (gpu/close-session! session))))))
 
 (deftest ocl-resident-typed-scan-runs-through-the-compiled-graph-step
   (if-not @device-probe/opencl-available?

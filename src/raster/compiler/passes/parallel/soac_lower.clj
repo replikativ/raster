@@ -56,9 +56,8 @@
           [_ _ body-results] lambda
           {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
           _ (when-not (and (seq results)
-                           (= (count results) (count body-results))
-                           (every? symbol? results))
-              (throw (ex-info "typed SegMap requires one scalar body result per symbolic output"
+                           (= (count results) (count body-results)))
+              (throw (ex-info "typed SegMap requires one scalar body result per logical output"
                               {:reason :typed-soac-map-subset
                                :equation equation-id :results results})))
           index (:index attributes)
@@ -71,14 +70,16 @@
                             par/expand-par-forms)
                        body-results)
           result (first results)
-          values (:values (soac-dialect/facts program))
+          facts (soac-dialect/facts program)
+          values (:values facts)
+          physical-results (soac-dialect/physical-results facts equation)
           secondary-stores
-          (mapv (fn [secondary-result secondary-body]
-                  (let [secondary-dtype (:dtype (get values secondary-result))
+          (mapv (fn [logical-result secondary-result secondary-body]
+                  (let [secondary-dtype (:dtype (get values logical-result))
                         cast (dtype/scalar-tag-for-dtype secondary-dtype)]
                     (list 'clojure.core/aset secondary-result index
                           (list cast secondary-body))))
-                (rest results) (rest bodies))
+                (rest results) (rest physical-results) (rest bodies))
           body (if (seq secondary-stores)
                  (list* 'do (concat secondary-stores [(first bodies)]))
                  (first bodies))
@@ -87,14 +88,13 @@
           scalar-captures (set (remove stable-array-captures captures))
           result-dtype (or (:dtype (get values result))
                            dtype :double)
-          destination (get-in (soac-dialect/facts program)
-                              [:equations equation-id :attributes :destination])
-          physical-result (or destination result)
+          storage (soac-dialect/result-storage facts equation-id)
+          physical-result (first physical-results)
           node (assoc (soac/->SoacMap equation-id result index (:extent attributes) nil body
                                       (into (set arrays) stable-array-captures)
-                                      (if destination #{physical-result} (set results))
+                                      (set physical-results)
                                       scalar-captures)
-                      :sym physical-result :elem-type result-dtype :pure? (nil? destination))]
+                      :sym physical-result :elem-type result-dtype :pure? (nil? storage))]
       (mapv #(assoc % :algorithm-dialect :typed-soac
                     :algorithm-equation equation-id)
             (lower-map node device-id :dtype result-dtype)))))

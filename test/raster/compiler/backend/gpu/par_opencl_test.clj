@@ -176,19 +176,22 @@
 
 (deftest opencl-pass-map-void-marker-follows-abi-test
   (testing "the compatibility marker is projected from the ordered ABI"
-    (let [form '(raster.par/map-void! i n
-                                      (do (aset y i (* scale (aget x i)))
-                                          (aset state i (+ (aget state i) limit))))
-          result (opencl-pass/opencl-pass
-                  form :device-id :ze:0 :dtype :float
-                  :array-types {'state :int 'x :float 'y :float}
-                  :scalar-types {'limit :int 'scale :float})
-          marker (:form result)
-          abi (:abi (first (:kernels result)))]
-      (is (= 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel (first marker)))
-      (is (= (kabi/pointer-binding-names abi) (nth marker 2)))
-      (is (= '[limit scale] (nth marker 3)))
-      (is (= 'n (nth marker 4))))))
+    (doseq [[device expected-head]
+            [[:ze:0 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel]
+             [:ocl:0 'raster.gpu.ocl-runtime/invoke-registered-map-void-kernel]]]
+      (let [form '(raster.par/map-void! i n
+                                        (do (aset y i (* scale (aget x i)))
+                                            (aset state i (+ (aget state i) limit))))
+            result (opencl-pass/opencl-pass
+                    form :device-id device :dtype :float
+                    :array-types {'state :int 'x :float 'y :float}
+                    :scalar-types {'limit :int 'scale :float})
+            marker (:form result)
+            abi (:abi (first (:kernels result)))]
+        (is (= expected-head (first marker)))
+        (is (= (kabi/pointer-binding-names abi) (nth marker 2)))
+        (is (= '[limit scale] (nth marker 3)))
+        (is (= 'n (nth marker 4)))))))
 
 (deftest opencl-pass-fallback-test
   (testing "Small arrays fall back to scalar expansion"

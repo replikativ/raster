@@ -595,7 +595,7 @@
   Phase 0/2 of .internal/ad_typed_emission_plan.md), keyed by census-rhs-head:
 
     1. void-returning SOAC/effect STATEMENT bindings (raster.par/map-void!,
-       dotimes) — the binding exists only to sequence an effect; there is no
+       raster.par/map2!, dotimes) — the binding exists only to sequence an effect; there is no
        result VALUE to tag (the census's untagged-binding-pairs already excludes
        fn* pullback closures and loop*/dotimes BINDERS for the same reason).
     2. clojure.core integer scalar arithmetic on Long dims/indices — see
@@ -609,6 +609,7 @@
   edge."
   [head]
   (or (contains? '#{raster.par/map-void! par/map-void!
+                    raster.par/map2! par/map2!
                     raster.par/product-reduce! par/product-reduce! dotimes} head)
       (contains? census-exempt-int-arith-heads head)
       (= :vector head)))
@@ -754,6 +755,8 @@
     (write-read-fuse/fuse-write-read form)
     {:form form :stats {:write-read-fused 0}}))
 
+(declare top-level-binding-form)
+
 (defn- pass-soac-fuse
   "SOAC graph-based fusion: vertical (map→map, map→reduce, map→scan),
   horizontal (independent same-bound maps), iterated to fixpoint.
@@ -788,8 +791,20 @@
           {:form (list* let-sym new-bindings body-exprs)
            :stats (cond-> stats
                     (:declined typed) (assoc :typed-soac-declined (:declined typed)))})))
-    ;; Not a let* form — fall back to par-fusion
-    (par-fusion/par-fusion-pass form)))
+    ;; A bare top-level parallel expression has no binding site for the direct SSA front end.
+    ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
+    ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
+    (let [source (top-level-binding-form form)
+          typed (typed-soac-route/attempt
+                 source (:dtype opts) (:array-types opts)
+                 {:resident-reductions? (true? (:resident-reductions? opts))
+                  :scalar-types (:scalar-types opts)})]
+      (if (:program typed)
+        {:form (:program typed) :stats (:stats typed)}
+        (let [fallback (par-fusion/par-fusion-pass form)]
+          (cond-> fallback
+            (:declined typed)
+            (assoc-in [:stats :typed-soac-declined] (:declined typed))))))))
 
 (defn- register-gpu-kernels!
   "Register generated GPU kernels eagerly so they're available at eval time.
@@ -1269,6 +1284,7 @@
 
 (def ^:private gpu-invoke-heads
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+     raster.gpu.ocl-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
      raster.gpu.ocl-runtime/invoke-registered-kernel
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
@@ -1354,7 +1370,9 @@
   (let [head (first expr)
         argc (count expr)]
     (cond
-      (= head 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
+      (contains? '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+                    raster.gpu.ocl-runtime/invoke-registered-map-void-kernel}
+                 head)
       (when (= 5 argc)
         (let [[_ kname arrays scalars n] expr]
           {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
@@ -1707,6 +1725,13 @@
                           d-params* d-tags*)
         value-reg   @types/soa-registry
         value-fn?   (boolean (some #(contains? value-reg (:tag %)) param-specs))
+        pre-gpu-param-types
+        ;; Flat signatures already have their authoritative walker/deftm parameter tags. Give
+        ;; TypedSOAC those facts before fusion instead of defaulting every resident array to the
+        ;; program dtype. Value-type signatures are derived only after SoA expansion below.
+        (when-not value-fn?
+          (opencl-pass/derive-param-types
+           (mapv :sym param-specs) (mapv :tag param-specs) effective-dtype))
         pre-opts (cond-> {:inline? true :simd? false :target-device device-id
                           :active-params active-params :dtype effective-dtype
                           ;; Resident reduction realization is a TypedSOAC transform. The logical
@@ -1714,7 +1739,10 @@
                           ;; roles keep the physical one-element buffer resident.
                           :resident-reductions? true}
                    param-env (assoc :param-env param-env)
-                   source-ns (assoc :source-ns source-ns))
+                   source-ns (assoc :source-ns source-ns)
+                   pre-gpu-param-types
+                   (assoc :scalar-types (:scalar-types pre-gpu-param-types)
+                          :array-types (:array-types pre-gpu-param-types)))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
         form-mat (run-passes raw-form gpu-resident-pre-soa-passes pre-opts)
         {form-soa :body eff-param-specs :params}
