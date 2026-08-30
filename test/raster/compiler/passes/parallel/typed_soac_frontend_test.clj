@@ -72,15 +72,25 @@
                    {:dtype :float :array-types {'x :float 'target :float}})
           facts (dialect/facts program)]
       (is (= 'map (dialect/operation-kind (first (dialect/equations program)))))
+      (is (= '[x] (dialect/operation-inputs (first (dialect/equations program))))
+          "a write-only destination is not duplicated as a semantic read operand")
       (is (= '{step target} (get-in facts [:equations 0 :aliases])))
       (is (= :buffer (get-in facts [:equations 0 :attributes :destination-return])))
+      (is (some? (get-in facts [:values 'target]))
+          "the physical output boundary retains its own value contract")
       (is (= #{:memory/write} (:effects facts)))))
   (testing "a source binder and destination still require distinct SSA identities"
     (is (nil? (frontend/form->program
                '(let* [target (raster.par/map! target i n float
                                                (+ (clojure.core/aget x i) 1.0))]
                       target)
-               {:dtype :float :array-types {'x :float 'target :float}})))))
+               {:dtype :float :array-types {'x :float 'target :float}}))))
+  (testing "a read/write destination waits for an explicit single-slot inout role"
+    (is (nil? (frontend/form->program
+               '(let* [step (raster.par/map! target i n float
+                                             (+ (clojure.core/aget target i) 1.0))]
+                      step)
+               {:dtype :float :array-types {'target :float}})))))
 
 (deftest destination-shapes-refine-across-ordered-maps
   (let [program (frontend/form->program

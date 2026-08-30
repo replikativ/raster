@@ -95,15 +95,18 @@
 
     (par/par-map-form? expression)
     (let [{:keys [out idx bound cast body elem-type offset]}
-          (par/extract-par-map-info expression)]
+          (par/extract-par-map-info expression)
+          io (extract-io body idx [out])]
       ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
       ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
-      ;; destination also needs distinct value/view identity before it can be SSA. Never silently
-      ;; describe either form as an ordinary functional result.
-      (when-not (or offset (= symbol out))
+      ;; destination also needs distinct value/view identity before it can be SSA. Reading and
+      ;; writing the same destination likewise needs one explicit inout operand, which the current
+      ;; map dialect cannot yet express without duplicating the physical pointer in the kernel ABI.
+      ;; Keep all three forms on the compatibility route rather than inventing false alias facts.
+      (when-not (or offset (= symbol out) (contains? (:inputs io) out))
         (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body body
                 :primary-out out :destination-return :buffer :elem-type elem-type}
-               (extract-io body idx [out]))))
+               io)))
 
     (par/par-reduce-form? expression)
     (let [{:keys [acc init idx bound body elem-type]} (par/extract-par-reduce-info expression)
@@ -250,11 +253,14 @@
 
 (defn- map-equation
   [description]
-  (let [{:keys [id sym index extent cast body inputs primary-out]} description
+  (let [{:keys [id sym index extent cast body inputs primary-out void?]} description
         expression (if cast (list cast body) body)
         [pointwise stable] ((juxt filter remove) #(pointwise-input? [expression] % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
-        stable (cond-> (set stable) primary-out (conj primary-out))
+        ;; map-void's destination remains a lexical stable capture in the existing dialect.
+        ;; A destination-returning map carries its write-only destination in equation facts; making
+        ;; it a capture would also make it a kernel input and duplicate the output pointer.
+        stable (cond-> (set stable) void? (conj primary-out))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
@@ -489,11 +495,20 @@
                                          (and (:extent %) (dialect/value-id? (:extent %)))
                                          (conj (:extent %))) equation-info))
               inputs (vec (sort-by pr-str (set/difference references definitions)))
+              destination-values
+              (into {}
+                    (keep (fn [description]
+                            (when-let [destination (:primary-out description)]
+                              [destination
+                               (tensor-value
+                                (value-dtype destination dtype array-types)
+                                [(list 'unknown-dimension destination)])])))
+                    equation-descriptions)
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv merge-value contracts
                                                    (equation-values equation dtype array-types
                                                                     contracts)))
-                                      {} equations)
+                                      destination-values equations)
               values (reduce-kv merge-value inferred-values values)
               equation-facts
               (into {}
