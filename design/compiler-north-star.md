@@ -89,10 +89,13 @@ legacy `SoacScan`. The GPU backend now target-lowers that scheduled value throug
 graph-emission boundary, wraps it in the same `KernelDispatch` value used by other selectable
 schedules, and resident descriptor extraction retains it as one executable step. LinkPlan and the
 runtime binder allocate its private temporary and flatten its nodes without reconstructing scan or
-ABI semantics. The ordinary per-call staging function still takes an explicitly counted exact
-sequential fallback until it has a generic graph runner. General recurrences and `scan-exclusive`
-remain outside this typed operation and must not borrow its reassociation proof. The remaining
-parallel forms must join the direct front end before the graph fallback can be deleted.
+ABI semantics. The ordinary per-call compiled function now invokes that same registered
+`KernelDispatch` through a backend-neutral staged `KernelExecutable` runner: its ordered ABI types
+scalars, preserves pointer identity, stages JVM arrays (or borrows resident buffers), owns graph
+temporaries, and copies back only declared writes. No duplicate sequential source implementation
+is embedded in the emitted form. General recurrences and `scan-exclusive` remain outside this
+typed operation and must not borrow its reassociation proof. The remaining parallel forms must
+join the direct front end before the old dependency-graph fallback can be deleted.
 
 The first architectural correction is therefore:
 

@@ -175,8 +175,11 @@
                          :int   (let [ib (as-ibuf buf)]
                                   (.put ib ^ints arr 0 (int n))
                                   buf)
+                         ;; The fast coherent host views are currently specialized for the two
+                         ;; common storage types. All other typed buffers still use the ordinary
+                         ;; backend upload contract; allocation must never guess from dtype.
                          (upload buf arr))
-                       (upload buf arr))
+                         (upload buf arr))
                      buf)))]
     (into {}
           (map (fn [[k [dtype n source-arr]]]
@@ -1491,6 +1494,97 @@
          (let [{:keys [buffers scalar-values]} (kexec/graph-bindings executable arguments)]
            (bind-kernel-graph! sess executable-key executable buffers scalar-values
                                (select-keys options [:profile?]))))))))
+
+(defn- staged-pointer-plan
+  "Validate and group ABI pointer values by object identity before any allocation.
+
+   One host array or resident buffer supplied at several ABI positions receives one session
+   allocation/registration, preserving legal in-place calls and exposing illegal stable-input
+   aliases to the ordinary graph validator."
+  [device-id executable typed-arguments]
+  (let [device-buffer? (rt-resolve device-id "device-buffer?")
+        identities (java.util.IdentityHashMap.)
+        groups (volatile! [])]
+    (doseq [[index [slot value]] (map-indexed vector (map vector (kexec/abi executable)
+                                                          typed-arguments))
+            :when (not= :scalar (:kind slot))]
+      (let [array-dtype (dtype/dtype-for-jvm-array value)
+            resident? (boolean (device-buffer? value))
+            actual-dtype (cond array-dtype array-dtype resident? (dtype/canon (:dtype value)))]
+        (when-not actual-dtype
+          (throw (ex-info "staged kernel executable pointer is not a primitive array or backend buffer"
+                          {:device-id device-id :index index :slot slot
+                           :actual (type value)})))
+        (when-not (= (dtype/canon (:dtype slot)) actual-dtype)
+          (throw (ex-info "staged kernel executable pointer has the wrong storage dtype"
+                          {:device-id device-id :index index :slot slot
+                           :expected (dtype/canon (:dtype slot)) :actual actual-dtype})))
+        (let [existing (.get identities value)
+              read? (or (= :input (:kind slot)) (= :inout (:role slot)))
+              write? (or (= :output (:kind slot)) (= :inout (:role slot)))]
+          (if (some? existing)
+            (vswap! groups update existing
+                    (fn [group]
+                      (-> group
+                          (update :indexes conj index)
+                          (update :read? #(or % read?))
+                          (update :write? #(or % write?)))))
+            (let [group-index (count @groups)
+                  key [:staged-executable-pointer group-index]
+                  elements (if array-dtype
+                             (java.lang.reflect.Array/getLength value)
+                             (:n-elements value))]
+              (.put identities value group-index)
+              (vswap! groups conj {:key key :value value :dtype actual-dtype
+                                   :elements elements :resident? resident?
+                                   :indexes [index] :read? read? :write? write?}))))))
+    (let [groups @groups
+          key-by-index (reduce (fn [result {:keys [key indexes]}]
+                                 (reduce #(assoc %1 %2 key) result indexes))
+                               {} groups)]
+      {:groups groups
+       :arguments (mapv (fn [index [slot value]]
+                          (if (= :scalar (:kind slot)) value (get key-by-index index)))
+                        (range) (map vector (kexec/abi executable) typed-arguments))})))
+
+(declare run-kernel-graph!)
+
+(defn invoke-staged-executable!
+  "Execute a registered KernelDispatch through the common KernelExecutable session machinery.
+
+   This is the ordinary compiled-function staging contract: JVM primitive arrays are copied in
+   and ABI-declared writes are copied back; backend DeviceBuffers are borrowed without copying.
+   Every call owns and closes its graph recording and temporary buffers. Long-lived/replayable
+   execution belongs to compile-gpu-program plus LinkPlan, which uses the same executable binder."
+  [device-id dispatch-id runtime-arguments]
+  (let [dispatch-entry (rt-resolve device-id "kernel-dispatch-registry-entry")
+        dispatch (or (dispatch-entry dispatch-id)
+                     (throw (ex-info "staged kernel executable dispatch is not registered"
+                                     {:device-id device-id :dispatch-id dispatch-id})))
+        dispatch (kdispatch/validate! dispatch)
+        common (kdispatch/default-alternative dispatch)
+        typed-arguments (kexec/typed-runtime-arguments common runtime-arguments)
+        executable (kdispatch/select-alternative dispatch typed-arguments)
+        {:keys [groups arguments]} (staged-pointer-plan device-id executable typed-arguments)
+        result-pairs (filterv (fn [[slot _]] (= :result (:role slot)))
+                              (map vector (kexec/abi executable) typed-arguments))]
+    (when (> (count result-pairs) 1)
+      (throw (ex-info "staged kernel executable has more than one primary result"
+                      {:dispatch-id dispatch-id :result-slots (mapv first result-pairs)})))
+    (with-gpu-session* device-id
+      (fn [session]
+        (doseq [{:keys [key value dtype elements resident? read?]} groups]
+          (if resident?
+            (register-buffer! session key value {:ownership :borrowed})
+            (alloc! session {key [dtype elements (when read? value)]})))
+        (let [handle (bind-kernel-executable! session
+                                              [:staged-executable dispatch-id]
+                                              executable arguments)]
+          (run-kernel-graph! session handle)
+          (doseq [{:keys [key value elements resident? write?]} groups
+                  :when (and write? (not resident?))]
+            (download-range! session key value {:elements elements})))
+        (some-> (first result-pairs) second)))))
 
 (defn kernel-graph-execution-plan
   "Return the pure backend-neutral queue/event plan for a bound KernelGraph."

@@ -12,6 +12,7 @@
 ;;   :scalar-tag   primitive dispatch tag for a scalar of this dtype, or nil
 ;;                 when the dtype has no JVM primitive (e.g. :half)
 ;;   :array-tag    dispatch tag for a primitive array of this dtype
+;;   :jvm-array-class-name JVM descriptor for the corresponding primitive-array storage class
 ;;   :vt           wasm / vector value-type keyword
 ;;   :needs-pragma OpenCL extension pragma this type requires, or nil
 ;;   :fp?          floating-point?
@@ -27,22 +28,22 @@
 (def dtype-info
   {:double {:native {:c "double" :opencl "double" :glsl "double"}
             :scalar-tag 'double :array-tag 'doubles :vt :f64 :needs-pragma :cl_khr_fp64 :fp? true
-            :bytes 8 :aliases #{:float64 :f64}}
+            :bytes 8 :jvm-array-class-name "[D" :aliases #{:float64 :f64}}
    :float  {:native {:c "float" :opencl "float" :glsl "float"}
             :scalar-tag 'float :array-tag 'floats :vt :f32 :needs-pragma nil :fp? true
-            :bytes 4 :aliases #{:float32 :f32}}
+            :bytes 4 :jvm-array-class-name "[F" :aliases #{:float32 :f32}}
    :half   {:native {:c "_Float16" :opencl "half" :glsl "float16_t"}
             :scalar-tag nil :array-tag 'shorts :vt :f16 :needs-pragma :cl_khr_fp16 :fp? true
-            :bytes 2 :aliases #{:float16 :f16}}
+            :bytes 2 :jvm-array-class-name "[S" :aliases #{:float16 :f16}}
    :int    {:native {:c "int" :opencl "int" :glsl "int"}
             :scalar-tag 'int :array-tag 'ints :vt :i32 :needs-pragma nil :fp? false
-            :bytes 4 :aliases #{:int32 :i32}}
+            :bytes 4 :jvm-array-class-name "[I" :aliases #{:int32 :i32}}
    :long   {:native {:c "long long" :opencl "long" :glsl "int"}
             :scalar-tag 'long :array-tag 'longs :vt :i64 :needs-pragma nil :fp? false
-            :bytes 8 :aliases #{:int64 :i64}}
+            :bytes 8 :jvm-array-class-name "[J" :aliases #{:int64 :i64}}
    :byte   {:native {:c "int8_t" :opencl "char" :glsl "int"}
             :scalar-tag 'byte :array-tag 'bytes :vt :i32 :needs-pragma nil :fp? false
-            :bytes 1 :aliases #{:int8 :i8}}})
+            :bytes 1 :jvm-array-class-name "[B" :aliases #{:int8 :i8}}})
 
 (def ^:private alias->canonical
   (into {} (for [[k v] dtype-info, a (cons k (:aliases v))] [a k])))
@@ -125,6 +126,20 @@
     (some (fn [[dtype facets]]
             (when (= tag (:array-tag facets)) dtype))
           dtype-info)))
+
+(def ^:private jvm-array-class->dtype
+  (delay
+    (into {}
+          (map (fn [[dtype facets]]
+                 [(Class/forName (:jvm-array-class-name facets)) dtype]))
+          dtype-info)))
+
+(defn dtype-for-jvm-array
+  "Canonical storage dtype for a supported JVM primitive array, or nil.
+
+   This is the runtime reverse projection of `dtype-info`, not a backend-private type table."
+  [value]
+  (when value (get @jvm-array-class->dtype (class value))))
 
 (defn needs-pragma-for
   "The OpenCL extension pragma keyword this dtype requires (e.g. :half →

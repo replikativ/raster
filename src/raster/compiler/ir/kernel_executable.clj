@@ -73,6 +73,40 @@
   [executable]
   (mapv :kernel-name (artifacts (validate! executable))))
 
+(defn- cast-runtime-scalar
+  [dtype value]
+  (case dtype
+    :int (int value)
+    :long (long value)
+    :float (float value)
+    :double (double value)
+    (throw (ex-info "kernel executable has no runtime scalar representation for ABI dtype"
+                    {:dtype dtype :value value}))))
+
+(defn typed-runtime-arguments
+  "Normalize raw caller scalars to the explicit values required by KernelCall/KernelGraphCall.
+
+   Pointer values remain opaque. A caller may also supply an already typed scalar map; its type
+   must agree with the executable ABI. This is the single normalization seam used before runtime
+   dispatch selection and binding."
+  [executable runtime-arguments]
+  (let [executable (validate! executable)
+        abi (:abi executable)
+        runtime-arguments (kabi/validate-arguments! abi runtime-arguments)]
+    (mapv (fn [slot value]
+            (if (= :scalar (:kind slot))
+              (if (and (map? value) (contains? value :type) (contains? value :value))
+                (do
+                  (when-not (= (:kernel-dtype slot) (:type value))
+                    (throw (ex-info "kernel executable scalar argument has the wrong ABI dtype"
+                                    {:slot slot :expected (:kernel-dtype slot)
+                                     :actual (:type value) :value value})))
+                  (update value :value #(cast-runtime-scalar (:kernel-dtype slot) %)))
+                {:type (:kernel-dtype slot)
+                 :value (cast-runtime-scalar (:kernel-dtype slot) value)})
+              value))
+          abi runtime-arguments)))
+
 (defn common-view
   "Return the logical interface that every dispatch alternative must preserve."
   [executable]

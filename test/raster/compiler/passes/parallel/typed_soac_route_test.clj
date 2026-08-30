@@ -207,22 +207,20 @@
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
         dispatch (first (:dispatches emitted))
         executable (kdispatch/default-alternative dispatch)
-        binding-expr (nth (second (:form emitted)) 1)
-        execute (eval (list 'fn '[out x n] (:form emitted)))
-        out (float-array 5)
-        fallback-result (execute out (float-array [1.0 2.0 3.0 4.0 5.0]) 5)]
+        binding-expr (nth (second (:form emitted)) 1)]
     (is (= 1 (get-in emitted [:stats :kernel-graphs])))
-    (is (= 1 (get-in emitted [:stats :graph-staging-fallbacks])))
+    (is (not (contains? (:stats emitted) :graph-staging-fallbacks)))
     (is (= 3 (count (:kernels emitted))))
     (is (= 1 (count (:dispatches emitted))))
     (is (kernel-graph/kernel-graph? executable))
     (is (= executable (kdispatch/select-alternative dispatch [] :scheduled-graph)))
-    (is (= 'raster.compiler.pipeline/invoke-scheduled-executable-fallback
+    (is (= 'raster.compiler.pipeline/invoke-scheduled-executable!
            (first binding-expr)))
-    (is (= (:arguments executable) (nth binding-expr 2)))
-    (is (= (get-in scheduled [:equations 0 :source]) (nth binding-expr 3)))
-    (is (identical? out fallback-result))
-    (is (= [1.0 3.0 6.0 10.0 15.0] (mapv double fallback-result)))))
+    (is (= :ocl:0 (nth binding-expr 1)))
+    (is (= (:id dispatch) (nth binding-expr 2)))
+    (is (= (:arguments executable) (nth binding-expr 3)))
+    (is (= 4 (count binding-expr))
+        "the emitted form carries no duplicate sequential source implementation")))
 
 (deftest typed-inclusive-scan-preserves-exact-sequential-jvm-semantics
   (let [typed (:program (route/attempt inclusive-scan :float
