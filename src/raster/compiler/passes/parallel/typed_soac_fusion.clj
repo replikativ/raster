@@ -14,66 +14,74 @@
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
                           (map ?attributes [??arrays] [??captures]
-                               (lambda [??parameters] [??body-results])))
+                               (lambda [??parameters]
+                                       (region [??local-definitions] [??body-results]))))
                       (success {:kind :map
                                 :id equation-id
                                 :results results
                                 :attributes attributes
                                 :arrays arrays
                                 :captures captures
-                                :parameters parameters
+                                :local-definitions local-definitions
                                 :body-results body-results}))))
 
 (def ^:private reduce-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
                           (reduce ?attributes [??arrays] [??captures]
-                                  (lambda [??parameters] [??body-results])))
+                                  (lambda [??parameters]
+                                          (region [??local-definitions] [??body-results]))))
                       (success {:kind :reduce
                                 :id equation-id
                                 :results results
                                 :attributes attributes
                                 :arrays arrays
                                 :captures captures
-                                :parameters parameters
+                                :local-definitions local-definitions
                                 :body-results body-results}))))
 
 (def ^:private scalar-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
                           (scalar ?attributes [??captures]
-                                  (lambda [??parameters] [??body-results])))
+                                  (lambda [??parameters]
+                                          (region [??local-definitions] [??body-results]))))
                       (success {:kind :scalar
                                 :id equation-id
                                 :results results
                                 :attributes attributes
                                 :arrays []
                                 :captures captures
-                                :parameters parameters
+                                :local-definitions local-definitions
                                 :body-results body-results}))))
 
 (def ^:private scan-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
                           (scan ?attributes [??arrays] [??captures]
-                                (lambda [??parameters] [??body-results])))
+                                (lambda [??parameters]
+                                        (region [??local-definitions] [??body-results]))))
                       (success {:kind :scan
                                 :id equation-id
                                 :results results
                                 :attributes attributes
                                 :arrays arrays
                                 :captures captures
-                                :parameters parameters
+                                :local-definitions local-definitions
                                 :body-results body-results}))))
 
 (defn equation-info
   "Return a normalized equation description, using Pattern as the dialect matcher."
   [equation]
-  (some #(when (map? %) %)
-        [(scalar-equation-rule equation)
-         (map-equation-rule equation)
-         (reduce-equation-rule equation)
-         (scan-equation-rule equation)]))
+  (when-let [matched
+             (some #(when (map? %) %)
+                   [(scalar-equation-rule equation)
+                    (map-equation-rule equation)
+                    (reduce-equation-rule equation)
+                    (scan-equation-rule equation)])]
+    (let [lambda (:lambda (dialect/operation-parts equation))]
+      (merge (dissoc matched :local-definitions)
+             (dialect/lambda-parts lambda)))))
 
 (defn- equation-references
   [equation]
@@ -103,7 +111,7 @@
 
 (defn- canonical-operands
   "Sort/deduplicate operands and alpha-rename both element and capture parameters."
-  [arrays element-parameters captures capture-parameters body-results]
+  [arrays element-parameters captures capture-parameters locals body-results]
   (let [canonical-arrays (vec (sort-by pr-str (distinct arrays)))
         canonical-elements (element-symbols (count canonical-arrays))
         element-for (zipmap canonical-arrays canonical-elements)
@@ -121,6 +129,7 @@
      :elements canonical-elements
      :captures canonical-captures
      :capture-parameters canonical-capture-parameters
+     :locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init))) locals)
      :body-results (mapv #(util/subst-syms substitutions %) body-results)}))
 
 (defn- stable-array-captures
@@ -133,24 +142,34 @@
             (vec (filter stable captures))))
 
 (defn- freshen-parameters
-  "Give one equation's element and capture binders private names before scopes are combined."
+  "Give one equation's parameters and local SSA definitions private names before scopes combine."
   [info prefix]
   (let [{:keys [accumulators elements capture-parameters]} (parameter-parts info)
         fresh-elements (mapv #(symbol (str "%" prefix "-element" %))
                              (range (count elements)))
         fresh-captures (mapv #(symbol (str "%" prefix "-capture" %))
                              (range (count capture-parameters)))
-        substitutions (merge (zipmap elements fresh-elements)
-                             (zipmap capture-parameters fresh-captures))]
+        parameter-substitutions (merge (zipmap elements fresh-elements)
+                                       (zipmap capture-parameters fresh-captures))
+        {:keys [locals substitutions]}
+        (reduce (fn [{:keys [locals substitutions]} {:keys [id dtype init]}]
+                  (let [fresh-id (symbol (str "rstr_" prefix "_local_" (count locals)))]
+                    {:locals (conj locals {:id fresh-id :dtype dtype
+                                           :init (util/subst-syms substitutions init)})
+                     :substitutions (assoc substitutions id fresh-id)}))
+                {:locals [] :substitutions parameter-substitutions}
+                (:locals info))]
     (assoc info
            :parameters (vec (concat accumulators fresh-elements fresh-captures))
+           :locals locals
            :body-results (mapv #(util/subst-syms substitutions %) (:body-results info)))))
 
 (defn- emit-equation
-  [{:keys [kind id results attributes arrays captures parameters body-results]}]
+  [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
   (list '= id (vec results)
         (list (symbol (name kind)) attributes (vec arrays) (vec captures)
-              (list 'lambda (vec parameters) (vec body-results)))))
+              (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
+                                   (vec body-results)))))
 
 (defn- fusible-equation?
   [program equation-id]
@@ -225,6 +244,8 @@
            :when (= :map (:kind producer))
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
+           :when (empty? (:locals producer))
+           :when (empty? (:locals consumer))
            :when (contains? #{:map :reduce} (:kind consumer))
            :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
            :when (= 1 (get uses produced 0))
@@ -263,7 +284,7 @@
           (vec (concat (:capture-parameters producer-parameters)
                        (:capture-parameters consumer-parameters)))
           canonical (canonical-operands raw-arrays raw-elements
-                                        raw-captures raw-capture-parameters inlined-body)
+                                        raw-captures raw-capture-parameters [] inlined-body)
           stable (set/union (stable-array-captures producer)
                             (stable-array-captures consumer))
           updated (assoc consumer
@@ -274,6 +295,7 @@
                          :parameters (vec (concat (:accumulators consumer-parameters)
                                                   (:elements canonical)
                                                   (:capture-parameters canonical)))
+                         :locals (:locals canonical)
                          :body-results (:body-results canonical))
           equations (-> (dialect/equations program)
                         (assoc consumer-index (emit-equation updated))
@@ -303,6 +325,8 @@
                  right-uses (set (concat (:arrays right) (:captures right)
                                          [(:extent (:attributes right))]))]
            :when (= :map (:kind left) (:kind right))
+           :when (empty? (:locals left))
+           :when (empty? (:locals right))
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))
            :when (empty? (set/intersection left-results right-uses))
            :when (empty? (set/intersection right-results left-uses))
@@ -330,6 +354,7 @@
                      (vec (concat (:captures left) (:captures right)))
                      (vec (concat (:capture-parameters left-parameters)
                                   (:capture-parameters right-parameters)))
+                     []
                      (vec (concat (:body-results left) (:body-results right))))
           stable (set/union (stable-array-captures left) (stable-array-captures right))
           updated (assoc left
@@ -340,6 +365,7 @@
                          :captures (:captures canonical)
                          :parameters (vec (concat (:elements canonical)
                                                   (:capture-parameters canonical)))
+                         :locals (:locals canonical)
                          :body-results (:body-results canonical))
           equations (-> (dialect/equations program)
                         (assoc left-index (emit-equation updated))

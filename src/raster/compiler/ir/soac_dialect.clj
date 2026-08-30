@@ -11,22 +11,30 @@
      (soac-program facts
        [(= equation-id [result ...]
            (scalar {:dtypes [:long ...]} [capture ...]
-             (lambda [capture-parameter ...] [result-expr ...])))
+             (lambda [capture-parameter ...]
+               (region [(let-value local :dtype init-expr) ...]
+                       [result-expr ...]))))
         (= equation-id [result ...]
            (map {:index i :extent n} [array ...] [capture ...]
-             (lambda [element ... capture-parameter ...] [result-expr ...])))
+             (lambda [element ... capture-parameter ...]
+               (region [(let-value local :dtype init-expr) ...]
+                       [result-expr ...]))))
         (= equation-id [result ...]
            (reduce {:index i :extent n
                     :accumulators [acc ...] :identities [zero ...]
                     :dtypes [:float ...] :algebra [{} ...]}
              [array ...] [capture ...]
-             (lambda [acc ... element ... capture-parameter ...] [step-result ...])))
+             (lambda [acc ... element ... capture-parameter ...]
+               (region [(let-value local :dtype init-expr) ...]
+                       [step-result ...]))))
         (= equation-id [result]
            (scan {:mode :inclusive :index i :extent n
                   :accumulators [acc] :identities [zero]
                   :dtypes [:float] :algebra [{}]}
              [array ...] [capture ...]
-             (lambda [acc element ... capture-parameter ...] [step-result])))]
+             (lambda [acc element ... capture-parameter ...]
+               (region [(let-value local :dtype init-expr) ...]
+                       [step-result]))))]
        [program-result ...])
 
    Scan mode may be `:inclusive` or `:exclusive`; it is an explicit result-layout property. Map
@@ -35,10 +43,13 @@
    `:result-storage` vector aligned with those functional results; logical SSA identity therefore
    stays separate from physical write identity and host return semantics. Captures are explicit
    operands with explicit scalar lambda parameters, so stable value IDs never leak into lexical
-   expression binding."
+   expression binding. Lambda regions have one typed, ordered local-SSA spine. A local initializer
+   may reference parameters, the map index, and earlier locals; results may reference all locals.
+   This represents shared scalar work once without smuggling type inference into an emitter."
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
             [raster.compiler.ir.scan :as scan-ir]))
@@ -158,6 +169,7 @@
              [ma map-attributes?]
              [ra reduce-attributes?]
              [ca scan-attributes?]
+             [dt keyword?]
              [facts program-facts?])
 
   (Scalar [s :enforce]
@@ -169,8 +181,14 @@
           (.invk ?sym:impl (?:* s:args))
           (& (?sym:f (?:* s:args)) (? _ seq?)))
 
+  (Local [d :enforce]
+         (let-value ?sym:binding ?dt ?s:init))
+
+  (Region [r :enforce]
+          (region [(?:* d)] [(?:+ s)]))
+
   (Lambda [l :enforce]
-          (lambda [(?:* ?sym:parameter)] [(?:+ s)]))
+          (lambda [(?:* ?sym:parameter)] ?r))
 
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
@@ -223,6 +241,41 @@
       (let [[_ attributes arrays captures lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
 
+(defn local-value
+  "Construct one explicitly typed scalar-region SSA definition."
+  [id dtype init]
+  (list 'let-value id dtype init))
+
+(defn lambda-region
+  "Construct the canonical scalar region used by every TypedSOAC lambda."
+  [locals results]
+  (list 'region (vec locals) (vec results)))
+
+(defn lambda-form
+  "Construct a canonical TypedSOAC lambda, with an optional ordered local-SSA spine."
+  ([parameters results]
+   (lambda-form parameters [] results))
+  ([parameters locals results]
+   (list 'lambda (vec parameters) (lambda-region locals results))))
+
+(defn lambda-parts
+  "Project a canonical lambda into parameters, typed locals, and ordered result expressions.
+
+   Locals are returned as maps so compiler passes do not independently parse their S-expression
+   spelling. The TypedSOAC form remains the sole serialized representation."
+  [lambda]
+  (let [[_ parameters [_ local-forms body-results]] lambda]
+    {:parameters (vec parameters)
+     :locals (mapv (fn [[_ id dtype init]]
+                     {:id id :dtype dtype :init init})
+                   local-forms)
+     :body-results (vec body-results)}))
+
+(defn emit-locals
+  "Return local-value forms for normalized local maps."
+  [locals]
+  (mapv (fn [{:keys [id dtype init]}] (local-value id dtype init)) locals))
+
 (defn result-storage
   "Ordered physical storage contracts for an equation's functional results.
 
@@ -249,7 +302,7 @@
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]
   (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
-        parameters (vec (second lambda))
+        parameters (:parameters (lambda-parts lambda))
         accumulator-count (if (contains? #{'reduce 'scan} kind)
                             (count (:accumulators attributes)) 0)
         array-count (count arrays)
@@ -271,7 +324,7 @@
   [equation]
   (let [[_ equation-id results operation] equation
         {:keys [kind attributes arrays captures lambda]} (operation-parts equation)
-        [_ parameters body-results] lambda
+        {:keys [parameters locals body-results]} (lambda-parts lambda)
         result-count (count results)]
     (when-not (distinct-vector? results)
       (fail! :typed-soac-equation-results "SOAC equation results must be distinct"
@@ -296,6 +349,31 @@
     (when-not (every? symbol? parameters)
       (fail! :typed-soac-lambda-parameters "SOAC lambda parameters must be symbols"
              {:equation equation-id :parameters parameters}))
+    (let [local-ids (mapv :id locals)
+          lexical-ids (vec (concat parameters local-ids))]
+      (when-not (= (count lexical-ids) (count (distinct lexical-ids)))
+        (fail! :typed-soac-region-binders
+               "scalar-region parameters and local SSA definitions must be distinct"
+               {:equation equation-id :parameters parameters :locals local-ids}))
+      (when (and (contains? #{'map 'reduce 'scan} kind)
+                 (some #{(:index attributes)} local-ids))
+        (fail! :typed-soac-region-binders
+               "a scalar-region local cannot shadow its operation index"
+               {:equation equation-id :index (:index attributes) :locals local-ids})))
+    (doseq [{:keys [dtype] :as local} locals]
+      ;; Region locals are currently materialized as typed JVM scalar bindings before the common
+      ;; CPU/GPU scalar emitters see them. Reuse the compiler's authoritative dtype facets here;
+      ;; accepting :half or an unknown keyword would only fail later in target lowering.
+      (when-not (and (dtype/known? dtype)
+                     (= dtype (dtype/canon dtype))
+                     (:scalar-tag (dtype/info dtype)))
+        (fail! :typed-soac-local-dtype
+               "scalar-region locals require a supported JVM scalar dtype"
+               {:equation equation-id :local local :dtype dtype})))
+    (when (and (seq locals) (not= 'map kind))
+      (fail! :typed-soac-region-operation
+             "typed local SSA is currently admitted only in map scalar regions"
+             {:equation equation-id :operation kind :locals locals}))
     (when-not (= result-count (count body-results))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
              {:equation equation-id :results result-count :body-results (count body-results)}))
@@ -312,14 +390,23 @@
                 :actual (count parameters)
                 :arrays arrays
                 :captures captures})))
-    (doseq [body body-results
-            :let [bound (cond-> (set parameters)
+    (let [initial-bound (cond-> (set parameters)
                           (contains? #{'map 'reduce 'scan} kind) (conj (:index attributes)))
-                  unbound (util/free-syms body bound)]
-            :when (seq unbound)]
-      (fail! :typed-soac-unbound-scalar
-             "scalar regions may reference only their explicit lambda parameters"
-             {:equation equation-id :unbound unbound :body body}))
+          final-bound
+          (reduce (fn [bound {:keys [id init] :as local}]
+                    (let [unbound (util/free-syms init bound)]
+                      (when (seq unbound)
+                        (fail! :typed-soac-unbound-local
+                               "local SSA initializers may reference only parameters and earlier locals"
+                               {:equation equation-id :local local :unbound unbound}))
+                      (conj bound id)))
+                  initial-bound locals)]
+      (doseq [body body-results
+              :let [unbound (util/free-syms body final-bound)]
+              :when (seq unbound)]
+        (fail! :typed-soac-unbound-scalar
+               "scalar-region results may reference only parameters and local SSA values"
+               {:equation equation-id :unbound unbound :body body})))
     (case kind
       scalar
       (when-not (= result-count (count (:dtypes attributes)))

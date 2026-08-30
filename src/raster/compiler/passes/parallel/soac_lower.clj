@@ -31,6 +31,19 @@
 (declare lower-scan-description)
 (declare scan-kernel-graph-description)
 
+(defn- materialize-region-locals
+  [locals body]
+  (if (seq locals)
+    (list 'let*
+          (vec
+           (mapcat (fn [{:keys [id dtype init]}]
+                     (let [tag (dtype/scalar-tag-for-dtype dtype)]
+                       [(with-meta id {:raster.type/tag tag})
+                        (list tag init)]))
+                   locals))
+          body)
+    body))
+
 (defn typed-map-program?
   "Whether a validated one-equation TypedSOAC program is a map accepted by SegMap lowering."
   [program]
@@ -53,7 +66,7 @@
     (let [equation (first (soac-dialect/equations program))
           [_ equation-id results operation] equation
           [_ attributes arrays captures lambda] operation
-          [_ _ body-results] lambda
+          {:keys [locals body-results]} (soac-dialect/lambda-parts lambda)
           {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
           _ (when-not (and (seq results)
                            (= (count results) (count body-results)))
@@ -66,6 +79,11 @@
                 (map (fn [parameter array]
                        [parameter (list 'clojure.core/aget array index)])
                      elements arrays))
+          locals (mapv #(update % :init
+                                (fn [init]
+                                  (-> (util/subst-syms substitutions init)
+                                      par/expand-par-forms)))
+                       locals)
           bodies (mapv #(-> (util/subst-syms substitutions %)
                             par/expand-par-forms)
                        body-results)
@@ -80,9 +98,11 @@
                     (list 'clojure.core/aset secondary-result index
                           (list cast secondary-body))))
                 (rest results) (rest physical-results) (rest bodies))
-          body (if (seq secondary-stores)
-                 (list* 'do (concat secondary-stores [(first bodies)]))
-                 (first bodies))
+          body (materialize-region-locals
+                locals
+                (if (seq secondary-stores)
+                  (list* 'do (concat secondary-stores [(first bodies)]))
+                  (first bodies)))
           stable-array-captures (set (get-in attributes
                                              [:attributes :stable-array-captures]))
           scalar-captures (set (remove stable-array-captures captures))
@@ -121,7 +141,7 @@
     (let [equation (first (soac-dialect/equations program))
           [_ equation-id results operation] equation
           [_ attributes arrays captures lambda] operation
-          [_ _ body-results] lambda
+          {:keys [body-results]} (soac-dialect/lambda-parts lambda)
           {:keys [accumulators elements capture-parameters]}
           (soac-dialect/parameter-layout equation)
           _ (when-not (and (= 1 (count results))
@@ -175,7 +195,7 @@
   (let [equation (first (soac-dialect/equations program))
         [_ equation-id results operation] equation
         [_ attributes arrays captures lambda] operation
-        [_ _ body-results] lambda
+        {:keys [body-results]} (soac-dialect/lambda-parts lambda)
         {:keys [accumulators elements capture-parameters]}
         (soac-dialect/parameter-layout equation)
         facts (soac-dialect/facts program)

@@ -50,6 +50,15 @@
    (do (ra/aset y i (float (* (ra/aget x i) 2.0)))
        (ra/aset labels i (int (+ (int (ra/aget q i)) 7))))))
 
+(deftm ocl-session-effect-shared-local
+  [x :- (Array float) a :- (Array float) b :- (Array float) n :- Long] :- Void
+  (raster.par/map-void!
+   i n
+   (let [shifted (float (+ (ra/aget x i) 1.0))
+         squared (float (* shifted shifted))]
+     (ra/aset a i shifted)
+     (ra/aset b i squared))))
+
 (deftm ocl-session-contract
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
@@ -168,6 +177,30 @@
               ^ints actual-labels (get result 'labels)]
           (is (= (float (* 2.0 (aget x 256))) (aget actual-y 256)))
           (is (= (+ 7 (int (aget q 256))) (aget actual-labels 256))))
+        (finally (gpu/close-session! session))))))
+
+(deftest ocl-resident-typed-region-ssa-shares-tuple-work
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed scalar-region SSA")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-effect-shared-local
+                                             :ocl:0 :dtype :float)
+          source (get-in descriptor [:steps 0 :artifact :source])
+          n 513
+          x (float-array (map float (range n)))
+          a (float-array n)
+          b (float-array n)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= :segmap (get-in descriptor [:steps 0 :artifact :provenance :dialect])))
+        (is (= 1 (count (re-seq #"x\[idx\]" source)))
+            "the live kernel computes its shared tuple producer once")
+        (let [program (fixture/instantiate! session descriptor [x a b n]
+                                            {'x :input 'a :output 'b :output})
+              result (fixture/run! program [x a b n])
+              ^floats actual-a (get result 'a)
+              ^floats actual-b (get result 'b)]
+          (is (= 513.0 (double (aget actual-a 512))))
+          (is (= (* 513.0 513.0) (double (aget actual-b 512)))))
         (finally (gpu/close-session! session))))))
 
 (deftest ocl-resident-typed-scan-runs-through-the-compiled-graph-step

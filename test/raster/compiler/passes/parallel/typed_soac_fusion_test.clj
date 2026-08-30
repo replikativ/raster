@@ -57,24 +57,26 @@
   (let [{:keys [legacy-result typed-result typed-stats]}
         (differential-fusion horizontal-map-pairs '[u v])
         equation (first (dialect/equations typed-result))
-        lambda (nth (nth equation 3) 4)]
+        lambda (nth (nth equation 3) 4)
+        region (dialect/lambda-parts lambda)]
     (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
     (is (= {:vertical 0 :horizontal 1 :iterations 2} typed-stats))
     (is (= '[u v] (nth equation 2)))
     (is (= '[%element0 %element1] (second lambda)))
-    (is (= '[(* %element0 2.0) (+ %element1 1.0)] (nth lambda 2)))))
+    (is (= '[(* %element0 2.0) (+ %element1 1.0)] (:body-results region)))))
 
 (deftest captured-map-fusion-matches-current-graph
   (let [{:keys [legacy-result typed-result typed-stats]}
         (differential-fusion captured-map-map-pairs '[z])
         equation (first (dialect/equations typed-result))
         operation (nth equation 3)
-        lambda (nth operation 4)]
+        lambda (nth operation 4)
+        region (dialect/lambda-parts lambda)]
     (is (= (dialect/equations legacy-result) (dialect/equations typed-result)))
     (is (= {:vertical 1 :horizontal 0 :iterations 2} typed-stats))
     (is (= '[bias scale] (nth operation 3)))
     (is (= '[%element0 %capture0 %capture1] (second lambda)))
-    (is (= '[(+ (* %element0 %capture1) %capture0)] (nth lambda 2)))))
+    (is (= '[(+ (* %element0 %capture1) %capture0)] (:body-results region)))))
 
 (deftest current-graph-rewrites-the-canonical-reduction-region
   (let [pairs [['tmp '(raster.par/map! tmp i n float (* (aget x i) 2.0))]
@@ -106,6 +108,28 @@
                                                {:outputs '[z] :dtype :float})
         facts (assoc-in (dialect/facts program) [:equations 0 :aliases] {'y 'x})
         program (dialect/make facts (dialect/equations program) (dialect/outputs program))
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
+
+(deftest local-ssa-equations-decline-fusion-until-region-composition-is-proved
+  (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
+        program (adapter/legacy-nodes->program (:nodes legacy-graph)
+                                               {:outputs '[z] :dtype :float})
+        equations (dialect/equations program)
+        producer (first equations)
+        operation (dialect/operation-parts producer)
+        {:keys [parameters body-results]} (dialect/lambda-parts (:lambda operation))
+        producer (list '= (second producer) (nth producer 2)
+                       (list 'map (:attributes operation) (:arrays operation)
+                             (:captures operation)
+                             (dialect/lambda-form
+                              parameters
+                              [(dialect/local-value 'shared :float (first body-results))]
+                              '[shared])))
+        program (dialect/make (dialect/facts program)
+                              (assoc equations 0 producer)
+                              (dialect/outputs program))
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
@@ -159,13 +183,14 @@
            :effects #{:memory/read}})
          [(list '= 'left '[left-value]
                 (list 'map {:index 'i :extent 'n} '[x] []
-                      (list 'lambda '[x-element] '[(* x-element 2.0)])))
+                      (dialect/lambda-form '[x-element] '[(* x-element 2.0)])))
           (list '= 'middle '[middle-value]
                 (list 'map {:index 'i :extent 'n} '[z] []
-                      (list 'lambda '[z-element] '[(+ z-element 1.0)])))
+                      (dialect/lambda-form '[z-element] '[(+ z-element 1.0)])))
           (list '= 'right '[right-value]
                 (list 'map {:index 'i :extent 'n} '[middle-value] []
-                      (list 'lambda '[middle-element] '[(* middle-element 3.0)])))]
+                      (dialect/lambda-form '[middle-element]
+                                           '[(* middle-element 3.0)])))]
          '[left-value right-value])
         [result stats] (typed-fusion/fusion-fixpoint program)]
     (is (= program result))

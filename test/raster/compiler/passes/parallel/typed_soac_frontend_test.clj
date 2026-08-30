@@ -143,6 +143,31 @@
         (is (= [] (dialect/outputs program))
             "the host nil result is not mislabeled as a tensor result")))))
 
+(deftest typed-shared-locals-become-one-region-ssa-spine
+  (let [expression
+        '(raster.par/map-void!
+          i n
+          (let* [^float shifted (+ (clojure.core/aget x i) 1.0)
+                 ^float squared (* shifted shifted)]
+                (clojure.core/aset a i (float shifted))
+                (clojure.core/aset b i (float squared))))
+        program (frontend/form->program
+                 (list 'let* ['effect expression] 'effect)
+                 {:dtype :float :array-types {'x :float 'a :float 'b :float}})
+        equation (first (dialect/equations program))
+        {:keys [locals body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= [{:id 'rstr_local_0 :dtype :float
+             :init '(+ %element0 1.0)}
+            {:id 'rstr_local_1 :dtype :float
+             :init '(* rstr_local_0 rstr_local_0)}]
+           locals))
+    (is (= '[(float rstr_local_0) (float rstr_local_1)] body-results))
+    (is (= '[n x] (:inputs (dialect/facts program))))
+    (is (not-any? #{'rstr_local_0 'rstr_local_1}
+                  (keys (:values (dialect/facts program))))
+        "region-local SSA values are lexical, not fake program inputs")))
+
 (deftest ordered-or-nonpointwise-void-bodies-decline-the-functional-tuple-map
   (doseq [[label body]
           [["one destination written twice"
@@ -151,11 +176,15 @@
            ["a later store observes an earlier sibling write"
             '(do (clojure.core/aset a i (float (clojure.core/aget x i)))
                  (clojure.core/aset b i (float (clojure.core/aget a i))))]
-           ["shared local computation has no tuple-region SSA representation yet"
+           ["a typed local cannot hide a sibling destination dependency"
+            '(let* [^float observed (clojure.core/aget a i)]
+                   (clojure.core/aset a i (float (clojure.core/aget x i)))
+                   (clojure.core/aset b i (float observed)))]
+           ["an untyped shared local cannot enter a typed region"
             '(let* [v (+ (clojure.core/aget x i) 1.0)]
                    (clojure.core/aset a i (float v))
                    (clojure.core/aset b i (float (* v v))))]
-           ["transitively shared local computation also declines"
+           ["transitively shared locals without retained types also decline"
             '(let* [u (+ (clojure.core/aget x i) 1.0)
                     v (* u 2.0)]
                    (clojure.core/aset a i (float v))

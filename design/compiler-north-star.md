@@ -119,10 +119,15 @@ its caller-owned destination, access mode, and host-return contract. The effect 
 retains its real `nil` host semantics instead of masquerading as a tensor result. The scheduled
 SegMap and its ordered ABI are consumed by staged and resident compilation; unsupported raw
 map-void bodies retain the compatibility generator. The front end refuses duplicate destinations,
-scatter indices, sibling write/read ordering, atomics, and shared local bindings whose projection
-would duplicate computation. The last case needs local SSA inside tuple scalar regions, not source
-substitution. Flat resident `deftm` signatures provide their declared per-buffer dtypes before
-fusion, so a mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
+scatter indices, sibling write/read ordering, and atomics. Shared scalar work now remains one
+explicit ordered local-SSA spine inside the tuple map's scalar region; each definition has a dtype
+retained from walker/TypedClojure facts, and local binders never become fake program inputs.
+Validation proves definition order and lexical closure, and the front end expands locals only for
+dependency analysis so a local cannot hide sibling write/read ordering. JVM and GPU lowering both
+materialize the same typed spine once around all tuple results. Fusion currently leaves
+local-bearing regions intact until region composition is proved, rather than duplicating their
+work. Flat resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
+mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
 
 The first architectural correction is therefore:
 
@@ -430,13 +435,16 @@ reconstructed from arbitrary source forms. Conceptually:
    :values {%x x-value %y y-value %z z-value}}
   [(= map-0 [%y]
       (map {:index %i :extent %n} [%x] []
-           (lambda [%xi] [(* %xi %xi)])))
+           (lambda [%xi]
+             (region [(let-value %squared :float (* %xi %xi))]
+                     [%squared]))))
    (= reduce-0 [%z]
       (reduce {:index %i :extent %n
                :accumulators [%acc] :identities [0.0]
                :dtypes [:float] :algebra [{:associative? true}]}
               [%y] []
-              (lambda [%acc %yi] [(+ %acc %yi)])))]
+              (lambda [%acc %yi]
+                (region [] [(+ %acc %yi)]))))]
   [%z])
 ```
 
@@ -841,9 +849,11 @@ The immediate continuation after the verified double-buffered weighted-reduction
    destinations lower to one physical `:inout` ABI result and execute through both resident and
    staged binding without an aliased compatibility input. Independent effect-only tuple maps also
    carry an ordered logical-result-to-physical-storage contract and compile through their scheduled
-   SegMap on resident OpenCL execution. Hardware-costed
+   SegMap on resident OpenCL execution. Their shared typed scalar computations use one explicit
+   ordered local-SSA region that lowers once through JVM and GPU paths; fusion declines those
+   regions until composition is proved. Hardware-costed
    multi-consumer fusion, nested-region JVM
-   scheduling, local SSA for shared multi-result scalar regions, indexed/scatter operations, the
+   scheduling, local-region fusion, indexed/scatter operations, the
    remaining parallel forms, and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a

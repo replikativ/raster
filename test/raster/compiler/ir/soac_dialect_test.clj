@@ -27,7 +27,7 @@
       :effects effects})
     [(list '= 'map-0 '[y]
            (list 'map {:index 'i :extent 'n} '[x] []
-                 (list 'lambda '[x-element] [body])))]
+                 (dialect/lambda-form '[x-element] [body])))]
     '[y])))
 
 (deftest typed-soac-is-a-pattern-declared-recursive-dialect
@@ -45,8 +45,8 @@
                  {:destination 'b :access :read-write :host-return :effect}]
         equation (list '= 'map-0 [left right]
                        (list 'map {:index 'i :extent 'n} '[x b] []
-                             (list 'lambda '[x-element b-element]
-                                   '[x-element (+ b-element 1.0)])))
+                             (dialect/lambda-form '[x-element b-element]
+                                                  '[x-element (+ b-element 1.0)])))
         equation-facts (assoc (dialect/default-equation-facts)
                               :effects #{:memory/write}
                               :aliases {left 'a right 'b}
@@ -90,6 +90,67 @@
         (catch clojure.lang.ExceptionInfo exception
           (is (= :typed-soac-result-storage-value (:reason (ex-data exception)))))))))
 
+(deftest scalar-region-locals-are-explicit-typed-and-ordered-ssa
+  (let [equation
+        (list '= 'map-0 '[y]
+              (list 'map {:index 'i :extent 'n} '[x] []
+                    (dialect/lambda-form
+                     '[element]
+                     [(dialect/local-value 'shifted :float '(+ element 1.0))
+                      (dialect/local-value 'squared :float '(* shifted shifted))]
+                     '[squared])))
+        facts (dialect/default-program-facts
+               {:values {'n extent 'x tensor 'y tensor}
+                :inputs '[n x]
+                :equations {'map-0 (dialect/default-equation-facts)}})
+        program (dialect/make facts [equation] '[y])
+        parts (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= [{:id 'shifted :dtype :float :init '(+ element 1.0)}
+            {:id 'squared :dtype :float :init '(* shifted shifted)}]
+           (:locals parts)))
+    (is (= program (dialect/validate! program)))
+    (testing "a local initializer cannot read a later SSA definition"
+      (let [bad-equation
+            (list '= 'map-0 '[y]
+                  (list 'map {:index 'i :extent 'n} '[x] []
+                        (dialect/lambda-form
+                         '[element]
+                         [(dialect/local-value 'shifted :float '(+ squared 1.0))
+                          (dialect/local-value 'squared :float '(* element element))]
+                         '[shifted])))]
+        (try
+          (dialect/make facts [bad-equation] '[y])
+          (is false "use-before-definition inside a region must fail")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-unbound-local (:reason (ex-data exception))))))))
+    (testing "a local cannot shadow a lambda parameter"
+      (let [bad-equation
+            (list '= 'map-0 '[y]
+                  (list 'map {:index 'i :extent 'n} '[x] []
+                        (dialect/lambda-form
+                         '[element]
+                         [(dialect/local-value 'element :float '(+ element 1.0))]
+                         '[element])))]
+        (try
+          (dialect/make facts [bad-equation] '[y])
+          (is false "lexical SSA binders must be unique")
+          (catch clojure.lang.ExceptionInfo exception
+            (is (= :typed-soac-region-binders (:reason (ex-data exception))))))))
+    (testing "a local dtype is checked against the authoritative dtype facets"
+      (doseq [unsupported [:made-up :half :f32]]
+        (let [bad-equation
+              (list '= 'map-0 '[y]
+                    (list 'map {:index 'i :extent 'n} '[x] []
+                          (dialect/lambda-form
+                           '[element]
+                           [(dialect/local-value 'local unsupported '(+ element 1.0))]
+                           '[local])))]
+          (try
+            (dialect/make facts [bad-equation] '[y])
+            (is false "unsupported scalar-region dtype must fail at the IR boundary")
+            (catch clojure.lang.ExceptionInfo exception
+              (is (= :typed-soac-local-dtype (:reason (ex-data exception)))))))))))
+
 (deftest scan-mode-has-a-distinct-typed-and-effectful-contract
   (let [out (av/tensor {:dtype :float :shape '[(unknown-dimension out)]})
         algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(float 0.0) :float)
@@ -111,8 +172,8 @@
                                :dtypes [:float] :algebra [algebra]
                                :attributes {:stable-array-captures '[out]}}
                               '[x] '[out]
-                              (list 'lambda '[acc element destination]
-                                    '[(+ acc element)])))]
+                              (dialect/lambda-form '[acc element destination]
+                                                   '[(+ acc element)])))]
                  '[result])
         equation (first (dialect/equations program))]
     (is (= program (dialect/validate! program)))
@@ -155,10 +216,10 @@
                        'map-0 (dialect/default-equation-facts)}})
          [(list '= 'shape '[n]
                 (list 'scalar {:dtypes [:long]} '[x]
-                      (list 'lambda '[array] '[(clojure.core/alength array)])))
+                      (dialect/lambda-form '[array] '[(clojure.core/alength array)])))
           (list '= 'map-0 '[y]
                 (list 'map {:index 'i :extent 'n} '[x] []
-                      (list 'lambda '[element] '[(* element 2.0)])))]
+                      (dialect/lambda-form '[element] '[(* element 2.0)])))]
          '[y])
         scalar-equation (first (dialect/equations program))]
     (is (= program (dialect/validate! program)))
@@ -180,8 +241,9 @@
                 (list 'map {:index 'i :extent 'n
                             :attributes {:stable-array-captures '[weights]}}
                       '[x] '[weights]
-                      (list 'lambda '[element weights-value]
-                            '[(+ element (clojure.core/aget weights-value i))])))]
+                      (dialect/lambda-form
+                       '[element weights-value]
+                       '[(+ element (clojure.core/aget weights-value i))])))]
          '[y])
         remapped (dialect/remap-values program
                                        {'weights [:argument :weights]
@@ -253,10 +315,10 @@
         equations
         [(list '= 'use-a '[b]
                (list 'map {:index 'i :extent 'n} '[a] []
-                     (list 'lambda '[a-element] '[(* a-element 2.0)])))
+                     (dialect/lambda-form '[a-element] '[(* a-element 2.0)])))
          (list '= 'define-a '[a]
                (list 'map {:index 'i :extent 'n} '[x] []
-                     (list 'lambda '[x-element] '[(* x-element x-element)])))]]
+                     (dialect/lambda-form '[x-element] '[(* x-element x-element)])))]]
     (try
       (dialect/make facts equations '[b])
       (is false "an equation cannot consume a result defined later")
@@ -274,8 +336,8 @@
            :equations {'map-0 (dialect/default-equation-facts)}})
          [(list '= 'map-0 '[y]
                 (list 'map {:index 'i :extent 'n} '[x] [scale-id]
-                      (list 'lambda '[x-element scale]
-                            '[(* x-element scale)])))]
+                      (dialect/lambda-form '[x-element scale]
+                                           '[(* x-element scale)])))]
          '[y])]
     (is (= {:accumulators []
             :elements '[x-element]
@@ -300,7 +362,7 @@
            :equations {'map-0 (dialect/default-equation-facts)}})
          [(list '= 'map-0 '[y]
                 (list 'map {:index 'i :extent extent-id} '[x] []
-                      (list 'lambda '[x-element] '[(* x-element 2.0)])))]
+                      (dialect/lambda-form '[x-element] '[(* x-element 2.0)])))]
          '[y])]
     (is (= [(list 'value extent-id)] (:shape (get-in (dialect/facts program)
                                                      [:values 'x]))))))
@@ -315,7 +377,7 @@
            :equations {'map-0 (dialect/default-equation-facts)}})
          [(list '= 'map-0 '[y]
                 (list 'map {:index 'i :extent 8} '[x] []
-                      (list 'lambda '[x-element] '[(* x-element 2.0)])))]
+                      (dialect/lambda-form '[x-element] '[(* x-element 2.0)])))]
          '[y])
         remapped (dialect/remap-values program {'x [:argument 0] 'y [:result 0]})
         equation (first (dialect/equations remapped))]
