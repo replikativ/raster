@@ -18,6 +18,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [clojure.string :as str]
             [raster.compiler.ir.kernel-artifact :as kart]
+            [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.segop-lower-pass :as slp]
             [raster.compiler.ir.parallel-program :as program]
@@ -37,7 +38,8 @@
     (testing "facts are the payload, derived once"
       (is (= '[[i 128] [j 128]] (:free-axes (:facts n))))
       (is (= '[[l 128]] (:contract-axes (:facts n))))
-      (is (= '[A B] (mapv :sym (:operands (:facts n))))))
+      (is (= '[A B] (mapv :sym (:operands (:facts n)))))
+      (is (reduction/product-reduction? (:reduction (:facts n)))))
     (testing "graph projections derive from the facts"
       (is (= '#{A B} (soac/soac-inputs n)))
       (is (= '#{C} (soac/soac-outputs n))))

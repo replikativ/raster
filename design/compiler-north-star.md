@@ -314,6 +314,14 @@ contains only values, output indices, row count and width; ties select the lowes
 NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
 multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
 
+Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
+and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
+one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;
+`SegContract`, generic `SegRed` fallback and peak routing consume those facts unchanged. Free axes,
+operand axis maps, decode/storage precision, epilogues and staged accumulator structure remain
+orthogonal contraction facts and schedule choices. This is the semantic bridge toward representing
+contraction as an ordinary segmented TypedSOAC reduction, not a new hard-coded GEMM algebra.
+
 Indexed storage movement remains a separate generic operation. Allocation-free `gather-blocks!`
 and `scatter-blocks!` move contiguous typed blocks between dense staging and routed resident
 storage through the direct TypedSOAC→SegMap vertical: gather is a stable indexed read in a dense

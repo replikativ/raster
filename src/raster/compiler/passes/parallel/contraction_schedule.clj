@@ -276,8 +276,9 @@
    (when-not (facts/facts? contract-facts)
      (throw (ex-info "contraction scheduling requires verified contraction facts"
                      {:reason :raster/bug :facts contract-facts})))
-   (let [{:keys [dtype free-axes contract-axes body combine init operands epilogue]}
+   (let [{:keys [dtype free-axes contract-axes operands epilogue]}
          contract-facts
+         {:keys [element combine neutral]} (facts/scalar-reduction-view contract-facts)
          authoritative-desc? (and desc (or (:backend desc) (:execution desc)))
          matrix-capability-unavailable? (and authoritative-desc? (nil? (:matrix desc)))
          raw-tile (when-not matrix-capability-unavailable?
@@ -310,10 +311,10 @@
        (not (additive? combine))
        (decline :non-plus-combine {:combine combine})
 
-       (not (zero-init? init))
-       (decline :non-zero-matrix-init {:init init})
+       (not (zero-init? neutral))
+       (decline :non-zero-matrix-init {:init neutral})
 
-       (nil? (facts/body-product-of body (map :sym operands)))
+       (nil? (facts/body-product-of element (map :sym operands)))
        (decline :body-has-unmodeled-terms)
 
        (not (:ok layout-verdict))

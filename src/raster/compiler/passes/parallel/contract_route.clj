@@ -294,7 +294,7 @@
         (let [;; The staged emitter hardwires `+=` at every level, and a lift's linearity argument
             ;; assumes `+`. A form carrying :combine max routed here and was SILENTLY SUMMED —
             ;; contraction-facts surfaces :combine and nothing read it. Refuse rather than ignore.
-              _ (let [cmb (:combine contract-facts)]
+              _ (let [cmb (:combine (cf/scalar-reduction-view contract-facts))]
                   (when-not (contains? '#{+ clojure.core/+ raster.numeric/+} cmb)
                     (throw (ex-info (str "staged contraction: only `+` combine is supported (got "
                                          cmb ") — every accumulator level uses += and a lift's "
@@ -344,7 +344,7 @@
       ;; Its launch protocol differs (two phases + a host-side final combine), so the descriptor
       ;; says so with :invoke :reduction rather than pretending it is a 2-D kernel launch.
         (zero? n-free)
-        (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+        (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
               k (sco/generate-segred-kernel sr out-sym :dtype dtype)
               attrs (:attributes k)
               red-bound (second (first contract-axes))]
@@ -384,7 +384,7 @@
       ;; → naive segmented reduce (general: any dtype, symbolic dims, any assoc combine).
       ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
         :else
-        (let [sr (cl/contract-form->segred contract-form :dtype dtype)
+        (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
               {:keys [kernel-name source array-params scalar-params abi]}
               (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
@@ -474,7 +474,8 @@
   (let [acc (volatile! [])
         note! (fn [d] (vswap! acc conj d) nil)]
     (try
-      (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype))
+      (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype
+                                                  :facts contract-facts))
             scheduled (contraction-schedule/plan-matrix-body contract-facts desc tile
                                                              {:operation-id operation-id})
             dpas (if (:ok scheduled)

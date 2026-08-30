@@ -93,16 +93,17 @@
     (is (= '[A B] (:array-params routed)))))
 
 (deftest production-lowering-preserves-the-semantic-operation-identity
-  (let [contract (matrix-form 128 128 128)
-        source (list 'let* ['c contract] 'c)
-        lowered (:form (segop-lower/segop-lower-pass
-                        source {:target-device :ze:0 :dtype :half}))
-        semantic-operation (first (program/operations-for-binding lowered 'c contract))
-        compiled (opencl/opencl-pass lowered :dtype :half :min-elements 0)
-        kernel (artifact/attribute (first (:kernels compiled)) :kernel-body)]
-    (is (some? semantic-operation))
-    (is (= [:contraction (:id semantic-operation)] (:id kernel)))
-    (is (= (:id semantic-operation) (get-in kernel [:provenance :operation-id])))))
+  (with-redefs [hardware/descriptor-for (constantly nil)]
+    (let [contract (matrix-form 128 128 128)
+          source (list 'let* ['c contract] 'c)
+          lowered (:form (segop-lower/segop-lower-pass
+                          source {:target-device :ze:0 :dtype :half}))
+          semantic-operation (first (program/operations-for-binding lowered 'c contract))
+          compiled (opencl/opencl-pass lowered :dtype :half :min-elements 0)
+          kernel (artifact/attribute (first (:kernels compiled)) :kernel-body)]
+      (is (some? semantic-operation))
+      (is (= [:contraction (:id semantic-operation)] (:id kernel)))
+      (is (= (:id semantic-operation) (get-in kernel [:provenance :operation-id]))))))
 
 (deftest kernel-body-lowering-shadows-the-proven-dpas-oracle
   (let [form (matrix-form 128 128 128)
@@ -182,15 +183,16 @@
 
 (deftest opencl-consumes-the-resolved-contraction-tile
   (let [tile (assoc (hardware/derive-gemm-tile {})
-                    :block-m 64 :block-n 64 :num-stages 2)
-        compiled (opencl/opencl-pass (matrix-form 128 128 128)
-                                     :dtype :half :min-elements 0
-                                     :schedule {:tile tile})
-        artifact (first (:kernels compiled))
-        kernel (artifact/attribute artifact :kernel-body)]
-    (is (= tile (:schedule kernel)))
-    (is (= [64 64] ((juxt :block-m :block-n) (:schedule kernel))))
-    (is (= 2 (get-in kernel [:schedule :num-stages])))
-    (is (re-find #"WG 64x64" (:source artifact)))
-    (is (re-find #"\+ 32;" (:source artifact))
-        "num-stages=2 changes the K16 prefetch distance to 32")))
+                    :block-m 64 :block-n 64 :num-stages 2)]
+    (with-redefs [hardware/descriptor-for (constantly nil)]
+      (let [compiled (opencl/opencl-pass (matrix-form 128 128 128)
+                                         :dtype :half :min-elements 0
+                                         :schedule {:tile tile})
+            artifact (first (:kernels compiled))
+            kernel (artifact/attribute artifact :kernel-body)]
+        (is (= tile (:schedule kernel)))
+        (is (= [64 64] ((juxt :block-m :block-n) (:schedule kernel))))
+        (is (= 2 (get-in kernel [:schedule :num-stages])))
+        (is (re-find #"WG 64x64" (:source artifact)))
+        (is (re-find #"\+ 32;" (:source artifact))
+            "num-stages=2 changes the K16 prefetch distance to 32")))))
