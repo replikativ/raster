@@ -160,6 +160,17 @@
              (:pointer-bindings
               (kabi/validate-split-binding! abi [:x-in :other :x-out] [])))))))
 
+(deftest access-kind-and-semantic-role-are-orthogonal
+  (let [slot (kabi/slot 'state :inout :float :c-name "out" :role :result)
+        abi [slot (kabi/slot '_n_bound :scalar :int :role :bound)]]
+    (is (= abi (kabi/validate! abi)))
+    (is (= :read-write (kabi/slot-access slot)))
+    (is (kabi/readable? slot))
+    (is (kabi/writable? slot))
+    (is (= '[state] (kabi/pointer-binding-names abi)))
+    (is (= '[state]
+           (:pointer-bindings (kabi/validate-split-binding! abi [:state] []))))))
+
 (deftest ordered-reduction-binding-is-derived-from-roles
   (let [abi [(kabi/slot 'x :input :float :role :operand)
              (kabi/slot 'out :output :float :role :result)

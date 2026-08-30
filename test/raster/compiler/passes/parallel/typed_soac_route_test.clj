@@ -58,6 +58,47 @@
       (is (nil? (get-in emitted [:stats :segop-relowered])))
       (is (= 1 (get-in emitted [:stats :ze-maps]))))))
 
+(deftest destination-read-lowers-to-one-inout-result-slot
+  (let [source '(raster.par/map! target i n float
+                                 (+ (clojure.core/aget target i) 1.0))
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'target :float}})
+        equation (first (:equations form))
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                         :dtype :float :min-elements 0)
+        artifact (first (:kernels emitted))
+        pointer-slots (filterv #(not= :scalar (:kind %)) (:abi artifact))]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= :read-write (get-in equation [:attributes :destination-access])))
+    (is (= ['target] (mapv :name pointer-slots)))
+    (is (= [:inout] (mapv :kind pointer-slots)))
+    (is (= [:result] (mapv :role pointer-slots)))
+    (is (= '[target n] (:arguments artifact)))
+    (is (re-find #"inout_result\[idx\]" (:source artifact))
+        "the scalar-region read is projected through the sole result parameter")
+    (is (some #{'raster.gpu.ocl-runtime/invoke-registered-kernel}
+              (tree-seq coll? seq (:form emitted))))
+    (is (not (some #{'raster.gpu.ze-runtime/invoke-registered-kernel}
+                   (tree-seq coll? seq (:form emitted))))
+        "an OpenCL program must not leak a Level Zero staging call")))
+
+(deftest typed-inout-preserves-sequential-jvm-semantics
+  (let [source '(let* [step (raster.par/map! target i n float
+                                             (* (clojure.core/aget target i) 2.0))]
+                      step)
+        typed (:program (route/attempt source :float {'target :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[target n] (:form jvm)))
+        target (float-array [1.0 2.0 3.0 4.0])
+        result (execute target 4)]
+    (is (identical? target result))
+    (is (= [2.0 4.0 6.0 8.0] (mapv double result)))
+    (is (= 1 (get-in jvm [:stats :segop-reused])))
+    (is (nil? (get-in jvm [:stats :segop-relowered])))))
+
 (deftest gpu-session-scheduling-exposes-each-top-level-do-step
   (let [{:keys [form stats]}
         (pipeline/schedule-parallel-form

@@ -350,13 +350,6 @@
                       {:reason :link-step-interface :phase (:phase step)
                        :convention (:convention step)}))))
 
-(defn- slot-access [{:keys [kind role]}]
-  (cond
-    (= :inout role) :read-write
-    (= :input kind) :read
-    (= :output kind) :write
-    :else nil))
-
 (defn- merge-access [left right]
   (if (= left right) left
       (if (or (= :read-write left) (= :read-write right)
@@ -432,7 +425,7 @@
                                                   :expected (:dtype slot)
                                                   :actual (get-in link-node [:view :dtype])})))
                                {:symbol sym :value value-id :node node
-                                :field name :access (slot-access slot)}))
+                                :field name :access (kabi/slot-access slot)}))
                            slots leaves)]
                       {:symbol sym :value value-id :slots slots :leaves leaves
                        :facts leaf-facts})))

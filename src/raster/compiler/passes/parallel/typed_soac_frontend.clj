@@ -99,13 +99,14 @@
           io (extract-io body idx [out])]
       ;; Offset maps are not pointwise in the result coordinate and require an indexed/scatter
       ;; operation in the typed dialect. A binder with the same spelling as the caller-owned
-      ;; destination also needs distinct value/view identity before it can be SSA. Reading and
-      ;; writing the same destination likewise needs one explicit inout operand, which the current
-      ;; map dialect cannot yet express without duplicating the physical pointer in the kernel ABI.
-      ;; Keep all three forms on the compatibility route rather than inventing false alias facts.
-      (when-not (or offset (= symbol out) (contains? (:inputs io) out))
+      ;; destination also needs distinct value/view identity before it can be SSA. A pointwise read
+      ;; of the destination is an explicit read/write operand; scheduling must retain it as one
+      ;; physical inout value rather than manufacturing separate aliased input/output pointers.
+      (when-not (or offset (= symbol out))
         (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body body
-                :primary-out out :destination-return :buffer :elem-type elem-type}
+                :primary-out out :destination-return :buffer
+                :destination-access (if (contains? (:inputs io) out) :read-write :write)
+                :elem-type elem-type}
                io)))
 
     (par/par-reduce-form? expression)
@@ -524,6 +525,9 @@
                                 (assoc :effects #{:memory/write}
                                        :aliases {(:sym description) destination}
                                        :attributes (cond-> {:destination destination}
+                                                     (:destination-access description)
+                                                     (assoc :destination-access
+                                                            (:destination-access description))
                                                      (:destination-return description)
                                                      (assoc :destination-return
                                                             (:destination-return description)))))]))

@@ -100,6 +100,14 @@ alias, effect and return facts. General recurrences and `scan-exclusive` remain 
 typed operation and must not borrow its reassociation proof. The remaining parallel forms must
 join the direct front end before the old dependency-graph fallback can be deleted.
 
+Pointwise maps that read and write their caller-owned destination stay on this same route. The
+typed equation records read/write destination access, and GPU lowering emits that storage exactly
+once as a `KernelABI` `:inout` pointer with semantic role `:result`. Physical access and functional
+identity are therefore orthogonal: resident and staged binders derive transfers from ABI kind,
+while composition identifies the returned value by role. OpenCL and Level Zero staged maps also
+use target-specific invocation markers selected by the emitter, rather than leaking a Level Zero
+runtime call into an OpenCL program.
+
 The first architectural correction is therefore:
 
 > SOAC, scheduled kernel graph, and kernel IR must be first-class program values,
@@ -813,7 +821,9 @@ The immediate continuation after the verified double-buffered weighted-reduction
    reduction results and certified inclusive scan now share the direct
    analyzed-source→TypedSOAC→SegOp production route. Inclusive scan additionally reaches an emitted
    graph-backed resident executable through ordinary dispatch, LinkPlan and binding, and a generic
-   per-call staging graph runner executes the same registered dispatch. Hardware-costed
+   per-call staging graph runner executes the same registered dispatch. Pointwise read/write map
+   destinations lower to one physical `:inout` ABI result and execute through both resident and
+   staged binding without an aliased compatibility input. Hardware-costed
    multi-consumer fusion, nested-region JVM
    scheduling, the remaining parallel forms (including distinct exclusive-scan semantics), and
    deletion of the remaining graph/backend fallbacks remain.

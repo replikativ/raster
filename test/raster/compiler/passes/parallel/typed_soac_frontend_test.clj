@@ -85,12 +85,18 @@
                                                (+ (clojure.core/aget x i) 1.0))]
                       target)
                {:dtype :float :array-types {'x :float 'target :float}}))))
-  (testing "a read/write destination waits for an explicit single-slot inout role"
-    (is (nil? (frontend/form->program
-               '(let* [step (raster.par/map! target i n float
-                                             (+ (clojure.core/aget target i) 1.0))]
-                      step)
-               {:dtype :float :array-types {'target :float}})))))
+  (testing "a read/write destination is one explicit typed operand"
+    (let [program (frontend/form->program
+                   '(let* [step (raster.par/map! target i n float
+                                                 (+ (clojure.core/aget target i) 1.0))]
+                          step)
+                   {:dtype :float :array-types {'target :float}})
+          equation (first (dialect/equations program))
+          facts (dialect/facts program)]
+      (is (= '[target] (dialect/operation-inputs equation)))
+      (is (= :read-write
+             (get-in facts [:equations 0 :attributes :destination-access])))
+      (is (= '{step target} (get-in facts [:equations 0 :aliases]))))))
 
 (deftest destination-shapes-refine-across-ordered-maps
   (let [program (frontend/form->program

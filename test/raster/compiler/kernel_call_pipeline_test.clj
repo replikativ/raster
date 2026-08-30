@@ -11,6 +11,10 @@
   [x :- (Array float) out :- (Array float) scale :- Float n :- Long] :- (Array float)
   (raster.par/map! out i n float (* scale (ra/aget x i))))
 
+(deftm resident-kernel-call-inout
+  [state :- (Array float) scale :- Float n :- Long] :- (Array float)
+  (raster.par/map! state i n float (* scale (ra/aget state i))))
+
 (deftm resident-kernel-call-reduce
   [x :- (Array float) out :- (Array float) scale :- Double n :- Long] :- Void
   (let [sum (raster.par/reduce acc 0.0 i n
@@ -65,6 +69,20 @@
            (mapv :kind (:argument-specs step))))
     (is (= [256] (get-in call [:geometry :workgroup-size])))
     (is (= [3] (get-in call [:geometry :group-count])))))
+
+(deftest resident-segmap-inout-is-one-physical-result-slot
+  (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-inout
+                                                 :ze:0 :dtype :float)
+        step (first (:steps descriptor))]
+    (is (= :map (:convention step)))
+    (is (= '[state scale _n_bound]
+           (mapv (comp :name :slot) (:argument-specs step))))
+    (is (= [:inout :scalar :scalar]
+           (mapv :kind (:argument-specs step))))
+    (is (= [:result :parameter :bound]
+           (mapv (comp :role :slot) (:argument-specs step))))
+    (is (= {'state :output} (:array-roles descriptor)))
+    (is (= :state (:output step)))))
 
 (deftest resident-segred-schedule-is-an-explicit-kernel-call-override
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-reduce

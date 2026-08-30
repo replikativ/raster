@@ -82,9 +82,20 @@
         ;; positional arg order matches the C signature); an input that is also
         ;; written (read+write buffer) likewise loses const.
         written (set (map #(symbol (name %)) (:outputs segmap)))
-        input-params (vec (sort-by name (:inputs segmap)))
-        input-name-set (set (map #(symbol (name %)) input-params))
         out-name (when out-sym (symbol (name out-sym)))
+        all-input-params (vec (sort-by name (:inputs segmap)))
+        input-name-set (set (map #(symbol (name %)) all-input-params))
+        primary-inout? (contains? input-name-set out-name)
+        ;; The mapped result may also be read pointwise. Keep that physical value in the dedicated
+        ;; result position and rewrite its scalar-region reads to the emitted `out` parameter;
+        ;; passing it once as an input and again as the result violates both ABI identity and C
+        ;; restrict aliasing.
+        input-params (if primary-inout?
+                       (filterv #(not= out-name (symbol (name %))) all-input-params)
+                       all-input-params)
+        result-c-name (if primary-inout? "inout_result" "out")
+        result-symbol (symbol result-c-name)
+        body (if primary-inout? (util/subst-syms {out-sym result-symbol} body) body)
         extra-outs (vec (sort-by name
                                  (remove #(or (= % out-name)
                                               (contains? input-name-set %))
@@ -107,20 +118,21 @@
         scl-param-str (str/join ", "
                                 (map (fn [s] (str (scl-type s) " " (ce/c-symbol s)))
                                      scl-params))
-        out-param (str "__global " out-ctype "* restrict out")
+        out-param (str "__global " out-ctype "* restrict " result-c-name)
         all-params (str/join ", "
                              (remove empty?
                                      [arr-param-str out-param scl-param-str "int _n_bound"]))
         ;; Emit body as C expression
         adapted-body (ce/adapt-casts-for-dtype body out-dtype)
-        arr-sym-set (set (map #(symbol (name %)) arr-params))
+        arr-sym-set (cond-> (set (map #(symbol (name %)) arr-params))
+                      primary-inout? (conj result-symbol))
         body-str (binding [ce/*emit-config* ce/opencl-config
                            ce/*scalar-type* out-ctype
                            ce/*idx-sym* idx
                            ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                    (ce/emit-expr adapted-body idx arr-sym-set))
         cast-str (if cast-fn (str "(" (name cast-fn) ")(" body-str ")") body-str)
-        scalar-body-str (str "out[idx] = " cast-str ";")
+        scalar-body-str (str result-c-name "[idx] = " cast-str ";")
         ;; Affine-index vectorization (shared c_emit): a SegMap store is `out[idx] = f(..)`,
         ;; expressed here as the synthetic aset the vectorizer analyzes. The store target
         ;; is the literal `out` param (not c-symbol-mangled), so pass :store-name. nil ⇒
@@ -130,9 +142,10 @@
                               ce/*idx-sym* idx
                               ce/*int-vars* (into ce/*int-vars* int-scalar-syms)]
                       (ce/emit-vectorized-elementwise-loop
-                       (list 'aset 'out idx (if cast-fn (list cast-fn adapted-body) adapted-body))
-                       idx (conj arr-sym-set 'out) "idx" scalar-body-str
-                       {:n-bound "_n_bound" :store-name "out"}))
+                       (list 'aset result-symbol idx
+                             (if cast-fn (list cast-fn adapted-body) adapted-body))
+                       idx (conj arr-sym-set result-symbol) "idx" scalar-body-str
+                       {:n-bound "_n_bound" :store-name result-c-name}))
         ;; pragmas cover the output dtype AND every input array's dtype
         scalar-dtype (fn [s]
                        (case (scl-type s)
@@ -146,13 +159,16 @@
                           (let [written? (contains? written (symbol (name s)))
                                 extra-output? (and written? (not (contains? input-name-set
                                                                             (symbol (name s)))))]
-                            (kabi/slot s (if extra-output? :output :input) (arr-dtype s)
+                            (kabi/slot s (cond extra-output? :output
+                                               written? :inout
+                                               :else :input)
+                                       (arr-dtype s)
                                        :c-name (ce/c-symbol s)
-                                       :role (cond extra-output? :secondary-result
-                                                   written? :inout
+                                       :role (cond written? :secondary-result
                                                    :else :operand))))
                         arr-params)
-                   [(kabi/slot out-sym :output out-dtype :c-name "out" :role :result)]
+                   [(kabi/slot out-sym (if primary-inout? :inout :output) out-dtype
+                               :c-name result-c-name :role :result)]
                    (map #(kabi/slot % :scalar (scalar-dtype %)
                                     :c-name (ce/c-symbol %) :role :parameter)
                         scl-params)
@@ -735,12 +751,15 @@
                 (mapv (fn [{:keys [buffer access]}]
                         (let [spec (get buffers buffer)
                               output? (contains? #{:write :read-write} access)]
-                          (kabi/slot buffer (if output? :output :input) (:dtype spec)
+                          (kabi/slot buffer (case access
+                                              :read :input
+                                              :write :output
+                                              :read-write :inout)
+                                     (:dtype spec)
                                      :c-name (ce/c-symbol buffer)
                                      :role (cond
                                              (contains? temporary-ids buffer) :temporary
                                              (and output? (contains? output-ids buffer)) :result
-                                             (= :read-write access) :inout
                                              :else :operand))))
                       uses)
                 scalar-slots (mapv #(kabi/slot % :scalar (scalar-dtype %)

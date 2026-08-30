@@ -1060,8 +1060,7 @@
          expanded-entries
          (if abi
            (mapv (fn [entry slot]
-                   (assoc entry :write? (or (= :output (:kind slot))
-                                            (= :inout (:role slot)))))
+                   (assoc entry :write? (kabi/writable? slot)))
                  expanded-entries (kabi/pointer-slots abi))
            expanded-entries)
 
@@ -1110,6 +1109,33 @@
                                (into-array Object [cl-mem]))))
 
      nil)))
+
+(defn invoke-registered-kernel
+  "Pipeline-friendly value-returning map invocation for OpenCL.
+
+   The emitter-authored ABI is still authoritative; this wrapper only projects the compatibility
+   `(inputs, result, scalars, bound)` marker into the existing ordered OpenCL staging path and
+   returns the declared result value."
+  [^String kernel-name input-arrays output-array scalar-args n]
+  (let [registered (or (get @kernel-registry kernel-name)
+                       (throw (ex-info (str "Kernel not registered: " kernel-name)
+                                       {:kernel-name kernel-name
+                                        :registered (keys @kernel-registry)})))
+        abi (or (:abi registered)
+                (throw (ex-info "registered map kernel has no ordered ABI"
+                                {:kernel-name kernel-name :registry-entry registered
+                                 :fallback :none})))
+        arguments (vec (concat input-arrays [output-array] scalar-args [n]))
+        pairs (mapv vector (kabi/validate! abi)
+                    (kabi/validate-arguments! abi arguments))
+        result-pairs (filterv #(= :result (:role (first %))) pairs)]
+    (when-not (= 1 (count result-pairs))
+      (throw (ex-info "map kernel ABI must identify exactly one result"
+                      {:kernel-name kernel-name :result-slots (mapv first result-pairs)})))
+    (invoke-registered-map-void-kernel kernel-name
+                                       (vec (concat input-arrays [output-array]))
+                                       scalar-args n)
+    (second (first result-pairs))))
 
 (defn invoke-registered-scan-exclusive-kernel
   "Invoke Blelloch exclusive scan. Same multi-pass algorithm as ze_runtime.
