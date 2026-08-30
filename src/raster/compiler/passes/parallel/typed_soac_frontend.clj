@@ -359,15 +359,26 @@
           normalized
           (mapcat
            (fn [ordinal [symbol expression]]
-             (let [extent (parallel-extent expression)]
-               (if (and extent
-                        (not (dialect/extent? extent))
-                        (provably-pure-scalar? extent))
+             (let [extent (parallel-extent expression)
+                   canonical-extent (some-> extent descriptor/unwrap-int-cast)]
+               (cond
+                 (nil? extent)
+                 [[symbol expression]]
+
+                 ;; Integral casts are representation noise, not new semantic dimensions.
+                 ;; Keeping their underlying value identity also prevents one array from
+                 ;; acquiring incompatible [n] and [(long n)] shapes across operations.
+                 (dialect/extent? canonical-extent)
+                 [[symbol (replace-parallel-extent expression canonical-extent)]]
+
+                 (provably-pure-scalar? canonical-extent)
                  (let [extent-id (with-meta
                                    (clojure.core/symbol (str "rstr_extent_" ordinal))
                                    {:tag 'long :raster.type/tag 'long})]
-                   [[extent-id extent]
+                   [[extent-id canonical-extent]
                     [symbol (replace-parallel-extent expression extent-id)]])
+
+                 :else
                  [[symbol expression]])))
            (range) pairs)]
       (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
