@@ -164,7 +164,7 @@
             (lower-reduce node device-id :dtype accumulator-dtype)))))
 
 (defn typed-scan-program?
-  "Whether a validated one-equation TypedSOAC program is a certified inclusive scan."
+  "Whether a validated one-equation TypedSOAC program is a certified scan."
   [program]
   (and (soac-dialect/program-form? program)
        (= 1 (count (soac-dialect/equations program)))
@@ -182,7 +182,7 @@
         destination (get-in facts [:equations equation-id :attributes :destination])
         _ (when-not (and (= 1 (count results)) (= 1 (count accumulators))
                          (= 1 (count body-results)) destination)
-            (throw (ex-info "typed inclusive scan requires one result, accumulator and destination"
+            (throw (ex-info "typed scan requires one result, accumulator and destination"
                             {:reason :typed-soac-scan-subset :equation equation-id
                              :results results :accumulators accumulators
                              :destination destination})))
@@ -205,6 +205,7 @@
      :init (first (:identities attributes))
      :lambda (util/subst-syms substitutions (first body-results))
      :algebra algebra
+     :mode (:mode attributes)
      :bound (:extent attributes)
      :idx index
      :inputs (into (set arrays) (disj stable destination))
@@ -213,7 +214,7 @@
      :elem-type scan-dtype}))
 
 (defn lower-typed-scan
-  "Lower one certified TypedSOAC inclusive scan without reconstructing the legacy SOAC record IR.
+  "Lower one certified TypedSOAC scan without reconstructing the legacy SOAC record IR.
 
    Returns both ordered SegOps and their KernelGraph because temporary storage and dependencies are
    properties of the selected schedule, not of the functional scan equation."
@@ -456,7 +457,8 @@
   (let [dtype (or (:elem-type description) dtype)
         bound (:bound description)
         idx (:idx description)
-        raw-scan-op (select-keys description [:acc :init :lambda :out])
+        mode (or (:mode description) :inclusive)
+        raw-scan-op (assoc (select-keys description [:acc :init :lambda :out]) :mode mode)
         map-lambda (:map-lambda description)
         _ (when map-lambda
             (throw (ex-info "fused scan/map needs an explicit scheduled scan epilogue"
@@ -552,12 +554,18 @@
                                  [id {:dtype dtype :elements temporary-elements
                                       :memory-space :device}]))
                           temporary-ids)
+        output-elements (if (= :exclusive (:mode description))
+                          (kernel-launch/sum (:bound description) 1)
+                          (:bound description))
+        output-ids (set (:outputs description))
         buffer-specs (into {}
                            (map (fn [id]
                                   [id {:dtype (or (get array-types id)
                                                   (get array-types (symbol (name id)))
                                                   dtype)
-                                       :elements (:bound description)}]))
+                                       :elements (if (contains? output-ids id)
+                                                   output-elements
+                                                   (:bound description))}]))
                            external)]
     (kernel-graph/from-segops
      segops
@@ -569,6 +577,7 @@
       :effects {:memory-order :dependency-ordered}
       :provenance {:dialect :segop :algorithm :scan :soac-id (:id description)}
       :attributes {:strategy (if (= 1 (count segops)) :single :three-stage)
+                   :scan-mode (or (:mode description) :inclusive)
                    :scan-algebra (get-in (first segops) [:scan-op :algebra])}})))
 
 (defn scan-soac?

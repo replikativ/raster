@@ -8,6 +8,7 @@
 (defrecord RuntimeValue [value])
 (defrecord CeilDiv [value divisor])
 (defrecord FloorDiv [value divisor])
+(defrecord Sum [terms])
 (defrecord Product [factors])
 (defrecord AlignUp [value alignment])
 (defrecord Minimum [values])
@@ -45,6 +46,14 @@
   (when-not (or (not (integer? divisor)) (pos? divisor))
     (throw (ex-info "floor-div divisor must be positive" {:value value :divisor divisor})))
   (->FloorDiv value divisor))
+
+(defn sum
+  "A checked sum of integer launch/storage expressions. Sums are explicit IR rather than
+   arbitrary Clojure forms so symbolic view extents remain inspectable and safely realizable."
+  [& terms]
+  (when-not (and (seq terms) (every? some? terms))
+    (throw (ex-info "sum requires one or more non-nil terms" {:terms terms})))
+  (->Sum (vec terms)))
 
 (defn product
   "A checked product of integer launch/storage expressions. Products are explicit IR rather than
@@ -86,6 +95,9 @@
 (defn- floor-div? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.FloorDiv" x))
 
+(defn- sum? [x]
+  (record-kind? "raster.compiler.ir.kernel_launch.Sum" x))
+
 (defn- product? [x]
   (record-kind? "raster.compiler.ir.kernel_launch.Product" x))
 
@@ -105,6 +117,7 @@
     (runtime-value? x) (some? (:value x))
     (ceil-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
     (floor-div? x) (and (expression? (:value x)) (expression? (:divisor x)))
+    (sum? x) (and (seq (:terms x)) (every? expression? (:terms x)))
     (product? x) (and (seq (:factors x)) (every? expression? (:factors x)))
     (align-up? x) (and (expression? (:value x))
                        (integer? (:alignment x)) (pos? (:alignment x)))
@@ -122,6 +135,7 @@
                                  (expression-references (:divisor expression)))
     (floor-div? expression) (into (expression-references (:value expression))
                                   (expression-references (:divisor expression)))
+    (sum? expression) (reduce into #{} (map expression-references (:terms expression)))
     (product? expression) (reduce into #{} (map expression-references (:factors expression)))
     (align-up? expression) (expression-references (:value expression))
     (minimum? expression) (reduce into #{} (map expression-references (:values expression)))
@@ -149,6 +163,7 @@
       (product? x)
       (align-up? x)
       (floor-div? x)
+      (sum? x)
       (minimum? x)))
 
 (defn validate-spec!
@@ -235,9 +250,9 @@
 (defn resolve-expression
   "Resolve one integer launch/storage expression.
 
-   Besides literal integers this understands the explicit `RuntimeValue` and `CeilDiv` records
-   used by launch and graph-buffer contracts. `resolve-value` supplies an integer for an opaque
-   compiler value such as a bound symbol. Keeping this evaluator here prevents graph runners from
+   Besides literal integers this understands the explicit symbolic records declared above and used
+   by launch and graph-buffer contracts. `resolve-value` supplies an integer for an opaque compiler
+   value such as a bound symbol. Keeping this evaluator here prevents graph runners from
    interpreting arbitrary compiler S-expressions."
   [resolve-value dimension]
   (letfn [(resolve* [expression]
@@ -261,6 +276,10 @@
                    (throw (ex-info "floor-div resolved divisor must be positive"
                                    {:expression expression :divisor divisor})))
                  (quot value divisor))
+               (sum? expression)
+               (reduce (fn [acc term]
+                         (Math/addExact (long acc) (long term)))
+                       0 (map resolve* (:terms expression)))
                (product? expression)
                (reduce (fn [acc factor]
                          (Math/multiplyExact (long acc) (long factor)))

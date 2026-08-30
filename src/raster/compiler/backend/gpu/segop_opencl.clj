@@ -720,6 +720,10 @@
         _ (when-not (scan/associative-scan? algebra)
             (throw (ex-info "scan KernelGraph lacks certified associative algebra"
                             {:reason :uncertified-scan-graph :algebra algebra})))
+        scan-mode (or (get-in graph [:attributes :scan-mode]) :inclusive)
+        _ (when-not (contains? #{:inclusive :exclusive} scan-mode)
+            (throw (ex-info "scan KernelGraph has an unsupported result mode"
+                            {:reason :scan-mode-not-emittable :mode scan-mode})))
         _ (when-not (= 1 (count (:outputs graph)))
             (throw (ex-info "scan artifact lowering requires exactly one graph output"
                             {:reason :scan-multi-output-unimplemented
@@ -797,6 +801,7 @@
                     (ce/emit-expr (ce/adapt-casts-for-dtype
                                    (ce/normalize-array-prims element) dtype)
                                   idx (set (map #(symbol (name %)) input-ids)) "idx")))
+                result-index (if (= :exclusive scan-mode) "idx + 1" "idx")
                 source-body
                 (case phase
                   (:single :intra-block)
@@ -817,9 +822,11 @@
                        "        if (tid >= offset) sdata[tid] = " (combine-c "left" "self") ";\n"
                        "        barrier(CLK_LOCAL_MEM_FENCE);\n"
                        "    }\n"
-                       "    if (idx < _n_bound) " out-c "[idx] = sdata[tid];\n"
+                       (when (= :exclusive scan-mode)
+                         (str "    if (block == 0 && tid == 0) " out-c "[0] = " identity-c ";\n"))
+                       "    if (idx < _n_bound) " out-c "[" result-index "] = sdata[tid];\n"
                        (when totals-c
-                         (str "    if (tid == 0) {\n"
+                         (str "    if (tid == 0 && base < _n_bound) {\n"
                               "        int valid = min(" workgroup ", _n_bound - base);\n"
                               "        " totals-c "[block] = sdata[valid - 1];\n"
                               "    }\n")))
@@ -858,8 +865,9 @@
                   (str "    int stride = get_global_size(0);\n"
                        "    for (int idx = get_global_id(0); idx < _n_bound; idx += stride) {\n"
                        "        int block = idx / " scan-workgroup ";\n"
-                       "        if (block > 0) " out-c "[idx] = "
-                       (combine-c (str totals-c "[block - 1]") (str out-c "[idx]")) ";\n"
+                       "        if (block > 0) " out-c "[" result-index "] = "
+                       (combine-c (str totals-c "[block - 1]")
+                                  (str out-c "[" result-index "]")) ";\n"
                        "    }\n")
 
                   (throw (ex-info "scheduled scan node has no target lowering"
@@ -885,7 +893,8 @@
               :temporaries []
               :effects {:kind :scan-stage :phase phase}
               :provenance {:dialect :segscan :segop-id (:id operation) :graph-node id}
-              :attributes {:phase phase :dtype dtype :scan-workgroup scan-workgroup}})))
+              :attributes {:phase phase :dtype dtype :scan-mode scan-mode
+                           :scan-workgroup scan-workgroup}})))
         emitted (kgraph/map-operations graph emit-node)
         external-buffers (vec (distinct (concat (:inputs emitted) (:outputs emitted))))
         scalar-pairs (->> (:nodes emitted)

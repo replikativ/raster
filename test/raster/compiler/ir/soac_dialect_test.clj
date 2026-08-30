@@ -38,7 +38,7 @@
                                 (first (dialect/equations program)))))))
     (is (= '[x] (dialect/operation-inputs (first (dialect/equations program)))))))
 
-(deftest inclusive-scan-has-a-distinct-typed-and-effectful-contract
+(deftest scan-mode-has-a-distinct-typed-and-effectful-contract
   (let [out (av/tensor {:dtype :float :shape '[(unknown-dimension out)]})
         algebra (scan/->AssociativeScan 'acc 0.0 '+ 'element '(float 0.0) :float)
         facts (dialect/default-program-facts
@@ -70,14 +70,26 @@
             :capture-parameters '[destination]}
            (dialect/parameter-layout equation)))
     (is (= '[x out] (dialect/operation-inputs equation)))
-    (testing "exclusive semantics cannot enter by omitting or changing the mode"
+    (testing "exclusive mode requires its n+1 result contract"
+      (let [[_ attributes arrays captures lambda] (nth equation 3)
+            exclusive-result (av/tensor {:dtype :float :shape '[(clojure.core/inc n)]})
+            exclusive-facts (assoc-in facts [:values 'result] exclusive-result)
+            exclusive-equation (list '= 'scan-0 '[result]
+                                     (list 'scan (assoc attributes :mode :exclusive)
+                                           arrays captures lambda))]
+        (is (= :exclusive
+               (get-in (dialect/operation-parts
+                        (first (dialect/equations
+                                (dialect/make exclusive-facts [exclusive-equation] '[result]))))
+                       [:attributes :mode])))))
+    (testing "unknown scan modes cannot enter the typed dialect"
       (let [[_ attributes arrays captures lambda] (nth equation 3)
             bad-equation (list '= 'scan-0 '[result]
-                               (list 'scan (assoc attributes :mode :exclusive)
+                               (list 'scan (assoc attributes :mode :unknown)
                                      arrays captures lambda))]
         (try
           (dialect/make facts [bad-equation] '[result])
-          (is false "exclusive mode must fail TypedSOAC syntax validation")
+          (is false "unknown mode must fail TypedSOAC syntax validation")
           (catch clojure.lang.ExceptionInfo exception
             (is (= :typed-soac-syntax (:reason (ex-data exception))))))))))
 

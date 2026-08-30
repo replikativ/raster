@@ -162,14 +162,18 @@
 
       scan
       (let [result (first results)
+            mode (:mode attributes)
             destination (get-in placement-facts [:attributes :destination])
             _ (when-not (and (= 1 (count results)) destination)
-                (throw (ex-info "typed inclusive scan requires one caller-owned destination"
+                (throw (ex-info "typed scan requires one caller-owned destination"
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results
                                  :destination destination})))
             source (with-meta
-                     (list 'raster.par/scan destination
+                     (list (case mode
+                             :inclusive 'raster.par/scan
+                             :exclusive 'raster.par/scan-exclusive)
+                           destination
                            (first (:accumulators attributes))
                            (first (:identities attributes))
                            (:index attributes) (:extent attributes)

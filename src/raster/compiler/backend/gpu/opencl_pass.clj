@@ -527,22 +527,10 @@
 
             ;; par/scan-exclusive
             (par/par-scan-exclusive-form? form)
-            (let [{:keys [bound]} (par/extract-par-scan-exclusive-info form)]
-              (if (and (number? bound) (< bound min-elements))
-                (do (swap! stats update :fallback inc)
-                    (par/expand-par-scan-exclusive form))
-                (let [kernel (legacy/generate-par-scan-exclusive-kernel form
-                                                                        :dtype dtype :device-id device-id)
-                      k (maybe-compile-spirv kernel compile-spirv? device-id)
-                      block-entry (assoc k :kernel-name (:block-kernel-name k))
-                      prop-entry (assoc k :kernel-name (:prop-kernel-name k))]
-                  (swap! stats update :ze-maps inc)
-                  (swap! kernels conj block-entry)
-                  (swap! kernels conj prop-entry)
-                  (let [{:keys [out]} (par/extract-par-scan-exclusive-info form)]
-                    (list 'raster.gpu.ze-runtime/invoke-registered-scan-exclusive-kernel
-                          (:block-kernel-name k) (:prop-kernel-name k)
-                          (vec (:input-arrays k)) out bound)))))
+            (throw (ex-info "GPU exclusive scan must enter the backend as a scheduled TypedSOAC graph"
+                            {:reason :exclusive-scan-requires-typed-schedule
+                             :source form :target-dialect :kernel-graph
+                             :fallback :none}))
 
             ;; par/rng-fill!
             (par/par-rng-fill-form? form)
