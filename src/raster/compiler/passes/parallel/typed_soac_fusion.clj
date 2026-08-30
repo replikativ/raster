@@ -7,6 +7,7 @@
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :refer [from-dialect]]
             [pattern.r3.core :refer [rule success]]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
@@ -179,6 +180,20 @@
          ;; are treated as fresh SSA values and any explicit alias contract declines fusion.
          (empty? (:aliases facts)))))
 
+(defn- value-scalar-dtype
+  "Return the canonical scalar dtype carried by one logical tensor value, or nil.
+
+   Vertical region composition introduces an explicit local for the producer result so multiple
+   consumer references do not duplicate its scalar expression. The local type must come from the
+   existing value fact; fusion never infers or defaults it."
+  [program value]
+  (let [candidate (:dtype (get-in (dialect/facts program) [:values value]))]
+    (when (and (keyword? candidate)
+               (dtype/known? candidate)
+               (= candidate (dtype/canon candidate))
+               (:scalar-tag (dtype/info candidate)))
+      candidate)))
+
 (defn- value-use-counts
   [program]
   (frequencies
@@ -244,9 +259,15 @@
            :when (= :map (:kind producer))
            :when (= 1 (count (:results producer)))
            :when (= 1 (count (:body-results producer)))
-           :when (empty? (:locals producer))
-           :when (empty? (:locals consumer))
            :when (contains? #{:map :reduce} (:kind consumer))
+           ;; Local SSA is currently a map-region facility. A local-bearing producer/consumer can
+           ;; therefore compose vertically into another map; the established local-free
+           ;; map->reduce rule remains available until reduction regions admit typed locals.
+           :when (or (= :map (:kind consumer))
+                     (and (empty? (:locals producer)) (empty? (:locals consumer))))
+           :when (or (= :reduce (:kind consumer))
+                     (and (empty? (:locals producer)) (empty? (:locals consumer)))
+                     (some? (value-scalar-dtype program produced)))
            :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
            :when (= 1 (get uses produced 0))
            :when (some #{produced} (:arrays consumer))
@@ -266,12 +287,36 @@
           consumed-index (.indexOf ^java.util.List (:arrays consumer) produced)
           consumer-elements (:elements consumer-parameters)
           consumed-parameter (nth consumer-elements consumed-index)
+          consumer-operation-index (get-in consumer [:attributes :index])
+          producer-operation-index (get-in producer [:attributes :index])
+          producer-locals (mapv #(update % :init
+                                         (fn [init]
+                                           (util/subst-syms
+                                            {producer-operation-index
+                                             consumer-operation-index} init)))
+                                (:locals producer))
           producer-expression (util/subst-syms
-                               {(get-in producer [:attributes :index])
-                                (get-in consumer [:attributes :index])}
+                               {producer-operation-index consumer-operation-index}
                                (first (:body-results producer)))
+          producer-local-ids (set (map :id producer-locals))
+          local-region-composition? (or (seq producer-locals) (seq (:locals consumer)))
+          producer-result-local (when (and (= :map (:kind consumer))
+                                           local-region-composition?
+                                           (not (contains? producer-local-ids
+                                                           producer-expression)))
+                                  {:id 'rstr_producer_result
+                                   :dtype (value-scalar-dtype program produced)
+                                   :init producer-expression})
+          consumed-expression (if producer-result-local
+                                (:id producer-result-local)
+                                producer-expression)
+          consumer-locals (mapv #(update % :init
+                                         (fn [init]
+                                           (util/subst-syms
+                                            {consumed-parameter consumed-expression} init)))
+                                (:locals consumer))
           inlined-body (mapv #(util/subst-syms
-                               {consumed-parameter producer-expression} %)
+                               {consumed-parameter consumed-expression} %)
                              (:body-results consumer))
           raw-arrays (vec (concat (subvec (vec (:arrays consumer)) 0 consumed-index)
                                   (:arrays producer)
@@ -283,8 +328,12 @@
           raw-capture-parameters
           (vec (concat (:capture-parameters producer-parameters)
                        (:capture-parameters consumer-parameters)))
+          raw-locals (cond-> producer-locals
+                       producer-result-local (conj producer-result-local)
+                       true (into consumer-locals))
           canonical (canonical-operands raw-arrays raw-elements
-                                        raw-captures raw-capture-parameters [] inlined-body)
+                                        raw-captures raw-capture-parameters
+                                        raw-locals inlined-body)
           stable (set/union (stable-array-captures producer)
                             (stable-array-captures consumer))
           updated (assoc consumer
@@ -325,8 +374,6 @@
                  right-uses (set (concat (:arrays right) (:captures right)
                                          [(:extent (:attributes right))]))]
            :when (= :map (:kind left) (:kind right))
-           :when (empty? (:locals left))
-           :when (empty? (:locals right))
            :when (= (:extent (:attributes left)) (:extent (:attributes right)))
            :when (empty? (set/intersection left-results right-uses))
            :when (empty? (set/intersection right-results left-uses))
@@ -347,6 +394,16 @@
           right (freshen-parameters right "right")
           left-parameters (parameter-parts left)
           right-parameters (parameter-parts right)
+          right-operation-index (get-in right [:attributes :index])
+          left-operation-index (get-in left [:attributes :index])
+          right-locals (mapv #(update % :init
+                                     (fn [init]
+                                       (util/subst-syms
+                                        {right-operation-index left-operation-index} init)))
+                            (:locals right))
+          right-results (mapv #(util/subst-syms
+                                {right-operation-index left-operation-index} %)
+                              (:body-results right))
           canonical (canonical-operands
                      (vec (concat (:arrays left) (:arrays right)))
                      (vec (concat (:elements left-parameters)
@@ -354,8 +411,8 @@
                      (vec (concat (:captures left) (:captures right)))
                      (vec (concat (:capture-parameters left-parameters)
                                   (:capture-parameters right-parameters)))
-                     []
-                     (vec (concat (:body-results left) (:body-results right))))
+                     (vec (concat (:locals left) right-locals))
+                     (vec (concat (:body-results left) right-results)))
           stable (set/union (stable-array-captures left) (stable-array-captures right))
           updated (assoc left
                          :attributes (with-stable-array-captures

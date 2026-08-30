@@ -112,27 +112,71 @@
     (is (= program result))
     (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
 
-(deftest local-ssa-equations-decline-fusion-until-region-composition-is-proved
+(deftest vertical-fusion-composes-local-ssa-regions
   (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
         program (adapter/legacy-nodes->program (:nodes legacy-graph)
                                                {:outputs '[z] :dtype :float})
         equations (dialect/equations program)
-        producer (first equations)
-        operation (dialect/operation-parts producer)
-        {:keys [parameters body-results]} (dialect/lambda-parts (:lambda operation))
-        producer (list '= (second producer) (nth producer 2)
-                       (list 'map (:attributes operation) (:arrays operation)
-                             (:captures operation)
-                             (dialect/lambda-form
-                              parameters
-                              [(dialect/local-value 'shared :float (first body-results))]
-                              '[shared])))
+        equations (mapv (fn [equation]
+                          (let [operation (dialect/operation-parts equation)
+                                {:keys [parameters body-results]}
+                                (dialect/lambda-parts (:lambda operation))]
+                            (list '= (second equation) (nth equation 2)
+                                  (list 'map (:attributes operation) (:arrays operation)
+                                        (:captures operation)
+                                        (dialect/lambda-form
+                                         parameters
+                                         [(dialect/local-value
+                                           'shared :float (first body-results))]
+                                         '[shared])))))
+                        equations)
         program (dialect/make (dialect/facts program)
-                              (assoc equations 0 producer)
+                              equations
                               (dialect/outputs program))
-        [result stats] (typed-fusion/fusion-fixpoint program)]
-    (is (= program result))
-    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))))
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations result))
+        {:keys [locals body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= [{:id 'rstr_producer_local_0
+             :dtype :float
+             :init '(* %element0 %element0)}
+            {:id 'rstr_consumer_local_0
+             :dtype :float
+             :init '(+ rstr_producer_local_0 1.0)}]
+           locals))
+    (is (= '[rstr_consumer_local_0] body-results))
+    (is (= result (dialect/validate! result)))))
+
+(deftest horizontal-fusion-alpha-renames-and-composes-local-ssa-regions
+  (let [legacy-graph (graph/build-fusion-graph
+                      (legacy/let-bindings->nodes horizontal-map-pairs))
+        program (adapter/legacy-nodes->program (:nodes legacy-graph)
+                                               {:outputs '[u v] :dtype :float})
+        equations
+        (mapv (fn [equation]
+                (let [operation (dialect/operation-parts equation)
+                      {:keys [parameters body-results]}
+                      (dialect/lambda-parts (:lambda operation))]
+                  (list '= (second equation) (nth equation 2)
+                        (list 'map (:attributes operation) (:arrays operation)
+                              (:captures operation)
+                              (dialect/lambda-form
+                               parameters
+                               [(dialect/local-value 'shared :float (first body-results))]
+                               '[shared])))))
+              (dialect/equations program))
+        program (dialect/make (dialect/facts program) equations (dialect/outputs program))
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations result))
+        {:keys [locals body-results]}
+        (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))]
+    (is (= {:vertical 0 :horizontal 1 :iterations 2} stats))
+    (is (= ['rstr_left_local_0 'rstr_right_local_0] (mapv :id locals)))
+    (is (= '[(* %element0 2.0) (+ %element1 1.0)] (mapv :init locals)))
+    (is (= '[rstr_left_local_0 rstr_right_local_0] body-results))
+    (is (= result (dialect/validate! result)))))
 
 (deftest fusion-preserves-constituent-equation-facts
   (let [legacy-graph (graph/build-fusion-graph (legacy/let-bindings->nodes map-map-pairs))
