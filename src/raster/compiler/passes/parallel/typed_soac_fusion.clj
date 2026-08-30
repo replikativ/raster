@@ -41,6 +41,21 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private scatter-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (scatter ?attributes [??arrays] [??captures]
+                                   (lambda [??parameters]
+                                           (region [??local-definitions] [??body-results]))))
+                      (success {:kind :scatter
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :local-definitions local-definitions
+                                :body-results body-results}))))
+
 (def ^:private scalar-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -78,6 +93,7 @@
              (some #(when (map? %) %)
                    [(scalar-equation-rule equation)
                     (map-equation-rule equation)
+                    (scatter-equation-rule equation)
                     (reduce-equation-rule equation)
                     (scan-equation-rule equation)])]
     (let [lambda (:lambda (dialect/operation-parts equation))]

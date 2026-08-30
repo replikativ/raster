@@ -50,6 +50,19 @@
     (second expression)
     expression))
 
+(def ^:private unique-index-ops
+  '#{raster.par/unique-index unique-index})
+
+(defn- unique-index-expression
+  "Return the inner destination expression when `expression` carries Raster's explicit
+   uniqueness contract. The marker may be a direct source call or a walker-devirtualized call;
+   semantic-op/call-args are the only sanctioned way to look through the latter."
+  [expression]
+  (when (and (seq? expression)
+             (contains? unique-index-ops (descriptor/semantic-op expression))
+             (= 1 (count (descriptor/call-args expression))))
+    (first (descriptor/call-args expression))))
+
 (defn- retained-local-dtype
   [binding init]
   (let [init-tag (when (instance? clojure.lang.IObj init)
@@ -58,7 +71,7 @@
         (dtype/dtype-for-scalar-tag init-tag))))
 
 (defn- pointwise-region
-  "Recognize an ordered, pure local-SSA spine ending exclusively in pointwise stores.
+  "Recognize an ordered, pure local-SSA spine ending exclusively in indexed stores.
 
    Local types come only from retained walker/TypedClojure facts. Nested local scopes and missing
    local types decline; guessing them in this source recognizer or a C emitter would make the
@@ -91,9 +104,11 @@
                                    :substitutions (assoc substitutions binding id)}))
                               {:locals [] :substitutions {}} typed)]
                   {:locals locals
-                   :stores (mapv #(update % :value
-                                          (fn [value]
-                                            (util/subst-syms substitutions value)))
+                   :stores (mapv (fn [store]
+                                   (reduce (fn [store field]
+                                             (update store field
+                                                     #(util/subst-syms substitutions %)))
+                                           store [:index :predicate :value]))
                                  stores)})))))))
 
     (and (seq? body) (= 'do (first body)))
@@ -113,30 +128,30 @@
                  (or (nil? else-expression)
                      (and else-region (empty? (:locals else-region))))
                  (or (nil? else-region)
-                     (= (mapv :out (:stores then-region))
-                        (mapv :out (:stores else-region)))))
+                     (= (mapv (juxt :out :index) (:stores then-region))
+                        (mapv (juxt :out :index) (:stores else-region)))))
         {:locals []
          :stores
          (mapv (fn [ordinal then-store]
                  (let [else-store (when else-region (nth (:stores else-region) ordinal))]
-                   (update then-store :value
-                           (fn [then-value]
-                             (list 'if predicate then-value
-                                   (if else-store
-                                     (:value else-store)
-                                     ;; A guarded pointwise write semantically preserves the
-                                     ;; caller-owned destination when its predicate is false.
-                                     ;; Making that read explicit turns gather-with-bounds-guard
-                                     ;; into an ordinary inout map; no hidden effect reaches the
-                                     ;; scheduler or emitter.
-                                     (list 'clojure.core/aget (:out then-store) index)))))))
+                   (if else-store
+                     (assoc then-store
+                            :value (list 'if predicate (:value then-store) (:value else-store))
+                            :predicate (list 'if predicate
+                                             (:predicate then-store)
+                                             (:predicate else-store)))
+                     (update then-store :predicate
+                             #(if (contains? #{true 1} %)
+                                predicate
+                                (list 'if predicate % 0))))))
                (range) (:stores then-region))}))
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
-      (when (and (= 3 (count arguments))
-                 (= index (strip-index-cast (nth arguments 1))))
-        (let [value (nth arguments 2)
+      (when (= 3 (count arguments))
+        (let [raw-index (nth arguments 1)
+              unique-index (unique-index-expression raw-index)
+              value (nth arguments 2)
               cast? (and (seq? value)
                          (contains? #{'float 'double 'int 'long
                                       'clojure.core/float 'clojure.core/double}
@@ -144,6 +159,9 @@
                          (= 2 (count value)))]
           {:locals []
            :stores [{:out (descriptor/aset-array-sym body)
+                     :index (strip-index-cast (or unique-index raw-index))
+                     :conflict (when unique-index :unique)
+                     :predicate 1
                      :value (if cast? (second value) value)
                      :cast (when cast? (first value))}]})))
 
@@ -155,15 +173,16 @@
             (util/subst-syms {id init} body))
           expression (reverse locals)))
 
-(defn- independent-pointwise-stores?
+(defn- independent-stores?
   [locals stores]
   (let [destinations (mapv :out stores)
         destination-set (set destinations)]
     (and (= (count destinations) (count destination-set))
-         (every? (fn [{:keys [out value]}]
+         (every? (fn [{:keys [out index predicate value]}]
                    (empty? (disj (set/intersection destination-set
                                                    (par/collect-aget-arrays
-                                                    (expanded-local-expression locals value)))
+                                                    (expanded-local-expression
+                                                     locals (list 'do index predicate value))))
                                  out)))
                  stores))))
 
@@ -173,24 +192,46 @@
 
 (defn- effect-map-description
   [id symbol index extent {:keys [locals stores]} elem-type]
-  (when (and (seq stores) (independent-pointwise-stores? locals stores))
-    (let [destinations (mapv :out stores)
+  (when (and (seq stores) (independent-stores? locals stores))
+    (let [stores (mapv #(merge {:index index :predicate 1} %) stores)
+          pointwise? (every? #(= index (:index %)) stores)
+          stores (if pointwise?
+                   (mapv (fn [{:keys [out predicate value] :as store}]
+                           (assoc store :value
+                                  (if (contains? #{true 1} predicate)
+                                    value
+                                    ;; A guarded dense write preserves its caller-owned
+                                    ;; destination. Making that read explicit yields an ordinary
+                                    ;; inout map instead of a hidden conditional effect.
+                                    (list 'if predicate value
+                                          (list 'clojure.core/aget out index)))))
+                         stores)
+                   stores)
+          conflict (when (every? #(= :unique (:conflict %)) stores) :unique)
+          destinations (mapv :out stores)
           values (mapv :value stores)
-          analysis-values (concat (map :init locals) values)
+          write-indices (mapv :index stores)
+          predicates (mapv :predicate stores)
+          analysis-values (concat (map :init locals) write-indices predicates values)
           io (update (extract-io (list* 'do analysis-values) index destinations)
                      :scalars set/difference (set (map :id locals)))
           results (mapv #(effect-result-id id %) (range (count stores)))]
-      (merge {:kind :map :id id :sym symbol :index index :extent extent
+      (when (or pointwise? (= :unique conflict))
+        (merge {:kind (if pointwise? :map :scatter)
+              :id id :sym symbol :index index :extent extent
               :results results :locals locals :bodies values :casts (mapv :cast stores)
+              :write-indices write-indices :predicates predicates
+              :conflict (when-not pointwise? conflict)
               :effect-only? true :host-binding symbol :elem-type elem-type
               :result-storage
               (mapv (fn [destination]
                       {:destination destination
-                       :access (if (contains? (:inputs io) destination)
+                       :access (if (or (not pointwise?)
+                                       (contains? (:inputs io) destination))
                                  :read-write :write)
                        :host-return :effect})
                     destinations)}
-             io))))
+               io)))))
 
 (defn- operation-description
   [id symbol expression]
@@ -266,7 +307,8 @@
                  (extract-io body idx [out] :accumulator acc)))))
 
     (par/par-map-void-form? expression)
-    (let [{:keys [idx bound body elem-type]} (par/extract-par-map-void-info expression)]
+    (let [{:keys [idx bound body elem-type]}
+          (par/extract-par-map-void-info expression)]
       (when-let [region (pointwise-region body idx)]
         (effect-map-description id symbol idx bound region elem-type)))
 
@@ -368,7 +410,7 @@
                                                  expression representative)))
               (assoc-in [:scalar-representatives (:sym description)] representative)))
 
-        (:map :reduce :scan)
+        (:map :scatter :reduce :scan)
         (let [extent (descriptor/unwrap-int-cast (:extent description))
               array (alength-array extent)
               extent' (cond
@@ -377,7 +419,7 @@
                         :else extent)
               description' (assoc description :extent extent')]
           (cond-> (update state :descriptions conj description')
-            (contains? #{:map :scan} (:kind description'))
+            (contains? #{:map :scatter :scan} (:kind description'))
             (assoc-in [:extents (:sym description')] extent')))
 
         (update state :descriptions conj description)))
@@ -396,7 +438,7 @@
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (reduce set/union #{}
-                                 (map #(if (contains? #{:map :reduce :scan} (:kind %))
+                                 (map #(if (contains? #{:map :scatter :reduce :scan} (:kind %))
                                          (:outputs %) #{})
                                       descriptions))]
     (every? (fn [description]
@@ -407,6 +449,10 @@
                          (and (seq (:result-storage description))
                               (every? (comp symbol? :destination)
                                       (:result-storage description))))
+                :scatter (and (seq (:result-storage description))
+                              (= :unique (:conflict description))
+                              (every? (comp symbol? :destination)
+                                      (:result-storage description)))
                 :reduce true
                 :scan (symbol? (:primary-out description))
                 false))
@@ -458,6 +504,40 @@
                 arrays captures
                 (dialect/lambda-form (vec (concat parameters capture-parameters))
                                      local-forms body-results)))))
+
+(defn- scatter-equation
+  [description]
+  (let [{:keys [id index extent locals casts bodies inputs results result-storage
+                write-indices predicates conflict]} description
+        values (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
+        destinations (mapv :destination result-storage)
+        semantic-inputs (into (set inputs) destinations)
+        all-expressions (vec (concat (map :init locals) write-indices predicates values))
+        [pointwise stable]
+        ((juxt filter remove) #(pointwise-input? all-expressions % index) semantic-inputs)
+        arrays (vec (sort-by pr-str pointwise))
+        captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
+        parameters (element-symbols (count arrays))
+        capture-parameters (capture-symbols (count captures))
+        substitutions (zipmap captures capture-parameters)
+        transform (fn [expression]
+                    (util/subst-syms
+                     substitutions
+                     (first (elementize [expression] arrays parameters index))))
+        local-forms (mapv (fn [{:keys [id dtype init]}]
+                            (dialect/local-value id dtype (transform init)))
+                          locals)
+        writes (mapv (fn [destination-index predicate value]
+                       (list 'write (transform destination-index)
+                             (transform predicate) (transform value)))
+                     write-indices predicates values)]
+    (list '= id results
+          (list 'scatter {:index index :extent extent :conflict conflict
+                          :attributes {:stable-array-captures
+                                       (vec (sort-by pr-str stable))}}
+                arrays captures
+                (dialect/lambda-form (vec (concat parameters capture-parameters))
+                                     local-forms writes)))))
 
 (defn- reduce-equation
   [{:keys [id extent inputs scalars product]}]
@@ -535,15 +615,15 @@
 
 (defn- terminal-results
   [descriptions body]
-  (let [operations (filter #(contains? #{:map :reduce :scan} (:kind %)) descriptions)
+  (let [operations (filter #(contains? #{:map :scatter :reduce :scan} (:kind %)) descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
-                                              :map (:results %)
+                                              (:map :scatter) (:results %)
                                               :scan [(:sym %)]
                                               (:outputs %))
                                            operations))
         terminal-operation-definitions
         (set (mapcat #(case (:kind %)
-                        :map (if (:effect-only? %) [] (:results %))
+                        (:map :scatter) (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
                         (:outputs %))
                      operations))
@@ -595,7 +675,7 @@
                         scalar (:dtypes attributes)
                         reduce (:dtypes attributes)
                         scan (:dtypes attributes)
-                        map (map #(value-dtype % default-dtype array-types) results))]
+                        (map scatter) (map #(value-dtype % default-dtype array-types) results))]
     (merge
      (if (and extent (dialect/value-id? extent)) {extent (tensor-value :long [])} {})
      (into {} (map (fn [id] [id (tensor-value (value-dtype id default-dtype array-types)
@@ -627,6 +707,7 @@
                                        (case kind
                                          (scalar reduce) []
                                          scan (dialect/scan-result-shape attributes)
+                                         scatter [(list 'unknown-dimension id)]
                                          (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 
@@ -661,8 +742,10 @@
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (supported-descriptions? descriptions))
-        (let [operation-descriptions (filterv #(contains? #{:map :reduce :scan} (:kind %)) descriptions)
+        (let [operation-descriptions
+              (filterv #(contains? #{:map :scatter :reduce :scan} (:kind %)) descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
+                                               :scatter (scatter-equation %)
                                                :reduce (reduce-equation %)
                                                :scan (scan-equation %))
                                         operation-descriptions)
@@ -680,11 +763,12 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :reduce :scan)
+                          (:map :scatter :reduce :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
                                         :map (map-equation description)
+                                        :scatter (scatter-equation description)
                                         :reduce (reduce-equation description)
                                         :scan (scan-equation description)))
                               (update :equation-descriptions conj description))))

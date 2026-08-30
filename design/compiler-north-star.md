@@ -119,14 +119,18 @@ its caller-owned destination, access mode, and host-return contract. The effect 
 retains its real `nil` host semantics instead of masquerading as a tensor result. The scheduled
 SegMap and its ordered ABI are consumed by staged and resident compilation; unsupported raw
 map-void bodies retain the compatibility generator. The front end refuses duplicate destinations,
-scatter indices, sibling write/read ordering, and atomics. Shared scalar work now remains one
+uncontracted scatter indices, sibling write/read ordering, and atomics. A destination wrapped in
+`par/unique-index` carries an explicit caller proof of conflict freedom into a TypedSOAC `scatter`;
+the marker is consumed before scalar lowering, while the checked read/write storage contract and
+guarded indexed store remain visible to scheduling and ABI construction. Shared scalar work now remains one
 explicit ordered local-SSA spine inside the tuple map's scalar region; each definition has a dtype
 retained from walker/TypedClojure facts, and local binders never become fake program inputs.
 Validation proves definition order and lexical closure, and the front end expands locals only for
 dependency analysis so a local cannot hide sibling write/read ordering. JVM and GPU lowering both
-materialize the same typed spine once around all tuple results. Fusion currently leaves
-local-bearing regions intact until region composition is proved, rather than duplicating their
-work. Flat resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
+materialize the same typed spine once around all tuple results. Vertical and horizontal fusion
+alpha-rename and compose these regions while preserving definition order; a typed producer-result
+bridge is introduced only when reuse requires it, so fusion does not duplicate scalar work. Flat
+resident `deftm` signatures provide their declared per-buffer dtypes before fusion, so a
 mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
 
 The first architectural correction is therefore:
@@ -312,7 +316,9 @@ multi-workgroup alternatives remain schedule candidates, not new semantic primit
 
 Indexed storage movement remains a separate generic operation. Allocation-free `gather-blocks!`
 and `scatter-blocks!` move contiguous typed blocks between dense staging and routed resident
-storage with one ordinary SOAC map per direction. Routing is an `int[nblocks]` buffer; it does not
+storage through the direct TypedSOAC→SegMap vertical: gather is a stable indexed read in a dense
+`map`, while scatter is an explicit guarded `scatter` with unique destinations. Compound launch
+extents are hoisted into typed scalar SSA before scheduling. Routing is an `int[nblocks]` buffer; it does not
 encode pages, attention, cache policy, or quantization. Gather permits repeated sources, while the
 non-reducing scatter contract requires unique destinations. Host validation proves active extents,
 index bounds, non-aliasing and the current 32-bit device-index limit; emitted kernels retain bounds
@@ -850,11 +856,11 @@ The immediate continuation after the verified double-buffered weighted-reduction
    staged binding without an aliased compatibility input. Independent effect-only tuple maps also
    carry an ordered logical-result-to-physical-storage contract and compile through their scheduled
    SegMap on resident OpenCL execution. Their shared typed scalar computations use one explicit
-   ordered local-SSA region that lowers once through JVM and GPU paths; fusion declines those
-   regions until composition is proved. Hardware-costed
-   multi-consumer fusion, nested-region JVM
-   scheduling, local-region fusion, indexed/scatter operations, the
-   remaining parallel forms, and
+   ordered local-SSA region that lowers once through JVM and GPU paths; vertical and horizontal
+   fusion now alpha-rename and compose those regions without duplicating shared scalar work.
+   Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
+   route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
+   JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.

@@ -78,6 +78,34 @@
            (first (:body-results
                    (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))))))))
 
+(deftest unique-indexed-write-is-a-typed-scatter
+  (let [scatter '(raster.par/map-void!
+                  i n
+                  (clojure.core/aset out
+                                     (raster.par/unique-index
+                                      (clojure.core/aget indices i))
+                                     (clojure.core/aget src i)))
+        source (list 'let* ['step scatter] 'step)
+        program (frontend/form->program
+                 source {:dtype :float
+                         :array-types {'indices :int 'src :float 'out :float}
+                         :scalar-types {'n :long}})
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        write (dialect/write-parts
+               (first (:body-results (dialect/lambda-parts (:lambda operation)))))]
+    (is (= 'scatter (:kind operation)))
+    (is (= :unique (get-in operation [:attributes :conflict])))
+    (is (= '[indices src out] (dialect/operation-inputs equation)))
+    (is (= {:destination-index '%element0 :predicate 1 :value '%element1} write))
+    (is (= [{:destination 'out :access :read-write :host-return :effect}]
+           (get-in (dialect/facts program) [:equations 0 :attributes :result-storage])))
+    (is (= :analyzed-source
+           (get-in (route/attempt source :float
+                                  {'indices :int 'src :float 'out :float}
+                                  {:scalar-types {'n :long}})
+                   [:stats :front-end])))))
+
 (deftest parallel-semantics-enter-only-their-exact-typed-operation
   (testing "a certified inclusive scan is represented directly, with destination facts"
     (let [program (frontend/form->program
@@ -210,7 +238,7 @@
                   (keys (:values (dialect/facts program))))
         "region-local SSA values are lexical, not fake program inputs")))
 
-(deftest ordered-or-nonpointwise-void-bodies-decline-the-functional-tuple-map
+(deftest ordered-void-bodies-decline-the-functional-tuple-map
   (doseq [[label body]
           [["one destination written twice"
             '(do (clojure.core/aset a i (float 1.0))
@@ -231,7 +259,7 @@
                     v (* u 2.0)]
                    (clojure.core/aset a i (float v))
                    (clojure.core/aset b i (float u)))]
-           ["scatter index"
+           ["an indexed write without an explicit conflict contract"
             '(clojure.core/aset a (clojure.core/aget indices i)
                                 (float (clojure.core/aget x i)))]]]
     (testing label

@@ -282,6 +282,8 @@
                              scalar {:operations []}
                              map {:operations (soac-lower/lower-typed-map
                                                algorithm device-id :dtype dtype)}
+                             scatter {:operations (soac-lower/lower-typed-scatter
+                                                   algorithm device-id :dtype dtype)}
                              reduce {:operations (soac-lower/lower-typed-reduce
                                                   algorithm device-id :dtype dtype)}
                              scan (soac-lower/lower-typed-scan

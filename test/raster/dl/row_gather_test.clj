@@ -103,9 +103,13 @@
                            #'ops/gather-blocks! :ocl:0 :dtype :float)]
     (testing "both directions are ordinary allocation-free SOAC maps"
       (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
-      (is (= [:map-void :map-void]
+      (is (= [:segmap :segmap]
              (mapv #(get-in % [:artifact :provenance :dialect]) (:steps descriptor)))
-          "the closed-program route declines while its dynamic scatter remains unsupported")
+          "scatter and gather share the typed scheduled-map vertical")
+      (is (= [true nil]
+             (mapv #(get-in % [:artifact :attributes :explicit-stores])
+                   (:steps descriptor)))
+          "scatter owns explicit indexed stores; gather retains the implicit dense result")
       (is (= [:segmap]
              (mapv #(get-in % [:artifact :provenance :dialect])
                    (:steps gather-descriptor)))
@@ -114,8 +118,10 @@
       (is (= '[src block-indices paged restored nblocks block-width paged-blocks]
              (:all-params descriptor)))
       (is (= #{'paged 'restored}
-             (set (mapcat #(get-in % [:artifact :attributes :written-arrays])
-                          (:steps descriptor))))))
+             (set (for [step (:steps descriptor)
+                        slot (:abi step)
+                        :when (contains? #{:output :inout} (:kind slot))]
+                    (:name slot))))))
     (testing "OpenCL and Level Zero preserve the same physical ABI"
       (is (apply = (map (fn [[_ compiled]]
                           (mapv (comp #(mapv (juxt :kind :dtype :kernel-dtype) %) :abi)

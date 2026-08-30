@@ -167,6 +167,38 @@
            :site [:binding (if storage host-binding effect)]
            :source source}))
 
+      scatter
+      (let [storage (dialect/result-storage (dialect/facts program) equation-id)
+            physical-results (dialect/physical-results (dialect/facts program) equation)
+            host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            result-dtypes (mapv #(:dtype (get values %)) results)
+            casts (mapv #(nth (get dtype->allocation %) 2 nil) result-dtypes)
+            writes (mapv dialect/write-parts bodies)
+            _ (when-not (and (= (count results) (count writes) (count physical-results))
+                             (every? some? writes)
+                             (every? some? casts)
+                             (= #{:effect} (set (map :host-return storage))))
+                (throw (ex-info "the production scatter route requires typed effect writes"
+                                {:reason :typed-soac-production-subset
+                                 :equation equation-id :results results
+                                 :storage storage :writes writes :dtypes result-dtypes})))
+            statements
+            (mapv (fn [destination cast {:keys [destination-index predicate value]}]
+                    (let [store (list 'clojure.core/aset destination destination-index
+                                      (list cast value))]
+                      (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+                  physical-results casts writes)
+            source (with-meta
+                     (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                           (materialize-region region-locals (list* 'do statements)))
+                     {:raster.type/elem-type (first result-dtypes)})]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding source]]
+         :site [:binding host-binding]
+         :source source})
+
       reduce
       (let [result (first results)
             accumulator (first (:accumulators attributes))
@@ -310,7 +342,7 @@
                (if resident-reductions?
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :reduce :scan}
+           (if (not-any? #(contains? #{:map :scatter :reduce :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

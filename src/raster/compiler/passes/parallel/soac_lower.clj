@@ -119,6 +119,64 @@
                     :algorithm-equation equation-id)
             (lower-map node device-id :dtype result-dtype)))))
 
+(defn lower-typed-scatter
+  "Lower one unique-destination TypedSOAC scatter to an explicit-store SegMap.
+
+   The SegMap has no implicit primary result store (`out-sym` is nil); its typed scalar region
+   contains every conditional indexed write. Physical destinations remain both inputs and outputs
+   because an indexed update preserves unselected elements."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)
+        equation (first (soac-dialect/equations program))]
+    (when-not (and (= 1 (count (soac-dialect/equations program)))
+                   (= 'scatter (soac-dialect/operation-kind equation)))
+      (throw (ex-info "typed scatter lowering requires one scatter equation"
+                      {:reason :typed-soac-scatter-subset :program program})))
+    (let [[_ equation-id results operation] equation
+          [_ attributes arrays captures lambda] operation
+          {:keys [locals body-results]} (soac-dialect/lambda-parts lambda)
+          {:keys [elements capture-parameters]} (soac-dialect/parameter-layout equation)
+          substitutions
+          (into (zipmap capture-parameters captures)
+                (map (fn [parameter array]
+                       [parameter (list 'clojure.core/aget array (:index attributes))])
+                     elements arrays))
+          locals (mapv #(update % :init
+                                (fn [init]
+                                  (-> (util/subst-syms substitutions init)
+                                      par/expand-par-forms)))
+                       locals)
+          writes (mapv #(some-> % soac-dialect/write-parts
+                                (update-vals (fn [expression]
+                                               (-> (util/subst-syms substitutions expression)
+                                                   par/expand-par-forms))))
+                       body-results)
+          facts (soac-dialect/facts program)
+          physical-results (soac-dialect/physical-results facts equation)
+          _ (when-not (and (= (count results) (count writes) (count physical-results))
+                           (every? some? writes))
+              (throw (ex-info "typed scatter requires one write per physical result"
+                              {:reason :typed-soac-scatter-subset :equation equation-id
+                               :results results :writes writes
+                               :physical-results physical-results})))
+          statements
+          (mapv (fn [destination {:keys [destination-index predicate value]}]
+                  (let [store (list 'clojure.core/aset destination destination-index value)]
+                    (if (contains? #{true 1} predicate) store (list 'if predicate store))))
+                physical-results writes)
+          body (materialize-region-locals locals (list* 'do statements))
+          stable (set (get-in attributes [:attributes :stable-array-captures]))
+          scalar-captures (set (remove stable captures))
+          result-dtype (or (:dtype (get-in facts [:values (first results)])) dtype :double)
+          node (assoc (soac/->SoacMap equation-id nil (:index attributes)
+                                      (:extent attributes) nil body
+                                      (into (set arrays) stable)
+                                      (set physical-results) scalar-captures)
+                      :elem-type result-dtype :pure? false)]
+      (mapv #(assoc % :algorithm-dialect :typed-soac
+                    :algorithm-equation equation-id)
+            (lower-map node device-id :dtype result-dtype)))))
+
 (defn typed-reduce-program?
   "Whether a validated one-equation TypedSOAC program is the scalar reduction vertical currently
    accepted by SegRed lowering."
