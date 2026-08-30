@@ -102,6 +102,36 @@
                  (every? (comp empty? :locals) groups))
         {:locals [] :stores (vec (mapcat :stores groups))}))
 
+    (and (seq? body)
+         (contains? #{'if 'clojure.core/if} (first body))
+         (<= 3 (count body) 4))
+    (let [[_ predicate then-expression else-expression] body
+          then-region (pointwise-region then-expression index)
+          else-region (when else-expression (pointwise-region else-expression index))]
+      (when (and then-region
+                 (empty? (:locals then-region))
+                 (or (nil? else-expression)
+                     (and else-region (empty? (:locals else-region))))
+                 (or (nil? else-region)
+                     (= (mapv :out (:stores then-region))
+                        (mapv :out (:stores else-region)))))
+        {:locals []
+         :stores
+         (mapv (fn [ordinal then-store]
+                 (let [else-store (when else-region (nth (:stores else-region) ordinal))]
+                   (update then-store :value
+                           (fn [then-value]
+                             (list 'if predicate then-value
+                                   (if else-store
+                                     (:value else-store)
+                                     ;; A guarded pointwise write semantically preserves the
+                                     ;; caller-owned destination when its predicate is false.
+                                     ;; Making that read explicit turns gather-with-bounds-guard
+                                     ;; into an ordinary inout map; no hidden effect reaches the
+                                     ;; scheduler or emitter.
+                                     (list 'clojure.core/aget (:out then-store) index)))))))
+               (range) (:stores then-region))}))
+
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
       (when (and (= 3 (count arguments))
@@ -248,6 +278,58 @@
       (and (descriptor/alength-op? (descriptor/semantic-op expression))
            (= 1 (count (descriptor/call-args expression)))
            (symbol? (first (descriptor/call-args expression))))))
+
+(defn- parallel-extent
+  [expression]
+  (cond
+    (par/par-map-pure-form? expression) (nth expression 2)
+    (par/par-map-form? expression) (nth expression 3)
+    (par/par-map2-form? expression) (nth expression 4)
+    (par/par-reduce-form? expression) (nth expression 4)
+    (or (par/par-scan-form? expression) (par/par-scan-exclusive-form? expression))
+    (nth expression 5)
+    (par/par-map-void-form? expression) (nth expression 2)
+    :else nil))
+
+(defn- replace-parallel-extent
+  [expression extent]
+  (let [position (cond
+                   (par/par-map-pure-form? expression) 2
+                   (par/par-map-form? expression) 3
+                   (par/par-map2-form? expression) 4
+                   (par/par-reduce-form? expression) 4
+                   (or (par/par-scan-form? expression)
+                       (par/par-scan-exclusive-form? expression)) 5
+                   (par/par-map-void-form? expression) 2)]
+    (when position
+      (with-meta (apply list (assoc (vec expression) position extent)) (meta expression)))))
+
+(defn normalize-source
+  "Give pure compound parallel extents stable scalar SSA identities before dialect construction.
+
+   TypedSOAC operations name extents; executable host expressions never leak into schedule fields.
+   This normalization inserts an ordinary typed scalar binding immediately before its operation,
+   so the same expression remains visible to JVM materialization and runtime specialization."
+  [source]
+  (if (and (seq? source) (contains? #{'let 'let*} (first source)))
+    (let [[head bindings & body] source
+          pairs (vec (partition 2 bindings))
+          normalized
+          (mapcat
+           (fn [ordinal [symbol expression]]
+             (let [extent (parallel-extent expression)]
+               (if (and extent
+                        (not (dialect/extent? extent))
+                        (provably-pure-scalar? extent))
+                 (let [extent-id (with-meta
+                                   (clojure.core/symbol (str "rstr_extent_" ordinal))
+                                   {:tag 'long :raster.type/tag 'long})]
+                   [[extent-id extent]
+                    [symbol (replace-parallel-extent expression extent-id)]])
+                 [[symbol expression]])))
+           (range) pairs)]
+      (with-meta (list* head (vec (mapcat identity normalized)) body) (meta source)))
+    source))
 
 (defn- alength-array
   [expression]
@@ -498,8 +580,13 @@
       (when (symbol? id) (get array-types (symbol (name id))))
       default-dtype :double))
 
+(defn- declared-type
+  [types id]
+  (or (get types id)
+      (when (symbol? id) (get types (clojure.core/symbol (name id))))))
+
 (defn- equation-values
-  [equation default-dtype array-types known-values]
+  [equation default-dtype array-types scalar-types known-values]
   (let [[_ _ results] equation
         {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
         extent (:extent attributes)
@@ -516,6 +603,8 @@
      (if (= 'scalar kind)
        (into {} (keep (fn [id]
                         (when-let [value (or (get known-values id)
+                                             (when-let [declared (declared-type scalar-types id)]
+                                               (tensor-value declared []))
                                              (when-let [declared (and (symbol? id)
                                                                       (dtype/dtype-for-scalar-tag
                                                                        (types/sym-type-tag id)))]
@@ -529,7 +618,9 @@
                                             (contains? array-types (symbol (name id)))))
                                  (tensor-value (value-dtype id default-dtype array-types)
                                                [(list 'unknown-dimension id)])
-                                 (tensor-value (value-dtype id default-dtype array-types) [])))])
+                                 (tensor-value (or (declared-type scalar-types id)
+                                                   (value-dtype id default-dtype array-types))
+                                               [])))])
                      captures)))
      (into {} (map (fn [id result-dtype]
                      [id (tensor-value (or result-dtype default-dtype :double)
@@ -632,6 +723,7 @@
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv merge-value contracts
                                                    (equation-values equation dtype array-types'
+                                                                    scalar-types
                                                                     contracts)))
                                       destination-values equations)
               values (reduce-kv merge-value inferred-values values)

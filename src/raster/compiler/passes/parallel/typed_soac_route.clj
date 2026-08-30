@@ -300,10 +300,11 @@
   ([form dtype array-types {:keys [resident-reductions? scalar-types values]
                             :or {resident-reductions? false}}]
    (when (and (seq? form) (contains? #{'let 'let*} (first form)))
-     (try
-       (when-let [typed-input (frontend/form->program
-                               form {:dtype dtype :array-types array-types
-                                     :scalar-types scalar-types :values values})]
+     (let [form (frontend/normalize-source form)]
+       (try
+        (when-let [typed-input (frontend/form->program
+                                form {:dtype dtype :array-types array-types
+                                      :scalar-types scalar-types :values values})]
          (let [[typed-result typed-stats] (fusion/fusion-fixpoint typed-input)
                [typed-result resident-stats]
                (if resident-reductions?
@@ -319,9 +320,9 @@
                 :stats (merge typed-stats resident-stats
                               {:route :typed-soac :typed-validated true
                                :front-end :analyzed-source})}))))
-       (catch clojure.lang.ExceptionInfo exception
-         (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
-           (throw exception))
-         {:declined {:reason (or (:reason (ex-data exception)) :typed-soac-route-declined)
-                     :message (.getMessage exception)
-                     :details (ex-data exception)}})))))
+        (catch clojure.lang.ExceptionInfo exception
+          (when (contains? #{:raster/fatal :raster/bug} (:reason (ex-data exception)))
+            (throw exception))
+          {:declined {:reason (or (:reason (ex-data exception)) :typed-soac-route-declined)
+                      :message (.getMessage exception)
+                      :details (ex-data exception)}}))))))

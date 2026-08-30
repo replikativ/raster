@@ -98,9 +98,18 @@
                                  [target (pipeline/compile-gpu-program
                                           #'block-transfer-roundtrip! target :dtype :float)]))
                           [:ocl:0 :ze:0])
-        descriptor (get descriptors :ocl:0)]
+        descriptor (get descriptors :ocl:0)
+        gather-descriptor (pipeline/compile-gpu-program
+                           #'ops/gather-blocks! :ocl:0 :dtype :float)]
     (testing "both directions are ordinary allocation-free SOAC maps"
       (is (= [:map-void :map-void] (mapv :convention (:steps descriptor))))
+      (is (= [:map-void :map-void]
+             (mapv #(get-in % [:artifact :provenance :dialect]) (:steps descriptor)))
+          "the closed-program route declines while its dynamic scatter remains unsupported")
+      (is (= [:segmap]
+             (mapv #(get-in % [:artifact :provenance :dialect])
+                   (:steps gather-descriptor)))
+          "bounded block gather independently enters TypedSOAC as an inout map")
       (is (empty? (:allocs descriptor)))
       (is (= '[src block-indices paged restored nblocks block-width paged-blocks]
              (:all-params descriptor)))
@@ -135,10 +144,14 @@
       (is (empty? (:allocs descriptor))))
     (testing "every output element lowers through one target-neutral map"
       (is (= [:map-void] (mapv :convention (:steps descriptor))))
-      (is (= '[indices out src width _n_bound] (mapv :name (:abi step))))
+      (is (= :segmap (get-in step [:artifact :provenance :dialect])))
+      (is (= '[indices src out width _n_bound] (mapv :name (:abi step))))
       (is (= [:int :float :float :int :int] (mapv :dtype (:abi step))))
-      (is (= '(clojure.core/* (long nrows) (long width))
-             (last (get-in step [:artifact :arguments])))))
+      (is (= 'rstr_extent_0 (last (get-in step [:artifact :arguments])))
+          "the schedule names the typed scalar extent instead of embedding host code")
+      (is (= 15 ((:value-fn (last (:argument-specs step)))
+                 [nil nil nil 3 5]))
+          "the resident binder evaluates the scalar SSA definition from external arguments"))
     (testing "OpenCL and Level Zero preserve the same physical ABI"
       (is (apply = (map (comp #(mapv (juxt :kind :dtype :kernel-dtype) %)
                               :abi first :steps val)

@@ -36,6 +36,48 @@
     (is (= :analyzed-source
            (get-in (route/attempt source :float {'x :float}) [:stats :front-end])))))
 
+(deftest compound-parallel-extents-become-typed-scalar-ssa
+  (let [source '(let* [step (raster.par/map! target i
+                                              (clojure.core/* nrows width)
+                                              float (clojure.core/aget x i))]
+                        step)
+        normalized (frontend/normalize-source source)
+        program (frontend/form->program
+                 normalized
+                 {:dtype :float
+                  :array-types {'x :float 'target :float}
+                  :scalar-types {'nrows :long 'width :long}})
+        equations (dialect/equations program)]
+    (is (= '[rstr_extent_0 step] (mapv (comp first #(nth % 2)) equations)))
+    (is (= ['scalar 'map] (mapv dialect/operation-kind equations)))
+    (is (= 'rstr_extent_0 (dialect/operation-extent (second equations))))
+    (is (= :long (:dtype (get-in (dialect/facts program) [:values 'rstr_extent_0]))))
+    (is (= :analyzed-source
+           (get-in (route/attempt source :float {'x :float 'target :float}
+                                  {:scalar-types {'nrows :long 'width :long}})
+                   [:stats :front-end])))))
+
+(deftest guarded-dense-write-is-an-explicit-inout-map
+  (let [program
+        (frontend/form->program
+         '(let* [step (raster.par/map-void! i n
+                                             (if (< i limit)
+                                               (clojure.core/aset
+                                                out i (clojure.core/aget src i))))]
+                step)
+         {:dtype :float
+          :array-types {'src :float 'out :float}
+          :scalar-types {'n :long 'limit :long}})
+        equation (first (dialect/equations program))
+        facts (dialect/facts program)]
+    (is (= 'map (dialect/operation-kind equation)))
+    (is (= '[out src limit] (dialect/operation-inputs equation)))
+    (is (= [{:destination 'out :access :read-write :host-return :effect}]
+           (get-in facts [:equations 0 :attributes :result-storage])))
+    (is (= '(if (< i %capture0) %element1 %element0)
+           (first (:body-results
+                   (dialect/lambda-parts (:lambda (dialect/operation-parts equation)))))))))
+
 (deftest parallel-semantics-enter-only-their-exact-typed-operation
   (testing "a certified inclusive scan is represented directly, with destination facts"
     (let [program (frontend/form->program
