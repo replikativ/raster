@@ -185,14 +185,30 @@
 (defn- realize-source
   [form program]
   (let [[let-head bindings & body] form
+        original-pairs (vec (partition 2 bindings))
         realized (mapv #(realize-equation program %) (dialect/equations program))
         by-placement (group-by :placement realized)
+        physical-destinations
+        (into #{}
+              (keep (fn [[_ equation-facts]]
+                      (get-in equation-facts [:attributes :destination])))
+              (:equations (dialect/facts program)))
         pairs
         (vec
          (mapcat
           (fn [id]
-            (mapcat :pairs (get by-placement id)))
-          (range (count (partition 2 bindings)))))
+            (let [[symbol :as original-pair] (nth original-pairs id)]
+              (concat
+               ;; A destination may be a caller-owned input or a locally allocated buffer. The
+               ;; typed algorithm records the physical write boundary but does not own host-side
+               ;; allocation. Preserve a defining source binding when one exists; dropping it
+               ;; leaves CPU-C/JVM materialization with an unbound destination and also loses a
+               ;; resident scratch allocation before GPU extraction.
+               (when (and (contains? physical-destinations symbol)
+                          (empty? (get by-placement id)))
+                 [original-pair])
+               (mapcat :pairs (get by-placement id)))))
+          (range (count original-pairs))))
         source (with-meta (list* let-head (vec (mapcat identity pairs)) body) (meta form))]
     {:source source :realized (into {} (map (juxt :equation-id identity)) realized)}))
 

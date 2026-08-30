@@ -75,6 +75,18 @@
                    (tree-seq coll? seq (:source form))))
         "top-level do is an ordered binding spine before semantic analysis")))
 
+(deftest local-destination-allocation-survives-typed-materialization
+  (let [source '(let* [target (clojure.core/float-array n)
+                       step (raster.par/map! target i n float
+                                             (+ (clojure.core/aget x i) 1.0))]
+                      step)
+        {:keys [program stats]} (route/attempt source :float {'x :float 'target :float})
+        materialized-bindings (apply hash-map (second (:source program)))]
+    (is (= :typed-soac (:route stats)))
+    (is (= '(clojure.core/float-array n) (get materialized-bindings 'target))
+        "the typed algorithm owns the write boundary, not host-side buffer allocation")
+    (is (= 'raster.par/map! (first (get materialized-bindings 'step))))))
+
 (deftest pure-vertical-fusion-becomes-a-first-class-typed-program
   (let [{:keys [program stats]} (route/attempt map-map :float)
         equation (first (:equations program))]
