@@ -36,10 +36,11 @@
      :capture-parameters (subvec (vec parameters) element-end)}))
 
 (defn- emit-equation
-  [{:keys [kind id results attributes arrays captures parameters body-results]}]
+  [{:keys [kind id results attributes arrays captures parameters locals body-results]}]
   (list '= id (vec results)
         (list (symbol (name kind)) attributes (vec arrays) (vec captures)
-              (list 'lambda (vec parameters) (vec body-results)))))
+              (dialect/lambda-form (vec parameters) (dialect/emit-locals locals)
+                                   (vec body-results)))))
 
 (defn- use-sites
   [equations]
@@ -114,10 +115,15 @@
                         (scalar-expression scalar-defs dependent roots capture)
                         :else capture)]))
               (map vector capture-parameters (:captures info)))
+        global-locals (mapv #(update % :init
+                                     (fn [init]
+                                       (util/subst-syms capture-substitutions init)))
+                            (:locals info))
         global-bodies (mapv #(util/subst-syms capture-substitutions %) (:body-results info))
         bound (set (concat accumulators elements [(get-in info [:attributes :index])]))
         stable-before (set (get-in info [:attributes :attributes :stable-array-captures]))
-        referenced-values (->> (concat (mapcat #(util/free-syms % bound) global-bodies)
+        referenced-values (->> (concat (mapcat #(util/free-syms (:init %) bound) global-locals)
+                                       (mapcat #(util/free-syms % bound) global-bodies)
                                        stable-before)
                                (filter #(contains? values %)) distinct (sort-by pr-str) vec)
         new-parameters (mapv #(symbol (str "%capture" %)) (range (count referenced-values)))
@@ -128,6 +134,10 @@
     (assoc info
            :captures referenced-values
            :parameters (vec (concat accumulators elements new-parameters))
+           :locals (mapv #(update % :init
+                                  (fn [init]
+                                    (util/subst-syms body-substitutions init)))
+                         global-locals)
            :body-results (mapv #(util/subst-syms body-substitutions %) global-bodies)
            :attributes (assoc-in (:attributes info) [:attributes :stable-array-captures]
                                  (vec (filter stable-after referenced-values))))))

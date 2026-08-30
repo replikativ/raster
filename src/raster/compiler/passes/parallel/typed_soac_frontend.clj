@@ -50,13 +50,20 @@
     (second expression)
     expression))
 
-(defn- pointwise-stores
-  "Recognize an ordered body made exclusively of pointwise stores.
+(defn- retained-local-dtype
+  [binding init]
+  (let [init-tag (when (instance? clojure.lang.IObj init)
+                   (or (:raster.type/tag (meta init)) (:tag (meta init))))]
+    (or (dtype/dtype-for-scalar-tag (types/sym-type-tag binding))
+        (dtype/dtype-for-scalar-tag init-tag))))
 
-   Pure let bindings are substituted into every result expression. That projection is semantic,
-   not permission to reorder stores: callers additionally prove that destinations are distinct
-   and no result reads a sibling destination. Bodies with atomics, scatter indices, duplicate
-   destinations, or other effects return nil and remain on the compatibility route."
+(defn- pointwise-region
+  "Recognize an ordered, pure local-SSA spine ending exclusively in pointwise stores.
+
+   Local types come only from retained walker/TypedClojure facts. Nested local scopes and missing
+   local types decline; guessing them in this source recognizer or a C emitter would make the
+   region only nominally typed. Store legality is checked separately after local dependencies are
+   expanded for analysis."
   [body index]
   (cond
     (and (seq? body) (form/let-head? (first body)))
@@ -64,40 +71,36 @@
       (when (and (even? (count bindings))
                  (seq nested-body)
                  (not-any? util/effectful? (take-nth 2 (rest bindings))))
-        (when-let [stores (pointwise-stores (list* 'do nested-body) index)]
-          (let [binding-initializers (into {} (map vec) (partition 2 bindings))
-                binding-symbols (set (keys binding-initializers))
-                dependencies
-                (fn [expression]
-                  (loop [pending (set/intersection binding-symbols
-                                                   (util/free-syms expression))
-                         seen #{}]
-                    (if-let [binding (first pending)]
-                      (let [nested (set/intersection
-                                    binding-symbols
-                                    (util/free-syms (get binding-initializers binding)))]
-                        (recur (set/union (disj pending binding)
-                                          (set/difference nested seen))
-                               (conj seen binding)))
-                      seen)))
-                store-dependencies (mapv #(dependencies (:value %)) stores)
-                shared? (some (fn [binding]
-                                (< 1 (count (filter #(contains? % binding)
-                                                    store-dependencies))))
-                              binding-symbols)]
-            ;; TypedSOAC's current tuple-map region has no shared local binding spine. Duplicating
-            ;; a common initializer into several results is semantically valid but a performance
-            ;; regression, so retain that body unchanged until scalar regions own local SSA.
-            (when-not shared?
-              (let [environment (util/binding-env bindings)]
-                (mapv #(update % :value (fn [value]
-                                          (util/subst-syms environment value)))
-                      stores)))))))
+        (when-let [{nested-locals :locals stores :stores}
+                   (pointwise-region (list* 'do nested-body) index)]
+          ;; Flattening nested lexical scopes needs alpha-renaming across each scope. Keep this
+          ;; first production slice to the ANF shape the walker emits: one local spine around the
+          ;; store sequence.
+          (when (empty? nested-locals)
+            (let [pairs (vec (partition 2 bindings))
+                  typed (mapv (fn [[binding init]]
+                                [binding init (retained-local-dtype binding init)])
+                              pairs)]
+              (when (every? (comp some? #(nth % 2)) typed)
+                (let [{:keys [locals substitutions]}
+                      (reduce (fn [{:keys [locals substitutions]} [binding init local-dtype]]
+                                (let [id (symbol (str "rstr_local_" (count locals)))]
+                                  {:locals (conj locals
+                                                 {:id id :dtype local-dtype
+                                                  :init (util/subst-syms substitutions init)})
+                                   :substitutions (assoc substitutions binding id)}))
+                              {:locals [] :substitutions {}} typed)]
+                  {:locals locals
+                   :stores (mapv #(update % :value
+                                          (fn [value]
+                                            (util/subst-syms substitutions value)))
+                                 stores)})))))))
 
     (and (seq? body) (= 'do (first body)))
-    (let [groups (mapv #(pointwise-stores % index) (rest body))]
-      (when (and (seq groups) (every? seq groups))
-        (vec (mapcat identity groups))))
+    (let [groups (mapv #(pointwise-region % index) (rest body))]
+      (when (and (seq groups) (every? some? groups)
+                 (every? (comp empty? :locals) groups))
+        {:locals [] :stores (vec (mapcat :stores groups))}))
 
     (descriptor/aset-call? body)
     (let [arguments (vec (descriptor/call-args body))]
@@ -109,20 +112,28 @@
                                       'clojure.core/float 'clojure.core/double}
                                     (first value))
                          (= 2 (count value)))]
-          [{:out (descriptor/aset-array-sym body)
-            :value (if cast? (second value) value)
-            :cast (when cast? (first value))}])))
+          {:locals []
+           :stores [{:out (descriptor/aset-array-sym body)
+                     :value (if cast? (second value) value)
+                     :cast (when cast? (first value))}]})))
 
     :else nil))
 
+(defn- expanded-local-expression
+  [locals expression]
+  (reduce (fn [body {:keys [id init]}]
+            (util/subst-syms {id init} body))
+          expression (reverse locals)))
+
 (defn- independent-pointwise-stores?
-  [stores]
+  [locals stores]
   (let [destinations (mapv :out stores)
         destination-set (set destinations)]
     (and (= (count destinations) (count destination-set))
          (every? (fn [{:keys [out value]}]
                    (empty? (disj (set/intersection destination-set
-                                                   (par/collect-aget-arrays value))
+                                                   (par/collect-aget-arrays
+                                                    (expanded-local-expression locals value)))
                                  out)))
                  stores))))
 
@@ -131,14 +142,16 @@
   [:effect-map equation-id ordinal])
 
 (defn- effect-map-description
-  [id symbol index extent stores elem-type]
-  (when (and (seq stores) (independent-pointwise-stores? stores))
+  [id symbol index extent {:keys [locals stores]} elem-type]
+  (when (and (seq stores) (independent-pointwise-stores? locals stores))
     (let [destinations (mapv :out stores)
           values (mapv :value stores)
-          io (extract-io (list* 'do values) index destinations)
+          analysis-values (concat (map :init locals) values)
+          io (update (extract-io (list* 'do analysis-values) index destinations)
+                     :scalars set/difference (set (map :id locals)))
           results (mapv #(effect-result-id id %) (range (count stores)))]
       (merge {:kind :map :id id :sym symbol :index index :extent extent
-              :results results :bodies values :casts (mapv :cast stores)
+              :results results :locals locals :bodies values :casts (mapv :cast stores)
               :effect-only? true :host-binding symbol :elem-type elem-type
               :result-storage
               (mapv (fn [destination]
@@ -156,7 +169,7 @@
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
           io (extract-io body idx [symbol])]
       (merge {:kind :map :id id :sym symbol :results [symbol]
-              :index idx :extent bound :casts [cast] :bodies [body]
+              :index idx :extent bound :locals [] :casts [cast] :bodies [body]
               :pure? true :elem-type elem-type}
              io))
 
@@ -171,7 +184,7 @@
       ;; physical inout value rather than manufacturing separate aliased input/output pointers.
       (when-not (or offset (= symbol out))
         (merge {:kind :map :id id :sym symbol :results [symbol]
-                :index idx :extent bound :casts [cast] :bodies [body]
+                :index idx :extent bound :locals [] :casts [cast] :bodies [body]
                 :result-storage [{:destination out
                                   :access (if (contains? (:inputs io) out) :read-write :write)
                                   :host-return :buffer}]
@@ -183,8 +196,9 @@
     (let [{:keys [out1 out2 idx bound cast body1 body2 elem-type]}
           (par/extract-par-map2-info expression)]
       (effect-map-description id symbol idx bound
-                              [{:out out1 :value body1 :cast cast}
-                               {:out out2 :value body2 :cast cast}]
+                              {:locals []
+                               :stores [{:out out1 :value body1 :cast cast}
+                                        {:out out2 :value body2 :cast cast}]}
                               elem-type))
 
     (par/par-reduce-form? expression)
@@ -223,8 +237,8 @@
 
     (par/par-map-void-form? expression)
     (let [{:keys [idx bound body elem-type]} (par/extract-par-map-void-info expression)]
-      (when-let [stores (pointwise-stores body idx)]
-        (effect-map-description id symbol idx bound stores elem-type)))
+      (when-let [region (pointwise-region body idx)]
+        (effect-map-description id symbol idx bound region elem-type)))
 
     :else nil))
 
@@ -337,20 +351,31 @@
 
 (defn- map-equation
   [description]
-  (let [{:keys [id index extent casts bodies inputs results]} description
+  (let [{:keys [id index extent locals casts bodies inputs results]} description
         expressions (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
-        [pointwise stable] ((juxt filter remove) #(pointwise-input? expressions % index) inputs)
+        all-expressions (into (mapv :init locals) expressions)
+        [pointwise stable] ((juxt filter remove) #(pointwise-input? all-expressions % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
+        substitutions (zipmap captures capture-parameters)
+        local-forms
+        (->> locals
+             (mapv (fn [{:keys [id dtype init]}]
+                     (dialect/local-value
+                      id dtype
+                      (util/subst-syms
+                       substitutions
+                       (first (elementize [init] arrays parameters index)))))))
         body-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
                            (elementize expressions arrays parameters index))]
     (list '= id results
           (list 'map {:index index :extent extent
                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
                 arrays captures
-                (list 'lambda (vec (concat parameters capture-parameters)) body-results)))))
+                (dialect/lambda-form (vec (concat parameters capture-parameters))
+                                     local-forms body-results)))))
 
 (defn- reduce-equation
   [{:keys [id extent inputs scalars product]}]
@@ -372,9 +397,9 @@
                          :dtypes [(:dtype component)]
                          :algebra [(:algebra product)]}
                 arrays captures
-                (list 'lambda
-                      (vec (concat [(:accumulator component)] elements capture-parameters))
-                      results)))))
+                (dialect/lambda-form
+                 (vec (concat [(:accumulator component)] elements capture-parameters))
+                 results)))))
 
 (defn- scan-equation
   [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
@@ -397,9 +422,9 @@
                        :dtypes [dtype]
                        :algebra [algebra]}
                 arrays captures
-                (list 'lambda
-                      (vec (concat [accumulator] elements capture-parameters))
-                      [result])))))
+                (dialect/lambda-form
+                 (vec (concat [accumulator] elements capture-parameters))
+                 [result])))))
 
 (defn- scalar-dtype
   [{:keys [sym expr]} scalar-dtypes scalar-types]
@@ -422,8 +447,9 @@
              {:binding id :symbol sym :expression expr}))
     (list '= id [sym]
           (list 'scalar {:dtypes [result-dtype]} captures
-                (list 'lambda parameters
-                      [(util/subst-syms (zipmap captures parameters) expr)])))))
+                (dialect/lambda-form
+                 parameters
+                 [(util/subst-syms (zipmap captures parameters) expr)])))))
 
 (defn- terminal-results
   [descriptions body]

@@ -127,7 +127,8 @@
           (list 'map {:index (:idx node) :extent (:bound node)
                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
                 arrays captures
-                (list 'lambda (vec (concat parameters capture-parameters)) body-results)))))
+                (dialect/lambda-form (vec (concat parameters capture-parameters))
+                                     body-results)))))
 
 (defn- reduce-equation
   [node]
@@ -160,10 +161,10 @@
                       :algebra [(:algebra product)]}]
       (list '= (:id node) (vec (filter some? (reduction/results product)))
             (list 'reduce attributes arrays captures
-                  (list 'lambda
-                        (vec (concat [(:accumulator component)]
-                                     element-parameters capture-parameters))
-                        body-results))))))
+                  (dialect/lambda-form
+                   (vec (concat [(:accumulator component)]
+                                element-parameters capture-parameters))
+                   body-results))))))
 
 (defn- scalar-dtype
   [node scalar-dtypes scalar-types]
@@ -189,8 +190,9 @@
              {:node (:id node) :symbol (:sym node) :expression expression}))
     (list '= (:id node) [(:sym node)]
           (list 'scalar {:dtypes [dtype]} captures
-                (list 'lambda parameters
-                      [(util/subst-syms (zipmap captures parameters) expression)])))))
+                (dialect/lambda-form
+                 parameters
+                 [(util/subst-syms (zipmap captures parameters) expression)])))))
 
 (defn- operation-equation
   [node aliases]

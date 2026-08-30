@@ -4,7 +4,8 @@
    Supported programs are represented and fused in the typed dialect whether or not a fusion
    fires. The resulting functional equations are mechanically projected into the surrounding host
    control expression and retained as first-class algorithms in a ParallelProgram."
-  (:require [raster.compiler.ir.parallel-program :as parallel-program]
+  (:require [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
@@ -38,14 +39,29 @@
 (defn- scalar-region
   [equation]
   (let [{:keys [attributes arrays captures lambda]} (dialect/operation-parts equation)
-        [_ _ body-results] lambda
+        {:keys [locals body-results]} (dialect/lambda-parts lambda)
         {:keys [elements capture-parameters]} (dialect/parameter-layout equation)
         substitutions
         (into (zipmap capture-parameters captures)
               (map (fn [parameter array]
                      [parameter (list 'clojure.core/aget array (:index attributes))])
                    elements arrays))]
-    (mapv #(util/subst-syms substitutions %) body-results)))
+    {:locals (mapv #(update % :init (fn [init] (util/subst-syms substitutions init)))
+                   locals)
+     :bodies (mapv #(util/subst-syms substitutions %) body-results)}))
+
+(defn- materialize-region
+  [locals body]
+  (if (seq locals)
+    (list 'let*
+          (vec
+           (mapcat (fn [{:keys [id dtype init]}]
+                     (let [tag (dtype/scalar-tag-for-dtype dtype)]
+                       [(with-meta id {:raster.type/tag tag})
+                        (list tag init)]))
+                   locals))
+          body)
+    body))
 
 (defn- allocation-pair
   [values result extent]
@@ -63,7 +79,7 @@
   (let [[_ equation-id results] equation
         {:keys [kind attributes]} (dialect/operation-parts equation)
         values (:values (dialect/facts program))
-        bodies (scalar-region equation)
+        {region-locals :locals bodies :bodies} (scalar-region equation)
         placement-facts (get-in (dialect/facts program) [:equations equation-id])
         constituent-ids (or (some-> placement-facts :attributes :fusion/constituents keys set)
                             #{(or (get-in placement-facts [:provenance :source-binding-id])
@@ -77,7 +93,7 @@
                                 {:reason :typed-soac-production-subset
                                  :equation equation-id :results results})))
             result (first results)
-            source (first bodies)]
+            source (materialize-region region-locals (first bodies))]
         {:equation-id equation-id
          :placement placement
          :pairs [[result source]]
@@ -114,24 +130,29 @@
                       (list 'clojure.core/aset secondary (:index attributes)
                             (list secondary-cast body)))
                     (rest physical-results) (rest casts) (rest bodies))
-              body (if (seq secondary-stores)
-                     (list* 'do (concat secondary-stores [(first bodies)]))
-                     (first bodies))
+              body (materialize-region
+                    region-locals
+                    (if (seq secondary-stores)
+                      (list* 'do (concat secondary-stores [(first bodies)]))
+                      (first bodies)))
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
                        (cond
                          (= #{:effect} host-returns)
                          (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                               (list* 'do
-                                      (map (fn [destination result-cast result-body]
-                                             (list 'clojure.core/aset destination
-                                                   (:index attributes)
-                                                   (list result-cast result-body)))
-                                           physical-results casts bodies)))
+                               (materialize-region
+                                region-locals
+                                (list* 'do
+                                       (map (fn [destination result-cast result-body]
+                                              (list 'clojure.core/aset destination
+                                                    (:index attributes)
+                                                    (list result-cast result-body)))
+                                            physical-results casts bodies))))
 
                          (= #{:buffer} host-returns)
                          (list 'raster.par/map! (first physical-results) (:index attributes)
-                               (:extent attributes) cast (first bodies))
+                               (:extent attributes) cast
+                               (materialize-region region-locals (first bodies)))
 
                          :else
                          (list 'raster.par/map! result (:index attributes) (:extent attributes)
@@ -150,14 +171,15 @@
       (let [result (first results)
             accumulator (first (:accumulators attributes))
             resident? (resident/resident-scalar-value? (get values result))
+            body (materialize-region region-locals (first bodies))
             source (if resident?
                      ;; reduce-into owns its explicit one-element destination first. The
                      ;; functional reduction algorithm itself remains unchanged.
                      (list 'raster.par/reduce-into result accumulator
                            (first (:identities attributes)) (:index attributes)
-                           (:extent attributes) (first bodies))
+                           (:extent attributes) body)
                      (list 'raster.par/reduce accumulator (first (:identities attributes))
-                           (:index attributes) (:extent attributes) (first bodies)))]
+                           (:index attributes) (:extent attributes) body))]
         (if resident?
           (let [effect (gensym (str "typed_soac_reduce_" equation-id "__"))]
             {:equation-id equation-id
@@ -189,7 +211,7 @@
                            (first (:identities attributes))
                            (:index attributes) (:extent attributes)
                            (nth (get dtype->allocation (first (:dtypes attributes))) 2 nil)
-                           (first bodies))
+                           (materialize-region region-locals (first bodies)))
                      {:raster.type/elem-type (first (:dtypes attributes))})]
         {:equation-id equation-id
          :placement placement

@@ -138,6 +138,33 @@
     (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
     (is (= [12.0 22.0 32.0 42.0] (mapv double b)))))
 
+(deftest shared-tuple-work-stays-single-copy-through-jvm-and-gpu-lowering
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        i n
+                        (let* [^float shifted (+ (clojure.core/aget x i) 1.0)
+                               ^float squared (* shifted shifted)]
+                              (clojure.core/aset a i (float shifted))
+                              (clojure.core/aset b i (float squared))))]
+                      effect)
+        typed (:program (route/attempt source :float {'x :float 'a :float 'b :float}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0}))
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 0)
+        kernel-source (:source (first (:kernels emitted)))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x a b n] (:form jvm)))
+        x (float-array [1.0 2.0 3.0 4.0])
+        a (float-array 4)
+        b (float-array 4)]
+    (is (= 1 (count (re-seq #"x\[idx\]" kernel-source)))
+        "the shared producer is emitted once, not projected into both results")
+    (is (re-find #"float rstr_local_0" kernel-source))
+    (is (nil? (execute x a b 4)))
+    (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
+    (is (= [4.0 9.0 16.0 25.0] (mapv double b)))))
+
 (deftest typed-inout-preserves-sequential-jvm-semantics
   (let [source '(let* [step (raster.par/map! target i n float
                                              (* (clojure.core/aget target i) 2.0))]
