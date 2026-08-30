@@ -77,16 +77,19 @@ with typed scalar SSA, stable reads, workgroup allocation, masks, barriers and a
 the same body emits as OpenCL, CUDA and HIP and is compiled by the hardware-free vendor CI gates.
 Unsupported scalar regions decline explicitly to the established verified SegRed OpenCL emitter.
 
-The map/scalar/full-reduction/inclusive-scan front end now constructs TypedSOAC directly from closed analyzed
+The map/scalar/full-reduction/certified-scan front end now constructs TypedSOAC directly from closed analyzed
 source and retained walker type metadata. It establishes stable equation/value identity, types,
 effects, aliases and placement provenance before fusion; no `ir.soac` record or record-to-dialect
 adapter participates in this production route. The old dependency-graph path remains only as an
-explicit fallback for unsupported parallel forms and as a differential oracle. Inclusive scan has
-a distinct `scan` equation with an explicit `:inclusive` mode and a checked `AssociativeScan`
-certificate; its caller-owned destination is an alias/effect fact, not part of the functional
-algebra. It lowers directly to a one- or three-node SegScan `KernelGraph` without constructing a
-legacy `SoacScan`. The GPU backend now target-lowers that scheduled value through one fail-loud
-graph-emission boundary, wraps it in the same `KernelDispatch` value used by other selectable
+explicit fallback for unsupported parallel forms and as a differential oracle. Scan has a distinct
+equation with an explicit `:inclusive` or `:exclusive` result mode and a checked `AssociativeScan`
+certificate; its caller-owned destination and output layout are facts, not part of the functional
+algebra. Both modes lower directly to the same one- or three-node SegScan `KernelGraph` without
+constructing a legacy `SoacScan`. Exclusive mode retains logical traversal extent `n`, records its
+result as `n+1` through checked symbolic integer-expression IR, and specializes scheduled stores to
+materialize the identity at zero and prefixes at `idx+1`. The GPU backend now target-lowers that
+scheduled value through one fail-loud graph-emission boundary, wraps it in the same
+`KernelDispatch` value used by other selectable
 schedules, and resident descriptor extraction retains it as one executable step. LinkPlan and the
 runtime binder allocate its private temporary and flatten its nodes without reconstructing scan or
 ABI semantics. The ordinary per-call compiled function now invokes that same registered
@@ -96,8 +99,9 @@ temporaries, and copies back only declared writes. No duplicate sequential sourc
 is embedded in the emitted form. The public GPU-session compiler now crosses the same direct
 TypedSOAC and scheduled SegOp boundary instead of asking the OpenCL emitter to reconstruct generic
 maps and reductions from walked source. Destination-writing maps retain explicit destination,
-alias, effect and return facts. General recurrences and `scan-exclusive` remain outside this
-typed operation and must not borrow its reassociation proof. The remaining parallel forms must
+alias, effect and return facts. General recurrences remain outside this typed operation and must
+not borrow its reassociation proof. The obsolete raw exclusive-scan GPU generator is no longer a
+backend fallback: unscheduled source fails loudly. The remaining parallel forms must
 join the direct front end before the old dependency-graph fallback can be deleted.
 
 Pointwise maps that read and write their caller-owned destination stay on this same route. The
@@ -462,10 +466,10 @@ SIMD/GPU reuse its certified SegOps. Non-escaping reduction results remain logic
 whose `:resident-scalar-buffer` representation drives one-element device allocation and stable
 consumer loads; dependent scalar equations are inlined as a typed transform. The former raw-source
 resident rewrite and typed-route opt-out are deleted. The analyzed front end now constructs this
-TypedSOAC subset directly. Certified inclusive scan also crosses the same typed algorithm and
-scheduled-program boundary, retaining its explicit destination contract and graph-owned temporary
-storage. Migration is complete when hardware-costed multi-consumer fusion, the remaining parallel
-forms, and covered backend compatibility re-lowerings are deleted. Nested reductions
+TypedSOAC subset directly. Certified inclusive and exclusive scans also cross the same typed
+algorithm and scheduled-program boundary, retaining explicit destination, result-layout, and
+graph-owned temporary-storage contracts. Migration is complete when hardware-costed multi-consumer
+fusion, the remaining parallel forms, and covered backend compatibility re-lowerings are deleted. Nested reductions
 inside a retained map are typed and correctly classified, but the JVM SIMD leaf still lowers those inner
 regions through its established scalar fallback; this is an explicit scheduling boundary rather
 than a loss of semantic facts.
@@ -818,14 +822,14 @@ The immediate continuation after the verified double-buffered weighted-reduction
 5. **In progress:** finish typed parallel coverage and scalar JVM scheduling, then remove compatibility
    re-lowering. Supported map/reduce programs, including unfused and host-visible intermediates,
    horizontal tuple maps, typed scalar/shape equations, stable tensor captures, and resident
-   reduction results and certified inclusive scan now share the direct
-   analyzed-source→TypedSOAC→SegOp production route. Inclusive scan additionally reaches an emitted
+   reduction results and certified inclusive/exclusive scan now share the direct
+   analyzed-source→TypedSOAC→SegOp production route. Both scan modes additionally reach an emitted
    graph-backed resident executable through ordinary dispatch, LinkPlan and binding, and a generic
    per-call staging graph runner executes the same registered dispatch. Pointwise read/write map
    destinations lower to one physical `:inout` ABI result and execute through both resident and
    staged binding without an aliased compatibility input. Hardware-costed
    multi-consumer fusion, nested-region JVM
-   scheduling, the remaining parallel forms (including distinct exclusive-scan semantics), and
+   scheduling, the remaining parallel forms, and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.

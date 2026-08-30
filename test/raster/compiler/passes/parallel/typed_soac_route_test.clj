@@ -4,6 +4,7 @@
             [raster.compiler.backend.jvm.par-simd :as par-simd]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
@@ -31,6 +32,11 @@
 (def ^:private inclusive-scan
   '(let* [result (raster.par/scan out acc 0.0 i n float
                                   (+ acc (clojure.core/aget x i)))]
+         result))
+
+(def ^:private exclusive-scan
+  '(let* [result (raster.par/scan-exclusive out acc 0.0 i n float
+                                            (+ acc (clojure.core/aget x i)))]
          result))
 
 (deftest gpu-session-scheduling-enters-the-shared-typed-boundary
@@ -329,6 +335,75 @@
     (is (= [1.0 3.0 6.0 10.0 15.0] (mapv double result)))
     (is (nil? (get-in jvm [:stats :segop-relowered]))
         "JVM keeps the exact inclusive recurrence until a certified vector scan schedule lands")))
+
+(deftest typed-exclusive-scan-keeps-one-algorithm-and-specializes-its-result-layout
+  (let [{:keys [program stats]} (route/attempt exclusive-scan :float
+                                               {'x :float 'out :float})
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :float :target-device :ocl:0
+                                   :array-types {'x :float 'out :float}}))
+        equation (first (:equations scheduled))
+        graph (get-in equation [:attributes :kernel-graph])
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
+        [intra _ carry] (:kernels emitted)]
+    (is (= :typed-soac (:route stats)))
+    (is (= :exclusive
+           (get-in (dialect/operation-parts
+                    (first (dialect/equations (:algorithm equation))))
+                   [:attributes :mode])))
+    (is (= :exclusive (get-in graph [:attributes :scan-mode])))
+    (is (= (kernel-launch/sum 'n 1) (:elements (first (:outputs graph)))))
+    (is (= 3 (count (:nodes graph))))
+    (is (re-find #"\[0\] = 0.0f" (:source intra)))
+    (is (re-find #"\[idx \+ 1\] = sdata\[tid\]" (:source intra)))
+    (is (re-find #"\[idx \+ 1\]" (:source carry)))
+    (is (= 1 (get-in emitted [:stats :kernel-graphs])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))))
+
+(deftest typed-exclusive-scan-preserves-exact-sequential-jvm-semantics
+  (let [typed (:program (route/attempt exclusive-scan :float
+                                       {'x :float 'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out x n] (:form jvm)))
+        out (float-array 6)
+        result (execute out (float-array [1.0 2.0 3.0 4.0 5.0]) 5)]
+    (is (identical? out result))
+    (is (= [0.0 1.0 3.0 6.0 10.0 15.0] (mapv double result)))
+    (is (nil? (get-in jvm [:stats :segop-relowered]))
+        "JVM retains the exact exclusive recurrence without rebuilding its algorithm")))
+
+(deftest raw-exclusive-scan-cannot-enter-the-gpu-backend-around-typed-scheduling
+  (try
+    (opencl-pass/opencl-pass
+     '(raster.par/scan-exclusive out acc 0.0 i n float
+                                 (+ acc (clojure.core/aget x i)))
+     :device-id :ocl:0 :dtype :float)
+    (is false "raw source must not select the obsolete backend-local scan generator")
+    (catch clojure.lang.ExceptionInfo exception
+      (is (= :exclusive-scan-requires-typed-schedule
+             (:reason (ex-data exception)))))))
+
+(deftest zero-length-exclusive-scan-still-materializes-the-identity
+  (let [source '(let* [result (raster.par/scan-exclusive out acc 0.0 i 0 float
+                                                         (+ acc 1.0))]
+                      result)
+        typed (:program (route/attempt source :float {'out :float}))
+        scheduled (:form (segop-lower/segop-lower-pass
+                          typed {:dtype :float :target-device :ocl:0
+                                 :array-types {'out :float}}))
+        graph (get-in scheduled [:equations 0 :attributes :kernel-graph])
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)
+        artifact (first (:kernels emitted))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[out] (:form jvm)))
+        out (float-array 1)]
+    (is (= 1 (count (:nodes graph))))
+    (is (= (kernel-launch/sum 0 1) (:elements (first (:outputs graph)))))
+    (is (= [1] (get-in artifact [:launch :group-count])))
+    (is (re-find #"\[0\] = 0.0f" (:source artifact)))
+    (is (identical? out (execute out)))
+    (is (= 0.0 (double (aget out 0))))))
 
 (deftest typed-horizontal-fusion-lowers-to-one-explicit-multi-output-segmap
   (let [{:keys [program stats]} (route/attempt

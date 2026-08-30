@@ -56,6 +56,11 @@
   (raster.par/scan out acc 0.0 i n float
                    (clojure.core/+ acc (ra/aget x i))))
 
+(deftm ocl-session-exclusive-scan
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/scan-exclusive out acc 0.0 i n float
+                             (clojure.core/+ acc (ra/aget x i))))
+
 (deftest ocl-map-void-mixed-storage-abi-roundtrip
   (if-not @device-probe/opencl-available?
     (device-probe/opencl-skip! "mixed-storage map-void")
@@ -128,6 +133,32 @@
       (is (= (float n) (aget out (dec n))))
       (is (every? (fn [i] (= (float (inc i)) (aget out i)))
                   [0 1 255 256 511 512 1024])))))
+
+(deftest ocl-resident-and-staged-exclusive-scan-use-the-same-typed-graph
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident and staged typed exclusive scan graph")
+    (let [n 1025
+          x (float-array (repeat n 1.0))
+          descriptor (pl/compile-gpu-program #'ocl-session-exclusive-scan
+                                             :ocl:0 :dtype :float)
+          session (gpu/make-session :ocl:0)]
+      (try
+        (is (= :exclusive
+               (get-in descriptor [:steps 0 :artifact :attributes :scan-mode])))
+        (let [out (float-array (inc n))
+              program (fixture/instantiate! session descriptor [x out n]
+                                            {'x :input 'out :output})
+              ^floats scanned (get (fixture/run! program [x out n]) 'out)]
+          (is (every? (fn [i] (= (float i) (aget scanned i)))
+                      [0 1 255 256 257 512 1024 1025])))
+        (let [execute (pl/compile-aot #'ocl-session-exclusive-scan
+                                      :target-device :ocl:0 :dtype :float)
+              out (float-array (inc n))
+              result (execute x out n)]
+          (is (identical? out result))
+          (is (every? (fn [i] (= (float i) (aget out i)))
+                      [0 1 255 256 257 512 1024 1025])))
+        (finally (gpu/close-session! session))))))
 
 (deftest ocl-resident-indexed-row-reduction-roundtrip
   (if-not @device-probe/opencl-available?

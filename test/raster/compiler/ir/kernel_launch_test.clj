@@ -47,6 +47,9 @@
          (launch/resolve-expression
           {'m 3 'k 257}
           (launch/product 'm (launch/align-up (launch/ceil-div 'k 2) 256)))))
+  (let [padded-extent (launch/sum 'n 1)]
+    (is (= #{'n} (launch/expression-references padded-extent)))
+    (is (= 1026 (launch/resolve-expression {'n 1025} padded-extent))))
   (let [tiles (launch/product (launch/ceil-div 'm 128) (launch/ceil-div 'n 128))
         requested-splits (launch/minimum (launch/ceil-div 128 tiles)
                                          (launch/floor-div 'k 1024)

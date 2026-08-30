@@ -4,6 +4,7 @@
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
+            [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.pipeline :as pipeline]
             [raster.core :refer [deftm]]))
 
@@ -31,6 +32,10 @@
   [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
   (raster.par/scan out acc 0.0 i n float (+ acc (ra/aget x i))))
 
+(deftm resident-kernel-call-exclusive-scan
+  [x :- (Array float) out :- (Array float) n :- Long] :- (Array float)
+  (raster.par/scan-exclusive out acc 0.0 i n float (+ acc (ra/aget x i))))
+
 (deftest resident-typed-scan-is-one-graph-backed-executable-step
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-scan
                                                  :ze:0 :dtype :float)
@@ -48,6 +53,16 @@
            (mapv (fn [{:keys [kind sym expression]}]
                    (if (= :scalar kind) expression sym))
                  (:argument-specs step))))))
+
+(deftest resident-exclusive-scan-preserves-its-n-plus-one-result-contract
+  (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-exclusive-scan
+                                                 :ze:0 :dtype :float)
+        step (first (:steps descriptor))
+        executable (:artifact step)]
+    (is (= [:executable] (mapv :convention (:steps descriptor))))
+    (is (= :exclusive (get-in executable [:attributes :scan-mode])))
+    (is (= (kernel-launch/sum 'n 1) (:elements (first (:outputs executable)))))
+    (is (empty? (:allocs descriptor)))))
 
 (deftest resident-segmap-step-carries-one-executable-call-template
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map

@@ -29,7 +29,8 @@
              (lambda [acc element ... capture-parameter ...] [step-result])))]
        [program-result ...])
 
-   Map lambdas return tuples, so horizontal fusion remains functional rather than encoding
+   Scan mode may be `:inclusive` or `:exclusive`; it is an explicit result-layout property. Map
+   lambdas return tuples, so horizontal fusion remains functional rather than encoding
    secondary results as hidden stores. Captures are explicit operands with explicit scalar lambda
    parameters, so stable value IDs never leak into lexical expression binding."
   (:require [clojure.set :as set]
@@ -71,6 +72,17 @@
      (symbol? extent) extent
      :else (list 'value extent))])
 
+(defn scan-result-shape
+  "The functional result shape of a scan operation.
+
+   Inclusive scan produces one value per input element. Raster's public exclusive scan includes
+   the initial identity at element zero, so its result has `extent + 1` elements. The logical
+   traversal extent remains unchanged and is what schedules use for work decomposition."
+  [{:keys [mode extent]}]
+  [(if (= :exclusive mode)
+     (if (integer? extent) (inc extent) (list 'clojure.core/inc extent))
+     (first (extent-shape extent)))])
+
 (defn map-attributes?
   [value]
   (and (map? value)
@@ -96,12 +108,10 @@
        (every? map? (:algebra value))))
 
 (defn scan-attributes?
-  "Attributes for the certified inclusive scan dialect operation.
-
-   The explicit mode is intentionally load-bearing: exclusive scan is a distinct surface
-   primitive and must never enter this schedule by spelling accident."
+  "Attributes for a certified scan dialect operation. The explicit mode is load-bearing because
+   inclusive and exclusive scans have different observable result layouts."
   [value]
-  (and (= :inclusive (:mode value))
+  (and (contains? #{:inclusive :exclusive} (:mode value))
        (reduce-attributes? (dissoc value :mode))
        (every? scan-ir/associative-scan? (:algebra value))))
 
@@ -387,12 +397,12 @@
         (let [value (get values id)]
           (when (and value
                      (not (and (= :tensor (:kind value))
-                               (= (extent-shape extent) (:shape value))
+                               (= (scan-result-shape attributes) (:shape value))
                                (= dtype (:dtype value)))))
             (fail! :typed-soac-scan-result-type
-                   "scan results must be rank-one tensors over the declared extent"
+                   "scan result shape must agree with its explicit inclusive/exclusive mode"
                    {:equation equation-id :id id :value value
-                    :extent extent :dtype dtype}))))
+                    :extent extent :mode (:mode attributes) :dtype dtype}))))
 
       nil)))
 

@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.typed-soac-frontend
-  "Direct analyzed-source to TypedSOAC construction for the closed map/scalar/reduce/inclusive-scan subset.
+  "Direct analyzed-source to TypedSOAC construction for the closed map/scalar/reduce/certified-scan subset.
 
    This is the production front door for TypedSOAC.  It consumes the retained source form and
    walker type metadata directly; it never constructs the older record graph.  Unsupported
@@ -122,9 +122,14 @@
                          :attributes {:source :raster.par/reduce}})}
              io))
 
-    (par/par-scan-form? expression)
-    (let [{:keys [out acc init idx bound cast body elem-type]}
-          (par/extract-par-scan-info expression)
+    (or (par/par-scan-form? expression)
+        (par/par-scan-exclusive-form? expression))
+    (let [mode (if (par/par-scan-exclusive-form? expression) :exclusive :inclusive)
+          {:keys [out acc init idx bound cast body elem-type]}
+          ((if (= :exclusive mode)
+             par/extract-par-scan-exclusive-info
+             par/extract-par-scan-info)
+           expression)
           scan-dtype (or elem-type
                          (dtype/dtype-for-scalar-tag cast)
                          :double)]
@@ -133,7 +138,7 @@
       ;; the typed route instead of pretending the destination is both an input and a definition.
       (when-not (= symbol out)
         (let [algebra (scan/certify {:acc acc :init init :lambda body :out out} scan-dtype)]
-          (merge {:kind :scan :id id :sym symbol :index idx :extent bound
+          (merge {:kind :scan :id id :sym symbol :index idx :extent bound :mode mode
                   :primary-out out :accumulator acc :identity init :dtype scan-dtype
                   :algebra algebra :body body}
                  (extract-io body idx [out] :accumulator acc)))))
@@ -299,7 +304,7 @@
                       results)))))
 
 (defn- scan-equation
-  [{:keys [id sym index extent inputs scalars primary-out accumulator identity dtype body]}]
+  [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
   (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
         stable (conj (set stable) primary-out)
@@ -312,7 +317,7 @@
         algebra (scan/certify {:acc accumulator :init identity :lambda result
                                :out primary-out} dtype)]
     (list '= id [sym]
-          (list 'scan {:mode :inclusive :index index :extent extent
+          (list 'scan {:mode mode :index index :extent extent
                        :attributes {:stable-array-captures (vec (sort-by pr-str stable))}
                        :accumulators [accumulator]
                        :identities [identity]
@@ -422,8 +427,10 @@
                      captures)))
      (into {} (map (fn [id result-dtype]
                      [id (tensor-value (or result-dtype default-dtype :double)
-                                       (if (contains? #{'scalar 'reduce} kind) []
-                                           (dialect/extent-shape extent)))])
+                                       (case kind
+                                         (scalar reduce) []
+                                         scan (dialect/scan-result-shape attributes)
+                                         (dialect/extent-shape extent)))])
                    results result-dtypes)))))
 
 (defn- merge-value

@@ -48,12 +48,17 @@
       (is (= :inclusive (get-in (dialect/operation-parts equation) [:attributes :mode])))
       (is (= '{result target} (get-in (dialect/facts program) [:equations 0 :aliases])))
       (is (= #{:memory/write} (:effects (dialect/facts program))))))
-  (testing "exclusive scan remains a distinct, unsupported semantic operation"
-    (is (nil? (frontend/form->program
-               '(let* [result (raster.par/scan-exclusive target acc 0.0 i n float
-                                                         (+ acc (clojure.core/aget x i)))]
-                      result)
-               {:dtype :float :array-types {'x :float 'target :float}}))))
+  (testing "exclusive scan is the same certified operation with a distinct result mode"
+    (let [program (frontend/form->program
+                   '(let* [result (raster.par/scan-exclusive target acc 0.0 i n float
+                                                             (+ acc (clojure.core/aget x i)))]
+                          result)
+                   {:dtype :float :array-types {'x :float 'target :float}})
+          equation (first (dialect/equations program))]
+      (is (= 'scan (dialect/operation-kind equation)))
+      (is (= :exclusive (get-in (dialect/operation-parts equation) [:attributes :mode])))
+      (is (= '[(clojure.core/inc n)]
+             (:shape (get-in (dialect/facts program) [:values 'result]))))))
   (testing "a general recurrence cannot be mislabeled as an associative scan"
     (try
       (frontend/form->program
