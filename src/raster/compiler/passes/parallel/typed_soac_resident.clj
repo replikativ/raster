@@ -194,7 +194,12 @@
                                         (conj (dialect/operation-extent equation))))
                                     rewritten))
             inputs (vec (sort-by pr-str (set/difference references definitions)))
-            live-values (set/union definitions references outputs)
+            storage-destinations
+            (set (mapcat (fn [equation]
+                           (map :destination
+                                (or (dialect/result-storage facts (second equation)) [])))
+                         rewritten))
+            live-values (set/union definitions references storage-destinations outputs)
             facts (-> facts
                       (assoc :values (select-keys values live-values)
                              :inputs inputs)

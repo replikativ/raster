@@ -18,14 +18,14 @@
 (defn- why [form] (get-in (pipeline/extract-gpu-program form) [nr-key :why]))
 
 (deftest map-void-arity
-  (testing "a correct 5-wide map-void invoke extracts to one step, no rejection"
-    (let [r (pipeline/extract-gpu-program
-             '(let* [out (raster.gpu.ze-runtime/invoke-registered-map-void-kernel
-                          "k" [a b] [s] 10)]
-                    out))]
-      (is (nil? (nr-key r)))
-      (is (= 1 (count (:steps r))))
-      (is (= :map-void (:convention (first (:steps r)))))))
+  (doseq [head '[raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+                 raster.gpu.ocl-runtime/invoke-registered-map-void-kernel]]
+    (testing (str "a correct target-specific 5-wide map-void invoke extracts: " head)
+      (let [r (pipeline/extract-gpu-program
+               (list 'let* ['out (list head "k" '[a b] '[s] 10)] 'out))]
+        (is (nil? (nr-key r)))
+        (is (= 1 (count (:steps r))))
+        (is (= :map-void (:convention (first (:steps r))))))))
   (testing "an EXTRA operand is rejected by name, not silently dropped"
     (is (= :unparseable-kernel-invoke
            (why '(let* [out (raster.gpu.ze-runtime/invoke-registered-map-void-kernel
@@ -101,14 +101,14 @@
     (testing "nil at the ABI result role is an explicit host-scalar staging fallback"
       (let [r (pipeline/extract-gpu-program
                '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
-                             "k" [a nil scale n])]
+                            "k" [a nil scale n])]
                       out)
                info)]
         (is (= :host-scalar-reduction (get-in r [nr-key :why])))))
     (testing "a concrete result buffer remains resident and aliases the marker binding"
       (let [r (pipeline/extract-gpu-program
                '(let* [out (raster.gpu.ze-runtime/invoke-registered-reduction-kernel
-                             "k" [a obuf scale n])]
+                            "k" [a obuf scale n])]
                       out)
                info)]
         (is (nil? (nr-key r)))

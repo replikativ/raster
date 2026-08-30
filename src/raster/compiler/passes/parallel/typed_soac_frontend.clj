@@ -50,38 +50,104 @@
     (second expression)
     expression))
 
-(defn- pointwise-map-void
-  "Recognize one pointwise store without erasing or duplicating effects.
+(defn- pointwise-stores
+  "Recognize an ordered body made exclusively of pointwise stores.
 
-   The let-wrapper case is the closed form produced by the walker.  Its initializers must be pure
-   because flattening them into the element expression changes their evaluation placement."
+   Pure let bindings are substituted into every result expression. That projection is semantic,
+   not permission to reorder stores: callers additionally prove that destinations are distinct
+   and no result reads a sibling destination. Bodies with atomics, scatter indices, duplicate
+   destinations, or other effects return nil and remain on the compatibility route."
   [body index]
-  (let [statement (if (and (seq? body) (= 'do (first body)) (= 2 (count body)))
-                    (second body)
-                    body)]
-    (cond
-      (and (seq? statement) (form/let-head? (first statement)))
-      (let [[_ bindings & nested-body] statement]
-        (when (and (= 1 (count nested-body))
-                   (not-any? util/effectful? (take-nth 2 (rest bindings))))
-          (when-let [inner (pointwise-map-void (first nested-body) index)]
-            (update inner :value #(util/subst-syms (util/binding-env bindings) %)))))
+  (cond
+    (and (seq? body) (form/let-head? (first body)))
+    (let [[_ bindings & nested-body] body]
+      (when (and (even? (count bindings))
+                 (seq nested-body)
+                 (not-any? util/effectful? (take-nth 2 (rest bindings))))
+        (when-let [stores (pointwise-stores (list* 'do nested-body) index)]
+          (let [binding-initializers (into {} (map vec) (partition 2 bindings))
+                binding-symbols (set (keys binding-initializers))
+                dependencies
+                (fn [expression]
+                  (loop [pending (set/intersection binding-symbols
+                                                   (util/free-syms expression))
+                         seen #{}]
+                    (if-let [binding (first pending)]
+                      (let [nested (set/intersection
+                                    binding-symbols
+                                    (util/free-syms (get binding-initializers binding)))]
+                        (recur (set/union (disj pending binding)
+                                          (set/difference nested seen))
+                               (conj seen binding)))
+                      seen)))
+                store-dependencies (mapv #(dependencies (:value %)) stores)
+                shared? (some (fn [binding]
+                                (< 1 (count (filter #(contains? % binding)
+                                                    store-dependencies))))
+                              binding-symbols)]
+            ;; TypedSOAC's current tuple-map region has no shared local binding spine. Duplicating
+            ;; a common initializer into several results is semantically valid but a performance
+            ;; regression, so retain that body unchanged until scalar regions own local SSA.
+            (when-not shared?
+              (let [environment (util/binding-env bindings)]
+                (mapv #(update % :value (fn [value]
+                                          (util/subst-syms environment value)))
+                      stores)))))))
 
-      (descriptor/aset-call? statement)
-      (let [arguments (vec (descriptor/call-args statement))]
-        (when (and (= 3 (count arguments))
-                   (= index (strip-index-cast (nth arguments 1))))
-          (let [value (nth arguments 2)
-                cast? (and (seq? value)
-                           (contains? #{'float 'double 'int 'long
-                                        'clojure.core/float 'clojure.core/double}
-                                      (first value))
-                           (= 2 (count value)))]
-            {:out (descriptor/aset-array-sym statement)
-             :value (if cast? (second value) value)
-             :cast (when cast? (first value))})))
+    (and (seq? body) (= 'do (first body)))
+    (let [groups (mapv #(pointwise-stores % index) (rest body))]
+      (when (and (seq groups) (every? seq groups))
+        (vec (mapcat identity groups))))
 
-      :else nil)))
+    (descriptor/aset-call? body)
+    (let [arguments (vec (descriptor/call-args body))]
+      (when (and (= 3 (count arguments))
+                 (= index (strip-index-cast (nth arguments 1))))
+        (let [value (nth arguments 2)
+              cast? (and (seq? value)
+                         (contains? #{'float 'double 'int 'long
+                                      'clojure.core/float 'clojure.core/double}
+                                    (first value))
+                         (= 2 (count value)))]
+          [{:out (descriptor/aset-array-sym body)
+            :value (if cast? (second value) value)
+            :cast (when cast? (first value))}])))
+
+    :else nil))
+
+(defn- independent-pointwise-stores?
+  [stores]
+  (let [destinations (mapv :out stores)
+        destination-set (set destinations)]
+    (and (= (count destinations) (count destination-set))
+         (every? (fn [{:keys [out value]}]
+                   (empty? (disj (set/intersection destination-set
+                                                   (par/collect-aget-arrays value))
+                                 out)))
+                 stores))))
+
+(defn- effect-result-id
+  [equation-id ordinal]
+  [:effect-map equation-id ordinal])
+
+(defn- effect-map-description
+  [id symbol index extent stores elem-type]
+  (when (and (seq stores) (independent-pointwise-stores? stores))
+    (let [destinations (mapv :out stores)
+          values (mapv :value stores)
+          io (extract-io (list* 'do values) index destinations)
+          results (mapv #(effect-result-id id %) (range (count stores)))]
+      (merge {:kind :map :id id :sym symbol :index index :extent extent
+              :results results :bodies values :casts (mapv :cast stores)
+              :effect-only? true :host-binding symbol :elem-type elem-type
+              :result-storage
+              (mapv (fn [destination]
+                      {:destination destination
+                       :access (if (contains? (:inputs io) destination)
+                                 :read-write :write)
+                       :host-return :effect})
+                    destinations)}
+             io))))
 
 (defn- operation-description
   [id symbol expression]
@@ -89,7 +155,8 @@
     (par/par-map-pure-form? expression)
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
           io (extract-io body idx [symbol])]
-      (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body body
+      (merge {:kind :map :id id :sym symbol :results [symbol]
+              :index idx :extent bound :casts [cast] :bodies [body]
               :pure? true :elem-type elem-type}
              io))
 
@@ -103,11 +170,22 @@
       ;; of the destination is an explicit read/write operand; scheduling must retain it as one
       ;; physical inout value rather than manufacturing separate aliased input/output pointers.
       (when-not (or offset (= symbol out))
-        (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body body
-                :primary-out out :destination-return :buffer
-                :destination-access (if (contains? (:inputs io) out) :read-write :write)
+        (merge {:kind :map :id id :sym symbol :results [symbol]
+                :index idx :extent bound :casts [cast] :bodies [body]
+                :result-storage [{:destination out
+                                  :access (if (contains? (:inputs io) out) :read-write :write)
+                                  :host-return :buffer}]
+                :host-binding symbol
                 :elem-type elem-type}
                io)))
+
+    (par/par-map2-form? expression)
+    (let [{:keys [out1 out2 idx bound cast body1 body2 elem-type]}
+          (par/extract-par-map2-info expression)]
+      (effect-map-description id symbol idx bound
+                              [{:out out1 :value body1 :cast cast}
+                               {:out out2 :value body2 :cast cast}]
+                              elem-type))
 
     (par/par-reduce-form? expression)
     (let [{:keys [acc init idx bound body elem-type]} (par/extract-par-reduce-info expression)
@@ -145,10 +223,8 @@
 
     (par/par-map-void-form? expression)
     (let [{:keys [idx bound body elem-type]} (par/extract-par-map-void-info expression)]
-      (when-let [{:keys [out value cast]} (pointwise-map-void body idx)]
-        (merge {:kind :map :id id :sym symbol :index idx :extent bound :cast cast :body value
-                :void? true :primary-out out :elem-type elem-type}
-               (extract-io value idx [out]))))
+      (when-let [stores (pointwise-stores body idx)]
+        (effect-map-description id symbol idx bound stores elem-type)))
 
     :else nil))
 
@@ -232,7 +308,9 @@
                 :scalar (or (provably-pure-scalar? (:expr description))
                             (generated-scaffolding? description physical-outputs))
                 :map (or (:pure? description)
-                         (symbol? (:primary-out description)))
+                         (and (seq (:result-storage description))
+                              (every? (comp symbol? :destination)
+                                      (:result-storage description))))
                 :reduce true
                 :scan (symbol? (:primary-out description))
                 false))
@@ -259,25 +337,20 @@
 
 (defn- map-equation
   [description]
-  (let [{:keys [id sym index extent cast body inputs primary-out void?]} description
-        expression (if cast (list cast body) body)
-        [pointwise stable] ((juxt filter remove) #(pointwise-input? [expression] % index) inputs)
+  (let [{:keys [id index extent casts bodies inputs results]} description
+        expressions (mapv (fn [cast body] (if cast (list cast body) body)) casts bodies)
+        [pointwise stable] ((juxt filter remove) #(pointwise-input? expressions % index) inputs)
         arrays (vec (sort-by pr-str pointwise))
-        ;; map-void's destination remains a lexical stable capture in the existing dialect.
-        ;; A destination-returning map carries its write-only destination in equation facts; making
-        ;; it a capture would also make it a kernel input and duplicate the output pointer.
-        stable (cond-> (set stable) void? (conj primary-out))
         captures (vec (sort-by pr-str (distinct (concat stable (:scalars description)))))
         parameters (element-symbols (count arrays))
         capture-parameters (capture-symbols (count captures))
-        body-result (util/subst-syms
-                     (zipmap captures capture-parameters)
-                     (first (elementize [expression] arrays parameters index)))]
-    (list '= id [sym]
+        body-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
+                           (elementize expressions arrays parameters index))]
+    (list '= id results
           (list 'map {:index index :extent extent
                       :attributes {:stable-array-captures (vec (sort-by pr-str stable))}}
                 arrays captures
-                (list 'lambda (vec (concat parameters capture-parameters)) [body-result])))))
+                (list 'lambda (vec (concat parameters capture-parameters)) body-results)))))
 
 (defn- reduce-equation
   [{:keys [id extent inputs scalars product]}]
@@ -356,9 +429,16 @@
   [descriptions body]
   (let [operations (filter #(contains? #{:map :reduce :scan} (:kind %)) descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
-                                              (:map :scan) [(:sym %)]
+                                              :map (:results %)
+                                              :scan [(:sym %)]
                                               (:outputs %))
                                            operations))
+        terminal-operation-definitions
+        (set (mapcat #(case (:kind %)
+                        :map (if (:effect-only? %) [] (:results %))
+                        :scan [(:sym %)]
+                        (:outputs %))
+                     operations))
         scalar-definitions (set (keep #(when (= :scalar (:kind %)) (:sym %)) descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
         operation-uses (set (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
@@ -367,7 +447,7 @@
                                             descriptions)))
         body-uses (set (mapcat util/free-syms body))]
     (vec (sort-by pr-str
-                  (set/union (set/difference operation-definitions operation-uses)
+                  (set/union (set/difference terminal-operation-definitions operation-uses)
                              (set/intersection all-definitions body-uses))))))
 
 (defn- selected-scalars
@@ -402,7 +482,7 @@
                         scalar (:dtypes attributes)
                         reduce (:dtypes attributes)
                         scan (:dtypes attributes)
-                        (repeat (count results) default-dtype))]
+                        map (map #(value-dtype % default-dtype array-types) results))]
     (merge
      (if (and extent (dialect/value-id? extent)) {extent (tensor-value :long [])} {})
      (into {} (map (fn [id] [id (tensor-value (value-dtype id default-dtype array-types)
@@ -503,27 +583,38 @@
                                          (and (:extent %) (dialect/value-id? (:extent %)))
                                          (conj (:extent %))) equation-info))
               inputs (vec (sort-by pr-str (set/difference references definitions)))
+              logical-result-types
+              (into {}
+                    (mapcat (fn [description]
+                              (map (fn [result storage]
+                                     [result (value-dtype (:destination storage)
+                                                          dtype array-types)])
+                                   (:results description)
+                                   (:result-storage description))))
+                    (filter :result-storage equation-descriptions))
+              array-types' (merge array-types logical-result-types)
               destination-values
               (into {}
-                    (keep (fn [description]
-                            (when-let [destination (:primary-out description)]
-                              [destination
-                               (tensor-value
-                                (value-dtype destination dtype array-types)
-                                [(list 'unknown-dimension destination)])])))
+                    (mapcat (fn [description]
+                              (map (fn [{:keys [destination]}]
+                                     [destination
+                                      (tensor-value
+                                       (value-dtype destination dtype array-types)
+                                       [(list 'unknown-dimension destination)])])
+                                   (:result-storage description))))
                     equation-descriptions)
               inferred-values (reduce (fn [contracts equation]
                                         (reduce-kv merge-value contracts
-                                                   (equation-values equation dtype array-types
+                                                   (equation-values equation dtype array-types'
                                                                     contracts)))
                                       destination-values equations)
               values (reduce-kv merge-value inferred-values values)
               equation-facts
               (into {}
                     (map (fn [description]
-                           (let [destination (when (or (:primary-out description)
-                                                       (= :scan (:kind description)))
-                                               (:primary-out description))]
+                           (let [destination (when (= :scan (:kind description))
+                                               (:primary-out description))
+                                 storage (:result-storage description)]
                              [(:id description)
                               (cond-> (dialect/default-equation-facts
                                        {:front-end :analyzed-source
@@ -531,13 +622,16 @@
                                 destination
                                 (assoc :effects #{:memory/write}
                                        :aliases {(:sym description) destination}
-                                       :attributes (cond-> {:destination destination}
-                                                     (:destination-access description)
-                                                     (assoc :destination-access
-                                                            (:destination-access description))
-                                                     (:destination-return description)
-                                                     (assoc :destination-return
-                                                            (:destination-return description)))))]))
+                                       :attributes {:destination destination})
+                                storage
+                                (assoc :effects #{:memory/write}
+                                       :aliases (into {}
+                                                      (map (fn [result {:keys [destination]}]
+                                                             [result destination])
+                                                           (:results description) storage))
+                                       :attributes {:result-storage storage
+                                                    :host-binding
+                                                    (:host-binding description)}))]))
                          equation-descriptions))
               total-effects (reduce set/union #{} (map :effects (vals equation-facts)))
               facts (dialect/default-program-facts

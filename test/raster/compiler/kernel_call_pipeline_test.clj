@@ -135,6 +135,7 @@
     (is (= :map-void (:convention step)))
     (is (:logical-bindings? step))
     (is (kart/kernel-artifact? (:artifact step)))
-    (is (= '[out x scale]
+    (is (= :segmap (get-in step [:artifact :provenance :dialect])))
+    (is (= '[x out scale]
            (subvec (kcall/logical-arguments (:artifact step)) 0 3)))
     (is (= [3] (get-in call [:geometry :group-count])))))

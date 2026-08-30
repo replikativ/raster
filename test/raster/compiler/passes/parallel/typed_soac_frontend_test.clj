@@ -80,7 +80,8 @@
       (is (= '[x] (dialect/operation-inputs (first (dialect/equations program))))
           "a write-only destination is not duplicated as a semantic read operand")
       (is (= '{step target} (get-in facts [:equations 0 :aliases])))
-      (is (= :buffer (get-in facts [:equations 0 :attributes :destination-return])))
+      (is (= [{:destination 'target :access :write :host-return :buffer}]
+             (get-in facts [:equations 0 :attributes :result-storage])))
       (is (some? (get-in facts [:values 'target]))
           "the physical output boundary retains its own value contract")
       (is (= #{:memory/write} (:effects facts)))))
@@ -100,7 +101,7 @@
           facts (dialect/facts program)]
       (is (= '[target] (dialect/operation-inputs equation)))
       (is (= :read-write
-             (get-in facts [:equations 0 :attributes :destination-access])))
+             (get-in facts [:equations 0 :attributes :result-storage 0 :access])))
       (is (= '{step target} (get-in facts [:equations 0 :aliases]))))))
 
 (deftest destination-shapes-refine-across-ordered-maps
@@ -114,3 +115,56 @@
                   :array-types {'x :float 'first-out :float 'second-out :float}})]
     (is (= '[n] (get-in (dialect/facts program) [:values 'first-out :shape])))
     (is (= 2 (count (dialect/equations program))))))
+
+(deftest effect-only-pointwise-writes-have-logical-results-and-physical-storage
+  (doseq [[label expression]
+          [["map2"
+            '(raster.par/map2! a b i n float
+                               (+ (clojure.core/aget x i) 1.0)
+                               (* (clojure.core/aget y i) 2.0))]
+           ["independent multi-store map-void"
+            '(raster.par/map-void!
+              i n
+              (do (clojure.core/aset a i (float (+ (clojure.core/aget x i) 1.0)))
+                  (clojure.core/aset b i (float (* (clojure.core/aget y i) 2.0)))))]]]
+    (testing label
+      (let [program (frontend/form->program
+                     (list 'let* ['effect expression] 'effect)
+                     {:dtype :float
+                      :array-types {'x :float 'y :float 'a :float 'b :float}})
+            equation (first (dialect/equations program))
+            facts (dialect/facts program)
+            results (vec (nth equation 2))]
+        (is (= [[:effect-map 0 0] [:effect-map 0 1]] results))
+        (is (= ['a 'b] (dialect/physical-results program equation)))
+        (is (= [:write :write]
+               (mapv :access (dialect/result-storage program 0))))
+        (is (= #{:memory/write} (:effects facts)))
+        (is (= [] (dialect/outputs program))
+            "the host nil result is not mislabeled as a tensor result")))))
+
+(deftest ordered-or-nonpointwise-void-bodies-decline-the-functional-tuple-map
+  (doseq [[label body]
+          [["one destination written twice"
+            '(do (clojure.core/aset a i (float 1.0))
+                 (clojure.core/aset a i (float 2.0)))]
+           ["a later store observes an earlier sibling write"
+            '(do (clojure.core/aset a i (float (clojure.core/aget x i)))
+                 (clojure.core/aset b i (float (clojure.core/aget a i))))]
+           ["shared local computation has no tuple-region SSA representation yet"
+            '(let* [v (+ (clojure.core/aget x i) 1.0)]
+                   (clojure.core/aset a i (float v))
+                   (clojure.core/aset b i (float (* v v))))]
+           ["transitively shared local computation also declines"
+            '(let* [u (+ (clojure.core/aget x i) 1.0)
+                    v (* u 2.0)]
+                   (clojure.core/aset a i (float v))
+                   (clojure.core/aset b i (float u)))]
+           ["scatter index"
+            '(clojure.core/aset a (clojure.core/aget indices i)
+                                (float (clojure.core/aget x i)))]]]
+    (testing label
+      (is (nil? (frontend/form->program
+                 (list 'let* ['effect (list 'raster.par/map-void! 'i 'n body)] 'effect)
+                 {:dtype :float
+                  :array-types {'x :float 'a :float 'b :float 'indices :int}}))))))

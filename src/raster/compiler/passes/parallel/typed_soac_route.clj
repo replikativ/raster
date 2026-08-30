@@ -27,7 +27,7 @@
                  (dialect/value-id? extent) (conj extent))
         source-facts (dialect/facts program)
         equation-facts (get-in source-facts [:equations equation-id])
-        value-ids (set (concat inputs results))
+        value-ids (set (concat inputs results (dialect/physical-results source-facts equation)))
         facts (-> source-facts
                   (assoc :values (select-keys (:values source-facts) value-ids)
                          :inputs (vec inputs)
@@ -98,41 +98,52 @@
                                   {:reason :typed-soac-materialization-dtype
                                    :results results :dtypes result-dtypes})))
               cast (first casts)
-              destination (get-in placement-facts [:attributes :destination])
-              _ (when (and destination (not= 1 (count results)))
-                  (throw (ex-info "an effectful map destination cannot have fused logical outputs"
+              storage (dialect/result-storage (dialect/facts program) equation-id)
+              physical-results (dialect/physical-results (dialect/facts program) equation)
+              host-binding (or (get-in placement-facts [:attributes :host-binding]) result)
+              host-returns (set (map :host-return storage))
+              _ (when (and storage
+                           (not (or (= #{:effect} host-returns)
+                                    (and (= 1 (count storage))
+                                         (= #{:buffer} host-returns)))))
+                  (throw (ex-info "stored map results require one coherent host return contract"
                                   {:reason :typed-soac-production-subset
-                                   :equation equation-id :results results
-                                   :destination destination})))
+                                   :equation equation-id :storage storage})))
               secondary-stores
               (mapv (fn [secondary secondary-cast body]
                       (list 'clojure.core/aset secondary (:index attributes)
                             (list secondary-cast body)))
-                    (rest results) (rest casts) (rest bodies))
+                    (rest physical-results) (rest casts) (rest bodies))
               body (if (seq secondary-stores)
                      (list* 'do (concat secondary-stores [(first bodies)]))
                      (first bodies))
-              destination-return (get-in placement-facts
-                                         [:attributes :destination-return])
               effect (gensym (str "typed_soac_map_" equation-id "__"))
               source (with-meta
-                       (if destination
-                         (if (= :buffer destination-return)
-                           (list 'raster.par/map! destination (:index attributes)
-                                 (:extent attributes) cast body)
-                           (list 'raster.par/map-void! (:index attributes) (:extent attributes)
-                                 (list 'clojure.core/aset destination (:index attributes)
-                                       (list cast body))))
+                       (cond
+                         (= #{:effect} host-returns)
+                         (list 'raster.par/map-void! (:index attributes) (:extent attributes)
+                               (list* 'do
+                                      (map (fn [destination result-cast result-body]
+                                             (list 'clojure.core/aset destination
+                                                   (:index attributes)
+                                                   (list result-cast result-body)))
+                                           physical-results casts bodies)))
+
+                         (= #{:buffer} host-returns)
+                         (list 'raster.par/map! (first physical-results) (:index attributes)
+                               (:extent attributes) cast (first bodies))
+
+                         :else
                          (list 'raster.par/map! result (:index attributes) (:extent attributes)
                                cast body))
                        {:raster.type/elem-type (first result-dtypes)})]
           {:equation-id equation-id
            :placement placement
-           :pairs (if destination
-                    [[result source]]
+           :pairs (if storage
+                    [[host-binding source]]
                     (conj (mapv #(allocation-pair values % (:extent attributes)) results)
                           [effect source]))
-           :site [:binding (if destination result effect)]
+           :site [:binding (if storage host-binding effect)]
            :source source}))
 
       reduce
@@ -194,8 +205,11 @@
         by-placement (group-by :placement realized)
         physical-destinations
         (into #{}
-              (keep (fn [[_ equation-facts]]
-                      (get-in equation-facts [:attributes :destination])))
+              (mapcat (fn [[_ equation-facts]]
+                        (concat
+                         (keep identity [(get-in equation-facts [:attributes :destination])])
+                         (map :destination
+                              (get-in equation-facts [:attributes :result-storage])))))
               (:equations (dialect/facts program)))
         pairs
         (vec

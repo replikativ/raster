@@ -1,6 +1,6 @@
 # Raster compiler north star
 
-Status: architectural direction, reconciled with the implementation on 2026-08-28.
+Status: architectural direction, reconciled with the implementation on 2026-08-30.
 
 Raster should become a compiler in which a typed Clojure program, its parallel
 algorithm, its schedule, its device placement, and its executable artifact are
@@ -111,6 +111,18 @@ identity are therefore orthogonal: resident and staged binders derive transfers 
 while composition identifies the returned value by role. OpenCL and Level Zero staged maps also
 use target-specific invocation markers selected by the emitter, rather than leaking a Level Zero
 runtime call into an OpenCL program.
+
+Effect-only pointwise maps now use the same orthogonal contract for several outputs. `map2!` and
+independent multi-store `map-void!` bodies become one tuple-valued TypedSOAC `map`: fresh logical
+result IDs remain SSA values, while an ordered checked `:result-storage` vector maps each result to
+its caller-owned destination, access mode, and host-return contract. The effect binder therefore
+retains its real `nil` host semantics instead of masquerading as a tensor result. The scheduled
+SegMap and its ordered ABI are consumed by staged and resident compilation; unsupported raw
+map-void bodies retain the compatibility generator. The front end refuses duplicate destinations,
+scatter indices, sibling write/read ordering, atomics, and shared local bindings whose projection
+would duplicate computation. The last case needs local SSA inside tuple scalar regions, not source
+substitution. Flat resident `deftm` signatures provide their declared per-buffer dtypes before
+fusion, so a mixed FP32/int8-input, FP32/int32-output map does not inherit a global default dtype.
 
 The first architectural correction is therefore:
 
@@ -827,9 +839,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    graph-backed resident executable through ordinary dispatch, LinkPlan and binding, and a generic
    per-call staging graph runner executes the same registered dispatch. Pointwise read/write map
    destinations lower to one physical `:inout` ABI result and execute through both resident and
-   staged binding without an aliased compatibility input. Hardware-costed
+   staged binding without an aliased compatibility input. Independent effect-only tuple maps also
+   carry an ordered logical-result-to-physical-storage contract and compile through their scheduled
+   SegMap on resident OpenCL execution. Hardware-costed
    multi-consumer fusion, nested-region JVM
-   scheduling, the remaining parallel forms, and
+   scheduling, local SSA for shared multi-result scalar regions, indexed/scatter operations, the
+   remaining parallel forms, and
    deletion of the remaining graph/backend fallbacks remain.
 6. Add a differential PTX target dialect/module boundary. Start topology and sharding values as a
    read-only distributed track without interrupting the kernel and typed-middle-end verticals.

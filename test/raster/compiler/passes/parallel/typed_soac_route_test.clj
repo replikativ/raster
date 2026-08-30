@@ -55,8 +55,8 @@
       (is (= :typed-soac (get-in form [:provenance :source-dialect])))
       (is (= :typed-soac (:source-dialect stats)))
       (is (= :typed-soac (get-in equation [:attributes :algorithm-dialect])))
-      (is (= 'target (get-in equation [:attributes :destination])))
-      (is (= :buffer (get-in equation [:attributes :destination-return])))
+      (is (= [{:destination 'target :access :write :host-return :buffer}]
+             (get-in equation [:attributes :result-storage])))
       (is (= 'raster.par/map! (first realized-expression))
           "materialization preserves map!'s destination-returning semantics"))
     (testing "the emitter consumes the scheduled SegMap instead of reconstructing source"
@@ -77,7 +77,7 @@
         artifact (first (:kernels emitted))
         pointer-slots (filterv #(not= :scalar (:kind %)) (:abi artifact))]
     (is (= :typed-soac (:source-dialect stats)))
-    (is (= :read-write (get-in equation [:attributes :destination-access])))
+    (is (= :read-write (get-in equation [:attributes :result-storage 0 :access])))
     (is (= ['target] (mapv :name pointer-slots)))
     (is (= [:inout] (mapv :kind pointer-slots)))
     (is (= [:result] (mapv :role pointer-slots)))
@@ -89,6 +89,54 @@
     (is (not (some #{'raster.gpu.ze-runtime/invoke-registered-kernel}
                    (tree-seq coll? seq (:form emitted))))
         "an OpenCL program must not leak a Level Zero staging call")))
+
+(deftest tuple-map-deduplicates-a-read-write-physical-result
+  (let [source '(raster.par/map-void!
+                 i n
+                 (do (clojure.core/aset a i (clojure.core/aget x i))
+                     (clojure.core/aset b i
+                                        (+ (clojure.core/aget b i) 2.0))))
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'x :float 'a :float 'b :float}})
+        equation (first (:equations form))
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                         :dtype :float :min-elements 0)
+        artifact (first (:kernels emitted))
+        pointer-slots (filterv #(not= :scalar (:kind %)) (:abi artifact))]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= [:write :read-write]
+           (mapv :access (get-in equation [:attributes :result-storage]))))
+    (is (= ['b 'x 'a] (mapv :name pointer-slots)))
+    (is (= [:inout :input :output] (mapv :kind pointer-slots)))
+    (is (= 1 (count (filter #(= 'b (:name %)) pointer-slots)))
+        "a read/write destination is one physical ABI value, not aliased input and output slots")
+    (is (= #{'a 'b} (:outputs (first (:operations equation)))))
+    (is (re-find #"b\[idx\] = \(float\)" (:source artifact)))
+    (is (re-find #"out\[idx\]" (:source artifact)))))
+
+(deftest typed-tuple-map-preserves-effect-semantics-on-the-jvm
+  (let [source '(let* [effect
+                       (raster.par/map-void!
+                        i n
+                        (do (clojure.core/aset a i
+                                               (float (+ (clojure.core/aget x i) 1.0)))
+                            (clojure.core/aset b i
+                                               (float (+ (clojure.core/aget b i) 2.0)))))]
+                      effect)
+        typed (:program (route/attempt source :float
+                                       {'x :float 'a :float 'b :float}))
+        scheduled (:form (segop-lower/segop-lower-pass typed {:dtype :float}))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        execute (eval (list 'fn '[x a b n] (:form jvm)))
+        x (float-array [1.0 2.0 3.0 4.0])
+        a (float-array 4)
+        b (float-array [10.0 20.0 30.0 40.0])]
+    (is (nil? (execute x a b 4))
+        "the source effect binder remains nil after TypedSOAC materialization")
+    (is (= [2.0 3.0 4.0 5.0] (mapv double a)))
+    (is (= [12.0 22.0 32.0 42.0] (mapv double b)))))
 
 (deftest typed-inout-preserves-sequential-jvm-semantics
   (let [source '(let* [step (raster.par/map! target i n float
@@ -427,6 +475,47 @@
            (mapv :kind (:abi kernel))))
     (is (re-find #"__global float\* restrict [uv]" (:source kernel)))))
 
+(deftest effect-only-tuple-map-lowers-to-one-explicit-multi-output-segmap
+  (let [source
+        '(let* [effect
+                (raster.par/map-void!
+                 i n
+                 (do (clojure.core/aset a i
+                                        (float (+ (clojure.core/aget x i) 1.0)))
+                     (clojure.core/aset b i
+                                        (float (* (clojure.core/aget y i) 2.0)))))]
+               [a b])
+        {:keys [program stats]}
+        (route/attempt source :float {'x :float 'y :float 'a :float 'b :float})
+        equation (first (:equations program))
+        algorithm (:algorithm equation)
+        scheduled (:form (segop-lower/segop-lower-pass
+                          program {:dtype :float :target-device :ocl:0}))
+        operation (first (:operations (first (:equations scheduled))))
+        jvm (par-simd/simd-pass scheduled :min-elements 1)
+        emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0
+                                         :dtype :float :min-elements 1)
+        kernel (first (:kernels emitted))]
+    (is (= :typed-soac (:dialect program)))
+    (is (:typed-validated stats))
+    (is (= [] (:outputs program))
+        "the effect binder keeps its host nil semantics")
+    (is (= [[:effect-map 0 0] [:effect-map 0 1]]
+           (dialect/outputs algorithm)))
+    (is (= ['a 'b]
+           (dialect/physical-results algorithm
+                                     (first (dialect/equations algorithm)))))
+    (is (= #{'a 'b} (:outputs operation)))
+    (is (= 'a (:out-sym operation)))
+    (is (some #{'clojure.core/aset} (flatten (:lambda operation))))
+    (is (nil? (get-in jvm [:stats :segop-relowered])))
+    (is (= [:input :input :output :output :scalar]
+           (mapv :kind (:abi kernel))))
+    (is (= ['x 'y 'b 'a 'n] (:arguments kernel)))
+    (is (= 1 (get-in emitted [:stats :ze-maps])))
+    (is (= 1 (get-in emitted [:stats :segop-reused])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))))
+
 (deftest unfused-map-also-uses-the-typed-production-route
   (let [source '(let* [y (raster.par/pmap i n float
                                           (* (clojure.core/aget x i) 2.0))]
@@ -490,7 +579,7 @@
                    [:equations 2 :effects])))
     (is (= 'out
            (get-in (dialect/facts (get-in program [:equations 1 :algorithm]))
-                   [:equations 2 :attributes :destination])))
+                   [:equations 2 :attributes :result-storage 0 :destination])))
     (is (= 2 (count reductions)))
     (is (= #{partial} (:inputs phase-two)))
     (is (= :double (get-in scheduled [:values partial :dtype])))))

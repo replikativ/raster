@@ -31,8 +31,11 @@
 
    Scan mode may be `:inclusive` or `:exclusive`; it is an explicit result-layout property. Map
    lambdas return tuples, so horizontal fusion remains functional rather than encoding
-   secondary results as hidden stores. Captures are explicit operands with explicit scalar lambda
-   parameters, so stable value IDs never leak into lexical expression binding."
+   secondary results as hidden stores. Caller-owned map outputs use an equation-fact
+   `:result-storage` vector aligned with those functional results; logical SSA identity therefore
+   stays separate from physical write identity and host return semantics. Captures are explicit
+   operands with explicit scalar lambda parameters, so stable value IDs never leak into lexical
+   expression binding."
   (:require [clojure.set :as set]
             [pattern.nanopass.dialect :as dialect
              :refer [def-dialect]]
@@ -220,6 +223,28 @@
       (let [[_ attributes arrays captures lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
 
+(defn result-storage
+  "Ordered physical storage contracts for an equation's functional results.
+
+   A map that writes caller-owned buffers still defines fresh functional values. Each entry maps
+   one equation result to the physical destination used when that result is materialized. Absence
+   means the equation owns fresh result storage. The vector is aligned with the equation results;
+   it is deliberately not a destination-name registry reconstructed by a backend."
+  [program-or-facts equation-id]
+  (get-in (if (program-form? program-or-facts)
+            (facts program-or-facts)
+            program-or-facts)
+          [:equations equation-id :attributes :result-storage]))
+
+(defn physical-results
+  "Resolve an equation's ordered logical results to their physical storage identities."
+  [program-or-facts equation]
+  (let [results (vec (nth equation 2))
+        storage (result-storage program-or-facts (second equation))]
+    (if (seq storage)
+      (mapv :destination storage)
+      results)))
+
 (defn parameter-layout
   "Split a SOAC lambda's ordered parameters into semantic roles."
   [equation]
@@ -406,6 +431,57 @@
 
       nil)))
 
+(defn- validate-result-storage!
+  [program-facts equation]
+  (let [[_ equation-id results] equation
+        {:keys [kind]} (operation-parts equation)
+        storage (result-storage program-facts equation-id)]
+    (when storage
+      (when-not (= 'map kind)
+        (fail! :typed-soac-result-storage-operation
+               "physical result storage is currently valid only for map equations"
+               {:equation equation-id :operation kind :storage storage}))
+      (when-not (and (vector? storage)
+                     (= (count results) (count storage))
+                     (every? #(and (map? %)
+                                   (value-id? (:destination %))
+                                   (contains? #{:write :read-write} (:access %))
+                                   (contains? #{:buffer :effect} (:host-return %)))
+                             storage))
+        (fail! :typed-soac-result-storage
+               "result storage must align every map result with a typed destination contract"
+               {:equation equation-id :results results :storage storage}))
+      (let [destinations (mapv :destination storage)
+            aliases (get-in program-facts [:equations equation-id :aliases])]
+        (when-not (= (count destinations) (count (distinct destinations)))
+          (fail! :typed-soac-result-storage-alias
+                 "one pointwise equation may write each physical destination only once"
+                 {:equation equation-id :destinations destinations}))
+        (doseq [[result destination] (map vector results destinations)]
+          (when-not (= destination (get aliases result))
+            (fail! :typed-soac-result-storage-alias
+                   "every stored functional result must explicitly alias its physical destination"
+                   {:equation equation-id :result result :destination destination
+                    :aliases aliases})))
+        (when-not (contains? (get-in program-facts [:equations equation-id :effects])
+                             :memory/write)
+          (fail! :typed-soac-result-storage-effect
+                 "physical result storage requires an explicit memory-write effect"
+                 {:equation equation-id :storage storage}))
+        (doseq [[result destination] (map vector results destinations)
+                :let [logical (get-in program-facts [:values result])
+                      physical (get-in program-facts [:values destination])]]
+          (when-not physical
+            (fail! :typed-soac-result-storage-value
+                   "a physical result destination requires an AbstractValue"
+                   {:equation equation-id :result result :destination destination}))
+          (when (and logical physical
+                     (not= (dissoc logical :shape) (dissoc physical :shape)))
+            (fail! :typed-soac-result-storage-type
+                   "logical result and physical destination storage types disagree"
+                   {:equation equation-id :result result :destination destination
+                    :logical logical :physical physical})))))))
+
 (defn validate!
   "Validate syntax, typed value references, ordered SSA definitions and explicit effects.
    Returns the input program unchanged."
@@ -443,7 +519,8 @@
              {:facts equation-fact-ids :equations (set equation-ids)}))
     (doseq [equation equations]
       (validate-equation! equation)
-      (validate-equation-types! values equation))
+      (validate-equation-types! values equation)
+      (validate-result-storage! program-facts equation))
     (let [definitions (mapcat #(nth % 2) equations)
           definition-set (set definitions)
           references (set (mapcat (fn [equation]
@@ -457,11 +534,16 @@
       (when-not (= (count definitions) (count definition-set))
         (fail! :typed-soac-definitions "logical values may be defined by only one equation"
                {:definitions definitions}))
-      (doseq [id (set/union definition-set references (set program-inputs)
-                            (set program-outputs))]
-        (when-not (contains? values id)
-          (fail! :typed-soac-unknown-value "SOAC program references an unknown value"
-                 {:id id})))
+      (let [storage-destinations
+            (set (mapcat (fn [equation]
+                           (map :destination
+                                (or (result-storage program-facts (second equation)) [])))
+                         equations))]
+        (doseq [id (set/union definition-set references storage-destinations
+                              (set program-inputs) (set program-outputs))]
+          (when-not (contains? values id)
+            (fail! :typed-soac-unknown-value "SOAC program references an unknown value"
+                   {:id id}))))
       (when-not (= external (set program-inputs))
         (fail! :typed-soac-input-boundary
                "program inputs must exactly name values used but not defined"
@@ -545,7 +627,14 @@
         equation-facts
         (into {}
               (map (fn [[id equation-facts]]
-                     [id (update equation-facts :aliases rename-aliases)]))
+                     [id (-> equation-facts
+                             (update :aliases rename-aliases)
+                             (cond-> (seq (get-in equation-facts
+                                                  [:attributes :result-storage]))
+                               (update-in [:attributes :result-storage]
+                                          #(mapv (fn [storage]
+                                                   (update storage :destination rename))
+                                                 %))))]))
               (:equations source-facts))
         facts' (assoc source-facts
                       :values values

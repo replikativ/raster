@@ -246,7 +246,7 @@
 (defn- emit-map-void-invocation
   "Render the staging marker from the artifact's logical argument projection. The marker remains
    useful to the host evaluator, but it no longer owns or reconstructs an argument convention."
-  [artifact]
+  [artifact device-id]
   (let [plan (kcall/logical-argument-plan artifact)
         pointer-values (mapv :value (filterv :pointer? plan))
         scalar-entries (filterv (complement :pointer?) plan)
@@ -255,7 +255,9 @@
     (when-not (= 1 (count bound-entries))
       (throw (ex-info "map-void artifact must identify exactly one :bound scalar"
                       {:kernel-name (:kernel-name artifact) :plan plan})))
-    (list 'raster.gpu.ze-runtime/invoke-registered-map-void-kernel
+    (list (if (and device-id (.startsWith (name device-id) "ocl"))
+            'raster.gpu.ocl-runtime/invoke-registered-map-void-kernel
+            'raster.gpu.ze-runtime/invoke-registered-map-void-kernel)
           (:kernel-name artifact)
           pointer-values
           (mapv :value user-scalars)
@@ -265,8 +267,9 @@
   "Pipeline pass: walk S-expression, replace par forms with GPU kernel invocations.
 
    Uses full SegOp conversion for par/map! and par/reduce.
-   Delegates to specialized generators for stencil, scatter,
-   scan, rng-fill, active-ids, reduce-by-key, compound-kernel, map-void).
+   Certified effect-only map-void forms consume their scheduled TypedSOAC SegMap; unsupported
+   bodies and the remaining stencil, scatter, rng, active-id and key-reduction forms retain
+   explicit compatibility generators.
 
    Returns {:form new-form :stats {:ze-maps N :ze-reduces N :fallback N}
             :kernels [{:kernel-name :source ...} ...]}
@@ -508,7 +511,7 @@
                   kernel (segop-cl/generate-product-reduction-kernel
                           segred :scalar-types top-scalar-types :array-types top-array-types)
                   k (register-kernel! kernel :ze-reduces)]
-              (emit-map-void-invocation k))
+              (emit-map-void-invocation k device-id))
 
             ;; === Specialized forms — delegate to legacy generators ===
 
@@ -518,12 +521,22 @@
               (if (and (number? bound) (< bound min-elements))
                 (do (swap! stats update :fallback inc)
                     (par/expand-par-map-void! form))
-                (let [kernel (legacy/generate-par-map-void-kernel form
-                                                                  :dtype dtype :device-id device-id
-                                                                  :array-types top-array-types
-                                                                  :scalar-types top-scalar-types)
+                (let [scheduled (take-bound-segop
+                                 stats :segmap
+                                 #(and (instance? raster.compiler.ir.segop.SegMap %)
+                                       (= :typed-soac (:algorithm-dialect %))))
+                      kernel (if scheduled
+                               (segop-cl/generate-segmap-kernel
+                                scheduled (:out-sym scheduled)
+                                :dtype (:dtype scheduled)
+                                :scalar-types top-scalar-types
+                                :array-types top-array-types)
+                               (legacy/generate-par-map-void-kernel
+                                form :dtype dtype :device-id device-id
+                                :array-types top-array-types
+                                :scalar-types top-scalar-types))
                       k (register-kernel! kernel :ze-maps)]
-                  (emit-map-void-invocation k))))
+                  (emit-map-void-invocation k device-id))))
 
             ;; par/scan-exclusive
             (par/par-scan-exclusive-form? form)
@@ -591,7 +604,7 @@
                          (legacy/generate-par-gather-kernel form
                                                             :dtype dtype :device-id device-id)
                          :ze-maps)]
-                  (emit-map-void-invocation k))))
+                  (emit-map-void-invocation k device-id))))
 
             ;; par/reduce-by-key
             (par/par-reduce-by-key-form? form)
