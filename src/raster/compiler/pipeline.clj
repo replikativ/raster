@@ -1270,6 +1270,7 @@
 (def ^:private gpu-invoke-heads
   '#{raster.gpu.ze-runtime/invoke-registered-map-void-kernel
      raster.gpu.ze-runtime/invoke-registered-kernel
+     raster.gpu.ocl-runtime/invoke-registered-kernel
      raster.gpu.ze-runtime/invoke-registered-reduction-kernel
      raster.gpu.ze-runtime/invoke-registered-contraction!
      raster.gpu.ze-runtime/invoke-registered-contraction-dispatch!
@@ -1358,7 +1359,9 @@
         (let [[_ kname arrays scalars n] expr]
           {:kernel-name kname :arrays (vec arrays) :scalars (vec scalars) :n-expr n
            :convention :map-void :returns sym}))
-      (= head 'raster.gpu.ze-runtime/invoke-registered-kernel)
+      (contains? '#{raster.gpu.ze-runtime/invoke-registered-kernel
+                    raster.gpu.ocl-runtime/invoke-registered-kernel}
+                 head)
       (when (= 6 argc)
         (let [[_ kname inputs out scalars n] expr]
           {:kernel-name kname
@@ -1807,8 +1810,7 @@
                                                                    (kexec/abi ki)
                                                                    (:abi ki)))]
                                                     (map #(or (:binding %) (:name %))
-                                                         (filter #(or (= :output (:kind %))
-                                                                      (= :inout (:role %)))
+                                                         (filter kabi/writable?
                                                                  (kabi/pointer-slots abi)))
                                                     (:written-arrays ki)))))))
                                  #{} (:steps prog)))
@@ -1829,8 +1831,7 @@
                                                          (kexec/abi ki)
                                                          (:abi ki)))))]
                                       (reduce (fn [m slot]
-                                                (if (or (= :output (:kind slot))
-                                                        (= :inout (:role slot)))
+                                                (if (kabi/writable? slot)
                                                   (assoc m (:name slot) (:dtype slot))
                                                   m))
                                               m (kabi/pointer-slots abi))

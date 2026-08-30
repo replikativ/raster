@@ -38,6 +38,9 @@
 (descriptor/register-op-descriptor!
  'raster.gpu.ze-runtime/invoke-registered-kernel
  {:buffer {:allocates? false :in-place-arg 2}})
+(descriptor/register-op-descriptor!
+ 'raster.gpu.ocl-runtime/invoke-registered-kernel
+ {:buffer {:allocates? false :in-place-arg 2}})
 
 ;; ================================================================
 ;; Single source of declared GPU param types (shared by BOTH compile entries:
@@ -197,8 +200,9 @@
     descriptor))
 
 (defn- emit-map-invocation
-  "Render the compatibility map marker from the emitter-authored ABI and ordered values."
-  [{:keys [kernel-name abi arguments]}]
+  "Render the target-specific compatibility map marker from the emitter-authored ABI and ordered
+   values."
+  [{:keys [kernel-name abi arguments]} device-id]
   (let [arguments (kabi/validate-arguments! abi arguments)
         pairs (mapv vector abi arguments)
         result-pairs (filterv #(= :result (:role (first %))) pairs)
@@ -221,7 +225,9 @@
                                   (and (= :scalar (:kind slot))
                                        (not= :bound (:role slot))))
                                 pairs))]
-      (list 'raster.gpu.ze-runtime/invoke-registered-kernel
+      (list (if (and device-id (.startsWith (name device-id) "ocl"))
+              'raster.gpu.ocl-runtime/invoke-registered-kernel
+              'raster.gpu.ze-runtime/invoke-registered-kernel)
             kernel-name inputs out scalars bound))))
 
 (defn- emit-reduction-invocation
@@ -422,7 +428,7 @@
                               :dtype dtype :scalar-types top-scalar-types
                               :array-types (merge top-array-types (:array-types (meta form))))
                       k (register-kernel! kernel :ze-maps)]
-                  (emit-map-invocation k))))
+                  (emit-map-invocation k device-id))))
 
             ;; === par/contract — tensor contraction, routed through the DPAS legality gate ===
             ;; The routing brain (contract-route) chooses the hardware-optimal kernel: DPAS/XMX

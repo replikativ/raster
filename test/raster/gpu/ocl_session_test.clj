@@ -31,6 +31,10 @@
   [x :- (Array float) y :- (Array float) a :- Float n :- Long] :- (Array float)
   (raster.par/map! y i n float (* a (ra/aget x i))))
 
+(deftm ocl-session-inout
+  [state :- (Array float) a :- Float n :- Long] :- (Array float)
+  (raster.par/map! state i n float (* a (ra/aget state i))))
+
 (deftm ocl-session-contract
   [A :- (Array float) B :- (Array float)] :- (Array float)
   (let [C (ra/alloc-like A 64)]
@@ -182,6 +186,38 @@
                                  1e-3))
                       (range n))))
         (finally (gpu/close-session! s))))))
+
+(deftest ocl-resident-typed-inout-roundtrip
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "resident typed inout SegMap")
+    (let [descriptor (pl/compile-gpu-program #'ocl-session-inout :ocl:0 :dtype :float)
+          n 4096
+          state (float-array (map #(float (inc %)) (range n)))
+          s (gpu/make-session :ocl:0)]
+      (try
+        (is (= [:inout :scalar :scalar]
+               (mapv :kind (:argument-specs (first (:steps descriptor))))))
+        (let [program (fixture/instantiate! s descriptor [state (float 2.0) n]
+                                            {'state :state})]
+          (fixture/run! program [state (float 2.0) n])
+          (let [^floats once (fixture/download program 'state)]
+            (is (= (float (* 2.0 513.0)) (aget once 512))))
+          (fixture/run! program [state (float 2.0) n])
+          (let [^floats twice (fixture/download program 'state)]
+            (is (= (float (* 4.0 513.0)) (aget twice 512))
+                "resident state is read and written through one ABI pointer on replay")))
+        (finally (gpu/close-session! s))))))
+
+(deftest ocl-staged-typed-inout-roundtrip
+  (if-not @device-probe/opencl-available?
+    (device-probe/opencl-skip! "staged typed inout SegMap")
+    (let [n 1024
+          execute (pl/compile-aot #'ocl-session-inout
+                                  :target-device :ocl:0 :dtype :float)
+          state (float-array (map #(float (inc %)) (range n)))
+          result (execute state (float 3.0) n)]
+      (is (identical? state result))
+      (is (= (float (* 3.0 513.0)) (aget state 512))))))
 
 (deftest ocl-resident-contraction-roundtrip
   (if-not @device-probe/opencl-available?

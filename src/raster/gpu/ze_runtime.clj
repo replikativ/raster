@@ -2028,7 +2028,7 @@
                       (let [host (MemorySegment/ofArray value)
                             n-bytes (.byteSize host)
                             seg (ensure-seg kernel-name (keyword (str "abi-arg-" idx)) n-bytes)]
-                        (when (or (= :input (:kind slot)) (= :inout (:role slot)))
+                        (when (kabi/readable? slot)
                           (MemorySegment/copy host 0 seg 0 n-bytes))
                         {:arg seg :value value :host host :n-bytes n-bytes :slot slot}))))
                 (range) pairs)
@@ -2040,10 +2040,10 @@
         wg (registered-1d-workgroup-size loaded)
         group-count (long (Math/ceil (/ (double n) wg)))]
     (launch! kernel-handle group-count wg all-args)
-    ;; ABI output and inout roles are the single source of copy-back truth. DeviceBuffers are
-    ;; already resident and therefore need no host copy.
+    ;; Writable ABI kinds are the single source of copy-back truth. DeviceBuffers are already
+    ;; resident and therefore need no host copy.
     (doseq [{:keys [arg host n-bytes slot]} staged
-            :when (and host (or (= :output (:kind slot)) (= :inout (:role slot))))]
+            :when (and host (kabi/writable? slot))]
       (MemorySegment/copy ^MemorySegment arg 0 ^MemorySegment host 0 (long n-bytes)))
     (or (some (fn [[slot value]] (when (= :result (:role slot)) value)) pairs)
         output-array)))
@@ -2685,8 +2685,7 @@
          expanded-entries
          (if abi
            (mapv (fn [entry slot]
-                   (assoc entry :write? (or (= :output (:kind slot))
-                                            (= :inout (:role slot)))))
+                   (assoc entry :write? (kabi/writable? slot)))
                  expanded-entries (kabi/pointer-slots abi))
            expanded-entries)
          dev-segs (mapv :seg expanded-entries)

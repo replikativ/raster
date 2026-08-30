@@ -1453,7 +1453,7 @@
                (into {}
                      (keep-indexed
                       (fn [index slot]
-                        (when (= :output (:kind slot))
+                        (when (kabi/writable? slot)
                           [(or (:binding slot) (:name slot))
                            (nth runtime-arguments index)])))
                      abi)
@@ -1525,8 +1525,8 @@
                           {:device-id device-id :index index :slot slot
                            :expected (dtype/canon (:dtype slot)) :actual actual-dtype})))
         (let [existing (.get identities value)
-              read? (or (= :input (:kind slot)) (= :inout (:role slot)))
-              write? (or (= :output (:kind slot)) (= :inout (:role slot)))]
+              read? (kabi/readable? slot)
+              write? (kabi/writable? slot)]
           (if (some? existing)
             (vswap! groups update existing
                     (fn [group]

@@ -8,7 +8,7 @@
   (:require [clojure.string :as str]
             [raster.compiler.core.dtype :as dt]))
 
-(def ^:private kinds #{:input :output :scalar})
+(def ^:private kinds #{:input :output :inout :scalar})
 
 (defn slot
   "Construct one ABI slot. Options: :c-name, :kernel-dtype, :role, :binding, :field, and
@@ -33,8 +33,32 @@
     aliasing (assoc :aliasing aliasing)
     alignment (assoc :alignment alignment)))
 
+(defn slot-access
+  "Return the physical memory access declared by one ABI slot.
+
+   `:kind` owns access; `:role` owns semantic identity such as `:result` or `:temporary`.
+   The role-derived `:inout` case remains readable for already-emitted artifacts while new ABIs
+   use the unambiguous `:kind :inout` spelling."
+  [{:keys [kind role]}]
+  (cond
+    (= :scalar kind) nil
+    (or (= :inout kind) (= :inout role)) :read-write
+    (= :input kind) :read
+    (= :output kind) :write
+    :else nil))
+
+(defn readable?
+  "Whether an ABI slot may read its bound pointer."
+  [slot]
+  (contains? #{:read :read-write} (slot-access slot)))
+
+(defn writable?
+  "Whether an ABI slot may write its bound pointer."
+  [slot]
+  (contains? #{:write :read-write} (slot-access slot)))
+
 (defn validate!
-  "Validate an ordered ABI and return it unchanged.  A kernel has at least one output;
+  "Validate an ordered ABI and return it unchanged. A kernel has at least one writable pointer;
    multi-output maps represent every independently written result in signature order."
   [abi]
   (when-not (vector? abi)
@@ -87,8 +111,8 @@
                                 (count (distinct (map :field bound-slots)))))))
           (throw (ex-info "composite ABI slots require unique explicit field identities"
                           {:binding binding :slots bound-slots :abi abi})))))
-    (when-not (some #(= :output (:kind %)) abi)
-      (throw (ex-info "kernel ABI must contain at least one output" {:abi abi})))
+    (when-not (some writable? abi)
+      (throw (ex-info "kernel ABI must contain at least one writable pointer" {:abi abi})))
     abi))
 
 (defn pointer-slots
@@ -153,7 +177,7 @@
         pairs (mapv vector abi arguments)
         stable-inputs (filterv (fn [[slot _]]
                                  (= :no-write-alias (:aliasing slot))) pairs)
-        outputs (filterv (fn [[slot _]] (= :output (:kind slot))) pairs)]
+        outputs (filterv (fn [[slot _]] (writable? slot)) pairs)]
     (doseq [[input-slot input] stable-inputs
             [output-slot output] outputs
             :when (overlaps? input output)]
@@ -220,8 +244,8 @@
     (when-not (= 1 (count result-pairs))
       (throw (ex-info "reduction ABI must identify exactly one :result slot"
                       {:abi abi :result-slots (mapv first result-pairs)})))
-    (when-not (= :output (:kind (ffirst result-pairs)))
-      (throw (ex-info "reduction ABI :result slot must be an output pointer"
+    (when-not (writable? (ffirst result-pairs))
+      (throw (ex-info "reduction ABI :result slot must be writable"
                       {:abi abi :result-slot (ffirst result-pairs)})))
     (when-not (= 1 (count bound-pairs))
       (throw (ex-info "reduction ABI must identify exactly one :bound slot"
