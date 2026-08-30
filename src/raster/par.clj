@@ -442,6 +442,14 @@
          ~body-expr)
        nil)))
 
+(deftm ^:no-inline unique-index
+  "Assert that an indexed-write destination is unique over its enclosing parallel iteration.
+
+   Runtime semantics are identity. The typed compiler consumes this marker as a conflict contract;
+   callers must establish uniqueness before dispatch (for example with validate-block-indices!)."
+  [index :- Long] :- Long
+  index)
+
 (defmacro collect!
   "Atomically claim a slot in count-arr and write values to SoA arrays.
   Useful for building output queues in parallel kernels.

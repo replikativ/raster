@@ -20,6 +20,11 @@
                (region [(let-value local :dtype init-expr) ...]
                        [result-expr ...]))))
         (= equation-id [result ...]
+           (scatter {:index i :extent n :conflict :unique} [array ...] [capture ...]
+             (lambda [element ... capture-parameter ...]
+               (region [(let-value local :dtype init-expr) ...]
+                       [(write destination-index predicate value) ...]))))
+        (= equation-id [result ...]
            (reduce {:index i :extent n
                     :accumulators [acc ...] :identities [zero ...]
                     :dtypes [:float ...] :algebra [{} ...]}
@@ -104,6 +109,11 @@
        (extent? (:extent value))
        (or (nil? (:attributes value)) (map? (:attributes value)))))
 
+(defn scatter-attributes?
+  [value]
+  (and (map-attributes? value)
+       (= :unique (:conflict value))))
+
 (defn reduce-attributes?
   [value]
   (and (map-attributes? value)
@@ -167,6 +177,7 @@
              [lit scalar-literal?]
              [sa scalar-attributes?]
              [ma map-attributes?]
+             [xa scatter-attributes?]
              [ra reduce-attributes?]
              [ca scan-attributes?]
              [dt keyword?]
@@ -177,6 +188,7 @@
           (if ?s:test ?s:then ?s:else)
           (do (?:+ s))
           (let* [(?:* ?sym:binding ?s:init)] ?s:body)
+          (write ?s:destination-index ?s:predicate ?s:value)
           [(?:* s)]
           (.invk ?sym:impl (?:* s:args))
           (& (?sym:f (?:* s:args)) (? _ seq?)))
@@ -193,6 +205,7 @@
   (Operation [o :enforce]
              (scalar ?sa [(?:* ?id:capture)] ?l)
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (scatter ?xa [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (scan ?ca [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
@@ -240,6 +253,17 @@
         {:kind kind :attributes attributes :arrays [] :captures captures :lambda lambda})
       (let [[_ attributes arrays captures lambda] operation]
         {:kind kind :attributes attributes :arrays arrays :captures captures :lambda lambda}))))
+
+(defn write-form?
+  "Whether a scatter-region result is one explicit conditional indexed write."
+  [value]
+  (and (seq? value) (= 'write (first value)) (= 4 (count value))))
+
+(defn write-parts
+  [value]
+  (when (write-form? value)
+    (let [[_ destination-index predicate written-value] value]
+      {:destination-index destination-index :predicate predicate :value written-value})))
 
 (defn local-value
   "Construct one explicitly typed scalar-region SSA definition."
@@ -355,7 +379,7 @@
         (fail! :typed-soac-region-binders
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
-      (when (and (contains? #{'map 'reduce 'scan} kind)
+      (when (and (contains? #{'map 'scatter 'reduce 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
                "a scalar-region local cannot shadow its operation index"
@@ -370,9 +394,9 @@
         (fail! :typed-soac-local-dtype
                "scalar-region locals require a supported JVM scalar dtype"
                {:equation equation-id :local local :dtype dtype})))
-    (when (and (seq locals) (not= 'map kind))
+    (when (and (seq locals) (not (contains? #{'map 'scatter} kind)))
       (fail! :typed-soac-region-operation
-             "typed local SSA is currently admitted only in map scalar regions"
+             "typed local SSA is currently admitted only in map/scatter scalar regions"
              {:equation equation-id :operation kind :locals locals}))
     (when-not (= result-count (count body-results))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
@@ -391,7 +415,8 @@
                 :arrays arrays
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
-                          (contains? #{'map 'reduce 'scan} kind) (conj (:index attributes)))
+                          (contains? #{'map 'scatter 'reduce 'scan} kind)
+                          (conj (:index attributes)))
           final-bound
           (reduce (fn [bound {:keys [id init] :as local}]
                     (let [unbound (util/free-syms init bound)]
@@ -402,11 +427,14 @@
                       (conj bound id)))
                   initial-bound locals)]
       (doseq [body body-results
-              :let [unbound (util/free-syms body final-bound)]
+              expression (if (= 'scatter kind)
+                           (vals (write-parts body))
+                           [body])
+              :let [unbound (util/free-syms expression final-bound)]
               :when (seq unbound)]
         (fail! :typed-soac-unbound-scalar
                "scalar-region results may reference only parameters and local SSA values"
-               {:equation equation-id :unbound unbound :body body})))
+               {:equation equation-id :unbound unbound :body body :expression expression})))
     (case kind
       scalar
       (when-not (= result-count (count (:dtypes attributes)))
@@ -415,7 +443,16 @@
                {:equation equation-id :results results :dtypes (:dtypes attributes)}))
 
       map
-      nil
+      (when (some write-form? body-results)
+        (fail! :typed-soac-map-write
+               "functional map results cannot contain indexed writes"
+               {:equation equation-id :results body-results}))
+
+      scatter
+      (when-not (every? write-form? body-results)
+        (fail! :typed-soac-scatter-write
+               "scatter results must be explicit conditional indexed writes"
+               {:equation equation-id :results body-results}))
 
       reduce
       (let [accumulators (:accumulators attributes)]
@@ -494,6 +531,14 @@
                    "map results must be rank-one tensors over the declared extent"
                    {:equation equation-id :id id :value value :extent extent}))))
 
+      scatter
+      (doseq [id results]
+        (let [value (get values id)]
+          (when (and value (not= :tensor (:kind value)))
+            (fail! :typed-soac-scatter-result-type
+                   "scatter results require tensor storage contracts"
+                   {:equation equation-id :id id :value value}))))
+
       reduce
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
         (let [value (get values id)]
@@ -524,9 +569,9 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (= 'map kind)
+      (when-not (contains? #{'map 'scatter} kind)
         (fail! :typed-soac-result-storage-operation
-               "physical result storage is currently valid only for map equations"
+               "physical result storage is valid only for map/scatter equations"
                {:equation equation-id :operation kind :storage storage}))
       (when-not (and (vector? storage)
                      (= (count results) (count storage))

@@ -44,6 +44,104 @@
 ;; SegMap → OpenCL kernel
 ;; ================================================================
 
+(defn generate-explicit-segmap-kernel
+  "Emit an explicit-store SegMap without reconstructing a source `map-void!` form.
+
+   Unique-destination scatter schedules use this shape: the scalar region owns its indexed aset
+   statements, while SegMap owns the iteration geometry and the typed input/output boundary."
+  [segmap & {:keys [dtype kernel-name-prefix scalar-types array-types]
+             :or {dtype :float kernel-name-prefix "segmap_effect"
+                  scalar-types {} array-types {}}}]
+  (let [idx (seg-idx segmap)
+        bound (seg-bound segmap)
+        body (ce/normalize-array-prims (:lambda segmap))
+        inputs (set (:inputs segmap))
+        outputs (set (:outputs segmap))
+        pointers (vec (sort-by name (clojure.set/union inputs outputs)))
+        scalars (vec (sort-by name (:scalars segmap)))
+        default-dtype (or (:dtype segmap) dtype)
+        default-ctype (dt/ctype :opencl default-dtype)
+        meta-types (ce/collect-array-types-from-meta body)
+        array-types (merge meta-types array-types)
+        pointer-dtype (fn [symbol]
+                        (or (get array-types symbol)
+                            (get array-types (clojure.core/symbol (name symbol)))
+                            default-dtype))
+        pointer-ctype #(dt/ctype :opencl (pointer-dtype %))
+        written? #(contains? outputs %)
+        read? #(contains? inputs %)
+        pointer-kind (fn [symbol]
+                       (cond
+                         (and (read? symbol) (written? symbol)) :inout
+                         (written? symbol) :output
+                         :else :input))
+        scalar-ctype #(ce/scalar-native-type % scalar-types default-ctype)
+        scalar-dtype (fn [symbol]
+                       (case (scalar-ctype symbol)
+                         "int" :int
+                         "long" :long
+                         "double" :double
+                         "float" :float))
+        pointer-params
+        (str/join ", "
+                  (map (fn [symbol]
+                         (str "__global "
+                              (when-not (written? symbol) "const ")
+                              (pointer-ctype symbol) "* "
+                              (when-not (written? symbol) "restrict ")
+                              (ce/c-symbol symbol)))
+                       pointers))
+        scalar-params (str/join ", "
+                                (map #(str (scalar-ctype %) " " (ce/c-symbol %)) scalars))
+        parameter-list (str/join ", "
+                                 (remove empty? [pointer-params scalar-params "int _n_bound"]))
+        array-symbols (set (map #(clojure.core/symbol (name %)) pointers))
+        int-scalars (into #{idx} (filter #(= "int" (scalar-ctype %)) scalars))
+        adapted-body (ce/adapt-casts-for-dtype body default-dtype)
+        body-source (binding [ce/*emit-config* ce/opencl-config
+                              ce/*scalar-type* default-ctype
+                              ce/*idx-sym* idx
+                              ce/*int-vars* (into ce/*int-vars* int-scalars)]
+                      (ce/emit-stmt adapted-body idx array-symbols "idx"))
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        abi (kabi/validate!
+             (vec (concat
+                   (map (fn [symbol]
+                          (kabi/slot symbol (pointer-kind symbol) (pointer-dtype symbol)
+                                     :c-name (ce/c-symbol symbol)
+                                     :role (if (written? symbol) :effect :operand)))
+                        pointers)
+                   (map (fn [symbol]
+                          (kabi/slot symbol :scalar (scalar-dtype symbol)
+                                     :c-name (ce/c-symbol symbol) :role :parameter))
+                        scalars)
+                   [(kabi/slot '_n_bound :scalar :int :role :bound)])))
+        source (str (apply codegen/extension-pragmas
+                           default-dtype (map pointer-dtype pointers))
+                    (ce/intrinsic-helper-sources body-source)
+                    "__kernel void " kernel-name "(" parameter-list ") {\n"
+                    "    for (int idx = get_global_id(0); idx < _n_bound; "
+                    "idx += get_global_size(0)) {\n"
+                    "        " body-source "\n"
+                    "    }\n}\n")]
+    (kabi/validate-source-signature! kernel-name source abi)
+    (kart/make
+     {:kernel-name kernel-name
+      :source source
+      :abi abi
+      :arguments (vec (concat pointers scalars [bound]))
+      :launch (klaunch/spec {:workgroup-size [256]
+                             :group-count [(klaunch/ceil-div bound 256)]})
+      :temporaries []
+      :effects {:kind :side-effect-map :write-conflict :unique}
+      :provenance {:dialect :segmap :segop-id (:id segmap)}
+      :attributes {:array-params pointers
+                   :scalar-params scalars
+                   :written-arrays (vec (sort-by name outputs))
+                   :array-types array-types
+                   :dtype default-dtype
+                   :explicit-stores true}})))
+
 (defn generate-segmap-kernel
   "Generate an OpenCL C kernel from a SegMap record.
 

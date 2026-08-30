@@ -520,7 +520,8 @@
             (let [body (when (and (seq? operation) (= '= (first operation))
                                   (= 4 (count operation)))
                          (nth operation 3))]
-              (and (seq? body) (contains? #{'scalar 'map 'reduce 'scan} (first body)))))
+              (and (seq? body)
+                   (contains? #{'scalar 'map 'scatter 'reduce 'scan} (first body)))))
           (fn [_ algorithm]
             (= algorithm (soac-dialect/validate! algorithm))))
          (valid-let*-ordered? (:source value))

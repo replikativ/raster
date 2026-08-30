@@ -221,9 +221,10 @@
                       (let [block (quot i block-width)
                             element (rem i block-width)
                             source-block (aget indices block)]
-                        (when (and (>= source-block 0) (< source-block indexed-blocks))
-                          (aset out i
-                                (aget src (+ (* source-block block-width) element))))))))
+                        (when (>= source-block 0)
+                          (when (< source-block indexed-blocks)
+                            (aset out i
+                                  (aget src (+ (* source-block block-width) element)))))))))
 
 (deftm scatter-blocks!
   "Copy dense `src[nblocks,block-width]` blocks to indexed locations in
@@ -236,10 +237,11 @@
                       (let [source-block (quot i block-width)
                             element (rem i block-width)
                             destination-block (aget indices source-block)]
-                        (when (and (>= destination-block 0)
-                                   (< destination-block indexed-blocks))
-                          (aset out (+ (* destination-block block-width) element)
-                                (aget src i)))))))
+                        (when (>= destination-block 0)
+                          (when (< destination-block indexed-blocks)
+                            (aset out (par/unique-index
+                                       (+ (* destination-block block-width) element))
+                                  (aget src i))))))))
 
 ;; Float16 is a physical storage type without a JVM primitive scalar. Its arrays are short[] on
 ;; the host, so give the bit-preserving layout transforms an explicit storage overload rather than
@@ -251,9 +253,10 @@
                  (let [block (quot i block-width)
                        element (rem i block-width)
                        source-block (aget indices block)]
-                   (when (and (>= source-block 0) (< source-block indexed-blocks))
-                     (aset out i
-                           (aget src (+ (* source-block block-width) element)))))))
+                   (when (>= source-block 0)
+                     (when (< source-block indexed-blocks)
+                       (aset out i
+                             (aget src (+ (* source-block block-width) element))))))))
 
 (deftm scatter-blocks!
   [src :- (Array short), indices :- (Array int), out :- (Array short),
@@ -262,10 +265,11 @@
                  (let [source-block (quot i block-width)
                        element (rem i block-width)
                        destination-block (aget indices source-block)]
-                   (when (and (>= destination-block 0)
-                              (< destination-block indexed-blocks))
-                     (aset out (+ (* destination-block block-width) element)
-                           (aget src i))))))
+                   (when (>= destination-block 0)
+                     (when (< destination-block indexed-blocks)
+                       (aset out (par/unique-index
+                                  (+ (* destination-block block-width) element))
+                             (aget src i)))))))
 
 (deftm gather-rows!
   "Compatibility spelling for dense row gathering. New layout code should use `gather-blocks!`,

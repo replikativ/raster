@@ -526,11 +526,17 @@
                                  #(and (instance? raster.compiler.ir.segop.SegMap %)
                                        (= :typed-soac (:algorithm-dialect %))))
                       kernel (if scheduled
-                               (segop-cl/generate-segmap-kernel
-                                scheduled (:out-sym scheduled)
-                                :dtype (:dtype scheduled)
-                                :scalar-types top-scalar-types
-                                :array-types top-array-types)
+                               (if (:out-sym scheduled)
+                                 (segop-cl/generate-segmap-kernel
+                                  scheduled (:out-sym scheduled)
+                                  :dtype (:dtype scheduled)
+                                  :scalar-types top-scalar-types
+                                  :array-types top-array-types)
+                                 (segop-cl/generate-explicit-segmap-kernel
+                                  scheduled
+                                  :dtype (:dtype scheduled)
+                                  :scalar-types top-scalar-types
+                                  :array-types top-array-types))
                                (legacy/generate-par-map-void-kernel
                                 form :dtype dtype :device-id device-id
                                 :array-types top-array-types
