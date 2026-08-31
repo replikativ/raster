@@ -30,6 +30,7 @@
 (declare lower-map)
 (declare lower-scan-description)
 (declare scan-kernel-graph-description)
+(declare phase-grid)
 
 (defn- materialize-region-locals
   [locals body]
@@ -284,12 +285,15 @@
                        [parameter (list 'clojure.core/aget array dense-coordinate)])
                      elements arrays))
           step-results (mapv #(util/subst-syms substitutions %) body-results)
+          facts (soac-dialect/facts program)
+          physical-results (soac-dialect/physical-results facts equation)
           components
           (mapv (fn [ordinal accumulator neutral component-dtype result]
                   {:id (keyword (str "component-" ordinal))
                    :accumulator accumulator :neutral neutral :dtype component-dtype
                    :result result})
-                (range) accumulators (:identities attributes) (:dtypes attributes) results)
+                (range) accumulators (:identities attributes) (:dtypes attributes)
+                physical-results)
           operator (reduction/make
                     {:components components
                      :index reduced-index
@@ -297,7 +301,6 @@
                      :algebra {:components (:algebra attributes)}
                      :attributes {:source :typed-soac :equation equation-id
                                   :segmented true}})
-          facts (soac-dialect/facts program)
           values (:values facts)
           stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
           inputs (set/union (set arrays) stable-captures)
@@ -312,6 +315,25 @@
                  (conj (mapv (fn [[index extent]] {:name index :bound extent}) segment-axes)
                        {:name reduced-index :bound reduced-extent}))
           output-dtype (or (first (:dtypes attributes)) dtype :double)
+          contraction? (= :raster.par/contract
+                          (get-in attributes [:attributes :source-operation]))
+          planned-grid (when contraction?
+                         (phase-grid :reduce device-id reduced-extent output-dtype))
+          contraction-schedule
+          (when contraction?
+            (let [workgroup-size (:block-size planned-grid)
+                  candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
+              (reduction/schedule
+               {:strategy :hardware-contraction-candidates
+                :workgroup-size workgroup-size
+                :stages [:segment-space :reduction :target-lowering]
+                :tuning-space {:families [:matrix :register-tiled :portable]
+                               :workgroup-size candidates}
+                :numerical-mode (select-keys (first (get-in operator [:algebra :components]))
+                                             [:order :reassociation :overflow])
+                :attributes {:source-operation :raster.par/contract
+                             :device device-id
+                             :selection :target-lowering}})))
           _ (doseq [input inputs]
               (when-not (= :tensor (:kind (get values input)))
                 (throw (ex-info "segmented reduction tensor input lacks an AbstractValue"
@@ -320,7 +342,9 @@
                                  :value (get values input)}))))]
       [(segop/->SegRed equation-id space
                        (segop/->SegLevel :thread :virtual)
-                       operator nil inputs (set results) scalars nil :segmented nil output-dtype)])))
+                       operator nil inputs (set physical-results) scalars planned-grid
+                       (if contraction? :contraction :segmented)
+                       contraction-schedule output-dtype)])))
 
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."

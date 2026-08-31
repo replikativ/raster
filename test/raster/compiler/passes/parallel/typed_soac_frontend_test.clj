@@ -2,6 +2,9 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
@@ -118,6 +121,7 @@
       (is (= :inclusive (get-in (dialect/operation-parts equation) [:attributes :mode])))
       (is (= '{result target} (get-in (dialect/facts program) [:equations 0 :aliases])))
       (is (= #{:memory/write} (:effects (dialect/facts program))))))
+
   (testing "exclusive scan is the same certified operation with a distinct result mode"
     (let [program (frontend/form->program
                    '(let* [result (raster.par/scan-exclusive target acc 0.0 i n float
@@ -173,6 +177,45 @@
       (is (= :read-write
              (get-in facts [:equations 0 :attributes :result-storage 0 :access])))
       (is (= '{step target} (get-in facts [:equations 0 :aliases]))))))
+
+(deftest contraction-enters-as-a-general-typed-segmented-reduction
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                       (* (clojure.core/aget A (+ (* i k) l))
+                          (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        options {:dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long}}
+        program (frontend/form->program source options)
+        equation (first (dialect/equations program))
+        operation (dialect/operation-parts equation)
+        routed (route/attempt source :float (:array-types options)
+                              {:scalar-types (:scalar-types options)})
+        scheduled
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "typed scheduling reparsed source" {})))]
+          ((requiring-resolve
+            'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+           (:program routed) {:target-device :ze:0 :dtype :float}))
+        segred (-> scheduled :form :equations first :operations first)]
+    (is (= 'segmented-reduce (:kind operation)))
+    (is (= '[[i m] [j n]] (get-in operation [:attributes :segment-axes])))
+    (is (= '[m n k] (dialect/operation-extents equation)))
+    (is (= [{:destination 'C :access :write :host-return :effect}]
+           (get-in (dialect/facts program) [:equations 0 :attributes :result-storage])))
+    (is (= '[m n] (:shape (get-in (dialect/facts program)
+                                  [:values (first (nth equation 2))]))))
+    (is (= :analyzed-source (get-in routed [:stats :front-end])))
+    (is (instance? raster.compiler.ir.segop.SegRed segred))
+    (is (= :contraction (:phase segred)))
+    (is (= :hardware-contraction-candidates (get-in segred [:schedule :strategy])))
+    (is (= '[C] (reduction/results (:reduction segred))))
+    (is (nil? (some #(when (instance? raster.compiler.ir.soac.SoacContract %) %)
+                    (tree-seq coll? seq (:form scheduled)))))
+    (is (= :typed-soac (get-in (-> scheduled :form :equations first)
+                               [:attributes :algorithm-dialect])))))
 
 (deftest destination-shapes-refine-across-ordered-maps
   (let [program (frontend/form->program

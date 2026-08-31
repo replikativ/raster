@@ -11,9 +11,9 @@
        body — so an extra factor was silently dropped.
 
    Patching each instance leaves the shape intact. This closes it structurally: there is exactly
-   ONE producer of facts, its only input is the FORM, and a checker takes facts — so there is no
-   argument to pass inconsistently. A checker that wants the contract axes cannot be handed a
-   different set; it reads `:contract-axes`, which came from the form's own declaration slot.
+   ONE verified facts constructor, and checkers take its tagged result — so there is no collection
+   of independently derived gate arguments to pass inconsistently. Surface source and validated
+   TypedSOAC equations both enter that constructor through explicit semantic components.
 
    DECLARATIONS ARE EVIDENCE, NOT FACTS. A form may declare operand axis-maps (`:maps`), which is
    what lets a merged/batched operand be understood at all — a derived map cannot guess grouping.
@@ -121,20 +121,33 @@
                        :sym sym :declared (am/index-expr declared) :actual idx})))
     declared))
 
-(defn contraction-facts
-  "Derive the checkable facts of `(raster.par/contract out free-axes contract-axes body & opts)`.
-   The ONLY input is the form (plus the intended element dtype, which is a compilation choice
-   rather than a property of the form). Throws on a malformed form or an unverifiable declaration."
-  [form & {:keys [dtype] :or {dtype :double}}]
-  (when-not (and (seq? form) (= 'raster.par/contract (first form)))
-    (throw (ex-info "contraction-facts: not a par/contract form" {:reason :not-a-contract-form
-                                                                  :form form})))
-  (let [[_ out free-axes contract-axes body] form
-        opts (form-opts form)
+(defn surface-form
+  "Spell contraction components in the temporary `raster.par/contract` target vocabulary."
+  [{:keys [out free-axes contract-axes body opts metadata]}]
+  (with-meta
+    (apply list
+           (concat ['raster.par/contract out free-axes contract-axes body]
+                   (mapcat identity opts)))
+    metadata))
+
+(defn from-components
+  "Construct the sole verified contraction-facts value from explicit semantic components.
+
+   `form` is optional provenance/compatibility spelling. When absent it is generated mechanically;
+   no fact is inferred by parsing that spelling. Throws on malformed axes or an unverifiable
+   physical layout declaration."
+  [{:keys [out free-axes contract-axes body opts dtype form metadata]
+    :or {opts {} dtype :double}}]
+  (let [form (or form (surface-form {:out out :free-axes free-axes
+                                     :contract-axes contract-axes :body body
+                                     :opts opts :metadata metadata}))
+        _ (when-not (symbol? out)
+            (throw (ex-info "contract output must be a symbol" {:reason :malformed-output
+                                                                 :out out})))
         _ (when-not (vector? free-axes)
-            (throw (ex-info "contract form: free-axes must be a vector" {:reason :malformed-free-axes})))
+            (throw (ex-info "contract free-axes must be a vector" {:reason :malformed-free-axes})))
         _ (when-not (vector? contract-axes)
-            (throw (ex-info "contract form: contract-axes must be a vector" {:reason :malformed-contract-axes})))
+            (throw (ex-info "contract contract-axes must be a vector" {:reason :malformed-contract-axes})))
         declared (:maps opts)
         ;; `:decode` is the per-operand LOAD-LAMBDA, an expression in `x` (the raw load). This is
         ;; where a zero-point subtraction belongs — exact on the load path, needing no correction
@@ -174,6 +187,19 @@
       :dims dims
       :opts opts}
      normalized)))
+
+(defn contraction-facts
+  "Derive verified facts from `(raster.par/contract out free-axes contract-axes body & opts)`.
+
+   Source parsing ends here. Typed compiler paths call `from-components` instead, so schedule
+   analysis never has to reconstruct or reparse source syntax."
+  [form & {:keys [dtype] :or {dtype :double}}]
+  (when-not (and (seq? form) (= 'raster.par/contract (first form)))
+    (throw (ex-info "contraction-facts: not a par/contract form" {:reason :not-a-contract-form
+                                                                  :form form})))
+  (let [[_ out free-axes contract-axes body] form]
+    (from-components {:out out :free-axes free-axes :contract-axes contract-axes
+                      :body body :opts (form-opts form) :dtype dtype :form form})))
 
 (defn scalar-reduction-view
   "Project the canonical one-component ProductReduction into the contraction facts needed by

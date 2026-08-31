@@ -6,6 +6,7 @@
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
@@ -562,6 +563,54 @@
                           typed {:dtype :float :target-device :ocl:0}))
         emitted (opencl-pass/opencl-pass scheduled :device-id :ocl:0 :dtype :float)]
     (is (= 1 (get-in emitted [:stats :ze-maps])))
+    (is (= 1 (get-in emitted [:stats :segop-reused])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))
+    (is (= 1 (count (:kernels emitted))))))
+
+(deftest typed-contraction-schedule-view-retains-body-scalars
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                       (* alpha
+                          (clojure.core/aget A (+ (* i k) l))
+                          (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long 'alpha :float}})
+        operation (-> form :equations first :operations first)]
+    (is (= '#{m n k alpha} (segop/operation-scalars operation)))
+    (is (= '#{A B} (segop/operation-inputs operation)))
+    (is (= '#{C} (segop/operation-outputs operation)))))
+
+(deftest gpu-emission-consumes-the-scheduled-typed-contraction
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                       (* (clojure.core/aget A (+ (* i k) l))
+                          (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        emitted
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "typed emission reparsed source" {})))]
+          (opencl-pass/opencl-pass form :device-id :ocl:0
+                                     :dtype :float :min-elements 0))]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (instance? raster.compiler.ir.segop.SegRed operation))
+    (is (= :contraction (:phase operation)))
+    (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
+    (is (= :raster.par/contract
+           (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
+                   [:attributes :attributes :source-operation])))
+    (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (= 1 (get-in emitted [:stats :segop-reused])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))
     (is (= 1 (count (:kernels emitted))))))
