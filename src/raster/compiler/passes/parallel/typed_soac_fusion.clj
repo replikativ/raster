@@ -11,7 +11,8 @@
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.axis-map :as axis-map]
-            [raster.compiler.ir.soac-dialect :as dialect]))
+            [raster.compiler.ir.soac-dialect :as dialect]
+            [raster.compiler.passes.parallel.fusion-placement :as placement]))
 
 (def ^:private map-equation-rule
   (from-dialect dialect/TypedSOAC
@@ -244,16 +245,17 @@
            :fusion fused-kind
            :fused-equations ids)))
 
+(defn- equation-constituents
+  [equation-id equation-facts]
+  (or (get-in equation-facts [:attributes :fusion/constituents])
+      {equation-id (update equation-facts :attributes dissoc :fusion/constituents)}))
+
 (defn- remove-equation-fact
   [facts removed-id kept-id fused-kind]
   (let [removed (get-in facts [:equations removed-id])
         kept (get-in facts [:equations kept-id])
-        constituent-facts
-        (fn [id equation-facts]
-          (or (get-in equation-facts [:attributes :fusion/constituents])
-              {id (update equation-facts :attributes dissoc :fusion/constituents)}))
-        constituents (merge (constituent-facts kept-id kept)
-                            (constituent-facts removed-id removed))]
+        constituents (merge (equation-constituents kept-id kept)
+                            (equation-constituents removed-id removed))]
     (-> facts
         (update :equations dissoc removed-id)
         (assoc-in [:equations kept-id :attributes :fusion/constituents] constituents)
@@ -261,6 +263,22 @@
                   (merge-provenance
                    (assoc (:provenance kept) :fused-equations [kept-id])
                    (assoc (:provenance removed) :fused-equations [removed-id])
+                   fused-kind)))))
+
+(defn- record-recomputed-fusion
+  "Record that `producer-id` was cloned into one consumer while its materialized equation remains."
+  [facts producer-id consumer-id fused-kind placement-witness]
+  (let [producer (get-in facts [:equations producer-id])
+        consumer (get-in facts [:equations consumer-id])
+        constituents (merge (equation-constituents consumer-id consumer)
+                            (equation-constituents producer-id producer))]
+    (-> facts
+        (assoc-in [:equations consumer-id :attributes :fusion/constituents] constituents)
+        (assoc-in [:equations consumer-id :attributes :fusion/placement] placement-witness)
+        (assoc-in [:equations consumer-id :provenance]
+                  (merge-provenance
+                   (assoc (:provenance consumer) :fused-equations [consumer-id])
+                   (assoc (:provenance producer) :fused-equations [producer-id])
                    fused-kind)))))
 
 (defn- transfer-result-boundary
@@ -476,12 +494,30 @@
                                        (:attributes updated))))]
       (rebuild-boundary program facts equations))))
 
-(defn- vertical-candidate
-  [program]
+(defn- producer-placement-witness
+  [program infos uses producer produced abstract-machine]
+  (let [consumer-ids (->> infos
+                          (filter #(some #{produced} (equation-references
+                                                      (emit-equation %))))
+                          (mapv :id))
+        witness (placement/placement-decision
+                 {:abstract-machine abstract-machine
+                  :dtype (value-scalar-dtype program produced)
+                  :expressions (concat (map :init (:locals producer))
+                                       (:body-results producer))
+                  :consumer-count (get uses produced 0)})]
+    (assoc witness
+           :producer (:id producer)
+           :value produced
+           :consumers consumer-ids
+           :externally-visible? (contains? (set (dialect/outputs program)) produced))))
+
+(defn- vertical-candidates
+  [program abstract-machine]
   (let [equations (dialect/equations program)
         infos (mapv equation-info equations)
         uses (value-use-counts program)]
-    (first
+    (vec
      (for [producer-index (range (count infos))
            consumer-index (range (inc producer-index) (count infos))
            :let [producer (nth infos producer-index)
@@ -500,17 +536,20 @@
                      (and (empty? (:locals producer)) (empty? (:locals consumer)))
                      (some? (value-scalar-dtype program produced)))
            :when (= (:extent (:attributes producer)) (:extent (:attributes consumer)))
-           :when (= 1 (get uses produced 0))
+           :when (pos? (get uses produced 0))
            :when (some #{produced} (:arrays consumer))
            :when (fusible-equation? program (:id producer))
-           :when (fusible-equation? program (:id consumer))]
+           :when (fusible-equation? program (:id consumer))
+           :let [placement-witness (producer-placement-witness
+                                    program infos uses producer produced abstract-machine)]]
        {:producer-index producer-index :consumer-index consumer-index
-        :producer producer :consumer consumer :produced produced}))))
+        :producer producer :consumer consumer :produced produced
+        :use-count (get uses produced 0)
+        :placement placement-witness}))))
 
-(defn- fuse-vertical-once
-  [program]
-  (when-let [{:keys [producer-index consumer-index producer consumer produced]}
-             (vertical-candidate program)]
+(defn- fuse-vertical-candidate
+  [program {:keys [producer-index consumer-index producer consumer produced use-count]
+            placement-witness :placement}]
     (let [producer (freshen-parameters producer "producer")
           consumer (freshen-parameters consumer "consumer")
           producer-parameters (parameter-parts producer)
@@ -577,14 +616,22 @@
                                                   (:capture-parameters canonical)))
                          :locals (:locals canonical)
                          :body-results (:body-results canonical))
-          equations (-> (dialect/equations program)
-                        (assoc consumer-index (emit-equation updated))
-                        (->> (keep-indexed (fn [index equation]
-                                             (when-not (= index producer-index) equation)))
-                             vec))
-          facts (remove-equation-fact (dialect/facts program) (:id producer) (:id consumer)
-                                      (keyword (str "map-" (name (:kind consumer)))))]
-      (rebuild-boundary program facts equations))))
+          retain-producer? (> use-count 1)
+          fused-kind (keyword (str "map-" (name (:kind consumer))))
+          equations (assoc (dialect/equations program) consumer-index (emit-equation updated))
+          equations (if retain-producer?
+                      equations
+                      (->> equations
+                           (keep-indexed (fn [index equation]
+                                           (when-not (= index producer-index) equation)))
+                           vec))
+          facts (if retain-producer?
+                  (record-recomputed-fusion (dialect/facts program)
+                                            (:id producer) (:id consumer)
+                                            fused-kind placement-witness)
+                  (remove-equation-fact (dialect/facts program)
+                                        (:id producer) (:id consumer) fused-kind))]
+      (rebuild-boundary program facts equations)))
 
 (defn- horizontal-candidate
   [program]
@@ -664,20 +711,63 @@
                                       :horizontal-map)]
       (rebuild-boundary program facts equations))))
 
+(defn- placement-key
+  [{:keys [producer value decision]}]
+  [producer value decision])
+
+(defn- remember-placement
+  [placements witness]
+  (if (> (:consumer-count witness) 1)
+    (assoc placements (placement-key witness) witness)
+    placements))
+
+(defn- attach-placement-facts
+  [program placements]
+  (if (seq placements)
+    (let [ordered (->> (vals placements)
+                       (sort-by (juxt (comp pr-str :producer)
+                                      (comp pr-str :value)
+                                      (comp name :decision)))
+                       vec)
+          facts (assoc-in (dialect/facts program)
+                          [:attributes :fusion/placements] ordered)]
+      [(dialect/make facts (dialect/equations program) (dialect/outputs program)) ordered])
+    [program []]))
+
 (defn fusion-fixpoint
-  "Fuse legal typed SOAC equations to a fixpoint. Returns [program stats]."
-  [program]
-  (dialect/validate! program)
-  (loop [program program
-         vertical 0
-         horizontal 0
-         iterations 0]
-    (if-let [fused (fuse-vertical-once program)]
-      (recur fused (inc vertical) horizontal (inc iterations))
-      (if-let [fused (fuse-segmented-reduce-result-map-once program)]
-        (recur fused (inc vertical) horizontal (inc iterations))
-        (if-let [fused (fuse-horizontal-once program)]
-          (recur fused vertical (inc horizontal) (inc iterations))
-          [program {:vertical vertical
-                    :horizontal horizontal
-                    :iterations (inc iterations)}])))))
+  "Fuse legal typed SOAC equations to a fixpoint. Returns [program stats].
+
+   With an Abstract Machine, legal multi-consumer map fusion is selected by the shared placement
+   policy. Decisions are retained in program facts and stats; no device/vendor identity enters the
+   typed dialect. The one-argument form preserves the existing single-consumer rewrites and keeps
+   fan-out materialized when no target performance description can justify recomputation."
+  ([program]
+   (fusion-fixpoint program nil))
+  ([program abstract-machine]
+   (dialect/validate! program)
+   (loop [program program
+          vertical 0
+          horizontal 0
+          iterations 0
+          placements {}]
+     (let [candidates (vertical-candidates program abstract-machine)
+           candidate (first (filter (comp :fuse? :placement) candidates))]
+       (if candidate
+         (recur (fuse-vertical-candidate program candidate)
+                (inc vertical) horizontal (inc iterations)
+                (remember-placement placements (:placement candidate)))
+         (if-let [fused (fuse-segmented-reduce-result-map-once program)]
+           (recur fused (inc vertical) horizontal (inc iterations) placements)
+           (if-let [fused (fuse-horizontal-once program)]
+             (recur fused vertical (inc horizontal) (inc iterations) placements)
+             (let [placements
+                   (reduce remember-placement placements
+                           (map :placement
+                                (filter (comp not :fuse? :placement) candidates)))
+                   [program ordered-placements] (attach-placement-facts program placements)
+                   stats {:vertical vertical
+                          :horizontal horizontal
+                          :iterations (inc iterations)}]
+               [program (cond-> stats
+                          (seq ordered-placements)
+                          (assoc :placements ordered-placements))]))))))))

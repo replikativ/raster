@@ -124,7 +124,7 @@
               output (get result (keyword (name (:result-sym (:descriptor compiled)))))]
           (is (every? #(= 15.0 (double %)) (v/->host output)))
           (let [profile (r/profile compiled)]
-            (is (= 2 (count (:profile profile))))
+            (is (= 1 (count (:profile profile))))
             (is (pos? (:device-wall-ms profile)))
             (is (not (v/live? output))
                 "profiling invalidates an earlier output whose resident storage it overwrites")))

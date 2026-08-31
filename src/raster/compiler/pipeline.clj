@@ -757,6 +757,17 @@
 
 (declare top-level-binding-form)
 
+(defn- abstract-machine-for-target
+  "Project a GPU target to the target-neutral cost surface used by typed scheduling.
+
+   A missing descriptor is an honest abstention: typed fan-out retains its materialization boundary
+   rather than making compilation depend on optional probing/catalogue data."
+  [target-device]
+  (when (device/gpu-target? target-device)
+    (try
+      (core-hw/abstract-machine (core-hw/descriptor-for target-device))
+      (catch Throwable _ nil))))
+
 (defn- pass-soac-fuse
   "SOAC graph-based fusion: vertical (map→map, map→reduce, map→scan),
   horizontal (independent same-bound maps), iterated to fixpoint.
@@ -764,17 +775,15 @@
   Returns {:form :stats}."
   [form opts]
   (if (form/binding-form? form)
-    (let [typed (typed-soac-route/attempt
+    (let [am (abstract-machine-for-target (:target-device opts))
+          typed (typed-soac-route/attempt
                  form (:dtype opts) (:array-types opts)
                  {:resident-reductions? (true? (:resident-reductions? opts))
-                  :scalar-types (:scalar-types opts)})]
+                  :scalar-types (:scalar-types opts)
+                  :abstract-machine am})]
       (if (:program typed)
         {:form (:program typed) :stats (:stats typed)}
-        (let [am (when (device/gpu-target? (:target-device opts))
-                   (try (core-hw/abstract-machine
-                         (core-hw/descriptor-for (:target-device opts)))
-                        (catch Throwable _ nil)))
-              [let-sym bindings-vec & body-exprs] form
+        (let [[let-sym bindings-vec & body-exprs] form
               pairs (vec (partition 2 bindings-vec))
               nodes (soac/let-bindings->nodes pairs)
               graph (soac-graph/build-fusion-graph nodes)
@@ -795,10 +804,12 @@
     ;; Normalize it only HERE, after fixpoint/type analysis, and retain the wrapper only when the
     ;; typed route accepts it. Unsupported forms must reach compatibility lowering unchanged.
     (let [source (top-level-binding-form form)
+          am (abstract-machine-for-target (:target-device opts))
           typed (typed-soac-route/attempt
                  source (:dtype opts) (:array-types opts)
                  {:resident-reductions? (true? (:resident-reductions? opts))
-                  :scalar-types (:scalar-types opts)})]
+                  :scalar-types (:scalar-types opts)
+                  :abstract-machine am})]
       (if (:program typed)
         {:form (:program typed) :stats (:stats typed)}
         (let [fallback (par-fusion/par-fusion-pass form)]
@@ -1068,7 +1079,9 @@
   [source {:keys [dtype array-types scalar-types target-device] :as opts}]
   (let [source (top-level-binding-form source)
         typed (typed-soac-route/attempt source dtype array-types
-                                        {:scalar-types scalar-types})
+                                        {:scalar-types scalar-types
+                                         :abstract-machine
+                                         (abstract-machine-for-target target-device)})
         semantic (or (:program typed) source)
         scheduled (segop-lower/segop-lower-pass
                    semantic (assoc opts :dtype dtype :target-device target-device))]
