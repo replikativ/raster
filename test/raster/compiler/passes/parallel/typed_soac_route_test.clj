@@ -2,6 +2,7 @@
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass]
             [raster.compiler.backend.jvm.par-simd :as par-simd]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-graph-call :as kernel-graph-call]
@@ -710,8 +711,9 @@
          algorithm (:id operation) (:schedule operation)
          :dtype :half :desc descriptor)
         alternatives (:alternatives dispatch)
-        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
-                                             :dtype :half :min-elements 0)
+        emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
+                  (opencl-pass/opencl-pass form :device-id :ocl:0
+                                           :dtype :half :min-elements 0))
         emitted-dispatch (first (:dispatches emitted))]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
