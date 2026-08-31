@@ -629,6 +629,14 @@
       (is false "a non-contraction reduction schedule must fail")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :typed-contraction-schedule (:reason (ex-data exception))))))
+    (try
+      (contract-route/route-typed-contraction
+       algorithm (:id operation)
+       (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+       :dtype :float :desc {})
+      (is false "a pinned family that cannot lower the equation must fail")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :no-legal-contraction-family (:reason (ex-data exception))))))
     (is (= :raster.par/contract
            (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
                    [:attributes :attributes :source-operation])))
@@ -636,6 +644,40 @@
     (is (= 1 (get-in emitted [:stats :segop-reused])))
     (is (nil? (get-in emitted [:stats :segop-relowered])))
     (is (= 1 (count (:kernels emitted))))))
+
+(deftest typed-contraction-schedule-families-control-leaf-selection
+  (let [source
+        '(let* [step (raster.par/contract C [[i 128] [j 128]] [[l 128]]
+                       (* (clojure.core/aget A (+ (* i 128) l))
+                          (clojure.core/aget B (+ (* l 128) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :half
+                 :array-types {'A :half 'B :half 'C :half}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :grf-bytes-per-lane 256 :subgroup-size 16
+                    :max-workgroup-size 1024 :shared-local-memory 131072}
+        select-family
+        (fn [family]
+          (contract-route/route-typed-contraction
+           algorithm (:id operation)
+           (assoc-in (:schedule operation) [:tuning-space :families] [family])
+           :dtype :half :desc descriptor))]
+    (is (= :dpas (:strategy (select-family :matrix))))
+    (is (= :regtiled (:strategy (select-family :register-tiled))))
+    (is (= :portable-segred (:strategy (select-family :portable))))
+    (doseq [families [[] [:unknown]]]
+      (try
+        (contract-route/route-typed-contraction
+         algorithm (:id operation)
+         (assoc-in (:schedule operation) [:tuning-space :families] families)
+         :dtype :half :desc descriptor)
+        (is false "an empty or unknown candidate family must fail")
+        (catch clojure.lang.ExceptionInfo exception
+          (is (= :typed-contraction-families (:reason (ex-data exception)))))))))
 
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source

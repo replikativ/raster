@@ -325,8 +325,11 @@ vocabulary. Until the tensorization route consumes TypedSOAC itself, one shared 
 component projection supplies host materialization and target routing. Ordinary typed contractions
 lower to a canonical `SegRed` whose `ReductionSchedule` records the hardware candidate families,
 workgroup search space and numerical constraints; the validated TypedSOAC equation remains attached
-to its `ProgramEquation`. GPU routing derives its transient verified contraction facts from that
-equation behind a typed routing API and never reparses the walked source form; the OpenCL pipeline
+to its `ProgramEquation`. Candidate families are executable constraints rather than diagnostics:
+pinning `:matrix`, `:register-tiled` or `:portable` disables the other leaves, and compilation fails
+loudly when no enabled family can implement the equation. GPU routing derives its transient verified
+contraction facts from that equation behind a typed routing API and never reparses the walked source
+form; the OpenCL pipeline
 therefore knows only the typed program, stable operation ID and certified candidate schedule, not
 the projection used by compatibility leaves. Only host materialization and compatibility leaves
 request a generated surface spelling. Staged quantization, decode lambdas,
