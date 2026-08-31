@@ -885,10 +885,10 @@
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (some #(= '[A B C M N K bias scale] (mapv :name (:abi %)))
               (:kernels emitted)))
-    (is (= [:dpas]
+    (is (= [:dpas :portable-segred]
            (mapv #(get-in % [:attributes :strategy])
                  (:alternatives emitted-dispatch))))
-    (is (= #{:register-tiled :portable}
+    (is (= #{:register-tiled}
            (set (map :candidate-family
                      (get-in emitted-dispatch [:attributes :declines])))))
     (is (kernel-graph-call/kernel-graph-call? call))

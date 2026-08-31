@@ -5,7 +5,8 @@
    axis as a typed loop-carried fold. It is deliberately simple but fully scheduled: launch
    geometry, segment decomposition, buffer shapes, loads, scalar SSA and the final store are IR.
    Target emitters only choose syntax."
-  (:require [raster.compiler.core.dtype :as dtype]
+  (:require [clojure.set :as set]
+            [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.layout :as layout]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.ir.axis-map :as axis-map]
@@ -13,6 +14,7 @@
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]
             [raster.compiler.passes.parallel.segred-body :as segred-body]))
 
 (def ^:private index-operators
@@ -37,7 +39,8 @@
 
 (defn declined?
   [exception]
-  (= :contraction-kernel-body-declined (:reason (ex-data exception))))
+  (or (= :contraction-kernel-body-declined (:reason (ex-data exception)))
+      (scalar-region-lower/declined? exception)))
 
 (defn lower-index
   "Translate verified source index arithmetic into KernelBody index expressions."
@@ -94,8 +97,16 @@
                       "portable contraction body requires at least one free axis"
                       {:segred-id (:id segred)}))
         dtype (dtype/canon (:dtype segred))
+        result-transform (:epilogue contract-facts)
+        result-region (scalar-region-lower/make-region result-transform)
+        transform-operands (vec (:operands result-transform))
+        transform-scalars (vec (:scalars result-transform))
         arrays (vec (sort-by name (:inputs segred)))
         scalars (vec (sort-by name (:scalars segred)))
+        transform-only-operands
+        (filterv #(not (contains? (set arrays) (:sym %))) transform-operands)
+        transform-only-scalars
+        (filterv #(not (contains? (set scalars) (:sym %))) transform-scalars)
         scalar-dtype (fn [id] (or (get scalar-types id)
                                   (get scalar-types (symbol (name id))) :int))
         array-dtype (fn [id] (dtype/canon
@@ -162,6 +173,18 @@
         physical-extent
         (fn [array]
           (lower-index (axis-map/n-elements (get operand-maps array)) index-scope))
+        transform-operand-parameters
+        (mapv (fn [{:keys [sym dtype map]}]
+                (let [dtype (dtype/canon dtype)
+                      extent (lower-index (axis-map/n-elements map) index-scope)]
+                  (body/->KernelParameter
+                   sym :input dtype [extent] :global
+                   (layout/row-major [extent] dtype) :epilogue)))
+              transform-only-operands)
+        transform-scalar-parameters
+        (mapv (fn [{:keys [sym dtype]}]
+                (body/->KernelParameter sym :scalar (dtype/canon dtype) [] nil nil :epilogue))
+              transform-only-scalars)
         parameters
         (vec (concat
               (map (fn [array]
@@ -174,52 +197,73 @@
                                        (layout/row-major [segment-count] dtype) :result)]
               (map #(body/->KernelParameter % :scalar (scalar-dtype %) [] nil nil :parameter)
                    scalars)
+              transform-operand-parameters
+              transform-scalar-parameters
               [(body/->KernelParameter '_nseg :scalar :int [] nil nil :bound)]))]
-    {:kernel-body
-     (body/make
-      {:id [:contraction (:id segred) :portable-sequential]
-       :parameters parameters
-       :stable-reads (mapv body/stable-read arrays)
-       :indices (vec (concat
-                      [(body/->IndexBinding group-index :group 0)
-                       (body/->IndexBinding local-index :local 0)
-                       (body/->IndexCompute
-                        segment-index
-                        (body/expression :add
-                                         (body/expression :mul group-index workgroup-size)
-                                         local-index))]
-                      decomposition))
-       :masks [(body/->Mask active-mask
-                            [(body/predicate :lt segment-index '_nseg)])]
-       :operations
-       [(body/->ForLoop
-         (body/value reduced-index :int)
-         0 reduced-bound 1
-         [(body/->LoopArg (body/value accumulator dtype)
-                          (body/literal identity dtype))]
-         (vec (concat
-               operations
-               [(body/->ScalarCompute
-                 (body/value next-accumulator dtype)
-                 (body/scalar-expression operator dtype [accumulator result]))
-                (body/->Yield [next-accumulator])]))
-         [(body/value reduction-result dtype)]
-         {})
-        (body/->ScalarStore output [segment-index] reduction-result active-mask)]
-       :schedule {:strategy :sequential-segments
-                  :workgroup-size workgroup-size
-                  :reduction-operator operator}
-       :launch (launch/spec
-                {:workgroup-size [workgroup-size]
-                 :group-count [(launch/ceil-div segment-count workgroup-size)]})
-       :provenance {:dialect :kernel-body :source-dialect :segcontract
-                    :segop-id (:id segred)}
-       :attributes {:kind :portable-contraction
-                    :identity identity :operator operator
-                    :segment-count segment-count
-                    :reduced-bound reduced-bound}})
-     :arrays arrays
-     :scalars scalars
-     :output output
-     :segment-count segment-count
-     :workgroup-size workgroup-size}))
+    (let [parameter-map (into {} (map (juxt :id clojure.core/identity)) parameters)
+          lowered-transform
+          (when result-region
+            (scalar-region-lower/lower
+             result-region
+             {:accumulator reduction-result
+              :accumulator-dtype dtype
+              :store-dtype dtype
+              :parameters parameter-map
+              :coordinate-lower coordinate-lower
+              :predicate active-mask}))
+          stored-result (or (:result lowered-transform) reduction-result)]
+      {:kernel-body
+       (body/make
+        {:id [:contraction (:id segred) :portable-sequential]
+         :parameters parameters
+         :stable-reads (mapv body/stable-read
+                             (distinct (concat arrays (map :sym transform-operands))))
+         :indices (vec (concat
+                        [(body/->IndexBinding group-index :group 0)
+                         (body/->IndexBinding local-index :local 0)
+                         (body/->IndexCompute
+                          segment-index
+                          (body/expression :add
+                                           (body/expression :mul group-index workgroup-size)
+                                           local-index))]
+                        decomposition))
+         :masks [(body/->Mask active-mask
+                              [(body/predicate :lt segment-index '_nseg)])]
+         :operations
+         (vec
+          (concat
+           [(body/->ForLoop
+             (body/value reduced-index :int)
+             0 reduced-bound 1
+             [(body/->LoopArg (body/value accumulator dtype)
+                              (body/literal identity dtype))]
+             (vec (concat
+                   operations
+                   [(body/->ScalarCompute
+                     (body/value next-accumulator dtype)
+                     (body/scalar-expression operator dtype [accumulator result]))
+                    (body/->Yield [next-accumulator])]))
+             [(body/value reduction-result dtype)]
+             {})]
+           (:operations lowered-transform)
+           [(body/->ScalarStore output [segment-index] stored-result active-mask)]))
+         :schedule {:strategy :sequential-segments
+                    :workgroup-size workgroup-size
+                    :reduction-operator operator}
+         :launch (launch/spec
+                  {:workgroup-size [workgroup-size]
+                   :group-count [(launch/ceil-div segment-count workgroup-size)]})
+         :provenance {:dialect :kernel-body :source-dialect :segcontract
+                      :segop-id (:id segred)}
+         :attributes {:kind :portable-contraction
+                      :identity identity :operator operator
+                      :segment-count segment-count
+                      :reduced-bound reduced-bound
+                      :axis-symbols (vec (concat (map :name segment-dims)
+                                                 [reduced-index]))
+                      :result-transform result-transform}})
+       :arrays arrays
+       :scalars scalars
+       :output output
+       :segment-count segment-count
+       :workgroup-size workgroup-size})))

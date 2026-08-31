@@ -1058,10 +1058,18 @@
                   :or {kernel-name-prefix "contract" target-dialect :opencl-intel}}]
   (let [kernel-body (kbody/validate! kernel-body)
         parameters (:parameters kernel-body)
-        inputs (vec (map :id (filter #(= :input (:kind %)) parameters)))
+        inputs (vec (map :id (filter #(and (= :input (:kind %))
+                                           (not= :epilogue (:role %))) parameters)))
+        epilogue-operands
+        (vec (map :id (filter #(and (= :input (:kind %))
+                                    (= :epilogue (:role %))) parameters)))
         output-parameter (first (filter #(= :output (:kind %)) parameters))
         output (:id output-parameter)
-        scalar-parameters (vec (filter #(= :scalar (:kind %)) parameters))
+        scalar-parameters (vec (filter #(and (= :scalar (:kind %))
+                                             (not= :epilogue (:role %))) parameters))
+        epilogue-scalars
+        (vec (map :id (filter #(and (= :scalar (:kind %))
+                                    (= :epilogue (:role %))) parameters)))
         scalars (vec (map :id (remove #(= '_nseg (:id %)) scalar-parameters)))
         kernel-name (str kernel-name-prefix "_" (gensym ""))
         parameter-names (into {output "out" '_nseg "_nseg"}
@@ -1087,6 +1095,8 @@
      :abi abi
      :array-params inputs
      :scalar-params scalars
+     :epilogue-operands epilogue-operands
+     :epilogue-scalars epilogue-scalars
      :output output
      :kernel-body kernel-body
      :launch (:launch kernel-body)}))

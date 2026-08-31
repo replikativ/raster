@@ -229,12 +229,13 @@
 (declare route-2free-1contract route-quant)
 
 (def ^:private splice-capable-strategies
-  "Strategies whose emitter has a store splice, and can therefore honour an :epilogue.
+  "Strategies whose scheduled body or emitter has a typed store region and can honour an :epilogue.
    A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
    blacklist got this wrong twice, most recently by exempting the only shape production produces.
-   `:dpas` splices through the KernelBody ScalarRegion; the three staged-emitter strategies splice at the store
-   (which is how a quant dequant scale is expressed since :scheme was deleted)."
-  #{:dpas :dp4a :quant-naive :staged-segred})
+   `:dpas` and `:portable-segred` lower through KernelBody ScalarRegion; the three staged-emitter
+   strategies still splice at the store (which is how a quant dequant scale is expressed since
+   :scheme was deleted)."
+  #{:dpas :dp4a :portable-segred :quant-naive :staged-segred})
 
 (def ^:private contraction-families
   "Target schedule families for ordinary scalar typed contractions."
@@ -252,8 +253,8 @@
    :staged-segred :portable})
 
 (defn- epilogue-honoured-or-refused
-  "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
-   silently — the consumer's computation vanishes with no error.
+  "An :epilogue is a typed result-store region. A leaf without one would drop the consumer's
+   computation, so refusal is mandatory.
 
    Decided AFTER routing, on the strategy actually chosen, because a pre-routing shape test got this
    wrong twice: a shape blacklist exempted (2 free, 1 contract) — the only shape production produces
@@ -436,33 +437,37 @@
                 portable (contraction-schedule/plan-portable-body contract-facts sr desc)
                 emitted (when (:ok portable)
                           (sco/generate-contraction-kernel-body (:body portable)))
-                {:keys [kernel-name source array-params scalar-params abi]}
+                {:keys [kernel-name source array-params scalar-params abi
+                        epilogue-operands epilogue-scalars]}
                 (or emitted (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype))
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
             ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
             ;; "not eligible".
-              declines (when (and (= 2 n-free) (= 1 n-contract))
-                         (::declines (tensorize-plan)))
-              declines (cond-> (vec declines)
-                         (not (:ok portable))
-                         (conj {:leaf :portable-kernel-body
-                                :reason (:reason portable)
-                                :data (:detail portable)}))
-              workgroup-size (or (:workgroup-size portable) 256)]
-          (cond->
-           {:strategy (if (:ok portable) :portable-segred :naive-segred)
-            :declines declines
-            :kernel-name kernel-name :source source :array-params array-params :abi abi
-            :kernel-body (:body portable)
-            :dtype dtype :out-dtype dtype
+                declines (when (and (= 2 n-free) (= 1 n-contract))
+                           (::declines (tensorize-plan)))
+                declines (cond-> (vec declines)
+                           (not (:ok portable))
+                           (conj {:leaf :portable-kernel-body
+                                  :reason (:reason portable)
+                                  :data (:detail portable)}))
+                workgroup-size (or (:workgroup-size portable) 256)]
+            (cond->
+             {:strategy (if (:ok portable) :portable-segred :naive-segred)
+              :declines declines
+              :kernel-name kernel-name :source source :array-params array-params :abi abi
+              :epilogue-operands epilogue-operands
+              :epilogue-scalars epilogue-scalars
+              :fused-epilogue (boolean epilogue)
+              :kernel-body (:body portable)
+              :dtype dtype :out-dtype dtype
          ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
-            :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
-                               {:type :int :value nseg})
-            :out-elems nseg :dims [nseg]
-            :wg [workgroup-size]
-            :grid [(ceil-div nseg workgroup-size)]}
+              :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
+                                 {:type :int :value nseg})
+              :out-elems nseg :dims [nseg]
+              :wg [workgroup-size]
+              :grid [(ceil-div nseg workgroup-size)]}
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
@@ -826,7 +831,8 @@
     :inner-stage-accumulator-not-integral :inner-stage-axis-is-not-contiguous
     ;; epilogue legality
     :epilogue-needs-2-free :epilogue-ignores-accumulator :accumulator-used-more-than-once
-    :reduction-in-epilogue :layout-changing-op-in-epilogue})
+    :reduction-in-epilogue :layout-changing-op-in-epilogue
+    :epilogue-unsupported-by-this-leaf})
 
 (defn- decline
   "A structured record of ONE leaf declining. `:data` is the gate's own ex-data minus its `:reason`
@@ -902,7 +908,7 @@
              :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
              :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
-          (if register-tiled?
+          (if (and register-tiled? (not (seq epilogue)))
             (let [rt (sco/generate-regtiled-contraction-kernel @sr out-sym :dtype dtype)
                   [bm bn _bk] (:block rt)
                   [M N _L] (:dims rt)]
@@ -919,8 +925,11 @@
                :scalar-args []                             ; regtiled bakes dims → no scalar params
                :dims (:dims rt)})
             (do
-              (note! (decline :regtiled :schedule-family-disabled nil
-                              {:family :register-tiled}))
+              (note! (if register-tiled?
+                       (decline :regtiled :epilogue-unsupported-by-this-leaf nil
+                                {:family :register-tiled})
+                       (decline :regtiled :schedule-family-disabled nil
+                                {:family :register-tiled})))
               {::declines @acc}))))
       (catch clojure.lang.ExceptionInfo e
      ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`

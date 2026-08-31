@@ -49,17 +49,16 @@
                         'out))]
       (is (re-find #"cl_khr_fp64" src)))))
 
-(deftest a-leaf-without-a-store-splice-refuses-an-epilogue
-  (testing "an :epilogue reaching :segmap or the :else fallback was silently DROPPED — the
-            consumer's computation vanished with no error. fuse-contract-map already produces such
-            forms (it has no rank restriction) and is one line from being wired."
+(deftest the-portable-leaf-keeps-a-multidimensional-result-transform
+  (testing "a three-free-axis contraction carries its result transform through typed scalar SSA"
     (let [ep {:acc 'acc :expr '(raster.numeric/* acc 2.0)}
-          ;; 3 free axes → the universal fallback, which has no store splice
           form (concat (list 'raster.par/contract 'out [['b 2] ['i 2] ['j 2]] [['l 4]]
                              (list 'raster.numeric/* (list 'aget 'a 'l) (list 'aget 'c 'l)))
-                       [:epilogue ep])]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"silently dropped"
-                            (cr/route-contraction form :dtype :double))))))
+                       [:epilogue ep])
+          routed (cr/route-contraction form :dtype :double)]
+      (is (= :portable-segred (:strategy routed)))
+      (is (true? (:fused-epilogue routed)))
+      (is (re-find #"\* 2\.0" (:source routed))))))
 
 (deftest the-decompose-is-row-major-and-distinguishably-so
   ;; MUTATION-PROVEN INADEQUATE, and this is the replacement. The previous version asserted
@@ -115,18 +114,17 @@
           "the identity must be the op's, not 0.0 — summing max-partials from 0.0 is wrong for
            all-negative data"))))
 
-(deftest epilogue-refused-on-the-shape-production-actually-produces
-  ;; The first version of this guard blacklisted shapes and so exempted (2 free, 1 contract) — the
-  ;; ONLY shape production produces. The form fell through to :regtiled, which has no store splice,
-  ;; and the epilogue was dropped. Refuse by ABSENCE of splice support instead.
-  (testing "an epilogue on an f64 2-free/1-contract contraction is refused, not dropped"
+(deftest fp64-result-transform-uses-the-typed-portable-store
+  (testing "an f64 two-free/one-contract result transform executes on the portable leaf"
     (let [form (list 'raster.par/contract 'C [['i 4] ['j 4]] [['l 8]]
                      (list 'raster.numeric/*
                            (list 'aget 'A (list 'clojure.core/+ (list 'clojure.core/* 'i 8) 'l))
                            (list 'aget 'B (list 'clojure.core/+ (list 'clojure.core/* 'l 4) 'j)))
-                     :epilogue {:acc 'acc :expr '(raster.numeric/* acc 2.0)})]
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"silently dropped"
-                            (cr/route-contraction form :dtype :double))))))
+                     :epilogue {:acc 'acc :expr '(raster.numeric/* acc 2.0)})
+          routed (cr/route-contraction form :dtype :double)]
+      (is (= :portable-segred (:strategy routed)))
+      (is (true? (:fused-epilogue routed)))
+      (is (re-find #"\* 2\.0" (:source routed))))))
 
 (deftest dp4a-refuses-a-decode-it-would-discard
   ;; The dp4a leaf replaces the whole summand with one hardware op, so a per-operand :decode — the
