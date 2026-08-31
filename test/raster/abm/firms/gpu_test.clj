@@ -6,11 +6,12 @@
 
    test-gpu-vs-cpu: Runs on GPU (if :ze:0 available) and compares
    aggregate stats to CPU results (tolerance for float atomics)."
-  (:require [clojure.test :refer [deftest is testing use-fixtures]]
+  (:require [clojure.test :refer [deftest is testing]]
             [raster.abm.firms :as firms]
             [raster.abm.firms.phases :as phases]
             [raster.abm.firms.gpu :as fgpu]
             [raster.gpu.core :as gpu]
+            [raster.dl.gpu-grad-parity :as gpu-probe]
             [raster.abm.firms.membership :as mem]
             [raster.par :as par]
             [raster.gpu.ze-runtime :as ze]
@@ -19,17 +20,6 @@
             [raster.compiler.backend.gpu.opencl-pass :as opencl-pass])
   (:import [raster.abm.firms AgentSoA FirmSoA FirmsConfig]
            [java.util SplittableRandom]))
-
-(def ^:private gpu-available?
-  (delay
-    (try
-      (let [p (.start (ProcessBuilder. ["ocloc" "--help"]))]
-        (.waitFor p)
-        (zero? (.exitValue p)))
-      (catch Exception _ false))))
-
-(use-fixtures :once
-  (fn [f] (if @gpu-available? (f) (println "[SKIP] No GPU/OpenCL compiler (ocloc)"))))
 
 ;; ================================================================
 ;; Helpers
@@ -277,23 +267,34 @@
         (is (= 'raster.gpu.ze-runtime/invoke-registered-active-ids-kernel (first emitted))
             "Should emit invoke-registered-active-ids-kernel call")))))
 
+(deftest test-active-ids-opencl-compilation-is-owned-by-the-pass
+  (testing "the optional pass boundary compiles generated source exactly once"
+    (let [compilations (atom 0)
+          spv (byte-array [3 2 35 7])]
+      (with-redefs [par-opencl/compile-kernel-to-spirv
+                    (fn [_source & _options]
+                      (swap! compilations inc)
+                      spv)]
+        (let [result (opencl-pass/opencl-pass
+                      '(raster.par/active-ids! ids n-active n-agents base-seed)
+                      :dtype :float
+                      :device-id :ze:0
+                      :compile-spirv? true)]
+          (is (= 1 @compilations)
+              "the generator must not compile before the pass compilation boundary")
+          (is (identical? spv (:spv-bytes (first (:kernels result))))))))))
+
 ;; ================================================================
 ;; Test: GPU active-ids kernel (requires Level Zero)
 ;; ================================================================
 
-(defn- ze-available? []
-  (try (require 'raster.gpu.ze-runtime)
-       (let [qfn (resolve 'raster.gpu.ze-runtime/query-devices)]
-         (and qfn (seq (qfn))))
-       (catch Exception _ false)))
-
-(defmacro when-ze [& body]
-  `(if (ze-available?)
+(defmacro when-ze [label & body]
+  `(if @gpu-probe/gpu-available?
      (do ~@body)
-     (println "  [SKIP] No Level Zero GPU")))
+     (gpu-probe/gpu-skip! ~label)))
 
 (deftest test-active-ids-gpu
-  (when-ze
+  (when-ze "ABM active-id generation"
    (testing "GPU active-ids kernel: all indices in [0, n-agents)"
      (ze/init!)
      (gpu/with-gpu-session [sess :ze:0]
@@ -338,7 +339,7 @@
     out))
 
 (deftest test-gpu-blelloch-scan
-  (when-ze
+  (when-ze "ABM Blelloch scan"
    (ze/init!)
 
    (testing "GPU exclusive scan: all-ones array → identity prefix sums"
@@ -407,7 +408,7 @@
 ;; ================================================================
 
 (deftest test-autotuner
-  (when-ze
+  (when-ze "ABM workgroup autotuning"
    (ze/init!)
 
    (testing "autotune-wg-sweep! returns valid KernelTuning with finite ms"
@@ -491,20 +492,16 @@
   (testing "OpenCL codegen produces valid kernel source for par phases"
     ;; This just tests that emit-opencl-expr handles the control flow
     ;; in the par bodies without errors. Doesn't require GPU.
-    (try
-      (let [;; Simple map-void! with if + aset
-            form '(raster.par/map-void! i n
-                                        (if (== 1 (aget alive i))
-                                          (aset output i (float 1.0))
-                                          (aset output i (float 0.0))))
-            result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)]
-        (is (seq (:kernels result))
-            "Should generate at least one kernel")
-        (when (seq (:kernels result))
-          (let [src (:source (first (:kernels result)))]
-            (is (string? src) "Kernel source should be a string")
-            (is (.contains ^String src "__kernel") "Should contain __kernel")
-            (is (.contains ^String src "if") "Should contain if statement"))))
-      (catch Exception e
-        ;; If OpenCL codegen can't be loaded (e.g., missing deps), skip
-        (println "Skipping codegen smoke test:" (.getMessage e))))))
+    (let [;; Simple map-void! with if + aset
+          form '(raster.par/map-void! i n
+                                      (if (== 1 (aget alive i))
+                                        (aset output i (float 1.0))
+                                        (aset output i (float 0.0))))
+          result (opencl-pass/opencl-pass form :dtype :float :compile-spirv? false)]
+      (is (seq (:kernels result))
+          "Should generate at least one kernel")
+      (when (seq (:kernels result))
+        (let [src (:source (first (:kernels result)))]
+          (is (string? src) "Kernel source should be a string")
+          (is (.contains ^String src "__kernel") "Should contain __kernel")
+          (is (.contains ^String src "if") "Should contain if statement"))))))
