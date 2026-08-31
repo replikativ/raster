@@ -7,6 +7,7 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.soac :as soac]
@@ -30,11 +31,20 @@
 
 (defn- contraction-artifact
   [dialect descriptor]
-  (let [form '(raster.par/contract y [[i 64]] [[l 32]]
-                (* (aget A (+ (* i 32) l)) (aget x l)))
-        verified (contraction-facts/contraction-facts form :dtype :float)
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/*
+                          (raster.numeric/+ acc (clojure.core/aget bias i)) scale)
+                  :operands [{:sym 'bias :dtype :float
+                              :map (axis-map/of-axes [['i 64]])}]
+                  :scalars [{:sym 'scale :dtype :float}]
+                  :dtype :float}
+        form (concat
+              '(raster.par/contract y [[i 64]] [[l 32]]
+                                    (* (aget A (+ (* i 32) l)) (aget x l)))
+              [:epilogue epilogue])
+        verified (contraction-facts/contraction-facts form :dtype :half)
         segred (contract-lower/contract-form->segred
-                form :dtype :float :facts verified)
+                form :dtype :half :facts verified)
         planned (contraction-schedule/plan-portable-body verified segred descriptor)]
     (when-not (:ok planned)
       (throw (ex-info "portable contraction compile fixture did not schedule" planned)))

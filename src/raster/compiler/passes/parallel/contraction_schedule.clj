@@ -12,7 +12,8 @@
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
             [raster.compiler.ir.kernel-launch :as launch]
-            [raster.compiler.passes.parallel.contraction-body :as contraction-body]))
+            [raster.compiler.passes.parallel.contraction-body :as contraction-body]
+            [raster.compiler.passes.parallel.scalar-region-lower :as scalar-region-lower]))
 
 (defn- decline [reason & [data]]
   (merge {:ok false :reason reason} data))
@@ -65,16 +66,6 @@
                                   (layout/row-major shape dtype) :epilogue)))
       (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
         (body/->KernelParameter sym :scalar dtype [] nil nil :epilogue))))))
-
-(defn- scalar-region [epilogue]
-  (when epilogue
-    (body/->ScalarRegion
-     (vec (concat [(:acc epilogue)]
-                  (map :sym (:operands epilogue))
-                  (map :sym (:scalars epilogue))))
-     (:expr epilogue)
-     (vec (:operands epilogue))
-     (get epilogue :dtype :float))))
 
 (defn- fragment-id [prefix a & [b]]
   (keyword (str prefix "-" a (when (some? b) (str "-" b)))))
@@ -224,7 +215,7 @@
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
-        region (scalar-region epilogue)
+        region (scalar-region-lower/make-region epilogue)
         stores (vec
                 (for [mm (range m-fragments) nn (range n-fragments)]
                   (body/->TileStore

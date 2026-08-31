@@ -1,0 +1,166 @@
+(ns raster.compiler.passes.parallel.scalar-region-lower
+  "Lower a closed KernelBody ScalarRegion to typed scalar SSA operations.
+
+   The region boundary already owns value IDs, dtypes and tensor axis maps. This pass uses only
+   the central intrinsic table and explicit KernelBody casts; target emitters receive no source
+   expression to re-infer."
+  (:require [raster.compiler.backend.intrinsics :as intrinsics]
+            [raster.compiler.core.dtype :as dtype]
+            [raster.compiler.core.op-descriptor :as descriptor]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.kernel-body :as body]))
+
+(defn make-region
+  "Convert the target-neutral result-transform descriptor into KernelBody region data."
+  [transform]
+  (when transform
+    (body/->ScalarRegion
+     (vec (concat [(:acc transform)]
+                  (map :sym (:operands transform))
+                  (map :sym (:scalars transform))))
+     (:expr transform)
+     (vec (:operands transform))
+     (get transform :dtype :float))))
+
+(defn- decline!
+  [rule message data]
+  (throw (ex-info message (assoc data
+                                 :reason :scalar-region-kernel-body-declined
+                                 :missing-rule rule))))
+
+(defn declined?
+  [exception]
+  (= :scalar-region-kernel-body-declined (:reason (ex-data exception))))
+
+(defn- cast-policy
+  [source target]
+  (let [source (dtype/canon source)
+        target (dtype/canon target)]
+    (cond
+      (= source target) nil
+      (and (dtype/fp-dtype? source) (dtype/fp-dtype? target)
+           (< (dtype/bytes-of source) (dtype/bytes-of target)))
+      [:exact :exact]
+
+      (and (dtype/fp-dtype? source) (dtype/fp-dtype? target)
+           (> (dtype/bytes-of source) (dtype/bytes-of target)))
+      [:nearest-even :ieee]
+
+      :else
+      (decline! :result-transform-cast
+                "portable result transform requires an explicit supported floating conversion"
+                {:source source :target target}))))
+
+(defn lower
+  "Lower `region` once per completed scalar reduction result.
+
+   `parameters` maps region scalar/operand IDs to KernelParameters. `coordinate-lower` translates
+   the declared operand axis-map to scheduled index arithmetic. The returned `:result` is cast to
+   `store-dtype`, so ScalarStore remains completely typed."
+  [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate]}]
+  (let [result-dtype (dtype/canon (:result-dtype region))
+        accumulator-id (first (:parameters region))
+        operand-by-id (into {} (map (juxt :sym identity)) (:operands region))
+        scalar-ids (vec (drop (inc (count operand-by-id)) (:parameters region)))
+        operations (atom [])
+        counter (atom 0)
+        fresh (fn [prefix] (symbol (str prefix "-" (swap! counter inc))))
+        emit! (fn [operation value value-dtype]
+                (swap! operations conj operation)
+                {:value value :dtype value-dtype})]
+    (letfn [(cast [{:keys [value dtype] :as typed} target]
+              (let [dtype (dtype/canon dtype)
+                    target (dtype/canon target)]
+                (if (= dtype target)
+                  typed
+                  (let [[rounding overflow] (cast-policy dtype target)
+                        result (fresh "result-transform-cast")]
+                    (emit! (body/->ScalarCompute
+                            (body/value result target)
+                            (body/cast-expression value target rounding overflow))
+                           result target)))))
+
+            (load-operand [id]
+              (let [{:keys [dtype map] :as operand} (get operand-by-id id)
+                    parameter (get parameters id)]
+                (when-not (and operand parameter (= :input (:kind parameter))
+                               (contains? #{:operand :epilogue} (:role parameter))
+                               (= (dtype/canon dtype) (dtype/canon (:dtype parameter))))
+                  (decline! :result-transform-operand
+                            "result-transform operand lacks its typed KernelBody parameter"
+                            {:operand operand :parameter parameter}))
+                (let [result (fresh "result-transform-load")
+                      coordinate (coordinate-lower (axis-map/index-expr map))]
+                  (cast
+                   (emit! (body/->ScalarLoad
+                           (body/value result (dtype/canon dtype)) id [coordinate]
+                           predicate
+                           (when predicate (body/literal 0 (dtype/canon dtype)))
+                           :cached)
+                          result (dtype/canon dtype))
+                   result-dtype))))
+
+            (lower-expression [expression]
+              (cond
+                (number? expression)
+                {:value (body/literal expression result-dtype) :dtype result-dtype}
+
+                (= accumulator-id expression)
+                (cast {:value accumulator :dtype accumulator-dtype} result-dtype)
+
+                (contains? (set scalar-ids) expression)
+                (let [parameter (get parameters expression)]
+                  (when-not (and parameter (= :scalar (:kind parameter))
+                                 (contains? #{:parameter :epilogue} (:role parameter)))
+                    (decline! :result-transform-scalar
+                              "result-transform scalar lacks its typed KernelBody parameter"
+                              {:scalar expression :parameter parameter}))
+                  (cast {:value expression :dtype (:dtype parameter)} result-dtype))
+
+                (descriptor/aget-call? expression)
+                (let [operand (descriptor/aget-array-sym expression)]
+                  (when-not (contains? operand-by-id operand)
+                    (decline! :result-transform-load
+                              "result-transform reads an undeclared tensor operand"
+                              {:expression expression :operand operand}))
+                  (load-operand operand))
+
+                (and (seq? expression) (descriptor/cast-op? (first expression))
+                     (= 2 (count expression)))
+                (let [target (dtype/dtype-for-scalar-tag
+                              (descriptor/cast-result-tag (first expression)))]
+                  (when-not (= target result-dtype)
+                    (decline! :result-transform-explicit-cast
+                              "portable result transform requires casts to its declared result dtype"
+                              {:expression expression :target target
+                               :result-dtype result-dtype}))
+                  (cast (lower-expression (second expression)) target))
+
+                (seq? expression)
+                (let [operator (intrinsics/canonical (descriptor/semantic-op expression))
+                      intrinsic (intrinsics/descriptor operator)
+                      arguments (vec (descriptor/call-args expression))]
+                  (when-not (and intrinsic
+                                 (= (:arity intrinsic) (count arguments))
+                                 (not= :cmp (:kind intrinsic))
+                                 (intrinsics/accepts-scalar-dtype? operator result-dtype))
+                    (decline! :result-transform-expression
+                              "result-transform expression has no typed portable scalar lowering"
+                              {:expression expression :operator operator
+                               :result-dtype result-dtype}))
+                  (let [inputs (mapv (comp :value lower-expression) arguments)
+                        result (fresh "result-transform-value")]
+                    (emit! (body/->ScalarCompute
+                            (body/value result result-dtype)
+                            (body/scalar-expression operator result-dtype inputs))
+                           result result-dtype)))
+
+                :else
+                (decline! :result-transform-expression
+                          "result-transform expression references an unbound or unsupported value"
+                          {:expression expression})))]
+      (let [typed-result (lower-expression (:expression region))
+            stored-result (cast typed-result store-dtype)]
+        {:operations @operations
+         :result (:value stored-result)
+         :result-dtype (:dtype stored-result)}))))

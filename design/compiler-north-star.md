@@ -926,9 +926,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    fusion now alpha-rename and compose those regions without duplicating shared scalar work.
    Explicit typed segmented-reduction result transforms now reach contraction store regions without
    compatibility re-lowering; the typed fusion pass discovers adjacent single-use result maps and
-   removes their physical intermediates without rewriting the reduction fold. Hardware-costed
-   multi-consumer placement and result-transform stores in the non-matrix contraction leaves are
-   the next fusion/scheduling coverage steps.
+   removes their physical intermediates without rewriting the reduction fold. Both the matrix
+   schedule and the portable sequential-segment schedule lower that closed transform to typed
+   KernelBody scalar SSA, including capture loads and explicit precision conversions. The latter
+   emits unchanged through OpenCL, CUDA and HIP and is compiled by the hardware-free CUDA/HIP CI
+   gates. Hardware-costed multi-consumer placement and migration of the register-tiled leaf to the
+   same scheduled-body store region are the next fusion/scheduling coverage steps.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
    JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and
