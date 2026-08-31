@@ -23,9 +23,9 @@
   [program equation]
   (let [equation-id (second equation)
         results (vec (nth equation 2))
-        extent (dialect/operation-extent equation)
-        inputs (cond-> (dialect/operation-inputs equation)
-                 (dialect/value-id? extent) (conj extent))
+        inputs (vec (distinct
+                     (into (dialect/operation-inputs equation)
+                           (filter dialect/value-id? (dialect/operation-extents equation)))))
         source-facts (dialect/facts program)
         equation-facts (get-in source-facts [:equations equation-id])
         value-ids (set (concat inputs results (dialect/physical-results source-facts equation)))

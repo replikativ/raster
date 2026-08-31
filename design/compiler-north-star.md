@@ -314,6 +314,14 @@ contains only values, output indices, row count and width; ties select the lowes
 NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
 multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
 
+TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
+axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
+arbitrarily indexed tensor captures. Its extents participate in the typed program boundary and
+alpha-remapping, and it lowers mechanically to canonical `SegRed` without constructing the former
+`SoacContract` record. Moving analyzed `raster.par/contract` source onto this equation is the next
+front-end slice; the operation is intentionally not a matmul node, so scientific contractions,
+batched reductions and attention-derived reductions share the same semantic vocabulary.
+
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
 one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;

@@ -286,6 +286,9 @@
                                                    algorithm device-id :dtype dtype)}
                              reduce {:operations (soac-lower/lower-typed-reduce
                                                   algorithm device-id :dtype dtype)}
+                             segmented-reduce
+                             {:operations (soac-lower/lower-typed-segmented-reduce
+                                           algorithm device-id :dtype dtype)}
                              scan (soac-lower/lower-typed-scan
                                    algorithm device-id :dtype dtype
                                    :array-types (:array-types opts)))

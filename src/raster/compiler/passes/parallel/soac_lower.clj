@@ -241,6 +241,87 @@
                     :algorithm-equation equation-id)
             (lower-reduce node device-id :dtype accumulator-dtype)))))
 
+(defn typed-segmented-reduce-program?
+  "Whether a validated one-equation TypedSOAC program is a general segmented reduction."
+  [program]
+  (and (soac-dialect/program-form? program)
+       (= 1 (count (soac-dialect/equations program)))
+       (= 'segmented-reduce
+          (soac-dialect/operation-kind (first (soac-dialect/equations program))))))
+
+(defn- flat-segment-coordinate
+  [segment-axes reduced-index reduced-extent]
+  (reduce (fn [coordinate [index extent]]
+            (list 'clojure.core/+ (list 'clojure.core/* coordinate extent) index))
+          0
+          (conj (vec segment-axes) [reduced-index reduced-extent])))
+
+(defn lower-typed-segmented-reduce
+  "Lower one general TypedSOAC segmented reduction directly to SegRed.
+
+   Segment axes are parallel result dimensions and the ordinary `:index/:extent` pair is the
+   innermost reduced dimension. Stable tensor captures retain arbitrary index expressions, which
+   is the general representation used by contractions; ordinary element operands denote dense
+   row-major storage over the complete segment-plus-reduction space."
+  [program device-id & {:keys [dtype] :or {dtype :double}}]
+  (let [program (soac-dialect/validate! program)]
+    (when-not (typed-segmented-reduce-program? program)
+      (throw (ex-info "typed segmented reduction lowering requires one segmented-reduce equation"
+                      {:reason :typed-soac-segmented-reduce-subset :program program})))
+    (let [equation (first (soac-dialect/equations program))
+          [_ equation-id results operation] equation
+          [_ attributes arrays captures lambda] operation
+          {:keys [body-results]} (soac-dialect/lambda-parts lambda)
+          {:keys [accumulators elements capture-parameters]}
+          (soac-dialect/parameter-layout equation)
+          segment-axes (:segment-axes attributes)
+          reduced-index (:index attributes)
+          reduced-extent (:extent attributes)
+          dense-coordinate (flat-segment-coordinate segment-axes reduced-index reduced-extent)
+          substitutions
+          (into (zipmap capture-parameters captures)
+                (map (fn [parameter array]
+                       [parameter (list 'clojure.core/aget array dense-coordinate)])
+                     elements arrays))
+          step-results (mapv #(util/subst-syms substitutions %) body-results)
+          components
+          (mapv (fn [ordinal accumulator neutral component-dtype result]
+                  {:id (keyword (str "component-" ordinal))
+                   :accumulator accumulator :neutral neutral :dtype component-dtype
+                   :result result})
+                (range) accumulators (:identities attributes) (:dtypes attributes) results)
+          operator (reduction/make
+                    {:components components
+                     :index reduced-index
+                     :step (reduction/->ReductionRegion [] step-results {})
+                     :algebra {:components (:algebra attributes)}
+                     :attributes {:source :typed-soac :equation equation-id
+                                  :segmented true}})
+          facts (soac-dialect/facts program)
+          values (:values facts)
+          stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
+          inputs (set/union (set arrays) stable-captures)
+          axis-indices (set (concat (map first segment-axes) [reduced-index]))
+          bound-symbols (reduce set/union #{}
+                                (map util/free-syms
+                                     (conj (mapv second segment-axes) reduced-extent)))
+          body-symbols (reduce set/union #{} (map util/free-syms step-results))
+          scalars (set/difference (set/union bound-symbols body-symbols)
+                                  inputs (set accumulators) axis-indices)
+          space (segop/make-seg-space-nd
+                 (conj (mapv (fn [[index extent]] {:name index :bound extent}) segment-axes)
+                       {:name reduced-index :bound reduced-extent}))
+          output-dtype (or (first (:dtypes attributes)) dtype :double)
+          _ (doseq [input inputs]
+              (when-not (= :tensor (:kind (get values input)))
+                (throw (ex-info "segmented reduction tensor input lacks an AbstractValue"
+                                {:reason :typed-soac-segmented-reduce-input
+                                 :equation equation-id :input input
+                                 :value (get values input)}))))]
+      [(segop/->SegRed equation-id space
+                       (segop/->SegLevel :thread :virtual)
+                       operator nil inputs (set results) scalars nil :segmented nil output-dtype)])))
+
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."
   [program]

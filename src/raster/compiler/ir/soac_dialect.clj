@@ -32,6 +32,14 @@
              (lambda [acc ... element ... capture-parameter ...]
                (region [(let-value local :dtype init-expr) ...]
                        [step-result ...]))))
+        (= equation-id [result ...]
+           (segmented-reduce {:segment-axes [[row rows] ...]
+                              :index k :extent width
+                              :accumulators [acc ...] :identities [zero ...]
+                              :dtypes [:float ...] :algebra [{} ...]}
+             [array ...] [capture ...]
+             (lambda [acc ... element ... capture-parameter ...]
+               (region [] [step-result ...]))))
         (= equation-id [result]
            (scan {:mode :inclusive :index i :extent n
                   :accumulators [acc] :identities [zero]
@@ -102,6 +110,11 @@
      (if (integer? extent) (inc extent) (list 'clojure.core/inc extent))
      (first (extent-shape extent)))])
 
+(defn segmented-reduce-result-shape
+  "Canonical tensor shape of a segmented reduction's ordered parallel axes."
+  [attributes]
+  (mapv (comp first extent-shape second) (:segment-axes attributes)))
+
 (defn map-attributes?
   [value]
   (and (map? value)
@@ -130,6 +143,20 @@
           (count (:algebra value)))
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))))
+
+(defn segmented-reduce-attributes?
+  "Attributes for a general segmented reduction. Segment axes are the ordered parallel result
+   space; `:index/:extent` remain the innermost reduced axis shared with ordinary reduce."
+  [value]
+  (let [axes (:segment-axes value)
+        indices (mapv first axes)]
+    (and (reduce-attributes? (dissoc value :segment-axes))
+         (vector? axes) (seq axes)
+         (every? #(and (vector? %) (= 2 (count %))
+                       (symbol? (first %)) (extent? (second %)))
+                 axes)
+         (= (count indices) (count (distinct indices)))
+         (not (contains? (set indices) (:index value))))))
 
 (defn scan-attributes?
   "Attributes for a certified scan dialect operation. The explicit mode is load-bearing because
@@ -179,6 +206,7 @@
              [ma map-attributes?]
              [xa scatter-attributes?]
              [ra reduce-attributes?]
+             [sra segmented-reduce-attributes?]
              [ca scan-attributes?]
              [dt keyword?]
              [facts program-facts?])
@@ -207,6 +235,7 @@
              (map ?ma [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (scatter ?xa [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (reduce ?ra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
+             (segmented-reduce ?sra [(?:* ?id:array)] [(?:* ?id:capture)] ?l)
              (scan ?ca [(?:* ?id:array)] [(?:* ?id:capture)] ?l))
 
   (Equation [q :enforce]
@@ -237,11 +266,22 @@
       (vec (nth operation 2))
       (vec (concat (nth operation 2) (nth operation 3))))))
 
+(declare operation-parts)
+
 (defn operation-extent
   [equation]
   (let [operation (nth equation 3)]
     (when-not (= 'scalar (first operation))
       (:extent (second operation)))))
+
+(defn operation-extents
+  "All ordered iteration extents referenced by an operation. For segmented reductions this is
+   the parallel segment space followed by the innermost reduction extent."
+  [equation]
+  (let [{:keys [kind attributes]} (operation-parts equation)]
+    (if (= 'segmented-reduce kind)
+      (conj (mapv second (:segment-axes attributes)) (:extent attributes))
+      (if-let [extent (:extent attributes)] [extent] []))))
 
 (defn operation-parts
   "Normalize one operation into semantic fields shared by validation and lowering."
@@ -327,7 +367,7 @@
   [equation]
   (let [{:keys [kind attributes arrays captures lambda]} (operation-parts equation)
         parameters (:parameters (lambda-parts lambda))
-        accumulator-count (if (contains? #{'reduce 'scan} kind)
+        accumulator-count (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
                             (count (:accumulators attributes)) 0)
         array-count (count arrays)
         accumulator-end accumulator-count
@@ -379,7 +419,7 @@
         (fail! :typed-soac-region-binders
                "scalar-region parameters and local SSA definitions must be distinct"
                {:equation equation-id :parameters parameters :locals local-ids}))
-      (when (and (contains? #{'map 'scatter 'reduce 'scan} kind)
+      (when (and (contains? #{'map 'scatter 'reduce 'segmented-reduce 'scan} kind)
                  (some #{(:index attributes)} local-ids))
         (fail! :typed-soac-region-binders
                "a scalar-region local cannot shadow its operation index"
@@ -401,7 +441,7 @@
     (when-not (= result-count (count body-results))
       (fail! :typed-soac-result-arity "SOAC result and lambda arity differ"
              {:equation equation-id :results result-count :body-results (count body-results)}))
-    (let [expected-parameter-count (+ (if (contains? #{'reduce 'scan} kind)
+    (let [expected-parameter-count (+ (if (contains? #{'reduce 'segmented-reduce 'scan} kind)
                                         (count (:accumulators attributes))
                                         0)
                                       (count arrays)
@@ -415,8 +455,10 @@
                 :arrays arrays
                 :captures captures})))
     (let [initial-bound (cond-> (set parameters)
-                          (contains? #{'map 'scatter 'reduce 'scan} kind)
-                          (conj (:index attributes)))
+                          (contains? #{'map 'scatter 'reduce 'segmented-reduce 'scan} kind)
+                          (conj (:index attributes))
+                          (= 'segmented-reduce kind)
+                          (into (map first (:segment-axes attributes))))
           final-bound
           (reduce (fn [bound {:keys [id init] :as local}]
                     (let [unbound (util/free-syms init bound)]
@@ -463,6 +505,17 @@
         (when-not (= result-count (count accumulators))
           (fail! :typed-soac-reduce-results
                  "reduce result arity must equal accumulator arity"
+                 {:equation equation-id :results results :accumulators accumulators})))
+
+      segmented-reduce
+      (let [accumulators (:accumulators attributes)]
+        (when-not (= accumulators (vec (take (count accumulators) parameters)))
+          (fail! :typed-soac-segmented-reduce-accumulators
+                 "segmented-reduce accumulator parameters must lead the lambda in declared order"
+                 {:equation equation-id :accumulators accumulators :parameters parameters}))
+        (when-not (= result-count (count accumulators))
+          (fail! :typed-soac-segmented-reduce-results
+                 "segmented-reduce result arity must equal accumulator arity"
                  {:equation equation-id :results results :accumulators accumulators})))
 
       scan
@@ -548,6 +601,18 @@
             (fail! :typed-soac-reduce-result-type
                    "reduce results must be scalar tensors with their declared accumulator dtype"
                    {:equation equation-id :id id :value value :dtype dtype}))))
+
+      segmented-reduce
+      (let [result-shape (segmented-reduce-result-shape attributes)]
+        (doseq [[id dtype] (map vector results (:dtypes attributes))]
+          (let [value (get values id)]
+            (when (and value
+                       (not (and (= :tensor (:kind value)) (= result-shape (:shape value))
+                                 (= dtype (:dtype value)))))
+              (fail! :typed-soac-segmented-reduce-result-type
+                     "segmented-reduce results must match the declared segment space and dtype"
+                     {:equation equation-id :id id :value value
+                      :segment-axes (:segment-axes attributes) :dtype dtype})))))
 
       scan
       (doseq [[id dtype] (map vector results (:dtypes attributes))]
@@ -656,9 +721,8 @@
     (let [definitions (mapcat #(nth % 2) equations)
           definition-set (set definitions)
           references (set (mapcat (fn [equation]
-                                    (cond-> (operation-inputs equation)
-                                      (value-id? (operation-extent equation))
-                                      (conj (operation-extent equation))))
+                                    (into (operation-inputs equation)
+                                          (filter value-id? (operation-extents equation))))
                                   equations))
           external (set/difference references definition-set)
           total-effects (reduce set/union #{}
@@ -684,9 +748,8 @@
              [equation & remaining] equations]
         (when equation
           (let [equation-id (second equation)
-                required (cond-> (set (operation-inputs equation))
-                           (value-id? (operation-extent equation))
-                           (conj (operation-extent equation)))
+                required (into (set (operation-inputs equation))
+                               (filter value-id? (operation-extents equation)))
                 missing (set/difference required available)]
             (when (seq missing)
               (fail! :typed-soac-use-before-definition
@@ -746,6 +809,12 @@
                                                 [:attributes :stable-array-captures]))
                                    (update-in [:attributes :stable-array-captures]
                                               #(mapv rename %)))
+                      attributes (if (= 'segmented-reduce kind)
+                                   (update attributes :segment-axes
+                                           #(mapv (fn [[index extent]]
+                                                    [index (if (value-id? extent)
+                                                             (rename extent) extent)]) %))
+                                   attributes)
                       operation (if (= 'scalar kind)
                                   (list kind attributes (mapv rename captures) lambda)
                                   (list kind (update attributes :extent
