@@ -326,8 +326,10 @@ component projection supplies host materialization and target routing. Ordinary 
 lower to a canonical `SegRed` whose `ReductionSchedule` records the hardware candidate families,
 workgroup search space and numerical constraints; the validated TypedSOAC equation remains attached
 to its `ProgramEquation`. GPU routing derives its transient verified contraction facts from that
-equation and never reparses the walked source form. Only host materialization and compatibility
-leaves request a generated surface spelling. Staged quantization, decode lambdas,
+equation behind a typed routing API and never reparses the walked source form; the OpenCL pipeline
+therefore knows only the typed program, stable operation ID and certified candidate schedule, not
+the projection used by compatibility leaves. Only host materialization and compatibility leaves
+request a generated surface spelling. Staged quantization, decode lambdas,
 declared physical maps, epilogues and output conversions remain on the certified compatibility
 front door, and may still use `SegContract`, until the typed equation has explicit facts for them;
 admitting them while dropping those contracts would be a miscompile, not migration progress.

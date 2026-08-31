@@ -10,6 +10,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
+            [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
 
@@ -597,6 +598,13 @@
                  :scalar-types {'m :long 'n :long 'k :long}})
         operation (-> form :equations first :operations first)
         algorithm (-> form :equations first :algorithm)
+        directly-routed
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "typed routing reparsed source" {})))]
+          (contract-route/route-typed-contraction
+           algorithm (:id operation) (:schedule operation)
+           :dtype :float :desc {}))
         emitted
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
@@ -607,6 +615,20 @@
     (is (instance? raster.compiler.ir.segop.SegRed operation))
     (is (= :contraction (:phase operation)))
     (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
+    (is (some? (:artifact directly-routed)))
+    (try
+      (contract-route/route-typed-contraction
+       algorithm (:id operation) (:schedule operation) :dtype :double :desc {})
+      (is false "a route dtype that disagrees with the typed equation must fail")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-contraction-dtype (:reason (ex-data exception))))))
+    (try
+      (contract-route/route-typed-contraction
+       algorithm (:id operation) (assoc (:schedule operation) :strategy :workgroup-tree)
+       :dtype :float :desc {})
+      (is false "a non-contraction reduction schedule must fail")
+      (catch clojure.lang.ExceptionInfo exception
+        (is (= :typed-contraction-schedule (:reason (ex-data exception))))))
     (is (= :raster.par/contract
            (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
                    [:attributes :attributes :source-operation])))

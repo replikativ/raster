@@ -26,7 +26,10 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-launch :as klaunch]
-            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]))
+            [raster.compiler.ir.reduction :as reduction]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]))
 
 (defn par-contract-form?
   "Is `form` a (raster.par/contract out free-axes contract-axes body & opts) form?"
@@ -430,6 +433,45 @@
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
             (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))
+
+(defn route-typed-contraction
+  "Route one scheduled scalar TypedSOAC contraction without exposing a source-form or facts adapter
+   to the backend.
+
+   The validated equation is the semantic input. `schedule` certifies that SegOp scheduling chose
+   the contraction candidate family; this target route then selects and verifies the concrete
+   matrix, register-tiled or portable leaf against the device descriptor. The temporary verified
+   contraction facts remain private to this migration adapter until those leaves accept the typed
+   reduction and operand maps directly."
+  [program operation-id schedule & options]
+  (let [program (soac-dialect/validate! program)
+        schedule (reduction/validate-schedule! schedule)
+        _ (when-not (= :hardware-contraction-candidates (:strategy schedule))
+            (throw (ex-info "typed contraction requires a contraction candidate schedule"
+                            {:reason :typed-contraction-schedule
+                             :operation operation-id :schedule schedule})))
+        equation (or (some #(when (= operation-id (second %)) %)
+                           (soac-dialect/equations program))
+                     (throw (ex-info "typed contraction program lacks its scheduled equation"
+                                     {:reason :typed-contraction-equation
+                                      :operation operation-id})))
+        components (typed-projection/segmented-reduce-contract-components program equation)
+        equation-dtype (:dtype components)
+        options (apply hash-map options)
+        _ (when (and (contains? options :dtype)
+                     (not= equation-dtype (:dtype options)))
+            (throw (ex-info "typed contraction route dtype disagrees with its equation"
+                            {:reason :typed-contraction-dtype
+                             :operation operation-id
+                             :equation-dtype equation-dtype
+                             :route-dtype (:dtype options)})))
+        facts (cf/from-components components)]
+    (apply route-contraction nil
+           (mapcat identity
+                   (assoc options
+                          :dtype equation-dtype
+                          :facts facts
+                          :operation-id operation-id)))))
 
 (def ^:private decline-reasons
   "The reasons a tensorize leaf may legitimately REFUSE a shape — a WHITELIST.
