@@ -6,6 +6,7 @@
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.parallel-program :as parallel-program]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.pipeline :as pipeline]
@@ -596,8 +597,12 @@
                  :scalar-types {'m :long 'n :long 'k :long}})
         operation (-> form :equations first :operations first)
         algorithm (-> form :equations first :algorithm)
-        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
-                                         :dtype :float :min-elements 0)]
+        emitted
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "typed emission reparsed source" {})))]
+          (opencl-pass/opencl-pass form :device-id :ocl:0
+                                     :dtype :float :min-elements 0))]
     (is (= :typed-soac (:source-dialect stats)))
     (is (instance? raster.compiler.ir.segop.SegContract operation))
     (is (= :raster.par/contract

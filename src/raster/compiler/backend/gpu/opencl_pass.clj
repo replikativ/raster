@@ -452,7 +452,9 @@
                   _ (when-not bound-sc (swap! stats update :segop-relowered (fnil inc 0)))
                   r (ensure-contraction-marker-expressible!
                      (croute/route-contraction
-                      form :dtype dtype
+                      ;; A scheduled equation routes from its verified facts. The source form is
+                      ;; only the host expression being replaced and is not semantic input again.
+                      (when-not bound-sc form) :dtype dtype
                       :facts (:facts bound-sc)
                       :operation-id (:id bound-sc)
                       ;; The resolved, feasibility-checked schedule is the single source of tile
