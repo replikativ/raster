@@ -85,6 +85,23 @@
     (is (= [256] (get-in call [:geometry :workgroup-size])))
     (is (= [3] (get-in call [:geometry :group-count])))))
 
+(deftest resident-compilation-enriches-the-shared-report-without-a-second-run
+  (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-map
+                                                 :ze:0 :dtype :float
+                                                 :compiler-report? true)
+        report (:compiler-report descriptor)]
+    (is (= 1 (:schema-version report)))
+    (is (= :opencl (get-in report [:route :backend])))
+    (is (= :typed-soac (get-in report [:route :source-dialect])))
+    (is (= {:assessed? true
+            :resident? true
+            :device-scratch-count 0
+            :host-array-allocs-in-compute 0
+            :internal-host-roundtrips 0}
+           (:residency report)))
+    (is (= (count (:steps descriptor))
+           (get-in report [:emission :kernel-count])))))
+
 (deftest resident-segmap-inout-is-one-physical-result-slot
   (let [descriptor (pipeline/compile-gpu-program #'resident-kernel-call-inout
                                                  :ze:0 :dtype :float)

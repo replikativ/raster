@@ -74,12 +74,13 @@
        vec))
 
 (defn- source-dialect
-  [soac-stats segop-stats backend-stats]
+  [soac-stats segop-stats backend-stats kernels]
   (or (:route soac-stats)
       (when (pos? (counter segop-stats :typed-soac-reused)) :typed-soac)
       (when (or (pos? (counter segop-stats :segops-lowered))
                 (pos? (counter segop-stats :kernel-graphs-lowered))
-                (pos? (counter backend-stats :segop-relowered)))
+                (pos? (counter backend-stats :segop-relowered))
+                (seq kernels))
         :compatibility)
       :scalar))
 
@@ -98,7 +99,7 @@
         kernels (vec (:kernels pipeline))]
     {:schema-version schema-version
      :route {:backend (:backend pipeline)
-             :source-dialect (source-dialect soac-stats segop-stats backend-stats)
+             :source-dialect (source-dialect soac-stats segop-stats backend-stats kernels)
              :typed-validated (true? (:typed-validated soac-stats))
              :declines (pass-declines stats)}
      :fusion {:vertical (counter soac-stats :vertical)
@@ -125,3 +126,25 @@
                  :host-array-allocs-in-compute nil
                  :internal-host-roundtrips nil}
      :pass-stats stats}))
+
+(defn with-residency
+  "Enrich a normalized report from a successfully extracted resident descriptor.
+
+   `compile-gpu-program` admits only straight-line device steps. Its `:allocs` are device scratch;
+   they are not host arrays. A successful extraction plus its explicit scratch count therefore
+   certifies no host allocation or host round-trip inside the compute graph while leaving boundary
+   upload/download policy to the LinkPlan/runtime report."
+  [compiler-report device-scratch-count]
+  (when-not (= schema-version (:schema-version compiler-report))
+    (throw (ex-info "cannot enrich an incompatible compiler-report schema"
+                    {:expected schema-version
+                     :actual (:schema-version compiler-report)})))
+  (when-not (nat-int? device-scratch-count)
+    (throw (ex-info "resident reporting requires a non-negative device scratch count"
+                    {:device-scratch-count device-scratch-count})))
+  (assoc compiler-report
+         :residency {:assessed? true
+                     :resident? true
+                     :device-scratch-count device-scratch-count
+                     :host-array-allocs-in-compute 0
+                     :internal-host-roundtrips 0}))

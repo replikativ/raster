@@ -1122,30 +1122,43 @@
 (defn- run-passes-diagnostic
   "Run passes with full intermediate recording for diagnostics.
   Returns {:form final-form :stages {stage-key form} :stats {stage-key stats}}."
-  [form passes opts]
-  (reduce (fn [acc pass-key]
-            (let [{:keys [from to]} (get pass-specs pass-key)
-                  pass-fn (:fn (get pass-specs pass-key))
-                  current-dialect (:dialect acc)
-                  _ (assert (or (= :* from) (= current-dialect from))
-                            (str "Pass :" pass-key " expects :" from " but pipeline is at :"
-                                 current-dialect))
-                  result (pass-fn (:form acc) opts)
-                  new-form (pass-result-form result)]
-              (validate-dialect! to new-form pass-key opts)
-              (-> acc
-                  (assoc :form new-form :dialect to)
-                  (assoc-in [:stages to] new-form)
-                  (cond-> (and (map? result) (:stats result))
-                    (assoc-in [:stats to] (:stats result)))
-                  ;; Capture backend-specific data
-                  (cond-> (and (map? result) (:backend result))
-                    (assoc-in [:stages :backend-type] (:backend result)))
-                  (cond-> (and (map? result) (:kernels result))
-                    (assoc-in [:stages :kernels] (:kernels result)))
-                  (cond-> (and (map? result) (:cuda-result result))
-                    (assoc-in [:stages :cuda-result] (:cuda-result result))))))
-          {:form form :stages {} :stats {} :dialect :walked} passes))
+  ([form passes opts]
+   (run-passes-diagnostic form passes opts :walked))
+  ([form passes opts start-dialect]
+   (reduce (fn [acc pass-key]
+             (let [{:keys [from to]} (get pass-specs pass-key)
+                   pass-fn (:fn (get pass-specs pass-key))
+                   current-dialect (:dialect acc)
+                   _ (assert (or (= :* from) (= current-dialect from))
+                             (str "Pass :" pass-key " expects :" from " but pipeline is at :"
+                                  current-dialect))
+                   result (pass-fn (:form acc) opts)
+                   new-form (pass-result-form result)]
+               (validate-dialect! to new-form pass-key opts)
+               (-> acc
+                   (assoc :form new-form :dialect to)
+                   (assoc-in [:stages to] new-form)
+                   (cond-> (and (map? result) (:stats result))
+                     (assoc-in [:stats to] (:stats result)))
+                   ;; Capture backend-specific data
+                   (cond-> (and (map? result) (:backend result))
+                     (assoc-in [:stages :backend-type] (:backend result)))
+                   (cond-> (and (map? result) (:kernels result))
+                     (assoc-in [:stages :kernels] (:kernels result)))
+                   (cond-> (and (map? result) (:cuda-result result))
+                     (assoc-in [:stages :cuda-result] (:cuda-result result))))))
+           {:form form :stages {} :stats {} :dialect start-dialect} passes)))
+
+(defn- diagnostic->pipeline-map
+  "Build the public stage map from one already executed diagnostic pass trace."
+  [walked default-backend {:keys [stages stats]}]
+  (-> {:walked walked
+       :backend (or (:backend-type stages) default-backend)}
+      (merge (dissoc stages :backend-type :cuda-result :kernels))
+      (merge (into {} (map (fn [[k v]] [(keyword (str (name k) "-stats")) v]) stats)))
+      (cond->
+       (:kernels stages) (assoc :kernels (:kernels stages))
+       (:cuda-result stages) (assoc :cuda-result (:cuda-result stages)))))
 
 ;; ================================================================
 ;; Pipeline: forward-only (buffer fusion, no AD)
@@ -1681,6 +1694,11 @@
      :nil             — return nil, for probing callers that legitimately fall back to the
                         compile-aot :target-device staging fn (e.g. the AD-GEMM boundary test).
 
+   :compiler-report? records the split resident pass run as it executes and attaches the normalized
+   report under :compiler-report. It does not compile a second time. A successful resident extraction
+   certifies zero internal host allocations/round-trips; descriptor :allocs are counted separately as
+   device scratch.
+
    :gemm-precision sets the resident :gemm binding policy. It is now deprecated SUGAR for the S6
    schedule's [:schedule :precision] (the source of truth the linked step binder reads). A caller
    overrides the policy on the plain-data descriptor with (assoc-in descriptor [:schedule :precision] …)
@@ -1703,7 +1721,7 @@
    The XMX pitch gate and direct-vs-split occupancy decision are emitted as checked
    KernelDispatch expression cases. LinkPlan instantiation selects and binds that compiler value; it does
    not recognize GEMM shapes or reconstruct conversion/split kernels."
-  [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule]
+  [f-var device-id & {:keys [dtype on-non-resident gemm-precision schedule compiler-report?]
                       :or {on-non-resident :throw gemm-precision :f16-xmx}}]
   (when-not (contains? #{:f16-xmx :f32-scalar} gemm-precision)
     (throw (ex-info (str "compile-gpu-program: unknown :gemm-precision " (pr-str gemm-precision)
@@ -1758,7 +1776,11 @@
                    (assoc :scalar-types (:scalar-types pre-gpu-param-types)
                           :array-types (:array-types pre-gpu-param-types)))
         raw-form (if (= 1 (count walked-body)) (first walked-body) (cons 'do walked-body))
-        form-mat (run-passes raw-form gpu-resident-pre-soa-passes pre-opts)
+        pre-diagnostic (when compiler-report?
+                         (run-passes-diagnostic raw-form gpu-resident-pre-soa-passes pre-opts))
+        form-mat (if pre-diagnostic
+                   (:form pre-diagnostic)
+                   (run-passes raw-form gpu-resident-pre-soa-passes pre-opts))
         {form-soa :body eff-param-specs :params}
         (if value-fn?
           (soa-lower/soa-lower form-mat param-specs)
@@ -1776,7 +1798,16 @@
                     source-ns (assoc :source-ns source-ns)
                     gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
                                            :array-types (:array-types gpu-param-types)))
-        form (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized)
+        post-diagnostic (when compiler-report?
+                          (run-passes-diagnostic form-soa gpu-resident-post-soa-passes
+                                                 post-opts :materialized))
+        form (if post-diagnostic
+               (:form post-diagnostic)
+               (run-passes form-soa gpu-resident-post-soa-passes post-opts :materialized))
+        compiler-diagnostic
+        (when compiler-report?
+          {:stages (merge (:stages pre-diagnostic) (:stages post-diagnostic))
+           :stats (merge (:stats pre-diagnostic) (:stats post-diagnostic))})
         ;; Final DCE before resident extraction. The pre-SOA :dce runs right after AD
         ;; lowering, while the value+grad result vector [loss dx ... dA dB] still makes
         ;; every parameter gradient look live. By here the vector is gone and only the
@@ -2128,7 +2159,13 @@
                            :convention convention
                            :phase (keyword (str "gpu-step-" i))})))
                     (range) (:steps prog))
-       :result-sym (:result prog)})))
+       :result-sym (:result prog)
+       :compiler-report
+       (when compiler-report?
+         (report/with-residency
+           (report/from-pipeline
+            (diagnostic->pipeline-map raw-form :opencl compiler-diagnostic))
+           (count (:allocs prog))))})))
 
 (defn- wasm-kernel-spec
   "Front-half for one deftm var → {:name :params :ir :simd?} ready for the wasm
@@ -2350,15 +2387,8 @@
                source-ns (assoc :source-ns source-ns)
                gpu-param-types (assoc :scalar-types (:scalar-types gpu-param-types)
                                       :array-types (:array-types gpu-param-types)))
-        {:keys [stages stats]} (run-passes-diagnostic raw-form passes opts)
-        backend-type (get-in stages [:backend-type])]
-    (-> {:walked raw-form
-         :backend (or backend-type (if simd? :simd :scalar))}
-        (merge (dissoc stages :backend-type :cuda-result :kernels))
-        (merge (into {} (map (fn [[k v]] [(keyword (str (name k) "-stats")) v]) stats)))
-        (cond->
-         (get-in stages [:kernels]) (assoc :kernels (get-in stages [:kernels]))
-         (get-in stages [:cuda-result]) (assoc :cuda-result (get-in stages [:cuda-result]))))))
+        diagnostic (run-passes-diagnostic raw-form passes opts)]
+    (diagnostic->pipeline-map raw-form (if simd? :simd :scalar) diagnostic)))
 
 (defn compile-report
   "Compile once through the diagnostic pipeline and return its normalized compatibility report.
