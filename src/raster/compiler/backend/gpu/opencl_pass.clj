@@ -10,8 +10,6 @@
   (:require [clojure.set :as set]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
-            [raster.compiler.ir.soac-dialect :as soac-dialect]
-            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -22,7 +20,6 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
-            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -468,40 +465,35 @@
                               stats :segcontract
                               #(instance? raster.compiler.ir.segop.SegContract %)))
                   bound-operation (or bound-sr bound-sc)
-                  typed-facts
+                  typed-algorithm
                   (when bound-sr
-                    (let [algorithm (or *bound-algorithm*
-                                        (throw (ex-info
-                                                "typed contraction SegRed lacks its algorithm"
-                                                {:reason :typed-contraction-algorithm
-                                                 :operation (:id bound-sr)})))
-                          equation (or (some #(when (= (:id bound-sr) (second %)) %)
-                                             (soac-dialect/equations algorithm))
-                                       (throw (ex-info
-                                               "typed contraction algorithm lacks its equation"
-                                               {:reason :typed-contraction-equation
-                                                :operation (:id bound-sr)})))]
-                      (contraction-facts/from-components
-                       (typed-projection/segmented-reduce-contract-components
-                        algorithm equation))))
-                  verified-facts (or typed-facts (:facts bound-sc))
+                    (or *bound-algorithm*
+                        (throw (ex-info
+                                "typed contraction SegRed lacks its algorithm"
+                                {:reason :typed-contraction-algorithm
+                                 :operation (:id bound-sr)}))))
                   _ (when-not bound-operation
                       (swap! stats update :segop-relowered (fnil inc 0)))
+                  target-desc (try ((requiring-resolve
+                                     'raster.compiler.core.hardware/descriptor-for)
+                                    device-id)
+                                   (catch Throwable _ nil))
                   r (ensure-contraction-marker-expressible!
-                     (croute/route-contraction
-                      ;; A scheduled equation routes from its verified facts. The source form is
-                      ;; only the host expression being replaced and is not semantic input again.
-                      (when-not bound-operation form) :dtype dtype
-                      :facts verified-facts
-                      :operation-id (:id bound-operation)
-                      ;; The resolved, feasibility-checked schedule is the single source of tile
-                      ;; geometry.  Previously this option reached opencl-pass but contractions
-                      ;; ignored it and re-derived a default, so a pinned/autotuned :tile changed
-                      ;; neither the KernelBody nor emitted source.
-                      :tile (:tile schedule)
-                      :desc (try ((requiring-resolve 'raster.compiler.core.hardware/descriptor-for)
-                                  device-id)
-                                 (catch Throwable _ nil))))
+                     (if bound-sr
+                       (croute/route-typed-contraction
+                        typed-algorithm (:id bound-sr) (:schedule bound-sr)
+                        :dtype dtype :tile (:tile schedule) :desc target-desc)
+                       (croute/route-contraction
+                        ;; A compatibility equation routes from its verified facts. Without a
+                        ;; scheduled operation, the direct backend door still consumes the form.
+                        (when-not bound-sc form) :dtype dtype
+                        :facts (:facts bound-sc)
+                        :operation-id (:id bound-sc)
+                        ;; The resolved, feasibility-checked schedule is the single source of tile
+                        ;; geometry.  Previously this option reached opencl-pass but contractions
+                        ;; ignored it and re-derived a default, so a pinned/autotuned :tile changed
+                        ;; neither the KernelBody nor emitted source.
+                        :tile (:tile schedule) :desc target-desc)))
                   ;; Every routed single-entry leaf is now a complete executable artifact. Routing
                   ;; diagnostics and tensorization facts live in its attributes/provenance rather
                   ;; than being flattened into the runtime registry namespace.
