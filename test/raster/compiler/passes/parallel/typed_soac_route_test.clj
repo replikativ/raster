@@ -605,6 +605,13 @@
           (contract-route/route-typed-contraction
            algorithm (:id operation) (:schedule operation)
            :dtype :float :desc {}))
+        candidate-routes
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "candidate routing reparsed source" {})))]
+          (contract-route/route-typed-contraction-candidates!
+           algorithm (:id operation) (:schedule operation)
+           :dtype :float :desc {}))
         emitted
         (with-redefs [contraction-facts/contraction-facts
                       (fn [& _]
@@ -616,6 +623,11 @@
     (is (= :contraction (:phase operation)))
     (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
     (is (some? (:artifact directly-routed)))
+    (is (= [:portable] (mapv :family (:candidates candidate-routes))))
+    (is (= #{:matrix :register-tiled}
+           (set (map :candidate-family (:declines candidate-routes)))))
+    (is (not-any? #(= :schedule-family-disabled (:reason %))
+                  (:declines candidate-routes)))
     (try
       (contract-route/route-typed-contraction
        algorithm (:id operation) (:schedule operation) :dtype :double :desc {})
@@ -637,6 +649,17 @@
       (is false "a pinned family that cannot lower the equation must fail")
       (catch clojure.lang.ExceptionInfo exception
         (is (= :no-legal-contraction-family (:reason (ex-data exception))))))
+    (try
+      (contract-route/route-typed-contraction-candidates!
+       algorithm (:id operation)
+       (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+       :dtype :float :desc {})
+      (is false "candidate enumeration must fail when every enabled family declines")
+      (catch clojure.lang.ExceptionInfo exception
+        (let [{:keys [reason route]} (ex-data exception)]
+          (is (= :typed-contraction-no-candidates reason))
+          (is (empty? (:candidates route)))
+          (is (= #{:matrix} (set (map :candidate-family (:declines route))))))))
     (is (= :raster.par/contract
            (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
                    [:attributes :attributes :source-operation])))
@@ -665,10 +688,23 @@
           (contract-route/route-typed-contraction
            algorithm (:id operation)
            (assoc-in (:schedule operation) [:tuning-space :families] [family])
-           :dtype :half :desc descriptor))]
+           :dtype :half :desc descriptor))
+        candidates
+        (contract-route/route-typed-contraction-candidates!
+         algorithm (:id operation) (:schedule operation)
+         :dtype :half :desc descriptor)]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
     (is (= :portable-segred (:strategy (select-family :portable))))
+    (is (= [:matrix :register-tiled :portable]
+           (mapv :family (:candidates candidates))))
+    (is (= [:dpas :regtiled :portable-segred]
+           (mapv :strategy (:candidates candidates))))
+    (is (= [[:matrix] [:register-tiled] [:portable]]
+           (mapv #(get-in % [:candidate-schedule :tuning-space :families])
+                 (:candidates candidates))))
+    (is (every? (comp some? :artifact) (:candidates candidates)))
+    (is (empty? (:declines candidates)))
     (doseq [families [[] [:unknown]]]
       (try
         (contract-route/route-typed-contraction
