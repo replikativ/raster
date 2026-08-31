@@ -69,9 +69,11 @@
                          :dialect (:id dialect) :parameter parameter})))
       (if (opencl? dialect)
         (str "__global " (when (= :input (:kind parameter)) "const ")
-             (type-name dialect (:dtype parameter)) "* " c-name)
+             (type-name dialect (:dtype parameter)) "* "
+             (when (:restrict? parameter) "restrict ") c-name)
         (str (when (= :input (:kind parameter)) "const ")
-             (type-name dialect (:dtype parameter)) "* __restrict__ " c-name)))))
+             (type-name dialect (:dtype parameter)) "* "
+             (when (:restrict? parameter) "__restrict__ ") c-name)))))
 
 (def ^:private axis-name ["x" "y" "z"])
 

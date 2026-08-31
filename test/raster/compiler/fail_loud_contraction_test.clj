@@ -114,15 +114,15 @@
           "the identity must be the op's, not 0.0 — summing max-partials from 0.0 is wrong for
            all-negative data"))))
 
-(deftest fp64-result-transform-uses-the-typed-portable-store
-  (testing "an f64 two-free/one-contract result transform executes on the portable leaf"
+(deftest fp64-result-transform-uses-the-typed-register-tiled-store
+  (testing "an f64 two-free/one-contract result transform executes on the register-tiled leaf"
     (let [form (list 'raster.par/contract 'C [['i 4] ['j 4]] [['l 8]]
                      (list 'raster.numeric/*
                            (list 'aget 'A (list 'clojure.core/+ (list 'clojure.core/* 'i 8) 'l))
                            (list 'aget 'B (list 'clojure.core/+ (list 'clojure.core/* 'l 4) 'j)))
                      :epilogue {:acc 'acc :expr '(raster.numeric/* acc 2.0)})
           routed (cr/route-contraction form :dtype :double)]
-      (is (= :portable-segred (:strategy routed)))
+      (is (= :regtiled (:strategy routed)))
       (is (true? (:fused-epilogue routed)))
       (is (re-find #"\* 2\.0" (:source routed))))))
 

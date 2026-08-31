@@ -1,0 +1,98 @@
+(ns raster.compiler.passes.parallel.register-tiled-body-test
+  (:require [clojure.java.shell :as shell]
+            [clojure.string :as str]
+            [clojure.test :refer [deftest is testing]]
+            [raster.compiler.backend.gpu.kernel-body-opencl :as body-emit]
+            [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
+            [raster.compiler.ir.axis-map :as axis-map]
+            [raster.compiler.ir.contraction-facts :as facts]
+            [raster.compiler.ir.kernel-body :as body]
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.register-tiled-body :as register-tiled]))
+
+(def ^:private small-tile
+  {:block-m 4 :block-n 4 :block-k 2 :thread-m 2 :thread-n 2})
+
+(defn- contraction
+  [& [epilogue]]
+  (facts/from-components
+   {:out 'C
+    :free-axes [['i 8] ['j 8]]
+    :contract-axes [['k 8]]
+    :body '(raster.numeric/*
+            (clojure.core/aget A (clojure.core/+ (clojure.core/* i 8) k))
+            (clojure.core/aget B (clojure.core/+ (clojure.core/* k 8) j)))
+    :opts (cond-> {} epilogue (assoc :epilogue epilogue))
+    :dtype :float}))
+
+(defn- operation-kinds
+  [operations]
+  (mapcat
+   (fn [operation]
+     (concat [(some-> operation class .getSimpleName)]
+             (when (instance? raster.compiler.ir.kernel_body.ForLoop operation)
+               (operation-kinds (:operations operation)))))
+   operations))
+
+(deftest cooperative-register-tile-is-a-verified-scalar-kernel-body
+  (let [kernel-body (:kernel-body
+                     (register-tiled/lower (contraction) {:tile small-tile}))
+        kinds (frequencies (operation-kinds (:operations kernel-body)))
+        opencl (body-emit/emit-scalar-kernel "register_tile" kernel-body)
+        cuda (body-emit/emit-scalar-kernel
+              "register_tile" kernel-body {:target-dialect :cuda})
+        hip (body-emit/emit-scalar-kernel
+             "register_tile" kernel-body {:target-dialect :hip})]
+    (is (body/kernel-body? kernel-body))
+    (is (= [[4 2] [2 4]] (mapv :shape (:allocations kernel-body))))
+    (is (= [2 2] (get-in kernel-body [:launch :workgroup-size])))
+    (is (= [2 2] (mapv #(launch/resolve-expression {} %)
+                       (get-in kernel-body [:launch :group-count]))))
+    (is (= 4 (get kinds "ForLoop")) "outer K, inner K and two cooperative staging loops are explicit")
+    (is (= 2 (get kinds "WorkgroupBarrier")))
+    (is (str/includes? opencl "__local"))
+    (is (str/includes? opencl "barrier(CLK_LOCAL_MEM_FENCE)"))
+    (is (str/includes? cuda "__shared__"))
+    (is (str/includes? cuda "__syncthreads()"))
+    (is (str/includes? hip "__shared__"))
+    (is (str/includes? hip "__syncthreads()"))
+    (testing "the nested cooperative schedule is valid OpenCL C"
+      (if-not (zero? (:exit (shell/sh "sh" "-c" "command -v clang")))
+        (is true "clang unavailable")
+        (let [compiled (shell/sh "clang" "-x" "cl" "-cl-std=CL2.0"
+                                 "-fsyntax-only" "-" :in opencl)]
+          (is (zero? (:exit compiled)) (:err compiled)))))))
+
+(deftest result-transform-is-alpha-renamed-per-microtile-store
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/*
+                          (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
+                  :operands [{:sym 'bias :dtype :float
+                              :map (axis-map/of-axes [['j 8]])}]
+                  :scalars [{:sym 'scale :dtype :float}]
+                  :dtype :float}
+        emitted (segop-emit/generate-register-tiled-kernel-body
+                 (contraction epilogue) 'C :tile small-tile)
+        kernel-body (:kernel-body emitted)]
+    (is (body/kernel-body? kernel-body))
+    (is (= '[A B C bias scale] (mapv :name (:abi emitted))))
+    (is (= '[bias] (:epilogue-operands emitted)))
+    (is (= '[scale] (:epilogue-scalars emitted)))
+    (is (= '[A B bias] (mapv :buffer (:stable-reads kernel-body))))
+    (is (str/includes? (:source emitted) "bias["))
+    (is (str/includes? (:source emitted) "* scale"))))
+
+(deftest target-resource-limits-select-or-refuse-a-finite-tile
+  (let [lowered (register-tiled/lower
+                 (contraction)
+                 {:descriptor {:execution {:max-workgroup-size 64}
+                               :shared-local-memory 4096}})]
+    (is (= {:block-m 32 :block-n 32 :block-k 16 :thread-m 4 :thread-n 4}
+           (:tile lowered)))
+    (is (= [8 8] (get-in lowered [:kernel-body :launch :workgroup-size]))))
+  (is (thrown-with-msg?
+       clojure.lang.ExceptionInfo #"cannot host any register-tiled"
+       (register-tiled/lower
+        (contraction)
+        {:descriptor {:execution {:max-workgroup-size 8}
+                      :shared-local-memory 128}}))))

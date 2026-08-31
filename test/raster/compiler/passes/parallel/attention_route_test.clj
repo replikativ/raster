@@ -589,7 +589,7 @@
            (mapv :dtype (:abi artifact))))
     (is (= :float (get-in artifact [:attributes :q-dtype])))
     (is (= :float (get-in artifact [:attributes :output-dtype])))
-    (is (str/includes? source "__global const float* q"))
+    (is (str/includes? source "__global const float* restrict q"))
     (is (str/includes? source "__global float* output"))
     (is (str/includes? source
                        "float rstr_qk_product = (rstr_query_float * rstr_key_float)"))

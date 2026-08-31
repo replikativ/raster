@@ -57,14 +57,17 @@
    `parameters` maps region scalar/operand IDs to KernelParameters. `coordinate-lower` translates
    a declared operand axis-map to one or more scheduled storage coordinates. The returned `:result` is cast to
    `store-dtype`, so ScalarStore remains completely typed."
-  [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate]}]
+  [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate
+                  id-prefix]}]
   (let [result-dtype (dtype/canon (:result-dtype region))
         accumulator-id (first (:parameters region))
         operand-by-id (into {} (map (juxt :sym identity)) (:operands region))
         scalar-ids (vec (drop (inc (count operand-by-id)) (:parameters region)))
         operations (atom [])
         counter (atom 0)
-        fresh (fn [prefix] (symbol (str prefix "-" (swap! counter inc))))
+        fresh (fn [prefix]
+                (symbol (str (when id-prefix (str id-prefix "-"))
+                             prefix "-" (swap! counter inc))))
         emit! (fn [operation value value-dtype]
                 (swap! operations conj operation)
                 {:value value :dtype value-dtype})]

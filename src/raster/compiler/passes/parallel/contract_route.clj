@@ -239,10 +239,10 @@
   "Strategies whose scheduled body or emitter has a typed store region and can honour an :epilogue.
    A WHITELIST on purpose: refuse by ABSENCE of support, never by a blacklist of shapes — a
    blacklist got this wrong twice, most recently by exempting the only shape production produces.
-   `:dpas` and `:portable-segred` lower through KernelBody ScalarRegion; the three staged-emitter
+   `:dpas`, `:regtiled` and `:portable-segred` lower through typed KernelBody storage; the three staged-emitter
    strategies still splice at the store (which is how a quant dequant scale is expressed since
    :scheme was deleted)."
-  #{:dpas :dp4a :portable-segred :quant-naive :staged-segred})
+  #{:dpas :dp4a :regtiled :portable-segred :quant-naive :staged-segred})
 
 (def ^:private contraction-families
   "Target schedule families for ordinary scalar typed contractions."
@@ -839,7 +839,8 @@
     ;; epilogue legality
     :epilogue-needs-2-free :epilogue-ignores-accumulator :accumulator-used-more-than-once
     :reduction-in-epilogue :layout-changing-op-in-epilogue
-    :epilogue-unsupported-by-this-leaf})
+    :epilogue-unsupported-by-this-leaf
+    :register-tiled-kernel-body-declined :scalar-region-kernel-body-declined})
 
 (defn- decline
   "A structured record of ONE leaf declining. `:data` is the gate's own ex-data minus its `:reason`
@@ -855,9 +856,15 @@
    reason; RETHROWS anything else — an unrecognized or absent reason is the compiler saying
    something is wrong, and a violated invariant is not a routing decision."
   [leaf ^clojure.lang.ExceptionInfo e]
-  (let [reason (:reason (ex-data e))]
+  (let [data (ex-data e)
+        reason (:reason data)
+        reported-reason (if (contains? #{:register-tiled-kernel-body-declined
+                                         :scalar-region-kernel-body-declined}
+                                       reason)
+                          (:missing-rule data)
+                          reason)]
     (when-not (contains? decline-reasons reason) (throw e))
-    (decline leaf reason (.getMessage e) (dissoc (ex-data e) :reason))))
+    (decline leaf reported-reason (.getMessage e) (dissoc data :reason :missing-rule))))
 
 (defn- route-2free-1contract
   "The tensorize fast path: DPAS if the gate accepts, else the register-tiled portable kernel.
@@ -878,9 +885,7 @@
         matrix? (contains? candidate-families :matrix)
         register-tiled? (contains? candidate-families :register-tiled)]
     (try
-      (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype
-                                                  :facts contract-facts))
-            scheduled (when matrix?
+      (let [scheduled (when matrix?
                         (contraction-schedule/plan-matrix-body
                          contract-facts desc tile {:operation-id operation-id}))
             dpas (cond
@@ -915,8 +920,9 @@
              :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
              :dims (:dims dpas)})
       ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
-          (if (and register-tiled? (not (seq epilogue)))
-            (let [rt (sco/generate-regtiled-contraction-kernel @sr out-sym :dtype dtype)
+          (if register-tiled?
+            (let [rt (sco/generate-register-tiled-kernel-body
+                      contract-facts out-sym :operation-id operation-id :descriptor desc)
                   [bm bn _bk] (:block rt)
                   [M N _L] (:dims rt)]
               {:strategy :regtiled
@@ -924,19 +930,20 @@
                :declines @acc
                :kernel-name (:kernel-name rt)
                :source (:source rt)
-               :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
+               :array-params (:array-params rt)
                :abi (:abi rt)
                :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
+               :kernel-body (:kernel-body rt)
+               :fused-epilogue (boolean epilogue)
+               :epilogue-operands (:epilogue-operands rt)
+               :epilogue-scalars (:epilogue-scalars rt)
                :wg (:workgroup rt)
                :grid [(ceil-div N bn) (ceil-div M bm)]
                :scalar-args []                             ; regtiled bakes dims → no scalar params
                :dims (:dims rt)})
             (do
-              (note! (if register-tiled?
-                       (decline :regtiled :epilogue-unsupported-by-this-leaf nil
-                                {:family :register-tiled})
-                       (decline :regtiled :schedule-family-disabled nil
-                                {:family :register-tiled})))
+              (note! (decline :regtiled :schedule-family-disabled nil
+                              {:family :register-tiled}))
               {::declines @acc}))))
       (catch clojure.lang.ExceptionInfo e
      ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`
