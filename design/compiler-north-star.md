@@ -343,6 +343,11 @@ validated executable artifact and family-qualified decline trail, so offline tun
 same compiler products that ordinary execution uses. These alternatives may still have different
 physical ABIs and therefore are not falsely packaged as a runtime `KernelDispatch`; ABI
 normalization or graph-private adapters must precede runtime selection through one dispatch.
+For static shapes, one-node candidate graphs now provide exactly that normalization: the logical
+operand/result pointers form the shared external ABI, while leaf-only `M/N/K` or flattened segment
+bounds remain checked graph-private integer scalars. Runtime-dependent private dimensions are
+refused until they are represented in a shared public scalar ABI, preventing an offline sample from
+being mistaken for a valid dynamic specialization.
 
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
