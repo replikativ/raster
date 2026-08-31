@@ -10,6 +10,8 @@
   (:require [clojure.set :as set]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.soac]
+            [raster.compiler.ir.soac-dialect :as soac-dialect]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
@@ -20,6 +22,7 @@
             [raster.compiler.ir.segop :as segop]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.passes.parallel.soac-lower]
+            [raster.compiler.passes.parallel.typed-soac-projection :as typed-projection]
             [raster.compiler.backend.gpu.segop-opencl :as segop-cl]
             [raster.compiler.passes.parallel.contract-route :as croute]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-fuse :as swr-fuse]
@@ -112,6 +115,11 @@
    This is the seam that makes the SegOp boundary REAL instead of nominal. `segop-lower` lowered
    every par form with the real target device. The equation is consumed here; re-lowering remains
    a counted compatibility path for callers that invoke opencl-pass directly."
+  nil)
+
+(def ^:dynamic *bound-algorithm*
+  "The validated TypedSOAC program associated with `*bound-segops*`. Target scheduling reads the
+   algorithm rather than recovering semantic facts from the host expression being replaced."
   nil)
 
 (defn- take-bound-segop
@@ -444,19 +452,48 @@
                   ;; pass the REAL descriptor: route-contraction fed `(or desc {})` into
                   ;; derive-gemm-tile, so the "hardware-derived" tile was derived from an empty map
                   ;; — Arc constants on every device. device-id is already in scope here.
-                  ;; CONSUME the SegContract segop-lower recorded (its facts were derived and
-                  ;; verified once, at the boundary) — the same take-bound-segop seam map/reduce
-                  ;; use. Without one (door C, no pass run) route from the form and count it.
-                  bound-sc (take-bound-segop stats :segcontract
-                                             #(instance? raster.compiler.ir.segop.SegContract %))
-                  _ (when-not bound-sc (swap! stats update :segop-relowered (fnil inc 0)))
+                  ;; CONSUME the contraction-specialized SegRed recorded by typed lowering. Its
+                  ;; algorithm remains attached to the ParallelProgram equation, so routing can
+                  ;; derive verified facts without hiding them in a second operation record.
+                  ;; SegContract remains only for the compatibility front door; without either
+                  ;; scheduled operation (door C), route from the form and count it.
+                  bound-sr (take-bound-segop
+                            stats :segred-contraction
+                            #(and (instance? raster.compiler.ir.segop.SegRed %)
+                                  (= :contraction (:phase %))
+                                  (= :hardware-contraction-candidates
+                                     (get-in % [:schedule :strategy]))))
+                  bound-sc (when-not bound-sr
+                             (take-bound-segop
+                              stats :segcontract
+                              #(instance? raster.compiler.ir.segop.SegContract %)))
+                  bound-operation (or bound-sr bound-sc)
+                  typed-facts
+                  (when bound-sr
+                    (let [algorithm (or *bound-algorithm*
+                                        (throw (ex-info
+                                                "typed contraction SegRed lacks its algorithm"
+                                                {:reason :typed-contraction-algorithm
+                                                 :operation (:id bound-sr)})))
+                          equation (or (some #(when (= (:id bound-sr) (second %)) %)
+                                             (soac-dialect/equations algorithm))
+                                       (throw (ex-info
+                                               "typed contraction algorithm lacks its equation"
+                                               {:reason :typed-contraction-equation
+                                                :operation (:id bound-sr)})))]
+                      (contraction-facts/from-components
+                       (typed-projection/segmented-reduce-contract-components
+                        algorithm equation))))
+                  verified-facts (or typed-facts (:facts bound-sc))
+                  _ (when-not bound-operation
+                      (swap! stats update :segop-relowered (fnil inc 0)))
                   r (ensure-contraction-marker-expressible!
                      (croute/route-contraction
                       ;; A scheduled equation routes from its verified facts. The source form is
                       ;; only the host expression being replaced and is not semantic input again.
-                      (when-not bound-sc form) :dtype dtype
-                      :facts (:facts bound-sc)
-                      :operation-id (:id bound-sc)
+                      (when-not bound-operation form) :dtype dtype
+                      :facts verified-facts
+                      :operation-id (:id bound-operation)
                       ;; The resolved, feasibility-checked schedule is the single source of tile
                       ;; geometry.  Previously this option reached opencl-pass but contractions
                       ;; ignored it and re-derived a default, so a pinned/autotuned :tile changed
@@ -657,6 +694,10 @@
                                                        (binding [*bound-segops*
                                                                  (when parallel-program
                                                                    (parallel-program/operations-for-binding
+                                                                    parallel-program sym expr))
+                                                                 *bound-algorithm*
+                                                                 (when parallel-program
+                                                                   (parallel-program/algorithm-for-binding
                                                                     parallel-program sym expr))]
                                                          (transform expr)))]))
                                             pairs))
@@ -664,6 +705,10 @@
                                    (binding [*bound-segops*
                                              (when parallel-program
                                                (parallel-program/operations-for-source
+                                                parallel-program expr))
+                                             *bound-algorithm*
+                                             (when parallel-program
+                                               (parallel-program/algorithm-for-source
                                                 parallel-program expr))]
                                      (transform expr)))
                                  body-exprs)]

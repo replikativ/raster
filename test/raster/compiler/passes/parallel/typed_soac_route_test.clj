@@ -584,7 +584,7 @@
     (is (= '#{A B} (segop/operation-inputs operation)))
     (is (= '#{C} (segop/operation-outputs operation)))))
 
-(deftest gpu-emission-consumes-the-typed-contraction-schedule-view
+(deftest gpu-emission-consumes-the-scheduled-typed-contraction
   (let [source
         '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
                        (* (clojure.core/aget A (+ (* i k) l))
@@ -604,7 +604,9 @@
           (opencl-pass/opencl-pass form :device-id :ocl:0
                                      :dtype :float :min-elements 0))]
     (is (= :typed-soac (:source-dialect stats)))
-    (is (instance? raster.compiler.ir.segop.SegContract operation))
+    (is (instance? raster.compiler.ir.segop.SegRed operation))
+    (is (= :contraction (:phase operation)))
+    (is (= :hardware-contraction-candidates (get-in operation [:schedule :strategy])))
     (is (= :raster.par/contract
            (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
                    [:attributes :attributes :source-operation])))

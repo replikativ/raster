@@ -16,7 +16,6 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.util :as util]
-            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.par :as par]
@@ -25,13 +24,13 @@
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.execution-plan :as execution-plan]
-            [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
+            [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
 
 (declare lower-reduce)
 (declare lower-map)
 (declare lower-scan-description)
 (declare scan-kernel-graph-description)
+(declare phase-grid)
 
 (defn- materialize-region-locals
   [locals body]
@@ -316,25 +315,36 @@
                  (conj (mapv (fn [[index extent]] {:name index :bound extent}) segment-axes)
                        {:name reduced-index :bound reduced-extent}))
           output-dtype (or (first (:dtypes attributes)) dtype :double)
+          contraction? (= :raster.par/contract
+                          (get-in attributes [:attributes :source-operation]))
+          planned-grid (when contraction?
+                         (phase-grid :reduce device-id reduced-extent output-dtype))
+          contraction-schedule
+          (when contraction?
+            (let [workgroup-size (:block-size planned-grid)
+                  candidates (filterv #(<= % workgroup-size) [32 64 128 256 512 1024])]
+              (reduction/schedule
+               {:strategy :hardware-contraction-candidates
+                :workgroup-size workgroup-size
+                :stages [:segment-space :reduction :target-lowering]
+                :tuning-space {:families [:matrix :register-tiled :portable]
+                               :workgroup-size candidates}
+                :numerical-mode (select-keys (first (get-in operator [:algebra :components]))
+                                             [:order :reassociation :overflow])
+                :attributes {:source-operation :raster.par/contract
+                             :device device-id
+                             :selection :target-lowering}})))
           _ (doseq [input inputs]
               (when-not (= :tensor (:kind (get values input)))
                 (throw (ex-info "segmented reduction tensor input lacks an AbstractValue"
                                 {:reason :typed-soac-segmented-reduce-input
                                  :equation equation-id :input input
                                  :value (get values input)}))))]
-      (if (= :raster.par/contract
-             (get-in attributes [:attributes :source-operation]))
-        ;; The equation remains the sole semantic representation.  SegContract is a target
-        ;; scheduling view carrying facts derived from the shared mechanical projection; it lets
-        ;; DPAS/register-tiled leaves consume the typed front door without re-reading source.
-        (let [components (projection/segmented-reduce-contract-components program equation)
-              facts (contraction-facts/from-components
-                     (assoc components :dtype output-dtype))]
-          [(segop/->SegContract equation-id facts output-dtype device-id)])
-        [(segop/->SegRed equation-id space
-                         (segop/->SegLevel :thread :virtual)
-                         operator nil inputs (set physical-results) scalars nil :segmented nil
-                         output-dtype)]))))
+      [(segop/->SegRed equation-id space
+                       (segop/->SegLevel :thread :virtual)
+                       operator nil inputs (set physical-results) scalars planned-grid
+                       (if contraction? :contraction :segmented)
+                       contraction-schedule output-dtype)])))
 
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."
