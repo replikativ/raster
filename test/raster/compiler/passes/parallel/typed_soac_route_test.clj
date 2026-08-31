@@ -14,7 +14,9 @@
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.passes.parallel.contract-route :as contract-route]
             [raster.compiler.passes.parallel.segop-lower-pass :as segop-lower]
-            [raster.compiler.passes.parallel.typed-soac-route :as route]))
+            [raster.compiler.passes.parallel.typed-soac-route :as route]
+            [raster.gpu.dispatch-tuning :as dispatch-tuning]
+            [raster.gpu.program-tuning :as program-tuning]))
 
 (def ^:private map-map
   '(let* [y (raster.par/pmap i n float
@@ -714,7 +716,15 @@
         emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
                   (opencl-pass/opencl-pass form :device-id :ocl:0
                                            :dtype :half :min-elements 0))
-        emitted-dispatch (first (:dispatches emitted))]
+        emitted-dispatch (first (:dispatches emitted))
+        measured-selector {:kind :fixed-strategy :strategy :portable-segred}
+        measured-emitted
+        (with-redefs [hardware/descriptor-for (constantly descriptor)]
+          (opencl-pass/opencl-pass
+           form :device-id :ocl:0 :dtype :half :min-elements 0
+           :schedule {:typed-contraction
+                      {:measured-selectors {(:id emitted-dispatch) measured-selector}}}))
+        measured-dispatch (first (:dispatches measured-emitted))]
     (is (= :dpas (:strategy (select-family :matrix))))
     (is (= :regtiled (:strategy (select-family :register-tiled))))
     (is (= :portable-segred (:strategy (select-family :portable))))
@@ -728,6 +738,15 @@
     (is (every? (comp some? :artifact) (:candidates candidates)))
     (is (empty? (:declines candidates)))
     (is (= :dpas (:default-strategy dispatch)))
+    (is (re-matches #"raster_typed_contraction_dispatch_[0-9a-f]{8}" (:id dispatch)))
+    (is (= [:typed-contraction :measured-selectors]
+           (get-in dispatch [:attributes :tuning :schedule-path])))
+    (is (= (:id dispatch) (get-in dispatch [:attributes :tuning :schedule-key])))
+    (is (map? (get-in dispatch [:attributes :tuning :numerical-mode])))
+    (is (map? (get-in dispatch [:attributes :tuning :layout])))
+    (is (= {:path [:typed-contraction :measured-selectors]
+            :key (:id dispatch)}
+           (get-in (program-tuning/dispatch-signature dispatch) [:schedule-target])))
     (is (= [:dpas :regtiled :portable-segred]
            (mapv #(get-in % [:attributes :strategy]) alternatives)))
     (is (every? kernel-graph/kernel-graph? alternatives))
@@ -749,6 +768,12 @@
     (is (= 3 (count (:kernels emitted))))
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (= 1 (get-in emitted [:stats :kernel-graphs])))
+    (is (= (:id emitted-dispatch) (:id measured-dispatch)))
+    (is (= (mapv dispatch-tuning/executable-signature (:alternatives emitted-dispatch))
+           (mapv dispatch-tuning/executable-signature (:alternatives measured-dispatch)))
+        "counter-based emitter names must not invalidate the tuning cache on recompilation")
+    (is (= measured-selector (:selector measured-dispatch)))
+    (is (= :measured-fixed (get-in measured-dispatch [:attributes :selection])))
     (with-redefs [contract-route/route-contraction (fn [& _] {:strategy :full-reduce})]
       (try
         (contract-route/route-typed-contraction
