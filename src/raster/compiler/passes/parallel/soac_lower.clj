@@ -16,6 +16,7 @@
             [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.hardware :as hardware]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-graph :as kernel-graph]
             [raster.compiler.ir.kernel-launch :as kernel-launch]
             [raster.compiler.ir.par :as par]
@@ -24,7 +25,8 @@
             [raster.compiler.ir.soac-dialect :as soac-dialect]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
-            [raster.compiler.passes.parallel.execution-plan :as execution-plan]))
+            [raster.compiler.passes.parallel.execution-plan :as execution-plan]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]))
 
 (declare lower-reduce)
 (declare lower-map)
@@ -284,12 +286,15 @@
                        [parameter (list 'clojure.core/aget array dense-coordinate)])
                      elements arrays))
           step-results (mapv #(util/subst-syms substitutions %) body-results)
+          facts (soac-dialect/facts program)
+          physical-results (soac-dialect/physical-results facts equation)
           components
           (mapv (fn [ordinal accumulator neutral component-dtype result]
                   {:id (keyword (str "component-" ordinal))
                    :accumulator accumulator :neutral neutral :dtype component-dtype
                    :result result})
-                (range) accumulators (:identities attributes) (:dtypes attributes) results)
+                (range) accumulators (:identities attributes) (:dtypes attributes)
+                physical-results)
           operator (reduction/make
                     {:components components
                      :index reduced-index
@@ -297,7 +302,6 @@
                      :algebra {:components (:algebra attributes)}
                      :attributes {:source :typed-soac :equation equation-id
                                   :segmented true}})
-          facts (soac-dialect/facts program)
           values (:values facts)
           stable-captures (set (get-in attributes [:attributes :stable-array-captures]))
           inputs (set/union (set arrays) stable-captures)
@@ -318,9 +322,18 @@
                                 {:reason :typed-soac-segmented-reduce-input
                                  :equation equation-id :input input
                                  :value (get values input)}))))]
-      [(segop/->SegRed equation-id space
-                       (segop/->SegLevel :thread :virtual)
-                       operator nil inputs (set results) scalars nil :segmented nil output-dtype)])))
+      (if (= :raster.par/contract
+             (get-in attributes [:attributes :source-operation]))
+        ;; The equation remains the sole semantic representation.  SegContract is a target
+        ;; scheduling view carrying facts derived from the shared mechanical projection; it lets
+        ;; DPAS/register-tiled leaves consume the typed front door without re-reading source.
+        (let [form (projection/segmented-reduce-contract-form program equation)
+              facts (contraction-facts/contraction-facts form :dtype output-dtype)]
+          [(segop/->SegContract equation-id facts output-dtype device-id)])
+        [(segop/->SegRed equation-id space
+                         (segop/->SegLevel :thread :virtual)
+                         operator nil inputs (set physical-results) scalars nil :segmented nil
+                         output-dtype)]))))
 
 (defn typed-scan-program?
   "Whether a validated one-equation TypedSOAC program is a certified scan."

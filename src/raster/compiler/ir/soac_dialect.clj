@@ -634,9 +634,9 @@
         {:keys [kind]} (operation-parts equation)
         storage (result-storage program-facts equation-id)]
     (when storage
-      (when-not (contains? #{'map 'scatter} kind)
+      (when-not (contains? #{'map 'scatter 'segmented-reduce} kind)
         (fail! :typed-soac-result-storage-operation
-               "physical result storage is valid only for map/scatter equations"
+               "physical result storage is valid only for map/scatter/segmented-reduce equations"
                {:equation equation-id :operation kind :storage storage}))
       (when-not (and (vector? storage)
                      (= (count results) (count storage))
@@ -646,7 +646,7 @@
                                    (contains? #{:buffer :effect} (:host-return %)))
                              storage))
         (fail! :typed-soac-result-storage
-               "result storage must align every map result with a typed destination contract"
+               "result storage must align every functional result with a typed destination contract"
                {:equation equation-id :results results :storage storage}))
       (let [destinations (mapv :destination storage)
             aliases (get-in program-facts [:equations equation-id :aliases])]

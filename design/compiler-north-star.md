@@ -317,10 +317,16 @@ multi-workgroup alternatives remain schedule candidates, not new semantic primit
 TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
 axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
 arbitrarily indexed tensor captures. Its extents participate in the typed program boundary and
-alpha-remapping, and it lowers mechanically to canonical `SegRed` without constructing the former
-`SoacContract` record. Moving analyzed `raster.par/contract` source onto this equation is the next
-front-end slice; the operation is intentionally not a matmul node, so scientific contractions,
-batched reductions and attention-derived reductions share the same semantic vocabulary.
+alpha-remapping, and general equations lower mechanically to canonical `SegRed` without
+constructing the former `SoacContract` record. Ordinary scalar `raster.par/contract` source now
+enters this equation directly; the operation is intentionally not a matmul node, so scientific
+contractions, batched reductions and attention-derived reductions share the same semantic
+vocabulary. Until the tensorization route consumes TypedSOAC itself, one shared mechanical
+projection supplies both host materialization and a `SegContract` schedule view. The GPU emitter
+reuses that scheduled view rather than re-reading source. Staged quantization, decode lambdas,
+declared physical maps, epilogues and output conversions remain on the certified compatibility
+front door until the typed equation has explicit facts for them; admitting them while dropping
+those contracts would be a miscompile, not migration progress.
 
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical

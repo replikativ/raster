@@ -12,6 +12,7 @@
             [raster.compiler.core.types :as types]
             [raster.compiler.core.util :as util]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.form :as form]
             [raster.compiler.ir.par :as par]
             [raster.compiler.ir.reduction :as reduction]
@@ -234,7 +235,7 @@
                io)))))
 
 (defn- operation-description
-  [id symbol expression]
+  [id symbol expression default-dtype]
   (cond
     (par/par-map-pure-form? expression)
     (let [{:keys [idx bound cast body elem-type]} (par/extract-par-map-pure-info expression)
@@ -284,6 +285,41 @@
                          :result symbol :index idx :step-result body
                          :attributes {:source :raster.par/reduce}})}
              io))
+
+    (and (seq? expression) (= 'raster.par/contract (first expression)))
+    (let [facts (contraction-facts/contraction-facts
+                 expression :dtype (or (:raster.type/elem-type (meta expression))
+                                       default-dtype :double))
+          {:keys [free-axes contract-axes out opts]} facts]
+      ;; The first direct slice is the ordinary scalar segmented-reduction algebra. Staged
+      ;; quantization and fused epilogues carry additional schedule/store contracts and must not
+      ;; be admitted by dropping those facts.
+      (when (and (seq free-axes) (seq contract-axes)
+                 ;; Decode lambdas, declared physical maps, staged accumulators, epilogues and
+                 ;; output conversions are not scalar fold syntax.  Keep them on the certified
+                 ;; contraction route until TypedSOAC represents those facts explicitly.
+                 (empty? (apply dissoc opts [:init :combine :algebra]))
+                 (reduction/scalar? (:reduction facts)))
+        (let [product (:reduction facts)
+              component (first (:components product))
+              step-result (first (:results (reduction/fold-region product)))
+              arrays (set (map :sym (:operands facts)))
+              axis-symbols (set (concat (map first free-axes) [(:index product)]))
+              bound-symbols (reduce set/union #{}
+                                    (map util/free-syms
+                                         (concat (map second free-axes)
+                                                 (map second contract-axes))))
+              scalars (set/difference
+                       (set/union bound-symbols (util/free-syms step-result))
+                       arrays axis-symbols #{(:accumulator component) out})]
+          {:kind :segmented-reduce :id id :sym symbol
+           :segment-axes free-axes
+           :reduce-index (:index product)
+           :reduce-extent (second (:flat-contract-axis facts))
+           :results [(effect-result-id id 0)]
+           :product product :inputs arrays :outputs #{out} :scalars scalars
+           :effect-only? true :host-binding symbol
+           :result-storage [{:destination out :access :write :host-return :effect}]})))
 
     (or (par/par-scan-form? expression)
         (par/par-scan-exclusive-form? expression))
@@ -392,9 +428,9 @@
     (first (descriptor/call-args expression))))
 
 (defn- source-descriptions
-  [pairs]
+  [pairs default-dtype]
   (mapv (fn [id [symbol expression]]
-          (or (operation-description id symbol expression)
+          (or (operation-description id symbol expression default-dtype)
               (if (par/par-form? expression)
                 {:kind :unsupported :id id :sym symbol :expr expression}
                 {:kind :scalar :id id :sym symbol :expr expression})))
@@ -449,7 +485,7 @@
 (defn- supported-descriptions?
   [descriptions]
   (let [physical-outputs (reduce set/union #{}
-                                 (map #(if (contains? #{:map :scatter :reduce :scan} (:kind %))
+                                 (map #(if (contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %))
                                          (:outputs %) #{})
                                       descriptions))]
     (every? (fn [description]
@@ -465,6 +501,8 @@
                               (every? (comp symbol? :destination)
                                       (:result-storage description)))
                 :reduce true
+                :segmented-reduce (and (seq (:segment-axes description))
+                                       (symbol? (get-in description [:result-storage 0 :destination])))
                 :scan (symbol? (:primary-out description))
                 false))
             descriptions)))
@@ -574,6 +612,29 @@
                  (vec (concat [(:accumulator component)] elements capture-parameters))
                  results)))))
 
+(defn- segmented-reduce-equation
+  [{:keys [id segment-axes reduce-index reduce-extent inputs scalars product results]}]
+  (let [component (first (:components product))
+        stable (vec (sort-by pr-str inputs))
+        captures (vec (sort-by pr-str (distinct (concat stable scalars))))
+        capture-parameters (capture-symbols (count captures))
+        step-results (mapv #(util/subst-syms (zipmap captures capture-parameters) %)
+                           (:results (reduction/fold-region product)))]
+    (list '= id results
+          (list 'segmented-reduce
+                {:segment-axes segment-axes
+                 :index reduce-index :extent reduce-extent
+                 :attributes {:stable-array-captures stable
+                              :source-operation :raster.par/contract}
+                 :accumulators [(:accumulator component)]
+                 :identities [(:neutral component)]
+                 :dtypes [(:dtype component)]
+                 :algebra [(:algebra product)]}
+                [] captures
+                (dialect/lambda-form
+                 (vec (concat [(:accumulator component)] capture-parameters))
+                 step-results)))))
+
 (defn- scan-equation
   [{:keys [id sym index extent mode inputs scalars primary-out accumulator identity dtype body]}]
   (let [[pointwise stable] ((juxt filter remove) #(pointwise-input? [body] % index) inputs)
@@ -626,16 +687,18 @@
 
 (defn- terminal-results
   [descriptions body]
-  (let [operations (filter #(contains? #{:map :scatter :reduce :scan} (:kind %)) descriptions)
+  (let [operations (filter #(contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %)) descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter) (:results %)
                                               :scan [(:sym %)]
+                                              :segmented-reduce (:results %)
                                               (:outputs %))
                                            operations))
         terminal-operation-definitions
         (set (mapcat #(case (:kind %)
                         (:map :scatter) (if (:effect-only? %) [] (:results %))
                         :scan [(:sym %)]
+                        :segmented-reduce (if (:effect-only? %) [] (:results %))
                         (:outputs %))
                      operations))
         scalar-definitions (set (keep #(when (= :scalar (:kind %)) (:sym %)) descriptions))
@@ -654,9 +717,9 @@
   (let [by-symbol (into {} (keep #(when (= :scalar (:kind %)) [(:sym %) %])) descriptions)
         roots (set (concat outputs
                            (mapcat (fn [equation]
-                                     (cond-> (dialect/operation-inputs equation)
-                                       (dialect/value-id? (dialect/operation-extent equation))
-                                       (conj (dialect/operation-extent equation))))
+                                     (into (dialect/operation-inputs equation)
+                                           (filter dialect/value-id?
+                                                   (dialect/operation-extents equation))))
                                    operation-equations)))]
     (loop [needed (set/intersection roots (set (keys by-symbol)))]
       (let [dependencies (set (mapcat #(util/free-syms (:expr (get by-symbol %))) needed))
@@ -681,14 +744,16 @@
   (let [[_ _ results] equation
         {:keys [kind attributes arrays captures]} (dialect/operation-parts equation)
         extent (:extent attributes)
+        dimension-ids (set (filter dialect/value-id? (dialect/operation-extents equation)))
         stable (set (get-in attributes [:attributes :stable-array-captures]))
         result-dtypes (case kind
                         scalar (:dtypes attributes)
                         reduce (:dtypes attributes)
+                        segmented-reduce (:dtypes attributes)
                         scan (:dtypes attributes)
                         (map scatter) (map #(value-dtype % default-dtype array-types) results))]
     (merge
-     (if (and extent (dialect/value-id? extent)) {extent (tensor-value :long [])} {})
+     (into {} (map (fn [id] [id (tensor-value :long [])])) dimension-ids)
      (into {} (map (fn [id] [id (tensor-value (value-dtype id default-dtype array-types)
                                               (dialect/extent-shape extent))]) arrays))
      (if (= 'scalar kind)
@@ -702,7 +767,9 @@
                                                (tensor-value declared [])))]
                           [id value]))) captures)
        (into {} (map (fn [id]
-                       [id (or (get known-values id)
+                       [id (or (when (contains? dimension-ids id)
+                                 (tensor-value :long []))
+                               (get known-values id)
                                (if (or (contains? stable id)
                                        (contains? array-types id)
                                        (and (symbol? id)
@@ -717,6 +784,8 @@
                      [id (tensor-value (or result-dtype default-dtype :double)
                                        (case kind
                                          (scalar reduce) []
+                                         segmented-reduce
+                                         (dialect/segmented-reduce-result-shape attributes)
                                          scan (dialect/scan-result-shape attributes)
                                          scatter [(list 'unknown-dimension id)]
                                          (dialect/extent-shape extent)))])
@@ -749,15 +818,16 @@
   (when (and (seq? source) (contains? #{'let 'let*} (first source)))
     (let [[_ bindings & body] source
           pairs (vec (partition 2 bindings))
-          descriptions (normalize-extents (source-descriptions pairs))]
+          descriptions (normalize-extents (source-descriptions pairs dtype))]
       (when (and (even? (count bindings))
                  (seq descriptions)
                  (supported-descriptions? descriptions))
         (let [operation-descriptions
-              (filterv #(contains? #{:map :scatter :reduce :scan} (:kind %)) descriptions)
+              (filterv #(contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %)) descriptions)
               operation-equations (mapv #(case (:kind %) :map (map-equation %)
                                                :scatter (scatter-equation %)
                                                :reduce (reduce-equation %)
+                                               :segmented-reduce (segmented-reduce-equation %)
                                                :scan (scan-equation %))
                                         operation-descriptions)
               outputs (terminal-results descriptions body)
@@ -774,13 +844,14 @@
                                   (update :equation-descriptions conj description)
                                   (assoc-in [:scalar-dtypes (:sym description)] result-dtype)))
                             state)
-                          (:map :scatter :reduce :scan)
+                          (:map :scatter :reduce :segmented-reduce :scan)
                           (-> state
                               (update :equations conj
                                       (case (:kind description)
                                         :map (map-equation description)
                                         :scatter (scatter-equation description)
                                         :reduce (reduce-equation description)
+                                        :segmented-reduce (segmented-reduce-equation description)
                                         :scan (scan-equation description)))
                               (update :equation-descriptions conj description))))
                       {:equations [] :equation-descriptions [] :scalar-dtypes {}}
@@ -788,12 +859,12 @@
               equation-info (mapv (fn [equation]
                                     {:results (nth equation 2)
                                      :inputs (dialect/operation-inputs equation)
-                                     :extent (dialect/operation-extent equation)})
+                                     :extents (dialect/operation-extents equation)})
                                   equations)
               definitions (set (mapcat :results equation-info))
-              references (set (mapcat #(cond-> (:inputs %)
-                                         (and (:extent %) (dialect/value-id? (:extent %)))
-                                         (conj (:extent %))) equation-info))
+              references (set (mapcat #(into (:inputs %)
+                                             (filter dialect/value-id? (:extents %)))
+                                      equation-info))
               inputs (vec (sort-by pr-str (set/difference references definitions)))
               logical-result-types
               (into {}
