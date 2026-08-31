@@ -41,6 +41,22 @@
                                 :local-definitions local-definitions
                                 :body-results body-results}))))
 
+(def ^:private segmented-reduce-equation-rule
+  (from-dialect dialect/TypedSOAC
+                (rule '(= ?equation-id [??results]
+                          (segmented-reduce ?attributes [??arrays] [??captures]
+                                            (lambda [??parameters]
+                                                    (region [??local-definitions]
+                                                            [??body-results]))))
+                      (success {:kind :segmented-reduce
+                                :id equation-id
+                                :results results
+                                :attributes attributes
+                                :arrays arrays
+                                :captures captures
+                                :local-definitions local-definitions
+                                :body-results body-results}))))
+
 (def ^:private scatter-equation-rule
   (from-dialect dialect/TypedSOAC
                 (rule '(= ?equation-id [??results]
@@ -95,6 +111,7 @@
                     (map-equation-rule equation)
                     (scatter-equation-rule equation)
                     (reduce-equation-rule equation)
+                    (segmented-reduce-equation-rule equation)
                     (scan-equation-rule equation)])]
     (let [lambda (:lambda (dialect/operation-parts equation))]
       (merge (dissoc matched :local-definitions)
@@ -102,9 +119,8 @@
 
 (defn- equation-references
   [equation]
-  (let [{:keys [arrays captures attributes]} (equation-info equation)]
-    (cond-> (vec (concat arrays captures))
-      (:extent attributes) (conj (:extent attributes)))))
+  (let [{:keys [arrays captures]} (equation-info equation)]
+    (into (vec (concat arrays captures)) (dialect/operation-extents equation))))
 
 (defn- element-symbols
   [n]
@@ -116,7 +132,7 @@
 
 (defn- parameter-parts
   [info]
-  (let [accumulator-count (if (contains? #{:reduce :scan} (:kind info))
+  (let [accumulator-count (if (contains? #{:reduce :segmented-reduce :scan} (:kind info))
                             (count (get-in info [:attributes :accumulators]))
                             0)
         array-count (count (:arrays info))

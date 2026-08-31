@@ -323,7 +323,12 @@
 
 (defn- shape! [owner shape]
   (when-not (and (vector? shape) (seq shape)
-                 (every? #(or (value-id? %) (and (integer? %) (pos? %))) shape))
+                 (every? #(or (value-id? %)
+                              (and (integer? %) (pos? %))
+                              (and (record-kind?
+                                    "raster.compiler.ir.kernel_body.IndexExpr" %)
+                                   (expression? %)))
+                         shape))
     (throw (ex-info (str owner " requires a non-empty shape of positive extents")
                     {:shape shape}))))
 

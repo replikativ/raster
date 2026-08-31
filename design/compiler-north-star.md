@@ -314,6 +314,22 @@ contains only values, output indices, row count and width; ties select the lowes
 NaN outranks numeric values so corruption is visible and deterministic. Subgroup/shuffle and
 multi-workgroup alternatives remain schedule candidates, not new semantic primitives.
 
+TypedSOAC now also names the general `segmented-reduce` algebra directly: ordered parallel segment
+axes, one innermost reduction axis, typed accumulator products, dense element operands and stable
+arbitrarily indexed tensor captures. Its extents participate in the typed program boundary and
+alpha-remapping, and it lowers mechanically to canonical `SegRed` without constructing the former
+`SoacContract` record. Moving analyzed `raster.par/contract` source onto this equation is the next
+front-end slice; the operation is intentionally not a matmul node, so scientific contractions,
+batched reductions and attention-derived reductions share the same semantic vocabulary.
+
+Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
+and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
+one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;
+`SegContract`, generic `SegRed` fallback and peak routing consume those facts unchanged. Free axes,
+operand axis maps, decode/storage precision, epilogues and staged accumulator structure remain
+orthogonal contraction facts and schedule choices. This is the semantic bridge toward representing
+contraction as an ordinary segmented TypedSOAC reduction, not a new hard-coded GEMM algebra.
+
 Indexed storage movement remains a separate generic operation. Allocation-free `gather-blocks!`
 and `scatter-blocks!` move contiguous typed blocks between dense staging and routed resident
 storage through the direct TypedSOAC→SegMap vertical: gather is a stable indexed read in a dense

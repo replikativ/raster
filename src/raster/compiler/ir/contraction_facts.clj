@@ -21,8 +21,11 @@
    actual index. A declaration that fails verification does not fall back to derivation; it makes
    the whole extraction fail. Trusting a declared layout while having checked only its axis
    symbols is how a transpose rewrite risked a silent miscompile."
-  (:require [raster.compiler.ir.axis-map :as am]
-            [raster.compiler.core.op-descriptor :as od]))
+  (:require [clojure.walk :as walk]
+            [raster.compiler.core.op-descriptor :as od]
+            [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.contract-stages :as contract-stages]
+            [raster.compiler.ir.reduction :as reduction]))
 
 (def ^:private facts-tag ::facts)
 
@@ -41,6 +44,60 @@
       (throw (ex-info "contract form: trailing options must be key/value pairs"
                       {:reason :malformed-opts :opts (vec tail)})))
     (apply hash-map tail)))
+
+(defn flatten-contract-axes
+  "Normalize one or more contraction axes to the single reduced coordinate consumed by SegRed.
+   Returns `[index extent body]`, with original axis references replaced by row-major coordinate
+   decomposition. This is part of semantic fact construction, not an emitter-specific rewrite."
+  [contract-axes body]
+  (if (= 1 (count contract-axes))
+    (let [[[index extent]] contract-axes]
+      [index extent body])
+    (let [flat-index (gensym "contract_index__")
+          extents (mapv second contract-axes)
+          multiply (fn [values]
+                     (if (every? number? values)
+                       (reduce * values)
+                       (reduce (fn [left right]
+                                 (list 'clojure.core/* left right))
+                               values)))
+          flat-extent (multiply extents)
+          suffix (fn [position]
+                   (let [remaining (subvec extents (inc position))]
+                     (if (empty? remaining) 1 (multiply remaining))))
+          substitutions
+          (into {}
+                (map-indexed
+                 (fn [position [index _]]
+                   [index (list 'clojure.core/rem
+                                (list 'clojure.core/quot flat-index (suffix position))
+                                (nth extents position))])
+                 contract-axes))]
+      [flat-index flat-extent (walk/postwalk-replace substitutions body)])))
+
+(defn- canonical-reduction-facts
+  [out contract-axes body opts dtype]
+  (when (seq contract-axes)
+    (let [stages (:stages opts)
+          semantic-body (if (seq stages)
+                          (contract-stages/flat-equivalent stages body)
+                          body)
+          [index extent flat-body] (flatten-contract-axes contract-axes semantic-body)
+          accumulator (gensym "contract_acc__")
+          operator
+          (reduction/scalar
+           {:accumulator accumulator
+            :neutral (get opts :init 0.0)
+            :dtype (or (:acc-dtype opts) dtype)
+            :result out
+            :index index
+            :step-result (list (get opts :combine '+) accumulator flat-body)
+            :algebra (or (:algebra opts) {})
+            :attributes {:source :raster.par/contract
+                         :contract-axes (mapv vec contract-axes)
+                         :stages stages}})]
+      {:reduction operator
+       :flat-contract-axis [index extent]})))
 
 (defn- aget-terms
   "Every array read the expression makes, as {:sym :idx}, in encounter order.
@@ -93,25 +150,47 @@
         roles (merge (into {} (map-indexed (fn [n [a _]] [(keyword (str "free" n)) a])) free-axes)
                      (into {} (map-indexed (fn [n [a _]] [(keyword (str "contract" n)) a])) contract-axes))
         dims (merge (into {} (map-indexed (fn [n [_ e]] [(keyword (str "free" n)) e])) free-axes)
-                    (into {} (map-indexed (fn [n [_ e]] [(keyword (str "contract" n)) e])) contract-axes))]
-    {facts-tag true
-     :form form
-     :out out
-     :free-axes (mapv vec free-axes)
-     :contract-axes (mapv vec contract-axes)
-     :n-free (count free-axes)
-     :n-contract (count contract-axes)
-     :body body
-     :operands terms
-     :combine (get opts :combine '+)
-     :init (get opts :init 0.0)
-     :dtype dtype
-     :out-dtype (get opts :out-dtype)
-     :stages (:stages opts)
-     :epilogue (:epilogue opts)
-     :roles roles
-     :dims dims
-     :opts opts}))
+                    (into {} (map-indexed (fn [n [_ e]] [(keyword (str "contract" n)) e])) contract-axes))
+        normalized (canonical-reduction-facts out contract-axes body opts dtype)]
+    (merge
+     {facts-tag true
+      :form form
+      :out out
+      :free-axes (mapv vec free-axes)
+      :contract-axes (mapv vec contract-axes)
+      :n-free (count free-axes)
+      :n-contract (count contract-axes)
+      :body body
+      :operands terms
+      ;; Compatibility projections. New semantic and schedule passes consume :reduction; leaf
+      ;; gates still read these until the contraction KernelBody vertical is complete.
+      :combine (get opts :combine '+)
+      :init (get opts :init 0.0)
+      :dtype dtype
+      :out-dtype (get opts :out-dtype)
+      :stages (:stages opts)
+      :epilogue (:epilogue opts)
+      :roles roles
+      :dims dims
+      :opts opts}
+     normalized)))
+
+(defn scalar-reduction-view
+  "Project the canonical one-component ProductReduction into the contraction facts needed by
+   legality and schedule passes. This is a checked view, not a second stored representation."
+  [facts]
+  (when-not (facts? facts)
+    (throw (ex-info "contraction reduction view requires verified facts"
+                    {:reason :raster/bug :facts facts})))
+  (let [{:keys [acc init lambda]} (reduction/scalar-op (:reduction facts))]
+    (when-not (and (seq? lambda) (= 3 (count lambda)) (= acc (second lambda)))
+      (throw (ex-info "canonical contraction reduction is not an accumulator/element fold"
+                      {:reason :raster/bug :accumulator acc :lambda lambda})))
+    {:accumulator acc
+     :neutral init
+     :combine (first lambda)
+     :element (nth lambda 2)
+     :dtype (first (reduction/dtypes (:reduction facts)))}))
 
 ;; ── body shape: what a leaf that DISCARDS the body must first account for ────────────
 (defn body-product-of
@@ -144,6 +223,35 @@
     (for [i (range (count xs))
           rest-perm (permutations (concat (take i xs) (drop (inc i) xs)))]
       (into [(nth xs i)] rest-perm))))
+
+(defn- subsets
+  [values]
+  (if-let [value (first values)]
+    (let [tail (subsets (next values))]
+      (concat tail (map #(cons value %) tail)))
+    (list '())))
+
+(defn operand-axis-map
+  "Return a verified physical AxisMap for one contraction operand.
+
+   Explicit maps were verified while facts were constructed. For ordinary dense operands, infer
+   only a plain permutation/broadcast map whose generated flat index is provably equal to the
+   actual load index. Non-affine gathers and ambiguous layouts return nil and therefore cannot
+   enter a schedule that needs a physical buffer shape."
+  [facts operand]
+  (when-not (facts? facts)
+    (throw (ex-info "operand map inference requires verified contraction facts"
+                    {:reason :raster/bug :facts facts})))
+  (let [operand (if (symbol? operand)
+                  (some #(when (= operand (:sym %)) %) (:operands facts))
+                  operand)]
+    (when operand
+      (or (:map operand)
+          (let [axes (vec (concat (:free-axes facts) (:contract-axes facts)))
+                candidates (for [selection (rest (sort-by count (subsets axes)))
+                                 ordering (permutations selection)]
+                             (am/of-axes ordering))]
+            (first (filter #(am/index-matches? % (:idx operand)) candidates)))))))
 
 ;; ── leaf layout requirements as DATA ────────────────────────────────────────────────
 (def leaf-layouts

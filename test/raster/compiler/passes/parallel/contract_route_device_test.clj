@@ -102,20 +102,20 @@
     (is (route/par-contract-form? (matmul-form 8 8 8)))
     (is (not (route/par-contract-form? '(raster.par/map! a i 8 body))))))
 
-;; ── A1a: 0-contract (outer product → SegMap) + n-free (batch → naive segred) ──────────
+;; ── A1a: 0-contract (outer product → SegMap) + n-free (batch → portable SegRed) ───────
 (defn- launch-1d-routed
-  "Launch a routed 1-D contraction (segmap / naive-segred) with a trailing nseg count."
+  "Launch a routed 1-D contraction with a trailing nseg count."
   [r bufs out-buf nseg]
   (let [ze (find-ns 'raster.gpu.ze-runtime)
         register! (ns-resolve ze 'register-kernel!)
         ensure-loaded! (ns-resolve ze 'ensure-kernel-loaded!)
-        launch-2d! (ns-resolve ze 'launch-2d!)
+        launch-geometry! (ns-resolve ze 'launch-geometry!)
         buf->doubles (ns-resolve ze 'buffer->double-array)
         _ (register! (:kernel-name r) {:source (:source r) :dtype (:dtype r)})
         {:keys [kernel-handle]} (ensure-loaded! (:kernel-name r))
         args (into (mapv #(:segment (get bufs %)) (:array-params r))
                    [(:segment out-buf) {:type :int :value (int nseg)}])]
-    (launch-2d! kernel-handle (:wg r) (:grid r) args)
+    (launch-geometry! kernel-handle (:wg r) (:grid r) args)
     (vec (buf->doubles out-buf))))
 
 (defn- mk-f64 [xs] (let [ze (find-ns 'raster.gpu.ze-runtime)
@@ -136,10 +136,10 @@
         (is (= :segmap (:strategy r)))
         (is (= gpu cpu))))))
 
-(deftest a1a-n-free-routes-to-naive-segred
+(deftest a1a-n-free-routes-to-portable-segred
   (if-not @gpu?
     (println "[skip] a1a-naive-segred: no GPU")
-    (testing "3 free + 1 contract (batch matmul) → :naive-segred; == reference on device"
+    (testing "3 free + 1 contract (batch matmul) → :portable-segred; == reference on device"
       (let [B 2 M 4 N 3 K 5
             Ad (double-array (map #(* 0.1 (double %)) (range (* B M K))))
             Bd (double-array (map #(* 0.2 (double %)) (range (* B K N))))
@@ -155,13 +155,13 @@
                        (reduce + (for [l (range K)]
                                    (* (aget Ad (+ (* (+ (* bb M) i) K) l))
                                       (aget Bd (+ (* (+ (* bb K) l) N) j)))))))]
-        (is (= :naive-segred (:strategy r)))
+        (is (= :portable-segred (:strategy r)))
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
 
-(deftest a1c-multi-contract-flattens-and-routes-to-naive-segred
+(deftest a1c-multi-contract-flattens-and-routes-to-portable-segred
   (if-not @gpu?
     (println "[skip] a1c-multi-contract: no GPU")
-    (testing "2 contract axes → flattened → :naive-segred; C[i]=Σ_{l1,l2} A[i,l1,l2]·V[l1,l2] == ref"
+    (testing "2 contract axes → flattened → :portable-segred; C[i]=Σ_{l1,l2} A[i,l1,l2]·V[l1,l2] == ref"
       (let [I 4
             A (double-array (map #(* 0.1 (double %)) (range (* I 2 3))))
             V (double-array (map #(* 0.5 (double %)) (range 6)))
@@ -176,7 +176,7 @@
             cpu (vec (for [i (range I)]
                        (reduce + (for [l1 (range 2) l2 (range 3)]
                                    (* (aget A (+ (* i 6) (* l1 3) l2)) (aget V (+ (* l1 3) l2)))))))]
-        (is (= :naive-segred (:strategy r)))
+        (is (= :portable-segred (:strategy r)))
         (is (every? true? (map #(< (Math/abs (- (double %1) (double %2))) 1.0e-9) gpu cpu)))))))
 
 ;; ── A3: output-axis permutation falls out of free-axis DECLARATION ORDER ──────────────
@@ -337,10 +337,10 @@
     (testing "0 contract axes → :segmap"
       (is (= :segmap (strategy '(raster.par/contract C [[i 4] [j 3]] []
                                                      (* (aget a i) (aget b j))) :dtype :double))))
-    (testing "n free ≠ 2 → :naive-segred"
+    (testing "an unprovable gather retains the verified source fallback"
       (is (= :naive-segred (strategy '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
                                                            (* (aget A x) (aget B y))) :dtype :double))))
-    (testing "n ≥ 2 contract axes → :naive-segred (flattened)"
+    (testing "an unprovable gather still falls back after multi-axis flattening"
       (is (= :naive-segred (strategy '(raster.par/contract C [[i 4]] [[l1 2] [l2 3]]
                                                            (* (aget A x) (aget V y))) :dtype :double))))
     (testing "2 free + 1 contract: f16 canonical → :dpas, f64 → :regtiled"

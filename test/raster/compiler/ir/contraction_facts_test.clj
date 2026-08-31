@@ -7,7 +7,8 @@
    against axes derived from itself, and a body-replacing leaf that never checked the body."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.contraction-facts :as cf]
-            [raster.compiler.ir.axis-map :as am]))
+            [raster.compiler.ir.axis-map :as am]
+            [raster.compiler.ir.reduction :as reduction]))
 
 (def ^:private ma (am/of-groups '[[[i 4]] [[blk 4] [t 32]]]))
 (def ^:private mb (am/of-groups '[[[j 6]] [[blk 4] [t 32]]]))
@@ -31,7 +32,14 @@
       (is (= '{:free0 i :free1 j :contract0 blk :contract1 t} (:roles f)))
       (is (= {:free0 4 :free1 6 :contract0 4 :contract1 32} (:dims f))))
     (testing "operands are the body's aget reads"
-      (is (= '[a b] (mapv :sym (:operands f)))))))
+      (is (= '[a b] (mapv :sym (:operands f)))))
+    (testing "one canonical ProductReduction owns fold semantics before scheduling"
+      (let [operator (:reduction f)]
+        (is (reduction/product-reduction? operator))
+        (is (= :byte (first (reduction/dtypes operator))))
+        (is (= [(:index operator) 128] (:flat-contract-axis f)))
+        (is (= (:element (cf/scalar-reduction-view f))
+               (second (rest (first (:results (reduction/fold-region operator)))))))))))
 
 (deftest a-stage-list-cannot-supply-the-axes-it-is-checked-against
   (testing "the form's contract axes are independent of its :stages — the two are separate slots,

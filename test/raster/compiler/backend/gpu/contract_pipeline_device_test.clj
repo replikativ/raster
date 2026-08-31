@@ -100,7 +100,7 @@
 ;; ── Phase 0: EVERY routed strategy survives the pipeline (descriptor passed through intact) ──
 ;; Before the descriptor fix, only :dpas (3 scalar-args) and :regtiled (0) worked: the invoke
 ;; reconstructed scalar-args from a `case` with no default and destructured [m n k] from :dims,
-;; so :segmap / :naive-segred (1 scalar-arg, :dims [nseg]) crashed, and quant's f32 output was
+;; so :segmap / general SegRed (1 scalar-arg, :dims [nseg]) crashed, and quant's f32 output was
 ;; staged at int8 size (4× undersized).
 (defn- run-form [form dt args-map out-len]
   (let [{:keys [form kernels]} (ocl/opencl-pass form :dtype dt :compile-spirv? false)
@@ -120,7 +120,7 @@
               out (run-form form :double {'a a 'b b} 12)
               ref (vec (for [i (range 4) j (range 3)] (* (aget a i) (aget b j))))]
           (is (= (vec out) ref))))
-      (testing ":naive-segred (3 free axes, batch matmul) through opencl-pass → device"
+      (testing ":portable-segred (3 free axes, batch matmul) through opencl-pass → device"
         (let [B 2 M 3 N 2 K 4
               A (double-array (map #(* 0.1 (double %)) (range (* B M K))))
               Bd (double-array (map #(* 0.2 (double %)) (range (* B K N))))
@@ -153,7 +153,7 @@
           call (kcall/make artifact runtime-arguments)]
       (is (some? (:out-elems r)))
       (is (not (number? (:out-elems r))))            ; carried symbolically
-      (is (contains? #{:regtiled :naive-segred} (:strategy r)))
+      (is (contains? #{:regtiled :portable-segred} (:strategy r)))
       ;; STRENGTHENED: the original assertion only checked that routing did not CRASH, which let a
       ;; real bug through — the descriptor supplied 1 scalar arg where the kernel declares 4
       ;; (int k, int m, int n, int _nseg), so a caller would have mis-bound at launch. The
@@ -163,6 +163,6 @@
       (is (= '[k m n] (mapv :value (butlast (:scalar-args r))))
           "…in the kernel's declared (name-sorted) order")
       (is (= (:out-elems r) (:value (last (:scalar-args r)))))
-      (is (= [256 1] (get-in call [:geometry :workgroup-size])))
-      (is (= [2 1] (get-in call [:geometry :group-count]))
+      (is (= [256] (get-in call [:geometry :workgroup-size])))
+      (is (= [2] (get-in call [:geometry :group-count]))
           "the artifact resolves its symbolic ceil-div grid from ordered ABI values"))))

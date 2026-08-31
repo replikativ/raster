@@ -12,9 +12,9 @@
    `SoacReduce` fuses its map into the canonical reduction operator."
   (:require [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.par :as ir-par]
-            [raster.compiler.ir.reduction :as reduction]
-            [clojure.set :as set]
-            [clojure.walk :as walk]))
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.core.util :as util]
+            [clojure.set :as set]))
 
 (defn flatten-contract-axes
   "Flatten n≥1 contract axes into ONE innermost reduced dim (the A0 convention, endorsed by
@@ -24,58 +24,45 @@
    the flat index: li = (kflat / prod(bounds after i)) mod bound_i. For a single contract axis
    this is the identity. The naive segmented emitter then loops the single k-sym unchanged."
   [contract-axes body]
-  (if (= 1 (count contract-axes))
-    (let [[[k-sym k-bound]] contract-axes] [k-sym k-bound body])
-    (let [flat-sym (gensym "kflat__")
-          bounds   (mapv second contract-axes)
-          k-bound  (if (every? number? bounds) (reduce * bounds)
-                       (reduce (fn [a b] (list 'clojure.core/* a b)) bounds))
-          suffix   (fn [p] (let [after (subvec bounds (inc p))]
-                             (cond (empty? after) 1
-                                   (every? number? after) (reduce * after)
-                                   :else (reduce (fn [a b] (list 'clojure.core/* a b)) after))))
-          subst    (into {} (map-indexed
-                             (fn [p [s _]]
-                               [s (list 'clojure.core/rem
-                                        (list 'clojure.core/quot flat-sym (suffix p))
-                                        (nth bounds p))])
-                             contract-axes))]
-      [flat-sym k-bound (walk/postwalk-replace subst body)])))
+  (contraction-facts/flatten-contract-axes contract-axes body))
 
 (defn contract-form->segred
   "Parse `(raster.par/contract out [[i mi] …] [[k mk]] body & opts)` → a segmented SegRed.
    opts: :init (combine init, default 0.0), :combine (default +). :id/:dtype/:grid via
-   kwargs. Prototype: exactly one contracted axis. Pure + device-free (grid stays the
-   passed value, default nil — the device-aware pass fills it)."
-  [form & {:keys [id dtype grid] :or {id 0 dtype :double grid nil}}]
-  (let [[_ out free-axes contract-axes body & opts] form
-        opts-map (apply hash-map opts)
-        init (get opts-map :init 0.0)
-        combine (get opts-map :combine '+)
+   kwargs. Supports one or more contracted axes. Pure + device-free (grid stays the passed value,
+   default nil — the device-aware pass fills it)."
+  [form & {:keys [id dtype grid facts] :or {id 0 dtype :double grid nil}}]
+  (let [[_ out free-axes contract-axes] form
+        facts (or facts (contraction-facts/contraction-facts form :dtype dtype))
+        _ (when-not (and (contraction-facts/facts? facts)
+                         (= form (:form facts))
+                         (= dtype (:dtype facts)))
+            (throw (ex-info "contract lowering requires facts derived from the same form"
+                            {:reason :contraction-facts-mismatch
+                             :form form :dtype dtype :facts facts})))
         ;; ZERO free axes is legal: the SegSpace then has only the reduced dim, i.e. exactly the
         ;; 1-D shape (segop/seg-space-1d?) that the full-reduction emitter consumes.
         _ (assert (vector? free-axes) "contract-lower: free-axes must be a vector")
         _ (assert (and (vector? contract-axes) (pos? (count contract-axes)))
                   "contract-lower: contract-form->segred needs ≥1 contract axis (0 → contract-form->segmap)")
         _ (assert (symbol? out) "contract-lower: out must be a symbol")
-        ;; n≥2 contract axes → flatten into one innermost reduced dim + substitute indices.
-        [k-sym k-bound body] (flatten-contract-axes contract-axes body)
+        ;; The canonical ProductReduction and flattened axis/body were derived together once.
+        [k-sym k-bound] (:flat-contract-axis facts)
+        body (:element (contraction-facts/scalar-reduction-view facts))
         free-dims (mapv (fn [[s b]] {:name s :bound b}) free-axes)
         red-dim   {:name k-sym :bound k-bound}
         ;; N-D space: free (segment) dims OUTER, contracted (reduced) dim INNERMOST.
         space (segop/make-seg-space-nd (conj free-dims red-dim))
-        acc-sym (gensym "acc__")
-        ;; fused map→reduce: product sits in the combine's element slot.
-        reduction (reduction/scalar
-                   {:accumulator acc-sym :neutral init :dtype dtype :result out
-                    :index k-sym :step-result (list combine acc-sym body)
-                    :attributes {:source :raster.par/contract}})
+        reduction (:reduction facts)
         arrays  (set (ir-par/collect-aget-arrays body))
         inputs  (disj arrays out)
-        ;; scalars = the symbol-valued axis bounds (the contraction dims). Body-level
-        ;; extra scalars (e.g. a scale) are a later refinement.
-        bound-syms (into #{} (filter symbol?)
-                         (conj (mapv second free-axes) k-bound))]
+        ;; Flattening two or more reduction axes makes k-bound a typed arithmetic expression.
+        ;; Preserve every dimension scalar it references; collecting only direct symbol bounds
+        ;; silently omitted l1/l2 from the ABI of an otherwise valid portable contraction.
+        ;; Body-level extra scalars (e.g. a scale) are a later refinement.
+        bound-syms (reduce set/union #{}
+                           (map util/free-syms
+                                (conj (mapv second free-axes) k-bound)))]
     (segop/->SegRed id space
                     (segop/->SegLevel :thread :virtual)
                     reduction

@@ -4,6 +4,7 @@
             [raster.arrays :as ra]
             [raster.compiler.pipeline :as pipeline]
             [raster.compiler.backend.gpu.opencl-pass :as op]
+            [raster.compiler.core.hardware :as hardware]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -38,8 +39,9 @@
 (defn- compile-form
   ([contract] (compile-form contract :half))
   ([contract dtype]
-   (op/opencl-pass (list 'let* ['result contract] 'result)
-                   :device-id :ze:0 :dtype dtype :min-elements 0)))
+   (with-redefs [hardware/descriptor-for (constantly nil)]
+     (op/opencl-pass (list 'let* ['result contract] 'result)
+                     :device-id :ze:0 :dtype dtype :min-elements 0))))
 
 (defn- thrown-data [thunk]
   (try

@@ -11,7 +11,8 @@
             [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.contraction-facts :as facts]
             [raster.compiler.ir.kernel-body :as body]
-            [raster.compiler.ir.kernel-launch :as launch]))
+            [raster.compiler.ir.kernel-launch :as launch]
+            [raster.compiler.passes.parallel.contraction-body :as contraction-body]))
 
 (defn- decline [reason & [data]]
   (merge {:ok false :reason reason} data))
@@ -276,8 +277,9 @@
    (when-not (facts/facts? contract-facts)
      (throw (ex-info "contraction scheduling requires verified contraction facts"
                      {:reason :raster/bug :facts contract-facts})))
-   (let [{:keys [dtype free-axes contract-axes body combine init operands epilogue]}
+   (let [{:keys [dtype free-axes contract-axes operands epilogue]}
          contract-facts
+         {:keys [element combine neutral]} (facts/scalar-reduction-view contract-facts)
          authoritative-desc? (and desc (or (:backend desc) (:execution desc)))
          matrix-capability-unavailable? (and authoritative-desc? (nil? (:matrix desc)))
          raw-tile (when-not matrix-capability-unavailable?
@@ -310,10 +312,10 @@
        (not (additive? combine))
        (decline :non-plus-combine {:combine combine})
 
-       (not (zero-init? init))
-       (decline :non-zero-matrix-init {:init init})
+       (not (zero-init? neutral))
+       (decline :non-zero-matrix-init {:init neutral})
 
-       (nil? (facts/body-product-of body (map :sym operands)))
+       (nil? (facts/body-product-of element (map :sym operands)))
        (decline :body-has-unmodeled-terms)
 
        (not (:ok layout-verdict))
@@ -365,3 +367,38 @@
                 :bindings bindings
                 :epilogue epilogue
                 :provenance {:dialect :segcontract :operation-id operation-id}})}))))
+
+(defn- portable-workgroup-size
+  [desc]
+  (let [limit (long (or (get-in desc [:execution :max-workgroup-size]) 256))
+        limit (max 1 (min 256 limit))]
+    (loop [width 1]
+      (if (<= (* 2 width) limit) (recur (* 2 width)) width))))
+
+(defn plan-portable-body
+  "Apply the portable sequential-segment schedule to a verified contraction SegRed.
+
+   The descriptor affects only legal launch width. Unsupported semantic/indexing cases return a
+   structured decline so the established source emitter remains available during migration."
+  ([contract-facts segred desc]
+   (plan-portable-body contract-facts segred desc {}))
+  ([contract-facts segred desc {:keys [array-types scalar-types]
+                                :or {array-types {} scalar-types {}}}]
+   (try
+     (let [workgroup-size (portable-workgroup-size desc)
+           lowered (contraction-body/lower
+                    contract-facts segred
+                    {:workgroup-size workgroup-size
+                     :array-types array-types :scalar-types scalar-types})]
+       {:ok true
+        :body (:kernel-body lowered)
+        :workgroup-size workgroup-size
+        :arrays (:arrays lowered)
+        :scalars (:scalars lowered)
+        :segment-count (:segment-count lowered)})
+     (catch clojure.lang.ExceptionInfo exception
+       (if (contraction-body/declined? exception)
+         {:ok false
+          :reason (:missing-rule (ex-data exception))
+          :detail (ex-data exception)}
+         (throw exception))))))

@@ -280,7 +280,7 @@
       ;; flatten-contract-axes collapses n≥2 axes into one flat index k-sym and substitutes
       ;; each original contract index in the body (one source of truth with the compiler path).
       (let [[k-sym k-bound sbody]
-            ((requiring-resolve 'raster.compiler.passes.parallel.contract-lower/flatten-contract-axes)
+            ((requiring-resolve 'raster.compiler.ir.contraction-facts/flatten-contract-axes)
              contract-axes body)]
         `(let [~out-sym ~out ~F-sym ~F-expr]
            (dotimes [~f-sym ~F-sym]
