@@ -224,6 +224,35 @@
           rest-perm (permutations (concat (take i xs) (drop (inc i) xs)))]
       (into [(nth xs i)] rest-perm))))
 
+(defn- subsets
+  [values]
+  (if-let [value (first values)]
+    (let [tail (subsets (next values))]
+      (concat tail (map #(cons value %) tail)))
+    (list '())))
+
+(defn operand-axis-map
+  "Return a verified physical AxisMap for one contraction operand.
+
+   Explicit maps were verified while facts were constructed. For ordinary dense operands, infer
+   only a plain permutation/broadcast map whose generated flat index is provably equal to the
+   actual load index. Non-affine gathers and ambiguous layouts return nil and therefore cannot
+   enter a schedule that needs a physical buffer shape."
+  [facts operand]
+  (when-not (facts? facts)
+    (throw (ex-info "operand map inference requires verified contraction facts"
+                    {:reason :raster/bug :facts facts})))
+  (let [operand (if (symbol? operand)
+                  (some #(when (= operand (:sym %)) %) (:operands facts))
+                  operand)]
+    (when operand
+      (or (:map operand)
+          (let [axes (vec (concat (:free-axes facts) (:contract-axes facts)))
+                candidates (for [selection (rest (sort-by count (subsets axes)))
+                                 ordering (permutations selection)]
+                             (am/of-axes ordering))]
+            (first (filter #(am/index-matches? % (:idx operand)) candidates)))))))
+
 ;; ── leaf layout requirements as DATA ────────────────────────────────────────────────
 (def leaf-layouts
   "Each tensorize leaf's required operand layout, as ROLE → the axis roles that index it,

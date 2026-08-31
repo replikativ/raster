@@ -53,7 +53,7 @@
         (is (not (re-find #"DECLINED a conversion" s)) "nothing declines any more"))
       (testing "the kernel section names the leaf, the headline reason, and every leaf that refused"
         (is (re-find #"--- Kernels ---" s))
-        (is (re-find #"strategy=:naive-segred" s))
+        (is (re-find #"strategy=:portable-segred" s))
         (is (re-find #"fallback-reason=:symbolic-dims" s))
         (is (re-find #"declined :dpas: :dtype-not-dpas" s))
         (is (re-find #"declined :regtiled: :symbolic-dims" s))))))

@@ -129,8 +129,12 @@
     (second expression)
     expression))
 
-(defn- element-operations
-  [expression {:keys [index coordinate dtype arrays scalars]}]
+(defn lower-element-operations
+  "Lower a scalar reduction element into typed SSA. `coordinate-lower` may translate a verified
+   source-level flat array index into KernelBody index arithmetic; without it, this retains the
+   pointwise full-reduction contract. A predicate requires an explicit typed load fallback."
+  [expression {:keys [index coordinate dtype arrays scalars coordinate-lower
+                      load-predicate load-other]}]
   (let [operations (atom [])
         counter (atom 0)
         fresh (fn [prefix] (symbol (str prefix "-" (swap! counter inc))))
@@ -153,17 +157,24 @@
                   (descriptor/aget-call? expression)
                   (let [arguments (vec (descriptor/call-args expression))
                         array (descriptor/aget-array-sym expression)
-                        source-coordinate (some-> (last arguments) strip-index-cast)]
+                        source-coordinate (some-> (last arguments) strip-index-cast)
+                        lowered-coordinate (if coordinate-lower
+                                             (coordinate-lower source-coordinate)
+                                             (when (= index source-coordinate) coordinate))]
                     (when-not (and (= 2 (count arguments))
                                    (contains? arrays array)
-                                   (= index source-coordinate))
+                                   lowered-coordinate)
                       (decline! :indexed-load
-                                "initial KernelBody reduction supports pointwise array loads"
+                                "KernelBody reduction cannot prove this array load coordinate"
                                 {:expression expression :array array :coordinate source-coordinate
                                  :index index :arrays arrays}))
                     (let [result (fresh "element-load")]
-                      (emit! (body/->ScalarLoad (body/value result dtype) array [coordinate]
-                                                nil nil :cached)
+                      (emit! (body/->ScalarLoad
+                              (body/value result dtype) array [lowered-coordinate]
+                              load-predicate
+                              (when load-predicate
+                                (or load-other (body/literal 0 dtype)))
+                              :cached)
                              result)))
 
                   (and (seq? expression) (contains? cast-heads (first expression))
@@ -238,8 +249,8 @@
         next-lane-accumulator 'next-lane-accumulator
         lane-result 'lane-result
         {:keys [operations result]}
-        (element-operations element {:index index :coordinate element-index :dtype dtype
-                                     :arrays (set arrays) :scalars (set scalars)})
+        (lower-element-operations element {:index index :coordinate element-index :dtype dtype
+                                           :arrays (set arrays) :scalars (set scalars)})
         output (or out-sym 'output)
         group-count (launch-group-count (get-in segred [:grid :num-blocks])
                                         bound workgroup-size)
