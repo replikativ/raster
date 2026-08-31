@@ -55,19 +55,19 @@
           {:keys [store epi-ops declares]} (store-line (:form f))]
       (is (= '[bias] (mapv :sym (:operands (:epilogue f)))))
       (is (= (am/of-axes [['j N]]) (:map (first (:operands (:epilogue f))))))
-      (is (str/includes? store "bias[col]"))
+      (is (re-find #"bias\[[^]]*col" store))
       (is (= '[bias] epi-ops) "the descriptor must surface the extra kernel arg")
       (is (declares "bias") "…and the signature must declare it")))
   (testing "elementwise residual: full map, emitted index is R[row*N+col]"
     (let [f (fuse (list 'raster.numeric/+ (list 'aget 'C 't) (list 'aget 'R 't)))
           {:keys [store epi-ops]} (store-line (:form f))]
       (is (= (am/of-axes [['i M] ['j N]]) (:map (first (:operands (:epilogue f))))))
-      (is (str/includes? store (str "R[((row * " N ") + col)]")))
+      (is (re-find (re-pattern (str "R\\[[^]]*row[^]]*" N "[^]]*col")) store))
       (is (= '[R] epi-ops))))
   (testing "per-row scale: operand map is [i], emitted index is rs[row]"
     (let [f (fuse (list 'raster.numeric/* (list 'aget 'C 't) (list 'aget 'rs (list 'quot 't N))))
           {:keys [store]} (store-line (:form f))]
-      (is (str/includes? store "rs[row]"))))
+      (is (re-find #"rs\[[^]]*row" store))))
   (testing "an activation-only body still fuses, with no operands"
     (let [f (fuse (list 'raster.math/exp (list 'aget 'C 't)))
           {:keys [epi-ops]} (store-line (:form f))]

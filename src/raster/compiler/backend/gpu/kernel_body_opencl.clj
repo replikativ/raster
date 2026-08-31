@@ -146,6 +146,8 @@
      :epilogue-params params
      :region region}))
 
+(declare lower-scalar-ssa-region)
+
 (defn lower-store-region
   "Lower the one verified ScalarRegion shared by all matrix stores to OpenCL scalar syntax.
 
@@ -160,7 +162,9 @@
       (throw (ex-info "all matrix tile stores must carry the same scalar region"
                       {:reason :raster/bug :regions (vec regions)})))
     (when-let [region (first regions)]
-      (lower-scalar-region kernel-body region))))
+      (if (record-kind? "ScalarSSARegion" region)
+        (lower-scalar-ssa-region kernel-body region)
+        (lower-scalar-region kernel-body region)))))
 
 (defn- only!
   [owner values]
@@ -963,6 +967,76 @@
     (if view-offset
       (str "((long)(" (emit-index-expression view-offset names) ") + " local-offset ")")
       (str "(" local-offset ")"))))
+
+(defn- lower-scalar-ssa-region
+  [kernel-body region]
+  (let [storage (into {} (map (juxt :id identity)) (:parameters kernel-body))
+        accumulator (first (:parameters region))
+        [row-id col-id] (:indices region)
+        accumulator-token (str "__acc_" (name (gensym "")))
+        row-token (str "__row_" (name (gensym "")))
+        col-token (str "__col_" (name (gensym "")))
+        parameter-names (into {} (map (fn [id] [id (ce/c-symbol id)]))
+                              (rest (:parameters region)))
+        initial-context
+        {:names (merge parameter-names
+                       {accumulator accumulator-token row-id row-token col-id col-token})
+         :types (merge
+                 (into {} (map (fn [id] [id (dtype/canon (:dtype (get storage id)))]))
+                       (rest (:parameters region)))
+                 {accumulator (dtype/canon (:accumulator-dtype region))
+                  row-id :int col-id :int})}
+        final-context
+        (reduce
+         (fn [context operation]
+           (cond
+             (record-kind? "ScalarCompute" operation)
+             (let [result (:result operation)
+                   expression (emit-scalar-value (:expression operation) context)]
+               (-> context
+                   (assoc-in [:names (:id result)] (str "(" expression ")"))
+                   (assoc-in [:types (:id result)] (dtype/canon (:type result)))))
+
+             (record-kind? "ScalarLoad" operation)
+             (let [result (:result operation)
+                   parameter (get storage (:buffer operation))
+                   index (emit-storage-index parameter (:coordinates operation) (:names context))
+                   load (str (get parameter-names (:buffer operation)) "[" index "]")]
+               (when (:predicate operation)
+                 (throw (ex-info "matrix scalar SSA store regions do not admit masked loads"
+                                 {:reason :kernel-body-matrix-scalar-region-mask
+                                  :operation operation})))
+               (-> context
+                   (assoc-in [:names (:id result)] load)
+                   (assoc-in [:types (:id result)] (dtype/canon (:type result)))))
+
+             :else
+             (throw (ex-info "matrix store region contains unsupported scalar SSA"
+                             {:reason :kernel-body-matrix-scalar-region-operation
+                              :operation operation}))))
+         initial-context (:operations region))
+        emitted (get-in final-context [:names (:result region)])
+        external-parameters (rest (:parameters region))
+        epilogue-parameters
+        (filterv #(= :epilogue (:role (get storage %))) external-parameters)
+        params
+        (apply str
+               (for [id epilogue-parameters
+                     :let [parameter (get storage id)]]
+                 (if (= :scalar (:kind parameter))
+                   (str ", " (dtype/ctype :opencl (:dtype parameter)) " " (ce/c-symbol id))
+                   (str ", __global const " (dtype/ctype :opencl (:dtype parameter))
+                        "* restrict " (ce/c-symbol id)))))]
+    (when-not emitted
+      (throw (ex-info "matrix scalar SSA region has no emitted result"
+                      {:reason :raster/bug :region region})))
+    {:epilogue (fn [accumulator-expression row col]
+                 (-> emitted
+                     (str/replace accumulator-token (str "(" accumulator-expression ")"))
+                     (str/replace row-token row)
+                     (str/replace col-token col)))
+     :epilogue-params params
+     :region region}))
 
 (defn- emit-mask-predicate
   [predicate names]

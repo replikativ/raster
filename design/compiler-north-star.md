@@ -928,7 +928,12 @@ The immediate continuation after the verified double-buffered weighted-reduction
    compatibility re-lowering; the typed fusion pass discovers adjacent single-use result maps and
    removes their physical intermediates without rewriting the reduction fold. Both the matrix
    schedule and the portable sequential-segment schedule lower that closed transform to typed
-   KernelBody scalar SSA, including capture loads and explicit precision conversions. The latter
+   KernelBody scalar SSA, including capture loads and explicit precision conversions. Matrix
+   storage parameters retain dense physical layouts independently from matrix-fragment lane
+   layouts; a transform that reuses A/B refers to the existing compiler identity instead of
+   duplicating its pointer. The matrix target ABI is projected from the verified KernelBody and its
+   stable-read contracts, and its store emitter consumes only typed SSA—no source expression or
+   target-local type inference remains on that path. The portable path
    emits unchanged through OpenCL, CUDA and HIP and is compiled by the hardware-free CUDA/HIP CI
    gates. Hardware-costed multi-consumer placement and migration of the register-tiled leaf to the
    same scheduled-body store region are the next fusion/scheduling coverage steps.

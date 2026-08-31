@@ -2,6 +2,7 @@
   (:require [clojure.string :as str]
             [clojure.test :refer [deftest is testing]]
             [clojure.walk :as walk]
+            [raster.compiler.backend.gpu.c-emit :as c-emit]
             [raster.compiler.backend.gpu.opencl-pass :as opencl]
             [raster.compiler.backend.gpu.opencl-codegen :as opencl-codegen]
             [raster.compiler.backend.gpu.segop-opencl :as segop-opencl]
@@ -116,22 +117,42 @@
     (is (= (:workgroup oracle) (:wg routed)))
     (is (body/kernel-body? (:kernel-body routed)))))
 
-(deftest typed-store-regions-lower-identically-to-the-epilogue-oracle
+(deftest typed-store-regions-lower-from-scheduled-scalar-ssa
   (let [epilogue {:acc 'acc
                   :expr '(raster.numeric/+ acc (clojure.core/aget bias j))
                   :operands [{:sym 'bias
                               :map (axis-map/of-axes [['j 128]])
                               :dtype :float}]}
         form (concat (matrix-form 128 128 128) [:epilogue epilogue])
-        routed (route/route-contraction form :dtype :half)
-        oracle (segop-opencl/generate-dpas-contraction-kernel
-                (contract-lower/contract-form->segred form :dtype :half) 'C
-                :epilogue epilogue)
-        normalize #(str/replace % #"dpas_contract_[0-9]+" "dpas_contract_N")]
-    (is (= (normalize (:source oracle)) (normalize (:source routed))))
+        routed
+        (with-redefs [c-emit/emit-expr
+                      (fn [& _]
+                        (throw (ex-info "matrix store reparsed a source expression" {})))]
+          (route/route-contraction form :dtype :half))
+        region (some :value-region (get-in routed [:kernel-body :operations 0 :operations]))]
+    (is (instance? raster.compiler.ir.kernel_body.ScalarSSARegion region))
+    (is (= ["ScalarLoad" "ScalarCompute" "ScalarCompute"]
+           (mapv #(some-> % class .getSimpleName) (:operations region))))
+    (is (= :half (:result-dtype region)))
     (is (= '[bias] (:epilogue-operands routed)))
-    (is (re-find #"bias\[col\]" (:source routed)))
-    (is (some :value-region (get-in routed [:kernel-body :operations 0 :operations])))))
+    (is (re-find #"bias\[.*col" (:source routed)))
+    (is (re-find #"convert_half_rte" (:source routed)))))
+
+(deftest typed-store-regions-reuse-existing-contraction-inputs-by-identity
+  (let [epilogue {:acc 'acc
+                  :expr '(raster.numeric/+ acc (clojure.core/aget A
+                                                                  (clojure.core/+ (clojure.core/* i 128) j)))
+                  :operands [{:sym 'A
+                              :map (axis-map/of-axes [['i 128] ['j 128]])
+                              :dtype :half}]}
+        routed (route/route-contraction
+                (concat (matrix-form 128 128 128) [:epilogue epilogue]) :dtype :half)
+        parameter-ids (mapv :id (get-in routed [:kernel-body :parameters]))]
+    (is (= 1 (count (filter #{'A} parameter-ids))))
+    (is (empty? (filter #(= :epilogue (:role %))
+                        (get-in routed [:kernel-body :parameters]))))
+    (is (= '[A] (:epilogue-operands routed)))
+    (is (= 1 (count (re-seq #"__global const half\* restrict A" (:source routed)))))))
 
 (deftest production-kernel-body-lowering-does-not-call-the-legacy-template
   (with-redefs [opencl-codegen/emit-gemm-tiled

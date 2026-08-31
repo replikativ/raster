@@ -36,6 +36,8 @@
     (let [m (am/of-groups '[[[b 2]] [[c 3] [h 4]] [[w 5]]])]
       (is (= [2 12 5] (am/shape m)))                       ; group extent = 3*4
       (is (= 120 (am/n-elements m)))
+      (is (= '[b (clojure.core/+ (clojure.core/* c 4) h) w]
+             (am/coordinate-exprs m)))
       ;; index = b*(12*5) + (c*4 + h)*5 + w
       (is (= '(clojure.core/+ (clojure.core/* b 60)
                               (clojure.core/* (clojure.core/+ (clojure.core/* c 4) h) 5)

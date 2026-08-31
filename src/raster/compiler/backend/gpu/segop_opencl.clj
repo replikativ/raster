@@ -21,6 +21,7 @@
             [raster.compiler.ir.kernel-abi :as kabi]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-body :as kbody]
+            [raster.compiler.ir.kernel-body-abi :as body-abi]
             [raster.compiler.ir.kernel-graph :as kgraph]
             [raster.compiler.ir.kernel-launch :as klaunch]
             [raster.compiler.ir.scan :as scan]
@@ -1598,6 +1599,23 @@
              (when epilogue
                (epilogue-splice epilogue [i-sym j-sym] (get epilogue :dtype :float))))
         effective-epilogue (or epilogue (get-in kernel-body [:attributes :epilogue]))
+        matrix-abi
+        (when kernel-body
+          (let [dimensions (filterv #(= :dimension (:role %)) (:parameters kernel-body))
+                dimension-names (zipmap (map :id dimensions) ["M" "N" "K"])
+                c-name (fn [{:keys [id role]}]
+                         (case role
+                           :lhs "A"
+                           :rhs "B"
+                           :result "C"
+                           (or (get dimension-names id) (ce/c-symbol id))))]
+            (body-abi/project-contracts
+             (mapv (fn [{:keys [id kind dtype role] :as parameter}]
+                     (kabi/slot id kind dtype
+                                :c-name (c-name parameter)
+                                :role (if (contains? #{:lhs :rhs} role) :operand role)))
+                   (:parameters kernel-body))
+             kernel-body)))
         source (if kernel-body
                  (kernel-body-opencl/emit-matrix-kernel kernel-name kernel-body)
                  (apply codegen/emit-gemm-tiled kernel-name
@@ -1613,18 +1631,19 @@
      {:kernel-name kernel-name
       :source source
       :array-params [row-arr col-arr]
-      :abi (kabi/validate!
-            (vec (concat
-                  [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
-                   (kabi/slot col-arr :input :half :c-name "B" :role :operand)
-                   (kabi/slot out-sym :output result-dtype :c-name "C" :role :result)
-                   (kabi/slot 'M :scalar :int :role :dimension)
-                   (kabi/slot 'N :scalar :int :role :dimension)
-                   (kabi/slot 'K :scalar :int :role :dimension)]
-                  (for [{:keys [sym dtype] :or {dtype :float}} (:operands effective-epilogue)]
-                    (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
-                  (for [{:keys [sym dtype] :or {dtype :float}} (:scalars effective-epilogue)]
-                    (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue)))))
+      :abi (or matrix-abi
+               (kabi/validate!
+                (vec (concat
+                      [(kabi/slot row-arr :input :half :c-name "A" :role :operand)
+                       (kabi/slot col-arr :input :half :c-name "B" :role :operand)
+                       (kabi/slot out-sym :output result-dtype :c-name "C" :role :result)
+                       (kabi/slot 'M :scalar :int :role :dimension)
+                       (kabi/slot 'N :scalar :int :role :dimension)
+                       (kabi/slot 'K :scalar :int :role :dimension)]
+                      (for [{:keys [sym dtype] :or {dtype :float}} (:operands effective-epilogue)]
+                        (kabi/slot sym :input dtype :c-name (ce/c-symbol sym) :role :epilogue))
+                      (for [{:keys [sym dtype] :or {dtype :float}} (:scalars effective-epilogue)]
+                        (kabi/slot sym :scalar dtype :c-name (ce/c-symbol sym) :role :epilogue))))))
       :dims [M N L]
       :dtype result-dtype
       :tile effective-tile

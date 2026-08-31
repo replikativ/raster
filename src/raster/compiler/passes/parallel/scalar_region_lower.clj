@@ -55,7 +55,7 @@
   "Lower `region` once per completed scalar reduction result.
 
    `parameters` maps region scalar/operand IDs to KernelParameters. `coordinate-lower` translates
-   the declared operand axis-map to scheduled index arithmetic. The returned `:result` is cast to
+   a declared operand axis-map to one or more scheduled storage coordinates. The returned `:result` is cast to
    `store-dtype`, so ScalarStore remains completely typed."
   [region {:keys [accumulator accumulator-dtype store-dtype parameters coordinate-lower predicate]}]
   (let [result-dtype (dtype/canon (:result-dtype region))
@@ -81,23 +81,25 @@
                            result target)))))
 
             (load-operand [id]
-              (let [{:keys [dtype map] :as operand} (get operand-by-id id)
+              (let [{:keys [map] :as operand} (get operand-by-id id)
+                    operand-dtype (dtype/canon (get operand :dtype :float))
                     parameter (get parameters id)]
                 (when-not (and operand parameter (= :input (:kind parameter))
-                               (contains? #{:operand :epilogue} (:role parameter))
-                               (= (dtype/canon dtype) (dtype/canon (:dtype parameter))))
+                               (contains? #{:operand :lhs :rhs :epilogue} (:role parameter))
+                               (= operand-dtype (dtype/canon (:dtype parameter))))
                   (decline! :result-transform-operand
                             "result-transform operand lacks its typed KernelBody parameter"
                             {:operand operand :parameter parameter}))
                 (let [result (fresh "result-transform-load")
-                      coordinate (coordinate-lower (axis-map/index-expr map))]
+                      coordinates (coordinate-lower map)
+                      coordinates (if (vector? coordinates) coordinates [coordinates])]
                   (cast
                    (emit! (body/->ScalarLoad
-                           (body/value result (dtype/canon dtype)) id [coordinate]
+                           (body/value result operand-dtype) id coordinates
                            predicate
-                           (when predicate (body/literal 0 (dtype/canon dtype)))
+                           (when predicate (body/literal 0 operand-dtype))
                            :cached)
-                          result (dtype/canon dtype))
+                          result operand-dtype)
                    result-dtype))))
 
             (lower-expression [expression]
@@ -164,3 +166,11 @@
         {:operations @operations
          :result (:value stored-result)
          :result-dtype (:dtype stored-result)}))))
+
+(defn lower-region
+  "Close a semantic ScalarRegion as validated, target-neutral scalar SSA for a store site."
+  [region {:keys [accumulator accumulator-dtype store-dtype indices] :as options}]
+  (let [{:keys [operations result result-dtype]} (lower region options)]
+    (body/->ScalarSSARegion
+     (:parameters region) (:operands region) (vec indices) (dtype/canon accumulator-dtype)
+     operations result result-dtype)))

@@ -158,7 +158,7 @@
             (decline! :literal-identity
                       "portable contraction requires a typed numeric reduction identity"
                       {:identity identity :segred-id (:id segred)}))
-        coordinate-lower #(lower-index % index-scope)
+        coordinate-lower #(lower-index (axis-map/index-expr %) index-scope)
         {:keys [operations result]}
         (segred-body/lower-element-operations
          element {:index reduced-index :coordinate reduced-index :dtype dtype

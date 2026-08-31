@@ -131,7 +131,8 @@
    7-arg kernel. Both are mechanically detectable by comparing the emitted signature with what the
    descriptor says to bind, which is what this does.
 
-   Pointer params must equal (array-params + 1 output + epilogue-operands). Default single-launch
+   Pointer params must equal the distinct bound inputs plus one output; a result transform may
+   reuse a contraction input by compiler identity without adding a second ABI slot. Default single-launch
    leaves must also supply matching 1-3D workgroup/grid data; validation closes those fields and the
    ordered compiler values into a KernelArtifact. Full reductions already arrive as a verified
    artifact and retain their distinct two-phase invoke protocol, whose scheduler owns geometry.
@@ -154,16 +155,20 @@
         ;; EXTRA operand arrays are pointer params too, whichever seam declared them: an
         ;; epilogue's (bias/residual/scale, appended after the dims) or a staged contraction's
         ;; lift operands (the per-block scales, bound between the operands and the output).
-        expect-ptr (+ (count array-params) 1 (count epilogue-operands) (count lift-operands))
+        distinct-pointer-inputs
+        (distinct (concat array-params epilogue-operands lift-operands))
+        expect-ptr (inc (count distinct-pointer-inputs))
         ;; Full reduction carries a complete ordered ABI. Other leaves still construct their
         ;; compiler argument values from descriptor scalars here, exactly once, before artifact
         ;; validation eliminates the positional convention from all runtime paths.
         ;; an epilogue's SCALARS are kernel scalar params too — they are emitted into the
         ;; signature by epilogue-splice, so a descriptor that omits them under-counts and the
         ;; capability becomes unusable (which is what pushed `:scheme` into a private channel)
+        abi-epilogue-scalars
+        (count (filter #(and (= :scalar (:kind %)) (= :epilogue (:role %))) abi))
         expect-scalar (if (= :reduction invoke)
                         (count (when abi (kabi/scalar-slots abi)))
-                        (+ (count scalar-args) (count epilogue-scalars)))]
+                        (+ (count scalar-args) abi-epilogue-scalars))]
     (cond
       (nil? abi)
       (throw (ex-info "contract descriptor: the ordered :abi is required"
@@ -176,9 +181,11 @@
       (throw (ex-info (str "contract descriptor: kernel takes " n-ptr " pointer params but the "
                            "descriptor binds " expect-ptr " (" (count array-params) " operands + out"
                            (when (seq epilogue-operands)
-                             (str " + " (count epilogue-operands) " epilogue"))
+                             (str " + distinct transform inputs from "
+                                  (count epilogue-operands) " references"))
                            (when (seq lift-operands)
-                             (str " + " (count lift-operands) " lift")) ")")
+                             (str " + distinct lift inputs from "
+                                  (count lift-operands) " references")) ")")
                       {:strategy strategy :kernel-name kernel-name :params params
                        :array-params array-params :epilogue-operands epilogue-operands
                        :lift-operands lift-operands}))

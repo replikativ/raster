@@ -47,24 +47,31 @@
 (defn- matrix-parameters
   [row col out M N K dimension-parameters row-layout col-layout out-layout result-dtype epilogue
    buffer-shapes additional-parameters]
-  (let [[m-parameter n-parameter k-parameter] dimension-parameters]
+  (let [[m-parameter n-parameter k-parameter] dimension-parameters
+        base-parameters
+        (vec
+         (concat
+          [(body/->KernelParameter row :input :half (get buffer-shapes row [M K])
+                                   :global row-layout :lhs)
+           (body/->KernelParameter col :input :half (get buffer-shapes col [K N])
+                                   :global col-layout :rhs)
+           (body/->KernelParameter out :output result-dtype (get buffer-shapes out [M N])
+                                   :global out-layout :result)
+           (body/->KernelParameter m-parameter :scalar :int [] nil nil :dimension)
+           (body/->KernelParameter n-parameter :scalar :int [] nil nil :dimension)
+           (body/->KernelParameter k-parameter :scalar :int [] nil nil :dimension)]
+          additional-parameters))
+        base-ids (set (map :id base-parameters))]
     (vec
      (concat
-      [(body/->KernelParameter row :input :half (get buffer-shapes row [M K])
-                               :global row-layout :lhs)
-       (body/->KernelParameter col :input :half (get buffer-shapes col [K N])
-                               :global col-layout :rhs)
-       (body/->KernelParameter out :output result-dtype (get buffer-shapes out [M N])
-                               :global out-layout :result)
-       (body/->KernelParameter m-parameter :scalar :int [] nil nil :dimension)
-       (body/->KernelParameter n-parameter :scalar :int [] nil nil :dimension)
-       (body/->KernelParameter k-parameter :scalar :int [] nil nil :dimension)]
-      additional-parameters
-      (for [{:keys [sym dtype map] :or {dtype :float}} (:operands epilogue)]
+      base-parameters
+      (for [{:keys [sym dtype map] :or {dtype :float}} (:operands epilogue)
+            :when (not (contains? base-ids sym))]
         (let [shape (axis-map/shape map)]
           (body/->KernelParameter sym :input dtype shape :global
                                   (layout/row-major shape dtype) :epilogue)))
-      (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)]
+      (for [{:keys [sym dtype] :or {dtype :float}} (:scalars epilogue)
+            :when (not (contains? base-ids sym))]
         (body/->KernelParameter sym :scalar dtype [] nil nil :epilogue))))))
 
 (defn- fragment-id [prefix a & [b]]
@@ -113,8 +120,10 @@
         k-width (max 1 (quot 32 (layout/dtype-bits :half)))
         row-layout (layout/dot-operand 0 acc-layout k-width :half)
         col-layout (layout/dot-operand 1 acc-layout k-width :half)
-        out-layout (layout/row-major [M N] result-dtype)
-        buffer-layouts {row row-layout col col-layout out out-layout}
+        row-storage-layout (layout/row-major (get buffer-shapes row [M K]) :half)
+        col-storage-layout (layout/row-major (get buffer-shapes col [K N]) :half)
+        out-layout (layout/row-major (get buffer-shapes out [M N]) result-dtype)
+        buffer-layouts {row row-storage-layout col col-storage-layout out out-layout}
         buffer-views (mapv (fn [view]
                              (if (instance? raster.compiler.ir.kernel_body.BufferView view)
                                view
@@ -215,7 +224,26 @@
                             {:unrolled-by (quot block-k matrix-k)
                              :matrix-step matrix-k
                              :pipeline-depth num-stages})
-        region (scalar-region-lower/make-region epilogue)
+        parameters (matrix-parameters row col out M N K dimension-parameters
+                                      row-storage-layout col-storage-layout out-layout
+                                      result-dtype epilogue
+                                      buffer-shapes additional-parameters)
+        semantic-region (scalar-region-lower/make-region epilogue)
+        region
+        (when semantic-region
+          (scalar-region-lower/lower-region
+           semantic-region
+           {:accumulator (first (:parameters semantic-region))
+            :accumulator-dtype :float
+            :store-dtype result-dtype
+            :indices [i j]
+            :parameters (into {} (map (juxt :id identity)) parameters)
+            :coordinate-lower
+            #(mapv (fn [coordinate]
+                     (contraction-body/lower-index
+                      coordinate (set (concat axis-symbols dimension-parameters))))
+                   (axis-map/coordinate-exprs %))
+            :predicate nil}))
         stores (vec
                 (for [mm (range m-fragments) nn (range n-fragments)]
                   (body/->TileStore
@@ -228,10 +256,10 @@
                          (launch/ceil-div (launch/runtime-value m-parameter) block-m)])]
     (body/make
      {:id id
-      :parameters (matrix-parameters row col out M N K dimension-parameters
-                                     row-layout col-layout out-layout result-dtype epilogue
-                                     buffer-shapes additional-parameters)
+      :parameters parameters
       :views (vec buffer-views)
+      :stable-reads (mapv body/stable-read
+                          (map :id (filter #(= :input (:kind %)) parameters)))
       :indices (into (vec additional-indices) indices)
       :masks masks
       :fragments fragments
