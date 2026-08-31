@@ -1,5 +1,5 @@
 (ns raster.compiler.passes.parallel.segmented-weighted-reduction-fuse-test
-  (:require [clojure.test :refer [deftest is]]
+  (:require [clojure.test :refer [deftest is use-fixtures]]
             [raster.compiler.ir.kernel-artifact :as kart]
             [raster.compiler.ir.kernel-call :as kcall]
             [raster.compiler.ir.kernel-dispatch :as kdispatch]
@@ -11,7 +11,27 @@
             [raster.dl.gsdm :as gsdm]
             [raster.gpu.core :as gpu]
             [raster.gpu.link :as link]
-            [raster.numeric]))
+            [raster.numeric]
+            [raster.runtime.hardware :as hardware]))
+
+;; These are cross-compilation tests.  Own the target facts instead of inheriting a
+;; :ze:0 registration from whichever namespace happened to run first in a monolithic
+;; test JVM.  No device or driver is required to derive and emit these schedules.
+(use-fixtures
+  :once
+  (fn [f]
+    (hardware/reset-hardware!)
+    (hardware/init!)
+    (hardware/register-target-device!
+     :ze:0
+     {:name "Intel(R) Arc(TM) Graphics"
+      :capabilities {:total-eus 64
+                     :threads-per-eu 8
+                     :simd-width 16
+                     :subgroup-sizes [16 32]
+                     :max-workgroup-size 1024
+                     :shared-local-memory 131072}})
+    (f)))
 
 (defn- chain
   []
