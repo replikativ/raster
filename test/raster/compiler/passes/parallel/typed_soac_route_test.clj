@@ -795,6 +795,71 @@
         (catch clojure.lang.ExceptionInfo exception
           (is (= :typed-contraction-families (:reason (ex-data exception)))))))))
 
+(deftest typed-contraction-result-transform-reaches-the-matrix-store
+  (let [transform {:acc 'acc
+                   :expr '(raster.numeric/*
+                           (raster.numeric/+ acc (clojure.core/aget bias j)) scale)
+                   :operands [{:sym 'bias :dtype :float
+                               :map {:groups [[['j 128]]]}}]
+                   :scalars [{:sym 'scale :dtype :float}]
+                   :dtype :float}
+        contract (apply list
+                        (concat
+                         '(raster.par/contract C [[i 128] [j 128]] [[l 128]]
+                           (* (clojure.core/aget A (+ (* i 128) l))
+                              (clojure.core/aget B (+ (* l 128) j))))
+                         [:epilogue transform]))
+        source (list 'let* ['step contract] 'step)
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :half
+                 :array-types {'A :half 'B :half 'C :half 'bias :float}
+                 :scalar-types {'scale :float}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        descriptor {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                    :grf-bytes-per-lane 256 :subgroup-size 16
+                    :max-workgroup-size 1024 :shared-local-memory 131072}
+        routed (contract-route/route-typed-contraction
+                algorithm (:id operation)
+                (assoc-in (:schedule operation) [:tuning-space :families] [:matrix])
+                :dtype :half :desc descriptor)
+        emitted (with-redefs [hardware/descriptor-for (constantly descriptor)]
+                  (opencl-pass/opencl-pass form :device-id :ocl:0
+                                           :dtype :half :min-elements 0))
+        emitted-dispatch (first (:dispatches emitted))
+        alternative (first (:alternatives emitted-dispatch))
+        call (kernel-graph-call/make
+              alternative
+              {'A (Object.) 'B (Object.) 'C (Object.) 'bias (Object.)}
+              {'scale {:type :float :value 0.5}})]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= :float
+           (get-in (dialect/operation-parts
+                    (first (dialect/equations algorithm)))
+                   [:attributes :result-transform :result-dtype])))
+    (is (= '#{A B bias} (segop/operation-inputs operation)))
+    (is (= '#{scale} (segop/operation-scalars operation)))
+    (is (= :dpas (:strategy routed)))
+    (is (true? (:fused-epilogue routed)))
+    (is (= '[bias] (:epilogue-operands routed)))
+    (is (= '[A B C M N K bias scale] (mapv :name (:abi routed))))
+    (is (re-find #"bias\[col\]" (:source routed)))
+    (is (re-find #"\* scale" (:source routed)))
+    (is (= 1 (get-in emitted [:stats :ze-contracts])))
+    (is (some #(= '[A B C M N K bias scale] (mapv :name (:abi %)))
+              (:kernels emitted)))
+    (is (= [:dpas]
+           (mapv #(get-in % [:attributes :strategy])
+                 (:alternatives emitted-dispatch))))
+    (is (= #{:register-tiled :portable}
+           (set (map :candidate-family
+                     (get-in emitted-dispatch [:attributes :declines])))))
+    (is (kernel-graph-call/kernel-graph-call? call))
+    (is (= {:type :float :value 0.5}
+           (last (-> call :nodes first :call :arguments))))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))))
+
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source
         '(let* [total (raster.par/reduce acc 0.0 i n

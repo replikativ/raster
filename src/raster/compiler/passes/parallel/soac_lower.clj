@@ -309,8 +309,11 @@
                                 (map util/free-syms
                                      (conj (mapv second segment-axes) reduced-extent)))
           body-symbols (reduce set/union #{} (map util/free-syms step-results))
+          result-transform (:result-transform attributes)
+          transform-scalars (set (map :value (:scalars result-transform)))
           scalars (set/difference (set/union bound-symbols body-symbols)
                                   inputs (set accumulators) axis-indices)
+          scalars (set/union scalars transform-scalars)
           space (segop/make-seg-space-nd
                  (conj (mapv (fn [[index extent]] {:name index :bound extent}) segment-axes)
                        {:name reduced-index :bound reduced-extent}))
