@@ -246,12 +246,12 @@
                        nsub (quot (long in) 32)
                        xiw (quot (long in) 4)
                        wiw (quot (long in) 8)           ; weight int32 words per row (in/2 bytes / 4)
-                       wb (* (long o) wiw)
-                       sbb (* (long o) nsb)
-                       subb (* (long o) nsub)
-                       xb (* row xiw)
-                       xsb-base (* row nsb)
-                       bsum-base (* row nsub)
+                       ^long wb (* (long o) wiw)
+                       ^long sbb (* (long o) nsb)
+                       ^long subb (* (long o) nsub)
+                       ^long xb (* row xiw)
+                       ^long xsb-base (* row nsb)
+                       ^long bsum-base (* row nsub)
                        acc (loop [sb 0 a (float 0.0)]
                              (if (< sb nsb)
                                (let [dav (ra/aget da (+ sbb sb))
@@ -278,7 +278,11 @@
                                               s))]
                                  (recur (inc sb) (+ a (* dact ssum))))
                                a))]
-                   (ra/aset y (+ (* row (long out)) o) acc))))
+                   ;; `ro = row*out + o` by the quotient/remainder definitions above. Keep the
+                   ;; canonical 1:1 destination explicit: TypedSOAC can then certify this effectful
+                   ;; map as a SegMap instead of sending quantized arithmetic through the legacy
+                   ;; map-void emitter.
+                   (ra/aset y ro acc))))
 
 ;; Q6_K work-item-per-row twin of qmatmul-q6k-composable! (symmetric K dot, unsigned+zp32).
 (deftm qmatmul-q6k-gpu!

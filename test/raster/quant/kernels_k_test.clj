@@ -4,6 +4,7 @@
    the SAME composable path the legacy Q4_0 uses (and that the GPU/OpenCL path will reuse).
    Single-call correctness; no spin-pool, no Valhalla."
   (:require [clojure.test :refer [deftest is testing]]
+            [raster.compiler.report :as report]
             [raster.quant.kernels-k :as qk]
             [raster.compiler.backend.cpu.quant :as q]
             [raster.compiler.pipeline :as pipeline]))
@@ -158,8 +159,10 @@
                                                         :target-device :ze:0 :dtype :float))
         padded-kernels (:kernels (pipeline/show-pipeline #'qk/quant-act-q8k-padded-rows-gpu!
                                                          :target-device :ze:0 :dtype :float))
-        projection-kernels (:kernels (pipeline/show-pipeline #'qk/qmatmul-q4k-dp4a-rows!
-                                                             :target-device :ze:0 :dtype :float))]
+        projection-pipeline (pipeline/show-pipeline #'qk/qmatmul-q4k-dp4a-rows!
+                                                    :target-device :ze:0 :dtype :float)
+        projection-kernels (:kernels projection-pipeline)
+        projection-report (report/from-pipeline projection-pipeline)]
     (is (= 2 (count quant-kernels)) "Q8_K remains an ordered two-phase reduction")
     (is (= '[[[submax :float] [x :float] [_n_bound :int]]
              [[bsums :int] [submax :float] [x :float] [xp :int]
@@ -173,6 +176,16 @@
     (is (every? #(re-find #"col < .*width" (:source %)) padded-kernels)
         "both phases guard dense-row reads and synthesize the padding region")
     (is (= 1 (count projection-kernels)))
+    (is (= {:backend :opencl
+            :source-dialect :typed-soac
+            :typed-validated true
+            :declines []}
+           (:route projection-report))
+        "Q4_K uses the validated typed route rather than compatibility lowering")
+    (is (= {:segops 1 :kernel-graphs 0 :typed-reused 1 :typed-scalar-equations 1
+            :backend-reused 1 :backend-relowered 0 :fallback 0}
+           (:lowering projection-report))
+        "the scheduled SegMap is preserved through OpenCL emission")
     (is (= '[[aq :byte] [bq :byte] [bsums :int] [da :float] [db :float]
              [wp :int] [xp :int] [xs :float] [y :float]
              [in :int] [out :int] [_n_bound :int]]
