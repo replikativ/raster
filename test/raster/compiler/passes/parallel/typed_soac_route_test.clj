@@ -880,7 +880,7 @@
     (is (true? (:fused-epilogue routed)))
     (is (= '[bias] (:epilogue-operands routed)))
     (is (= '[A B C M N K bias scale] (mapv :name (:abi routed))))
-    (is (re-find #"bias\[col\]" (:source routed)))
+    (is (re-find #"bias\[.*col" (:source routed)))
     (is (re-find #"\* scale" (:source routed)))
     (is (= 1 (get-in emitted [:stats :ze-contracts])))
     (is (some #(= '[A B C M N K bias scale] (mapv :name (:abi %)))

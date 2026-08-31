@@ -177,7 +177,8 @@
       (testing "the fused KernelBody gains the operand ABI and a typed scalar region"
         (is (str/includes? (:source fused-k) "restrict bias"))
         (is (not (str/includes? (:source fused-k) "silu_f")))
-        (is (str/includes? (:source fused-k) "float x = ((acc00.s0) + bias[col])")
+        (is (re-find #"float x = \(\(acc00\.s0\) \+ .*bias\[[^]]*col"
+                     (:source fused-k))
             "the axis-map's j must bind to the store slot's col"))
       (testing "fused result == unfused GEMM followed by a separate bias+silu pass"
         ;; the two-pass reference: read C back, then apply the epilogue on the host

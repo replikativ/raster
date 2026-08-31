@@ -129,11 +129,11 @@
              (mapv (juxt :id :kind :dtype) epilogue-parameters)))
       (is (= ['acc 'bias 'scale] (:parameters region)))
       (is (re-find #"restrict bias, float scale" (:source emitted)))
-      (is (re-find #"bias\[col\].*scale" (:source emitted))))))
+      (is (re-find #"bias\[.*col.*\].*scale" (:source emitted))))))
 
 (deftest unresolved-source-helper-calls-are-not-scalar-ir
   (is (thrown-with-msg?
-       clojure.lang.ExceptionInfo #"without a typed target lowering"
+       clojure.lang.ExceptionInfo #"typed portable scalar lowering"
        (gemm/emit-scheduled-matrix-kernel
         {:kernel-name "body_undefined_helper"
          :a 'a :b 'b :c 'c :m 'm :n 'n :k 'k

@@ -103,7 +103,7 @@
                      (filter #(= :epilogue (:role %))
                              (get-in emitted [:kernel-body :parameters])))))
         (is (re-find #"restrict bias" (:source emitted)))
-        (is (re-find #"bias\[col\]" (:source emitted)))))
+        (is (re-find #"bias\[[^]]*col" (:source emitted)))))
     (is (thrown-with-msg? clojure.lang.ExceptionInfo #"unsupported fields"
                           (resident-program {:key :bias :fn identity :params "raw"
                                              :bindings {}})))))

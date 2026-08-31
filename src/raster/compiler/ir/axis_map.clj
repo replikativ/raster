@@ -95,6 +95,16 @@
   (rowmajor (for [g (:groups amap)]
               [(rowmajor (for [[a e] g] [a e])) (group-extent g)])))
 
+(defn coordinate-exprs
+  "Return one row-major coordinate expression per physical axis-map group.
+
+  Unlike `index-expr`, this preserves physical rank for scheduled storage whose KernelParameter
+  is not flattened. A merged group still becomes one coordinate."
+  [amap]
+  (mapv (fn [group]
+          (rowmajor (for [[axis extent] group] [axis extent])))
+        (:groups amap)))
+
 ;; ── layout relations (what the gate and the rearrange-inserter ask) ──────────────────
 (defn canonical?
   "Is this map the plain row-major layout over `expected-axes` (in that order, unmerged)?

@@ -23,6 +23,8 @@
 (defrecord Mask [id predicates])
 (defrecord Fragment [id dtype shape layout])
 (defrecord ScalarRegion [parameters expression operands result-dtype])
+(defrecord ScalarSSARegion
+           [parameters operands indices accumulator-dtype operations result result-dtype])
 
 ;; General scalar/control kernel vocabulary.  Results are SSA values; :predicate is an internal
 ;; control type rather than a public storage dtype.  Memory operations remain element/rank aware,
@@ -385,10 +387,8 @@
                       {:operand operand})))
     (axis-map/shape (:map operand))))
 
-(defn- validate-scalar-region!
-  [region storage epilogue-abi]
-  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarRegion" region)
-    (throw (ex-info "tile-store value region must be a ScalarRegion" {:region region})))
+(defn- validate-scalar-region-boundary!
+  [region storage epilogue-abi operand-roles scalar-roles]
   (let [parameters (:parameters region)
         operands (:operands region)
         operand-ids (when (vector? operands) (mapv :sym operands))]
@@ -396,13 +396,15 @@
                    (every? symbol? parameters)
                    (= (count parameters) (count (set parameters)))
                    (vector? operands)
-                   (<= (inc (count operand-ids)) (count parameters))
-                   (some? (:expression region))
-                   (keyword? (:result-dtype region)))
+                   (<= (inc (count operand-ids)) (count parameters)))
       (throw (ex-info "tile-store scalar region is incomplete or has ambiguous parameters"
                       {:region region})))
     (let [accumulator (first parameters)
-          scalar-ids (subvec parameters (inc (count operand-ids)))]
+          scalar-ids (subvec parameters (inc (count operand-ids)))
+          external-ids (vec (rest parameters))
+          missing-external-ids (filterv #(not (contains? storage %)) external-ids)
+          region-epilogue-ids
+          (filterv #(= :epilogue (:role (get storage %))) external-ids)]
       (when-not (and (= operand-ids (subvec parameters 1 (inc (count operand-ids))))
                      (= (count operand-ids) (count (set operand-ids))))
         (throw (ex-info "scalar-region operands must be an ordered prefix of its ABI parameters"
@@ -410,31 +412,75 @@
       (when (contains? storage accumulator)
         (throw (ex-info "scalar-region accumulator must be region-local"
                         {:accumulator accumulator})))
-      (when-not (= epilogue-abi (vec (rest parameters)))
+      (when (seq missing-external-ids)
         (throw (ex-info "scalar-region parameters and the epilogue ABI disagree"
-                        {:parameters (vec (rest parameters))
+                        {:parameters external-ids
+                         :missing-parameters missing-external-ids
+                         :epilogue-abi epilogue-abi})))
+      (when-not (= epilogue-abi region-epilogue-ids)
+        (throw (ex-info "scalar-region parameters and the epilogue ABI disagree"
+                        {:parameters external-ids
+                         :region-epilogue-parameters region-epilogue-ids
                          :epilogue-abi epilogue-abi})))
       (doseq [operand operands]
         (let [id (:sym operand)
               parameter (get storage id)
               shape (axis-map! operand)]
           (when-not (and parameter (= :input (:kind parameter))
-                         (= :epilogue (:role parameter))
-                         (= (:dtype operand :float) (:dtype parameter))
+                         (contains? operand-roles (:role parameter))
+                         (= (dtype/canon (:dtype operand :float))
+                            (dtype/canon (:dtype parameter)))
                          (= shape (:shape parameter)))
             (throw (ex-info "scalar-region operand and its kernel ABI slot disagree"
                             {:operand operand :parameter parameter :shape shape})))))
       (doseq [id scalar-ids]
         (let [parameter (get storage id)]
           (when-not (and parameter (= :scalar (:kind parameter))
-                         (= :epilogue (:role parameter)))
+                         (contains? scalar-roles (:role parameter)))
             (throw (ex-info "scalar-region scalar and its kernel ABI slot disagree"
                             {:scalar id :parameter parameter})))))
-      (let [legal (scalar-region-legal? region)]
-        (when-not (:ok legal)
-          (throw (ex-info "tile-store scalar region is not store-local"
-                          (assoc legal :region region)))))
       region)))
+
+(defn- validate-scalar-region!
+  [region storage epilogue-abi]
+  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarRegion" region)
+    (throw (ex-info "tile-store value region must be a ScalarRegion" {:region region})))
+  (when-not (and (some? (:expression region))
+                 (dtype/known? (:result-dtype region)))
+    (throw (ex-info "tile-store scalar region is incomplete or has ambiguous parameters"
+                    {:region region})))
+  (validate-scalar-region-boundary! region storage epilogue-abi #{:epilogue} #{:epilogue})
+  (let [legal (scalar-region-legal? region)]
+    (when-not (:ok legal)
+      (throw (ex-info "tile-store scalar region is not store-local"
+                      (assoc legal :region region)))))
+  region)
+
+(defn- validate-scalar-ssa-region!
+  [region storage masks scope epilogue-abi]
+  (when-not (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion" region)
+    (throw (ex-info "tile-store value region must be typed scalar SSA" {:region region})))
+  (let [parameters (:parameters region)
+        indices (:indices region)
+        operations (:operations region)]
+    (validate-scalar-region-boundary!
+     region storage epilogue-abi #{:operand :lhs :rhs :epilogue} #{:parameter :epilogue})
+    (when-not (and (vector? indices) (every? symbol? indices)
+                   (= (count indices) (count (set indices)))
+                   (not-any? (set parameters) indices)
+                   (dtype/known? (:accumulator-dtype region))
+                   (vector? operations)
+                   (every? #(contains? #{"raster.compiler.ir.kernel_body.ScalarCompute"
+                                         "raster.compiler.ir.kernel_body.ScalarLoad"}
+                                       (some-> % class .getName))
+                           operations)
+                   (value-id? (:result region))
+                   (dtype/known? (:result-dtype region)))
+      (throw (ex-info "tile-store scalar SSA region is incomplete"
+                      {:reason :kernel-body-scalar-ssa-region :region region})))
+    (validate-operations! operations storage {} masks
+                          (into scope (concat parameters indices)) epilogue-abi)
+    region))
 
 (defn- validate-operation!
   [operation storage fragments masks scope epilogue-abi]
@@ -559,7 +605,9 @@
         (coordinates! "tile-store" (:coordinates operation))
         (mask (:mask operation))
         (when-let [region (:value-region operation)]
-          (validate-scalar-region! region storage epilogue-abi)))
+          (if (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion" region)
+            (validate-scalar-ssa-region! region storage masks scope epilogue-abi)
+            (validate-scalar-region! region storage epilogue-abi))))
 
       (record-kind? "raster.compiler.ir.kernel_body.ScalarCompute" operation)
       (do
@@ -1417,6 +1465,42 @@
 
     :else []))
 
+(defn- scalar-ssa-store-regions
+  [operations]
+  (mapcat
+   (fn [operation]
+     (concat
+      (when (and (record-kind? "raster.compiler.ir.kernel_body.TileStore" operation)
+                 (record-kind? "raster.compiler.ir.kernel_body.ScalarSSARegion"
+                               (:value-region operation)))
+        [(:value-region operation)])
+      (mapcat scalar-ssa-store-regions (nested-operation-regions operation))))
+   operations))
+
+(defn- validate-scalar-ssa-dataflow!
+  [region values context]
+  (let [accumulator (first (:parameters region))
+        region-values
+        (into (assoc values accumulator
+                     {:type (canonical-type (:accumulator-dtype region))
+                      :uniformity lane-varying})
+              (map (fn [index] [index {:type :int :uniformity lane-varying}]))
+              (:indices region))
+        boundary-ids (set (concat (:parameters region) (:indices region)))
+        region-context (-> context
+                           (assoc :claimed (atom #{}))
+                           (update :reserved into boundary-ids)
+                           (assoc :control-uniformity lane-varying))
+        final-values (validate-dataflow-operations!
+                      (:operations region) region-values region-context)
+        result (get final-values (:result region))]
+    (when-not (= (canonical-type (:result-dtype region)) (:type result))
+      (throw (ex-info "scalar SSA store-region result has the wrong dtype"
+                      {:reason :kernel-body-scalar-region-result-dtype
+                       :result (:result region) :declared (:result-dtype region)
+                       :actual (:type result)})))
+    region))
+
 (defn- validate-async-protocol!
   [operations storage stable-buffers reserved]
   (let [claimed (atom reserved)]
@@ -1887,6 +1971,8 @@
                      :control-uniformity all-uniform
                      :launch launch
                      :schedule schedule}]
+        (doseq [region (scalar-ssa-store-regions operations)]
+          (validate-scalar-ssa-dataflow! region initial-values context))
         (validate-dataflow-operations! operations initial-values context))))
   body)
 

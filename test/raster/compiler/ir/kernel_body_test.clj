@@ -126,6 +126,48 @@
                                                :operands 0 :map]
                                        (axis-map/of-axes [['group-x 8]]))))))))
 
+(deftest typed-scalar-store-regions-have-closed-ssa-and-a-shared-buffer-abi
+  (let [region
+        (body/->ScalarSSARegion
+         ['value 'A] [{:sym 'A :map (axis-map/of-axes [['i 16] ['j 16]]) :dtype :half}]
+         ['i 'j] :half
+         [(body/->ScalarLoad (body/value 'loaded :half) 'A ['i 'j] nil nil :cached)
+          (body/->ScalarCompute
+           (body/value 'sum :half)
+           (body/scalar-expression :+ :half ['value 'loaded]))]
+         'sum :half)
+        kernel (-> (minimal-body)
+                   (assoc :stable-reads [(body/stable-read 'A)])
+                   (assoc-in [:operations 0 :operations 2 :value-region] region))]
+    (is (= kernel (body/validate! kernel)))
+    (testing "a shared contraction input does not need a second epilogue ABI slot"
+      (is (= ['A 'B 'C] (mapv :id (:parameters kernel)))))
+    (testing "uses must follow definitions inside the closed region"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"before it is defined"
+           (body/validate!
+            (assoc-in kernel [:operations 0 :operations 2 :value-region :operations]
+                      [(body/->ScalarCompute
+                        (body/value 'sum :half)
+                        (body/scalar-expression :+ :half ['value 'loaded]))])))))
+    (testing "the declared region result dtype is checked against typed SSA"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"wrong dtype"
+           (body/validate!
+            (assoc-in kernel [:operations 0 :operations 2 :value-region :result-dtype]
+                      :float)))))
+    (testing "the nested region admits only its small scalar/load vocabulary"
+      (is (thrown-with-msg?
+           clojure.lang.ExceptionInfo #"incomplete"
+           (body/validate!
+            (update-in kernel [:operations 0 :operations 2 :value-region :operations]
+                       conj (body/->ScalarStore 'C ['i 'j] 'sum nil))))))
+    (testing "unclaimed epilogue slots cannot drift outside the region boundary"
+      (let [bias (body/->KernelParameter 'bias :scalar :float [] nil nil :epilogue)]
+        (is (thrown-with-msg?
+             clojure.lang.ExceptionInfo #"epilogue ABI disagree"
+             (body/validate! (update kernel :parameters conj bias))))))))
+
 (defn- scalar-body
   [operations & {:keys [masks stable-reads allocations schedule shared-memory-bytes]
                  :or {masks [] stable-reads [] allocations [] schedule {:subgroup-size 16}
