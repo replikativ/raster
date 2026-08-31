@@ -234,6 +234,10 @@
    (which is how a quant dequant scale is expressed since :scheme was deleted)."
   #{:dpas :dp4a :quant-naive :staged-segred})
 
+(def ^:private contraction-families
+  "Target schedule families for ordinary scalar typed contractions."
+  #{:matrix :register-tiled :portable})
+
 (defn- epilogue-honoured-or-refused
   "An :epilogue is a STORE SPLICE, and only the DPAS leaf has one. Every other leaf drops it
    silently — the consumer's computation vanishes with no error.
@@ -261,7 +265,8 @@
    products use the quant leaves (dp4a for :nt, widening for :nn) until those instruction families
    consume the same scheduled body vocabulary.  Quantization remains an operand/decode concern,
    not a buffer-ownership or graph-composition concern."
-  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id]
+  [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id
+                           candidate-families]
                     :or {dtype :half prefer-peak? false}}]
   (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
         contract-form (or contract-form (:form contract-facts))
@@ -290,8 +295,16 @@
         ;; declared operand axis-maps, needed to tensorize a staged inner stage (the gate VERIFIES
         ;; them against the body rather than trusting them)
         operands (or operands (:operands form-opts))
+        candidate-families (set (or candidate-families contraction-families))
+        _ (when-not (and (seq candidate-families)
+                         (every? contraction-families candidate-families))
+            (throw (ex-info "contraction route requires known non-empty candidate families"
+                            {:reason :contraction-candidate-families
+                             :families candidate-families
+                             :allowed contraction-families})))
         tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile
-                                                        epilogue contract-facts operation-id))]
+                                                        epilogue contract-facts operation-id
+                                                        candidate-families))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The
     ;; failure mode it guards is a LAUNCH-time arity mismatch (valid C, wrong number of bound args),
     ;; which has bitten twice; validating at generation makes it a loud compile-time error instead.
@@ -398,12 +411,20 @@
       ;; → the portable scheduled KernelBody when its operand layouts are provable. During the
       ;; migration, unsupported gathers retain the verified source emitter as an explicit decline.
         :else
-        (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
-              portable (contraction-schedule/plan-portable-body contract-facts sr desc)
-              emitted (when (:ok portable)
-                        (sco/generate-contraction-kernel-body (:body portable)))
-              {:keys [kernel-name source array-params scalar-params abi]}
-              (or emitted (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype))
+        (do
+          (when-not (contains? candidate-families :portable)
+            (throw (ex-info "no enabled contraction schedule family can lower this equation"
+                            {:reason :no-legal-contraction-family
+                             :operation operation-id
+                             :families candidate-families
+                             :declines (when (and (= 2 n-free) (= 1 n-contract))
+                                         (::declines (tensorize-plan)))})))
+          (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
+                portable (contraction-schedule/plan-portable-body contract-facts sr desc)
+                emitted (when (:ok portable)
+                          (sco/generate-contraction-kernel-body (:body portable)))
+                {:keys [kernel-name source array-params scalar-params abi]}
+                (or emitted (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype))
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
             ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
@@ -432,7 +453,7 @@
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.
-            (seq declines) (assoc :fallback-reason (:reason (last declines))))))))))
+              (seq declines) (assoc :fallback-reason (:reason (last declines)))))))))))
 
 (defn route-typed-contraction
   "Route one scheduled scalar TypedSOAC contraction without exposing a source-form or facts adapter
@@ -450,6 +471,15 @@
             (throw (ex-info "typed contraction requires a contraction candidate schedule"
                             {:reason :typed-contraction-schedule
                              :operation operation-id :schedule schedule})))
+        families (get-in schedule [:tuning-space :families])
+        _ (when-not (and (vector? families) (seq families)
+                         (= (count families) (count (distinct families)))
+                         (every? contraction-families families))
+            (throw (ex-info "typed contraction schedule requires known distinct candidate families"
+                            {:reason :typed-contraction-families
+                             :operation operation-id
+                             :families families
+                             :allowed contraction-families})))
         equation (or (some #(when (= operation-id (second %)) %)
                            (soac-dialect/equations program))
                      (throw (ex-info "typed contraction program lacks its scheduled equation"
@@ -471,6 +501,7 @@
                    (assoc options
                           :dtype equation-dtype
                           :facts facts
+                          :candidate-families families
                           :operation-id operation-id)))))
 
 (def ^:private decline-reasons
@@ -535,16 +566,25 @@
    shape could express neither: a decline is usually LEGITIMATE (symbolic dims, a non-`+` combine and
    a non-product body are all perfectly good contractions that merely are not tiled-leaf shaped), and
    it is always worth REPORTING."
-  [contract-form out-sym dtype desc tile epilogue contract-facts operation-id]
+  [contract-form out-sym dtype desc tile epilogue contract-facts operation-id candidate-families]
   (let [acc (volatile! [])
-        note! (fn [d] (vswap! acc conj d) nil)]
+        note! (fn [d] (vswap! acc conj d) nil)
+        matrix? (contains? candidate-families :matrix)
+        register-tiled? (contains? candidate-families :register-tiled)]
     (try
       (let [sr (delay (cl/contract-form->segred contract-form :dtype dtype
                                                   :facts contract-facts))
-            scheduled (contraction-schedule/plan-matrix-body contract-facts desc tile
-                                                             {:operation-id operation-id})
-            dpas (if (:ok scheduled)
+            scheduled (when matrix?
+                        (contraction-schedule/plan-matrix-body
+                         contract-facts desc tile {:operation-id operation-id}))
+            dpas (cond
+                   (not matrix?)
+                   {:tensorized false :reason :schedule-family-disabled :family :matrix}
+
+                   (:ok scheduled)
                    (sco/generate-dpas-kernel-body (:body scheduled) out-sym)
+
+                   :else
                    {:tensorized false :reason (:reason scheduled) :detail scheduled})]
         (when-not (:tensorized dpas)
           (note! (decline :dpas (:reason dpas) nil (dissoc dpas :tensorized :reason))))
@@ -568,22 +608,27 @@
              :grid [(ceil-div N block-n) (ceil-div M block-m)]  ; [gc-n gc-m] (id0=N, id1=M)
              :scalar-args (mapv (fn [v] {:type :int :value (int v)}) (:dims dpas))  ; [m n k] params
              :dims (:dims dpas)})
-      ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel
-          (let [rt (sco/generate-regtiled-contraction-kernel @sr out-sym :dtype dtype)
-                [bm bn _bk] (:block rt)
-                [M N _L] (:dims rt)]
-            {:strategy :regtiled
-             :fallback-reason (:reason dpas)             ; kept: existing consumers read it
-             :declines @acc
-             :kernel-name (:kernel-name rt)
-             :source (:source rt)
-             :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
-             :abi (:abi rt)
-             :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
-             :wg (:workgroup rt)
-             :grid [(ceil-div N bn) (ceil-div M bm)]
-             :scalar-args []                             ; regtiled bakes dims → no scalar params
-             :dims (:dims rt)})))
+      ;; gate rejected (dtype/orientation/pitch) → portable register-tiled kernel when enabled
+          (if register-tiled?
+            (let [rt (sco/generate-regtiled-contraction-kernel @sr out-sym :dtype dtype)
+                  [bm bn _bk] (:block rt)
+                  [M N _L] (:dims rt)]
+              {:strategy :regtiled
+               :fallback-reason (:reason dpas)             ; kept: existing consumers read it
+               :declines @acc
+               :kernel-name (:kernel-name rt)
+               :source (:source rt)
+               :array-params (:array-params rt)            ; sorted-by-name (dims baked in source)
+               :abi (:abi rt)
+               :dtype (:dtype rt) :out-dtype (:dtype rt) :out-elems (* M N)
+               :wg (:workgroup rt)
+               :grid [(ceil-div N bn) (ceil-div M bm)]
+               :scalar-args []                             ; regtiled bakes dims → no scalar params
+               :dims (:dims rt)})
+            (do
+              (note! (decline :regtiled :schedule-family-disabled nil
+                              {:family :register-tiled}))
+              {::declines @acc}))))
       (catch clojure.lang.ExceptionInfo e
      ;; whichever tensorize leaf threw, record WHY and let the caller fall through. `decline-of`
      ;; rethrows :raster/fatal and :raster/bug — those are not routing decisions.
