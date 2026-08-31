@@ -11,6 +11,7 @@
           :segop-lowered-stats {:segops-lowered 2 :kernel-graphs-lowered 1
                                 :typed-soac-reused 3 :typed-scalar-equations 4}
           :backend-applied-stats {:segop-reused 2 :segop-relowered 1 :fallback 0
+                                  :typed-contraction-dispatch-declines [{}]
                                   :segop-declined [{:reason :missing-rule}]}
           :kernels [{:target :opencl-c
                      :attributes {:strategy :portable
@@ -41,3 +42,17 @@
                                  :backend-applied-stats {:fallback 0}
                                  :kernels [{:target :opencl-c}]})]
     (is (= :compatibility (get-in r [:route :source-dialect])))))
+
+(deftest counted-decline-summaries-retain-their-reasons
+  (let [r (report/from-pipeline
+           {:backend :opencl
+            :backend-applied-stats
+            {:typed-contraction-dispatch-declines {:dynamic-scalar 2}}
+            :kernels []})]
+    (is (= [{:stage :backend-applied-stats
+             :kind :typed-contraction-dispatch-declines
+             :reason :dynamic-scalar}
+            {:stage :backend-applied-stats
+             :kind :typed-contraction-dispatch-declines
+             :reason :dynamic-scalar}]
+           (get-in r [:route :declines])))))

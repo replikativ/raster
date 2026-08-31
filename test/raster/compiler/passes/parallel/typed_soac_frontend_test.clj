@@ -60,6 +60,24 @@
                                   {:scalar-types {'nrows :long 'width :long}})
                    [:stats :front-end])))))
 
+(deftest devirtualized-output-allocation-is-generated-scaffolding
+  (let [allocation (with-meta
+                     '(.invk raster.arrays/alloc-like_m_array_long-impl x n)
+                     {:raster.op/original 'raster.arrays/alloc-like})
+        source (list 'let*
+                     (vector 'out allocation
+                             'result '(raster.par/map! out i n float
+                                                       (clojure.core/aget x i)))
+                     'result)
+        direct (frontend/form->program
+                source {:dtype :float :array-types {'x :float 'out :float}
+                        :scalar-types {'n :long}})]
+    (is (= ['map] (mapv dialect/operation-kind (dialect/equations direct))))
+    (is (= :analyzed-source
+           (get-in (route/attempt source :float {'x :float 'out :float}
+                                  {:scalar-types {'n :long}})
+                   [:stats :front-end])))))
+
 (deftest guarded-dense-write-is-an-explicit-inout-map
   (let [program
         (frontend/form->program

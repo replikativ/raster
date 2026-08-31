@@ -1,6 +1,7 @@
 (ns raster.compiler.passes.parallel.typed-segmented-reduction-test
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.dialects :as dialects]
             [raster.compiler.ir.parallel-program :as parallel-program]
             [raster.compiler.ir.reduction :as reduction]
             [raster.compiler.ir.segop :as segop]
@@ -114,6 +115,8 @@
                  envelope {:target-device :ze:0 :dtype :float})
         scheduled-equation (first (:equations (:form lowered)))
         operation (first (:operations scheduled-equation))]
+    (is (dialects/valid-typed-soac-program? envelope)
+        "the pipeline boundary admits the TypedSOAC segmented-reduce operation")
     (is (= :segop (:dialect (:form lowered))))
     (is (= 1 (get-in lowered [:stats :typed-soac-reused])))
     (is (= 1 (get-in lowered [:stats :segops-lowered])))

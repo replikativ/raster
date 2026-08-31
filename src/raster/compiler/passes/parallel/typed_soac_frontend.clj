@@ -21,11 +21,6 @@
             [raster.compiler.passes.parallel.fusion-support :as fusion-support]
             [raster.compiler.passes.scalar.effects :as effects]))
 
-(def ^:private array-constructor-heads
-  '#{double-array float-array int-array long-array byte-array
-     clojure.core/double-array clojure.core/float-array
-     clojure.core/int-array clojure.core/long-array clojure.core/byte-array})
-
 (defn- fail!
   [reason message data]
   (throw (ex-info message (assoc data :reason reason :front-end :analyzed-source))))
@@ -501,14 +496,18 @@
          (or (and (symbol? expression) (contains? physical-outputs expression))
              (and (contains? physical-outputs (:sym description))
                   (seq? expression)
-                  (contains? array-constructor-heads (first expression)))))))
+                  (descriptor/alloc-op? (descriptor/semantic-op expression)))))))
+
+(defn- physical-output-symbols
+  [descriptions]
+  (reduce set/union #{}
+          (map #(if (contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %))
+                  (:outputs %) #{})
+               descriptions)))
 
 (defn- supported-descriptions?
   [descriptions]
-  (let [physical-outputs (reduce set/union #{}
-                                 (map #(if (contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %))
-                                         (:outputs %) #{})
-                                      descriptions))]
+  (let [physical-outputs (physical-output-symbols descriptions)]
     (every? (fn [description]
               (case (:kind description)
                 :scalar (or (provably-pure-scalar? (:expr description))
@@ -710,7 +709,8 @@
 
 (defn- terminal-results
   [descriptions body]
-  (let [operations (filter #(contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %)) descriptions)
+  (let [physical-outputs (physical-output-symbols descriptions)
+        operations (filter #(contains? #{:map :scatter :reduce :segmented-reduce :scan} (:kind %)) descriptions)
         operation-definitions (set (mapcat #(case (:kind %)
                                               (:map :scatter) (:results %)
                                               :scan [(:sym %)]
@@ -724,7 +724,11 @@
                         :segmented-reduce (if (:effect-only? %) [] (:results %))
                         (:outputs %))
                      operations))
-        scalar-definitions (set (keep #(when (= :scalar (:kind %)) (:sym %)) descriptions))
+        scalar-definitions
+        (set (keep #(when (and (= :scalar (:kind %))
+                               (not (generated-scaffolding? % physical-outputs)))
+                      (:sym %))
+                   descriptions))
         all-definitions (set/union operation-definitions scalar-definitions)
         operation-uses (set (concat (mapcat #(concat (:inputs %) (:scalars %)) operations)
                                     (mapcat #(when (= :scalar (:kind %))
@@ -737,7 +741,12 @@
 
 (defn- selected-scalars
   [descriptions operation-equations outputs]
-  (let [by-symbol (into {} (keep #(when (= :scalar (:kind %)) [(:sym %) %])) descriptions)
+  (let [physical-outputs (physical-output-symbols descriptions)
+        by-symbol (into {}
+                        (keep #(when (and (= :scalar (:kind %))
+                                          (not (generated-scaffolding? % physical-outputs)))
+                                 [(:sym %) %]))
+                        descriptions)
         roots (set (concat outputs
                            (mapcat (fn [equation]
                                      (into (dialect/operation-inputs equation)
