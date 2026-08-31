@@ -1,10 +1,12 @@
 (ns raster.compiler.passes.parallel.typed-soac-fusion-test
   (:require [clojure.test :refer [deftest is]]
             [raster.compiler.ir.abstract-value :as av]
+            [raster.compiler.ir.axis-map :as axis-map]
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
             [raster.compiler.passes.parallel.soac-graph :as graph]
+            [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as typed-fusion]))
 
 (def ^:private map-map-pairs
@@ -249,3 +251,73 @@
         graph (graph/build-fusion-graph [producer consumer])]
     (is (false? (boolean (graph/can-fuse-vertically? graph 0 1)))
         "legacy dependency edges do not identify which tuple component was consumed")))
+
+(defn- contract-result-map-program
+  [map-expression]
+  (frontend/form->program
+   (list 'let*
+         ['contract-step
+          '(raster.par/contract
+            C [[i 4] [j 8]] [[l 16]]
+            (* (clojure.core/aget A (+ (* i 16) l))
+               (clojure.core/aget B (+ (* l 8) j))))
+          'map-step
+          (list 'raster.par/map! 'D 't 32 nil map-expression)]
+         'map-step)
+   {:dtype :float
+    :array-types '{A :float B :float C :float D :float bias :float residual :float}
+    :scalar-types '{scale :float}}))
+
+(deftest segmented-reduce-result-map-becomes-a-typed-result-transform
+  (let [program (contract-result-map-program
+                 '(* (+ (clojure.core/aget C t)
+                        (clojure.core/aget bias (mod t 8))
+                        (clojure.core/aget residual t))
+                     scale))
+        fold-before (-> program dialect/equations first typed-fusion/equation-info :body-results)
+        [result stats] (typed-fusion/fusion-fixpoint program)
+        equation (first (dialect/equations result))
+        operation (dialect/operation-parts equation)
+        transform (get-in operation [:attributes :result-transform])
+        transform-region (dialect/lambda-parts (:lambda transform))
+        facts (dialect/facts result)]
+    (is (= {:vertical 1 :horizontal 0 :iterations 2} stats))
+    (is (= 1 (count (dialect/equations result))))
+    (is (= '[map-step] (nth equation 2)))
+    (is (= '[map-step] (dialect/outputs result)))
+    (is (= '[A B bias residual scale] (:inputs facts)))
+    (is (= 'D (get-in facts [:equations 0 :attributes :result-storage 0 :destination])))
+    (is (= {'map-step 'D} (get-in facts [:equations 0 :aliases])))
+    (is (not-any? #{'C [:effect-map 0 0]} (keys (:values facts))))
+    (is (= '[4 8] (get-in facts [:values 'map-step :shape])))
+    (is (= fold-before (:body-results (dialect/lambda-parts (:lambda operation))))
+        "post-reduction fusion must never rewrite the reduction fold")
+    (is (= '[residual bias] (mapv :value (:operands transform))))
+    (is (= '#{i j}
+           (-> transform :operands first :map axis-map/axes set)))
+    (is (= '#{j}
+           (-> transform :operands second :map axis-map/axes set)))
+    (is (= '[scale] (mapv :value (:scalars transform))))
+    (is (not-any? #{'C 't} (flatten (:body-results transform-region))))
+    (is (= result (dialect/validate! result)))))
+
+(deftest segmented-reduce-result-map-refuses-an-unproved-operand-index
+  (let [program (contract-result-map-program
+                 '(+ (clojure.core/aget C t)
+                     (clojure.core/aget bias (+ t 1))))
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= 2 (count (dialect/equations result))))))
+
+(deftest segmented-reduce-result-map-retains-an-externally-live-intermediate
+  (let [program (contract-result-map-program
+                 '(+ (clojure.core/aget C t) 1.0))
+        produced (-> program dialect/equations first (nth 2) first)
+        program (dialect/make (dialect/facts program)
+                              (dialect/equations program)
+                              [produced 'map-step])
+        [result stats] (typed-fusion/fusion-fixpoint program)]
+    (is (= program result))
+    (is (= {:vertical 0 :horizontal 0 :iterations 1} stats))
+    (is (= 2 (count (dialect/equations result))))))

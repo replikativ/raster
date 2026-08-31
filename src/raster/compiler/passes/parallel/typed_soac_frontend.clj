@@ -198,28 +198,12 @@
    and segment indices. This is what makes later ParallelProgram SSA remapping alpha-stable."
   [epilogue]
   (when epilogue
-    (let [operands (mapv (fn [ordinal {:keys [sym dtype map]}]
-                           {:value sym
-                            :parameter (symbol (str "%result-operand" ordinal))
-                            :dtype dtype :map map})
-                         (range) (vec (:operands epilogue)))
-          scalars (mapv (fn [ordinal {:keys [sym dtype]}]
-                          {:value sym
-                           :parameter (symbol (str "%result-scalar" ordinal))
-                           :dtype dtype})
-                        (range) (vec (:scalars epilogue)))
-          substitutions
-          (into {}
-                (concat (map (juxt :value :parameter) operands)
-                        (map (juxt :value :parameter) scalars)))
-          accumulator (:acc epilogue)]
-      {:operands operands
-       :scalars scalars
-       :result-dtype (or (:dtype epilogue) :float)
-       :lambda (dialect/lambda-form
-                (vec (concat [accumulator]
-                             (map :parameter operands) (map :parameter scalars)))
-                [(util/subst-syms substitutions (:expr epilogue))])})))
+    (dialect/make-result-transform
+     {:accumulator (:acc epilogue)
+      :expression (:expr epilogue)
+      :operands (mapv #(-> % (assoc :value (:sym %)) (dissoc :sym)) (:operands epilogue))
+      :scalars (mapv #(-> % (assoc :value (:sym %)) (dissoc :sym)) (:scalars epilogue))
+      :result-dtype (or (:dtype epilogue) :float)})))
 
 (defn- effect-map-description
   [id symbol index extent {:keys [locals stores]} elem-type]

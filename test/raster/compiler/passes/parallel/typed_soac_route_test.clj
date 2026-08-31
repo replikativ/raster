@@ -45,6 +45,42 @@
                                             (+ acc (clojure.core/aget x i)))]
          result))
 
+(def ^:private contraction-result-map
+  '(let* [contract-step
+          (raster.par/contract
+           C [[i 4] [j 8]] [[l 16]]
+           (* (clojure.core/aget A (+ (* i 16) l))
+              (clojure.core/aget B (+ (* l 8) j))))
+          map-step
+          (raster.par/map! D t 32 nil
+                           (* (+ (clojure.core/aget C t)
+                                 (clojure.core/aget bias (mod t 8)))
+                              scale))]
+         map-step))
+
+(deftest contraction-result-map-fuses-on-the-production-typed-route
+  (let [{:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         contraction-result-map
+         {:target-device :ocl:0 :dtype :float
+          :array-types {'A :float 'B :float 'C :float 'D :float 'bias :float}
+          :scalar-types {'scale :float}})
+        equation (first (:equations form))
+        algorithm (:algorithm equation)
+        typed-equation (first (dialect/equations algorithm))
+        transform (get-in (dialect/operation-parts typed-equation)
+                          [:attributes :result-transform])]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (= 1 (get-in stats [:typed-soac :vertical])))
+    (is (= 1 (count (:equations form))))
+    (is (= '[A B bias scale] (:operands equation)))
+    (is (= '[map-step] (:results equation)))
+    (is (= 'D (get-in equation [:attributes :result-storage 0 :destination])))
+    (is (= '[bias] (mapv :value (:operands transform))))
+    (is (= '[scale] (mapv :value (:scalars transform))))
+    (is (not-any? #{'C [:effect-map 0 0]}
+                  (keys (:values (dialect/facts algorithm)))))))
+
 (deftest gpu-session-scheduling-enters-the-shared-typed-boundary
   (let [source '(raster.par/map! target i n float
                                  (+ (clojure.core/aget x i) 1.0))

@@ -145,6 +145,8 @@
        (every? keyword? (:dtypes value))
        (every? map? (:algebra value))))
 
+(declare lambda-form)
+
 (defn result-transform?
   "A typed scalar transform applied once to a completed reduction result.
 
@@ -194,6 +196,36 @@
          (keyword? (:result-dtype value))
          (dtype/known? (:result-dtype value))
          (= (:result-dtype value) (dtype/canon (:result-dtype value))))))
+
+(defn make-result-transform
+  "Close a post-reduction scalar expression over an alpha-stable typed boundary.
+
+   Operand and scalar `:value` fields are program SSA IDs.  The returned lambda refers only to
+   fresh lexical parameters, its accumulator, and the segmented-reduction axes.  Frontends and
+   fusion rules use this one constructor so target projections never have to rediscover captures
+   from an expression."
+  [{:keys [accumulator expression operands scalars result-dtype]}]
+  (let [operands (mapv (fn [ordinal {:keys [value dtype map]}]
+                         {:value value
+                          :parameter (symbol (str "%result-operand" ordinal))
+                          :dtype dtype :map map})
+                       (range) (vec operands))
+        scalars (mapv (fn [ordinal {:keys [value dtype]}]
+                        {:value value
+                         :parameter (symbol (str "%result-scalar" ordinal))
+                         :dtype dtype})
+                      (range) (vec scalars))
+        substitutions
+        (into {}
+              (concat (map (juxt :value :parameter) operands)
+                      (map (juxt :value :parameter) scalars)))]
+    {:operands operands
+     :scalars scalars
+     :result-dtype result-dtype
+     :lambda (lambda-form
+              (vec (concat [accumulator]
+                           (map :parameter operands) (map :parameter scalars)))
+              [(util/subst-syms substitutions expression)])}))
 
 (defn segmented-reduce-attributes?
   "Attributes for a general segmented reduction. Segment axes are the ordered parallel result

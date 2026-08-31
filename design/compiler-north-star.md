@@ -336,8 +336,12 @@ request a generated surface spelling. A segmented reduction may now carry one ty
 result-transform: its accumulator, expression, result dtype, tensor operands with axis maps/dtypes,
 and uniform scalar captures with dtypes are all verified at the equation boundary. Contraction
 epilogues expressed by that closed contract therefore stay on TypedSOAC and lower through the same
-matrix store region and ordered ABI as the proven compatibility oracle. Discovering a following map
-as such a transform remains separate alias-aware fusion work; it must not rewrite the fold lambda.
+matrix store region and ordered ABI as the proven compatibility oracle. Typed fusion now discovers
+an adjacent, single-use pointwise map over a caller-owned segmented-reduction result as this same
+result-transform. It transfers the map's logical result, physical storage, alias/effect and host
+return boundary to the reduction; removes the dead intermediate; proves each residual/broadcast
+operand's map over the segment axes; and leaves the fold lambda byte-for-byte unchanged. Ambiguous
+indices, observable intermediates, read-write stores and dtype changes decline rather than guessing.
 Staged quantization, decode lambdas, declared physical operand maps and output conversions remain on
 the certified compatibility front door, and may still use `SegContract`, until the typed equation
 has explicit facts for them; admitting them while dropping those contracts would be a miscompile,
@@ -921,8 +925,10 @@ The immediate continuation after the verified double-buffered weighted-reduction
    ordered local-SSA region that lowers once through JVM and GPU paths; vertical and horizontal
    fusion now alpha-rename and compose those regions without duplicating shared scalar work.
    Explicit typed segmented-reduction result transforms now reach contraction store regions without
-   compatibility re-lowering; alias-aware segmented-reduction→map discovery is the next fusion
-   coverage step.
+   compatibility re-lowering; the typed fusion pass discovers adjacent single-use result maps and
+   removes their physical intermediates without rewriting the reduction fold. Hardware-costed
+   multi-consumer placement and result-transform stores in the non-matrix contraction leaves are
+   the next fusion/scheduling coverage steps.
    Stable indexed gathers and explicitly unique guarded scatters also use this typed scheduled-map
    route, including resident block transfers. Hardware-costed multi-consumer fusion, nested-region
    JVM scheduling, reducing/atomic scatter variants, the remaining parallel forms, and
