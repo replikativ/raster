@@ -1,0 +1,76 @@
+{:schema-version 1
+ :description
+ "Exact inventory of test code that prints a skip instead of reporting through the shared honest gates. Counts are compatibility debt: remove entries as sites migrate; never raise them without an explicit review."
+ :sites
+ {"test/raster/compiler/backend/gpu/contract_pipeline_device_test.clj"
+  {:count 3 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/backend/gpu/cuda_mma_compile_test.clj"
+  {:count 1 :class :toolchain :reason "Optional nvcc execution gate"}
+  "test/raster/compiler/backend/gpu/dp4a_contract_device_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/backend/gpu/dpas_contract_device_test.clj"
+  {:count 2 :class :device-test :reason "Level Zero device gates predate the shared probe"}
+  "test/raster/compiler/backend/gpu/gpu_correctness_test.clj"
+  {:count 1 :class :device-test :reason "Whole-fixture Level Zero device gate"}
+  "test/raster/compiler/backend/gpu/hip_compile_gate_test.clj"
+  {:count 2 :class :toolchain :reason "Optional local nvcc and hipcc execution gates"}
+  "test/raster/compiler/backend/gpu/quant_contract_device_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/backend/gpu/segmented_contract_device_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/backend/gpu/staged_contract_device_test.clj"
+  {:count 3 :class :device-test :reason "Level Zero device gates predate the shared probe"}
+  "test/raster/compiler/backend/gpu/tiled_contract_device_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/backend/wasm/emit_test.clj"
+  {:count 1 :class :toolchain :reason "Optional Node execution gate"}
+  "test/raster/compiler/csimd_test.clj"
+  {:count 4 :class :toolchain :reason "Optional clang and AVX2 execution gates"}
+  "test/raster/compiler/passes/parallel/contract_route_device_test.clj"
+  {:count 7 :class :device-test :reason "Level Zero device gates predate the shared probe"}
+  "test/raster/compiler/passes/parallel/epilogue_operand_fusion_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/compiler/pipeline_e2e_test.clj"
+  {:count 1 :class :optional-library :reason "Optional BLAS assertion guard"}
+  "test/raster/compiler/pipeline_quality_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/array_ops_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/attention_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/compiled_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/dv_batched_gemm_spike.clj"
+  {:count 1 :class :spike :reason "Experimental Level Zero device gate"}
+  "test/raster/dl/einsum_contract_test.clj"
+  {:count 2 :class :device-test :reason "Level Zero device gates predate the shared probe"}
+  "test/raster/dl/gpu_grad_parity.clj"
+  {:count 3 :class :shared-gate :reason "Canonical honest Level Zero skip reporting"}
+  "test/raster/dl/gsdm_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/nn_test.clj"
+  {:count 8 :class :optional-library :reason "Per-test BLAS assertion guards"}
+  "test/raster/dl/train_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/dl/wi8_dot_convergence_test.clj"
+  {:count 1 :class :toolchain :reason "Optional C compiler execution gate"}
+  "test/raster/gpu/byte_transpose_test.clj"
+  {:count 1 :class :device-test :reason "Level Zero device gate predates the shared probe"}
+  "test/raster/gpu/device_probe.clj"
+  {:count 3 :class :shared-gate :reason "Canonical honest OpenCL skip reporting"}
+  "test/raster/gpu/soa_test.clj"
+  {:count 1 :class :device-test :reason "Whole-fixture Level Zero device gate"}
+  "test/raster/gpu/ze_runtime_test.clj"
+  {:count 1 :class :device-test :reason "Whole-fixture Level Zero device gate"}
+  "test/raster/linalg/blas_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture BLAS gate"}
+  "test/raster/linalg/dense_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture LAPACK gate"}
+  "test/raster/linalg/eigen_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture LAPACK gate"}
+  "test/raster/linalg/pca_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture LAPACK gate"}
+  "test/raster/linalg/qr_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture LAPACK gate"}
+  "test/raster/linalg/svd_test.clj"
+  {:count 1 :class :optional-library :reason "Whole-fixture LAPACK gate"}}}
