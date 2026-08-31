@@ -1,10 +1,10 @@
 (ns raster.compiler.ir.contraction-facts-test
-  "FACTS: the single derivation whose only input is the form. Device-free.
+  "FACTS: one verified derivation from source or typed semantic components. Device-free.
 
-   The property under test is structural, not behavioural: because there is one producer and its
-   only input is the form, a checker cannot be handed a value derived from the thing it is meant
-   to check. That shape is what made two silent miscompiles writable — a stage list validated
-   against axes derived from itself, and a body-replacing leaf that never checked the body."
+   The property under test is structural, not behavioural: every checker receives the tagged
+   result of one constructor, rather than separately derived gate arguments. That old shape made
+   two silent miscompiles writable — a stage list validated against axes derived from itself, and
+   a body-replacing leaf that never checked the body."
   (:require [clojure.test :refer [deftest is testing]]
             [raster.compiler.ir.contraction-facts :as cf]
             [raster.compiler.ir.axis-map :as am]
@@ -40,6 +40,26 @@
         (is (= [(:index operator) 128] (:flat-contract-axis f)))
         (is (= (:element (cf/scalar-reduction-view f))
                (second (rest (first (:results (reduction/fold-region operator)))))))))))
+
+(deftest source-and-semantic-components-enter-the-same-facts-constructor
+  (let [source (form :init 1 :combine 'clojure.core/+)
+        parsed (cf/contraction-facts source :dtype :byte)
+        components (cf/from-components
+                    {:out 'out :free-axes '[[i 4] [j 6]]
+                     :contract-axes '[[blk 4] [t 32]] :body body
+                     :opts (array-map :init 1 :combine 'clojure.core/+)
+                     :dtype :byte})]
+    (is (cf/facts? components))
+    (is (= (select-keys parsed [:out :free-axes :contract-axes :body :operands
+                                :roles :dims :opts :dtype])
+           (select-keys components [:out :free-axes :contract-axes :body :operands
+                                    :roles :dims :opts :dtype])))
+    (is (= (select-keys (cf/scalar-reduction-view parsed) [:neutral :combine :dtype])
+           (select-keys (cf/scalar-reduction-view components) [:neutral :combine :dtype])))
+    (is (= (:form components)
+           (cf/surface-form {:out 'out :free-axes '[[i 4] [j 6]]
+                             :contract-axes '[[blk 4] [t 32]] :body body
+                             :opts (array-map :init 1 :combine 'clojure.core/+)})))))
 
 (deftest a-stage-list-cannot-supply-the-axes-it-is-checked-against
   (testing "the form's contract axes are independent of its :stages — the two are separate slots,

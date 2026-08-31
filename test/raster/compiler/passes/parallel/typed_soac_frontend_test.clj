@@ -3,6 +3,7 @@
             [raster.compiler.ir.soac :as legacy]
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.ir.segop :as segop]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.passes.parallel.soac-dialect-adapter :as adapter]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-route :as route]))
@@ -190,9 +191,13 @@
         operation (dialect/operation-parts equation)
         routed (route/attempt source :float (:array-types options)
                               {:scalar-types (:scalar-types options)})
-        scheduled ((requiring-resolve
-                    'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
-                   (:program routed) {:target-device :ze:0 :dtype :float})
+        scheduled
+        (with-redefs [contraction-facts/contraction-facts
+                      (fn [& _]
+                        (throw (ex-info "typed scheduling reparsed source" {})))]
+          ((requiring-resolve
+            'raster.compiler.passes.parallel.segop-lower-pass/segop-lower-pass)
+           (:program routed) {:target-device :ze:0 :dtype :float}))
         segcontract (-> scheduled :form :equations first :operations first)]
     (is (= 'segmented-reduce (:kind operation)))
     (is (= '[[i m] [j n]] (get-in operation [:attributes :segment-axes])))

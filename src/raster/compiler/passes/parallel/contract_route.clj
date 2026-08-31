@@ -249,6 +249,10 @@
 (defn route-contraction
   "Route a contraction form through verified facts, an applied hardware schedule and a target leaf.
 
+   `contract-form` may be nil when verified `:facts` are supplied. In that case any temporary
+   source-shaped spelling needed by a compatibility leaf is generated from those facts; routing
+   and legality never inspect the walked source form.
+
    Canonical f16 products first become a target-neutral KernelBody and are then lowered by the
    OpenCL DPAS backend.  Unsupported shapes retain the portable register-tiled route.  Byte/int8
    products use the quant leaves (dp4a for :nt, widening for :nn) until those instruction families
@@ -256,9 +260,15 @@
    not a buffer-ownership or graph-composition concern."
   [contract-form & {:keys [dtype prefer-peak? desc tile epilogue stages operands facts operation-id]
                     :or {dtype :half prefer-peak? false}}]
-  (let [out-sym (second contract-form)
-        free-axes (nth contract-form 2)
-        contract-axes (nth contract-form 3)
+  (let [contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
+        contract-form (or contract-form (:form contract-facts))
+        _ (when-not (and (cf/facts? contract-facts) contract-form)
+            (throw (ex-info "contraction routing requires verified facts and a target spelling"
+                            {:reason :contraction-route-input
+                             :facts contract-facts :form contract-form})))
+        out-sym (:out contract-facts)
+        free-axes (:free-axes contract-facts)
+        contract-axes (:contract-axes contract-facts)
         n-free (count free-axes)
         n-contract (count contract-axes)
         ;; Number of output elements = product of the free-axis bounds. Bounds may be SYMBOLS
@@ -271,13 +281,12 @@
         ;; memoized so the cond's test arm doesn't regenerate the kernel
         ;; a fused contraction carries its epilogue in the form's trailing opts (par-fusion's
         ;; fuse-contract-map puts it there); an explicit :epilogue kwarg overrides.
-        form-opts (apply hash-map (drop 5 contract-form))
-        contract-facts (or facts (cf/contraction-facts contract-form :dtype dtype))
-        epilogue (or epilogue (:epilogue form-opts))
-        stages (or stages (:stages (apply hash-map (drop 5 contract-form))))
+        form-opts (:opts contract-facts)
+        epilogue (or epilogue (:epilogue contract-facts))
+        stages (or stages (:stages contract-facts))
         ;; declared operand axis-maps, needed to tensorize a staged inner stage (the gate VERIFIES
         ;; them against the body rather than trusting them)
-        operands (or operands (:operands (apply hash-map (drop 5 contract-form))))
+        operands (or operands (:operands form-opts))
         tensorize-plan (memoize #(route-2free-1contract contract-form out-sym dtype desc tile
                                                         epilogue contract-facts operation-id))]
     ;; Every descriptor is validated against the kernel it describes before it leaves this fn. The

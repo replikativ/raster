@@ -8,6 +8,7 @@
   (:require [raster.compiler.core.dtype :as dtype]
             [raster.compiler.core.op-descriptor :as descriptor]
             [raster.compiler.core.util :as util]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.soac-dialect :as dialect]))
 
 (defn- materialize-region
@@ -44,12 +45,11 @@
     {:combine (descriptor/semantic-op expression)
      :element (second arguments)}))
 
-(defn segmented-reduce-contract-form
-  "Project one validated, scalar `segmented-reduce` equation to `raster.par/contract`.
+(defn segmented-reduce-contract-components
+  "Project one validated scalar `segmented-reduce` equation to contraction semantic components.
 
-   This is a compatibility seam for contraction scheduling and host materialization, not a second
-   semantic IR: captures, physical storage, axes, algebra and the scalar region all come from the
-   validated TypedSOAC program."
+   This is not a second IR: captures, physical storage, axes, algebra and the scalar region all
+   come from the validated TypedSOAC program."
   [program equation]
   (let [program (dialect/validate! program)
         [_ equation-id results] equation
@@ -81,12 +81,19 @@
                 locals
                 (util/subst-syms substitutions (first body-results)))
         {:keys [combine element]} (scalar-fold-parts attributes folded)
-        form (list 'raster.par/contract
-                   (first physical-results)
-                   (:segment-axes attributes)
-                   [[(:index attributes) (:extent attributes)]]
-                   element
-                   :init (first (:identities attributes))
-                   :combine combine
-                   :algebra (first (:algebra attributes)))]
-    (with-meta form {:raster.type/elem-type (first (:dtypes attributes))})))
+        contraction-dtype (first (:dtypes attributes))]
+    {:out (first physical-results)
+     :free-axes (:segment-axes attributes)
+     :contract-axes [[(:index attributes) (:extent attributes)]]
+     :body element
+     :opts (array-map :init (first (:identities attributes))
+                      :combine combine
+                      :algebra (first (:algebra attributes)))
+     :dtype contraction-dtype
+     :metadata {:raster.type/elem-type contraction-dtype}}))
+
+(defn segmented-reduce-contract-form
+  "Spell a typed scalar segmented reduction in the temporary host/leaf target vocabulary."
+  [program equation]
+  (contraction-facts/surface-form
+   (segmented-reduce-contract-components program equation)))

@@ -327,8 +327,9 @@
         ;; The equation remains the sole semantic representation.  SegContract is a target
         ;; scheduling view carrying facts derived from the shared mechanical projection; it lets
         ;; DPAS/register-tiled leaves consume the typed front door without re-reading source.
-        (let [form (projection/segmented-reduce-contract-form program equation)
-              facts (contraction-facts/contraction-facts form :dtype output-dtype)]
+        (let [components (projection/segmented-reduce-contract-components program equation)
+              facts (contraction-facts/from-components
+                     (assoc components :dtype output-dtype))]
           [(segop/->SegContract equation-id facts output-dtype device-id)])
         [(segop/->SegRed equation-id space
                          (segop/->SegLevel :thread :virtual)

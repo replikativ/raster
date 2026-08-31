@@ -322,8 +322,10 @@ constructing the former `SoacContract` record. Ordinary scalar `raster.par/contr
 enters this equation directly; the operation is intentionally not a matmul node, so scientific
 contractions, batched reductions and attention-derived reductions share the same semantic
 vocabulary. Until the tensorization route consumes TypedSOAC itself, one shared mechanical
-projection supplies both host materialization and a `SegContract` schedule view. The GPU emitter
-reuses that scheduled view rather than re-reading source. Staged quantization, decode lambdas,
+component projection supplies host materialization and the verified facts carried by a
+`SegContract` schedule view. Schedule legality and GPU routing consume those components directly;
+only host materialization and compatibility leaves request a generated surface spelling, and no
+walked source form is reparsed. Staged quantization, decode lambdas,
 declared physical maps, epilogues and output conversions remain on the certified compatibility
 front door until the typed equation has explicit facts for them; admitting them while dropping
 those contracts would be a miscompile, not migration progress.
