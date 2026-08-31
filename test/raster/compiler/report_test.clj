@@ -53,6 +53,13 @@
             :host-array-allocs-in-compute nil :internal-host-roundtrips nil}
            (:residency normalized)))))
 
+(deftest specialized-kernel-emission-is-visible-as-compatibility-not-scalar
+  (let [r (report/from-pipeline {:backend :opencl
+                                 :segop-lowered-stats {:segops-lowered 0}
+                                 :backend-applied-stats {:fallback 0}
+                                 :kernels [{:target :opencl-c}]})]
+    (is (= :compatibility (get-in r [:route :source-dialect])))))
+
 (deftest representative-dense-pipeline-exposes-current-compatibility-debt
   (let [r (pipeline/compile-report #'nn/predict-fn)]
     (testing "functional fusion stays on the typed route"
