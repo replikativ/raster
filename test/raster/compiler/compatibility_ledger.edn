@@ -1,0 +1,47 @@
+{:schema-version 1
+ :description
+ "Exact fast-lane compiler signatures for representative ML and scientific workloads. Improvements update this debt downward; unexpected route, fallback, or emitter drift fails CI. Large numerical/performance comparisons live in the cold benchmark lane."
+ :workloads
+ {:dense-relu-jvm
+  {:route {:backend :simd :source-dialect :typed-soac :typed-validated true :declines {}}
+   :fusion {:vertical 1 :horizontal 0 :iterations 2 :placements 0}
+   :lowering {:segops 2 :kernel-graphs 0 :typed-reused 2 :typed-scalar-equations 4
+              :backend-reused 2 :backend-relowered 2 :fallback 2}
+   :emission {:kernel-count 0 :targets [] :strategies [] :fallback-reasons [] :declines {}}}
+
+  :symbolic-dense-contraction-gpu
+  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false :declines {}}
+   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
+   :lowering {:segops 1 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 1 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 1 :targets [:opencl-c] :strategies [:portable-segred]
+              :fallback-reasons [:symbolic-dims]
+              :declines {[:dpas :matrix-capability-unavailable] 1
+                         [:regtiled :symbolic-dims] 1}}}
+
+  :q4k-dp4a-rows-gpu
+  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
+           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 1}}
+   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
+   :lowering {:segops 0 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 0 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 1 :targets [:opencl-c] :strategies []
+              :fallback-reasons [] :declines {}}}
+
+  :gqa-causal-mha-gpu
+  {:route {:backend :opencl :source-dialect :compatibility :typed-validated false
+           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 6}}
+   :fusion {:vertical 0 :horizontal 1 :iterations 2 :placements 0}
+   :lowering {:segops 2 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 0 :backend-relowered 0 :fallback 0}
+   :emission {:kernel-count 8 :targets [:opencl-c] :strategies []
+              :fallback-reasons [] :declines {}}}
+
+  :heat-rhs-1d-jvm
+  {:route {:backend :simd :source-dialect :scalar :typed-validated false
+           :declines {[:segop-lowered-stats :segops-declined :no-lowering-rule] 1}}
+   :fusion {:vertical 0 :horizontal 0 :iterations 1 :placements 0}
+   :lowering {:segops 0 :kernel-graphs 0 :typed-reused 0 :typed-scalar-equations 0
+              :backend-reused 0 :backend-relowered 0 :fallback 1}
+   :emission {:kernel-count 0 :targets [] :strategies []
+              :fallback-reasons [] :declines {}}}}}
