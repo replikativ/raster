@@ -12,8 +12,10 @@
 
   Each SegOp carries a KernelGrid with pre-computed launch config
   based on raster.runtime.hardware device properties."
-  (:require [raster.runtime.hardware :as hw]
+  (:require [clojure.set :as set]
+            [raster.runtime.hardware :as hw]
             [raster.compiler.core.hardware :as chw]
+            [raster.compiler.core.util :as util]
             [raster.compiler.ir.reduction :as reduction]))
 
 ;; ================================================================
@@ -112,6 +114,38 @@
   [x]
   (or (segop? x)
       (and x (= "raster.compiler.ir.segop.SegContract" (.getName (class x))))))
+
+(defn operation-inputs
+  "Physical tensor inputs of a scheduled operation, including a SegContract schedule view."
+  [operation]
+  (if (instance? SegContract operation)
+    (let [facts (:facts operation)]
+      (disj (set (map :sym (:operands facts))) (:out facts)))
+    (or (:inputs operation) #{})))
+
+(defn operation-outputs
+  "Physical tensor outputs of a scheduled operation, including a SegContract schedule view."
+  [operation]
+  (if (instance? SegContract operation)
+    #{(get-in operation [:facts :out])}
+    (or (:outputs operation) #{})))
+
+(defn operation-scalars
+  "Scalar shape operands of a scheduled operation.
+
+   A SegContract deliberately stores only verified contraction facts, so its scalar ABI is a
+   checked projection of axis bounds rather than a duplicate record field."
+  [operation]
+  (if (instance? SegContract operation)
+    (let [facts (:facts operation)
+          arrays (set/union (operation-inputs operation) (operation-outputs operation))
+          axes (concat (:free-axes facts) (:contract-axes facts))
+          axis-indices (set (map first axes))
+          expressions (conj (mapv second axes) (:body facts))]
+      (set/difference
+       (reduce set/union #{} (map util/free-syms expressions))
+       arrays axis-indices))
+    (or (:scalars operation) #{})))
 
 (defn segop-grid
   "Get the KernelGrid from a SegOp."

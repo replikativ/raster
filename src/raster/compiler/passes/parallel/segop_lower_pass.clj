@@ -344,9 +344,9 @@
           ;; partial arrays and aliased destinations—must have an AbstractValue contract.
           _ (doseq [equation equations
                     operation (:operations equation)
-                    id (set/union (or (:inputs operation) #{})
-                                  (or (:outputs operation) #{})
-                                  (or (:scalars operation) #{}))]
+                    id (set/union (segop/operation-inputs operation)
+                                  (segop/operation-outputs operation)
+                                  (segop/operation-scalars operation))]
               (when-not (contains? scheduled-values id)
                 (throw (ex-info "scheduled SegOp references an undeclared value"
                                 {:reason :segop-unknown-scheduled-value
@@ -365,7 +365,8 @@
                                     [:equations algorithm-id :aliases])
                     expected (set (map #(get aliases % %) (:results equation)))
                     scheduled-outputs (apply set/union #{}
-                                             (map :outputs (:operations equation)))]
+                                             (map segop/operation-outputs
+                                                  (:operations equation)))]
                 (when-not (set/subset? expected scheduled-outputs)
                   (throw (ex-info "scheduled SegOp does not realize the typed output boundary"
                                   {:reason :segop-output-boundary

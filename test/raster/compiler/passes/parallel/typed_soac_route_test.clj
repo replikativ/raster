@@ -566,6 +566,48 @@
     (is (nil? (get-in emitted [:stats :segop-relowered])))
     (is (= 1 (count (:kernels emitted))))))
 
+(deftest typed-contraction-schedule-view-retains-body-scalars
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                       (* alpha
+                          (clojure.core/aget A (+ (* i k) l))
+                          (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long 'alpha :float}})
+        operation (-> form :equations first :operations first)]
+    (is (= '#{m n k alpha} (segop/operation-scalars operation)))
+    (is (= '#{A B} (segop/operation-inputs operation)))
+    (is (= '#{C} (segop/operation-outputs operation)))))
+
+(deftest gpu-emission-consumes-the-typed-contraction-schedule-view
+  (let [source
+        '(let* [step (raster.par/contract C [[i m] [j n]] [[l k]]
+                       (* (clojure.core/aget A (+ (* i k) l))
+                          (clojure.core/aget B (+ (* l n) j))))]
+               step)
+        {:keys [form stats]}
+        (pipeline/schedule-parallel-form
+         source {:target-device :ocl:0 :dtype :float
+                 :array-types {'A :float 'B :float 'C :float}
+                 :scalar-types {'m :long 'n :long 'k :long}})
+        operation (-> form :equations first :operations first)
+        algorithm (-> form :equations first :algorithm)
+        emitted (opencl-pass/opencl-pass form :device-id :ocl:0
+                                         :dtype :float :min-elements 0)]
+    (is (= :typed-soac (:source-dialect stats)))
+    (is (instance? raster.compiler.ir.segop.SegContract operation))
+    (is (= :raster.par/contract
+           (get-in (dialect/operation-parts (first (dialect/equations algorithm)))
+                   [:attributes :attributes :source-operation])))
+    (is (= 1 (get-in emitted [:stats :ze-contracts])))
+    (is (= 1 (get-in emitted [:stats :segop-reused])))
+    (is (nil? (get-in emitted [:stats :segop-relowered])))
+    (is (= 1 (count (:kernels emitted))))))
+
 (deftest resident-reduction-realization-stays-on-the-typed-spine
   (let [source
         '(let* [total (raster.par/reduce acc 0.0 i n

@@ -9,6 +9,7 @@
             [raster.compiler.ir.soac-dialect :as dialect]
             [raster.compiler.passes.parallel.typed-soac-frontend :as frontend]
             [raster.compiler.passes.parallel.typed-soac-fusion :as fusion]
+            [raster.compiler.passes.parallel.typed-soac-projection :as projection]
             [raster.compiler.passes.parallel.typed-soac-resident :as resident]
             [raster.compiler.core.util :as util]))
 
@@ -225,6 +226,16 @@
            :site [:binding result]
            :source source}))
 
+      segmented-reduce
+      (let [host-binding (or (get-in placement-facts [:attributes :host-binding])
+                             (first results))
+            source (projection/segmented-reduce-contract-form program equation)]
+        {:equation-id equation-id
+         :placement placement
+         :pairs [[host-binding source]]
+         :site [:binding host-binding]
+         :source source})
+
       scan
       (let [result (first results)
             mode (:mode attributes)
@@ -342,7 +353,7 @@
                (if resident-reductions?
                  (resident/realize typed-result)
                  [typed-result {:resident-reductions 0 :inlined-scalars 0}])]
-           (if (not-any? #(contains? #{:map :scatter :reduce :scan}
+           (if (not-any? #(contains? #{:map :scatter :reduce :segmented-reduce :scan}
                                      (:kind (fusion/equation-info %)))
                          (dialect/equations typed-result))
              {:declined {:reason :no-certified-parallel-equation

@@ -294,9 +294,10 @@
         (when (and parallel-program
                    (= :typed-soac (get-in parallel-program [:provenance :source-dialect])))
           (let [operations (mapcat :operations (:equations parallel-program))
-                arrays (set (mapcat #(concat (or (:inputs %) #{}) (or (:outputs %) #{}))
+                arrays (set (mapcat #(concat (segop/operation-inputs %)
+                                             (segop/operation-outputs %))
                                     operations))
-                scalars (set (mapcat #(or (:scalars %) #{}) operations))
+                scalars (set (mapcat segop/operation-scalars operations))
                 overlap (set/intersection arrays scalars)]
             (when (seq overlap)
               (throw (ex-info "scheduled values have contradictory buffer and scalar ABI roles"
