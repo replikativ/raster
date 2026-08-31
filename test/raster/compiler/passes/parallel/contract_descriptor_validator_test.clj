@@ -27,12 +27,20 @@
 ;; ── every strategy's descriptor matches the kernel it describes ───────────────────────
 (deftest every-strategy-descriptor-is-consistent
   ;; route-contraction validates on the way out, so simply routing each shape is the assertion.
-  (testing "the six base strategies"
+  (testing "the base strategies, including the explicit migration fallback"
     (is (= :dpas         (:strategy (route/route-contraction (mm 256 512 128) :dtype :half))))
     (is (= :regtiled     (:strategy (route/route-contraction (mm 96 96 64) :dtype :double))))
     (is (= :segmap       (:strategy (route/route-contraction
                                      '(raster.par/contract C [[i 4] [j 3]] [] (* (aget a i) (aget b j)))
                                      :dtype :double))))
+    (is (= :portable-segred
+           (:strategy (route/route-contraction
+                       '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
+                          (* (aget A (+ (* (+ (* b 4) i) 5) l))
+                             (aget B (+ (* (+ (* b 5) l) 3) j))))
+                       :dtype :double))))
+    ;; The source template remains an explicit correctness fallback only where no physical
+    ;; operand layout can be proven (these deliberately unbound gather coordinates model that).
     (is (= :naive-segred (:strategy (route/route-contraction
                                      '(raster.par/contract C [[b 2] [i 4] [j 3]] [[l 5]]
                                                            (* (aget A x) (aget B y))) :dtype :double))))
@@ -77,7 +85,7 @@
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"out-elems"
                             (route/validate-descriptor (dissoc good :out-elems)))))
     (testing "malformed launch geometry"
-      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"2-element vectors"
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"matching 1-3D geometry"
                             (route/validate-descriptor (assoc good :grid [4])))))))
 
 (deftest validator-models-both-invoke-protocols

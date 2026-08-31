@@ -10,10 +10,11 @@
    opencl-pass makes when it meets a contraction; kept in ONE place so the gate's hardware
    knowledge lives with the emitters, not scattered across passes.
 
-   Returns a launch-ready descriptor. Strategies: :segmap (0 contract axes), :naive-segred
-   (general), :regtiled (portable tiled), :dpas (f16 peak), :dp4a (int8 peak), :quant-naive
+   Returns a launch-ready descriptor. Strategies: :segmap (0 contract axes), :portable-segred
+   (scheduled general), :naive-segred (explicit migration fallback), :regtiled (portable tiled),
+   :dpas (f16 peak), :dp4a (int8 peak), :quant-naive
    (int8 widening). Keys: :kernel-name :source :array-params (binding order) :dtype :out-dtype
-   :out-elems :wg [x y] :grid [gx gy] :scalar-args [{:type :value}…] :dims, plus optional
+   :out-elems :wg/:grid (uniform 1-3D geometry) :scalar-args [{:type :value}…] :dims, plus optional
    :fallback-reason, :scheme (quant decode) and :pre-steps (inserted layout rearranges)."
   (:require [raster.compiler.core.op-descriptor :as od]
             [clojure.string :as str]
@@ -126,7 +127,7 @@
    descriptor says to bind, which is what this does.
 
    Pointer params must equal (array-params + 1 output + epilogue-operands). Default single-launch
-   leaves must also supply positive 2-D workgroup/grid data; validation closes those fields and the
+   leaves must also supply matching 1-3D workgroup/grid data; validation closes those fields and the
    ordered compiler values into a KernelArtifact. Full reductions already arrive as a verified
    artifact and retain their distinct two-phase invoke protocol, whose scheduler owns geometry.
 
@@ -186,12 +187,13 @@
       (nil? out-elems)
       (throw (ex-info "contract descriptor: :out-elems is required (the artifact sizes the output with it)"
                       {:strategy strategy}))
-      ;; wg/grid belong to the 2-D launch contract only. The reduction invoke computes its own
-      ;; two-phase geometry, so a :reduction descriptor legitimately carries neither — a third
-      ;; protocol difference this validator forced into the open rather than leaving implicit.
+      ;; A single-launch descriptor preserves the schedule's actual dimensionality. The reduction
+      ;; invoke computes its own two-phase geometry, so it legitimately carries neither.
       (and (not= :reduction invoke)
-           (not (and (vector? wg) (= 2 (count wg)) (vector? grid) (= 2 (count grid)))))
-      (throw (ex-info "contract descriptor: :wg and :grid must both be 2-element vectors"
+           (not (and (vector? wg) (vector? grid)
+                     (<= 1 (count wg) 3)
+                     (= (count wg) (count grid)))))
+      (throw (ex-info "contract descriptor: :wg and :grid must have matching 1-3D geometry"
                       {:strategy strategy :wg wg :grid grid}))
       (and (= :reduction invoke) (or (some? wg) (some? grid)))
       (throw (ex-info "contract descriptor: :invoke :reduction must not carry :wg/:grid (the invoke owns the two-phase launch)"
@@ -381,28 +383,40 @@
         (tensorize-plan)
 
       ;; everything else (n-free≠2, n≥2 contract axes, or a tensorize-ineligible 2-free form)
-      ;; → naive segmented reduce (general: any dtype, symbolic dims, any assoc combine).
-      ;; contract-form->segred flattens n≥2 contract axes into one innermost dim.
+      ;; → the portable scheduled KernelBody when its operand layouts are provable. During the
+      ;; migration, unsupported gathers retain the verified source emitter as an explicit decline.
         :else
         (let [sr (cl/contract-form->segred contract-form :dtype dtype :facts contract-facts)
+              portable (contraction-schedule/plan-portable-body contract-facts sr desc)
+              emitted (when (:ok portable)
+                        (sco/generate-contraction-kernel-body (:body portable)))
               {:keys [kernel-name source array-params scalar-params abi]}
-              (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype)
+              (or emitted (sco/generate-segmented-reduce-kernel sr out-sym :dtype dtype))
             ;; WHY THIS LEAF AND NOT A FASTER ONE. Only meaningful for the 2-free/1-contract shape,
             ;; where a tensorize leaf was actually attempted; for every other shape no faster leaf
             ;; exists to decline, so an empty vector is the honest answer rather than a fabricated
             ;; "not eligible".
               declines (when (and (= 2 n-free) (= 1 n-contract))
-                         (::declines (tensorize-plan)))]
+                         (::declines (tensorize-plan)))
+              declines (cond-> (vec declines)
+                         (not (:ok portable))
+                         (conj {:leaf :portable-kernel-body
+                                :reason (:reason portable)
+                                :data (:detail portable)}))
+              workgroup-size (or (:workgroup-size portable) 256)]
           (cond->
-           {:strategy :naive-segred
-            :declines (vec declines)
+           {:strategy (if (:ok portable) :portable-segred :naive-segred)
+            :declines declines
             :kernel-name kernel-name :source source :array-params array-params :abi abi
-            :dtype dtype :out-dtype dtype :wg [256 1] :grid [(ceil-div nseg 256) 1]
+            :kernel-body (:body portable)
+            :dtype dtype :out-dtype dtype
          ;; SYMBOLIC axis bounds become int kernel params (the emitter declares them, sorted by
          ;; name); they must be bound BEFORE the trailing count or the launch arity is wrong.
             :scalar-args (conj (mapv (fn [p] {:type :int :value p}) scalar-params)
                                {:type :int :value nseg})
-            :out-elems nseg :dims [nseg]}
+            :out-elems nseg :dims [nseg]
+            :wg [workgroup-size]
+            :grid [(ceil-div nseg workgroup-size)]}
           ;; the LAST decline is the decisive one — the leaf that would otherwise have taken the
           ;; work. Using the first reported DPAS's generic :not-a-contraction where regtiled's
           ;; specific :symbolic-dims / :non-plus-combine is the actual answer.

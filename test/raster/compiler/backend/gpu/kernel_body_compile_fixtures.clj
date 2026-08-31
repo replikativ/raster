@@ -7,9 +7,12 @@
             [raster.compiler.backend.gpu.segop-opencl :as segop-emit]
             [raster.compiler.backend.gpu.target :as gpu-target]
             [raster.compiler.ir.attention :as attention]
+            [raster.compiler.ir.contraction-facts :as contraction-facts]
             [raster.compiler.ir.kernel-executable :as executable]
             [raster.compiler.ir.soac :as soac]
             [raster.compiler.passes.parallel.attention-route :as attention-route]
+            [raster.compiler.passes.parallel.contract-lower :as contract-lower]
+            [raster.compiler.passes.parallel.contraction-schedule :as contraction-schedule]
             [raster.compiler.passes.parallel.segmented-weighted-reduction-schedule :as schedule]
             [raster.compiler.passes.parallel.soac-lower :as soac-lower]))
 
@@ -24,6 +27,20 @@
     (segop-emit/generate-segred-kernel-body
      operation nil :dtype :float :scalar-types {'scale :float}
      :target-dialect dialect :kernel-name-prefix "workgroup_reduce")))
+
+(defn- contraction-artifact
+  [dialect descriptor]
+  (let [form '(raster.par/contract y [[i 64]] [[l 32]]
+                (* (aget A (+ (* i 32) l)) (aget x l)))
+        verified (contraction-facts/contraction-facts form :dtype :float)
+        segred (contract-lower/contract-form->segred
+                form :dtype :float :facts verified)
+        planned (contraction-schedule/plan-portable-body verified segred descriptor)]
+    (when-not (:ok planned)
+      (throw (ex-info "portable contraction compile fixture did not schedule" planned)))
+    (segop-emit/generate-contraction-kernel-body
+     (:body planned) :target-dialect dialect
+     :kernel-name-prefix "portable_contraction")))
 
 (defn- problem []
   (attention/make
@@ -96,6 +113,8 @@
                             swizzled-pipelined)
            (write-artifact! directory suffix "workgroup-reduction"
                             (reduction-artifact dialect))
+           (write-artifact! directory suffix "portable-contraction"
+                            (contraction-artifact dialect descriptor))
            (write-source! directory suffix "workgroup-memory"
                           (body-emit/emit-scalar-kernel
                            "workgroup_memory" (body-fixtures/workgroup-memory-body 32)

@@ -52,7 +52,7 @@
             previously recorded NOTHING AT ALL, not even a :fallback-reason key"
     (let [r (route (mm 128 128 128 :sym-dims true) :half)
           by-leaf (into {} (map (juxt :leaf identity)) (:declines r))]
-      (is (= :naive-segred (:strategy r)))
+      (is (= :portable-segred (:strategy r)))
       (is (= #{:dpas :regtiled} (set (keys by-leaf))) "both attempts itemized")
       (is (= :symbolic-dims (:reason (get by-leaf :regtiled))))
       (is (re-find #"literal dims" (str (:message (get by-leaf :regtiled))))
@@ -64,7 +64,7 @@
   (testing "a non-+ combine is a legitimate contraction that simply is not tiled-leaf shaped"
     (let [r (route (mm 128 128 128 :combine 'max) :half)
           by-leaf (into {} (map (juxt :leaf identity)) (:declines r))]
-      (is (= :naive-segred (:strategy r)))
+      (is (= :portable-segred (:strategy r)))
       (is (= :non-plus-combine (:reason (get by-leaf :regtiled))))
       (is (re-find #"combine must be \+" (str (:message (get by-leaf :regtiled))))))))
 
@@ -123,7 +123,12 @@
 
             This is north-star §10's 'no knob without emission', and the resident door had always
             passed it (ze_runtime `:prefetch (:num-stages tile 3)`)."
-    (let [desc (try (chw/descriptor-for :ze:0) (catch Throwable _ nil))
+    ;; This is a compiler test, so use a synthetic target descriptor. Querying :ze:0 made the
+    ;; assertion depend on local driver availability even though neither routing nor emission
+    ;; needs a device.
+    (let [desc {:matrix {:family :dpas :m 8 :n 16 :k 16 :subgroup 16}
+                :grf-bytes-per-lane 256 :subgroup-size 16
+                :max-workgroup-size 1024 :shared-local-memory 131072}
           base (chw/gemm-tile-for desc)
           norm #(clojure.string/replace (str %) #"_\d{3,}" "_N")
           src-for (fn [ns] (norm (:source (cr/route-contraction (mm 256 256 256) :dtype :half

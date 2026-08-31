@@ -36,7 +36,7 @@
     (let [{:keys [kernel-handle]} ((ns-resolve ze 'ensure-kernel-loaded!) (:kernel-name r))
           args (into (mapv #(:segment (get bufs %)) (:array-params r))
                      (into [(:segment o)] (:scalar-args r)))]
-      ((ns-resolve ze 'launch-2d!) kernel-handle (:wg r) (:grid r) args)
+      ((ns-resolve ze 'launch-geometry!) kernel-handle (:wg r) (:grid r) args)
       [(:strategy r) (vec ((ns-resolve ze 'buffer->double-array) o))])))
 
 (deftest einsum-contract-matches-reference-on-device
@@ -57,7 +57,7 @@
         (let [[_ r] (go "ij,jk->ki" {:i 3 :j 4 :k 2} bufs 6)
               ref (for [k (range 2) i (range 3)] (reduce + (for [j (range 4)] (* (aget Ad (+ (* i 4) j)) (aget Bd (+ (* j 2) k))))))]
           (is (close? r ref))))
-      (testing "bij,bjk->bik batch matmul → naive segmented reduce"
+      (testing "bij,bjk->bik batch matmul → scheduled portable reduction"
         (let [B 2 M 3 K 4 N 2
               Abd (double-array (map #(* 0.1 (double %)) (range (* B M K))))
               Bbd (double-array (map #(* 0.2 (double %)) (range (* B K N))))
@@ -66,7 +66,7 @@
               ref (for [b (range B) i (range M) k (range N)]
                     (reduce + (for [j (range K)] (* (aget Abd (+ (* (+ (* b M) i) K) j))
                                                     (aget Bbd (+ (* (+ (* b K) j) N) k))))))]
-          (is (= :naive-segred s))
+          (is (= :portable-segred s))
           (is (close? r ref)))))))
 
 ;; ── Phase 1/2: rearrange (transpose / split / merge) as a MAP application ──────────────

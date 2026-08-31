@@ -1052,6 +1052,45 @@
 ;; Segmented reduction (contraction) → OpenCL — the multi-axis SegSpace path
 ;; ================================================================
 
+(defn generate-contraction-kernel-body
+  "Emit one scheduled portable contraction KernelBody through the shared C-family boundary."
+  [kernel-body & {:keys [kernel-name-prefix target-dialect]
+                  :or {kernel-name-prefix "contract" target-dialect :opencl-intel}}]
+  (let [kernel-body (kbody/validate! kernel-body)
+        parameters (:parameters kernel-body)
+        inputs (vec (map :id (filter #(= :input (:kind %)) parameters)))
+        output-parameter (first (filter #(= :output (:kind %)) parameters))
+        output (:id output-parameter)
+        scalar-parameters (vec (filter #(= :scalar (:kind %)) parameters))
+        scalars (vec (map :id (remove #(= '_nseg (:id %)) scalar-parameters)))
+        kernel-name (str kernel-name-prefix "_" (gensym ""))
+        parameter-names (into {output "out" '_nseg "_nseg"}
+                              (map (fn [parameter]
+                                     [(:id parameter) (ce/c-symbol (:id parameter))]))
+                              parameters)
+        source (kernel-body-opencl/emit-scalar-kernel
+                kernel-name kernel-body
+                {:target-dialect target-dialect :parameter-names parameter-names})
+        abi (kabi/validate!
+             (mapv (fn [parameter]
+                     (let [{:keys [id kind dtype role]} parameter]
+                       (kabi/slot
+                        id kind dtype
+                        :c-name (get parameter-names id)
+                        :role (if (= id '_nseg) :bound role)
+                        :aliasing (when (= kind :input) :no-write-alias))))
+                   parameters))]
+    {:kernel-name kernel-name
+     :target (kernel-body-c-dialect/target
+              (kernel-body-c-dialect/resolve! target-dialect))
+     :source source
+     :abi abi
+     :array-params inputs
+     :scalar-params scalars
+     :output output
+     :kernel-body kernel-body
+     :launch (:launch kernel-body)}))
+
 (defn generate-segmented-reduce-kernel
   "NAIVE segmented reduction (a contraction) → OpenCL. One work-item per SEGMENT (free-axis
    tuple); each sequentially folds over the reduced (innermost) axis. segment-dims = the

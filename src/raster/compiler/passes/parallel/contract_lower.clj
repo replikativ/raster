@@ -13,6 +13,7 @@
   (:require [raster.compiler.ir.segop :as segop]
             [raster.compiler.ir.par :as ir-par]
             [raster.compiler.ir.contraction-facts :as contraction-facts]
+            [raster.compiler.core.util :as util]
             [clojure.set :as set]))
 
 (defn flatten-contract-axes
@@ -55,10 +56,13 @@
         reduction (:reduction facts)
         arrays  (set (ir-par/collect-aget-arrays body))
         inputs  (disj arrays out)
-        ;; scalars = the symbol-valued axis bounds (the contraction dims). Body-level
-        ;; extra scalars (e.g. a scale) are a later refinement.
-        bound-syms (into #{} (filter symbol?)
-                         (conj (mapv second free-axes) k-bound))]
+        ;; Flattening two or more reduction axes makes k-bound a typed arithmetic expression.
+        ;; Preserve every dimension scalar it references; collecting only direct symbol bounds
+        ;; silently omitted l1/l2 from the ABI of an otherwise valid portable contraction.
+        ;; Body-level extra scalars (e.g. a scale) are a later refinement.
+        bound-syms (reduce set/union #{}
+                           (map util/free-syms
+                                (conj (mapv second free-axes) k-bound)))]
     (segop/->SegRed id space
                     (segop/->SegLevel :thread :virtual)
                     reduction
