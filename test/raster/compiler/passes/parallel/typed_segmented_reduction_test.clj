@@ -76,6 +76,8 @@
       (is (= '#{A B} (:inputs operation)))
       (is (= '#{m n k} (:scalars operation)))
       (is (= '#{C} (:outputs operation)))
+      (is (= :segmented (:phase operation)))
+      (is (nil? (:schedule operation)))
       (is (reduction/product-reduction? product))
       (is (= :float (first (reduction/dtypes product))))
       (is (= 'C (first (reduction/results product))))

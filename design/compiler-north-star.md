@@ -322,21 +322,25 @@ constructing the former `SoacContract` record. Ordinary scalar `raster.par/contr
 enters this equation directly; the operation is intentionally not a matmul node, so scientific
 contractions, batched reductions and attention-derived reductions share the same semantic
 vocabulary. Until the tensorization route consumes TypedSOAC itself, one shared mechanical
-component projection supplies host materialization and the verified facts carried by a
-`SegContract` schedule view. Schedule legality and GPU routing consume those components directly;
-only host materialization and compatibility leaves request a generated surface spelling, and no
-walked source form is reparsed. Staged quantization, decode lambdas,
+component projection supplies host materialization and target routing. Ordinary typed contractions
+lower to a canonical `SegRed` whose `ReductionSchedule` records the hardware candidate families,
+workgroup search space and numerical constraints; the validated TypedSOAC equation remains attached
+to its `ProgramEquation`. GPU routing derives its transient verified contraction facts from that
+equation and never reparses the walked source form. Only host materialization and compatibility
+leaves request a generated surface spelling. Staged quantization, decode lambdas,
 declared physical maps, epilogues and output conversions remain on the certified compatibility
-front door until the typed equation has explicit facts for them; admitting them while dropping
-those contracts would be a miscompile, not migration progress.
+front door, and may still use `SegContract`, until the typed equation has explicit facts for them;
+admitting them while dropping those contracts would be a miscompile, not migration progress.
 
 Tensor contraction uses that same semantic operator rather than reconstructing `init`, `combine`
 and a fold body in `contract-lower`. The single contraction-facts derivation now owns its canonical
 one-component `ProductReduction`, normalized reduced coordinate and flattened semantic body;
-`SegContract`, generic `SegRed` fallback and peak routing consume those facts unchanged. Free axes,
+ordinary `SegRed` scheduling and peak routing consume those facts unchanged. The compatibility
+`SegContract` projection is now limited to contractions that are not yet in the typed subset. Free axes,
 operand axis maps, decode/storage precision, epilogues and staged accumulator structure remain
-orthogonal contraction facts and schedule choices. This is the semantic bridge toward representing
-contraction as an ordinary segmented TypedSOAC reduction, not a new hard-coded GEMM algebra.
+orthogonal contraction facts and schedule choices. Contraction is therefore an ordinary segmented
+TypedSOAC reduction, not a new hard-coded GEMM algebra; matrix, register-tiled and portable kernels
+are competing schedules for that algebra.
 
 Indexed storage movement remains a separate generic operation. Allocation-free `gather-blocks!`
 and `scatter-blocks!` move contiguous typed blocks between dense staging and routed resident
